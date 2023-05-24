@@ -1,8 +1,8 @@
 use arrow::array::{ArrayRef, Int32Array, StringArray};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
-use delta_core::delta_table::DeltaTable;
-use delta_core::expressions::Expression;
+use delta_kernel::delta_table::DeltaTable;
+use delta_kernel::expressions::Expression;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use std::path::PathBuf;
