@@ -1,8 +1,16 @@
 [package]
-name = "delta-kernel"
+name = "deltakernel"
 version = "0.0.0"
 edition = "2021"
-authors = ["Zach Schuermann <zach@zvs.io>"]
+authors = [
+            "Zach Schuermann <zach@zvs.io>",
+            "R. Tyler Croy <rtyler@brokenco.de>",
+          ]
+readme = "README.md"
+keywords = ["deltalake", "delta", "datalake"]
+license = "Apache-2.0"
+homepage = "https://delta.io"
+repository = "https://github.com/delta-incubator/delta-kernel-rs"
 
 [dependencies]
 tracing = "0.1" # only for structured logging

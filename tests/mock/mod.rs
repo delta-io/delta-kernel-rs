@@ -1,4 +1,4 @@
-use delta_kernel::{storage::StorageClient, Version};
+use deltakernel::{storage::StorageClient, Version};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
