@@ -35,8 +35,8 @@ fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     {
         let batch = batch?;
         let rows = batch.num_rows();
-        assert_eq!(rows, 8);
         arrow::util::pretty::print_batches(&[batch]).unwrap();
+        assert_eq!(rows, 8);
     }
     Ok(())
 }

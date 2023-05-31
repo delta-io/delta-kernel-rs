@@ -7,8 +7,8 @@ authors = ["Zach Schuermann <zach@zvs.io>"]
 [dependencies]
 tracing = "0.1" # only for structured logging
 # todo depend only on the bits we need (arrow-schema, etc.)
-arrow = { version = "35.0", features = [ "json", "prettyprint" ]}
-parquet = "35.0" # need to generalize over arrow, arrow2 and diff parquet etc. (BYOP)
+arrow = { version = "^40.0", features = [ "json", "prettyprint" ]}
+parquet = "^40.0" # need to generalize over arrow, arrow2 and diff parquet etc. (BYOP)
 bytes = "1.4" # HACK only using this since ParquetRecordBatchReaderBuilder requires ChunkRead
 
 # required to deserialize DVs
