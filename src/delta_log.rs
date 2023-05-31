@@ -1,9 +1,9 @@
 use crate::storage::StorageClient;
 use crate::Version;
-use arrow::json::RawReaderBuilder;
+use arrow::json::ReaderBuilder;
 use arrow::{
     array::{BooleanArray, StringArray, StructArray},
-    datatypes::{Field, Schema},
+    datatypes::{Field, Fields, Schema},
     record_batch::RecordBatch,
 };
 use std::collections::HashSet;
@@ -179,36 +179,40 @@ impl LogFile {
         };
 
         // commits and checkpoints will be deserialized into arrow with a column per action type
-        let dv_schema = arrow::datatypes::DataType::Struct(vec![
+        let dv_schema = arrow::datatypes::DataType::Struct(Fields::from(vec![
             Field::new("storageType", arrow::datatypes::DataType::Utf8, false),
             Field::new("pathOrInlineDv", arrow::datatypes::DataType::Utf8, false),
-            Field::new("offset", arrow::datatypes::DataType::UInt64, false),
+            Field::new("offset", arrow::datatypes::DataType::UInt64, true),
             Field::new("sizeInBytes", arrow::datatypes::DataType::UInt64, false),
             Field::new("cardinality", arrow::datatypes::DataType::UInt64, false),
-        ]);
-        let add_schema = arrow::datatypes::DataType::Struct(vec![
+        ]));
+        let add_schema = arrow::datatypes::DataType::Struct(Fields::from(vec![
             Field::new("path", arrow::datatypes::DataType::Utf8, false),
             Field::new("size", arrow::datatypes::DataType::UInt64, false),
-            Field::new("stats", arrow::datatypes::DataType::Utf8, false),
+            Field::new("stats", arrow::datatypes::DataType::Utf8, true),
+            Field::new("dataChange", arrow::datatypes::DataType::Boolean, false),
             Field::new("deletionVector", dv_schema, true),
-        ]);
-        let remove_schema = arrow::datatypes::DataType::Struct(vec![
+            /*
+             * TODO: Missing required fields: partitionValues, modificationTime
+             */
+        ]));
+        let remove_schema = arrow::datatypes::DataType::Struct(Fields::from(vec![
             Field::new("path", arrow::datatypes::DataType::Utf8, false),
-            Field::new("size", arrow::datatypes::DataType::UInt64, false),
-            Field::new("stats", arrow::datatypes::DataType::Utf8, false),
-        ]);
-        let metadata_schema = arrow::datatypes::DataType::Struct(vec![Field::new(
+            Field::new("dataChange", arrow::datatypes::DataType::Boolean, false),
+            Field::new("size", arrow::datatypes::DataType::UInt64, true),
+        ]));
+        let metadata_schema = arrow::datatypes::DataType::Struct(Fields::from(vec![Field::new(
             "id",
             arrow::datatypes::DataType::Utf8,
             false,
-        )]);
+        )]));
 
         let add_col = Field::new("add", add_schema, true);
         let remove_col = Field::new("remove", remove_schema, true);
         let metadata_col = Field::new("metaData", metadata_schema, true);
 
         let actions_schema = Schema::new(vec![add_col, remove_col, metadata_col]);
-        RawReaderBuilder::new(actions_schema.into())
+        ReaderBuilder::new(actions_schema.into())
             .build(BufReader::new(actions.as_slice()))
             .unwrap()
             .collect::<Vec<_>>()

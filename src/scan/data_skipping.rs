@@ -5,7 +5,7 @@ use tracing::debug;
 
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
-use arrow::json::RawReaderBuilder;
+use arrow::json::ReaderBuilder;
 use std::io::BufReader;
 use std::sync::Arc;
 
@@ -46,12 +46,12 @@ pub(crate) fn data_skipping_filter(
     let stats_schema = Schema::new(vec![
         Field::new(
             "minValues",
-            arrow::datatypes::DataType::Struct(data_fields.clone()),
+            arrow::datatypes::DataType::Struct(data_fields.clone().into()),
             true,
         ),
         Field::new(
             "maxValues",
-            arrow::datatypes::DataType::Struct(data_fields),
+            arrow::datatypes::DataType::Struct(data_fields.into()),
             true,
         ),
     ]);
@@ -85,17 +85,17 @@ fn hack_parse(json_string: Option<&str>) -> RecordBatch {
     let stats_schema = Schema::new(vec![
         Field::new(
             "minValues",
-            arrow::datatypes::DataType::Struct(data_fields.clone()),
+            arrow::datatypes::DataType::Struct(data_fields.clone().into()),
             true,
         ),
         Field::new(
             "maxValues",
-            arrow::datatypes::DataType::Struct(data_fields.clone()),
+            arrow::datatypes::DataType::Struct(data_fields.clone().into()),
             true,
         ),
     ]);
     match json_string {
-        Some(s) => RawReaderBuilder::new(stats_schema.into())
+        Some(s) => ReaderBuilder::new(stats_schema.into())
             .build(BufReader::new(s.as_bytes()))
             .unwrap()
             .collect::<Vec<_>>()
@@ -107,11 +107,11 @@ fn hack_parse(json_string: Option<&str>) -> RecordBatch {
             stats_schema.into(),
             vec![
                 Arc::new(arrow::array::new_null_array(
-                    &arrow::datatypes::DataType::Struct(data_fields.clone()),
+                    &arrow::datatypes::DataType::Struct(data_fields.clone().into()),
                     1,
                 )),
                 Arc::new(arrow::array::new_null_array(
-                    &arrow::datatypes::DataType::Struct(data_fields),
+                    &arrow::datatypes::DataType::Struct(data_fields.into()),
                     1,
                 )),
             ],
