@@ -19,3 +19,6 @@ roaring = "0.10.1"
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
+test-case = { version = "3.1.0" }
+serde = { version = "1.0.163", features = ["derive"] }
+serde_json = { version = "1.0.96" }
