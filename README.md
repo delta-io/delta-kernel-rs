@@ -19,7 +19,7 @@ Install rust via [rustup]. Then clone the repository and build/run tests via
 
 ## Development
 
-delta-kernel-rs is still under heavy development but follows what conventions
+delta-kernel-rs is still under heavy development but follows conventions
 adopted by most Rust projects.
 
 ### Architecture
