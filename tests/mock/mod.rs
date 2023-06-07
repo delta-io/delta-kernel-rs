@@ -1,4 +1,4 @@
-use delta_kernel::{storage::StorageClient, Version};
+use deltakernel::{storage::StorageClient, Version};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -13,7 +13,6 @@ impl StorageClient for MockStorageClient {
             .keys()
             .filter(|p| p.starts_with(prefix))
             .cloned()
-            .map(|f| PathBuf::from(f))
             .collect()
     }
     fn read(&self, path: &Path) -> Vec<u8> {

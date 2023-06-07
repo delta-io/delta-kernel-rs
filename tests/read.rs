@@ -1,8 +1,8 @@
 use arrow::array::{ArrayRef, Int32Array, StringArray};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
-use delta_kernel::delta_table::DeltaTable;
-use delta_kernel::expressions::Expression;
+use deltakernel::delta_table::DeltaTable;
+use deltakernel::expressions::Expression;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use std::path::PathBuf;
@@ -12,12 +12,12 @@ use test_log::test;
 mod mock;
 use mock::MockStorageClient;
 
-const PARQUET_FILE1: &'static str =
+const PARQUET_FILE1: &str =
     "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
-const PARQUET_FILE2: &'static str =
+const PARQUET_FILE2: &str =
     "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c000.snappy.parquet";
 
-const METADATA: &'static str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
+const METADATA: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
 {"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
 {"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 
@@ -42,7 +42,7 @@ fn load_parquet(batch: &RecordBatch) -> Vec<u8> {
     let mut data: Vec<u8> = Vec::new();
     let props = WriterProperties::builder().build();
     let mut writer = ArrowWriter::try_new(&mut data, batch.schema(), Some(props)).unwrap();
-    writer.write(&batch).expect("Writing batch");
+    writer.write(batch).expect("Writing batch");
     // writer must be closed to write footer
     writer.close().unwrap();
     data

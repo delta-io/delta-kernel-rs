@@ -1,7 +1,7 @@
 //! Read a small table with/without deletion vectors.
 //! Must run at the root of the crate
 
-use delta_kernel::{delta_table::DeltaTable, storage::StorageClient};
+use deltakernel::{delta_table::DeltaTable, storage::StorageClient};
 use std::path::PathBuf;
 
 #[derive(Default, Debug, Clone)]
