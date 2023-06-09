@@ -3,8 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::PathBuf;
-use test_case::test_case;
+use std::path::{Path, PathBuf};
 
 use delta_kernel::storage::StorageClient;
 use delta_kernel::Version;
@@ -41,19 +40,9 @@ struct TableVersionMetaData {
     min_writer_version: u32,
 }
 
-// TODO: macro generate this?
-#[test_case("tests/dat/reader_tests/generated/all_primitive_types")]
-#[test_case("tests/dat/reader_tests/generated/basic_append")]
-#[test_case("tests/dat/reader_tests/generated/basic_partitioned")]
-#[test_case("tests/dat/reader_tests/generated/multi_partitioned")]
-#[test_case("tests/dat/reader_tests/generated/multi_partitioned_2")]
-#[test_case("tests/dat/reader_tests/generated/nested_types")]
-#[test_case("tests/dat/reader_tests/generated/no_replay")]
-#[test_case("tests/dat/reader_tests/generated/no_stats")]
-#[test_case("tests/dat/reader_tests/generated/stats_as_struct")]
-#[test_case("tests/dat/reader_tests/generated/with_checkpoint")]
-#[test_case("tests/dat/reader_tests/generated/with_schema_change")]
-fn reader_test(root_dir: &str) {
+datatest_stable::harness!(reader_test, "tests/dat/out/reader_tests/generated/", r"test_case_info\.json");
+fn reader_test(path: &Path) -> datatest_stable::Result<()> {
+    let root_dir = path.parent().unwrap().to_str().unwrap();
     let expected_tvm_path = format!("{}/expected/latest/table_version_metadata.json", root_dir);
     let file = File::open(expected_tvm_path).expect("Oops");
     let reader = BufReader::new(file);
@@ -65,4 +54,6 @@ fn reader_test(root_dir: &str) {
     let snapshot = table.get_latest_snapshot(&storage_client);
 
     assert_eq!(snapshot.version(), expected_tvm.version);
+
+    Ok(())
 }

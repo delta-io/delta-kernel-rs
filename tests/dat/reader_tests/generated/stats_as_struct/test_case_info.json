@@ -1,4 +1,0 @@
-{
-  "name": "stats_as_struct",
-  "description": "Table with stats only written as struct (not JSON) with Checkpoint"
-}
