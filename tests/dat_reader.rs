@@ -1,12 +1,12 @@
-use delta_kernel::delta_table::DeltaTable;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
-use delta_kernel::storage::StorageClient;
-use delta_kernel::Version;
+use deltakernel::delta_table::DeltaTable;
+use deltakernel::storage::StorageClient;
+use deltakernel::Version;
 
 // TODO: common to dv.rs
 #[derive(Default, Debug, Clone)]
