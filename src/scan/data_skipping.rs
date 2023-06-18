@@ -72,7 +72,7 @@ pub(crate) fn data_skipping_filter(
     .unwrap();
 
     let before_count = actions.num_rows();
-    let after = arrow::compute::filter_record_batch(&actions, &skipping_vector).unwrap();
+    let after = arrow::compute::filter_record_batch(&actions, skipping_vector).unwrap();
     debug!(
         "number of actions before/after data skipping: {before_count} / {}",
         after.num_rows()

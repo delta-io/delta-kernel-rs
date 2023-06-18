@@ -1,8 +1,10 @@
 use crate::delta_log::LogSegment;
 use crate::scan::ScanBuilder;
-use crate::storage::StorageClient;
 use crate::Version;
-use std::path::PathBuf;
+
+use object_store::path::Path;
+use object_store::ObjectStore;
+use std::sync::Arc;
 
 /// In-memory representation of a specific snapshot of a Delta table. While a `DeltaTable` exists
 /// throughout time, `Snapshot`s represent a view of a table at a specific point in time; they
@@ -14,7 +16,7 @@ pub struct Snapshot {
     /// root location of the delta table
     // TODO many of these 'sub-types' of the top-level DeltaTable type own their paths. Should we
     // have refs?
-    location: PathBuf,
+    location: Path,
     /// snapshot version
     version: Version,
     /// arrow schema of the snapshot
@@ -27,12 +29,12 @@ impl Snapshot {
     /// Create a snapshot for a given table version. Main work done is listing files in storage and
     /// performing lightweight log replay to resolve protocol and metadata (schema) for the
     /// table/snapshot.
-    pub(crate) fn new<S: StorageClient>(
-        location: PathBuf,
+    pub(crate) async fn new(
+        location: Path,
         version: Version,
-        storage_client: &S,
+        storage: Arc<dyn ObjectStore>,
     ) -> Self {
-        let log_segment = LogSegment::new::<S>(location.clone(), version, storage_client);
+        let log_segment = LogSegment::from(location.clone(), version, storage).await;
         // FIXME need to resolve the table schema during snapshot creation using some minimal
         // log replay
         let schema = arrow::datatypes::Schema::empty();

@@ -1,25 +1,31 @@
 use crate::delta_log::*;
 use crate::expressions::Expression;
-use crate::storage::StorageClient;
-use std::fmt::Debug;
-use std::path::PathBuf;
 
-mod data_skipping;
 use arrow::record_batch::RecordBatch;
-use data_skipping::data_skipping_filter;
+use futures::prelude::*;
+use futures::stream::{BoxStream, StreamExt};
+use futures::task::{Context, Poll};
+use object_store::path::Path;
+use object_store::ObjectStore;
 
 use self::reader::DeltaReader;
+
+use std::fmt::Debug;
+use std::pin::Pin;
+use std::sync::Arc;
+
+mod data_skipping;
+use data_skipping::data_skipping_filter;
 
 // the Scan type is only concerned with metadata. it produces DataFiles which must then be read
 // TODO move this up/out of scan?
 mod reader;
-// mod deletion_vectors;
 
 // TODO ownership: should this own location/log_segment/schema/expression?
 /// Builder to scan a snapshot of a table.
 #[derive(Debug)]
 pub struct ScanBuilder {
-    location: PathBuf,
+    location: Path,
     log_segment: LogSegment,
     snapshot_schema: arrow::datatypes::Schema,
     schema: Option<arrow::datatypes::Schema>,
@@ -30,7 +36,7 @@ pub struct ScanBuilder {
 /// predicate implements filtering (row selection).
 #[derive(Debug)]
 pub struct Scan {
-    location: PathBuf,
+    location: Path,
     log_segment: LogSegment,
     schema: arrow::datatypes::Schema,
     predicate: Option<Expression>,
@@ -38,7 +44,7 @@ pub struct Scan {
 
 impl ScanBuilder {
     pub(crate) fn new(
-        location: PathBuf,
+        location: Path,
         snapshot_schema: arrow::datatypes::Schema,
         log_segment: LogSegment,
     ) -> Self {
@@ -88,8 +94,8 @@ impl<'a> Scan {
     /// which yields record batches of scan files and their associated metadata. Rows of the scan
     /// files batches correspond to data reads, and the DeltaReader is used to materialize the scan
     /// files into actual table data.
-    pub fn files<S: StorageClient>(&'a self, storage_client: &'a S) -> ScanFileBatchIterator<'a> {
-        ScanFileBatchIterator::new(storage_client, &self.log_segment, &self.predicate)
+    pub fn files(&'a self, storage_client: Arc<dyn ObjectStore>) -> ScanFileStream<'a> {
+        ScanFileStream::new(&self.log_segment, &self.predicate, storage_client)
     }
 
     /// Creates a `DeltaReader` for the scan. This reader implements the data reading portion of
@@ -111,52 +117,132 @@ impl<'a> Scan {
     }
 }
 
-/// An iterator over scan files and their associated metadata to read valid data for a table scan.
-pub struct ScanFileBatchIterator<'a> {
-    actions_batch_iter: Box<dyn Iterator<Item = RecordBatch> + 'a>,
+pub struct ScanFileStream<'a> {
+    stream: BoxStream<'a, RecordBatch>,
     log_replay: LogReplay,
+    log_segment: &'a LogSegment,
     predicate: &'a Option<Expression>,
 }
 
-// FIXME need to actually implement useful debug
-impl Debug for ScanFileBatchIterator<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "someone help make a better debug impl")
+impl std::fmt::Debug for ScanFileStream<'_> {
+    fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        todo!()
     }
 }
 
-impl Iterator for ScanFileBatchIterator<'_> {
+impl Stream for ScanFileStream<'_> {
     type Item = RecordBatch;
-    fn next(&mut self) -> Option<Self::Item> {
-        // NOTE duplicate work in the data skipping: we map(data_skipping_filter) in order to
-        // compute and apply the boolean vector of data skipping to all add file actions, including
-        // ones which are invalid from prior remove_file actions
-        self.actions_batch_iter.next().map(|actions| {
-            // filter actions based on predicate. it's a 'map' over record batches since we have
-            // [RecordBatch(action1, action2, action3), ...] and produce something like
-            // [RecordBatch(action2, action3), ...]
-            let data_skipped_actions = data_skipping_filter(actions, self.predicate);
-            self.log_replay.replay(data_skipped_actions)
-        })
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        ctx: &mut Context<'_>,
+    ) -> Poll<Option<<Self as futures::Stream>::Item>> {
+        let stream = Pin::new(&mut self.stream);
+
+        match stream.poll_next(ctx) {
+            futures::task::Poll::Ready(value) => {
+                if let Some(actions) = value {
+                    let skipped = data_skipping_filter(actions, self.predicate);
+                    futures::task::Poll::Ready(Some(self.log_replay.replay(skipped)))
+                } else {
+                    futures::task::Poll::Ready(value)
+                }
+            }
+            other => other,
+        }
     }
 }
 
-impl<'a> ScanFileBatchIterator<'a> {
-    pub(crate) fn new<S: StorageClient + 'a>(
-        storage_client: &'a S,
+impl<'a> ScanFileStream<'a> {
+    fn new(
         log_segment: &'a LogSegment,
         predicate: &'a Option<Expression>,
+        storage_client: Arc<dyn ObjectStore>,
     ) -> Self {
-        // iter over record batches of actions
-        let actions_batch_iter = log_segment
-            .iter() // iter over commit/checkpoint files
-            .rev() // ...in reverse (commit12, commit11, checkpoint10.p1, checkpoint10.p2)
-            .flat_map(|file| file.read(storage_client));
+        let storage_client = storage_client.clone();
 
-        ScanFileBatchIterator {
-            actions_batch_iter: Box::new(actions_batch_iter),
-            log_replay: LogReplay::new(),
+        let stream = Box::pin(
+            stream::iter(log_segment.iter().rev())
+                .map(move |log| log.read(storage_client.clone()))
+                .then(|f| f)
+                .flat_map(stream::iter),
+        );
+        Self {
+            log_segment,
             predicate,
+            stream,
+            log_replay: LogReplay::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::local::LocalFileSystem;
+
+    /*
+     * This test has a bit more scaffolding to make it easier to simulate a real use case of the
+     * ScanFileStream
+     */
+    #[tokio::test]
+    async fn test_scanfilestream() {
+        let storage_client = LocalFileSystem::new();
+        let path1 = Path::from(format!(
+            "{}/tests/data/table-with-dv-small/_delta_log/00000000000000000000.json",
+            std::env!["CARGO_MANIFEST_DIR"]
+        ));
+        let path2 = Path::from(format!(
+            "{}/tests/data/table-with-dv-small/_delta_log/00000000000000000001.json",
+            std::env!["CARGO_MANIFEST_DIR"]
+        ));
+        let log_segment = LogSegment {
+            log_files: vec![path1.try_into().unwrap(), path2.try_into().unwrap()],
+        };
+
+        let mut scan_stream = ScanFileStream::new(&log_segment, &None, Arc::new(storage_client));
+        let mut counted = 0;
+
+        while let Some(batch) = scan_stream.next().await {
+            let _batch: RecordBatch = batch;
+            //println!("batch: {batch:?}");
+            counted += 1;
+        }
+        assert_eq!(
+            2, counted,
+            "Expected to have iterated over some RecordBatches"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_for_scanning() {
+        let storage_client = LocalFileSystem::new();
+        let path = Path::from(format!(
+            "{}/tests/data/table-without-dv-small/_delta_log/00000000000000000000.json",
+            std::env!["CARGO_MANIFEST_DIR"]
+        ));
+        let log_file: LogFile = path.try_into().unwrap();
+        let segment = LogSegment {
+            log_files: vec![log_file.clone(), log_file],
+        };
+
+        let storage_client = Arc::new(storage_client);
+        let iterator = stream::iter(
+            segment
+                .iter()
+                .rev()
+                .map(|log| log.read(storage_client.clone())),
+        )
+        .then(|f| f)
+        .map(stream::iter)
+        .flatten();
+
+        let mut counted = 0;
+        for _batch in iterator.collect::<Vec<RecordBatch>>().await {
+            counted += 1;
+        }
+        assert_eq!(
+            2, counted,
+            "Expected to have iterated over some RecordBatches"
+        );
     }
 }
