@@ -55,10 +55,7 @@ impl DeltaTable {
         paths.sort();
 
         // XXX: This is not handling checkpoint files efficiently
-        if let Some(last_commit) = paths
-            .iter()
-            .rev().find(|p| p.extension() == Some("json"))
-        {
+        if let Some(last_commit) = paths.iter().rev().find(|p| p.extension() == Some("json")) {
             match version_from_path(last_commit) {
                 Ok(version) => Some(version),
                 Err(e) => {
