@@ -1,19 +1,17 @@
-use crate::*;
+use std::collections::HashSet;
+use std::io::{Error, ErrorKind};
+use std::sync::Arc;
 
-use arrow::json::ReaderBuilder;
-use arrow::{
-    array::{BooleanArray, StringArray, StructArray},
-    datatypes::{Field, Fields, Schema},
-    record_batch::RecordBatch,
-};
+use arrow_array::{BooleanArray, RecordBatch, StringArray, StructArray};
+use arrow_json::ReaderBuilder;
+use arrow_schema::{DataType, Field, Fields, Schema};
+use arrow_select::filter::filter_record_batch;
 use bytes::Buf;
 use futures::prelude::*;
 use object_store::path::Path;
 use object_store::ObjectStore;
 
-use std::collections::HashSet;
-use std::io::{Error, ErrorKind};
-use std::sync::Arc;
+use crate::*;
 
 #[derive(Debug, Clone)]
 pub(crate) struct LogSegment {
@@ -135,8 +133,7 @@ impl LogReplay {
                 None => false,
             })
             .collect();
-        arrow::compute::filter_record_batch(&actions_batch, &BooleanArray::from(filter_vec))
-            .unwrap()
+        filter_record_batch(&actions_batch, &BooleanArray::from(filter_vec)).unwrap()
     }
 }
 
@@ -212,33 +209,30 @@ impl TryFrom<Path> for LogFile {
 impl LogFile {
     pub(crate) fn schema() -> Schema {
         // commits and checkpoints will be deserialized into arrow with a column per action type
-        let dv_schema = arrow::datatypes::DataType::Struct(Fields::from(vec![
-            Field::new("storageType", arrow::datatypes::DataType::Utf8, false),
-            Field::new("pathOrInlineDv", arrow::datatypes::DataType::Utf8, false),
-            Field::new("offset", arrow::datatypes::DataType::UInt64, true),
-            Field::new("sizeInBytes", arrow::datatypes::DataType::UInt64, false),
-            Field::new("cardinality", arrow::datatypes::DataType::UInt64, false),
+        let dv_schema = DataType::Struct(Fields::from(vec![
+            Field::new("storageType", DataType::Utf8, false),
+            Field::new("pathOrInlineDv", DataType::Utf8, false),
+            Field::new("offset", DataType::UInt64, true),
+            Field::new("sizeInBytes", DataType::UInt64, false),
+            Field::new("cardinality", DataType::UInt64, false),
         ]));
-        let add_schema = arrow::datatypes::DataType::Struct(Fields::from(vec![
-            Field::new("path", arrow::datatypes::DataType::Utf8, false),
-            Field::new("size", arrow::datatypes::DataType::UInt64, false),
-            Field::new("stats", arrow::datatypes::DataType::Utf8, true),
-            Field::new("dataChange", arrow::datatypes::DataType::Boolean, false),
+        let add_schema = DataType::Struct(Fields::from(vec![
+            Field::new("path", DataType::Utf8, false),
+            Field::new("size", DataType::UInt64, false),
+            Field::new("stats", DataType::Utf8, true),
+            Field::new("dataChange", DataType::Boolean, false),
             Field::new("deletionVector", dv_schema, true),
             /*
              * TODO: Missing required fields: partitionValues, modificationTime
              */
         ]));
-        let remove_schema = arrow::datatypes::DataType::Struct(Fields::from(vec![
-            Field::new("path", arrow::datatypes::DataType::Utf8, false),
-            Field::new("dataChange", arrow::datatypes::DataType::Boolean, false),
-            Field::new("size", arrow::datatypes::DataType::UInt64, true),
+        let remove_schema = DataType::Struct(Fields::from(vec![
+            Field::new("path", DataType::Utf8, false),
+            Field::new("dataChange", DataType::Boolean, false),
+            Field::new("size", DataType::UInt64, true),
         ]));
-        let metadata_schema = arrow::datatypes::DataType::Struct(Fields::from(vec![Field::new(
-            "id",
-            arrow::datatypes::DataType::Utf8,
-            false,
-        )]));
+        let metadata_schema =
+            DataType::Struct(Fields::from(vec![Field::new("id", DataType::Utf8, false)]));
 
         let add_col = Field::new("add", add_schema, true);
         let remove_col = Field::new("remove", remove_schema, true);

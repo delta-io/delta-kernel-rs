@@ -1,10 +1,11 @@
-use arrow::record_batch::RecordBatch;
+use arrow_array::RecordBatch;
+use arrow_schema::ArrowError;
 use bytes::Bytes;
 
 /// A type that can parse parquet from bytes. FIXME this should take a path so the engine can
 /// optimize better.
 pub trait ParquetReader {
-    type Iter: Iterator<Item = Result<RecordBatch, arrow::error::ArrowError>>;
+    type Iter: Iterator<Item = Result<RecordBatch, ArrowError>>;
 
     fn read(&self, bytes: Bytes) -> Self::Iter;
 }

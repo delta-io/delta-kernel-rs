@@ -1,17 +1,17 @@
-use crate::delta_log::{from_actions_batch, Action, DataFile};
+use std::fmt::Debug;
+use std::sync::Arc;
 
-use crate::parquet_reader::arrow_parquet_reader::ArrowParquetReader;
-use crate::parquet_reader::ParquetReader;
-
-use arrow::error::ArrowError;
-use arrow::record_batch::RecordBatch;
+use arrow_array::{BooleanArray, RecordBatch};
+use arrow_schema::ArrowError;
+use arrow_select::filter::filter_record_batch;
 use futures::prelude::*;
 use object_store::path::Path;
 use object_store::ObjectStore;
 use tracing::debug;
 
-use std::fmt::Debug;
-use std::sync::Arc;
+use crate::delta_log::{from_actions_batch, Action, DataFile};
+use crate::parquet_reader::arrow_parquet_reader::ArrowParquetReader;
+use crate::parquet_reader::ParquetReader;
 
 #[derive(Debug)]
 pub struct DeltaReader {
@@ -97,8 +97,8 @@ pub(crate) async fn read<P: ParquetReader>(
             let vec: Vec<_> = (0..batch.num_rows())
                 .map(|i| Some(!dv.contains(i.try_into().unwrap())))
                 .collect();
-            let dv = arrow::array::BooleanArray::from(vec);
-            arrow::compute::filter_record_batch(&batch, &dv).unwrap()
+            let dv = BooleanArray::from(vec);
+            filter_record_batch(&batch, &dv).unwrap()
         }
         None => batch.unwrap(),
     })

@@ -1,12 +1,12 @@
-use crate::snapshot::Snapshot;
-use crate::{version_from_path, Version};
+use std::sync::Arc;
 
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::ObjectStore;
 use tracing::*;
 
-use std::sync::Arc;
+use crate::snapshot::Snapshot;
+use crate::{version_from_path, Version};
 
 /// In-memory representation of a Delta table. Location specifies the root location of the table.
 // We should verify the given path exists and is accessible before allowing any

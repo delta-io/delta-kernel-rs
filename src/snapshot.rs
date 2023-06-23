@@ -1,10 +1,12 @@
+use std::sync::Arc;
+
+use arrow_schema::Schema;
+use object_store::path::Path;
+use object_store::ObjectStore;
+
 use crate::delta_log::LogSegment;
 use crate::scan::ScanBuilder;
 use crate::Version;
-
-use object_store::path::Path;
-use object_store::ObjectStore;
-use std::sync::Arc;
 
 /// In-memory representation of a specific snapshot of a Delta table. While a `DeltaTable` exists
 /// throughout time, `Snapshot`s represent a view of a table at a specific point in time; they
@@ -20,7 +22,7 @@ pub struct Snapshot {
     /// snapshot version
     version: Version,
     /// arrow schema of the snapshot
-    schema: arrow::datatypes::Schema,
+    schema: Schema,
     /// log segment (essentially commit/checkpoint file names) valid for this snapshot
     pub(crate) log_segment: LogSegment,
 }
@@ -37,7 +39,7 @@ impl Snapshot {
         let log_segment = LogSegment::from(location.clone(), version, storage).await;
         // FIXME need to resolve the table schema during snapshot creation using some minimal
         // log replay
-        let schema = arrow::datatypes::Schema::empty();
+        let schema = Schema::empty();
         Snapshot {
             location,
             schema,
@@ -52,7 +54,7 @@ impl Snapshot {
     }
 
     /// schema of the snapshot
-    pub fn schema(&self) -> &arrow::datatypes::Schema {
+    pub fn schema(&self) -> &Schema {
         &self.schema
     }
 

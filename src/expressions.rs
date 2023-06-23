@@ -1,9 +1,6 @@
-use arrow::{
-    array::{BooleanArray, Int32Array, StructArray},
-    compute::lt_scalar,
-    error::ArrowError,
-    record_batch::RecordBatch,
-};
+use arrow_array::{BooleanArray, Int32Array, RecordBatch, StructArray};
+use arrow_ord::comparison::lt_scalar;
+use arrow_schema::ArrowError;
 
 #[derive(Debug, Clone)]
 pub enum Expression {
