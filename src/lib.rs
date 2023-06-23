@@ -11,6 +11,11 @@
     missing_debug_implementations
 )]
 
+use object_store::path::Path;
+use tracing::*;
+
+use std::io::{Error, ErrorKind};
+
 /// Includes top-level DeltaTable type which can construct Snapshots
 pub mod delta_table;
 
@@ -27,11 +32,77 @@ pub mod scan;
 /// has schema etc.) pub mod snapshot;
 pub mod snapshot;
 
-/// generic storage interface
-pub mod storage;
-
 /// delta_log module for defining schema of log files, actions, etc.
 mod delta_log;
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
+
+/**
+ * Parse the given [object_store::path::Path] to identify a commit log version
+ */
+fn version_from_path(path: &Path) -> Result<Version, object_store::Error> {
+    if let Some(filename) = path.filename() {
+        if let Some(part) = filename.split('.').next() {
+            return part.parse().map_err(|source: std::num::ParseIntError| {
+                object_store::Error::NotFound {
+                    path: part.to_string(),
+                    source: source.into(),
+                }
+            });
+        }
+        Ok(0)
+    } else {
+        let e = format!(
+            "Provided path does not have a filename at the end: {:?}",
+            path
+        );
+        error!("{}", &e);
+        let err = Error::new(ErrorKind::Other, e);
+        Err(object_store::Error::Generic {
+            store: "invalid",
+            source: Box::new(err),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_version_from_path() {
+        let path = Path::from("/tmp/test/_delta_log/00000000000000000001.json");
+        let version = version_from_path(&path).unwrap();
+
+        assert_eq!(1, version);
+    }
+
+    #[test]
+    fn test_version_from_path_invalid_stem() {
+        let path = Path::from("/tmp/test/_delta_log/some-garbage");
+        let result = version_from_path(&path);
+        assert!(result.is_err())
+    }
+
+    #[test]
+    fn test_version_from_path_invalid_extension() {
+        let path = Path::from("/tmp/test/_delta_log/some-garbage.txt");
+        let result = version_from_path(&path);
+        assert!(result.is_err())
+    }
+
+    #[test]
+    fn test_version_from_path_without_filename() {
+        let path = Path::from("/");
+        let result = version_from_path(&path);
+        assert!(result.is_err())
+    }
+
+    #[test]
+    fn test_version_from_path_with_dir() {
+        let path = Path::from("/tmp/test/_delta_log/");
+        let result = version_from_path(&path);
+        assert!(result.is_err())
+    }
+}

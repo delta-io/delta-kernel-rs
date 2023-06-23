@@ -14,10 +14,13 @@ homepage = "https://delta.io"
 repository = "https://github.com/delta-incubator/delta-kernel-rs"
 
 [dependencies]
+futures = "*"
 tracing = "0.1" # only for structured logging
 # todo depend only on the bits we need (arrow-schema, etc.)
-arrow = { version = "^40.0", features = [ "json", "prettyprint" ]}
-parquet = "^40.0" # need to generalize over arrow, arrow2 and diff parquet etc. (BYOP)
+arrow = { version = "^42.0", features = [ "json", "prettyprint" ]}
+parquet = "^42.0" # need to generalize over arrow, arrow2 and diff parquet etc. (BYOP)
+# used for providing a storage abstraction layer
+object_store = "^0.6.0"
 bytes = "1.4" # HACK only using this since ParquetRecordBatchReaderBuilder requires ChunkRead
 
 # required to deserialize DVs
@@ -34,6 +37,7 @@ tar = "0.4.36"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 test-case = { version = "3.1.0" }
+tokio = { version = "1" }
 serde = { version = "1.0.163", features = ["derive"] }
 serde_json = { version = "1.0.96" }
 datatest-stable = { version = "0.1.3" }

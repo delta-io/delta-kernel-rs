@@ -1,36 +1,13 @@
+use deltakernel::delta_table::DeltaTable;
+use deltakernel::Version;
+use object_store::local::LocalFileSystem;
 use serde::{Deserialize, Serialize};
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
-
-use deltakernel::delta_table::DeltaTable;
-use deltakernel::storage::StorageClient;
-use deltakernel::Version;
-
-// TODO: common to dv.rs
-#[derive(Default, Debug, Clone)]
-struct LocalStorageClient {}
-
-impl StorageClient for LocalStorageClient {
-    fn list(&self, prefix: &str) -> Vec<std::path::PathBuf> {
-        let path = PathBuf::from(prefix);
-        std::fs::read_dir(path)
-            .unwrap()
-            // .crc files break this, filter them out
-            .filter_map(|entry| match entry {
-                Ok(entry) if entry.path().extension().and_then(|s| s.to_str()) != Some("crc") => {
-                    Some(entry.path())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn read(&self, path: &std::path::Path) -> Vec<u8> {
-        std::fs::read(path).unwrap()
-    }
-}
+use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Serialize, Deserialize)]
 struct TableVersionMetaData {
@@ -40,20 +17,32 @@ struct TableVersionMetaData {
     min_writer_version: u32,
 }
 
-datatest_stable::harness!(reader_test, "tests/dat/out/reader_tests/generated/", r"test_case_info\.json");
+datatest_stable::harness!(
+    reader_test,
+    "tests/dat/out/reader_tests/generated/",
+    r"test_case_info\.json"
+);
 fn reader_test(path: &Path) -> datatest_stable::Result<()> {
-    let root_dir = path.parent().unwrap().to_str().unwrap();
+    let root_dir = format!(
+        "{}/{}",
+        env!["CARGO_MANIFEST_DIR"],
+        path.parent().unwrap().to_str().unwrap()
+    );
+    let storage = Arc::new(LocalFileSystem::new_with_prefix(&root_dir)?);
     let expected_tvm_path = format!("{}/expected/latest/table_version_metadata.json", root_dir);
     let file = File::open(expected_tvm_path).expect("Oops");
     let reader = BufReader::new(file);
     let expected_tvm: TableVersionMetaData = serde_json::from_reader(reader).unwrap();
 
-    let dt_path = format!("{}/delta", root_dir);
-    let storage_client = LocalStorageClient::default();
-    let table = DeltaTable::new(&dt_path);
-    let snapshot = table.get_latest_snapshot(&storage_client);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let table = DeltaTable::new("delta");
+            let snapshot = table.get_latest_snapshot(storage.clone()).await;
 
-    assert_eq!(snapshot.version(), expected_tvm.version);
-
+            assert_eq!(snapshot.version(), expected_tvm.version);
+        });
     Ok(())
 }
