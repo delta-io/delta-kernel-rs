@@ -17,8 +17,8 @@ repository = "https://github.com/delta-incubator/delta-kernel-rs"
 futures = "*"
 tracing = "0.1" # only for structured logging
 # todo depend only on the bits we need (arrow-schema, etc.)
-arrow = { version = "^41.0", features = [ "json", "prettyprint" ]}
-parquet = "^41.0" # need to generalize over arrow, arrow2 and diff parquet etc. (BYOP)
+arrow = { version = "^42.0", features = [ "json", "prettyprint" ]}
+parquet = "^42.0" # need to generalize over arrow, arrow2 and diff parquet etc. (BYOP)
 # used for providing a storage abstraction layer
 object_store = "^0.6.0"
 bytes = "1.4" # HACK only using this since ParquetRecordBatchReaderBuilder requires ChunkRead
