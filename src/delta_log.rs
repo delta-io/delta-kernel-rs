@@ -1,19 +1,19 @@
-use crate::*;
+use std::collections::HashSet;
+use std::io::{Error, ErrorKind};
+use std::sync::Arc;
 
-use arrow::json::ReaderBuilder;
-use arrow::{
-    array::{BooleanArray, StringArray, StructArray},
-    datatypes::{Field, Fields, Schema},
-    record_batch::RecordBatch,
-};
+use arrow_array::{BooleanArray, RecordBatch, StringArray, StructArray};
+use arrow_json::ReaderBuilder;
+use arrow_schema::{DataType, Field, Fields, Schema};
+use arrow_select::filter::filter_record_batch;
 use bytes::Buf;
+use futures::future::Either;
 use futures::prelude::*;
 use object_store::path::Path;
 use object_store::ObjectStore;
 
-use std::collections::HashSet;
-use std::io::{Error, ErrorKind};
-use std::sync::Arc;
+use crate::DeltaResult;
+use crate::*;
 
 #[derive(Debug, Clone)]
 pub(crate) struct LogSegment {
@@ -28,20 +28,17 @@ impl std::ops::Deref for LogSegment {
 }
 
 impl LogSegment {
-    pub(crate) async fn from(
+    pub(crate) async fn try_new(
         location: Path,
         version: Version,
         storage: Arc<dyn ObjectStore>,
-    ) -> Self {
+    ) -> DeltaResult<Self> {
         // get log files from storage and sort them appropriately for replay (descending commits
         // first then checkpoints)
         // TODO read last checkpoint file, do a list_from, etc. to prevent reading entire log
         let delta_log_root = location.child("_delta_log");
         let mut log_files: Vec<LogFile> = vec![];
-        let mut list_stream = storage
-            .list(Some(&delta_log_root))
-            .await
-            .expect("Failed to list!");
+        let mut list_stream = storage.list(Some(&delta_log_root)).await?;
 
         while let Some(result) = list_stream.next().await {
             match result {
@@ -63,7 +60,8 @@ impl LogSegment {
         for f in &log_files {
             debug!("- {f:?}");
         }
-        LogSegment { log_files }
+
+        Ok(Self { log_files })
     }
 }
 
@@ -114,13 +112,13 @@ impl LogReplay {
     ///
     /// in the future, this can be implemented as a join for step (1) above and anti-join for step
     /// (2) when integrated with query engines that support joins.
-    pub(crate) fn replay(&mut self, actions_batch: RecordBatch) -> RecordBatch {
+    pub(crate) fn replay(&mut self, actions_batch: RecordBatch) -> DeltaResult<RecordBatch> {
         debug!("replay actions: {:?}", actions_batch);
         debug!("last seen set: {:?}", self.seen);
 
         // TODO for the internal implementation of log replay, we should implement 'ages' to reduce
         // the size of the seen set
-        let filter_vec: Vec<bool> = parse_record_batch(actions_batch.clone())
+        let filter_vec: Vec<bool> = parse_record_batch(actions_batch.clone())?
             .map(|action| match action {
                 Some(Action::AddFile(path, dv))
                     if !self.seen.contains(&(path.clone(), dv.clone())) =>
@@ -135,14 +133,16 @@ impl LogReplay {
                 None => false,
             })
             .collect();
-        arrow::compute::filter_record_batch(&actions_batch, &BooleanArray::from(filter_vec))
-            .unwrap()
+        Ok(filter_record_batch(
+            &actions_batch,
+            &BooleanArray::from(filter_vec),
+        )?)
     }
 }
 
 // TODO de-normalize checkpoint/commit files?
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum LogFile {
+pub enum LogFile {
     /// CheckpointFile is a path to parquet checkpoint file
     CheckpointFile(LogFileInfo),
     /// CommitFile is a path to json commit file
@@ -150,33 +150,32 @@ pub(crate) enum LogFile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct LogFileInfo {
+pub struct LogFileInfo {
     path: Path,
     version: Version,
 }
 
 impl LogFileInfo {
-    pub(crate) fn new(version: Version, path: Path) -> Self {
+    pub fn new(version: Version, path: Path) -> Self {
         LogFileInfo { version, path }
     }
 }
 
-/**
-* Convert the given [object_store::path::Path] into a [LogFile]
-*
-* This will error for all cases unless the provided path is a versioned commit file
-* (`00000000000000000001.json`) or (`00000000000000000001.checkpoint.parquet`).
-*
-* ```rust
-*  # use object_store::path::Path;
-*  # use deltakernel::delta_log::LogFile;
-   let path = Path::from("/tmp/test/_delta_log/00000000000000000001.checkpoint.parquet");
-   let log_file: LogFile = path.try_into().unwrap();
-* ```
-*/
 impl TryFrom<Path> for LogFile {
     type Error = object_store::Error;
 
+    /// Convert the given [object_store::path::Path] into a [LogFile]
+    ///
+    /// This will error for all cases unless the provided path is a versioned commit file
+    /// - `00000000000000000001.json`
+    /// - `00000000000000000001.checkpoint.parquet`
+    ///
+    /// ```rust
+    /// # use object_store::path::Path;
+    /// # use deltakernel::LogFile;
+    /// let path = Path::from("/tmp/test/_delta_log/00000000000000000001.checkpoint.parquet");
+    /// let log_file: LogFile = path.try_into().unwrap();
+    /// ```
     fn try_from(path: Path) -> Result<Self, Self::Error> {
         let info = LogFileInfo {
             path: path.clone(),
@@ -212,33 +211,30 @@ impl TryFrom<Path> for LogFile {
 impl LogFile {
     pub(crate) fn schema() -> Schema {
         // commits and checkpoints will be deserialized into arrow with a column per action type
-        let dv_schema = arrow::datatypes::DataType::Struct(Fields::from(vec![
-            Field::new("storageType", arrow::datatypes::DataType::Utf8, false),
-            Field::new("pathOrInlineDv", arrow::datatypes::DataType::Utf8, false),
-            Field::new("offset", arrow::datatypes::DataType::UInt64, true),
-            Field::new("sizeInBytes", arrow::datatypes::DataType::UInt64, false),
-            Field::new("cardinality", arrow::datatypes::DataType::UInt64, false),
+        let dv_schema = DataType::Struct(Fields::from(vec![
+            Field::new("storageType", DataType::Utf8, false),
+            Field::new("pathOrInlineDv", DataType::Utf8, false),
+            Field::new("offset", DataType::UInt64, true),
+            Field::new("sizeInBytes", DataType::UInt64, false),
+            Field::new("cardinality", DataType::UInt64, false),
         ]));
-        let add_schema = arrow::datatypes::DataType::Struct(Fields::from(vec![
-            Field::new("path", arrow::datatypes::DataType::Utf8, false),
-            Field::new("size", arrow::datatypes::DataType::UInt64, false),
-            Field::new("stats", arrow::datatypes::DataType::Utf8, true),
-            Field::new("dataChange", arrow::datatypes::DataType::Boolean, false),
+        let add_schema = DataType::Struct(Fields::from(vec![
+            Field::new("path", DataType::Utf8, false),
+            Field::new("size", DataType::UInt64, false),
+            Field::new("stats", DataType::Utf8, true),
+            Field::new("dataChange", DataType::Boolean, false),
             Field::new("deletionVector", dv_schema, true),
             /*
              * TODO: Missing required fields: partitionValues, modificationTime
              */
         ]));
-        let remove_schema = arrow::datatypes::DataType::Struct(Fields::from(vec![
-            Field::new("path", arrow::datatypes::DataType::Utf8, false),
-            Field::new("dataChange", arrow::datatypes::DataType::Boolean, false),
-            Field::new("size", arrow::datatypes::DataType::UInt64, true),
+        let remove_schema = DataType::Struct(Fields::from(vec![
+            Field::new("path", DataType::Utf8, false),
+            Field::new("dataChange", DataType::Boolean, false),
+            Field::new("size", DataType::UInt64, true),
         ]));
-        let metadata_schema = arrow::datatypes::DataType::Struct(Fields::from(vec![Field::new(
-            "id",
-            arrow::datatypes::DataType::Utf8,
-            false,
-        )]));
+        let metadata_schema =
+            DataType::Struct(Fields::from(vec![Field::new("id", DataType::Utf8, false)]));
 
         let add_col = Field::new("add", add_schema, true);
         let remove_col = Field::new("remove", remove_schema, true);
@@ -291,14 +287,19 @@ pub(crate) type DvId = String;
 ///
 /// This function will then emit a new stream of the parsed actions from that stream
 pub(crate) fn from_actions_batch(
-    actions_stream: impl Stream<Item = RecordBatch>,
-) -> impl Stream<Item = Option<Action>> {
+    actions_stream: impl Stream<Item = DeltaResult<RecordBatch>>,
+) -> impl Stream<Item = DeltaResult<Option<Action>>> {
     actions_stream
-        .map(|batch| stream::iter(parse_record_batch(batch).collect::<Vec<Option<Action>>>()))
-        .flat_map(|a| a)
+        .map_ok(|batch| match parse_record_batch(batch) {
+            Ok(res) => Either::Left(stream::iter(res.map(Ok))),
+            Err(err) => Either::Right(stream::once(async { Err(err) })),
+        })
+        .try_flatten()
 }
 
-pub(crate) fn parse_record_batch(actions: RecordBatch) -> impl Iterator<Item = Option<Action>> {
+pub(crate) fn parse_record_batch(
+    actions: RecordBatch,
+) -> DeltaResult<impl Iterator<Item = Option<Action>>> {
     let actions = Box::leak(Box::new(actions)); // FIXME
     let add_paths = actions
         .column(0)
@@ -335,7 +336,7 @@ pub(crate) fn parse_record_batch(actions: RecordBatch) -> impl Iterator<Item = O
         .downcast_ref::<StringArray>()
         .unwrap();
 
-    add_paths
+    Ok(add_paths
         .into_iter()
         .zip(remove_paths.into_iter())
         .zip(dvs.into_iter())
@@ -347,7 +348,7 @@ pub(crate) fn parse_record_batch(actions: RecordBatch) -> impl Iterator<Item = O
                 return Some(Action::RemoveFile(remove_path.into(), None));
             }
             None
-        })
+        }))
 }
 
 #[cfg(test)]
@@ -450,10 +451,10 @@ mod tests {
             .build(cursor)
             .unwrap();
         // `json` is an Iterable<Item=Result<RecordBatch, ArrowError>>
-        let mut stream = from_actions_batch(stream::iter(json).map(|a| a.unwrap()));
+        let mut stream = from_actions_batch(stream::iter(json).map(|a| Ok(a.unwrap()))).boxed();
         let mut total = 0;
 
-        while let Some(action) = stream.next().await {
+        while let Some(Ok(action)) = stream.next().await {
             match action {
                 Some(Action::AddFile(_path, _dv)) => total += 1,
                 _ => {}

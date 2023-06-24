@@ -87,13 +87,13 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let table = DeltaTable::new("");
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.get_latest_snapshot(storage.clone()).await;
+    let snapshot = table.get_latest_snapshot(storage.clone()).await.unwrap();
     let scan = snapshot.scan().build();
     let reader = scan.create_reader();
     let mut files = 0;
 
     let mut stream = reader
-        .with_files(storage.clone(), scan.files(storage.clone()))
+        .with_files(storage.clone(), scan.files(storage.clone()))?
         .map(|res| res.unwrap())
         .zip(stream::iter(expected_data));
 
@@ -131,13 +131,13 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let table = DeltaTable::new("");
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.get_latest_snapshot(storage.clone()).await; // .unwrap();
+    let snapshot = table.get_latest_snapshot(storage.clone()).await.unwrap();
     let scan = snapshot.scan().build();
     let reader = scan.create_reader();
     let mut files = 0;
 
     let mut stream = reader
-        .with_files(storage.clone(), scan.files(storage.clone()))
+        .with_files(storage.clone(), scan.files(storage.clone()))?
         .map(|res| res.unwrap())
         .zip(stream::iter(expected_data));
 
@@ -179,13 +179,13 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let table = DeltaTable::new("");
     let expected_data = vec![batch];
 
-    let snapshot = table.get_latest_snapshot(storage.clone()).await; // .unwrap();
+    let snapshot = table.get_latest_snapshot(storage.clone()).await.unwrap();
     let scan = snapshot.scan().build();
     let reader = scan.create_reader();
     let mut files = 0;
 
     let mut stream = reader
-        .with_files(storage.clone(), scan.files(storage.clone()))
+        .with_files(storage.clone(), scan.files(storage.clone()))?
         .map(|res| res.unwrap())
         .zip(stream::iter(expected_data));
 
@@ -233,7 +233,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     let table = DeltaTable::new("");
     let expected_data = vec![batch];
 
-    let snapshot = table.get_latest_snapshot(storage.clone()).await; //.unwrap();
+    let snapshot = table.get_latest_snapshot(storage.clone()).await.unwrap();
 
     let predicate = Expression::LessThan(
         Box::new(Expression::Column(String::from("ids"))),
@@ -244,7 +244,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     let mut files = 0;
 
     let mut stream = reader
-        .with_files(storage.clone(), scan.files(storage.clone()))
+        .with_files(storage.clone(), scan.files(storage.clone()))?
         .map(|res| res.unwrap())
         .zip(stream::iter(expected_data));
 

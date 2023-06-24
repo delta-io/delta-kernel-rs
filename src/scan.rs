@@ -1,21 +1,21 @@
-use crate::delta_log::*;
-use crate::expressions::Expression;
+use std::fmt::Debug;
+use std::pin::Pin;
+use std::sync::Arc;
 
-use arrow::record_batch::RecordBatch;
+use arrow_array::RecordBatch;
+use arrow_schema::Schema;
 use futures::prelude::*;
 use futures::stream::{BoxStream, StreamExt};
 use futures::task::{Context, Poll};
 use object_store::path::Path;
 use object_store::ObjectStore;
 
+use self::data_skipping::data_skipping_filter;
 use self::reader::DeltaReader;
-
-use std::fmt::Debug;
-use std::pin::Pin;
-use std::sync::Arc;
+use crate::expressions::Expression;
+use crate::{delta_log::*, DeltaResult};
 
 mod data_skipping;
-use data_skipping::data_skipping_filter;
 
 // the Scan type is only concerned with metadata. it produces DataFiles which must then be read
 // TODO move this up/out of scan?
@@ -27,8 +27,8 @@ mod reader;
 pub struct ScanBuilder {
     location: Path,
     log_segment: LogSegment,
-    snapshot_schema: arrow::datatypes::Schema,
-    schema: Option<arrow::datatypes::Schema>,
+    snapshot_schema: Schema,
+    schema: Option<Schema>,
     predicate: Option<Expression>,
 }
 
@@ -38,16 +38,12 @@ pub struct ScanBuilder {
 pub struct Scan {
     location: Path,
     log_segment: LogSegment,
-    schema: arrow::datatypes::Schema,
+    schema: Schema,
     predicate: Option<Expression>,
 }
 
 impl ScanBuilder {
-    pub(crate) fn new(
-        location: Path,
-        snapshot_schema: arrow::datatypes::Schema,
-        log_segment: LogSegment,
-    ) -> Self {
+    pub(crate) fn new(location: Path, snapshot_schema: Schema, log_segment: LogSegment) -> Self {
         ScanBuilder {
             location,
             snapshot_schema,
@@ -61,7 +57,7 @@ impl ScanBuilder {
     /// columns `[a, b, c]` could have a scan which reads only the first two columns by using the
     /// schema `[a, b]`
     // TODO projection: something like fn select(self, columns: &[&str])
-    pub fn with_schema(mut self, schema: arrow::datatypes::Schema) -> Self {
+    pub fn with_schema(mut self, schema: Schema) -> Self {
         self.schema = Some(schema);
         self
     }
@@ -107,7 +103,7 @@ impl<'a> Scan {
     }
 
     /// Get the schema of the scan.
-    pub fn schema(&self) -> &arrow::datatypes::Schema {
+    pub fn schema(&self) -> &Schema {
         &self.schema
     }
 
@@ -131,7 +127,7 @@ impl std::fmt::Debug for ScanFileStream<'_> {
 }
 
 impl Stream for ScanFileStream<'_> {
-    type Item = RecordBatch;
+    type Item = DeltaResult<RecordBatch>;
     fn poll_next(
         mut self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
@@ -141,13 +137,13 @@ impl Stream for ScanFileStream<'_> {
         match stream.poll_next(ctx) {
             futures::task::Poll::Ready(value) => {
                 if let Some(actions) = value {
-                    let skipped = data_skipping_filter(actions, self.predicate);
+                    let skipped = data_skipping_filter(actions, self.predicate)?;
                     futures::task::Poll::Ready(Some(self.log_replay.replay(skipped)))
                 } else {
-                    futures::task::Poll::Ready(value)
+                    futures::task::Poll::Ready(Ok(value).transpose())
                 }
             }
-            other => other,
+            _ => futures::task::Poll::Pending,
         }
     }
 }
@@ -202,7 +198,7 @@ mod tests {
         let mut scan_stream = ScanFileStream::new(&log_segment, &None, Arc::new(storage_client));
         let mut counted = 0;
 
-        while let Some(batch) = scan_stream.next().await {
+        while let Some(Ok(batch)) = scan_stream.next().await {
             let _batch: RecordBatch = batch;
             //println!("batch: {batch:?}");
             counted += 1;

@@ -15,10 +15,12 @@ async fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     );
     let storage = Arc::new(LocalFileSystem::new_with_prefix(&path)?);
     let table = DeltaTable::new("");
-    let snapshot = table.get_latest_snapshot(storage.clone()).await;
+    let snapshot = table.get_latest_snapshot(storage.clone()).await.unwrap();
     let scan = snapshot.scan().build();
     let reader = scan.create_reader();
-    let mut stream = reader.with_files(storage.clone(), scan.files(storage.clone()));
+    let mut stream = reader
+        .with_files(storage.clone(), scan.files(storage.clone()))
+        .unwrap();
 
     while let Some(batch) = stream.next().await {
         let batch = batch?;
@@ -37,11 +39,13 @@ async fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
     );
     let storage = Arc::new(LocalFileSystem::new_with_prefix(&path)?);
     let table = DeltaTable::new("");
-    let snapshot = table.get_latest_snapshot(storage.clone()).await;
+    let snapshot = table.get_latest_snapshot(storage.clone()).await.unwrap();
     let scan = snapshot.scan().build();
 
     let reader = scan.create_reader();
-    let mut stream = reader.with_files(storage.clone(), scan.files(storage.clone()));
+    let mut stream = reader
+        .with_files(storage.clone(), scan.files(storage.clone()))
+        .unwrap();
 
     while let Some(batch) = stream.next().await {
         let batch = batch?;
