@@ -32,8 +32,12 @@ pub mod scan;
 /// has schema etc.) pub mod snapshot;
 pub mod snapshot;
 
+pub mod error;
+pub use error::DeltaResult;
+
 /// delta_log module for defining schema of log files, actions, etc.
 mod delta_log;
+pub use delta_log::LogFile;
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;

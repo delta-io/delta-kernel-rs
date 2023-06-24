@@ -12,8 +12,8 @@ use object_store::ObjectStore;
 
 use self::data_skipping::data_skipping_filter;
 use self::reader::DeltaReader;
-use crate::delta_log::*;
 use crate::expressions::Expression;
+use crate::{delta_log::*, DeltaResult};
 
 mod data_skipping;
 
@@ -127,7 +127,7 @@ impl std::fmt::Debug for ScanFileStream<'_> {
 }
 
 impl Stream for ScanFileStream<'_> {
-    type Item = RecordBatch;
+    type Item = DeltaResult<RecordBatch>;
     fn poll_next(
         mut self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
@@ -137,13 +137,13 @@ impl Stream for ScanFileStream<'_> {
         match stream.poll_next(ctx) {
             futures::task::Poll::Ready(value) => {
                 if let Some(actions) = value {
-                    let skipped = data_skipping_filter(actions, self.predicate);
+                    let skipped = data_skipping_filter(actions, self.predicate)?;
                     futures::task::Poll::Ready(Some(self.log_replay.replay(skipped)))
                 } else {
-                    futures::task::Poll::Ready(value)
+                    futures::task::Poll::Ready(Ok(value).transpose())
                 }
             }
-            other => other,
+            _ => futures::task::Poll::Pending,
         }
     }
 }
@@ -198,7 +198,7 @@ mod tests {
         let mut scan_stream = ScanFileStream::new(&log_segment, &None, Arc::new(storage_client));
         let mut counted = 0;
 
-        while let Some(batch) = scan_stream.next().await {
+        while let Some(Ok(batch)) = scan_stream.next().await {
             let _batch: RecordBatch = batch;
             //println!("batch: {batch:?}");
             counted += 1;

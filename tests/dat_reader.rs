@@ -40,7 +40,7 @@ fn reader_test(path: &Path) -> datatest_stable::Result<()> {
         .unwrap()
         .block_on(async {
             let table = DeltaTable::new("delta");
-            let snapshot = table.get_latest_snapshot(storage.clone()).await;
+            let snapshot = table.get_latest_snapshot(storage.clone()).await.unwrap();
 
             assert_eq!(snapshot.version(), expected_tvm.version);
         });

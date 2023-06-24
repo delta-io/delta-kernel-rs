@@ -10,15 +10,16 @@ use arrow_select::filter::filter_record_batch;
 use arrow_select::nullif::nullif;
 use tracing::debug;
 
+use crate::error::{DeltaResult, Error};
 use crate::scan::Expression;
 
 pub(crate) fn data_skipping_filter(
     actions: RecordBatch,
     predicate: &Option<Expression>,
-) -> RecordBatch {
+) -> DeltaResult<RecordBatch> {
     let predicate = match predicate {
         Some(p) => p,
-        None => return actions,
+        None => return Ok(actions),
     };
     // debug!(
     //     "actions before data skipping:\n{}\n{}\n{}",
@@ -29,16 +30,20 @@ pub(crate) fn data_skipping_filter(
     // ); // FIXME
     let adds = actions
         .column_by_name("add")
-        .unwrap()
+        .ok_or(Error::MissingColumn("Column 'add' not found.".into()))?
         .as_any()
         .downcast_ref::<StructArray>()
-        .unwrap();
+        .ok_or(Error::UnexpectedColumnType(
+            "Expected type 'StructArray'.".into(),
+        ))?;
     let stats = adds
         .column_by_name("stats")
-        .unwrap()
+        .ok_or(Error::MissingColumn("Column 'stats' not found.".into()))?
         .as_any()
         .downcast_ref::<StringArray>()
-        .unwrap();
+        .ok_or(Error::UnexpectedColumnType(
+            "Expected type 'StringArray'.".into(),
+        ))?;
     // parse each row as json using the stats schema from data skipping filter
     // HACK see https://github.com/apache/arrow/issues/33662
     let data_fields: Vec<_> = predicate
@@ -56,24 +61,26 @@ pub(crate) fn data_skipping_filter(
     ]);
     let parsed = concat_batches(
         &stats_schema.into(),
-        stats.iter().map(hack_parse).collect::<Vec<_>>().iter(),
-    )
-    .unwrap();
+        stats
+            .iter()
+            .map(hack_parse)
+            .collect::<Result<Vec<_>, _>>()?
+            .iter(),
+    )?;
 
-    let skipping_vector = predicate.construct_metadata_filters(parsed).unwrap();
-    let skipping_vector =
-        &is_not_null(&nullif(&skipping_vector, &not(&skipping_vector).unwrap()).unwrap()).unwrap();
+    let skipping_vector = predicate.construct_metadata_filters(parsed)?;
+    let skipping_vector = &is_not_null(&nullif(&skipping_vector, &not(&skipping_vector)?)?)?;
 
     let before_count = actions.num_rows();
-    let after = filter_record_batch(&actions, skipping_vector).unwrap();
+    let after = filter_record_batch(&actions, skipping_vector)?;
     debug!(
         "number of actions before/after data skipping: {before_count} / {}",
         after.num_rows()
     );
-    after
+    Ok(after)
 }
 
-fn hack_parse(json_string: Option<&str>) -> RecordBatch {
+fn hack_parse(json_string: Option<&str>) -> DeltaResult<RecordBatch> {
     let data_fields = vec![Field::new("ids", DataType::Int32, true)];
     let stats_schema = Schema::new(vec![
         Field::new(
@@ -88,15 +95,14 @@ fn hack_parse(json_string: Option<&str>) -> RecordBatch {
         ),
     ]);
     match json_string {
-        Some(s) => ReaderBuilder::new(stats_schema.into())
-            .build(BufReader::new(s.as_bytes()))
-            .unwrap()
+        Some(s) => Ok(ReaderBuilder::new(stats_schema.into())
+            .build(BufReader::new(s.as_bytes()))?
             .collect::<Vec<_>>()
             .into_iter()
-            .map(|i| i.unwrap())
             .next()
-            .unwrap(),
-        None => RecordBatch::try_new(
+            .transpose()?
+            .ok_or(Error::MissingData("Expected data".into()))?),
+        None => Ok(RecordBatch::try_new(
             stats_schema.into(),
             vec![
                 Arc::new(new_null_array(
@@ -105,7 +111,6 @@ fn hack_parse(json_string: Option<&str>) -> RecordBatch {
                 )),
                 Arc::new(new_null_array(&DataType::Struct(data_fields.into()), 1)),
             ],
-        )
-        .unwrap(),
+        )?),
     }
 }
