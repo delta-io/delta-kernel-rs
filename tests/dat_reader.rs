@@ -1,4 +1,4 @@
-use deltakernel::delta_table::DeltaTable;
+use deltakernel::Table;
 use deltakernel::Version;
 use object_store::local::LocalFileSystem;
 use serde::{Deserialize, Serialize};
@@ -39,8 +39,11 @@ fn reader_test(path: &Path) -> datatest_stable::Result<()> {
         .build()
         .unwrap()
         .block_on(async {
-            let table = DeltaTable::new("delta");
-            let snapshot = table.get_latest_snapshot(storage.clone()).await.unwrap();
+            let table = Table::with_store(storage.clone())
+                .at("delta")
+                .build()
+                .expect("Failed to build table");
+            let snapshot = table.get_latest_snapshot().await.unwrap();
 
             assert_eq!(snapshot.version(), expected_tvm.version);
         });

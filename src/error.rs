@@ -5,6 +5,15 @@ pub enum Error {
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
 
+    #[error("Generic delta kernel error: {0}")]
+    Generic(String),
+
+    #[error("Generic error: {source}")]
+    GenericError {
+        /// Source error
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
     #[error("Arrow error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
 

@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 
 use arrow_array::{BooleanArray, RecordBatch, StringArray, StructArray};
@@ -162,7 +161,7 @@ impl LogFileInfo {
 }
 
 impl TryFrom<Path> for LogFile {
-    type Error = object_store::Error;
+    type Error = crate::Error;
 
     /// Convert the given [object_store::path::Path] into a [LogFile]
     ///
@@ -189,21 +188,13 @@ impl TryFrom<Path> for LogFile {
                 _unknown => {
                     let e = format!("Unknown extension for file: {:?}", path);
                     error!("{}", &e);
-                    let err = Error::new(ErrorKind::Other, e);
-                    Err(object_store::Error::Generic {
-                        store: "invalid",
-                        source: Box::new(err),
-                    })
+                    Err(crate::Error::Generic(e))
                 }
             }
         } else {
             let e = format!("Missing extension for file: {:?}", path);
             error!("{}", &e);
-            let err = Error::new(ErrorKind::Other, e);
-            Err(object_store::Error::Generic {
-                store: "invalid",
-                source: Box::new(err),
-            })
+            Err(crate::Error::Generic(e))
         }
     }
 }
@@ -425,14 +416,14 @@ mod tests {
     #[test]
     fn test_logfile_tryfrom_path_with_invalid_file_ext() {
         let path = Path::from("/tmp/test/_delta_log/00000000000000000001.checkpoint.png");
-        let result: Result<LogFile, object_store::Error> = path.try_into();
+        let result: Result<LogFile, crate::Error> = path.try_into();
         assert!(result.is_err());
     }
 
     #[test]
     fn test_logfile_tryfrom_path_with_absent_ext() {
         let path = Path::from("/tmp/test/_delta_log/00000000000000000001");
-        let result: Result<LogFile, object_store::Error> = path.try_into();
+        let result: Result<LogFile, crate::Error> = path.try_into();
         assert!(result.is_err());
     }
 

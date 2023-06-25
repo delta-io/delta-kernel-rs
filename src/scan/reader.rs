@@ -47,7 +47,7 @@ impl DeltaReader {
                     }
                 })
                 .then(|a| a)
-                .map_ok(|a| stream::iter(a))
+                .map_ok(stream::iter)
                 .try_flatten(),
         ))
     }
