@@ -163,7 +163,7 @@ mod tests {
     }
 
     #[test]
-    fn build_invalid_table_withoout_store() {
+    fn build_invalid_table_without_store() {
         let result = TableBuilder::default().build();
         assert!(result.is_err());
     }
