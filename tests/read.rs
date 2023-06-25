@@ -1,8 +1,8 @@
 use arrow::array::{ArrayRef, Int32Array, StringArray};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
-use deltakernel::delta_table::DeltaTable;
 use deltakernel::expressions::Expression;
+use deltakernel::Table;
 use futures::prelude::*;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use parquet::arrow::arrow_writer::ArrowWriter;
@@ -84,10 +84,10 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         .put(&Path::from(PARQUET_FILE2), load_parquet(&batch).into())
         .await?;
 
-    let table = DeltaTable::new("");
+    let table = Table::with_store(storage.clone()).at("").build()?;
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.get_latest_snapshot(storage.clone()).await.unwrap();
+    let snapshot = table.get_latest_snapshot().await.unwrap();
     let scan = snapshot.scan().build();
     let reader = scan.create_reader();
     let mut files = 0;
@@ -128,10 +128,10 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         .put(&Path::from(PARQUET_FILE2), load_parquet(&batch).into())
         .await?;
 
-    let table = DeltaTable::new("");
+    let table = Table::with_store(storage.clone()).at("").build()?;
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.get_latest_snapshot(storage.clone()).await.unwrap();
+    let snapshot = table.get_latest_snapshot().await.unwrap();
     let scan = snapshot.scan().build();
     let reader = scan.create_reader();
     let mut files = 0;
@@ -176,10 +176,10 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         .put(&Path::from(PARQUET_FILE1), load_parquet(&batch).into())
         .await?;
 
-    let table = DeltaTable::new("");
+    let table = Table::with_store(storage.clone()).at("").build()?;
     let expected_data = vec![batch];
 
-    let snapshot = table.get_latest_snapshot(storage.clone()).await.unwrap();
+    let snapshot = table.get_latest_snapshot().await.unwrap();
     let scan = snapshot.scan().build();
     let reader = scan.create_reader();
     let mut files = 0;
@@ -230,10 +230,10 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         .put(&Path::from(PARQUET_FILE1), load_parquet(&batch).into())
         .await?;
 
-    let table = DeltaTable::new("");
+    let table = Table::with_store(storage.clone()).at("").build()?;
     let expected_data = vec![batch];
 
-    let snapshot = table.get_latest_snapshot(storage.clone()).await.unwrap();
+    let snapshot = table.get_latest_snapshot().await.unwrap();
 
     let predicate = Expression::LessThan(
         Box::new(Expression::Column(String::from("ids"))),

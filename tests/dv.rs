@@ -1,7 +1,7 @@
 //! Read a small table with/without deletion vectors.
 //! Must run at the root of the crate
 
-use deltakernel::delta_table::DeltaTable;
+use deltakernel::Table;
 use futures::prelude::*;
 use object_store::local::LocalFileSystem;
 
@@ -14,8 +14,8 @@ async fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
         env!["CARGO_MANIFEST_DIR"]
     );
     let storage = Arc::new(LocalFileSystem::new_with_prefix(&path)?);
-    let table = DeltaTable::new("");
-    let snapshot = table.get_latest_snapshot(storage.clone()).await.unwrap();
+    let table = Table::with_store(storage.clone()).at("").build()?;
+    let snapshot = table.get_latest_snapshot().await.unwrap();
     let scan = snapshot.scan().build();
     let reader = scan.create_reader();
     let mut stream = reader
@@ -38,8 +38,8 @@ async fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
         env!["CARGO_MANIFEST_DIR"]
     );
     let storage = Arc::new(LocalFileSystem::new_with_prefix(&path)?);
-    let table = DeltaTable::new("");
-    let snapshot = table.get_latest_snapshot(storage.clone()).await.unwrap();
+    let table = Table::with_store(storage.clone()).at("").build()?;
+    let snapshot = table.get_latest_snapshot().await.unwrap();
     let scan = snapshot.scan().build();
 
     let reader = scan.create_reader();

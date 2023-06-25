@@ -14,10 +14,9 @@
 use object_store::path::Path;
 use tracing::*;
 
-use std::io::{Error, ErrorKind};
-
 /// Includes top-level DeltaTable type which can construct Snapshots
-pub mod delta_table;
+pub mod table;
+pub use table::Table;
 
 /// defines a common expression language for use in data skipping predicates
 pub mod expressions;
@@ -33,7 +32,7 @@ pub mod scan;
 pub mod snapshot;
 
 pub mod error;
-pub use error::DeltaResult;
+pub use error::{DeltaResult, Error};
 
 /// delta_log module for defining schema of log files, actions, etc.
 mod delta_log;
@@ -45,15 +44,14 @@ pub type Version = u64;
 /**
  * Parse the given [object_store::path::Path] to identify a commit log version
  */
-fn version_from_path(path: &Path) -> Result<Version, object_store::Error> {
+fn version_from_path(path: &Path) -> Result<Version, Error> {
     if let Some(filename) = path.filename() {
         if let Some(part) = filename.split('.').next() {
-            return part.parse().map_err(|source: std::num::ParseIntError| {
-                object_store::Error::NotFound {
-                    path: part.to_string(),
-                    source: source.into(),
-                }
-            });
+            return part
+                .parse()
+                .map_err(|source: std::num::ParseIntError| Error::GenericError {
+                    source: Box::new(source),
+                });
         }
         Ok(0)
     } else {
@@ -62,11 +60,7 @@ fn version_from_path(path: &Path) -> Result<Version, object_store::Error> {
             path
         );
         error!("{}", &e);
-        let err = Error::new(ErrorKind::Other, e);
-        Err(object_store::Error::Generic {
-            store: "invalid",
-            source: Box::new(err),
-        })
+        Err(Error::Generic(e))
     }
 }
 
