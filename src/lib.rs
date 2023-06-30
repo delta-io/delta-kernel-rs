@@ -17,9 +17,12 @@ use tracing::*;
 /// Includes top-level DeltaTable type which can construct Snapshots
 pub mod table;
 pub use table::Table;
+pub mod client;
+pub use client::*;
 
 /// defines a common expression language for use in data skipping predicates
 pub mod expressions;
+pub use expressions::Expression;
 
 /// generic parquet interface
 pub mod parquet_reader;
