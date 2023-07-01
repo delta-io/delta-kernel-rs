@@ -19,6 +19,7 @@ pub mod table;
 pub use table::Table;
 pub mod client;
 pub use client::*;
+pub mod actions;
 
 /// defines a common expression language for use in data skipping predicates
 pub mod expressions;

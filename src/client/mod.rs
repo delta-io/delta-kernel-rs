@@ -41,6 +41,8 @@ use crate::{DeltaResult, Expression};
 #[cfg(feature = "default-client")]
 pub mod filesystem;
 #[cfg(feature = "default-client")]
+pub mod json;
+#[cfg(feature = "default-client")]
 pub mod table;
 
 pub type FileSlice = (Url, Range<usize>);

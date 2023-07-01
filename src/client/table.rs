@@ -1,15 +1,18 @@
 use std::sync::Arc;
 
-use object_store::{parse_url_opts, ObjectMeta};
+use object_store::{parse_url_opts, DynObjectStore, ObjectMeta};
 use url::Url;
 
 use super::filesystem::ObjectStoreFileSystemClient;
+use super::json::{DefaultJsonHandler, JsonReadContext};
 use super::{ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler, TableClient};
 use crate::DeltaResult;
 
 #[derive(Debug)]
 pub struct DefaultTableClient {
+    store: Arc<DynObjectStore>,
     file_system: Arc<ObjectStoreFileSystemClient>,
+    json: Arc<DefaultJsonHandler>,
 }
 
 impl DefaultTableClient {
@@ -21,15 +24,25 @@ impl DefaultTableClient {
         V: Into<String>,
     {
         let (store, prefix) = parse_url_opts(path.as_ref(), options)?;
-        let client = ObjectStoreFileSystemClient::new(Arc::new(store), prefix);
+        let store = Arc::new(store);
+        let file_system = Arc::new(ObjectStoreFileSystemClient::new(store.clone(), prefix));
+        let json = Arc::new(DefaultJsonHandler::new(store.clone()));
         Ok(Self {
-            file_system: Arc::new(client),
+            store,
+            file_system,
+            json,
         })
     }
 }
 
+impl DefaultTableClient {
+    pub fn get_object_store_for_url(&self, _url: &Url) -> Option<Arc<DynObjectStore>> {
+        Some(self.store.clone())
+    }
+}
+
 impl TableClient for DefaultTableClient {
-    type JsonReadContext = ObjectMeta;
+    type JsonReadContext = JsonReadContext;
     type ParquetReadContext = ObjectMeta;
 
     fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler> {
@@ -41,7 +54,7 @@ impl TableClient for DefaultTableClient {
     }
 
     fn get_json_handler(&self) -> Arc<dyn JsonHandler<FileReadContext = Self::JsonReadContext>> {
-        todo!()
+        self.json.clone()
     }
 
     fn get_parquet_handler(
