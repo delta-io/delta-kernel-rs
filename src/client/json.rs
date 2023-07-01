@@ -80,10 +80,11 @@ impl JsonHandler for DefaultJsonHandler {
 
     async fn read_json_files(
         &self,
-        files: Vec<<Self as FileHandler>::FileReadContext>,
+        files: Vec<JsonReadContext>,
         physical_schema: SchemaRef,
     ) -> DeltaResult<Vec<FileDataReadResult>> {
         let mut results = Vec::new();
+        // TODO run on threads
         for context in files {
             let raw = context.store.get(&context.path).await?.bytes().await?;
             let data = ReaderBuilder::new(physical_schema.clone())
@@ -127,13 +128,14 @@ mod tests {
     async fn test_read_json_files() {
         let store = Arc::new(LocalFileSystem::new());
 
-        let path =
-            PathBuf::from("./tests/data/table-with-dv-small/_delta_log/00000000000000000000.json");
-        let path = std::fs::canonicalize(path).unwrap();
-
+        let path = std::fs::canonicalize(PathBuf::from(
+            "./tests/data/table-with-dv-small/_delta_log/00000000000000000000.json",
+        ))
+        .unwrap();
         let url = url::Url::from_file_path(path).unwrap();
         let location = Path::from(url.path());
         let meta = store.head(&location).await.unwrap();
+
         let files = vec![FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp(),
