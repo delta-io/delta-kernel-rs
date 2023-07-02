@@ -1,0 +1,165 @@
+use std::sync::Arc;
+
+use arrow_schema::{
+    ArrowError, DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
+};
+use lazy_static::lazy_static;
+use regex::Regex;
+
+use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
+
+lazy_static! {
+    static ref DECIMAL_REGEX: Regex = Regex::new(r"\((\d{1,2}),(\d{1,2})\)").unwrap();
+}
+
+impl TryFrom<&StructType> for ArrowSchema {
+    type Error = ArrowError;
+
+    fn try_from(s: &StructType) -> Result<Self, ArrowError> {
+        let fields = s
+            .fields()
+            .iter()
+            .map(|f| <ArrowField as TryFrom<&StructField>>::try_from(*f))
+            .collect::<Result<Vec<ArrowField>, ArrowError>>()?;
+
+        Ok(ArrowSchema::new(fields))
+    }
+}
+
+impl TryFrom<&StructField> for ArrowField {
+    type Error = ArrowError;
+
+    fn try_from(f: &StructField) -> Result<Self, ArrowError> {
+        let metadata = f
+            .metadata()
+            .iter()
+            .map(|(key, val)| Ok((key.clone(), serde_json::to_string(val)?)))
+            .collect::<Result<_, serde_json::Error>>()
+            .map_err(|err| ArrowError::JsonError(err.to_string()))?;
+
+        let field = ArrowField::new(
+            f.name(),
+            ArrowDataType::try_from(f.data_type())?,
+            f.is_nullable(),
+        )
+        .with_metadata(metadata);
+
+        Ok(field)
+    }
+}
+
+impl TryFrom<&ArrayType> for ArrowField {
+    type Error = ArrowError;
+
+    fn try_from(a: &ArrayType) -> Result<Self, ArrowError> {
+        Ok(ArrowField::new(
+            "item",
+            ArrowDataType::try_from(a.element_type())?,
+            a.contains_null(),
+        ))
+    }
+}
+
+impl TryFrom<&MapType> for ArrowField {
+    type Error = ArrowError;
+
+    fn try_from(a: &MapType) -> Result<Self, ArrowError> {
+        Ok(ArrowField::new(
+            "entries",
+            ArrowDataType::Struct(
+                vec![
+                    ArrowField::new("key", ArrowDataType::try_from(a.key_type())?, false),
+                    ArrowField::new(
+                        "value",
+                        ArrowDataType::try_from(a.value_type())?,
+                        a.value_contains_null(),
+                    ),
+                ]
+                .into(),
+            ),
+            false, // always non-null
+        ))
+    }
+}
+
+impl TryFrom<&DataType> for ArrowDataType {
+    type Error = ArrowError;
+
+    fn try_from(t: &DataType) -> Result<Self, ArrowError> {
+        match t {
+            DataType::Primitive(p) => {
+                match p {
+                    PrimitiveType::String => Ok(ArrowDataType::Utf8),
+                    PrimitiveType::Long => Ok(ArrowDataType::Int64), // undocumented type
+                    PrimitiveType::Integer => Ok(ArrowDataType::Int32),
+                    PrimitiveType::Short => Ok(ArrowDataType::Int16),
+                    PrimitiveType::Byte => Ok(ArrowDataType::Int8),
+                    PrimitiveType::Float => Ok(ArrowDataType::Float32),
+                    PrimitiveType::Double => Ok(ArrowDataType::Float64),
+                    PrimitiveType::Boolean => Ok(ArrowDataType::Boolean),
+                    PrimitiveType::Binary => Ok(ArrowDataType::Binary),
+                    PrimitiveType::Deciaml(decimal) if DECIMAL_REGEX.is_match(decimal) => {
+                        let extract = DECIMAL_REGEX.captures(decimal).ok_or_else(|| {
+                            ArrowError::SchemaError(format!(
+                                "Invalid decimal type for Arrow: {decimal}"
+                            ))
+                        })?;
+                        let precision = extract.get(1).and_then(|v| v.as_str().parse::<u8>().ok());
+                        let scale = extract.get(2).and_then(|v| v.as_str().parse::<i8>().ok());
+                        match (precision, scale) {
+                            // TODO how do we decide which variant (128 / 256) to use?
+                            (Some(p), Some(s)) => Ok(ArrowDataType::Decimal128(p, s)),
+                            _ => Err(ArrowError::SchemaError(format!(
+                                "Invalid precision or scale decimal type for Arrow: {decimal}"
+                            ))),
+                        }
+                    }
+                    PrimitiveType::Date => {
+                        // A calendar date, represented as a year-month-day triple without a
+                        // timezone. Stored as 4 bytes integer representing days sinece 1970-01-01
+                        Ok(ArrowDataType::Date32)
+                    }
+                    PrimitiveType::Timestamp => {
+                        // Issue: https://github.com/delta-io/delta/issues/643
+                        Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
+                    }
+                    s => Err(ArrowError::SchemaError(format!(
+                        "Invalid data type for Arrow: {s:?}"
+                    ))),
+                }
+            }
+            DataType::Struct(s) => Ok(ArrowDataType::Struct(
+                s.fields()
+                    .iter()
+                    .map(|f| <ArrowField as TryFrom<&StructField>>::try_from(*f))
+                    .collect::<Result<Vec<ArrowField>, ArrowError>>()?
+                    .into(),
+            )),
+            DataType::Array(a) => Ok(ArrowDataType::List(Arc::new(<ArrowField as TryFrom<
+                &ArrayType,
+            >>::try_from(a)?))),
+            DataType::Map(m) => Ok(ArrowDataType::Map(
+                Arc::new(ArrowField::new(
+                    "entries",
+                    ArrowDataType::Struct(
+                        vec![
+                            ArrowField::new(
+                                "keys",
+                                <ArrowDataType as TryFrom<&DataType>>::try_from(m.key_type())?,
+                                false,
+                            ),
+                            ArrowField::new(
+                                "values",
+                                <ArrowDataType as TryFrom<&DataType>>::try_from(m.value_type())?,
+                                m.value_contains_null(),
+                            ),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                )),
+                false,
+            )),
+        }
+    }
+}

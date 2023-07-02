@@ -54,6 +54,7 @@ pub mod expressions;
 pub mod parquet_reader;
 pub mod path;
 pub mod scan;
+pub mod schema;
 pub mod snapshot;
 pub mod table;
 
@@ -71,7 +72,7 @@ pub use client::*;
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
 
-pub type FileSlice = (Url, Range<usize>);
+pub type FileSlice = (Url, Option<Range<usize>>);
 
 /// Data read from a Delta table file and the corresponding scan file information.
 pub type FileDataReadResult = (FileMeta, RecordBatch);

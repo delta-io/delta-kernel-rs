@@ -16,7 +16,7 @@ lazy_static! {
 }
 
 #[derive(Debug)]
-pub(crate) struct LogPath<'a>(pub &'a Url);
+pub(crate) struct LogPath<'a>(pub(crate) &'a Url);
 
 impl<'a> LogPath<'a> {
     pub(crate) fn child(&self, path: impl AsRef<str>) -> DeltaResult<Url> {

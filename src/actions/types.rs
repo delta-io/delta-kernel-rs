@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Format {
     /// Name of the encoding for files in this table
     pub provider: String,
@@ -17,7 +17,7 @@ impl Default for Format {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Metadata {
     /// Unique identifier for this table
     pub id: String,
@@ -37,7 +37,7 @@ pub struct Metadata {
     pub configuration: HashMap<String, String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Protocol {
     /// The minimum version of the Delta read protocol that a client must implement
     /// in order to correctly read this table
