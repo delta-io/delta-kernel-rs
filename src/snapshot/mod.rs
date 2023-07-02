@@ -1,12 +1,18 @@
+//! In-memory representation of snapshots of tables (snapshot is a table at given point in time, it
+//! has schema etc.)
+//!
+
 use std::sync::Arc;
 
 use arrow_schema::Schema;
 use object_store::path::Path;
 use object_store::ObjectStore;
 
-use crate::delta_log::LogSegment;
+use self::replay::LogSegment;
 use crate::scan::ScanBuilder;
 use crate::{DeltaResult, Version};
+
+pub(crate) mod replay;
 
 /// In-memory representation of a specific snapshot of a Delta table. While a `DeltaTable` exists
 /// throughout time, `Snapshot`s represent a view of a table at a specific point in time; they

@@ -6,8 +6,7 @@ use object_store::path::Path;
 use object_store::DynObjectStore;
 use url::Url;
 
-use super::{FileMeta, FileSlice, FileSystemClient};
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, Error, FileMeta, FileSlice, FileSystemClient};
 
 #[derive(Debug)]
 pub struct ObjectStoreFileSystemClient {

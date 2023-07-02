@@ -8,10 +8,10 @@ use object_store::path::Path;
 use object_store::ObjectStore;
 use tracing::debug;
 
-use crate::delta_log::{from_actions_batch, Action, DataFile};
 use crate::error::{DeltaResult, Error};
 use crate::parquet_reader::arrow_parquet_reader::ArrowParquetReader;
 use crate::parquet_reader::ParquetReader;
+use crate::snapshot::replay::{from_actions_batch, Action, DataFile};
 
 #[derive(Debug)]
 pub struct DeltaReader {

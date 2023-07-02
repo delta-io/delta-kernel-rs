@@ -13,7 +13,7 @@ use object_store::ObjectStore;
 use self::data_skipping::data_skipping_filter;
 use self::reader::DeltaReader;
 use crate::expressions::Expression;
-use crate::{delta_log::*, DeltaResult};
+use crate::{snapshot::replay::*, DeltaResult};
 
 mod data_skipping;
 

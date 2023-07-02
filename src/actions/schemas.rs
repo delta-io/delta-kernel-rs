@@ -2,26 +2,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Fields, Schema};
 
-#[derive(Debug)]
-pub enum ActionType {
-    /// modify the data in a table by adding individual logical files
-    Add,
-    /// add a file containing only the data that was changed as part of the transaction
-    Cdc,
-    /// additional provenance information about what higher-level operation was being performed
-    CommitInfo,
-    /// contains a configuration (string-string map) for a named metadata domain
-    DomainMetadata,
-    /// changes the current metadata of the table
-    Metadata,
-    /// increase the version of the Delta protocol that is required to read or write a given table
-    Protocol,
-    /// modify the data in a table by removing individual logical files
-    Remove,
-    /// The Row ID high-water mark tracks the largest ID that has been assigned to a row in the table.
-    RowIdHighWaterMark,
-    Txn,
-}
+use super::ActionType;
 
 impl ActionType {
     pub fn field(&self) -> Field {
@@ -147,7 +128,7 @@ fn remove_fields() -> Vec<Field> {
 
 fn metadata_fields() -> Vec<Field> {
     Vec::from_iter([
-        Field::new("id", DataType::Utf8, true),
+        Field::new("id", DataType::Utf8, false),
         Field::new("name", DataType::Utf8, true),
         Field::new("description", DataType::Utf8, true),
         Field::new(
@@ -170,14 +151,14 @@ fn metadata_fields() -> Vec<Field> {
                     false,
                 ),
             ])),
-            true,
+            false,
         ),
-        Field::new("schemaString", DataType::Utf8, true),
+        Field::new("schemaString", DataType::Utf8, false),
         Field::new("createdTime", DataType::Int64, true),
         Field::new(
             "partitionColumns",
-            DataType::List(Arc::new(Field::new("element", DataType::Utf8, true))),
-            true,
+            DataType::List(Arc::new(Field::new("element", DataType::Utf8, false))),
+            false,
         ),
         Field::new(
             "configuration",
@@ -199,16 +180,16 @@ fn metadata_fields() -> Vec<Field> {
 
 fn protocol_fields() -> Vec<Field> {
     Vec::from_iter([
-        Field::new("minReaderVersion", DataType::Int32, true),
-        Field::new("minWriterVersion", DataType::Int32, true),
+        Field::new("minReaderVersion", DataType::Int32, false),
+        Field::new("minWriterVersion", DataType::Int32, false),
         Field::new(
             "readerFeatures",
-            DataType::List(Arc::new(Field::new("element", DataType::Utf8, true))),
+            DataType::List(Arc::new(Field::new("element", DataType::Utf8, false))),
             true,
         ),
         Field::new(
             "writerFeatures",
-            DataType::List(Arc::new(Field::new("element", DataType::Utf8, true))),
+            DataType::List(Arc::new(Field::new("element", DataType::Utf8, false))),
             true,
         ),
     ])

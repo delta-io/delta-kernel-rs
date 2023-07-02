@@ -10,8 +10,7 @@ use arrow_select::concat::concat_batches;
 use object_store::path::Path;
 use object_store::DynObjectStore;
 
-use super::{FileDataReadResult, FileHandler, FileMeta, JsonHandler};
-use crate::{DeltaResult, Expression};
+use crate::{DeltaResult, Expression, FileDataReadResult, FileHandler, FileMeta, JsonHandler};
 
 #[derive(Debug)]
 pub struct JsonReadContext {

@@ -11,8 +11,7 @@ use object_store::path::Path;
 use object_store::{DynObjectStore, ObjectMeta};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 
-use super::{FileDataReadResult, FileHandler, FileMeta, ParquetHandler};
-use crate::{DeltaResult, Expression};
+use crate::{DeltaResult, Expression, FileDataReadResult, FileHandler, FileMeta, ParquetHandler};
 
 #[derive(Debug)]
 pub struct ParquetReadContext {
