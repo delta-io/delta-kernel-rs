@@ -10,6 +10,7 @@ use futures::future::Either;
 use futures::prelude::*;
 use object_store::path::Path;
 use object_store::ObjectStore;
+use tracing::debug;
 
 use crate::DeltaResult;
 use crate::*;

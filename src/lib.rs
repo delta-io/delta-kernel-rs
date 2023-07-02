@@ -12,7 +12,7 @@
 )]
 
 use object_store::path::Path;
-use tracing::*;
+use tracing::error;
 
 /// Includes top-level DeltaTable type which can construct Snapshots
 pub mod table;
@@ -20,6 +20,7 @@ pub use table::Table;
 pub mod client;
 pub use client::*;
 pub mod actions;
+pub mod path;
 
 /// defines a common expression language for use in data skipping predicates
 pub mod expressions;

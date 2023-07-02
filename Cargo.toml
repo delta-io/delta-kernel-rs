@@ -24,10 +24,12 @@ async-trait = "0.1"
 bytes = "1.4"
 chrono = { version = "0.4", optional = true }
 futures = "0.3"
+lazy_static = "1.4"
 # used for providing a storage abstraction layer
 object_store = "^0.6.0"
 # need to generalize over arrow, arrow2 and diff parquet etc. (BYOP)
 parquet = "^42.0"
+regex = "1.8"
 roaring = "0.10.1"
 thiserror = "1"
 # only for structured logging

@@ -34,4 +34,7 @@ pub enum Error {
 
     #[error("Deleteion Vecor error: {0}")]
     DeletionVector(String),
+
+    #[error("Invalid url: {0}")]
+    InvalidUrl(#[from] url::ParseError),
 }
