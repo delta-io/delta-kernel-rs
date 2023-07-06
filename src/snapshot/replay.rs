@@ -439,7 +439,7 @@ mod tests {
 
         let schema = LogFile::schema();
 
-        let json = arrow::json::ReaderBuilder::new(schema.into())
+        let json = arrow_json::ReaderBuilder::new(schema.into())
             .build(cursor)
             .unwrap();
         // `json` is an Iterable<Item=Result<RecordBatch, ArrowError>>

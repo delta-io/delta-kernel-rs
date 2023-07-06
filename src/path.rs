@@ -64,11 +64,15 @@ impl<'a> LogPath<'a> {
             .unwrap_or(false)
     }
 
-    /// Parse the version number assuming a commit json file
+    /// Parse the version number assuming a commit json or checkpoint parquet file
     pub(crate) fn commit_version(&self) -> Option<Version> {
         self.filename()
             .and_then(|f| f.split_once('.'))
             .and_then(|(name, _)| name.parse().ok())
+    }
+
+    fn is_log_root(&self) -> bool {
+        self.path().ends_with("_delta_log/")
     }
 }
 

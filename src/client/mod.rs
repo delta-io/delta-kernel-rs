@@ -12,6 +12,7 @@ use crate::{
     DeltaResult, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler, TableClient,
 };
 
+pub mod arrow;
 pub mod filesystem;
 pub mod json;
 pub mod parquet;
@@ -25,14 +26,14 @@ pub struct DefaultTableClient {
 }
 
 impl DefaultTableClient {
-    /// Create a new [`DefaultTableClient`] instnance
-    pub fn try_new<I, K, V>(path: impl AsRef<Url>, options: I) -> DeltaResult<Self>
+    /// Create a new [`DefaultTableClient`] instance
+    pub fn try_new<I, K, V>(path: &Url, options: I) -> DeltaResult<Self>
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str>,
         V: Into<String>,
     {
-        let (store, prefix) = parse_url_opts(path.as_ref(), options)?;
+        let (store, prefix) = parse_url_opts(path, options)?;
         let store = Arc::new(store);
         Ok(Self {
             file_system: Arc::new(ObjectStoreFileSystemClient::new(store.clone(), prefix)),

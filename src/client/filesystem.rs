@@ -50,7 +50,11 @@ impl FileSystemClient for ObjectStoreFileSystemClient {
         let mut bytes = Vec::new();
         for (url, range) in files {
             let path = Path::from(url.path());
-            let data = self.inner.get_range(&path, range).await?;
+            let data = if let Some(rng) = range {
+                self.inner.get_range(&path, rng).await?
+            } else {
+                self.inner.get(&path).await?.bytes().await?
+            };
             bytes.push(data);
         }
         Ok(bytes)
@@ -115,11 +119,11 @@ mod tests {
 
         let mut url1 = url.clone();
         url1.set_path(&format!("{}/b", url.path()));
-        slices.push((url1.clone(), Range { start: 0, end: 6 }));
-        slices.push((url1, Range { start: 7, end: 11 }));
+        slices.push((url1.clone(), Some(Range { start: 0, end: 6 })));
+        slices.push((url1, Some(Range { start: 7, end: 11 })));
 
         url.set_path(&format!("{}/c", url.path()));
-        slices.push((url, Range { start: 4, end: 9 }));
+        slices.push((url, Some(Range { start: 4, end: 9 })));
 
         let data = client.read_files(slices).await.unwrap();
 
