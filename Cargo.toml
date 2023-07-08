@@ -20,8 +20,9 @@ arrow-json = { version = "^42.0" }
 arrow-ord = { version = "^42.0" }
 arrow-schema = { version = "^42.0" }
 arrow-select = { version = "^42.0" }
+async-trait = "0.1"
 bytes = "1.4"
-futures = "*"
+futures = "0.3"
 # used for providing a storage abstraction layer
 object_store = "^0.6.0"
 # need to generalize over arrow, arrow2 and diff parquet etc. (BYOP)
@@ -30,8 +31,13 @@ roaring = "0.10.1"
 thiserror = "1"
 # only for structured logging
 tracing = "0.1"
+url = "2"
 uuid = "1.3.0"
 z85 = "3.0.5"
+
+[features]
+default = ["default-client"]
+default-client = []
 
 [build-dependencies]
 ureq = "2.2.0"
@@ -40,16 +46,17 @@ tar = "0.4.36"
 
 [dev-dependencies]
 arrow = { version = "^42.0", features = ["json", "prettyprint"] }
+datatest-stable = { version = "0.1.3" }
+serde = { version = "1.0.163", features = ["derive"] }
+serde_json = { version = "1.0.96" }
+test-log = { version = "0.2", default-features = false, features = ["trace"] }
+tempfile = "3"
+test-case = { version = "3.1.0" }
+tokio = { version = "1" }
 tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "fmt",
 ] }
-test-log = { version = "0.2", default-features = false, features = ["trace"] }
-test-case = { version = "3.1.0" }
-tokio = { version = "1" }
-serde = { version = "1.0.163", features = ["derive"] }
-serde_json = { version = "1.0.96" }
-datatest-stable = { version = "0.1.3" }
 
 [[test]]
 name = "dat_reader"
