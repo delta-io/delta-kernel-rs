@@ -13,6 +13,7 @@ use crate::{
 };
 
 pub mod arrow;
+pub mod file_handler;
 pub mod filesystem;
 pub mod json;
 pub mod parquet;

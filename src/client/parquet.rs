@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_schema::SchemaRef;
+use arrow_schema::SchemaRef as ArrowSchemaRef;
 use arrow_select::concat::concat_batches;
 use chrono::{TimeZone, Utc};
 use futures::stream::TryStreamExt;
@@ -11,7 +11,11 @@ use object_store::path::Path;
 use object_store::{DynObjectStore, ObjectMeta};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 
-use crate::{DeltaResult, Expression, FileDataReadResult, FileHandler, FileMeta, ParquetHandler};
+use crate::schema::SchemaRef;
+use crate::{
+    DeltaResult, Expression, FileDataReadResult, FileDataReadResultStream, FileHandler, FileMeta,
+    ParquetHandler,
+};
 
 #[derive(Debug)]
 pub struct ParquetReadContext {
@@ -61,7 +65,7 @@ impl ParquetHandler for DefaultParquetHandler {
     async fn read_parquet_files(
         &self,
         files: Vec<ParquetReadContext>,
-        _physical_schema: SchemaRef,
+        _physical_schema: ArrowSchemaRef,
     ) -> DeltaResult<Vec<FileDataReadResult>> {
         let mut results = Vec::new();
         // TODO run on threads
@@ -81,6 +85,14 @@ impl ParquetHandler for DefaultParquetHandler {
             results.push((context.meta, batch));
         }
         Ok(results)
+    }
+
+    fn read_parquet_files_stream(
+        &self,
+        _files: Vec<<Self as FileHandler>::FileReadContext>,
+        _physical_schema: SchemaRef,
+    ) -> DeltaResult<FileDataReadResultStream> {
+        todo!()
     }
 }
 

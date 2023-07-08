@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 pub type Schema = StructType;
+pub type SchemaRef = Arc<StructType>;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 #[serde(untagged)]
 pub enum MetadataValue {
     Number(i32),
@@ -38,7 +40,7 @@ impl AsRef<str> for ColumnMetadataKey {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct StructField {
     /// Name of this (possibly nested) column
     pub name: String,
@@ -100,7 +102,7 @@ impl StructField {
 
 /// A struct is used to represent both the top-level schema of the table
 /// as well as struct columns that contain nested columns.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct StructType {
     #[serde(rename = "type")]
     pub type_name: String,
@@ -121,7 +123,7 @@ impl StructType {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ArrayType {
     #[serde(rename = "type")]
@@ -152,7 +154,7 @@ impl ArrayType {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct MapType {
     #[serde(rename = "type")]
@@ -196,7 +198,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 #[serde(rename_all = "camelCase")]
 pub enum PrimitiveType {
     /// UTF-8 encoded string of characters
@@ -220,7 +222,7 @@ pub enum PrimitiveType {
     Deciaml(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 #[serde(untagged, rename_all = "camelCase")]
 pub enum DataType {
     /// UTF-8 encoded string of characters

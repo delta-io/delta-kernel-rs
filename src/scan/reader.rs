@@ -11,7 +11,7 @@ use tracing::debug;
 use crate::error::{DeltaResult, Error};
 use crate::parquet_reader::arrow_parquet_reader::ArrowParquetReader;
 use crate::parquet_reader::ParquetReader;
-use crate::snapshot::replay::{from_actions_batch, Action, DataFile};
+use crate::snapshot::replay::{from_actions_batch, DataFile, FileAction};
 
 #[derive(Debug)]
 pub struct DeltaReader {
@@ -28,9 +28,7 @@ impl DeltaReader {
         &self,
         storage: Arc<dyn ObjectStore>,
         files_stream: impl Stream<Item = DeltaResult<RecordBatch>> + std::marker::Unpin,
-        /*
-         * Unpin because of the async closure here: https://stackoverflow.com/a/61222654
-         */
+        // Unpin because of the async closure here: https://stackoverflow.com/a/61222654
     ) -> DeltaResult<impl Stream<Item = DeltaResult<RecordBatch>> + std::marker::Unpin> {
         // XXX: parquet should be provided by the caller
         let location = self.location.clone();
@@ -39,7 +37,7 @@ impl DeltaReader {
                 .map(move |action| (action, location.clone(), storage.clone()))
                 .map(|(action, location, storage)| async move {
                     match action {
-                        Ok(Some(Action::AddFile(path, dv))) => {
+                        Ok(Some(FileAction::AddFile(path, dv))) => {
                             let parquet = ArrowParquetReader::default();
                             read(DataFile::new(path, dv), location, storage, parquet).await
                         }

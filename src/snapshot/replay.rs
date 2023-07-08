@@ -120,13 +120,13 @@ impl LogReplay {
         // the size of the seen set
         let filter_vec: Vec<bool> = parse_record_batch(actions_batch.clone())?
             .map(|action| match action {
-                Some(Action::AddFile(path, dv))
+                Some(FileAction::AddFile(path, dv))
                     if !self.seen.contains(&(path.clone(), dv.clone())) =>
                 {
                     self.seen.insert((path, dv));
                     true
                 }
-                Some(Action::RemoveFile(path, dv)) | Some(Action::AddFile(path, dv)) => {
+                Some(FileAction::RemoveFile(path, dv)) | Some(FileAction::AddFile(path, dv)) => {
                     self.seen.insert((path, dv));
                     false
                 }
@@ -268,7 +268,7 @@ impl LogFile {
 }
 
 #[derive(Debug)]
-pub(crate) enum Action {
+pub(crate) enum FileAction {
     AddFile(Path, Option<DvId>),
     RemoveFile(Path, Option<DvId>),
 }
@@ -280,7 +280,7 @@ pub(crate) type DvId = String;
 /// This function will then emit a new stream of the parsed actions from that stream
 pub(crate) fn from_actions_batch(
     actions_stream: impl Stream<Item = DeltaResult<RecordBatch>>,
-) -> impl Stream<Item = DeltaResult<Option<Action>>> {
+) -> impl Stream<Item = DeltaResult<Option<FileAction>>> {
     actions_stream
         .map_ok(|batch| match parse_record_batch(batch) {
             Ok(res) => Either::Left(stream::iter(res.map(Ok))),
@@ -291,7 +291,7 @@ pub(crate) fn from_actions_batch(
 
 pub(crate) fn parse_record_batch(
     actions: RecordBatch,
-) -> DeltaResult<impl Iterator<Item = Option<Action>>> {
+) -> DeltaResult<impl Iterator<Item = Option<FileAction>>> {
     let actions = Box::leak(Box::new(actions)); // FIXME
     let add_paths = actions
         .column(0)
@@ -334,10 +334,13 @@ pub(crate) fn parse_record_batch(
         .zip(dvs.into_iter())
         .map(|((add, remove), dv)| {
             if let Some(add_path) = add {
-                return Some(Action::AddFile(add_path.into(), dv.map(|s| s.to_owned())));
+                return Some(FileAction::AddFile(
+                    add_path.into(),
+                    dv.map(|s| s.to_owned()),
+                ));
             }
             if let Some(remove_path) = remove {
-                return Some(Action::RemoveFile(remove_path.into(), None));
+                return Some(FileAction::RemoveFile(remove_path.into(), None));
             }
             None
         }))
@@ -448,7 +451,7 @@ mod tests {
 
         while let Some(Ok(action)) = stream.next().await {
             match action {
-                Some(Action::AddFile(_path, _dv)) => total += 1,
+                Some(FileAction::AddFile(_path, _dv)) => total += 1,
                 _ => {}
             }
         }

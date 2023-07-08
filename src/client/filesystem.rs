@@ -28,9 +28,11 @@ impl FileSystemClient for ObjectStoreFileSystemClient {
     async fn list_from(&self, path: &Url) -> DeltaResult<BoxStream<'_, DeltaResult<FileMeta>>> {
         let url = path.clone();
         let offset = Path::from(path.path());
+        // TODO properly handle table prefix
+        let prefix = self.prefix.child("_delta_log");
         Ok(self
             .inner
-            .list_with_offset(Some(&self.prefix), &offset)
+            .list_with_offset(Some(&prefix), &offset)
             .await?
             .map_err(Error::from)
             .map_ok(move |meta| {

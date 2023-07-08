@@ -38,15 +38,18 @@
 )]
 
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, StringArray};
-use arrow_schema::SchemaRef;
+use arrow_schema::SchemaRef as ArrowSchemaRef;
 use bytes::Bytes;
-use futures::stream::BoxStream;
+use futures::stream::{BoxStream, Stream};
 use object_store::path::Path;
 use tracing::error;
 use url::Url;
+
+use self::schema::SchemaRef;
 
 pub mod actions;
 pub mod error;
@@ -76,6 +79,7 @@ pub type FileSlice = (Url, Option<Range<usize>>);
 
 /// Data read from a Delta table file and the corresponding scan file information.
 pub type FileDataReadResult = (FileMeta, RecordBatch);
+pub type FileDataReadResultStream = Pin<Box<dyn Stream<Item = DeltaResult<RecordBatch>> + Send>>;
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,7 +121,7 @@ pub trait ExpressionHandler {
     /// [`Schema`]: arrow_schema::Schema
     fn get_evaluator(
         &self,
-        schema: SchemaRef,
+        schema: ArrowSchemaRef,
         expression: Expression,
     ) -> Arc<dyn ExpressionEvaluator>;
 }
@@ -179,7 +183,7 @@ pub trait JsonHandler: FileHandler {
     fn parse_json(
         &self,
         json_strings: StringArray,
-        output_schema: SchemaRef,
+        output_schema: ArrowSchemaRef,
     ) -> DeltaResult<RecordBatch>;
 
     /// Read and parse the JSON format file at given locations and return
@@ -192,8 +196,14 @@ pub trait JsonHandler: FileHandler {
     async fn read_json_files(
         &self,
         files: Vec<<Self as FileHandler>::FileReadContext>,
-        physical_schema: SchemaRef,
+        physical_schema: ArrowSchemaRef,
     ) -> DeltaResult<Vec<FileDataReadResult>>;
+
+    fn read_json_files_stream(
+        &self,
+        files: Vec<<Self as FileHandler>::FileReadContext>,
+        physical_schema: SchemaRef,
+    ) -> DeltaResult<FileDataReadResultStream>;
 }
 
 /// Provides Parquet file related functionalities to Delta Kernel.
@@ -212,8 +222,14 @@ pub trait ParquetHandler: FileHandler {
     async fn read_parquet_files(
         &self,
         files: Vec<<Self as FileHandler>::FileReadContext>,
-        physical_schema: SchemaRef,
+        physical_schema: ArrowSchemaRef,
     ) -> DeltaResult<Vec<FileDataReadResult>>;
+
+    fn read_parquet_files_stream(
+        &self,
+        files: Vec<<Self as FileHandler>::FileReadContext>,
+        physical_schema: SchemaRef,
+    ) -> DeltaResult<FileDataReadResultStream>;
 }
 
 /// Interface encapsulating all clients needed by the Delta Kernel in order to read the Delta table.

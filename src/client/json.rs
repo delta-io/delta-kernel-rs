@@ -1,16 +1,26 @@
 //! Default Json handler implementation
 
-use std::io::Cursor;
+use std::io::{BufReader, Cursor};
+use std::ops::Range;
 use std::sync::Arc;
+use std::task::{ready, Poll};
 
 use arrow_array::{RecordBatch, StringArray};
 use arrow_json::ReaderBuilder;
-use arrow_schema::SchemaRef;
+use arrow_schema::SchemaRef as ArrowSchemaRef;
 use arrow_select::concat::concat_batches;
+use bytes::{Buf, Bytes};
+use futures::stream::{StreamExt, TryStreamExt};
 use object_store::path::Path;
-use object_store::DynObjectStore;
+use object_store::{DynObjectStore, GetResult};
 
-use crate::{DeltaResult, Expression, FileDataReadResult, FileHandler, FileMeta, JsonHandler};
+use super::file_handler::{FileOpenFuture, FileOpener};
+use crate::file_handler::FileStream;
+use crate::schema::SchemaRef;
+use crate::{
+    DeltaResult, Error, Expression, FileDataReadResult, FileDataReadResultStream, FileHandler,
+    FileMeta, JsonHandler,
+};
 
 #[derive(Debug)]
 pub struct JsonReadContext {
@@ -54,7 +64,7 @@ impl JsonHandler for DefaultJsonHandler {
     fn parse_json(
         &self,
         json_strings: StringArray,
-        output_schema: SchemaRef,
+        output_schema: ArrowSchemaRef,
     ) -> DeltaResult<RecordBatch> {
         // TODO concatenating to a single string is probaly not needed if we use the
         // lower level RawDecoder APIs
@@ -80,7 +90,7 @@ impl JsonHandler for DefaultJsonHandler {
     async fn read_json_files(
         &self,
         files: Vec<JsonReadContext>,
-        physical_schema: SchemaRef,
+        physical_schema: ArrowSchemaRef,
     ) -> DeltaResult<Vec<FileDataReadResult>> {
         let mut results = Vec::new();
         // TODO run on threads
@@ -93,6 +103,103 @@ impl JsonHandler for DefaultJsonHandler {
             results.push((context.meta, batch));
         }
         Ok(results)
+    }
+
+    fn read_json_files_stream(
+        &self,
+        files: Vec<<Self as FileHandler>::FileReadContext>,
+        physical_schema: SchemaRef,
+    ) -> DeltaResult<FileDataReadResultStream> {
+        if files.is_empty() {
+            return Ok(futures::stream::empty().boxed());
+        }
+
+        let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
+        let store = files.first().unwrap().store.clone();
+        let file_reader = JsonOpener::new(1024, schema.clone(), store);
+
+        let files = files.into_iter().map(|f| f.meta).collect::<Vec<_>>();
+        let stream = FileStream::new(files, schema, file_reader)?;
+        Ok(stream.boxed())
+    }
+}
+
+/// A [`FileOpener`] that opens a JSON file and yields a [`FileOpenFuture`]
+#[allow(missing_debug_implementations)]
+pub struct JsonOpener {
+    batch_size: usize,
+    projected_schema: ArrowSchemaRef,
+    object_store: Arc<DynObjectStore>,
+}
+
+impl JsonOpener {
+    /// Returns a  [`JsonOpener`]
+    pub fn new(
+        batch_size: usize,
+        projected_schema: ArrowSchemaRef,
+        // file_compression_type: FileCompressionType,
+        object_store: Arc<DynObjectStore>,
+    ) -> Self {
+        Self {
+            batch_size,
+            projected_schema,
+            // file_compression_type,
+            object_store,
+        }
+    }
+}
+
+impl FileOpener for JsonOpener {
+    fn open(&self, file_meta: FileMeta, _: Option<Range<i64>>) -> DeltaResult<FileOpenFuture> {
+        let store = self.object_store.clone();
+        let schema = self.projected_schema.clone();
+        let batch_size = self.batch_size;
+
+        Ok(Box::pin(async move {
+            let path = Path::from(file_meta.location.path());
+            match store.get(&path).await? {
+                GetResult::File(file, _) => {
+                    let reader = ReaderBuilder::new(schema)
+                        .with_batch_size(batch_size)
+                        .build(BufReader::new(file))?;
+                    Ok(futures::stream::iter(reader).map_err(Error::from).boxed())
+                }
+                GetResult::Stream(s) => {
+                    let mut decoder = ReaderBuilder::new(schema)
+                        .with_batch_size(batch_size)
+                        .build_decoder()?;
+
+                    let mut input = s.map_err(Error::from);
+                    let mut buffered = Bytes::new();
+
+                    let s = futures::stream::poll_fn(move |cx| {
+                        loop {
+                            if buffered.is_empty() {
+                                buffered = match ready!(input.poll_next_unpin(cx)) {
+                                    Some(Ok(b)) => b,
+                                    Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                                    None => break,
+                                };
+                            }
+                            let read = buffered.len();
+
+                            let decoded = match decoder.decode(buffered.as_ref()) {
+                                Ok(decoded) => decoded,
+                                Err(e) => return Poll::Ready(Some(Err(e.into()))),
+                            };
+
+                            buffered.advance(decoded);
+                            if decoded != read {
+                                break;
+                            }
+                        }
+
+                        Poll::Ready(decoder.flush().map_err(Error::from).transpose())
+                    });
+                    Ok(s.map_err(Error::from).boxed())
+                }
+            }
+        }))
     }
 }
 
