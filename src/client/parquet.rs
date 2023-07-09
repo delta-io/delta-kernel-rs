@@ -1,20 +1,22 @@
 //! Default Parquet handler implementation
 
-use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef as ArrowSchemaRef;
-use arrow_select::concat::concat_batches;
 use chrono::{TimeZone, Utc};
-use futures::stream::TryStreamExt;
+use futures::stream::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{DynObjectStore, ObjectMeta};
+use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use parquet::arrow::ProjectionMask;
 
+use super::file_handler::{FileOpenFuture, FileOpener};
+use crate::file_handler::FileStream;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, Expression, FileDataReadResult, FileDataReadResultStream, FileHandler, FileMeta,
-    ParquetHandler,
+    DeltaResult, Error, Expression, FileDataReadResultStream, FileHandler, FileMeta, ParquetHandler,
 };
 
 #[derive(Debug)]
@@ -62,37 +64,81 @@ impl FileHandler for DefaultParquetHandler {
 
 #[async_trait::async_trait]
 impl ParquetHandler for DefaultParquetHandler {
-    async fn read_parquet_files(
+    fn read_parquet_files(
         &self,
-        files: Vec<ParquetReadContext>,
-        _physical_schema: ArrowSchemaRef,
-    ) -> DeltaResult<Vec<FileDataReadResult>> {
-        let mut results = Vec::new();
-        // TODO run on threads
-        for context in files {
-            let builder = ParquetRecordBatchStreamBuilder::new(context.reader).await?;
-            let schema = Arc::new(
-                builder
-                    .schema()
-                    .as_ref()
-                    .clone()
-                    // FIXME right now needed due to errors handling spark metadata
-                    .with_metadata(HashMap::default()),
-            );
-            let batches = builder.build()?.try_collect::<Vec<_>>().await?;
-            // TODO align with passed physical schema
-            let batch = concat_batches(&schema, &batches)?;
-            results.push((context.meta, batch));
-        }
-        Ok(results)
-    }
-
-    fn read_parquet_files_stream(
-        &self,
-        _files: Vec<<Self as FileHandler>::FileReadContext>,
-        _physical_schema: SchemaRef,
+        files: Vec<<Self as FileHandler>::FileReadContext>,
+        physical_schema: SchemaRef,
     ) -> DeltaResult<FileDataReadResultStream> {
-        todo!()
+        if files.is_empty() {
+            return Ok(futures::stream::empty().boxed());
+        }
+
+        let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
+        let store = files.first().unwrap().reader.clone();
+        let file_reader = ParquetOpener::new(1024, schema.clone(), store);
+
+        let files = files.into_iter().map(|f| f.meta).collect::<Vec<_>>();
+        let stream = FileStream::new(files, schema, file_reader)?;
+        Ok(stream.boxed())
+    }
+}
+
+/// Implements [`FileOpener`] for a parquet file
+struct ParquetOpener {
+    // projection: Arc<[usize]>,
+    batch_size: usize,
+    limit: Option<usize>,
+    table_schema: ArrowSchemaRef,
+    reader: ParquetObjectReader,
+}
+
+impl ParquetOpener {
+    pub(crate) fn new(
+        batch_size: usize,
+        schema: ArrowSchemaRef,
+        reader: ParquetObjectReader,
+    ) -> Self {
+        Self {
+            batch_size,
+            table_schema: schema,
+            limit: None,
+            reader,
+        }
+    }
+}
+
+impl FileOpener for ParquetOpener {
+    fn open(&self, file_meta: FileMeta, range: Option<Range<i64>>) -> DeltaResult<FileOpenFuture> {
+        // let file_range = file_meta.range.clone();
+
+        let reader = self.reader.clone();
+        let batch_size = self.batch_size;
+        // let projection = self.projection.clone();
+        let table_schema = self.table_schema.clone();
+        let limit = self.limit;
+
+        Ok(Box::pin(async move {
+            let options = ArrowReaderOptions::new(); //.with_page_index(enable_page_index);
+            let mut builder =
+                ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await?;
+
+            // let mask = ProjectionMask::roots(builder.parquet_schema(), projection.iter().cloned());
+
+            if let Some(limit) = limit {
+                builder = builder.with_limit(limit)
+            }
+
+            let stream = builder
+                // .with_projection(mask)
+                .with_batch_size(batch_size)
+                .build()?;
+
+            let adapted = stream.map_err(|e| Error::GenericError {
+                source: Box::new(e),
+            });
+
+            Ok(adapted.boxed())
+        }))
     }
 }
 
@@ -105,7 +151,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_read_json_files() {
+    async fn test_read_parquet_files() {
         let store = Arc::new(LocalFileSystem::new());
 
         let path = std::fs::canonicalize(PathBuf::from(
@@ -132,12 +178,13 @@ mod tests {
         let context = handler.contextualize_file_reads(files, None).unwrap();
 
         let data = handler
-            .read_parquet_files(context, physical_schema)
+            .read_parquet_files(context, Arc::new(physical_schema.try_into().unwrap()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
             .await
             .unwrap();
 
         assert_eq!(data.len(), 1);
-        assert_eq!(data[0].0.location, url);
-        assert_eq!(data[0].1.num_rows(), 10);
+        assert_eq!(data[0].num_rows(), 10);
     }
 }

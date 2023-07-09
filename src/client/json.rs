@@ -18,8 +18,7 @@ use super::file_handler::{FileOpenFuture, FileOpener};
 use crate::file_handler::FileStream;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, Error, Expression, FileDataReadResult, FileDataReadResultStream, FileHandler,
-    FileMeta, JsonHandler,
+    DeltaResult, Error, Expression, FileDataReadResultStream, FileHandler, FileMeta, JsonHandler,
 };
 
 #[derive(Debug)]
@@ -87,25 +86,7 @@ impl JsonHandler for DefaultJsonHandler {
         Ok(concat_batches(&output_schema, &batches)?)
     }
 
-    async fn read_json_files(
-        &self,
-        files: Vec<JsonReadContext>,
-        physical_schema: ArrowSchemaRef,
-    ) -> DeltaResult<Vec<FileDataReadResult>> {
-        let mut results = Vec::new();
-        // TODO run on threads
-        for context in files {
-            let raw = context.store.get(&context.path).await?.bytes().await?;
-            let data = ReaderBuilder::new(physical_schema.clone())
-                .build(raw.as_ref())?
-                .collect::<Result<Vec<_>, _>>()?;
-            let batch = concat_batches(&physical_schema, &data)?;
-            results.push((context.meta, batch));
-        }
-        Ok(results)
-    }
-
-    fn read_json_files_stream(
+    fn read_json_files(
         &self,
         files: Vec<<Self as FileHandler>::FileReadContext>,
         physical_schema: SchemaRef,
@@ -249,16 +230,16 @@ mod tests {
         }];
 
         let handler = DefaultJsonHandler::new(store);
-        let context = handler.contextualize_file_reads(files, None).unwrap();
-
         let physical_schema = Arc::new(get_log_schema());
+        let context = handler.contextualize_file_reads(files, None).unwrap();
         let data = handler
-            .read_json_files(context, physical_schema)
+            .read_json_files(context, Arc::new(physical_schema.try_into().unwrap()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
             .await
             .unwrap();
 
         assert_eq!(data.len(), 1);
-        assert_eq!(data[0].0.location, url);
-        assert_eq!(data[0].1.num_rows(), 4);
+        assert_eq!(data[0].num_rows(), 4);
     }
 }

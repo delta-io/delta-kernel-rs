@@ -77,6 +77,7 @@ impl std::fmt::Debug for ScanFileStream<'_> {
 
 impl Stream for ScanFileStream<'_> {
     type Item = DeltaResult<RecordBatch>;
+
     fn poll_next(
         mut self: Pin<&mut Self>,
         ctx: &mut Context<'_>,

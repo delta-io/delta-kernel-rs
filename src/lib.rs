@@ -193,13 +193,7 @@ pub trait JsonHandler: FileHandler {
     ///
     /// - `files` - Vec of FileReadContext objects to read data from.
     /// - `physical_schema` - Select list of columns to read from the JSON file.
-    async fn read_json_files(
-        &self,
-        files: Vec<<Self as FileHandler>::FileReadContext>,
-        physical_schema: ArrowSchemaRef,
-    ) -> DeltaResult<Vec<FileDataReadResult>>;
-
-    fn read_json_files_stream(
+    fn read_json_files(
         &self,
         files: Vec<<Self as FileHandler>::FileReadContext>,
         physical_schema: SchemaRef,
@@ -219,13 +213,7 @@ pub trait ParquetHandler: FileHandler {
     ///
     /// - `files` - Vec of FileReadContext objects to read data from.
     /// - `physical_schema` - Select list of columns to read from the JSON file.
-    async fn read_parquet_files(
-        &self,
-        files: Vec<<Self as FileHandler>::FileReadContext>,
-        physical_schema: ArrowSchemaRef,
-    ) -> DeltaResult<Vec<FileDataReadResult>>;
-
-    fn read_parquet_files_stream(
+    fn read_parquet_files(
         &self,
         files: Vec<<Self as FileHandler>::FileReadContext>,
         physical_schema: SchemaRef,
