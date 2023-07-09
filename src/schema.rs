@@ -13,6 +13,24 @@ pub enum MetadataValue {
     String(String),
 }
 
+impl From<String> for MetadataValue {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
+impl From<&String> for MetadataValue {
+    fn from(value: &String) -> Self {
+        Self::String(value.clone())
+    }
+}
+
+impl From<i32> for MetadataValue {
+    fn from(value: i32) -> Self {
+        Self::Number(value)
+    }
+}
+
 #[derive(Debug)]
 pub enum ColumnMetadataKey {
     ColumnMappingId,
