@@ -12,6 +12,7 @@ use crate::expressions::Expression;
 use crate::snapshot::replay::{LogReplay, LogSegment};
 use crate::DeltaResult;
 
+/// A stream of [`RecordBatch`]es that represent actions in the delta log.
 pub struct LogStream {
     stream: BoxStream<'static, DeltaResult<RecordBatch>>,
     log_replay: LogReplay,
@@ -27,6 +28,7 @@ impl std::fmt::Debug for LogStream {
 }
 
 impl LogStream {
+    /// Create a new [`LogStream`] instance
     pub(crate) fn new(
         stream: BoxStream<'static, DeltaResult<RecordBatch>>,
         predicate: Option<Expression>,

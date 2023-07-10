@@ -23,7 +23,10 @@ arrow-select = { version = "^42.0" }
 async-trait = "0.1"
 bytes = "1.4"
 chrono = { version = "0.4", optional = true }
+either = "1.8"
+fix-hidden-lifetime-bug = "0.2"
 futures = "0.3"
+itertools = "0.10"
 lazy_static = "1.4"
 # used for providing a storage abstraction layer
 object_store = "^0.6.0"
@@ -42,7 +45,7 @@ z85 = "3.0.5"
 
 [features]
 default = ["default-client"]
-default-client = ["parquet/async", "parquet/object_store", "chrono"]
+default-client = ["chrono", "parquet/async", "parquet/object_store"]
 
 [build-dependencies]
 ureq = "2.2.0"

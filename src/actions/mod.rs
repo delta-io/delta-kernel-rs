@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 
 use arrow_array::{
-    Int32Array, Int64Array, ListArray, MapArray, RecordBatch, StringArray, StructArray,
+    BooleanArray, Int32Array, Int64Array, ListArray, MapArray, RecordBatch, StringArray,
+    StructArray,
 };
+use either::Either;
+use fix_hidden_lifetime_bug::fix_hidden_lifetime_bug;
+use itertools::izip;
 
 use crate::{DeltaResult, Error};
 
@@ -37,6 +41,8 @@ pub enum ActionType {
 pub enum Action {
     Metadata(Metadata),
     Protocol(Protocol),
+    Add(Add),
+    Remove(Remove),
 }
 
 pub(crate) fn parse_actions(
@@ -46,6 +52,8 @@ pub(crate) fn parse_actions(
     let column_name = match action_type {
         ActionType::Metadata => "metaData",
         ActionType::Protocol => "protocol",
+        ActionType::Add => "add",
+        ActionType::Remove => "remove",
         _ => unimplemented!(),
     };
 
@@ -61,14 +69,16 @@ pub(crate) fn parse_actions(
     match action_type {
         ActionType::Metadata => {
             let metadata =
-                parse_action_metadata(&arr)?.ok_or(Error::MissingData("No metadta data".into()))?;
+                parse_action_metadata(arr)?.ok_or(Error::MissingData("No metadta data".into()))?;
             Ok(vec![Action::Metadata(metadata)])
         }
         ActionType::Protocol => {
-            let protocol = parse_action_protocol(&arr)?
-                .ok_or(Error::MissingData("No protocol data".into()))?;
+            let protocol =
+                parse_action_protocol(arr)?.ok_or(Error::MissingData("No protocol data".into()))?;
             Ok(vec![Action::Protocol(protocol)])
         }
+        ActionType::Add => Ok(parse_actions_add(arr)?.collect()),
+        ActionType::Remove => Ok(parse_actions_remove(arr)?.collect()),
         _ => todo!(),
     }
 }
@@ -234,6 +244,267 @@ fn parse_action_protocol(arr: &StructArray) -> DeltaResult<Option<Protocol>> {
     Ok(Some(protocol))
 }
 
+#[fix_hidden_lifetime_bug]
+fn parse_actions_add(arr: &StructArray) -> DeltaResult<impl Iterator<Item = Action>> {
+    let paths = cast_struct_column::<StringArray>(arr, "path")?;
+    let sizes = cast_struct_column::<Int64Array>(arr, "size")?;
+    let modification_times = cast_struct_column::<Int64Array>(arr, "modificationTime")?;
+    let data_changes = cast_struct_column::<BooleanArray>(arr, "dataChange")?;
+    let partition_values = cast_struct_column::<MapArray>(arr, "partitionValues")?
+        .iter()
+        .map(|data| data.map(|d| struct_array_to_map(&d).unwrap()));
+
+    let tags = if let Ok(stats) = cast_struct_column::<MapArray>(arr, "tags") {
+        Either::Left(
+            stats
+                .iter()
+                .map(|data| data.map(|d| struct_array_to_map(&d).unwrap())),
+        )
+    } else {
+        Either::Right(std::iter::repeat(None).take(sizes.len()))
+    };
+
+    let stats = if let Ok(stats) = cast_struct_column::<StringArray>(arr, "stats") {
+        Either::Left(stats.into_iter())
+    } else {
+        Either::Right(std::iter::repeat(None).take(sizes.len()))
+    };
+
+    let base_row_ids = if let Ok(row_ids) = cast_struct_column::<Int64Array>(arr, "baseRowId") {
+        Either::Left(row_ids.into_iter())
+    } else {
+        Either::Right(std::iter::repeat(None).take(sizes.len()))
+    };
+
+    let commit_versions =
+        if let Ok(versions) = cast_struct_column::<Int64Array>(arr, "defaultRowCommitVersion") {
+            Either::Left(versions.into_iter())
+        } else {
+            Either::Right(std::iter::repeat(None).take(sizes.len()))
+        };
+
+    let deletion_vectors = if let Ok(dvs) = cast_struct_column::<StructArray>(arr, "deletionVector")
+    {
+        Either::Left(parse_dv(dvs)?)
+    } else {
+        Either::Right(std::iter::repeat(None).take(sizes.len()))
+    };
+
+    let zipped = izip!(
+        paths,
+        sizes,
+        modification_times,
+        data_changes,
+        partition_values,
+        stats,
+        tags,
+        base_row_ids,
+        commit_versions,
+        deletion_vectors,
+    );
+    let zipped = zipped.map(
+        |(
+            maybe_paths,
+            maybe_size,
+            maybe_modification_time,
+            maybe_data_change,
+            partition_values,
+            stat,
+            tags,
+            base_row_id,
+            default_row_commit_version,
+            deletion_vector,
+        )| {
+            if let (Some(path), Some(size), Some(modification_time), Some(data_change)) = (
+                maybe_paths,
+                maybe_size,
+                maybe_modification_time,
+                maybe_data_change,
+            ) {
+                Some(Add {
+                    path: path.into(),
+                    size,
+                    modification_time,
+                    data_change,
+                    partition_values: partition_values.unwrap_or_default(),
+                    stats: stat.map(|v| v.to_string()),
+                    tags: tags.unwrap_or_default(),
+                    base_row_id,
+                    default_row_commit_version,
+                    deletion_vector,
+                })
+            } else {
+                None
+            }
+        },
+    );
+
+    Ok(zipped.filter_map(|v| v).map(Action::Add))
+}
+
+#[fix_hidden_lifetime_bug]
+fn parse_actions_remove(arr: &StructArray) -> DeltaResult<impl Iterator<Item = Action>> {
+    let paths = cast_struct_column::<StringArray>(arr, "path")?;
+    let data_changes = cast_struct_column::<BooleanArray>(arr, "dataChange")?;
+
+    let deletion_timestamps =
+        if let Ok(ts) = cast_struct_column::<Int64Array>(arr, "deletionTimestamp") {
+            Either::Left(ts.into_iter())
+        } else {
+            Either::Right(std::iter::repeat(None).take(data_changes.len()))
+        };
+
+    let extended_file_metadata =
+        if let Ok(metas) = cast_struct_column::<BooleanArray>(arr, "extendedFileMetadata") {
+            Either::Left(metas.into_iter())
+        } else {
+            Either::Right(std::iter::repeat(None).take(data_changes.len()))
+        };
+
+    let partition_values =
+        if let Ok(values) = cast_struct_column::<MapArray>(arr, "partitionValues") {
+            Either::Left(
+                values
+                    .iter()
+                    .map(|data| data.map(|d| struct_array_to_map(&d).unwrap())),
+            )
+        } else {
+            Either::Right(std::iter::repeat(None).take(data_changes.len()))
+        };
+
+    let sizes = if let Ok(size) = cast_struct_column::<Int64Array>(arr, "size") {
+        Either::Left(size.into_iter())
+    } else {
+        Either::Right(std::iter::repeat(None).take(data_changes.len()))
+    };
+
+    let tags = if let Ok(tags) = cast_struct_column::<MapArray>(arr, "tags") {
+        Either::Left(
+            tags.iter()
+                .map(|data| data.map(|d| struct_array_to_map(&d).unwrap())),
+        )
+    } else {
+        Either::Right(std::iter::repeat(None).take(data_changes.len()))
+    };
+
+    let deletion_vectors = if let Ok(dvs) = cast_struct_column::<StructArray>(arr, "deletionVector")
+    {
+        Either::Left(parse_dv(dvs)?)
+    } else {
+        Either::Right(std::iter::repeat(None).take(data_changes.len()))
+    };
+
+    let base_row_ids = if let Ok(row_ids) = cast_struct_column::<Int64Array>(arr, "baseRowId") {
+        Either::Left(row_ids.into_iter())
+    } else {
+        Either::Right(std::iter::repeat(None).take(data_changes.len()))
+    };
+
+    let commit_versions =
+        if let Ok(row_ids) = cast_struct_column::<Int64Array>(arr, "defaultRowCommitVersion") {
+            Either::Left(row_ids.into_iter())
+        } else {
+            Either::Right(std::iter::repeat(None).take(data_changes.len()))
+        };
+
+    let zipped = izip!(
+        paths,
+        data_changes,
+        deletion_timestamps,
+        extended_file_metadata,
+        partition_values,
+        sizes,
+        tags,
+        deletion_vectors,
+        base_row_ids,
+        commit_versions,
+    );
+
+    let zipped = zipped.map(
+        |(
+            maybe_paths,
+            maybe_data_change,
+            deletion_timestamp,
+            extended_file_metadata,
+            partition_values,
+            size,
+            tags,
+            deletion_vector,
+            base_row_id,
+            default_row_commit_version,
+        )| {
+            if let (Some(path), Some(data_change)) = (maybe_paths, maybe_data_change) {
+                Some(Remove {
+                    path: path.into(),
+                    data_change,
+                    deletion_timestamp,
+                    extended_file_metadata,
+                    partition_values,
+                    size,
+                    tags,
+                    deletion_vector,
+                    base_row_id,
+                    default_row_commit_version,
+                })
+            } else {
+                None
+            }
+        },
+    );
+
+    Ok(zipped.filter_map(|v| v).map(Action::Remove))
+}
+
+#[fix_hidden_lifetime_bug]
+fn parse_dv(
+    arr: &StructArray,
+) -> DeltaResult<impl Iterator<Item = Option<DeletionVectorDescriptor>>> {
+    let storage_types = cast_struct_column::<StringArray>(arr, "storageType")?;
+    let paths_or_inlines = cast_struct_column::<StringArray>(arr, "pathOrInlineDv")?;
+    let sizes_in_bytes = cast_struct_column::<Int32Array>(arr, "sizeInBytes")?;
+    let cardinalities = cast_struct_column::<Int64Array>(arr, "cardinality")?;
+
+    let offsets = if let Ok(offsets) = cast_struct_column::<Int32Array>(arr, "offset") {
+        Either::Left(offsets.into_iter())
+    } else {
+        Either::Right(std::iter::repeat(None).take(cardinalities.len()))
+    };
+
+    let zipped = izip!(
+        storage_types,
+        paths_or_inlines,
+        sizes_in_bytes,
+        cardinalities,
+        offsets,
+    );
+
+    Ok(zipped.map(
+        |(maybe_type, maybe_path_or_inline_dv, maybe_size_in_bytes, maybe_cardinality, offset)| {
+            if let (
+                Some(storage_type),
+                Some(path_or_inline_dv),
+                Some(size_in_bytes),
+                Some(cardinality),
+            ) = (
+                maybe_type,
+                maybe_path_or_inline_dv,
+                maybe_size_in_bytes,
+                maybe_cardinality,
+            ) {
+                Some(DeletionVectorDescriptor {
+                    storage_type: storage_type.into(),
+                    path_or_inline_dv: path_or_inline_dv.into(),
+                    size_in_bytes,
+                    cardinality,
+                    offset,
+                })
+            } else {
+                None
+            }
+        },
+    ))
+}
+
 fn cast_struct_column<T: 'static>(arr: &StructArray, name: impl AsRef<str>) -> DeltaResult<&T> {
     arr.column_by_name(name.as_ref())
         .ok_or(Error::MissingColumn(name.as_ref().into()))?
@@ -242,6 +513,22 @@ fn cast_struct_column<T: 'static>(arr: &StructArray, name: impl AsRef<str>) -> D
         .ok_or(Error::UnexpectedColumnType(
             "Cannot downcast to expected type".into(),
         ))
+}
+
+fn struct_array_to_map(arr: &StructArray) -> DeltaResult<HashMap<String, Option<String>>> {
+    let keys = cast_struct_column::<StringArray>(arr, "key")?;
+    let values = cast_struct_column::<StringArray>(arr, "value")?;
+    Ok(keys
+        .into_iter()
+        .zip(values.into_iter())
+        .filter_map(|(k, v)| {
+            if let Some(key) = k {
+                Some((key.to_string(), v.map(|vv| vv.to_string())))
+            } else {
+                None
+            }
+        })
+        .collect())
 }
 
 #[cfg(all(test, feature = "default-client"))]
@@ -311,5 +598,26 @@ mod tests {
             configuration,
         });
         assert_eq!(action[0], expected)
+    }
+
+    #[test]
+    fn test_parse_add_partitioned() {
+        let store = Arc::new(LocalFileSystem::new());
+        let handler = DefaultJsonHandler::new(store);
+
+        let json_strings: StringArray = vec![
+            r#"{"commitInfo":{"timestamp":1670892998177,"operation":"WRITE","operationParameters":{"mode":"Append","partitionBy":"[\"c1\",\"c2\"]"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"3","numOutputRows":"3","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
+            r#"{"add":{"path":"c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet","partitionValues":{"c1":"4","c2":"c"},"size":452,"modificationTime":1670892998135,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":5},\"maxValues\":{\"c3\":5},\"nullCount\":{\"c3\":0}}"}}"#,
+            r#"{"add":{"path":"c1=5/c2=b/part-00007-4e73fa3b-2c88-424a-8051-f8b54328ffdb.c000.snappy.parquet","partitionValues":{"c1":"5","c2":"b"},"size":452,"modificationTime":1670892998135,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":6},\"maxValues\":{\"c3\":6},\"nullCount\":{\"c3\":0}}"}}"#,
+            r#"{"add":{"path":"c1=6/c2=a/part-00011-10619b10-b691-4fd0-acc4-2a9608499d7c.c000.snappy.parquet","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998135,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":4},\"maxValues\":{\"c3\":4},\"nullCount\":{\"c3\":0}}"}}"#,
+        ]
+        .into();
+        let output_schema = Arc::new(get_log_schema());
+        let batch = handler.parse_json(json_strings, output_schema).unwrap();
+
+        let actions = parse_actions(&batch, &ActionType::Add).unwrap();
+        println!("{:?}", actions)
     }
 }

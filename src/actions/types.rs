@@ -130,7 +130,7 @@ impl Protocol {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletionVectorDescriptor {
     /// A single character to indicate how to access the DV. Legal options are: ['u', 'i', 'p'].
-    storage_type: String,
+    pub storage_type: String,
 
     /// Three format options are currently proposed:
     /// - If `storageType = 'u'` then `<random prefix - optional><base85 encoded uuid>`:
@@ -146,22 +146,26 @@ pub struct DeletionVectorDescriptor {
     ///   in the `add`/`remove` actions.
     ///
     /// [Deletion Vector Format]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Deletion-Vector-Format
-    path_or_inline_dv: String,
+    pub path_or_inline_dv: String,
 
     /// Start of the data for this DV in number of bytes from the beginning of the file it is stored in.
     /// Always None (absent in JSON) when `storageType = 'i'`.
-    offset: Option<i32>,
+    pub offset: Option<i32>,
 
     /// Size of the serialized DV in bytes (raw data size, i.e. before base85 encoding, if inline).
-    size_in_bytes: i32,
+    pub size_in_bytes: i32,
 
     /// Number of rows the given DV logically removes from the file.
-    cardinality: i64,
+    pub cardinality: i64,
 }
 
 impl DeletionVectorDescriptor {
     pub fn unique_id(&self) -> String {
-        todo!()
+        if let Some(offset) = self.offset {
+            format!("{}{}@{offset}", self.storage_type, self.path_or_inline_dv)
+        } else {
+            format!("{}{}", self.storage_type, self.path_or_inline_dv)
+        }
     }
 
     pub fn absolute_path(&self, parent: &Url) -> DeltaResult<Option<Url>> {
@@ -253,28 +257,90 @@ pub struct Add {
     /// [RFC 2396 URI Generic Syntax], which needs to be decoded to get the data file path.
     ///
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
-    path: String,
+    pub path: String,
 
     /// A map from partition column to value for this logical file.
-    partition_values: HashMap<String, String>,
+    pub partition_values: HashMap<String, Option<String>>,
 
     /// The size of this data file in bytes
-    size: i64,
+    pub size: i64,
 
     /// The time this logical file was created, as milliseconds since the epoch.
-    modification_time: i64,
+    pub modification_time: i64,
 
     /// When `false` the logical file must already be present in the table or the records
     /// in the added file must be contained in one or more remove actions in the same version.
-    data_change: bool,
+    pub data_change: bool,
 
     /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this logical file.
     ///
     /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
-    stats: Option<String>,
+    pub stats: Option<String>,
 
     /// Map containing metadata about this logical file.
-    tags: HashMap<String, String>,
+    pub tags: HashMap<String, Option<String>>,
+
+    /// Information about deletion vector (DV) associated with this add action
+    pub deletion_vector: Option<DeletionVectorDescriptor>,
+
+    /// Default generated Row ID of the first row in the file. The default generated Row IDs
+    /// of the other rows in the file can be reconstructed by adding the physical index of the
+    /// row within the file to the base Row ID
+    pub base_row_id: Option<i64>,
+
+    /// First commit version in which an add action with the same path was committed to the table.
+    pub default_row_commit_version: Option<i64>,
+}
+
+impl Add {
+    pub fn dv_unique_id(&self) -> Option<String> {
+        self.deletion_vector.clone().map(|dv| dv.unique_id())
+    }
+
+    pub fn with_base_row_id(mut self, base_row_id: i64) -> Self {
+        self.base_row_id = Some(base_row_id);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Remove {
+    /// A relative path to a data file from the root of the table or an absolute path to a file
+    /// that should be added to the table. The path is a URI as specified by
+    /// [RFC 2396 URI Generic Syntax], which needs to be decoded to get the data file path.
+    ///
+    /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
+    pub path: String,
+
+    /// When `false` the logical file must already be present in the table or the records
+    /// in the added file must be contained in one or more remove actions in the same version.
+    pub data_change: bool,
+
+    /// The time this logical file was created, as milliseconds since the epoch.
+    pub deletion_timestamp: Option<i64>,
+
+    /// When true the fields `partition_values`, `size`, and `tags` are present
+    pub extended_file_metadata: Option<bool>,
+
+    /// A map from partition column to value for this logical file.
+    pub partition_values: Option<HashMap<String, Option<String>>>,
+
+    /// The size of this data file in bytes
+    pub size: Option<i64>,
+
+    /// Map containing metadata about this logical file.
+    pub tags: Option<HashMap<String, Option<String>>>,
+
+    /// Information about deletion vector (DV) associated with this add action
+    pub deletion_vector: Option<DeletionVectorDescriptor>,
+
+    /// Default generated Row ID of the first row in the file. The default generated Row IDs
+    /// of the other rows in the file can be reconstructed by adding the physical index of the
+    /// row within the file to the base Row ID
+    pub base_row_id: Option<i64>,
+
+    /// First commit version in which an add action with the same path was committed to the table.
+    pub default_row_commit_version: Option<i64>,
 }
 
 #[cfg(test)]
