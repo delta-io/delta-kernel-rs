@@ -343,6 +343,12 @@ pub struct Remove {
     pub default_row_commit_version: Option<i64>,
 }
 
+impl Remove {
+    pub fn dv_unique_id(&self) -> Option<String> {
+        self.deletion_vector.clone().map(|dv| dv.unique_id())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

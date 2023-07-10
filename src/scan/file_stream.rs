@@ -1,7 +1,9 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_arith::boolean::{is_not_null, or};
+use arrow_array::{BooleanArray, RecordBatch};
+use arrow_select::filter::filter_record_batch;
 use futures::prelude::*;
 use futures::stream::{BoxStream, StreamExt};
 use futures::task::{Context, Poll};
@@ -9,19 +11,20 @@ use object_store::ObjectStore;
 
 use super::data_skipping::data_skipping_filter;
 use crate::expressions::Expression;
+use crate::scan::log_replay::LogReplay as LogReplayNew;
 use crate::snapshot::replay::{LogReplay, LogSegment};
-use crate::DeltaResult;
+use crate::{DeltaResult, Error};
 
 /// A stream of [`RecordBatch`]es that represent actions in the delta log.
 pub struct LogStream {
     stream: BoxStream<'static, DeltaResult<RecordBatch>>,
-    log_replay: LogReplay,
+    log_replay: LogReplayNew,
     predicate: Option<Expression>,
 }
 
 impl std::fmt::Debug for LogStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        f.debug_struct("Snapshot")
+        f.debug_struct("LogStream")
             .field("predicate", &self.predicate)
             .finish()
     }
@@ -36,7 +39,7 @@ impl LogStream {
         Ok(Self {
             predicate,
             stream,
-            log_replay: LogReplay::new(),
+            log_replay: LogReplayNew::new(),
         })
     }
 }
@@ -49,7 +52,6 @@ impl Stream for LogStream {
         ctx: &mut Context<'_>,
     ) -> Poll<Option<<Self as futures::Stream>::Item>> {
         let stream = Pin::new(&mut self.stream);
-
         match stream.poll_next(ctx) {
             futures::task::Poll::Ready(value) => match value {
                 Some(Ok(actions)) => {
@@ -58,7 +60,7 @@ impl Stream for LogStream {
                     } else {
                         actions
                     };
-                    futures::task::Poll::Ready(Some(self.log_replay.replay(skipped)))
+                    futures::task::Poll::Ready(Some(self.log_replay.replay(&skipped)))
                 }
                 Some(Err(err)) => futures::task::Poll::Ready(Some(Err(err))),
                 None => futures::task::Poll::Ready(None),
@@ -66,6 +68,16 @@ impl Stream for LogStream {
             _ => futures::task::Poll::Pending,
         }
     }
+}
+
+fn filter_nulls(batch: &RecordBatch) -> DeltaResult<BooleanArray> {
+    let add_array = batch
+        .column_by_name("add")
+        .ok_or(Error::MissingData("expected add column".into()))?;
+    let remove_array = batch
+        .column_by_name("remove")
+        .ok_or(Error::MissingData("expected remove column".into()))?;
+    Ok(or(&is_not_null(add_array)?, &is_not_null(remove_array)?)?)
 }
 
 pub struct ScanFileStream<'a> {
@@ -96,7 +108,8 @@ impl Stream for ScanFileStream<'_> {
                     let skipped = if let Some(predicate) = &self.predicate {
                         data_skipping_filter(actions, predicate)?
                     } else {
-                        actions
+                        let predicate = filter_nulls(&actions)?;
+                        filter_record_batch(&actions, &predicate)?
                     };
                     futures::task::Poll::Ready(Some(self.log_replay.replay(skipped)))
                 } else {

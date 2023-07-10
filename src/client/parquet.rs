@@ -69,6 +69,7 @@ impl ParquetHandler for DefaultParquetHandler {
         files: Vec<<Self as FileHandler>::FileReadContext>,
         physical_schema: SchemaRef,
     ) -> DeltaResult<FileDataReadResultStream> {
+        // TODO at the very least load only required columns ...
         if files.is_empty() {
             return Ok(futures::stream::empty().boxed());
         }

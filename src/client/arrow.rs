@@ -145,12 +145,12 @@ impl TryFrom<&DataType> for ArrowDataType {
                     ArrowDataType::Struct(
                         vec![
                             ArrowField::new(
-                                "keys",
+                                "key",
                                 <ArrowDataType as TryFrom<&DataType>>::try_from(m.key_type())?,
                                 false,
                             ),
                             ArrowField::new(
-                                "values",
+                                "value",
                                 <ArrowDataType as TryFrom<&DataType>>::try_from(m.value_type())?,
                                 m.value_contains_null(),
                             ),
