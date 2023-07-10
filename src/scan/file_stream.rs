@@ -53,7 +53,11 @@ impl Stream for LogStream {
         match stream.poll_next(ctx) {
             futures::task::Poll::Ready(value) => match value {
                 Some(Ok(actions)) => {
-                    let skipped = data_skipping_filter(actions, &self.predicate)?;
+                    let skipped = if let Some(predicate) = &self.predicate {
+                        data_skipping_filter(actions, predicate)?
+                    } else {
+                        actions
+                    };
                     futures::task::Poll::Ready(Some(self.log_replay.replay(skipped)))
                 }
                 Some(Err(err)) => futures::task::Poll::Ready(Some(Err(err))),
@@ -89,7 +93,11 @@ impl Stream for ScanFileStream<'_> {
         match stream.poll_next(ctx) {
             futures::task::Poll::Ready(value) => {
                 if let Some(actions) = value {
-                    let skipped = data_skipping_filter(actions, self.predicate)?;
+                    let skipped = if let Some(predicate) = &self.predicate {
+                        data_skipping_filter(actions, predicate)?
+                    } else {
+                        actions
+                    };
                     futures::task::Poll::Ready(Some(self.log_replay.replay(skipped)))
                 } else {
                     futures::task::Poll::Ready(Ok(value).transpose())
