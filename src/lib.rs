@@ -45,8 +45,6 @@ use arrow_array::{RecordBatch, StringArray};
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use bytes::Bytes;
 use futures::stream::{BoxStream, Stream};
-use object_store::path::Path;
-use tracing::error;
 use url::Url;
 
 use self::schema::SchemaRef;
@@ -54,7 +52,6 @@ use self::schema::SchemaRef;
 pub mod actions;
 pub mod error;
 pub mod expressions;
-pub mod parquet_reader;
 pub mod path;
 pub mod scan;
 pub mod schema;
@@ -64,7 +61,6 @@ pub mod table;
 pub use actions::{types::*, ActionType};
 pub use error::{DeltaResult, Error};
 pub use expressions::Expression;
-pub use snapshot::replay::LogFile;
 pub use table::Table;
 
 #[cfg(feature = "default-client")]
@@ -243,27 +239,4 @@ pub trait TableClient {
     fn get_parquet_handler(
         &self,
     ) -> Arc<dyn ParquetHandler<FileReadContext = Self::ParquetReadContext>>;
-}
-
-/**
- * Parse the given [object_store::path::Path] to identify a commit log version
- */
-fn version_from_path(path: &Path) -> Result<Version, Error> {
-    if let Some(filename) = path.filename() {
-        if let Some(part) = filename.split('.').next() {
-            return part
-                .parse()
-                .map_err(|source: std::num::ParseIntError| Error::GenericError {
-                    source: Box::new(source),
-                });
-        }
-        Ok(0)
-    } else {
-        let e = format!(
-            "Provided path does not have a filename at the end: {:?}",
-            path
-        );
-        error!("{}", &e);
-        Err(Error::Generic(e))
-    }
 }

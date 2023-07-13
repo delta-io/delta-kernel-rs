@@ -70,10 +70,6 @@ impl<'a> LogPath<'a> {
             .and_then(|f| f.split_once('.'))
             .and_then(|(name, _)| name.parse().ok())
     }
-
-    fn is_log_root(&self) -> bool {
-        self.path().ends_with("_delta_log/")
-    }
 }
 
 impl<'a> AsRef<Url> for LogPath<'a> {

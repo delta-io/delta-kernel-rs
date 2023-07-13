@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use object_store::{parse_url_opts, DynObjectStore};
+use object_store::{parse_url_opts, path::Path, DynObjectStore};
 use url::Url;
 
 use self::filesystem::ObjectStoreFileSystemClient;
@@ -42,6 +42,15 @@ impl DefaultTableClient {
             parquet: Arc::new(DefaultParquetHandler::new(store.clone())),
             store,
         })
+    }
+
+    pub fn new(store: Arc<DynObjectStore>, prefix: Path) -> Self {
+        Self {
+            file_system: Arc::new(ObjectStoreFileSystemClient::new(store.clone(), prefix)),
+            json: Arc::new(DefaultJsonHandler::new(store.clone())),
+            parquet: Arc::new(DefaultParquetHandler::new(store.clone())),
+            store,
+        }
     }
 }
 

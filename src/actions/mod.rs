@@ -37,7 +37,7 @@ pub enum ActionType {
     Txn,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Action {
     Metadata(Metadata),
     Protocol(Protocol),

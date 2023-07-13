@@ -10,7 +10,6 @@ use object_store::path::Path;
 use object_store::{DynObjectStore, ObjectMeta};
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
-use parquet::arrow::ProjectionMask;
 
 use super::file_handler::{FileOpenFuture, FileOpener};
 use crate::file_handler::FileStream;
@@ -21,7 +20,7 @@ use crate::{
 
 #[derive(Debug)]
 pub struct ParquetReadContext {
-    pub(crate) reader: ParquetObjectReader,
+    // pub(crate) reader: ParquetObjectReader,
     pub(crate) meta: FileMeta,
 }
 
@@ -46,18 +45,7 @@ impl FileHandler for DefaultParquetHandler {
     ) -> DeltaResult<Vec<ParquetReadContext>> {
         Ok(files
             .into_iter()
-            .map(|meta| ParquetReadContext {
-                reader: ParquetObjectReader::new(
-                    self.store.clone(),
-                    ObjectMeta {
-                        location: Path::from(meta.location.path()),
-                        size: meta.size,
-                        last_modified: Utc.timestamp_millis_opt(meta.last_modified).unwrap(),
-                        e_tag: None,
-                    },
-                ),
-                meta,
-            })
+            .map(|meta| ParquetReadContext { meta })
             .collect())
     }
 }
@@ -75,8 +63,7 @@ impl ParquetHandler for DefaultParquetHandler {
         }
 
         let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
-        let store = files.first().unwrap().reader.clone();
-        let file_reader = ParquetOpener::new(1024, schema.clone(), store);
+        let file_reader = ParquetOpener::new(1024, schema.clone(), self.store.clone());
 
         let files = files.into_iter().map(|f| f.meta).collect::<Vec<_>>();
         let stream = FileStream::new(files, schema, file_reader)?;
@@ -90,41 +77,43 @@ struct ParquetOpener {
     batch_size: usize,
     limit: Option<usize>,
     table_schema: ArrowSchemaRef,
-    reader: ParquetObjectReader,
+    store: Arc<DynObjectStore>,
 }
 
 impl ParquetOpener {
     pub(crate) fn new(
         batch_size: usize,
         schema: ArrowSchemaRef,
-        reader: ParquetObjectReader,
+        store: Arc<DynObjectStore>,
     ) -> Self {
         Self {
             batch_size,
             table_schema: schema,
             limit: None,
-            reader,
+            store,
         }
     }
 }
 
 impl FileOpener for ParquetOpener {
-    fn open(&self, file_meta: FileMeta, range: Option<Range<i64>>) -> DeltaResult<FileOpenFuture> {
-        // let file_range = file_meta.range.clone();
+    fn open(&self, file_meta: FileMeta, _range: Option<Range<i64>>) -> DeltaResult<FileOpenFuture> {
+        let path = Path::from(file_meta.location.path());
+        let store = self.store.clone();
 
-        let reader = self.reader.clone();
         let batch_size = self.batch_size;
         // let projection = self.projection.clone();
-        let table_schema = self.table_schema.clone();
+        let _table_schema = self.table_schema.clone();
         let limit = self.limit;
 
         Ok(Box::pin(async move {
+            // TODO avoid IO by converting passed file meta to ObjectMeta
+            let meta = store.head(&path).await?;
+            let reader = ParquetObjectReader::new(store, meta);
             let options = ArrowReaderOptions::new(); //.with_page_index(enable_page_index);
             let mut builder =
                 ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await?;
 
             // let mask = ProjectionMask::roots(builder.parquet_schema(), projection.iter().cloned());
-
             if let Some(limit) = limit {
                 builder = builder.with_limit(limit)
             }

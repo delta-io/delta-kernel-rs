@@ -8,12 +8,12 @@ use crate::{DeltaResult, TableClient, Version};
 /// In-memory representation of a Delta table, which acts as an immutable root entity for reading
 /// the different versions (see [`Snapshot`]) of the table located in storage.
 #[derive(Clone)]
-pub struct Table<JRC: Send, PRC: Send> {
+pub struct Table<JRC: Send, PRC: Send + Sync> {
     table_client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
     location: Url,
 }
 
-impl<JRC: Send, PRC: Send> std::fmt::Debug for Table<JRC, PRC> {
+impl<JRC: Send, PRC: Send + Sync> std::fmt::Debug for Table<JRC, PRC> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("Snapshot")
             .field("location", &self.location)
@@ -21,7 +21,7 @@ impl<JRC: Send, PRC: Send> std::fmt::Debug for Table<JRC, PRC> {
     }
 }
 
-impl<JRC: Send, PRC: Send> Table<JRC, PRC> {
+impl<JRC: Send, PRC: Send + Sync> Table<JRC, PRC> {
     /// Create a new Delta table with the given parameters
     pub fn new(
         location: Url,
