@@ -128,7 +128,7 @@ pub trait ExpressionHandler {
 /// file system where the Delta table is present. Connector implementation of
 /// this interface can hide filesystem specific details from Delta Kernel.
 #[async_trait::async_trait]
-pub trait FileSystemClient {
+pub trait FileSystemClient: Send + Sync {
     /// List the paths in the same directory that are lexicographically greater or equal to
     /// (UTF-8 sorting) the given `path`. The result should also be sorted by the file name.
     async fn list_from(&self, path: &Url) -> DeltaResult<BoxStream<'_, DeltaResult<FileMeta>>>;
@@ -201,7 +201,7 @@ pub trait JsonHandler: FileHandler {
 /// Connectors can leverage this interface to provide their own custom
 /// implementation of Parquet data file functionalities to Delta Kernel.
 #[async_trait::async_trait]
-pub trait ParquetHandler: FileHandler {
+pub trait ParquetHandler: FileHandler + Send + Sync {
     /// Read and parse the JSON format file at given locations and return
     /// the data as a RecordBatch with the columns requested by physical schema.
     ///

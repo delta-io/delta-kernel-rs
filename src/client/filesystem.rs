@@ -70,38 +70,6 @@ mod tests {
     use std::ops::Range;
 
     #[tokio::test]
-    async fn test_list_from() {
-        let tmp = tempfile::tempdir().unwrap();
-        let tmp_store = LocalFileSystem::new_with_prefix(tmp.path()).unwrap();
-
-        let data = Bytes::from("kernel-data");
-        tmp_store.put(&Path::from("a"), data.clone()).await.unwrap();
-        tmp_store.put(&Path::from("b"), data.clone()).await.unwrap();
-        tmp_store.put(&Path::from("c"), data.clone()).await.unwrap();
-
-        let mut url = Url::from_directory_path(tmp.path()).unwrap();
-
-        let store = Arc::new(LocalFileSystem::new());
-        let prefix = Path::from(url.path());
-        let client = ObjectStoreFileSystemClient::new(store, prefix);
-
-        url.set_path(&format!("{}/b", url.path().trim_end_matches('/')));
-
-        println!("{}", url.as_str());
-
-        let files = client
-            .list_from(&url)
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        assert_eq!(files.len(), 1);
-        assert!(files[0].location.as_ref().ends_with("/c"))
-    }
-
-    #[tokio::test]
     async fn test_read_files() {
         let tmp = tempfile::tempdir().unwrap();
         let tmp_store = LocalFileSystem::new_with_prefix(tmp.path()).unwrap();

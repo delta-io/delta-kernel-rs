@@ -1,17 +1,20 @@
 use std::collections::HashSet;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use arrow_arith::boolean::{is_not_null, or};
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_select::filter::filter_record_batch;
-use futures::prelude::*;
-use futures::stream::BoxStream;
+use futures::future::BoxFuture;
+use futures::stream::{BoxStream, Stream};
 use futures::task::{Context, Poll};
+use roaring::RoaringTreemap;
+use url::Url;
 
 use super::data_skipping::data_skipping_filter;
-use crate::actions::{parse_actions, Action, ActionType};
+use crate::actions::{parse_actions, Action, ActionType, Add};
 use crate::expressions::Expression;
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, Error, FileSystemClient};
 
 /// A stream of [`RecordBatch`]es that represent actions in the delta log.
 pub struct LogReplayStream {
@@ -19,6 +22,8 @@ pub struct LogReplayStream {
     predicate: Option<Expression>,
     seen: HashSet<(String, Option<String>)>,
     // ages: HashMap<Version, HashSet<PathBuf>>
+    fs_client: Arc<dyn FileSystemClient>,
+    table_root: Url,
 }
 
 impl std::fmt::Debug for LogReplayStream {
@@ -34,17 +39,29 @@ impl LogReplayStream {
     pub(crate) fn new(
         stream: BoxStream<'static, DeltaResult<RecordBatch>>,
         predicate: Option<Expression>,
+        fs_client: Arc<dyn FileSystemClient>,
+        table_root: Url,
     ) -> DeltaResult<Self> {
         Ok(Self {
             predicate,
             stream,
+            fs_client,
+            table_root,
             seen: Default::default(),
         })
     }
 }
 
+/// A fallible future that resolves to a stream of [`RecordBatch`]
+pub type DvOpenFuture = BoxFuture<'static, DeltaResult<RoaringTreemap>>;
+
+pub struct DataFile {
+    pub add: Add,
+    pub dv: Option<DvOpenFuture>,
+}
+
 impl Stream for LogReplayStream {
-    type Item = DeltaResult<Vec<Action>>;
+    type Item = DeltaResult<Vec<DataFile>>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
@@ -62,7 +79,7 @@ impl Stream for LogReplayStream {
                     };
                     let filtered_actions =
                         parse_actions(&skipped, &[ActionType::Remove, ActionType::Add])?
-                            .filter_map(|action| match &action {
+                            .filter_map(|action| match action {
                                 Action::Add(add)
                                     // TODO right now this may not work as expected if we have the same add
                                     // file with different deletetion vectors in the log - i.e. additional
@@ -72,7 +89,18 @@ impl Stream for LogReplayStream {
                                         .contains(&(add.path.clone(), add.dv_unique_id())) =>
                                 {
                                     self.seen.insert((add.path.clone(), add.dv_unique_id()));
-                                    Some(action)
+                                    let dvv = add.deletion_vector.clone();
+                                    let dv = if let Some(dv_def) = dvv {
+                                        let dv_def = dv_def.clone();
+                                        let fut = dv_def.read(self.fs_client.clone(), self.table_root.clone()).unwrap();
+                                        Some(fut)
+                                    } else {
+                                        None
+                                    };
+                                    Some(DataFile {
+                                        add: add.clone(),
+                                        dv
+                                    })
                                 }
                                 Action::Add(add) => {
                                     self.seen.insert((add.path.clone(), add.dv_unique_id()));

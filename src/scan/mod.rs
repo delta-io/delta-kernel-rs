@@ -1,18 +1,18 @@
-use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::{Fields, Schema as ArrowSchema};
-use futures::stream::{BoxStream, Stream, StreamExt, TryStreamExt};
-use futures::task::Poll;
+use arrow_select::concat::concat_batches;
+use arrow_select::filter::filter_record_batch;
+use futures::stream::{StreamExt, TryStreamExt};
 use url::Url;
 
 use self::file_stream::LogReplayStream;
-use crate::actions::{Action, ActionType};
+use crate::actions::ActionType;
 use crate::expressions::Expression;
 use crate::schema::{Schema, SchemaRef};
 use crate::snapshot::LogSegmentNew;
-use crate::{DeltaResult, Error, FileMeta, ParquetHandler, TableClient};
+use crate::{DeltaResult, FileMeta, TableClient};
 
 mod data_skipping;
 pub mod file_stream;
@@ -156,82 +156,50 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
             .chain(parquet_handler.read_parquet_files(checkpoint_reads, schema.clone())?)
             .boxed();
 
-        LogReplayStream::new(stream, self.predicate.clone())
-    }
-
-    pub fn execute(&self) -> DeltaResult<Pin<Box<dyn Stream<Item = DeltaResult<RecordBatch>>>>> {
-        let parquet_handler = self.table_client.get_parquet_handler();
-        let stream = self.files()?.boxed();
-        Ok(Box::pin(
-            DataStream::new(
-                self.table_root.clone(),
-                self.schema.clone(),
-                parquet_handler,
-                stream,
-            )
-            .try_flatten(),
-        ))
-    }
-}
-
-#[allow(missing_debug_implementations)]
-pub struct DataStream<PRC: Sync> {
-    table_root: Url,
-    parquet_client: Arc<dyn ParquetHandler<FileReadContext = PRC>>,
-    schema: SchemaRef,
-    stream: BoxStream<'static, DeltaResult<Vec<Action>>>,
-}
-
-impl<PRC: Send + Sync> DataStream<PRC> {
-    pub fn new(
-        table_root: Url,
-        schema: SchemaRef,
-        parquet_client: Arc<dyn ParquetHandler<FileReadContext = PRC>>,
-        stream: BoxStream<'static, DeltaResult<Vec<Action>>>,
-    ) -> Self {
-        Self {
-            table_root,
-            schema,
-            parquet_client,
+        LogReplayStream::new(
             stream,
-        }
+            self.predicate.clone(),
+            self.table_client.get_file_system_client(),
+            self.table_root.clone(),
+        )
     }
-}
 
-impl<PRC: Send + Sync> Stream for DataStream<PRC> {
-    type Item = DeltaResult<Pin<Box<dyn Stream<Item = DeltaResult<RecordBatch>>>>>;
+    pub async fn execute(&self) -> DeltaResult<Vec<RecordBatch>> {
+        let parquet_handler = self.table_client.get_parquet_handler();
+        let mut stream = self.files()?.boxed();
 
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        ctx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let stream = Pin::new(&mut self.stream);
-        match stream.poll_next(ctx) {
-            Poll::Ready(Some(Ok(actions))) => {
-                let files = actions
-                    .into_iter()
-                    .map(|action| match action {
-                        Action::Add(add) => FileMeta {
-                            last_modified: add.modification_time,
-                            size: add.size as usize,
-                            location: self.table_root.join(&add.path).unwrap(),
-                        },
-                        _ => panic!("unexpected action type"),
-                    })
-                    .collect::<Vec<_>>();
-                let contexts = self.parquet_client.contextualize_file_reads(files, None)?;
-                let stream = self
-                    .parquet_client
-                    .read_parquet_files(contexts, self.schema.clone())?;
-                Poll::Ready(Some(Ok(stream)))
+        let mut results = Vec::new();
+        while let Some(Ok(data)) = stream.next().await {
+            for file in data {
+                let meta = FileMeta {
+                    last_modified: file.add.modification_time,
+                    size: file.add.size as usize,
+                    location: self.table_root.join(&file.add.path)?,
+                };
+                let context = parquet_handler.contextualize_file_reads(vec![meta], None)?;
+                let batches = parquet_handler
+                    .read_parquet_files(context, self.schema.clone())?
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                if batches.len() < 1 {
+                    continue;
+                }
+                let schema = batches[0].schema();
+                let batch = concat_batches(&schema, &batches)?;
+                if let Some(fut_dv) = file.dv {
+                    let dv = fut_dv.await?;
+                    let vec: Vec<_> = (0..batch.num_rows())
+                        .map(|i| Some(!dv.contains(i.try_into().expect("fit into u32"))))
+                        .collect();
+                    let dv = BooleanArray::from(vec);
+                    results.push(filter_record_batch(&batch, &dv)?);
+                } else {
+                    results.push(batch);
+                }
             }
-            Poll::Ready(Some(Err(err))) => {
-                println!("error ---> {:?}", err);
-                Poll::Ready(Some(Err(Error::MissingVersion)))
-            }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
         }
+
+        Ok(results)
     }
 }
 
@@ -275,12 +243,7 @@ mod tests {
         let table = Table::new(url, table_client);
         let snapshot = table.snapshot(None).await.unwrap();
         let scan = snapshot.scan().await.unwrap().build();
-        let files = scan
-            .execute()
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let files = scan.execute().await.unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].num_rows(), 10)

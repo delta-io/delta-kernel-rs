@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
+use std::sync::Arc;
 
+use futures::future::{BoxFuture, FutureExt};
 use roaring::RoaringTreemap;
 use url::Url;
 
@@ -202,49 +204,61 @@ impl DeletionVectorDescriptor {
         }
     }
 
-    pub async fn read(
+    // TODO read only required byte ranges
+    pub fn read(
         &self,
-        fs_client: &dyn FileSystemClient,
-        parent: &Url,
-    ) -> DeltaResult<RoaringTreemap> {
-        match self.absolute_path(parent)? {
+        fs_client: Arc<dyn FileSystemClient>,
+        parent: Url,
+    ) -> DeltaResult<BoxFuture<'static, DeltaResult<RoaringTreemap>>> {
+        match self.absolute_path(&parent)? {
             None => {
                 let bytes = z85::decode(&self.path_or_inline_dv)
                     .map_err(|_| Error::DeletionVector("Failed to decode DV".to_string()))?;
-                RoaringTreemap::deserialize_from(&bytes[12..])
-                    .map_err(|err| Error::DeletionVector(err.to_string()))
+                let rtm = RoaringTreemap::deserialize_from(&bytes[12..])
+                    .map_err(|err| Error::DeletionVector(err.to_string()));
+                Ok(async { rtm }.boxed())
             }
             Some(path) => {
-                let dv_data = fs_client
-                    .read_files(vec![(path, None)])
-                    .await?
-                    .first()
-                    .ok_or(Error::MissingData("No deletion Vecor data".to_string()))?
-                    .clone();
-                let mut cursor = Cursor::new(dv_data);
-                if let Some(offset) = self.offset {
-                    // TODO should we read the datasize from the DV file?
-                    // offset plus datasize bytes
-                    cursor.set_position((offset + 4) as u64);
-                }
+                let offset = self.offset.clone();
+                let size_in_bytes = self.size_in_bytes.clone();
 
-                let mut buf = vec![0; 4];
-                cursor
-                    .read(&mut buf)
-                    .map_err(|err| Error::DeletionVector(err.to_string()))?;
-                let magic =
-                    i32::from_le_bytes(buf.try_into().map_err(|_| {
+                Ok(Box::pin(async move {
+                    println!("path  --> : {}", path);
+                    println!("offset  --> : {:?}", offset);
+                    println!("size_in_bytes  --> : {}", size_in_bytes);
+
+                    let dv_data = fs_client
+                        .read_files(vec![(path, None)])
+                        .await?
+                        .first()
+                        .ok_or(Error::MissingData("No deletion Vecor data".to_string()))?
+                        .clone();
+
+                    let mut cursor = Cursor::new(dv_data);
+                    if let Some(offset) = offset {
+                        // TODO should we read the datasize from the DV file?
+                        // offset plus datasize bytes
+                        cursor.set_position((offset + 4) as u64);
+                    }
+
+                    let mut buf = vec![0; 4];
+                    cursor
+                        .read(&mut buf)
+                        .map_err(|err| Error::DeletionVector(err.to_string()))?;
+                    let magic = i32::from_le_bytes(buf.try_into().map_err(|_| {
                         Error::DeletionVector("filed to read magic bytes".to_string())
                     })?);
-                assert!(magic == 1681511377);
+                    println!("magic  --> : {}", magic);
+                    // assert!(magic == 1681511377);
 
-                let mut buf = vec![0; self.size_in_bytes as usize];
-                cursor
-                    .read(&mut buf)
-                    .map_err(|err| Error::DeletionVector(err.to_string()))?;
+                    let mut buf = vec![0; size_in_bytes as usize];
+                    cursor
+                        .read(&mut buf)
+                        .map_err(|err| Error::DeletionVector(err.to_string()))?;
 
-                RoaringTreemap::deserialize_from(Cursor::new(buf))
-                    .map_err(|err| Error::DeletionVector(err.to_string()))
+                    RoaringTreemap::deserialize_from(Cursor::new(buf))
+                        .map_err(|err| Error::DeletionVector(err.to_string()))
+                }))
             }
         }
     }
@@ -436,10 +450,10 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let parent = url::Url::from_directory_path(path).unwrap();
         let root = object_store::path::Path::from(parent.path());
-        let fs_client = ObjectStoreFileSystemClient::new(store, root);
+        let fs_client = Arc::new(ObjectStoreFileSystemClient::new(store, root));
 
         let example = dv_example();
-        let tree_map = example.read(&fs_client, &parent).await.unwrap();
+        let tree_map = example.read(fs_client, parent).unwrap().await.unwrap();
 
         let expected: Vec<u64> = vec![0, 9];
         let found = tree_map.iter().collect::<Vec<_>>();

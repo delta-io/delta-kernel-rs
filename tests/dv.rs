@@ -1,31 +1,28 @@
 //! Read a small table with/without deletion vectors.
 //! Must run at the root of the crate
-
-use deltakernel::Table;
-use futures::prelude::*;
-use object_store::local::LocalFileSystem;
-
+use std::path::PathBuf;
 use std::sync::Arc;
+
+use deltakernel::client::DefaultTableClient;
+use deltakernel::Table;
 
 #[tokio::test]
 async fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
-    let path = format!(
-        "{}/tests/data/table-with-dv-small",
-        env!["CARGO_MANIFEST_DIR"]
-    );
-    let storage = Arc::new(LocalFileSystem::new_with_prefix(&path)?);
-    let table = Table::with_store(storage.clone()).at("").build()?;
-    let snapshot = table.get_latest_snapshot().await.unwrap();
-    let scan = snapshot.scan().build();
-    let reader = scan.create_reader();
-    let mut stream = reader
-        .with_files(storage.clone(), scan.files(storage.clone()))
-        .unwrap();
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let table_client = Arc::new(DefaultTableClient::try_new(
+        &url,
+        std::iter::empty::<(&str, &str)>(),
+    )?);
 
-    while let Some(batch) = stream.next().await {
-        let batch = batch?;
+    let table = Table::new(url, table_client);
+    let snapshot = table.snapshot(None).await?;
+    let scan = snapshot.scan().await?.build();
+
+    let mut stream = scan.execute().await?.into_iter();
+    while let Some(batch) = stream.next() {
         let rows = batch.num_rows();
-        arrow::util::pretty::print_batches(&[batch]).unwrap();
+        arrow::util::pretty::print_batches(&[batch])?;
         assert_eq!(rows, 8);
     }
     Ok(())
@@ -33,25 +30,24 @@ async fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
-    let path = format!(
-        "{}/tests/data/table-without-dv-small",
-        env!["CARGO_MANIFEST_DIR"]
-    );
-    let storage = Arc::new(LocalFileSystem::new_with_prefix(&path)?);
-    let table = Table::with_store(storage.clone()).at("").build()?;
-    let snapshot = table.get_latest_snapshot().await.unwrap();
-    let scan = snapshot.scan().build();
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let table_client = Arc::new(DefaultTableClient::try_new(
+        &url,
+        std::iter::empty::<(&str, &str)>(),
+    )?);
 
-    let reader = scan.create_reader();
-    let mut stream = reader
-        .with_files(storage.clone(), scan.files(storage.clone()))
-        .unwrap();
+    let table = Table::new(url, table_client);
+    let snapshot = table.snapshot(None).await?;
+    let scan = snapshot.scan().await?.build();
 
-    while let Some(batch) = stream.next().await {
-        let batch = batch?;
+    let mut stream = scan.execute().await?.into_iter();
+    while let Some(batch) = stream.next() {
         let rows = batch.num_rows();
         arrow::util::pretty::print_batches(&[batch]).unwrap();
         assert_eq!(rows, 10);
     }
     Ok(())
 }
+// file:///home/reap/code/delta-kernel-rs/tests/data/table-with-dv-small/deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin
+// file:///home/reap/code/delta-kernel-rs/tests/data/table-with-dv-small/deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin

@@ -77,7 +77,7 @@ fn add_fields() -> Vec<Field> {
             DataType::Struct(Fields::from(vec![
                 Field::new("storageType", DataType::Utf8, false),
                 Field::new("pathOrInlineDv", DataType::Utf8, false),
-                Field::new("offset", DataType::Int64, true),
+                Field::new("offset", DataType::Int32, true),
                 Field::new("sizeInBytes", DataType::Int32, false),
                 Field::new("cardinality", DataType::Int64, false),
             ])),
