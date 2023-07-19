@@ -8,7 +8,7 @@ use deltakernel::client::DefaultTableClient;
 use deltakernel::{Table, Version};
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 struct TableVersionMetaData {
     version: Version,
     properties: HashMap<String, String>,
@@ -43,10 +43,26 @@ fn reader_test(path: &Path) -> datatest_stable::Result<()> {
             let table_client = Arc::new(
                 DefaultTableClient::try_new(&url, std::iter::empty::<(&str, &str)>()).unwrap(),
             );
+
+            // assert correct version is loaded
             let table = Table::new(url, table_client);
             let snapshot = table.snapshot(None).await.unwrap();
-
             assert_eq!(snapshot.version(), expected_tvm.version);
+
+            // assert correct metadata is read
+            let metadata = snapshot.metadata().await.unwrap();
+            let protocol = snapshot.protocol().await.unwrap();
+            let tvm = TableVersionMetaData {
+                version: snapshot.version(),
+                properties: metadata
+                    .configuration
+                    .into_iter()
+                    .map(|(k, v)| (k, v.unwrap()))
+                    .collect(),
+                min_reader_version: protocol.min_reader_version as u32,
+                min_writer_version: protocol.min_wrriter_version as u32,
+            };
+            assert_eq!(tvm, expected_tvm);
         });
     Ok(())
 }

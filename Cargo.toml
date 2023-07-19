@@ -26,7 +26,7 @@ chrono = { version = "0.4", optional = true }
 either = "1.8"
 fix-hidden-lifetime-bug = "0.2"
 futures = "0.3"
-itertools = "0.10"
+itertools = "0.11"
 lazy_static = "1.4"
 # used for providing a storage abstraction layer
 object_store = "^0.6.0"
@@ -34,7 +34,7 @@ object_store = "^0.6.0"
 parquet = "^42.0"
 regex = "1.8"
 roaring = "0.10.1"
-serde = { version = "1", features = ["derive"]}
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 # only for structured logging
@@ -46,6 +46,7 @@ z85 = "3.0.5"
 [features]
 default = ["default-client"]
 default-client = ["chrono", "parquet/async", "parquet/object_store"]
+acceptance = []
 
 [build-dependencies]
 ureq = "2.2.0"
