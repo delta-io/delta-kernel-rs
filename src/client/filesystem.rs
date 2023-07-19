@@ -15,10 +15,10 @@ pub struct ObjectStoreFileSystemClient {
 }
 
 impl ObjectStoreFileSystemClient {
-    pub fn new(store: Arc<DynObjectStore>, prefix: Path) -> Self {
+    pub fn new(store: Arc<DynObjectStore>, table_root: Path) -> Self {
         Self {
             inner: store,
-            table_root: prefix,
+            table_root,
         }
     }
 }

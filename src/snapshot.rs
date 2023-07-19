@@ -24,16 +24,12 @@ const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 pub struct LogSegment {
     log_root: Url,
     /// Reverse order soprted commit files in the log segment
-    commit_files: Vec<FileMeta>,
+    pub(crate) commit_files: Vec<FileMeta>,
     /// checkpoint files in the log segement.
-    checkpoint_files: Vec<FileMeta>,
+    pub(crate) checkpoint_files: Vec<FileMeta>,
 }
 
 impl LogSegment {
-    pub(crate) fn checkpoint_files(&self) -> impl Iterator<Item = &FileMeta> {
-        self.checkpoint_files.iter()
-    }
-
     pub(crate) fn commit_files(&self) -> impl Iterator<Item = &FileMeta> {
         self.commit_files.iter()
     }
@@ -164,30 +160,25 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
 
         // remove all files above requested version
         if let Some(version) = version {
-            commit_files = commit_files
-                .into_iter()
-                .filter(|meta| {
-                    if let Some(v) = LogPath(&meta.location).commit_version() {
-                        v <= version
-                    } else {
-                        false
-                    }
-                })
-                .collect();
+            commit_files.retain(|meta| {
+                if let Some(v) = LogPath(&meta.location).commit_version() {
+                    v <= version
+                } else {
+                    false
+                }
+            });
         }
 
         // get the effective version from chosen files
         let version_eff = if !commit_files.is_empty() {
             commit_files
                 .first()
-                .map(|f| LogPath(&f.location).commit_version())
-                .flatten()
+                .and_then(|f| LogPath(&f.location).commit_version())
                 .unwrap()
         } else if !checkpoint_files.is_empty() {
             checkpoint_files
                 .first()
-                .map(|f| LogPath(&f.location).commit_version())
-                .flatten()
+                .and_then(|f| LogPath(&f.location).commit_version())
                 .unwrap()
         } else {
             // TODO more descriptive error
@@ -321,7 +312,7 @@ async fn read_last_checkpoint(
             None => Ok(None),
         },
         Err(Error::FileNotFound(_)) => Ok(None),
-        Err(err) => Err(err.into()),
+        Err(err) => Err(err),
     }
 }
 
@@ -405,12 +396,9 @@ async fn list_log_files(
         }
     }
 
-    commit_files = commit_files
-        .into_iter()
-        .filter(|f| {
-            LogPath(&f.location).commit_version().unwrap_or(0) as i64 > max_checkpoint_version
-        })
-        .collect();
+    commit_files.retain(|f| {
+        LogPath(&f.location).commit_version().unwrap_or(0) as i64 > max_checkpoint_version
+    });
     // NOTE this will sort in reverse order
     commit_files.sort_unstable_by(|a, b| b.location.cmp(&a.location));
 

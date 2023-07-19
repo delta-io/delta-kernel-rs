@@ -67,7 +67,7 @@ impl<'a> LogPath<'a> {
 
 impl<'a> AsRef<Url> for LogPath<'a> {
     fn as_ref(&self) -> &Url {
-        &self.0
+        self.0
     }
 }
 

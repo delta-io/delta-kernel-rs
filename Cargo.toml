@@ -2,10 +2,10 @@
 name = "deltakernel"
 version = "0.0.0"
 edition = "2021"
-build = "build.rs"
 authors = [
   "Zach Schuermann <zach@zvs.io>",
   "R. Tyler Croy <rtyler@brokenco.de>",
+  "Robert Pack <robstar.pack@gmail.com>",
 ]
 readme = "README.md"
 keywords = ["deltalake", "delta", "datalake"]
@@ -47,11 +47,6 @@ z85 = "3.0.5"
 default = ["default-client"]
 default-client = ["chrono", "parquet/async", "parquet/object_store"]
 acceptance = []
-
-[build-dependencies]
-ureq = "2.2.0"
-flate2 = "1.0.20"
-tar = "0.4.36"
 
 [dev-dependencies]
 arrow = { version = "^42.0", features = ["json", "prettyprint"] }

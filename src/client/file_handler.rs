@@ -198,7 +198,7 @@ impl<F: FileOpener> FileStream<F> {
                                 },
                                 OnError::Fail => {
                                     self.state = FileStreamState::Error;
-                                    return Poll::Ready(Some(Err(err.into())));
+                                    return Poll::Ready(Some(Err(err)));
                                 }
                             }
                         }
