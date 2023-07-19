@@ -80,6 +80,7 @@ pub struct FileStream<F: FileOpener> {
     file_iter: VecDeque<FileMeta>,
     /// The stream schema (file schema including partition columns and after
     /// projection).
+    #[allow(unused)]
     projected_schema: ArrowSchemaRef,
     /// A closure that takes a reader and an optional remaining number of lines
     /// (before reaching the limit) and returns a batch iterator. If the file reader

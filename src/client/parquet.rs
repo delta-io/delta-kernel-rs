@@ -4,10 +4,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef as ArrowSchemaRef;
-use chrono::{TimeZone, Utc};
 use futures::stream::{StreamExt, TryStreamExt};
 use object_store::path::Path;
-use object_store::{DynObjectStore, ObjectMeta};
+use object_store::DynObjectStore;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 

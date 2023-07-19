@@ -22,8 +22,10 @@ const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 
 #[derive(Debug)]
 pub struct LogSegment {
-    log_path: Url,
+    log_root: Url,
+    /// Reverse order soprted commit files in the log segment
     commit_files: Vec<FileMeta>,
+    /// checkpoint files in the log segement.
     checkpoint_files: Vec<FileMeta>,
 }
 
@@ -54,9 +56,9 @@ impl LogSegment {
         let commit_stream = json_client
             .read_json_files(read_contexts, Arc::new(read_schema.clone().try_into()?))?;
 
-        let checkpoint_files: Vec<_> = self.checkpoint_files().cloned().collect();
         let parquet_client = table_client.get_parquet_handler();
-        let read_contexts = parquet_client.contextualize_file_reads(checkpoint_files, None)?;
+        let read_contexts =
+            parquet_client.contextualize_file_reads(self.checkpoint_files.clone(), None)?;
         let checkpoint_stream = parquet_client
             .read_parquet_files(read_contexts, Arc::new(read_schema.clone().try_into()?))?;
 
@@ -118,7 +120,7 @@ pub struct Snapshot<JRC: Send, PRC: Send> {
 impl<JRC: Send, PRC: Send> std::fmt::Debug for Snapshot<JRC, PRC> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Snapshot")
-            .field("path", &self.log_segment.log_path.as_str())
+            .field("path", &self.log_segment.log_root.as_str())
             .field("version", &self.version)
             .field("metadata", &self.metadata)
             .finish()
@@ -141,6 +143,7 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
         let fs_client = table_client.get_file_system_client();
         let log_url = LogPath(&table_root).child("_delta_log/").unwrap();
 
+        // List relevant files from log
         let (mut commit_files, checkpoint_files) =
             match read_last_checkpoint(fs_client.as_ref(), &log_url).await {
                 Err(err) => return Err(err),
@@ -159,6 +162,7 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
                 Ok(None) => list_log_files(fs_client.as_ref(), &log_url).await?,
             };
 
+        // remove all files above requested version
         if let Some(version) = version {
             commit_files = commit_files
                 .into_iter()
@@ -172,6 +176,7 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
                 .collect();
         }
 
+        // get the effective version from chosen files
         let version_eff = if !commit_files.is_empty() {
             commit_files
                 .first()
@@ -197,7 +202,7 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
         }
 
         let log_segment = LogSegment {
-            log_path: log_url,
+            log_root: log_url,
             commit_files,
             checkpoint_files,
         };
@@ -302,11 +307,14 @@ pub struct CheckpointMetadata {
     pub checksum: Option<String>,
 }
 
+/// Try reading the `_last_checkpoint` file.
+///
+/// In case the file is not found, `None` is returned.
 async fn read_last_checkpoint(
     fs_client: &dyn FileSystemClient,
-    log_path: &Url,
+    log_root: &Url,
 ) -> DeltaResult<Option<CheckpointMetadata>> {
-    let file_path = LogPath(log_path).child(LAST_CHECKPOINT_FILE_NAME)?;
+    let file_path = LogPath(log_root).child(LAST_CHECKPOINT_FILE_NAME)?;
     match fs_client.read_files(vec![(file_path, None)]).await {
         Ok(data) => match data.first() {
             Some(data) => Ok(Some(serde_json::from_slice(data)?)),
@@ -317,6 +325,7 @@ async fn read_last_checkpoint(
     }
 }
 
+/// List all log files after a givben checkpoint.
 async fn list_log_files_with_checkpoint(
     cp: &CheckpointMetadata,
     fs_client: &dyn FileSystemClient,
@@ -365,6 +374,9 @@ async fn list_log_files_with_checkpoint(
     Ok((commit_files, checkpoint_files))
 }
 
+/// List relevant log files.
+///
+/// Relevant files are the max checkpoint found and all subsequent commits.
 async fn list_log_files(
     fs_client: &dyn FileSystemClient,
     log_root: &Url,
