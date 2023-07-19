@@ -11,14 +11,14 @@ use crate::{DeltaResult, Error, FileMeta, FileSlice, FileSystemClient};
 #[derive(Debug)]
 pub struct ObjectStoreFileSystemClient {
     inner: Arc<DynObjectStore>,
-    prefix: Path,
+    table_root: Path,
 }
 
 impl ObjectStoreFileSystemClient {
     pub fn new(store: Arc<DynObjectStore>, prefix: Path) -> Self {
         Self {
             inner: store,
-            prefix,
+            table_root: prefix,
         }
     }
 }
@@ -29,7 +29,7 @@ impl FileSystemClient for ObjectStoreFileSystemClient {
         let url = path.clone();
         let offset = Path::from(path.path());
         // TODO properly handle table prefix
-        let prefix = self.prefix.child("_delta_log");
+        let prefix = self.table_root.child("_delta_log");
         Ok(self
             .inner
             .list_with_offset(Some(&prefix), &offset)
@@ -65,9 +65,11 @@ impl FileSystemClient for ObjectStoreFileSystemClient {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use object_store::{local::LocalFileSystem, ObjectStore};
     use std::ops::Range;
+
+    use object_store::{local::LocalFileSystem, ObjectStore};
+
+    use super::*;
 
     #[tokio::test]
     async fn test_read_files() {
