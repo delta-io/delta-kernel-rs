@@ -1,14 +1,15 @@
+use std::sync::Arc;
+
 use arrow::array::{ArrayRef, Int32Array, StringArray};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use deltakernel::client::DefaultTableClient;
 use deltakernel::expressions::Expression;
 use deltakernel::Table;
-use futures::prelude::*;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-
-use std::sync::Arc;
+use url::Url;
 
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
 const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c000.snappy.parquet";
@@ -54,7 +55,7 @@ fn generate_simple_batch() -> Result<RecordBatch, ArrowError> {
 }
 
 async fn add_commit(
-    store: Arc<dyn ObjectStore>,
+    store: &dyn ObjectStore,
     version: u64,
     data: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -68,7 +69,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
     add_commit(
-        storage.clone(),
+        storage.as_ref(),
         0,
         generate_commit(vec![
             TestAction::Metadata,
@@ -84,20 +85,19 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         .put(&Path::from(PARQUET_FILE2), load_parquet(&batch).into())
         .await?;
 
-    let table = Table::with_store(storage.clone()).at("").build()?;
+    let location = Url::parse("memory:///")?;
+    let table_client = Arc::new(DefaultTableClient::new(storage.clone(), Path::from("/")));
+
+    let table = Table::new(location, table_client);
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.get_latest_snapshot().await.unwrap();
-    let scan = snapshot.scan().build();
-    let reader = scan.create_reader();
+    let snapshot = table.snapshot(None).await?;
+    let scan = snapshot.scan().await?.build();
+
     let mut files = 0;
+    let mut stream = scan.execute().await?.into_iter().zip(expected_data);
 
-    let mut stream = reader
-        .with_files(storage.clone(), scan.files(storage.clone()))?
-        .map(|res| res.unwrap())
-        .zip(stream::iter(expected_data));
-
-    while let Some((data, expected)) = stream.next().await {
+    while let Some((data, expected)) = stream.next() {
         files += 1;
         assert_eq!(data, expected);
     }
@@ -110,13 +110,16 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
     add_commit(
-        storage.clone(),
+        storage.as_ref(),
         0,
-        generate_commit(vec![TestAction::Add(PARQUET_FILE1.to_string())]),
+        generate_commit(vec![
+            TestAction::Metadata,
+            TestAction::Add(PARQUET_FILE1.to_string()),
+        ]),
     )
     .await?;
     add_commit(
-        storage.clone(),
+        storage.as_ref(),
         1,
         generate_commit(vec![TestAction::Add(PARQUET_FILE2.to_string())]),
     )
@@ -128,20 +131,19 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         .put(&Path::from(PARQUET_FILE2), load_parquet(&batch).into())
         .await?;
 
-    let table = Table::with_store(storage.clone()).at("").build()?;
+    let location = Url::parse("memory:///").unwrap();
+    let table_client = Arc::new(DefaultTableClient::new(storage.clone(), Path::from("/")));
+
+    let table = Table::new(location, table_client);
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.get_latest_snapshot().await.unwrap();
-    let scan = snapshot.scan().build();
-    let reader = scan.create_reader();
+    let snapshot = table.snapshot(None).await.unwrap();
+    let scan = snapshot.scan().await?.build();
+
     let mut files = 0;
+    let mut stream = scan.execute().await?.into_iter().zip(expected_data);
 
-    let mut stream = reader
-        .with_files(storage.clone(), scan.files(storage.clone()))?
-        .map(|res| res.unwrap())
-        .zip(stream::iter(expected_data));
-
-    while let Some((data, expected)) = stream.next().await {
+    while let Some((data, expected)) = stream.next() {
         files += 1;
         assert_eq!(data, expected);
     }
@@ -155,19 +157,22 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
     add_commit(
-        storage.clone(),
+        storage.as_ref(),
         0,
-        generate_commit(vec![TestAction::Add(PARQUET_FILE1.to_string())]),
+        generate_commit(vec![
+            TestAction::Metadata,
+            TestAction::Add(PARQUET_FILE1.to_string()),
+        ]),
     )
     .await?;
     add_commit(
-        storage.clone(),
+        storage.as_ref(),
         1,
         generate_commit(vec![TestAction::Add(PARQUET_FILE2.to_string())]),
     )
     .await?;
     add_commit(
-        storage.clone(),
+        storage.as_ref(),
         2,
         generate_commit(vec![TestAction::Remove(PARQUET_FILE2.to_string())]),
     )
@@ -176,20 +181,19 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         .put(&Path::from(PARQUET_FILE1), load_parquet(&batch).into())
         .await?;
 
-    let table = Table::with_store(storage.clone()).at("").build()?;
+    let location = Url::parse("memory:///").unwrap();
+    let table_client = Arc::new(DefaultTableClient::new(storage.clone(), Path::from("/")));
+
+    let table = Table::new(location, table_client);
     let expected_data = vec![batch];
 
-    let snapshot = table.get_latest_snapshot().await.unwrap();
-    let scan = snapshot.scan().build();
-    let reader = scan.create_reader();
+    let snapshot = table.snapshot(None).await?;
+    let scan = snapshot.scan().await?.build();
+
+    let mut stream = scan.execute().await?.into_iter().zip(expected_data);
+
     let mut files = 0;
-
-    let mut stream = reader
-        .with_files(storage.clone(), scan.files(storage.clone()))?
-        .map(|res| res.unwrap())
-        .zip(stream::iter(expected_data));
-
-    while let Some((data, expected)) = stream.next().await {
+    while let Some((data, expected)) = stream.next() {
         files += 1;
         assert_eq!(data, expected);
     }
@@ -213,14 +217,17 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     let storage = Arc::new(InMemory::new());
     // valid commit with min/max (0, 2)
     add_commit(
-        storage.clone(),
+        storage.as_ref(),
         0,
-        generate_commit(vec![TestAction::Add(PARQUET_FILE1.to_string())]),
+        generate_commit(vec![
+            TestAction::Metadata,
+            TestAction::Add(PARQUET_FILE1.to_string()),
+        ]),
     )
     .await?;
     // storage.add_commit(1, &format!("{}\n", r#"{{"add":{{"path":"doesnotexist","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"ids\":0}},\"minValues\":{{\"ids\": 0}},\"maxValues\":{{\"ids\":2}}}}"}}}}"#));
     add_commit(
-        storage.clone(),
+        storage.as_ref(),
         1,
         generate_commit2(vec![TestAction::Add(PARQUET_FILE2.to_string())]),
     )
@@ -230,25 +237,24 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         .put(&Path::from(PARQUET_FILE1), load_parquet(&batch).into())
         .await?;
 
-    let table = Table::with_store(storage.clone()).at("").build()?;
+    let location = Url::parse("memory:///").unwrap();
+    let table_client = Arc::new(DefaultTableClient::new(storage.clone(), Path::from("/")));
+
+    let table = Table::new(location, table_client);
     let expected_data = vec![batch];
 
-    let snapshot = table.get_latest_snapshot().await.unwrap();
+    let snapshot = table.snapshot(None).await?;
 
     let predicate = Expression::LessThan(
         Box::new(Expression::Column(String::from("ids"))),
         Box::new(Expression::Literal(2)),
     );
-    let scan = snapshot.scan().with_predicate(predicate).build();
-    let reader = scan.create_reader();
+    let scan = snapshot.scan().await?.with_predicate(predicate).build();
+
     let mut files = 0;
+    let mut stream = scan.execute().await?.into_iter().zip(expected_data);
 
-    let mut stream = reader
-        .with_files(storage.clone(), scan.files(storage.clone()))?
-        .map(|res| res.unwrap())
-        .zip(stream::iter(expected_data));
-
-    while let Some((data, expected)) = stream.next().await {
+    while let Some((data, expected)) = stream.next() {
         files += 1;
         assert_eq!(data, expected);
     }

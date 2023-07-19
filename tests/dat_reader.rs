@@ -1,13 +1,12 @@
-use deltakernel::Table;
-use deltakernel::Version;
-use object_store::local::LocalFileSystem;
-use serde::{Deserialize, Serialize};
-
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use deltakernel::client::DefaultTableClient;
+use deltakernel::{Table, Version};
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
 struct TableVersionMetaData {
@@ -28,7 +27,6 @@ fn reader_test(path: &Path) -> datatest_stable::Result<()> {
         env!["CARGO_MANIFEST_DIR"],
         path.parent().unwrap().to_str().unwrap()
     );
-    let storage = Arc::new(LocalFileSystem::new_with_prefix(&root_dir)?);
     let expected_tvm_path = format!("{}/expected/latest/table_version_metadata.json", root_dir);
     let file = File::open(expected_tvm_path).expect("Oops");
     let reader = BufReader::new(file);
@@ -39,11 +37,14 @@ fn reader_test(path: &Path) -> datatest_stable::Result<()> {
         .build()
         .unwrap()
         .block_on(async {
-            let table = Table::with_store(storage.clone())
-                .at("delta")
-                .build()
-                .expect("Failed to build table");
-            let snapshot = table.get_latest_snapshot().await.unwrap();
+            let path =
+                std::fs::canonicalize(PathBuf::from(format!("{}/delta/", root_dir))).unwrap();
+            let url = url::Url::from_directory_path(path).unwrap();
+            let table_client = Arc::new(
+                DefaultTableClient::try_new(&url, std::iter::empty::<(&str, &str)>()).unwrap(),
+            );
+            let table = Table::new(url, table_client);
+            let snapshot = table.snapshot(None).await.unwrap();
 
             assert_eq!(snapshot.version(), expected_tvm.version);
         });

@@ -1,0 +1,70 @@
+# EditorConfig is awesome: https://EditorConfig.org
+
+root = true
+
+[*]
+indent_style = space
+indent_size = 2
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+[*.{py,pyi}]
+indent_size = 4
+max_line_length = 100
+multi_line_output = 3
+include_trailing_comma = True
+force_grid_wrap = 0
+use_parentheses = True
+ensure_newline_before_comments = True
+
+[*.rs]
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.html]
+indent_size = 2
+
+[*.json]
+indent_size = 2
+insert_final_newline = ignore
+
+# Minified JavaScript files shouldn't be changed
+[**.min.js]
+indent_style = ignore
+insert_final_newline = ignore
+
+[{Makefile,**.mk}]
+# Use tabs for indentation (Makefiles require tabs)
+indent_style = tab
+# Use Unix line endings
+end_of_line = lf
+# The files are utf-8 encoded
+charset = utf-8
+
+# Batch files use tabs for indentation
+[*.bat]
+indent_style = tab
+
+[*.md]
+trim_trailing_whitespace = true
+insert_final_newline = false
+
+[*.cmd]
+end_of_line = crlf
+
+[*.env]
+end_of_line = crlf
+
+[*.pem]
+insert_final_newline = false
+
+[*.crt]
+insert_final_newline = false
+
+[*.j2]
+insert_final_newline = false

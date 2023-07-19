@@ -15,19 +15,8 @@ use crate::scan::Expression;
 
 pub(crate) fn data_skipping_filter(
     actions: RecordBatch,
-    predicate: &Option<Expression>,
+    predicate: &Expression,
 ) -> DeltaResult<RecordBatch> {
-    let predicate = match predicate {
-        Some(p) => p,
-        None => return Ok(actions),
-    };
-    // debug!(
-    //     "actions before data skipping:\n{}\n{}\n{}",
-    //     arrow::util::pretty::pretty_format_columns("add", &[actions.column(0).clone()]).unwrap(),
-    //     arrow::util::pretty::pretty_format_columns("remove", &[actions.column(1).clone()]).unwrap(),
-    //     arrow::util::pretty::pretty_format_columns("metadata", &[actions.column(2).clone()])
-    //         .unwrap()
-    // ); // FIXME
     let adds = actions
         .column_by_name("add")
         .ok_or(Error::MissingColumn("Column 'add' not found.".into()))?

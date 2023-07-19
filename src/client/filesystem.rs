@@ -6,8 +6,7 @@ use object_store::path::Path;
 use object_store::DynObjectStore;
 use url::Url;
 
-use super::{FileMeta, FileSlice, FileSystemClient};
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, Error, FileMeta, FileSlice, FileSystemClient};
 
 #[derive(Debug)]
 pub struct ObjectStoreFileSystemClient {
@@ -29,9 +28,11 @@ impl FileSystemClient for ObjectStoreFileSystemClient {
     async fn list_from(&self, path: &Url) -> DeltaResult<BoxStream<'_, DeltaResult<FileMeta>>> {
         let url = path.clone();
         let offset = Path::from(path.path());
+        // TODO properly handle table prefix
+        let prefix = self.prefix.child("_delta_log");
         Ok(self
             .inner
-            .list_with_offset(Some(&self.prefix), &offset)
+            .list_with_offset(Some(&prefix), &offset)
             .await?
             .map_err(Error::from)
             .map_ok(move |meta| {
@@ -51,7 +52,11 @@ impl FileSystemClient for ObjectStoreFileSystemClient {
         let mut bytes = Vec::new();
         for (url, range) in files {
             let path = Path::from(url.path());
-            let data = self.inner.get_range(&path, range).await?;
+            let data = if let Some(rng) = range {
+                self.inner.get_range(&path, rng).await?
+            } else {
+                self.inner.get(&path).await?.bytes().await?
+            };
             bytes.push(data);
         }
         Ok(bytes)
@@ -63,38 +68,6 @@ mod tests {
     use super::*;
     use object_store::{local::LocalFileSystem, ObjectStore};
     use std::ops::Range;
-
-    #[tokio::test]
-    async fn test_list_from() {
-        let tmp = tempfile::tempdir().unwrap();
-        let tmp_store = LocalFileSystem::new_with_prefix(tmp.path()).unwrap();
-
-        let data = Bytes::from("kernel-data");
-        tmp_store.put(&Path::from("a"), data.clone()).await.unwrap();
-        tmp_store.put(&Path::from("b"), data.clone()).await.unwrap();
-        tmp_store.put(&Path::from("c"), data.clone()).await.unwrap();
-
-        let mut url = Url::from_directory_path(tmp.path()).unwrap();
-
-        let store = Arc::new(LocalFileSystem::new());
-        let prefix = Path::from(url.path());
-        let client = ObjectStoreFileSystemClient::new(store, prefix);
-
-        url.set_path(&format!("{}/b", url.path().trim_end_matches('/')));
-
-        println!("{}", url.as_str());
-
-        let files = client
-            .list_from(&url)
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        assert_eq!(files.len(), 1);
-        assert!(files[0].location.as_ref().ends_with("/c"))
-    }
 
     #[tokio::test]
     async fn test_read_files() {
@@ -116,11 +89,11 @@ mod tests {
 
         let mut url1 = url.clone();
         url1.set_path(&format!("{}/b", url.path()));
-        slices.push((url1.clone(), Range { start: 0, end: 6 }));
-        slices.push((url1, Range { start: 7, end: 11 }));
+        slices.push((url1.clone(), Some(Range { start: 0, end: 6 })));
+        slices.push((url1, Some(Range { start: 7, end: 11 })));
 
         url.set_path(&format!("{}/c", url.path()));
-        slices.push((url, Range { start: 4, end: 9 }));
+        slices.push((url, Some(Range { start: 4, end: 9 })));
 
         let data = client.read_files(slices).await.unwrap();
 

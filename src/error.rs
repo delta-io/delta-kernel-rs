@@ -18,7 +18,10 @@ pub enum Error {
     Parquet(#[from] parquet::errors::ParquetError),
 
     #[error("Error interacting with object store: {0}")]
-    ObjectStore(#[from] object_store::Error),
+    ObjectStore(object_store::Error),
+
+    #[error("File not found: {0}")]
+    FileNotFound(String),
 
     #[error("{0}")]
     MissingColumn(String),
@@ -34,4 +37,22 @@ pub enum Error {
 
     #[error("Deleteion Vecor error: {0}")]
     DeletionVector(String),
+
+    #[error("Invalid url: {0}")]
+    InvalidUrl(#[from] url::ParseError),
+
+    #[error("Invalid url: {0}")]
+    MalformedJson(#[from] serde_json::Error),
+
+    #[error("No table metadata found in delta log.")]
+    MissingMetadata,
+}
+
+impl From<object_store::Error> for Error {
+    fn from(value: object_store::Error) -> Self {
+        match value {
+            object_store::Error::NotFound { path, .. } => Self::FileNotFound(path),
+            err => Self::ObjectStore(err),
+        }
+    }
 }
