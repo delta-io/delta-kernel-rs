@@ -11,7 +11,7 @@ use self::file_stream::LogReplayStream;
 use crate::actions::ActionType;
 use crate::expressions::Expression;
 use crate::schema::{Schema, SchemaRef};
-use crate::snapshot::LogSegmentNew;
+use crate::snapshot::LogSegment;
 use crate::{DeltaResult, FileMeta, TableClient};
 
 mod data_skipping;
@@ -21,7 +21,7 @@ pub mod file_stream;
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder<JRC: Send, PRC: Send> {
     table_root: Url,
-    log_segment: LogSegmentNew,
+    log_segment: LogSegment,
     snapshot_schema: SchemaRef,
     schema: Option<SchemaRef>,
     predicate: Option<Expression>,
@@ -42,7 +42,7 @@ impl<JRC: Send, PRC: Send + Sync> ScanBuilder<JRC, PRC> {
     pub(crate) fn new(
         table_root: Url,
         snapshot_schema: SchemaRef,
-        log_segment: LogSegmentNew,
+        log_segment: LogSegment,
         table_client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
     ) -> Self {
         Self {
@@ -95,7 +95,7 @@ impl<JRC: Send, PRC: Send + Sync> ScanBuilder<JRC, PRC> {
 
 pub struct Scan<JRC: Send, PRC: Send + Sync> {
     table_root: Url,
-    log_segment: LogSegmentNew,
+    log_segment: LogSegment,
     schema: SchemaRef,
     predicate: Option<Expression>,
     table_client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
