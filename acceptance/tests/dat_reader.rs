@@ -1,8 +1,7 @@
-#[cfg(feature = "acceptance")]
 use std::path::Path;
 use std::sync::Arc;
 
-use deltakernel::acceptance::read_dat_case;
+use acceptance::read_dat_case;
 use deltakernel::client::DefaultTableClient;
 
 fn reader_test(path: &Path) -> datatest_stable::Result<()> {

@@ -8,8 +8,8 @@ use object_store::{local::LocalFileSystem, ObjectStore};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::snapshot::Snapshot;
-use crate::{Error, Table, TableClient, Version};
+use deltakernel::snapshot::Snapshot;
+use deltakernel::{Error, Table, TableClient, Version};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssertionError {

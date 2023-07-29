@@ -170,9 +170,7 @@ fn parse_action_metadata(arr: &StructArray) -> DeltaResult<Box<dyn Iterator<Item
         metadata.configuration = keys
             .into_iter()
             .zip(values.into_iter())
-            .filter_map(|(k, v)| {
-                k.map(|key| (key.to_string(), v.map(|vv| vv.to_string())))
-            })
+            .filter_map(|(k, v)| k.map(|key| (key.to_string(), v.map(|vv| vv.to_string()))))
             .collect::<HashMap<_, _>>();
     };
 
@@ -518,9 +516,7 @@ fn struct_array_to_map(arr: &StructArray) -> DeltaResult<HashMap<String, Option<
     Ok(keys
         .into_iter()
         .zip(values.into_iter())
-        .filter_map(|(k, v)| {
-            k.map(|key| (key.to_string(), v.map(|vv| vv.to_string())))
-        })
+        .filter_map(|(k, v)| k.map(|key| (key.to_string(), v.map(|vv| vv.to_string()))))
         .collect())
 }
 

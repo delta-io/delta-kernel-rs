@@ -67,8 +67,6 @@ pub use table::Table;
 pub mod client;
 #[cfg(feature = "default-client")]
 pub use client::*;
-#[cfg(feature = "acceptance")]
-pub mod acceptance;
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;

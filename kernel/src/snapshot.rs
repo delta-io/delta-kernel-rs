@@ -407,23 +407,17 @@ async fn list_log_files(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     use std::collections::HashMap;
     use std::path::PathBuf;
 
     use object_store::local::LocalFileSystem;
     use object_store::path::Path;
 
-    use super::*;
-    use crate::client::filesystem::ObjectStoreFileSystemClient;
     use crate::client::DefaultTableClient;
+    use crate::filesystem::ObjectStoreFileSystemClient;
     use crate::schema::StructType;
-
-    #[test]
-    fn test_checkpoint_serde() {
-        let file = std::fs::File::open("./tests/dat/out/reader_tests/generated/with_checkpoint/delta/_delta_log/_last_checkpoint").unwrap();
-        let cp: CheckpointMetadata = serde_json::from_reader(file).unwrap();
-        assert_eq!(cp.version, 2)
-    }
 
     #[tokio::test]
     async fn test_snapshot_read_metadata() {
@@ -476,19 +470,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_last_checkpoint() {
-        let path = std::fs::canonicalize(PathBuf::from(
-            "./tests/dat/out/reader_tests/generated/with_checkpoint/delta/_delta_log/",
-        ))
-        .unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-
-        let store = Arc::new(LocalFileSystem::new());
-        let prefix = Path::from(url.path());
-        let client = ObjectStoreFileSystemClient::new(store, prefix);
-        let cp = read_last_checkpoint(&client, &url).await.unwrap().unwrap();
-        assert_eq!(cp.version, 2);
-
+    async fn test_read_table_with_last_checkpoint() {
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/table-with-dv-small/_delta_log/",
         ))
@@ -504,29 +486,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_table_with_checkpoint() {
-        let path = std::fs::canonicalize(PathBuf::from(
-            "./tests/dat/out/reader_tests/generated/with_checkpoint/delta/",
-        ))
-        .unwrap();
-        let location = url::Url::from_directory_path(path).unwrap();
-        let table_client = Arc::new(
-            DefaultTableClient::try_new(&location, HashMap::<String, String>::new()).unwrap(),
-        );
-        let snapshot = Snapshot::try_new(location, table_client, None)
-            .await
-            .unwrap();
-
-        assert_eq!(snapshot.log_segment.checkpoint_files.len(), 1);
-        assert_eq!(
-            LogPath(&snapshot.log_segment.checkpoint_files[0].location).commit_version(),
-            Some(2)
-        );
-        assert_eq!(snapshot.log_segment.commit_files.len(), 1);
-        assert_eq!(
-            LogPath(&snapshot.log_segment.commit_files[0].location).commit_version(),
-            Some(3)
-        );
-
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/with_checkpoint_no_last_checkpoint/",
         ))
