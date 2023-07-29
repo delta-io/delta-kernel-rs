@@ -23,14 +23,6 @@ impl<'a> LogPath<'a> {
         Ok(self.0.join(path.as_ref())?)
     }
 
-    pub(crate) fn path(&self) -> &str {
-        self.0.path()
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        self.as_ref()
-    }
-
     /// Returns the last path segment containing the filename stored in this [`LogPath`]
     pub(crate) fn filename(&self) -> Option<&str> {
         match self.0.path().is_empty() || self.0.path().ends_with('/') {
@@ -40,6 +32,7 @@ impl<'a> LogPath<'a> {
     }
 
     /// Returns the extension of the file stored in this [`LogPath`], if any
+    #[allow(unused)]
     pub(crate) fn extension(&self) -> Option<&str> {
         self.filename()
             .and_then(|f| f.rsplit_once('.'))
@@ -74,7 +67,7 @@ impl<'a> LogPath<'a> {
 
 impl<'a> AsRef<Url> for LogPath<'a> {
     fn as_ref(&self) -> &Url {
-        &self.0
+        self.0
     }
 }
 

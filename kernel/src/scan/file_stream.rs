@@ -55,6 +55,7 @@ impl LogReplayStream {
 /// A fallible future that resolves to a stream of [`RecordBatch`]
 pub type DvOpenFuture = BoxFuture<'static, DeltaResult<RoaringTreemap>>;
 
+#[allow(missing_debug_implementations)]
 pub struct DataFile {
     pub add: Add,
     pub dv: Option<DvOpenFuture>,

@@ -95,9 +95,9 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let scan = snapshot.scan().await?.build();
 
     let mut files = 0;
-    let mut stream = scan.execute().await?.into_iter().zip(expected_data);
+    let stream = scan.execute().await?.into_iter().zip(expected_data);
 
-    while let Some((data, expected)) = stream.next() {
+    for (data, expected) in stream {
         files += 1;
         assert_eq!(data, expected);
     }
@@ -141,9 +141,9 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let scan = snapshot.scan().await?.build();
 
     let mut files = 0;
-    let mut stream = scan.execute().await?.into_iter().zip(expected_data);
+    let stream = scan.execute().await?.into_iter().zip(expected_data);
 
-    while let Some((data, expected)) = stream.next() {
+    for (data, expected) in stream {
         files += 1;
         assert_eq!(data, expected);
     }
@@ -190,10 +190,10 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = table.snapshot(None).await?;
     let scan = snapshot.scan().await?.build();
 
-    let mut stream = scan.execute().await?.into_iter().zip(expected_data);
+    let stream = scan.execute().await?.into_iter().zip(expected_data);
 
     let mut files = 0;
-    while let Some((data, expected)) = stream.next() {
+    for (data, expected) in stream {
         files += 1;
         assert_eq!(data, expected);
     }
@@ -252,9 +252,9 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     let scan = snapshot.scan().await?.with_predicate(predicate).build();
 
     let mut files = 0;
-    let mut stream = scan.execute().await?.into_iter().zip(expected_data);
+    let stream = scan.execute().await?.into_iter().zip(expected_data);
 
-    while let Some((data, expected)) = stream.next() {
+    for (data, expected) in stream {
         files += 1;
         assert_eq!(data, expected);
     }

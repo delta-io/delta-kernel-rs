@@ -22,16 +22,14 @@ const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 
 #[derive(Debug)]
 pub struct LogSegment {
-    log_path: Url,
-    commit_files: Vec<FileMeta>,
-    checkpoint_files: Vec<FileMeta>,
+    log_root: Url,
+    /// Reverse order soprted commit files in the log segment
+    pub(crate) commit_files: Vec<FileMeta>,
+    /// checkpoint files in the log segement.
+    pub(crate) checkpoint_files: Vec<FileMeta>,
 }
 
 impl LogSegment {
-    pub(crate) fn checkpoint_files(&self) -> impl Iterator<Item = &FileMeta> {
-        self.checkpoint_files.iter()
-    }
-
     pub(crate) fn commit_files(&self) -> impl Iterator<Item = &FileMeta> {
         self.commit_files.iter()
     }
@@ -54,9 +52,9 @@ impl LogSegment {
         let commit_stream = json_client
             .read_json_files(read_contexts, Arc::new(read_schema.clone().try_into()?))?;
 
-        let checkpoint_files: Vec<_> = self.checkpoint_files().cloned().collect();
         let parquet_client = table_client.get_parquet_handler();
-        let read_contexts = parquet_client.contextualize_file_reads(checkpoint_files, None)?;
+        let read_contexts =
+            parquet_client.contextualize_file_reads(self.checkpoint_files.clone(), None)?;
         let checkpoint_stream = parquet_client
             .read_parquet_files(read_contexts, Arc::new(read_schema.clone().try_into()?))?;
 
@@ -118,7 +116,7 @@ pub struct Snapshot<JRC: Send, PRC: Send> {
 impl<JRC: Send, PRC: Send> std::fmt::Debug for Snapshot<JRC, PRC> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Snapshot")
-            .field("path", &self.log_segment.log_path.as_str())
+            .field("path", &self.log_segment.log_root.as_str())
             .field("version", &self.version)
             .field("metadata", &self.metadata)
             .finish()
@@ -141,6 +139,7 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
         let fs_client = table_client.get_file_system_client();
         let log_url = LogPath(&table_root).child("_delta_log/").unwrap();
 
+        // List relevant files from log
         let (mut commit_files, checkpoint_files) =
             match read_last_checkpoint(fs_client.as_ref(), &log_url).await {
                 Err(err) => return Err(err),
@@ -159,30 +158,27 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
                 Ok(None) => list_log_files(fs_client.as_ref(), &log_url).await?,
             };
 
+        // remove all files above requested version
         if let Some(version) = version {
-            commit_files = commit_files
-                .into_iter()
-                .filter(|meta| {
-                    if let Some(v) = LogPath(&meta.location).commit_version() {
-                        v <= version
-                    } else {
-                        false
-                    }
-                })
-                .collect();
+            commit_files.retain(|meta| {
+                if let Some(v) = LogPath(&meta.location).commit_version() {
+                    v <= version
+                } else {
+                    false
+                }
+            });
         }
 
+        // get the effective version from chosen files
         let version_eff = if !commit_files.is_empty() {
             commit_files
                 .first()
-                .map(|f| LogPath(&f.location).commit_version())
-                .flatten()
+                .and_then(|f| LogPath(&f.location).commit_version())
                 .unwrap()
         } else if !checkpoint_files.is_empty() {
             checkpoint_files
                 .first()
-                .map(|f| LogPath(&f.location).commit_version())
-                .flatten()
+                .and_then(|f| LogPath(&f.location).commit_version())
                 .unwrap()
         } else {
             // TODO more descriptive error
@@ -197,7 +193,7 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
         }
 
         let log_segment = LogSegment {
-            log_path: log_url,
+            log_root: log_url,
             commit_files,
             checkpoint_files,
         };
@@ -302,21 +298,25 @@ pub struct CheckpointMetadata {
     pub checksum: Option<String>,
 }
 
+/// Try reading the `_last_checkpoint` file.
+///
+/// In case the file is not found, `None` is returned.
 async fn read_last_checkpoint(
     fs_client: &dyn FileSystemClient,
-    log_path: &Url,
+    log_root: &Url,
 ) -> DeltaResult<Option<CheckpointMetadata>> {
-    let file_path = LogPath(log_path).child(LAST_CHECKPOINT_FILE_NAME)?;
+    let file_path = LogPath(log_root).child(LAST_CHECKPOINT_FILE_NAME)?;
     match fs_client.read_files(vec![(file_path, None)]).await {
         Ok(data) => match data.first() {
             Some(data) => Ok(Some(serde_json::from_slice(data)?)),
             None => Ok(None),
         },
         Err(Error::FileNotFound(_)) => Ok(None),
-        Err(err) => Err(err.into()),
+        Err(err) => Err(err),
     }
 }
 
+/// List all log files after a givben checkpoint.
 async fn list_log_files_with_checkpoint(
     cp: &CheckpointMetadata,
     fs_client: &dyn FileSystemClient,
@@ -365,6 +365,9 @@ async fn list_log_files_with_checkpoint(
     Ok((commit_files, checkpoint_files))
 }
 
+/// List relevant log files.
+///
+/// Relevant files are the max checkpoint found and all subsequent commits.
 async fn list_log_files(
     fs_client: &dyn FileSystemClient,
     log_root: &Url,
@@ -393,12 +396,9 @@ async fn list_log_files(
         }
     }
 
-    commit_files = commit_files
-        .into_iter()
-        .filter(|f| {
-            LogPath(&f.location).commit_version().unwrap_or(0) as i64 > max_checkpoint_version
-        })
-        .collect();
+    commit_files.retain(|f| {
+        LogPath(&f.location).commit_version().unwrap_or(0) as i64 > max_checkpoint_version
+    });
     // NOTE this will sort in reverse order
     commit_files.sort_unstable_by(|a, b| b.location.cmp(&a.location));
 
@@ -407,23 +407,17 @@ async fn list_log_files(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     use std::collections::HashMap;
     use std::path::PathBuf;
 
     use object_store::local::LocalFileSystem;
     use object_store::path::Path;
 
-    use super::*;
-    use crate::client::filesystem::ObjectStoreFileSystemClient;
     use crate::client::DefaultTableClient;
+    use crate::filesystem::ObjectStoreFileSystemClient;
     use crate::schema::StructType;
-
-    #[test]
-    fn test_checkpoint_serde() {
-        let file = std::fs::File::open("./tests/dat/out/reader_tests/generated/with_checkpoint/delta/_delta_log/_last_checkpoint").unwrap();
-        let cp: CheckpointMetadata = serde_json::from_reader(file).unwrap();
-        assert_eq!(cp.version, 2)
-    }
 
     #[tokio::test]
     async fn test_snapshot_read_metadata() {
@@ -476,19 +470,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_last_checkpoint() {
-        let path = std::fs::canonicalize(PathBuf::from(
-            "./tests/dat/out/reader_tests/generated/with_checkpoint/delta/_delta_log/",
-        ))
-        .unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-
-        let store = Arc::new(LocalFileSystem::new());
-        let prefix = Path::from(url.path());
-        let client = ObjectStoreFileSystemClient::new(store, prefix);
-        let cp = read_last_checkpoint(&client, &url).await.unwrap().unwrap();
-        assert_eq!(cp.version, 2);
-
+    async fn test_read_table_with_last_checkpoint() {
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/table-with-dv-small/_delta_log/",
         ))
@@ -504,29 +486,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_table_with_checkpoint() {
-        let path = std::fs::canonicalize(PathBuf::from(
-            "./tests/dat/out/reader_tests/generated/with_checkpoint/delta/",
-        ))
-        .unwrap();
-        let location = url::Url::from_directory_path(path).unwrap();
-        let table_client = Arc::new(
-            DefaultTableClient::try_new(&location, HashMap::<String, String>::new()).unwrap(),
-        );
-        let snapshot = Snapshot::try_new(location, table_client, None)
-            .await
-            .unwrap();
-
-        assert_eq!(snapshot.log_segment.checkpoint_files.len(), 1);
-        assert_eq!(
-            LogPath(&snapshot.log_segment.checkpoint_files[0].location).commit_version(),
-            Some(2)
-        );
-        assert_eq!(snapshot.log_segment.commit_files.len(), 1);
-        assert_eq!(
-            LogPath(&snapshot.log_segment.commit_files[0].location).commit_version(),
-            Some(3)
-        );
-
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/with_checkpoint_no_last_checkpoint/",
         ))

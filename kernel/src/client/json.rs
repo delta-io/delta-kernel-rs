@@ -24,7 +24,6 @@ use crate::{
 #[derive(Debug)]
 pub struct JsonReadContext {
     pub(crate) store: Arc<DynObjectStore>,
-    pub(crate) path: Path,
     pub(crate) meta: FileMeta,
 }
 
@@ -51,7 +50,6 @@ impl FileHandler for DefaultJsonHandler {
             .into_iter()
             .map(|meta| JsonReadContext {
                 store: self.store.clone(),
-                path: Path::from(meta.location.path()),
                 meta,
             })
             .collect())

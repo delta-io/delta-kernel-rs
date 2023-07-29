@@ -1,4 +1,4 @@
 /target
 /Cargo.lock
-/tests/dat/
+acceptance/tests/dat/
 .vscode

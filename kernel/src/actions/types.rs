@@ -219,8 +219,8 @@ impl DeletionVectorDescriptor {
                 Ok(async { rtm }.boxed())
             }
             Some(path) => {
-                let offset = self.offset.clone();
-                let size_in_bytes = self.size_in_bytes.clone();
+                let offset = self.offset;
+                let size_in_bytes = self.size_in_bytes;
 
                 Ok(Box::pin(async move {
                     println!("path  --> : {}", path);

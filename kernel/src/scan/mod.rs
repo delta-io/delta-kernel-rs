@@ -135,19 +135,16 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
         };
         let schema = Arc::new(Schema::try_from(&schema).unwrap());
 
-        let mut commit_files: Vec<_> = self.log_segment.commit_files().cloned().collect();
-        // NOTE this will already sort in reverse order
-        commit_files.sort_unstable_by(|a, b| b.location.cmp(&a.location));
         let json_handler = self.table_client.get_json_handler();
-        let commit_reads =
-            json_handler.contextualize_file_reads(commit_files, self.predicate.clone())?;
+        let commit_reads = json_handler.contextualize_file_reads(
+            // NOTE commit files are sorted in reverse on creations
+            self.log_segment.commit_files.clone(),
+            self.predicate.clone(),
+        )?;
 
         let parquet_handler = self.table_client.get_parquet_handler();
         let checkpoint_reads = parquet_handler.contextualize_file_reads(
-            self.log_segment
-                .checkpoint_files()
-                .cloned()
-                .collect::<Vec<_>>(),
+            self.log_segment.checkpoint_files.clone(),
             self.predicate.clone(),
         )?;
 
@@ -181,7 +178,7 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
                     .read_parquet_files(context, self.schema.clone())?
                     .try_collect::<Vec<_>>()
                     .await?;
-                if batches.len() < 1 {
+                if batches.is_empty() {
                     continue;
                 }
                 let schema = batches[0].schema();

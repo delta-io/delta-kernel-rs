@@ -53,7 +53,7 @@ pub(crate) fn parse_actions<'a>(
     Ok(types
         .into_iter()
         .filter_map(|action| parse_action(batch, action).ok())
-        .flat_map(|it| it))
+        .flatten())
 }
 
 #[fix_hidden_lifetime_bug]
@@ -154,9 +154,9 @@ fn parse_action_metadata(arr: &StructArray) -> DeltaResult<Box<dyn Iterator<Item
         });
     metadata.created_time = cast_struct_column::<Int64Array>(arr, "createdTime")
         .ok()
-        .and_then(|arr| arr.iter().flat_map(|v| v).next());
+        .and_then(|arr| arr.iter().flatten().next());
 
-    if let Some(config) = cast_struct_column::<MapArray>(arr, "configuration").ok() {
+    if let Ok(config) = cast_struct_column::<MapArray>(arr, "configuration") {
         let keys = config
             .keys()
             .as_any()
@@ -170,13 +170,7 @@ fn parse_action_metadata(arr: &StructArray) -> DeltaResult<Box<dyn Iterator<Item
         metadata.configuration = keys
             .into_iter()
             .zip(values.into_iter())
-            .filter_map(|(k, v)| {
-                if let Some(key) = k {
-                    Some((key.to_string(), v.map(|vv| vv.to_string())))
-                } else {
-                    None
-                }
-            })
+            .filter_map(|(k, v)| k.map(|key| (key.to_string(), v.map(|vv| vv.to_string()))))
             .collect::<HashMap<_, _>>();
     };
 
@@ -342,7 +336,7 @@ fn parse_actions_add(arr: &StructArray) -> DeltaResult<Box<dyn Iterator<Item = A
         },
     );
 
-    Ok(Box::new(zipped.filter_map(|v| v).map(Action::Add)))
+    Ok(Box::new(zipped.flatten().map(Action::Add)))
 }
 
 fn parse_actions_remove(arr: &StructArray) -> DeltaResult<Box<dyn Iterator<Item = Action> + '_>> {
@@ -454,7 +448,7 @@ fn parse_actions_remove(arr: &StructArray) -> DeltaResult<Box<dyn Iterator<Item 
         },
     );
 
-    Ok(Box::new(zipped.filter_map(|v| v).map(Action::Remove)))
+    Ok(Box::new(zipped.flatten().map(Action::Remove)))
 }
 
 fn parse_dv(
@@ -522,13 +516,7 @@ fn struct_array_to_map(arr: &StructArray) -> DeltaResult<HashMap<String, Option<
     Ok(keys
         .into_iter()
         .zip(values.into_iter())
-        .filter_map(|(k, v)| {
-            if let Some(key) = k {
-                Some((key.to_string(), v.map(|vv| vv.to_string())))
-            } else {
-                None
-            }
-        })
+        .filter_map(|(k, v)| k.map(|key| (key.to_string(), v.map(|vv| vv.to_string()))))
         .collect())
 }
 

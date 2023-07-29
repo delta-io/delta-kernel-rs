@@ -2,9 +2,9 @@ name: build
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -48,4 +48,4 @@ jobs:
           override: true
       - uses: Swatinem/rust-cache@v2
       - name: test
-        run: cargo test --verbose
+        run: cargo test --verbose --all-features

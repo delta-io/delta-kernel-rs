@@ -19,8 +19,8 @@ async fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = table.snapshot(None).await?;
     let scan = snapshot.scan().await?.build();
 
-    let mut stream = scan.execute().await?.into_iter();
-    while let Some(batch) = stream.next() {
+    let stream = scan.execute().await?.into_iter();
+    for batch in stream {
         let rows = batch.num_rows();
         arrow::util::pretty::print_batches(&[batch])?;
         assert_eq!(rows, 8);
@@ -41,13 +41,11 @@ async fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = table.snapshot(None).await?;
     let scan = snapshot.scan().await?.build();
 
-    let mut stream = scan.execute().await?.into_iter();
-    while let Some(batch) = stream.next() {
+    let stream = scan.execute().await?.into_iter();
+    for batch in stream {
         let rows = batch.num_rows();
         arrow::util::pretty::print_batches(&[batch]).unwrap();
         assert_eq!(rows, 10);
     }
     Ok(())
 }
-// file:///home/reap/code/delta-kernel-rs/tests/data/table-with-dv-small/deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin
-// file:///home/reap/code/delta-kernel-rs/tests/data/table-with-dv-small/deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin
