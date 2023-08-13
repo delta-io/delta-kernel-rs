@@ -36,9 +36,9 @@ pub(crate) fn data_skipping_filter(
     // parse each row as json using the stats schema from data skipping filter
     // HACK see https://github.com/apache/arrow/issues/33662
     let data_fields: Vec<_> = predicate
-        .columns()
+        .references()
         .iter()
-        .map(|name| Field::new(name, DataType::Int32, true))
+        .map(|name| Field::new(name.to_string(), DataType::Int32, true))
         .collect();
     let stats_schema = Schema::new(vec![
         Field::new(

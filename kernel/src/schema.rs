@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::fmt::Formatter;
 use std::sync::Arc;
+use std::{collections::HashMap, fmt::Display};
 
 use serde::{Deserialize, Serialize};
 
@@ -284,6 +285,27 @@ where
     Ok((precision, scale))
 }
 
+impl Display for PrimitiveType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PrimitiveType::String => write!(f, "string"),
+            PrimitiveType::Long => write!(f, "bigint"),
+            PrimitiveType::Integer => write!(f, "int"),
+            PrimitiveType::Short => write!(f, "smallint"),
+            PrimitiveType::Byte => write!(f, "tinyint"),
+            PrimitiveType::Float => write!(f, "float"),
+            PrimitiveType::Double => write!(f, "double"),
+            PrimitiveType::Boolean => write!(f, "boolean"),
+            PrimitiveType::Binary => write!(f, "binary"),
+            PrimitiveType::Date => write!(f, "date"),
+            PrimitiveType::Timestamp => write!(f, "timestamp"),
+            PrimitiveType::Decimal(precision, scale) => {
+                write!(f, "decimal({}, {})", precision, scale)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 #[serde(untagged, rename_all = "camelCase")]
 pub enum DataType {
@@ -297,6 +319,26 @@ pub enum DataType {
     /// A map stores an arbitrary length collection of key-value pairs
     /// with a single keyType and a single valueType
     Map(Box<MapType>),
+}
+
+impl Display for DataType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataType::Primitive(p) => write!(f, "{}", p),
+            DataType::Array(a) => write!(f, "array<{}>", a.element_type),
+            DataType::Struct(s) => {
+                write!(f, "struct<")?;
+                for (i, field) in s.fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {}", field.name, field.data_type)?;
+                }
+                write!(f, ">")
+            }
+            DataType::Map(m) => write!(f, "map<{}, {}>", m.key_type, m.value_type),
+        }
+    }
 }
 
 #[cfg(test)]
