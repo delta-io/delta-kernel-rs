@@ -6,6 +6,7 @@ use arrow::record_batch::RecordBatch;
 use deltakernel::client::DefaultTableClient;
 use deltakernel::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::expressions::Expression;
+use deltakernel::schema::{DataType, PrimitiveType};
 use deltakernel::Table;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use parquet::arrow::arrow_writer::ArrowWriter;
@@ -262,8 +263,8 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
 
     let snapshot = table.snapshot(None)?;
 
-    let predicate = Expression::column("ids")
-        .lt(&Expression::Literal(2))
+    let predicate = Expression::column("ids", DataType::Primitive(PrimitiveType::Integer))
+        .lt(&Expression::literal(2))
         .unwrap();
     let scan = snapshot.scan().await?.with_predicate(predicate).build();
 

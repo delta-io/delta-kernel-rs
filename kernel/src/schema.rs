@@ -222,18 +222,19 @@ fn default_true() -> bool {
 pub enum PrimitiveType {
     /// UTF-8 encoded string of characters
     String,
-    /// 8-byte signed integer. Range: -9223372036854775808 to 9223372036854775807
+    /// i64: 8-byte signed integer. Range: -9223372036854775808 to 9223372036854775807
     Long,
-    /// 4-byte signed integer. Range: -2147483648 to 2147483647
+    /// i32: 4-byte signed integer. Range: -2147483648 to 2147483647
     Integer,
-    /// 2-byte signed integer numbers. Range: -32768 to 32767
+    /// i16: 2-byte signed integer numbers. Range: -32768 to 32767
     Short,
-    /// 1-byte signed integer number. Range: -128 to 127
+    /// i8: 1-byte signed integer number. Range: -128 to 127
     Byte,
-    /// 4-byte single-precision floating-point numbers
+    /// f32: 4-byte single-precision floating-point numbers
     Float,
-    /// 8-byte double-precision floating-point numbers
+    /// f64: 8-byte double-precision floating-point numbers
     Double,
+    /// bool
     Boolean,
     Binary,
     Date,
