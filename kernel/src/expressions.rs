@@ -330,8 +330,17 @@ impl Expression {
         todo!()
     }
 
-    /// Get the residual expression after applying the column bounds.
-    fn get_residual(&self, column_bounds: &HashMap<String, ColumnBounds>) -> DeltaResult<Self> {
+    /// Get the residual expression after applying the column values and bounds.
+    /// 
+    /// The column values are exactly values, such as those from partition values.
+    /// 
+    /// The column bounds are the min/max values for each column in the table,
+    /// as determined by the stats record batch.
+    fn get_residual(
+        &self,
+        column_values: &HashMap<String, Scalar>,
+        column_bounds: &HashMap<String, ColumnBounds>,
+    ) -> DeltaResult<Self> {
         if self.data_type() != DataType::Primitive(PrimitiveType::Boolean) {
             return Err(Error::Generic(format!(
                 "Cannot apply column bounds to expression of type {}",
@@ -501,45 +510,47 @@ impl std::ops::Div<Expression> for Expression {
 
 #[cfg(test)]
 mod tests {
+    use crate::expressions::scalars::NullStatus;
+
+    use super::Expression as Expr;
     use super::*;
 
     #[test]
     fn test_expression_format() {
-        let col_ref = Expression::column("x", DataType::Primitive(PrimitiveType::Integer));
+        let col_ref = Expr::column("x", DataType::integer());
         let cases = [
             (col_ref.clone(), "Column(x)"),
             (
-                col_ref.clone().eq(&Expression::literal(2)).unwrap(),
+                col_ref.clone().eq(&Expr::literal(2)).unwrap(),
                 "Column(x) = 2",
             ),
             (
                 col_ref
-                    .gt_eq(&Expression::literal(2))
+                    .gt_eq(&Expr::literal(2))
                     .unwrap()
-                    .and(&(col_ref.lt_eq(&Expression::literal(10))).unwrap())
+                    .and(&(col_ref.lt_eq(&Expr::literal(10))).unwrap())
                     .unwrap(),
                 "Column(x) >= 2 AND Column(x) <= 10",
             ),
             (
                 col_ref
                     .clone()
-                    .gt(&Expression::literal(2))
+                    .gt(&Expr::literal(2))
                     .unwrap()
-                    .or(&col_ref.lt(&Expression::literal(10)).unwrap())
+                    .or(&col_ref.lt(&Expr::literal(10)).unwrap())
                     .unwrap(),
                 "(Column(x) > 2 OR Column(x) < 10)",
             ),
             (
-                (col_ref.clone() - Expression::literal(4))
+                (col_ref.clone() - Expr::literal(4))
                     .unwrap()
-                    .lt(&Expression::literal(10))
+                    .lt(&Expr::literal(10))
                     .unwrap(),
                 "Column(x) - 4 < 10",
             ),
             (
-                (((col_ref + Expression::literal(4)).unwrap() / (Expression::literal(10)))
-                    .unwrap()
-                    * Expression::literal(42))
+                (((col_ref + Expr::literal(4)).unwrap() / (Expr::literal(10))).unwrap()
+                    * Expr::literal(42))
                 .unwrap(),
                 "Column(x) + 4 / 10 * 42",
             ),
@@ -553,12 +564,14 @@ mod tests {
 
     #[test]
     fn test_canonicalize() {
-        let x_ref = Expression::column("x", DataType::Primitive(PrimitiveType::Integer));
-        let ten = Expression::literal(10);
-        let cases = vec![(
-            ten.clone().eq(&x_ref).unwrap(),
-            x_ref.clone().eq(&ten).unwrap(),
-        )];
+        let x_ref = Expr::column("x", DataType::integer());
+        let cases = vec![
+            // 10 = x -> x = 10
+            (
+                Expr::literal(10).eq(&x_ref).unwrap(),
+                x_ref.clone().eq(&Expr::literal(10)).unwrap(),
+            ),
+        ];
 
         for (mut expr, expected) in cases {
             expr.canonicalize();
@@ -568,19 +581,123 @@ mod tests {
 
     #[test]
     fn test_simplify() {
-        // x + 0 -> x
-        // true AND false -> false
-        // true AND true -> true
-        // true OR false -> true
+        let x_ref = Expr::column("x", DataType::integer());
+        let cases = vec![
+            // x + 0 -> x
+            ((x_ref.clone() + Expr::literal(0)).unwrap(), x_ref.clone()),
+            // x + 1 -> x + 1
+            (
+                (x_ref.clone() + Expr::literal(1)).unwrap(),
+                (x_ref.clone() + Expr::literal(1)).unwrap(),
+            ),
+            // true AND (x > 0) -> x > 0
+            (
+                Expr::literal(true)
+                    .and(&x_ref.gt(&Expr::literal(0)).unwrap())
+                    .unwrap(),
+                x_ref.gt(&Expr::literal(0)).unwrap(),
+            ),
+            // (x > 0) AND false -> false
+            (
+                x_ref
+                    .gt(&Expr::literal(0))
+                    .unwrap()
+                    .and(&Expr::literal(false))
+                    .unwrap(),
+                Expr::literal(false),
+            ),
+            // (x > 0) OR false -> x > 0
+            (
+                x_ref
+                    .gt(&Expr::literal(0))
+                    .unwrap()
+                    .or(&Expr::literal(false))
+                    .unwrap(),
+                x_ref.gt(&Expr::literal(0)).unwrap(),
+            ),
+            // true OR (x > 0) -> true
+            (
+                Expr::literal(true)
+                    .or(&x_ref.gt(&Expr::literal(0)).unwrap())
+                    .unwrap(),
+                Expr::literal(true),
+            ),
+        ];
+
+        for (mut expr, expected) in cases {
+            expr.simplify();
+            assert_eq!(expr, expected);
+        }
     }
 
     #[test]
-    fn test_residual() {
-        // x > 0 + x = 1 -> true
-        // x > 0 + x = -1 -> false
+    fn test_residual_from_values() {
+        let expr = Expr::column("x", DataType::integer())
+            .gt(&Expr::literal(0))
+            .unwrap();
+
+        // TODO: null handling
+        let cases = vec![
+            // x > 0 with x = 1 -> true
+            ("x", 1i32, Expr::literal(true)),
+            // x > 0 with x = -1 -> false
+            ("x", -1i32, Expr::literal(false)),
+            // x > 0 with y = -1 -> x > 0 (ignores irrelevant columns)
+            ("y", -1i32, Expr::column("x", DataType::integer()).gt(&Expr::literal(0)).unwrap()),
+        ];
+
+        for (col_name, value, expected) in cases {
+            let column_values: HashMap<String, Scalar> = [(col_name.to_owned(), Scalar::from(value))].into();
+            let result = expr.get_residual(&column_values, &HashMap::new()).unwrap();
+            assert_eq!(result, expected);
+        }
+    }
+
+    #[test]
+    fn test_residual_from_bounds() {
+
         // x > 0 + minValues.x = 1 -> true
         // x > 0 + minValues.x = -1 -> x > 0
         // x > 0 + maxValues.x = -1 -> false
         // x > 0 + maxValues.x = 1 -> x > 0
+        let expr = Expr::column("x", DataType::integer())
+            .gt(&Expr::literal(0))
+            .unwrap();
+
+        // x > 0 + minValues.x = 1 -> true
+        let bounds = ColumnBounds {
+            data_type: DataType::integer(),
+            min: Some(Scalar::from(0i32)),
+            max: None,
+            null_status: NullStatus::NeverNull,
+        };
+        let column_bounds: HashMap<String, ColumnBounds> = [("x".to_owned(), bounds)].into();
+        let expected = Expr::literal(true);
+        let result = expr.get_residual(&HashMap::new(), &column_bounds).unwrap();
+        assert_eq!(result, expected);
+        
+        // x > 0 + minValues.x = -1 -> x > 0
+        let bounds = ColumnBounds {
+            data_type: DataType::integer(),
+            min: Some(Scalar::from(-1i32)),
+            max: None,
+            null_status: NullStatus::NeverNull,
+        };
+        let column_bounds: HashMap<String, ColumnBounds> = [("x".to_owned(), bounds)].into();
+        let expected = expr.clone();
+        let result = expr.get_residual(&HashMap::new(), &column_bounds).unwrap();
+        assert_eq!(result, expected);
+
+        // x > 0 + maxValues.x = -1 -> false
+        let bounds = ColumnBounds {
+            data_type: DataType::integer(),
+            min: Some(Scalar::from(-1i32)),
+            max: None,
+            null_status: NullStatus::NeverNull,
+        };
+        let column_bounds: HashMap<String, ColumnBounds> = [("x".to_owned(), bounds)].into();
+        let expected = expr.clone();
+        let result = expr.get_residual(&HashMap::new(), &column_bounds).unwrap();
+        assert_eq!(result, expected);
     }
 }

@@ -322,6 +322,56 @@ pub enum DataType {
     Map(Box<MapType>),
 }
 
+impl DataType {
+    pub fn string() -> Self {
+        DataType::Primitive(PrimitiveType::String)
+    }
+
+    pub fn long() -> Self {
+        DataType::Primitive(PrimitiveType::Long)
+    }
+
+    pub fn integer() -> Self {
+        DataType::Primitive(PrimitiveType::Integer)
+    }
+
+    pub fn short() -> Self {
+        DataType::Primitive(PrimitiveType::Short)
+    }
+
+    pub fn byte() -> Self {
+        DataType::Primitive(PrimitiveType::Byte)
+    }
+
+    pub fn float() -> Self {
+        DataType::Primitive(PrimitiveType::Float)
+    }
+
+    pub fn double() -> Self {
+        DataType::Primitive(PrimitiveType::Double)
+    }
+
+    pub fn boolean() -> Self {
+        DataType::Primitive(PrimitiveType::Boolean)
+    }
+
+    pub fn binary() -> Self {
+        DataType::Primitive(PrimitiveType::Binary)
+    }
+
+    pub fn date() -> Self {
+        DataType::Primitive(PrimitiveType::Date)
+    }
+
+    pub fn timestamp() -> Self {
+        DataType::Primitive(PrimitiveType::Timestamp)
+    }
+
+    pub fn decimal(precision: usize, scale: usize) -> Self {
+        DataType::Primitive(PrimitiveType::Decimal(format!("{},{}", precision, scale)))
+    }
+}
+
 impl Display for DataType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {

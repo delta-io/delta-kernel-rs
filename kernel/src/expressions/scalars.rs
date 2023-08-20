@@ -50,6 +50,12 @@ impl From<i32> for Scalar {
     }
 }
 
+impl From<bool> for Scalar {
+    fn from(b: bool) -> Self {
+        Self::Boolean(b)
+    }
+}
+
 /// Status of nulls
 pub(crate) enum NullStatus {
     /// Guaranteed to always be null
@@ -61,8 +67,9 @@ pub(crate) enum NullStatus {
 }
 
 pub(crate) struct ColumnBounds {
-    data_type: DataType,
-    min: Option<Scalar>,
-    max: Option<Scalar>,
-    null_status: NullStatus,
+    pub data_type: DataType,
+    pub min: Option<Scalar>,
+    pub max: Option<Scalar>,
+    pub null_status: NullStatus,
 }
+
