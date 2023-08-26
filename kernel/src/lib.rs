@@ -44,7 +44,7 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, StringArray};
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use bytes::Bytes;
-use futures::stream::{BoxStream, Stream};
+use futures::Stream;
 use url::Url;
 
 use self::schema::SchemaRef;
@@ -127,14 +127,14 @@ pub trait ExpressionHandler {
 /// Delta Kernel uses this client whenever it needs to access the underlying
 /// file system where the Delta table is present. Connector implementation of
 /// this interface can hide filesystem specific details from Delta Kernel.
-#[async_trait::async_trait]
 pub trait FileSystemClient: Send + Sync {
     /// List the paths in the same directory that are lexicographically greater or equal to
     /// (UTF-8 sorting) the given `path`. The result should also be sorted by the file name.
-    async fn list_from(&self, path: &Url) -> DeltaResult<BoxStream<'_, DeltaResult<FileMeta>>>;
+    fn list_from(&self, path: &Url)
+        -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
 
     /// Read data specified by the start and end offset from the file.
-    async fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<Vec<Bytes>>;
+    fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<Vec<Bytes>>;
 }
 
 /// Provides file handling functionality to Delta Kernel.

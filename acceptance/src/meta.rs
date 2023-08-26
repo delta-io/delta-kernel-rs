@@ -110,11 +110,11 @@ impl TestCaseInfo {
 
         let (latest, versions) = self.versions().await?;
 
-        let snapshot = table.snapshot(None).await?;
+        let snapshot = table.snapshot(None)?;
         self.assert_snapshot_meta(&latest, &snapshot).await?;
 
         for table_version in versions {
-            let snapshot = table.snapshot(Some(table_version.version)).await?;
+            let snapshot = table.snapshot(Some(table_version.version))?;
             self.assert_snapshot_meta(&table_version, &snapshot).await?;
         }
 

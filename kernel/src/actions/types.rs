@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use std::sync::Arc;
 
-use futures::future::{BoxFuture, FutureExt};
 use roaring::RoaringTreemap;
 use url::Url;
 
@@ -209,56 +208,54 @@ impl DeletionVectorDescriptor {
         &self,
         fs_client: Arc<dyn FileSystemClient>,
         parent: Url,
-    ) -> DeltaResult<BoxFuture<'static, DeltaResult<RoaringTreemap>>> {
+    ) -> DeltaResult<RoaringTreemap> {
         match self.absolute_path(&parent)? {
             None => {
                 let bytes = z85::decode(&self.path_or_inline_dv)
                     .map_err(|_| Error::DeletionVector("Failed to decode DV".to_string()))?;
                 let rtm = RoaringTreemap::deserialize_from(&bytes[12..])
                     .map_err(|err| Error::DeletionVector(err.to_string()));
-                Ok(async { rtm }.boxed())
+                rtm
             }
             Some(path) => {
                 let offset = self.offset;
                 let size_in_bytes = self.size_in_bytes;
 
-                Ok(Box::pin(async move {
-                    println!("path  --> : {}", path);
-                    println!("offset  --> : {:?}", offset);
-                    println!("size_in_bytes  --> : {}", size_in_bytes);
+                println!("path  --> : {}", path);
+                println!("offset  --> : {:?}", offset);
+                println!("size_in_bytes  --> : {}", size_in_bytes);
 
-                    let dv_data = fs_client
-                        .read_files(vec![(path, None)])
-                        .await?
-                        .first()
-                        .ok_or(Error::MissingData("No deletion Vecor data".to_string()))?
-                        .clone();
+                let dv_data = fs_client
+                    .read_files(vec![(path, None)])?
+                    .first()
+                    .ok_or(Error::MissingData("No deletion Vecor data".to_string()))?
+                    .clone();
 
-                    let mut cursor = Cursor::new(dv_data);
-                    if let Some(offset) = offset {
-                        // TODO should we read the datasize from the DV file?
-                        // offset plus datasize bytes
-                        cursor.set_position((offset + 4) as u64);
-                    }
+                let mut cursor = Cursor::new(dv_data);
+                if let Some(offset) = offset {
+                    // TODO should we read the datasize from the DV file?
+                    // offset plus datasize bytes
+                    cursor.set_position((offset + 4) as u64);
+                }
 
-                    let mut buf = vec![0; 4];
-                    cursor
-                        .read(&mut buf)
-                        .map_err(|err| Error::DeletionVector(err.to_string()))?;
-                    let magic = i32::from_le_bytes(buf.try_into().map_err(|_| {
+                let mut buf = vec![0; 4];
+                cursor
+                    .read(&mut buf)
+                    .map_err(|err| Error::DeletionVector(err.to_string()))?;
+                let magic =
+                    i32::from_le_bytes(buf.try_into().map_err(|_| {
                         Error::DeletionVector("filed to read magic bytes".to_string())
                     })?);
-                    println!("magic  --> : {}", magic);
-                    // assert!(magic == 1681511377);
+                println!("magic  --> : {}", magic);
+                // assert!(magic == 1681511377);
 
-                    let mut buf = vec![0; size_in_bytes as usize];
-                    cursor
-                        .read(&mut buf)
-                        .map_err(|err| Error::DeletionVector(err.to_string()))?;
+                let mut buf = vec![0; size_in_bytes as usize];
+                cursor
+                    .read(&mut buf)
+                    .map_err(|err| Error::DeletionVector(err.to_string()))?;
 
-                    RoaringTreemap::deserialize_from(Cursor::new(buf))
-                        .map_err(|err| Error::DeletionVector(err.to_string()))
-                }))
+                RoaringTreemap::deserialize_from(Cursor::new(buf))
+                    .map_err(|err| Error::DeletionVector(err.to_string()))
             }
         }
     }
@@ -372,6 +369,7 @@ mod tests {
 
     use super::*;
     use crate::client::filesystem::ObjectStoreFileSystemClient;
+    use crate::executor::tokio::TokioBackgroundExecutor;
 
     fn dv_relateive() -> DeletionVectorDescriptor {
         DeletionVectorDescriptor {
@@ -443,17 +441,21 @@ mod tests {
         assert_eq!(dv_url, example.absolute_path(&parent).unwrap().unwrap());
     }
 
-    #[tokio::test]
-    async fn test_deletion_vector_read() {
+    #[test]
+    fn test_deletion_vector_read() {
         let store = Arc::new(LocalFileSystem::new());
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let parent = url::Url::from_directory_path(path).unwrap();
         let root = object_store::path::Path::from(parent.path());
-        let fs_client = Arc::new(ObjectStoreFileSystemClient::new(store, root));
+        let fs_client = Arc::new(ObjectStoreFileSystemClient::new(
+            store,
+            root,
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
 
         let example = dv_example();
-        let tree_map = example.read(fs_client, parent).unwrap().await.unwrap();
+        let tree_map = example.read(fs_client, parent).unwrap();
 
         let expected: Vec<u64> = vec![0, 9];
         let found = tree_map.iter().collect::<Vec<_>>();

@@ -4,6 +4,7 @@ use arrow::array::{ArrayRef, Int32Array, StringArray};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use deltakernel::client::DefaultTableClient;
+use deltakernel::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::expressions::Expression;
 use deltakernel::Table;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
@@ -86,12 +87,16 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let table_client = Arc::new(DefaultTableClient::new(storage.clone(), Path::from("/")));
+    let table_client = Arc::new(DefaultTableClient::new(
+        storage.clone(),
+        Path::from("/"),
+        Arc::new(TokioBackgroundExecutor::new()),
+    ));
 
     let table = Table::new(location, table_client);
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.snapshot(None).await?;
+    let snapshot = table.snapshot(None)?;
     let scan = snapshot.scan().await?.build();
 
     let mut files = 0;
@@ -132,12 +137,16 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let table_client = Arc::new(DefaultTableClient::new(storage.clone(), Path::from("/")));
+    let table_client = Arc::new(DefaultTableClient::new(
+        storage.clone(),
+        Path::from("/"),
+        Arc::new(TokioBackgroundExecutor::new()),
+    ));
 
     let table = Table::new(location, table_client);
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.snapshot(None).await.unwrap();
+    let snapshot = table.snapshot(None).unwrap();
     let scan = snapshot.scan().await?.build();
 
     let mut files = 0;
@@ -182,12 +191,16 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let table_client = Arc::new(DefaultTableClient::new(storage.clone(), Path::from("/")));
+    let table_client = Arc::new(DefaultTableClient::new(
+        storage.clone(),
+        Path::from("/"),
+        Arc::new(TokioBackgroundExecutor::new()),
+    ));
 
     let table = Table::new(location, table_client);
     let expected_data = vec![batch];
 
-    let snapshot = table.snapshot(None).await?;
+    let snapshot = table.snapshot(None)?;
     let scan = snapshot.scan().await?.build();
 
     let stream = scan.execute().await?.into_iter().zip(expected_data);
@@ -238,12 +251,16 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let table_client = Arc::new(DefaultTableClient::new(storage.clone(), Path::from("/")));
+    let table_client = Arc::new(DefaultTableClient::new(
+        storage.clone(),
+        Path::from("/"),
+        Arc::new(TokioBackgroundExecutor::new()),
+    ));
 
     let table = Table::new(location, table_client);
     let expected_data = vec![batch];
 
-    let snapshot = table.snapshot(None).await?;
+    let snapshot = table.snapshot(None)?;
 
     let predicate = Expression::LessThan(
         Box::new(Expression::Column(String::from("ids"))),

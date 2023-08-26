@@ -38,6 +38,9 @@ url = "2"
 uuid = "1.3.0"
 z85 = "3.0.5"
 
+# optionally used with default client
+tokio = { version = "1", optional = true, features=["rt-multi-thread"] }
+
 [features]
 default = ["default-client"]
 default-client = ["chrono", "parquet/async", "parquet/object_store"]
@@ -52,4 +55,4 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "fmt",
 ] }
-
+deltakernel = { path = ".", features = ["tokio"] }

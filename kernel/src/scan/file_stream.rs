@@ -5,7 +5,6 @@ use std::sync::Arc;
 use arrow_arith::boolean::{is_not_null, or};
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_select::filter::filter_record_batch;
-use futures::future::BoxFuture;
 use futures::stream::{BoxStream, Stream};
 use futures::task::{Context, Poll};
 use roaring::RoaringTreemap;
@@ -52,13 +51,10 @@ impl LogReplayStream {
     }
 }
 
-/// A fallible future that resolves to a stream of [`RecordBatch`]
-pub type DvOpenFuture = BoxFuture<'static, DeltaResult<RoaringTreemap>>;
-
 #[allow(missing_debug_implementations)]
 pub struct DataFile {
     pub add: Add,
-    pub dv: Option<DvOpenFuture>,
+    pub dv: Option<RoaringTreemap>,
 }
 
 impl Stream for LogReplayStream {
@@ -100,7 +96,7 @@ impl Stream for LogReplayStream {
                                     };
                                     Some(DataFile {
                                         add: add.clone(),
-                                        dv
+                                        dv,
                                     })
                                 }
                                 Action::Add(add) => {

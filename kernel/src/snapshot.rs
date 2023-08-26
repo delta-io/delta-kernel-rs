@@ -7,7 +7,8 @@ use std::sync::RwLock;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Fields, Schema as ArrowSchema};
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
+use futures::TryStreamExt;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -131,7 +132,7 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
     /// - `location`: url pointing at the table root (where `_delta_log` folder is located)
     /// - `table_client`: Implementation of [`TableClient`] apis.
     /// - `version`: target version of the [`Snapshot`]
-    pub async fn try_new(
+    pub fn try_new(
         table_root: Url,
         table_client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
         version: Option<Version>,
@@ -141,21 +142,11 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
 
         // List relevant files from log
         let (mut commit_files, checkpoint_files) =
-            match read_last_checkpoint(fs_client.as_ref(), &log_url).await {
-                Err(err) => return Err(err),
-                Ok(Some(cp)) => {
-                    if let Some(v) = version {
-                        if cp.version >= v {
-                            list_log_files_with_checkpoint(&cp, fs_client.as_ref(), &log_url)
-                                .await?
-                        } else {
-                            list_log_files(fs_client.as_ref(), &log_url).await?
-                        }
-                    } else {
-                        list_log_files(fs_client.as_ref(), &log_url).await?
-                    }
+            match (read_last_checkpoint(fs_client.as_ref(), &log_url)?, version) {
+                (Some(cp), Some(version)) if cp.version >= version => {
+                    list_log_files_with_checkpoint(&cp, fs_client.as_ref(), &log_url)?
                 }
-                Ok(None) => list_log_files(fs_client.as_ref(), &log_url).await?,
+                _ => list_log_files(fs_client.as_ref(), &log_url)?,
             };
 
         // remove all files above requested version
@@ -301,12 +292,12 @@ pub struct CheckpointMetadata {
 /// Try reading the `_last_checkpoint` file.
 ///
 /// In case the file is not found, `None` is returned.
-async fn read_last_checkpoint(
+fn read_last_checkpoint(
     fs_client: &dyn FileSystemClient,
     log_root: &Url,
 ) -> DeltaResult<Option<CheckpointMetadata>> {
     let file_path = LogPath(log_root).child(LAST_CHECKPOINT_FILE_NAME)?;
-    match fs_client.read_files(vec![(file_path, None)]).await {
+    match fs_client.read_files(vec![(file_path, None)]) {
         Ok(data) => match data.first() {
             Some(data) => Ok(Some(serde_json::from_slice(data)?)),
             None => Ok(None),
@@ -317,7 +308,7 @@ async fn read_last_checkpoint(
 }
 
 /// List all log files after a given checkpoint.
-async fn list_log_files_with_checkpoint(
+fn list_log_files_with_checkpoint(
     cp: &CheckpointMetadata,
     fs_client: &dyn FileSystemClient,
     log_root: &Url,
@@ -326,10 +317,8 @@ async fn list_log_files_with_checkpoint(
     let start_from = log_root.join(&version_prefix)?;
 
     let files = fs_client
-        .list_from(&start_from)
-        .await?
-        .try_collect::<Vec<_>>()
-        .await?
+        .list_from(&start_from)?
+        .collect::<Result<Vec<_>, Error>>()?
         .into_iter()
         // TODO this filters out .crc files etc which start with "." - how do we want to use these kind of files?
         .filter(|f| LogPath(&f.location).commit_version().is_some())
@@ -368,7 +357,7 @@ async fn list_log_files_with_checkpoint(
 /// List relevant log files.
 ///
 /// Relevant files are the max checkpoint found and all subsequent commits.
-async fn list_log_files(
+fn list_log_files(
     fs_client: &dyn FileSystemClient,
     log_root: &Url,
 ) -> DeltaResult<(Vec<FileMeta>, Vec<FileMeta>)> {
@@ -379,8 +368,7 @@ async fn list_log_files(
     let mut commit_files = Vec::new();
     let mut checkpoint_files = Vec::with_capacity(10);
 
-    let mut stream = fs_client.list_from(&start_from).await?;
-    while let Some(maybe_meta) = stream.next().await {
+    for maybe_meta in fs_client.list_from(&start_from)? {
         let meta = maybe_meta?;
         if LogPath(&meta.location).is_checkpoint_file() {
             let version = LogPath(&meta.location).commit_version().unwrap_or(0) as i64;
@@ -416,8 +404,20 @@ mod tests {
     use object_store::path::Path;
 
     use crate::client::DefaultTableClient;
+    use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::filesystem::ObjectStoreFileSystemClient;
     use crate::schema::StructType;
+
+    fn default_table_client(url: &Url) -> Arc<DefaultTableClient<TokioBackgroundExecutor>> {
+        Arc::new(
+            DefaultTableClient::try_new(
+                url,
+                HashMap::<String, String>::new(),
+                Arc::new(TokioBackgroundExecutor::new()),
+            )
+            .unwrap(),
+        )
+    }
 
     #[tokio::test]
     async fn test_snapshot_read_metadata() {
@@ -425,9 +425,8 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
-        let client =
-            Arc::new(DefaultTableClient::try_new(&url, HashMap::<String, String>::new()).unwrap());
-        let snapshot = Snapshot::try_new(url, client, Some(1)).await.unwrap();
+        let client = default_table_client(&url);
+        let snapshot = Snapshot::try_new(url, client, Some(1)).unwrap();
 
         let protocol = snapshot.protocol().await.unwrap();
         let expected = Protocol {
@@ -450,9 +449,8 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
-        let client =
-            Arc::new(DefaultTableClient::try_new(&url, HashMap::<String, String>::new()).unwrap());
-        let snapshot = Snapshot::try_new(url, client, None).await.unwrap();
+        let client = default_table_client(&url);
+        let snapshot = Snapshot::try_new(url, client, None).unwrap();
 
         let protocol = snapshot.protocol().await.unwrap();
         let expected = Protocol {
@@ -469,8 +467,8 @@ mod tests {
         assert_eq!(schema, expected);
     }
 
-    #[tokio::test]
-    async fn test_read_table_with_last_checkpoint() {
+    #[test]
+    fn test_read_table_with_last_checkpoint() {
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/table-with-dv-small/_delta_log/",
         ))
@@ -479,24 +477,24 @@ mod tests {
 
         let store = Arc::new(LocalFileSystem::new());
         let prefix = Path::from(url.path());
-        let client = ObjectStoreFileSystemClient::new(store, prefix);
-        let cp = read_last_checkpoint(&client, &url).await.unwrap();
+        let client = ObjectStoreFileSystemClient::new(
+            store,
+            prefix,
+            Arc::new(TokioBackgroundExecutor::new()),
+        );
+        let cp = read_last_checkpoint(&client, &url).unwrap();
         assert!(cp.is_none())
     }
 
-    #[tokio::test]
-    async fn test_read_table_with_checkpoint() {
+    #[test]
+    fn test_read_table_with_checkpoint() {
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/with_checkpoint_no_last_checkpoint/",
         ))
         .unwrap();
         let location = url::Url::from_directory_path(path).unwrap();
-        let table_client = Arc::new(
-            DefaultTableClient::try_new(&location, HashMap::<String, String>::new()).unwrap(),
-        );
-        let snapshot = Snapshot::try_new(location, table_client, None)
-            .await
-            .unwrap();
+        let table_client = default_table_client(&location);
+        let snapshot = Snapshot::try_new(location, table_client, None).unwrap();
 
         assert_eq!(snapshot.log_segment.checkpoint_files.len(), 1);
         assert_eq!(
