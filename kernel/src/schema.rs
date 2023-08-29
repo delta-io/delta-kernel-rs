@@ -236,8 +236,52 @@ pub enum PrimitiveType {
     Boolean,
     Binary,
     Date,
+    /// Microsecond precision timestamp, adjusted to UTC.
     Timestamp,
-    Deciaml(String),
+    // TODO: timestamp without timezone
+    #[serde(
+        serialize_with = "serialize_decimal",
+        deserialize_with = "deserialize_decimal",
+        untagged
+    )]
+    Decimal(i32, i32),
+}
+
+fn serialize_decimal<S: serde::Serializer>(
+    precision: &i32,
+    scale: &i32,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&format!("decimal({},{})", precision, scale))
+}
+
+fn deserialize_decimal<'de, D>(deserializer: D) -> Result<(i32, i32), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let str_value = String::deserialize(deserializer)?;
+    if !str_value.starts_with("decimal(") || !str_value.ends_with(')') {
+        return Err(serde::de::Error::custom(format!(
+            "Invalid decimal: {}",
+            str_value
+        )));
+    }
+
+    let mut parts = str_value[8..str_value.len() - 1].split(',');
+    let precision = parts
+        .next()
+        .and_then(|part| part.trim().parse::<i32>().ok())
+        .ok_or_else(|| {
+            serde::de::Error::custom(format!("Invalid precision in decimal: {}", str_value))
+        })?;
+    let scale = parts
+        .next()
+        .and_then(|part| part.trim().parse::<i32>().ok())
+        .ok_or_else(|| {
+            serde::de::Error::custom(format!("Invalid scale in decimal: {}", str_value))
+        })?;
+
+    Ok((precision, scale))
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
@@ -335,6 +379,29 @@ mod tests {
         "#;
         let field: StructField = serde_json::from_str(data).unwrap();
         assert!(matches!(field.data_type, DataType::Map(_)));
+    }
+
+    #[test]
+    fn test_roundtrip_decimal() {
+        let data = r#"
+        {
+            "name": "a",
+            "type": "decimal(10, 2)",
+            "nullable": false,
+            "metadata": {}
+        }
+        "#;
+        let field: StructField = serde_json::from_str(data).unwrap();
+        assert!(matches!(
+            field.data_type,
+            DataType::Primitive(PrimitiveType::Decimal(10, 2))
+        ));
+
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(
+            json_str,
+            r#"{"name":"a","type":"decimal(10,2)","nullable":false,"metadata":{}}"#
+        );
     }
 
     #[test]

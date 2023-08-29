@@ -63,7 +63,7 @@ impl JsonHandler for DefaultJsonHandler {
         json_strings: StringArray,
         output_schema: ArrowSchemaRef,
     ) -> DeltaResult<RecordBatch> {
-        // TODO concatenating to a single string is probaly not needed if we use the
+        // TODO concatenating to a single string is probably not needed if we use the
         // lower level RawDecoder APIs
         let data = json_strings
             .into_iter()

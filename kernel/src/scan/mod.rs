@@ -110,7 +110,7 @@ impl<JRC: Send, PRC: Send + Sync> std::fmt::Debug for Scan<JRC, PRC> {
 }
 
 impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
-    /// Get a shred refernce to the [`Schema`] of the scan.
+    /// Get a shred reference to the [`Schema`] of the scan.
     ///
     /// [`Schema`]: crate::schema::Schema
     pub fn schema(&self) -> &SchemaRef {

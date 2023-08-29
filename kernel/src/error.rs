@@ -35,7 +35,7 @@ pub enum Error {
     #[error("No table version found.")]
     MissingVersion,
 
-    #[error("Deleteion Vecor error: {0}")]
+    #[error("Deletion Vector error: {0}")]
     DeletionVector(String),
 
     #[error("Invalid url: {0}")]

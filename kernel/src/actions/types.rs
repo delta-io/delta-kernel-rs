@@ -93,7 +93,7 @@ pub struct Protocol {
     pub min_reader_version: i32,
     /// The minimum version of the Delta write protocol that a client must implement
     /// in order to correctly write this table
-    pub min_wrriter_version: i32,
+    pub min_writer_version: i32,
     /// A collection of features that a client must implement in order to correctly
     /// read this table (exist only when minReaderVersion is set to 3)
     pub reader_features: Option<Vec<String>>,
@@ -106,7 +106,7 @@ impl Protocol {
     pub fn new(min_reader_version: i32, min_wrriter_version: i32) -> Self {
         Self {
             min_reader_version,
-            min_wrriter_version,
+            min_writer_version: min_wrriter_version,
             reader_features: None,
             writer_features: None,
         }

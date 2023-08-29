@@ -554,7 +554,7 @@ mod tests {
             .collect::<Vec<_>>();
         let expected = Action::Protocol(Protocol {
             min_reader_version: 3,
-            min_wrriter_version: 7,
+            min_writer_version: 7,
             reader_features: Some(vec!["deletionVectors".into()]),
             writer_features: Some(vec!["deletionVectors".into()]),
         });

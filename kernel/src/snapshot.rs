@@ -23,9 +23,9 @@ const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 #[derive(Debug)]
 pub struct LogSegment {
     log_root: Url,
-    /// Reverse order soprted commit files in the log segment
+    /// Reverse order sorted commit files in the log segment
     pub(crate) commit_files: Vec<FileMeta>,
-    /// checkpoint files in the log segement.
+    /// checkpoint files in the log segment.
     pub(crate) checkpoint_files: Vec<FileMeta>,
 }
 
@@ -316,7 +316,7 @@ async fn read_last_checkpoint(
     }
 }
 
-/// List all log files after a givben checkpoint.
+/// List all log files after a given checkpoint.
 async fn list_log_files_with_checkpoint(
     cp: &CheckpointMetadata,
     fs_client: &dyn FileSystemClient,
@@ -432,7 +432,7 @@ mod tests {
         let protocol = snapshot.protocol().await.unwrap();
         let expected = Protocol {
             min_reader_version: 3,
-            min_wrriter_version: 7,
+            min_writer_version: 7,
             reader_features: Some(vec!["deletionVectors".into()]),
             writer_features: Some(vec!["deletionVectors".into()]),
         };
@@ -457,7 +457,7 @@ mod tests {
         let protocol = snapshot.protocol().await.unwrap();
         let expected = Protocol {
             min_reader_version: 3,
-            min_wrriter_version: 7,
+            min_writer_version: 7,
             reader_features: Some(vec!["deletionVectors".into()]),
             writer_features: Some(vec!["deletionVectors".into()]),
         };

@@ -83,8 +83,8 @@ impl Stream for LogReplayStream {
                             .filter_map(|action| match action {
                                 Action::Add(add)
                                     // TODO right now this may not work as expected if we have the same add
-                                    // file with different deletetion vectors in the log - i.e. additional
-                                    // rows were deleted in spearate op. Is this a case to consider?
+                                    // file with different deletion vectors in the log - i.e. additional
+                                    // rows were deleted in separate op. Is this a case to consider?
                                     if !self
                                         .seen
                                         .contains(&(add.path.clone(), add.dv_unique_id())) =>

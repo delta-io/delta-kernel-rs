@@ -4,7 +4,7 @@
 //! such as reading parquet files, listing files in a file system, parsing a JSON string etc.
 //!
 //! The [`TableClient`] trait exposes methods to get sub-clients which expose the core
-//! functionalitites customizable by connectors.
+//! functionalities customizable by connectors.
 //!
 //! ## Expression handling
 //!
@@ -16,14 +16,14 @@
 //!
 //! Delta Kernel needs to perform some basic operations against file systems like listing and reading files.
 //! These interactions are encapsulated in the [`FileSystemClient`] trait. Implementors must take take
-//! care that all assumtions on the behavior if the functions - like sorted results - are respected.
+//! care that all assumptions on the behavior if the functions - like sorted results - are respected.
 //!
 //! ## Reading log and data files
 //!
 //! Delta Kernel requires the capability to read json and parquet files, which is exposed via the
 //! [`JsonHandler`] and [`ParquetHandler`] respectively. When reading files, connectors are asked
-//! to provide the context imformation it requires to execute the actual read. This is done by
-//! invoking methods on the [`FileHandler`] trait. All specifc file handlers must also provide
+//! to provide the context information it requires to execute the actual read. This is done by
+//! invoking methods on the [`FileHandler`] trait. All specific file handlers must also provide
 //! the contextualization APis.
 //!
 
@@ -107,7 +107,7 @@ pub trait ExpressionEvaluator {
 /// fill up partition column values and any computation on data using Expressions.
 pub trait ExpressionHandler {
     /// Create an [`ExpressionEvaluator`] that can evaluate the given [`Expression`]
-    /// on columnar batchs with the given [`Schema`].
+    /// on columnar batches with the given [`Schema`].
     ///
     /// # Parameters
     ///
