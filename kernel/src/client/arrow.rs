@@ -4,14 +4,8 @@ use arrow_schema::{
     ArrowError, DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
-use lazy_static::lazy_static;
-use regex::Regex;
 
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
-
-lazy_static! {
-    static ref DECIMAL_REGEX: Regex = Regex::new(r"\((\d{1,2}),(\d{1,2})\)").unwrap();
-}
 
 impl TryFrom<&StructType> for ArrowSchema {
     type Error = ArrowError;
