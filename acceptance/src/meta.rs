@@ -96,7 +96,7 @@ impl TestCaseInfo {
                 .map(|(k, v)| (k, v.unwrap()))
                 .collect(),
             min_reader_version: protocol.min_reader_version as u32,
-            min_writer_version: protocol.min_wrriter_version as u32,
+            min_writer_version: protocol.min_writer_version as u32,
         };
         assert_eq!(&tvm, case);
         Ok(())

@@ -4,14 +4,8 @@ use arrow_schema::{
     ArrowError, DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
-use lazy_static::lazy_static;
-use regex::Regex;
 
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
-
-lazy_static! {
-    static ref DECIMAL_REGEX: Regex = Regex::new(r"\((\d{1,2}),(\d{1,2})\)").unwrap();
-}
 
 impl TryFrom<&StructType> for ArrowSchema {
     type Error = ArrowError;
@@ -99,25 +93,31 @@ impl TryFrom<&DataType> for ArrowDataType {
                     PrimitiveType::Double => Ok(ArrowDataType::Float64),
                     PrimitiveType::Boolean => Ok(ArrowDataType::Boolean),
                     PrimitiveType::Binary => Ok(ArrowDataType::Binary),
-                    PrimitiveType::Deciaml(decimal) if DECIMAL_REGEX.is_match(decimal) => {
-                        let extract = DECIMAL_REGEX.captures(decimal).ok_or_else(|| {
+                    PrimitiveType::Decimal(precision, scale) => {
+                        let precision = u8::try_from(*precision).map_err(|_| {
                             ArrowError::SchemaError(format!(
-                                "Invalid decimal type for Arrow: {decimal}"
+                                "Invalid precision for decimal: {}",
+                                precision
                             ))
                         })?;
-                        let precision = extract.get(1).and_then(|v| v.as_str().parse::<u8>().ok());
-                        let scale = extract.get(2).and_then(|v| v.as_str().parse::<i8>().ok());
-                        match (precision, scale) {
-                            // TODO how do we decide which variant (128 / 256) to use?
-                            (Some(p), Some(s)) => Ok(ArrowDataType::Decimal128(p, s)),
-                            _ => Err(ArrowError::SchemaError(format!(
-                                "Invalid precision or scale decimal type for Arrow: {decimal}"
-                            ))),
+                        let scale = i8::try_from(*scale).map_err(|_| {
+                            ArrowError::SchemaError(format!("Invalid scale for decimal: {}", scale))
+                        })?;
+
+                        if precision <= 38 {
+                            Ok(ArrowDataType::Decimal128(precision, scale))
+                        } else if precision <= 76 {
+                            Ok(ArrowDataType::Decimal256(precision, scale))
+                        } else {
+                            Err(ArrowError::SchemaError(format!(
+                                "Precision too large to be represented in Arrow: {}",
+                                precision
+                            )))
                         }
                     }
                     PrimitiveType::Date => {
                         // A calendar date, represented as a year-month-day triple without a
-                        // timezone. Stored as 4 bytes integer representing days sinece 1970-01-01
+                        // timezone. Stored as 4 bytes integer representing days since 1970-01-01
                         Ok(ArrowDataType::Date32)
                     }
                     PrimitiveType::Timestamp => {
@@ -220,11 +220,11 @@ impl TryFrom<&ArrowDataType> for DataType {
             ArrowDataType::Binary => Ok(DataType::Primitive(PrimitiveType::Binary)),
             ArrowDataType::FixedSizeBinary(_) => Ok(DataType::Primitive(PrimitiveType::Binary)),
             ArrowDataType::LargeBinary => Ok(DataType::Primitive(PrimitiveType::Binary)),
-            ArrowDataType::Decimal128(p, s) => Ok(DataType::Primitive(PrimitiveType::Deciaml(
-                format!("decimal({p},{s})"),
+            ArrowDataType::Decimal128(p, s) => Ok(DataType::Primitive(PrimitiveType::Decimal(
+                *p as i32, *s as i32,
             ))),
-            ArrowDataType::Decimal256(p, s) => Ok(DataType::Primitive(PrimitiveType::Deciaml(
-                format!("decimal({p},{s})"),
+            ArrowDataType::Decimal256(p, s) => Ok(DataType::Primitive(PrimitiveType::Decimal(
+                *p as i32, *s as i32,
             ))),
             ArrowDataType::Date32 => Ok(DataType::Primitive(PrimitiveType::Date)),
             ArrowDataType::Date64 => Ok(DataType::Primitive(PrimitiveType::Date)),
