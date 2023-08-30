@@ -3,6 +3,7 @@ members = [
     "acceptance",
     "kernel",
 ]
+resolver = "2"
 
 [workspace.package]
 authors = [

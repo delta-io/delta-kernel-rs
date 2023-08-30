@@ -3,16 +3,8 @@
 /// Since each new `.rs` file in this directory results in increased build and link time, it is
 /// important to only add new files if absolutely necessary for code readability or test
 /// performance.
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
 
-use object_store::local::LocalFileSystem;
-use object_store::path::Path;
-
-use deltakernel::filesystem::ObjectStoreFileSystemClient;
-use deltakernel::snapshot::{CheckpointMetadata, Snapshot};
-use deltakernel::DefaultTableClient;
+use deltakernel::snapshot::CheckpointMetadata;
 
 #[test]
 fn test_checkpoint_serde() {
