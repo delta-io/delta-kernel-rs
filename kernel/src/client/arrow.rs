@@ -124,9 +124,6 @@ impl TryFrom<&DataType> for ArrowDataType {
                         // Issue: https://github.com/delta-io/delta/issues/643
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
-                    s => Err(ArrowError::SchemaError(format!(
-                        "Invalid data type for Arrow: {s:?}"
-                    ))),
                 }
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(

@@ -1,5 +1,5 @@
-use arrow_array::{BooleanArray, Int32Array, RecordBatch, StructArray};
-use arrow_ord::comparison::lt_scalar;
+use arrow_array::{array::PrimitiveArray, BooleanArray, Int32Array, RecordBatch, StructArray, types::Int32Type};
+use arrow_ord::cmp::lt;
 use arrow_schema::ArrowError;
 
 #[derive(Debug, Clone)]
@@ -21,7 +21,7 @@ impl Expression {
                 match (left.as_ref(), right.as_ref()) {
                     (Expression::Column(name), Expression::Literal(l)) => {
                         // column_min < value
-                        lt_scalar(
+                        lt(
                             stats
                                 .column_by_name("minValues")
                                 .unwrap()
@@ -33,7 +33,7 @@ impl Expression {
                                 .as_any()
                                 .downcast_ref::<Int32Array>()
                                 .unwrap(),
-                            *l,
+                            &PrimitiveArray::<Int32Type>::new_scalar(*l),
                         )
                     }
                     _ => todo!(),

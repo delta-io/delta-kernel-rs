@@ -9,12 +9,12 @@ readme.workspace = true
 version.workspace = true
 
 [dependencies]
-arrow-array = { version = "^42.0" }
-arrow-arith = { version = "^42.0" }
-arrow-json = { version = "^42.0" }
-arrow-ord = { version = "^42.0" }
-arrow-schema = { version = "^42.0" }
-arrow-select = { version = "^42.0" }
+arrow-array = { version = "^46.0" }
+arrow-arith = { version = "^46.0" }
+arrow-json = { version = "^46.0" }
+arrow-ord = { version = "^46.0" }
+arrow-schema = { version = "^46.0" }
+arrow-select = { version = "^46.0" }
 async-trait = "0.1"
 bytes = "1.4"
 chrono = { version = "0.4", optional = true }
@@ -24,9 +24,9 @@ futures = "0.3"
 itertools = "0.11"
 lazy_static = "1.4"
 # used for providing a storage abstraction layer
-object_store = "^0.6.0"
+object_store = "^0.7.0"
 # need to generalize over arrow, arrow2 and diff parquet etc. (BYOP)
-parquet = "^42.0"
+parquet = "^46.0"
 regex = "1.8"
 roaring = "0.10.1"
 serde = { version = "1", features = ["derive"] }
@@ -43,7 +43,7 @@ default = ["default-client"]
 default-client = ["chrono", "parquet/async", "parquet/object_store"]
 
 [dev-dependencies]
-arrow = { version = "^42.0", features = ["json", "prettyprint"] }
+arrow = { version = "^46.0", features = ["json", "prettyprint"] }
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 tempfile = "3"
 test-case = { version = "3.1.0" }

@@ -12,7 +12,7 @@ use arrow_select::concat::concat_batches;
 use bytes::{Buf, Bytes};
 use futures::stream::{StreamExt, TryStreamExt};
 use object_store::path::Path;
-use object_store::{DynObjectStore, GetResult};
+use object_store::{DynObjectStore, GetResultPayload};
 
 use super::file_handler::{FileOpenFuture, FileOpener};
 use crate::file_handler::FileStream;
@@ -136,14 +136,14 @@ impl FileOpener for JsonOpener {
 
         Ok(Box::pin(async move {
             let path = Path::from(file_meta.location.path());
-            match store.get(&path).await? {
-                GetResult::File(file, _) => {
+            match store.get(&path).await?.payload {
+                GetResultPayload::File(file, _) => {
                     let reader = ReaderBuilder::new(schema)
                         .with_batch_size(batch_size)
                         .build(BufReader::new(file))?;
                     Ok(futures::stream::iter(reader).map_err(Error::from).boxed())
                 }
-                GetResult::Stream(s) => {
+                GetResultPayload::Stream(s) => {
                     let mut decoder = ReaderBuilder::new(schema)
                         .with_batch_size(batch_size)
                         .build_decoder()?;
