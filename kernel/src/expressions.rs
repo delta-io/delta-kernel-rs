@@ -1,4 +1,6 @@
-use arrow_array::{array::PrimitiveArray, BooleanArray, Int32Array, RecordBatch, StructArray, types::Int32Type};
+use arrow_array::{
+    array::PrimitiveArray, types::Int32Type, BooleanArray, Int32Array, RecordBatch, StructArray,
+};
 use arrow_ord::cmp::lt;
 use arrow_schema::ArrowError;
 
