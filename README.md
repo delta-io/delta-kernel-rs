@@ -4,9 +4,9 @@ Delta-kernel-rs is an experimental [Delta][delta] implementation focused on
 interoperability with a wide range of query engines. It currently only supports
 reads.
 
-Delta's (the open-source [storage format][delta-protocol]) [reference
-implementation][delta-github] is effectively a Spark library. That is, one must
-use the JVM and Spark to interact with Delta tables. Delta-kernel-rs, by contrast,
+Delta is an open-source [storage format][delta-protocol] with a [reference
+implementation][delta-github] that is effectively a Spark library. For the reference implementation,
+JVM/Spark are required to interact with Delta tables. Delta-kernel-rs, by contrast,
 aims to democratize interacting with Delta tables by providing a means of
 'teaching' any query engine how to read (and in the future, write) Delta
 tables.
