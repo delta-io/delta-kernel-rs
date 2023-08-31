@@ -39,7 +39,7 @@ adopted by most Rust projects.
 
 ### Architecture
 
-See [doc/architecture.md] document (currently wip)
+See [arcitecture.md](doc/architecture.md) document (currently wip)
 
 Some design principles which should be considered:
 
