@@ -183,8 +183,7 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
                 }
                 let schema = batches[0].schema();
                 let batch = concat_batches(&schema, &batches)?;
-                if let Some(fut_dv) = file.dv {
-                    let dv = fut_dv.await?;
+                if let Some(dv) = file.dv {
                     let vec: Vec<_> = (0..batch.num_rows())
                         .map(|i| Some(!dv.contains(i.try_into().expect("fit into u32"))))
                         .collect();
@@ -208,6 +207,7 @@ mod tests {
 
     use super::*;
     use crate::client::DefaultTableClient;
+    use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::Table;
 
     #[tokio::test]
@@ -216,11 +216,16 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let table_client = Arc::new(
-            DefaultTableClient::try_new(&url, std::iter::empty::<(&str, &str)>()).unwrap(),
+            DefaultTableClient::try_new(
+                &url,
+                std::iter::empty::<(&str, &str)>(),
+                Arc::new(TokioBackgroundExecutor::new()),
+            )
+            .unwrap(),
         );
 
         let table = Table::new(url, table_client);
-        let snapshot = table.snapshot(None).await.unwrap();
+        let snapshot = table.snapshot(None).unwrap();
         let scan = snapshot.scan().await.unwrap().build();
         let files = scan.files().unwrap().try_collect::<Vec<_>>().await.unwrap();
 
@@ -234,11 +239,16 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let table_client = Arc::new(
-            DefaultTableClient::try_new(&url, std::iter::empty::<(&str, &str)>()).unwrap(),
+            DefaultTableClient::try_new(
+                &url,
+                std::iter::empty::<(&str, &str)>(),
+                Arc::new(TokioBackgroundExecutor::new()),
+            )
+            .unwrap(),
         );
 
         let table = Table::new(url, table_client);
-        let snapshot = table.snapshot(None).await.unwrap();
+        let snapshot = table.snapshot(None).unwrap();
         let scan = snapshot.scan().await.unwrap().build();
         let files = scan.execute().await.unwrap();
 

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use acceptance::read_dat_case;
 use deltakernel::client::DefaultTableClient;
+use deltakernel::executor::tokio::TokioBackgroundExecutor;
 
 fn reader_test(path: &Path) -> datatest_stable::Result<()> {
     let root_dir = format!(
@@ -18,8 +19,12 @@ fn reader_test(path: &Path) -> datatest_stable::Result<()> {
             let case = read_dat_case(root_dir).unwrap();
             let table_root = case.table_root().unwrap();
             let table_client = Arc::new(
-                DefaultTableClient::try_new(&table_root, std::iter::empty::<(&str, &str)>())
-                    .unwrap(),
+                DefaultTableClient::try_new(
+                    &table_root,
+                    std::iter::empty::<(&str, &str)>(),
+                    Arc::new(TokioBackgroundExecutor::new()),
+                )
+                .unwrap(),
             );
 
             case.assert_metadata(table_client.clone()).await.unwrap();

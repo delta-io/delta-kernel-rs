@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use deltakernel::client::DefaultTableClient;
+use deltakernel::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::Table;
 
 #[tokio::test]
@@ -13,10 +14,11 @@ async fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let table_client = Arc::new(DefaultTableClient::try_new(
         &url,
         std::iter::empty::<(&str, &str)>(),
+        Arc::new(TokioBackgroundExecutor::new()),
     )?);
 
     let table = Table::new(url, table_client);
-    let snapshot = table.snapshot(None).await?;
+    let snapshot = table.snapshot(None)?;
     let scan = snapshot.scan().await?.build();
 
     let stream = scan.execute().await?.into_iter();
@@ -35,10 +37,11 @@ async fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let table_client = Arc::new(DefaultTableClient::try_new(
         &url,
         std::iter::empty::<(&str, &str)>(),
+        Arc::new(TokioBackgroundExecutor::new()),
     )?);
 
     let table = Table::new(url, table_client);
-    let snapshot = table.snapshot(None).await?;
+    let snapshot = table.snapshot(None)?;
     let scan = snapshot.scan().await?.build();
 
     let stream = scan.execute().await?.into_iter();
