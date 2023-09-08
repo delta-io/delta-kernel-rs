@@ -213,9 +213,8 @@ impl DeletionVectorDescriptor {
             None => {
                 let bytes = z85::decode(&self.path_or_inline_dv)
                     .map_err(|_| Error::DeletionVector("Failed to decode DV".to_string()))?;
-                let rtm = RoaringTreemap::deserialize_from(&bytes[12..])
-                    .map_err(|err| Error::DeletionVector(err.to_string()));
-                rtm
+                RoaringTreemap::deserialize_from(&bytes[12..])
+                    .map_err(|err| Error::DeletionVector(err.to_string()))
             }
             Some(path) => {
                 let offset = self.offset;

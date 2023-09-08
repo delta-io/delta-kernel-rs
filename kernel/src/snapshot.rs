@@ -2,6 +2,7 @@
 //! has schema etc.)
 //!
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -76,20 +77,14 @@ impl LogSegment {
         let mut protocol_opt = None;
         for batch in batches {
             if let Ok(mut metas) = parse_action(&batch, &ActionType::Metadata) {
-                match metas.next() {
-                    Some(Action::Metadata(meta)) => {
-                        metadata_opt = Some(meta.clone());
-                    }
-                    _ => (),
+                if let Some(Action::Metadata(meta)) = metas.next() {
+                    metadata_opt = Some(meta.clone());
                 }
             }
 
             if let Ok(mut protos) = parse_action(&batch, &ActionType::Protocol) {
-                match protos.next() {
-                    Some(Action::Protocol(proto)) => {
-                        protocol_opt = Some(proto.clone());
-                    }
-                    _ => (),
+                if let Some(Action::Protocol(proto)) = protos.next() {
+                    protocol_opt = Some(proto.clone());
                 }
             }
 
@@ -220,14 +215,15 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
     }
 
     async fn get_or_insert_metadata(&self) -> DeltaResult<(Metadata, Protocol)> {
-        let read_lock = self
-            .metadata
-            .read()
-            .map_err(|_| Error::Generic("filed to get read lock".into()))?;
-        if let Some((metadata, protocol)) = read_lock.as_ref() {
-            return Ok((metadata.clone(), protocol.clone()));
-        }
-        drop(read_lock);
+        {
+            let read_lock = self
+                .metadata
+                .read()
+                .map_err(|_| Error::Generic("filed to get read lock".into()))?;
+            if let Some((metadata, protocol)) = read_lock.as_ref() {
+                return Ok((metadata.clone(), protocol.clone()));
+            }
+        } // drop the read_lock
 
         let (metadata, protocol) = self
             .log_segment
@@ -372,12 +368,16 @@ fn list_log_files(
         let meta = maybe_meta?;
         if LogPath(&meta.location).is_checkpoint_file() {
             let version = LogPath(&meta.location).commit_version().unwrap_or(0) as i64;
-            if version > max_checkpoint_version {
-                max_checkpoint_version = version;
-                checkpoint_files.clear();
-                checkpoint_files.push(meta);
-            } else if version == max_checkpoint_version {
-                checkpoint_files.push(meta);
+            match version.cmp(&max_checkpoint_version) {
+                Ordering::Greater => {
+                    max_checkpoint_version = version;
+                    checkpoint_files.clear();
+                    checkpoint_files.push(meta);
+                }
+                Ordering::Equal => {
+                    checkpoint_files.push(meta);
+                }
+                _ => {}
             }
         } else if LogPath(&meta.location).is_commit_file() {
             commit_files.push(meta);

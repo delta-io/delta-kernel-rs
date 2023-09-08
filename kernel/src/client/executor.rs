@@ -44,6 +44,12 @@ pub mod tokio {
         _thread: std::thread::JoinHandle<()>,
     }
 
+    impl Default for TokioBackgroundExecutor {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl TokioBackgroundExecutor {
         pub fn new() -> Self {
             let (sender, mut receiver) = tokio::sync::mpsc::channel::<BoxFuture<'_, ()>>(50);

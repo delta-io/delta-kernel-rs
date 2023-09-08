@@ -92,7 +92,7 @@ fn parse_action_metadata(arr: &StructArray) -> DeltaResult<Box<dyn Iterator<Item
     let schema_strings = cast_struct_column::<StringArray>(arr, "schemaString")?;
     let metadata = ids
         .into_iter()
-        .zip(schema_strings.into_iter())
+        .zip(schema_strings)
         .filter_map(|(maybe_id, maybe_schema_string)| {
             if let (Some(id), Some(schema_string)) = (maybe_id, maybe_schema_string) {
                 Some(Metadata::new(
@@ -169,7 +169,7 @@ fn parse_action_metadata(arr: &StructArray) -> DeltaResult<Box<dyn Iterator<Item
             .ok_or(Error::MissingData("expected value column in map".into()))?;
         metadata.configuration = keys
             .into_iter()
-            .zip(values.into_iter())
+            .zip(values)
             .filter_map(|(k, v)| k.map(|key| (key.to_string(), v.map(|vv| vv.to_string()))))
             .collect::<HashMap<_, _>>();
     };
@@ -182,7 +182,7 @@ fn parse_action_protocol(arr: &StructArray) -> DeltaResult<Box<dyn Iterator<Item
     let min_writer = cast_struct_column::<Int32Array>(arr, "minWriterVersion")?;
     let protocol = min_reader
         .into_iter()
-        .zip(min_writer.into_iter())
+        .zip(min_writer)
         .filter_map(|(r, w)| {
             if let (Some(min_reader_version), Some(min_wrriter_version)) = (r, w) {
                 Some(Protocol::new(min_reader_version, min_wrriter_version))
@@ -515,7 +515,7 @@ fn struct_array_to_map(arr: &StructArray) -> DeltaResult<HashMap<String, Option<
     let values = cast_struct_column::<StringArray>(arr, "value")?;
     Ok(keys
         .into_iter()
-        .zip(values.into_iter())
+        .zip(values)
         .filter_map(|(k, v)| k.map(|key| (key.to_string(), v.map(|vv| vv.to_string()))))
         .collect())
 }
