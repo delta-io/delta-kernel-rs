@@ -219,7 +219,7 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
             let read_lock = self
                 .metadata
                 .read()
-                .map_err(|_| Error::Generic("filed to get read lock".into()))?;
+                .map_err(|_| Error::Generic("failed to get read lock".into()))?;
             if let Some((metadata, protocol)) = read_lock.as_ref() {
                 return Ok((metadata.clone(), protocol.clone()));
             }
@@ -233,7 +233,7 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
         let mut meta = self
             .metadata
             .write()
-            .map_err(|_| Error::Generic("filed to get write lock".into()))?;
+            .map_err(|_| Error::Generic("failed to get write lock".into()))?;
         *meta = Some((metadata.clone(), protocol.clone()));
 
         Ok((metadata, protocol))
