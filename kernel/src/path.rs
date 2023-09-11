@@ -11,8 +11,8 @@ const DELIMITER: &str = "/";
 
 lazy_static! {
     static ref CHECKPOINT_FILE_PATTERN: Regex =
-        Regex::new(r#"\d+\.checkpoint(\.\d+\.\d+)?\.parquet"#).unwrap();
-    static ref DELTA_FILE_PATTERN: Regex = Regex::new(r#"\d+\.json"#).unwrap();
+        Regex::new(r"\d+\.checkpoint(\.\d+\.\d+)?\.parquet").unwrap();
+    static ref DELTA_FILE_PATTERN: Regex = Regex::new(r"\d+\.json").unwrap();
 }
 
 #[derive(Debug)]
