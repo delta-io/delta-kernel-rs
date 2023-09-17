@@ -101,8 +101,10 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
         let store = self.inner.clone();
 
-        // This channel will become the iterator
-        let (sender, receiver) = std::sync::mpsc::sync_channel(20);
+        // This channel will become the output iterator.
+        // Because there will already be buffering in the stream, we set the
+        // buffer size to 0.
+        let (sender, receiver) = std::sync::mpsc::sync_channel(0);
 
         self.task_executor.spawn(
             futures::stream::iter(files)
@@ -118,6 +120,9 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
                         }
                     }
                 })
+                // We allow executing up to `readahead` futures concurrently and
+                // buffer the results. This allows us to achieve async concurrency
+                // within a synchronous method.
                 .buffered(self.readahead)
                 .for_each(move |res| {
                     sender.send(res.map_err(Error::from)).ok();

@@ -44,6 +44,9 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
         }
     }
 
+    /// Set the maximum number of batches to read ahead during [Self::read_json_files()].
+    ///
+    /// Defaults to 10.
     pub fn with_readahead(mut self, readahead: usize) -> Self {
         self.readahead = readahead;
         self
@@ -111,7 +114,9 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         let files = files.into_iter().map(|f| f.meta).collect::<Vec<_>>();
         let stream = FileStream::new(files, schema, file_reader)?;
 
-        // This channel will become the iterator
+        // This channel will become the output iterator
+        // The stream will execute in the background, and we allow up to `readahead`
+        // batches to be buffered in the channel.
         let (sender, receiver) = std::sync::mpsc::sync_channel(self.readahead);
 
         self.task_executor.spawn(stream.for_each(move |res| {

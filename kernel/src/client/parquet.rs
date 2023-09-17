@@ -41,7 +41,9 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         }
     }
 
-    /// Max number of batches to read asynchronously.
+    /// Max number of batches to read ahead while executing [Self::read_parquet_files()].
+    ///
+    /// Defaults to 10.
     pub fn with_readahead(mut self, readahead: usize) -> Self {
         self.readahead = readahead;
         self
@@ -80,7 +82,10 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         let files = files.into_iter().map(|f| f.meta).collect::<Vec<_>>();
         let stream = FileStream::new(files, schema, file_reader)?;
 
-        // This channel will become the iterator
+        // This channel will become the output iterator.
+        // The stream will execute in the background and send results to this channel.
+        // The channel will buffer up to `readahead` results, allowing the background
+        // stream to get ahead of the consumer.
         let (sender, receiver) = std::sync::mpsc::sync_channel(self.readahead);
 
         self.task_executor.spawn(stream.for_each(move |res| {

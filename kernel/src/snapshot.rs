@@ -35,6 +35,14 @@ impl LogSegment {
         self.commit_files.iter()
     }
 
+    /// Read a stream of log data from this log segment.
+    ///
+    /// The log files will be read from most recent to oldest.
+    ///
+    /// `read_schema` is the schema to read the log files with. This can be used
+    /// to project the log files to a subset of the columns.
+    ///
+    /// `predicate` is an optional expression to filter the log files with.
     pub fn replay<JRC: Send, PRC: Send>(
         &self,
         table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,

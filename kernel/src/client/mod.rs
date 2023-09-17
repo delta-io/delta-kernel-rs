@@ -1,4 +1,12 @@
 //! # Default TableClient
+//!
+//! The default implementation of [`TableClient`] is [`DefaultTableClient`].
+//! This uses the [object_store], [parquet][::parquet], and [arrow_json] crates
+//! to read and write data.
+//!
+//! The underlying implementations use asynchronous IO. Async tasks are run on
+//! a separate thread pool, provided by the [`TaskExecutor`] trait. Read more in
+//! the [executor] module.
 
 use std::sync::Arc;
 
