@@ -5,6 +5,7 @@ use crate::actions::{parse_actions, Action, ActionType, Add};
 use crate::expressions::Expression;
 use crate::DeltaResult;
 use arrow_array::RecordBatch;
+use either::Either;
 
 struct LogReplayScanner {
     predicate: Option<Expression>,
@@ -70,20 +71,11 @@ pub fn log_replay_iter(
 ) -> impl Iterator<Item = DeltaResult<Add>> {
     let mut log_scanner = LogReplayScanner::new(predicate);
 
-    action_iter.flat_map(
-        move |actions| -> Box<dyn Iterator<Item = DeltaResult<Add>>> {
-            match actions {
-                Ok(actions) => match log_scanner.process_batch(actions) {
-                    Ok(adds) => Box::new(adds.into_iter().map(Ok)),
-                    Err(err) => Box::new(std::iter::once(Err(err))),
-                },
-                Err(err) => Box::new(std::iter::once(Err(err))),
-            }
+    action_iter.flat_map(move |actions| match actions {
+        Ok(actions) => match log_scanner.process_batch(actions) {
+            Ok(adds) => Either::Left(adds.into_iter().map(Ok)),
+            Err(err) => Either::Right(std::iter::once(Err(err))),
         },
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    // TODO: add tests
+        Err(err) => Either::Right(std::iter::once(Err(err))),
+    })
 }
