@@ -32,6 +32,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: build and lint with clippy
         run: cargo clippy --tests -- -D warnings
+      - name: lint without default features
+        run: cargo clippy --no-default--features -- -D warnings
   test:
     runs-on: ubuntu-latest
     steps:

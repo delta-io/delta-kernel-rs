@@ -10,6 +10,7 @@ use itertools::izip;
 
 use crate::{DeltaResult, Error};
 
+pub(crate) mod arrow;
 pub(crate) mod schemas;
 pub(crate) mod types;
 

@@ -13,7 +13,6 @@ use crate::{
     DeltaResult, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler, TableClient,
 };
 
-pub mod arrow;
 pub mod executor;
 pub mod file_handler;
 pub mod filesystem;
