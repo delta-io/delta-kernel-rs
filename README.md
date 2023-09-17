@@ -4,12 +4,9 @@ Delta-kernel-rs is an experimental [Delta][delta] implementation focused on
 interoperability with a wide range of query engines. It currently only supports
 reads.
 
-Delta's (the open-source [storage format][delta-protocol]) [reference
-implementation][delta-github] is effectively a Spark library. That is, one must
-use the JVM and Spark to interact with Delta tables. Delta-kernel-rs, by contrast,
-aims to democratize interacting with Delta tables by providing a means of
-'teaching' any query engine how to read (and in the future, write) Delta
-tables.
+The Delta Kernel project is a Rust and C library for building Delta connectors that
+can read (and soon, write to) Delta tables without needing to understand the Delta
+[protocol details][delta-protocol]. This is the Rust/C equivalent of [Java Delta Kernel][java-kernel].
 
 ## Building
 
@@ -39,7 +36,7 @@ adopted by most Rust projects.
 
 ### Architecture
 
-See [doc/architecture.md] document (currently wip)
+See [arcitecture.md](doc/architecture.md) document (currently wip)
 
 Some design principles which should be considered:
 
@@ -78,6 +75,7 @@ Some design principles which should be considered:
 [delta]: https://delta.io
 [delta-protocol]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md
 [delta-github]: https://github.com/delta-io/delta
+[java-kernel]: https://github.com/delta-io/delta/tree/master/kernel
 [rustup]: https://rustup.rs
 [architecture.md]: https://github.com/delta-incubator/delta-kernel-rs/tree/master/architecture.md
 [dat]: https://github.com/delta-incubator/dat
