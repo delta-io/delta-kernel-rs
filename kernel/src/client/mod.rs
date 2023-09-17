@@ -24,8 +24,8 @@ pub mod parquet;
 pub struct DefaultTableClient<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
     file_system: Arc<ObjectStoreFileSystemClient<E>>,
-    json: Arc<DefaultJsonHandler>,
-    parquet: Arc<DefaultParquetHandler>,
+    json: Arc<DefaultJsonHandler<E>>,
+    parquet: Arc<DefaultParquetHandler<E>>,
 }
 
 impl<E: TaskExecutor> DefaultTableClient<E> {
@@ -46,10 +46,13 @@ impl<E: TaskExecutor> DefaultTableClient<E> {
             file_system: Arc::new(ObjectStoreFileSystemClient::new(
                 store.clone(),
                 prefix,
-                task_executor,
+                task_executor.clone(),
             )),
-            json: Arc::new(DefaultJsonHandler::new(store.clone())),
-            parquet: Arc::new(DefaultParquetHandler::new(store.clone())),
+            json: Arc::new(DefaultJsonHandler::new(
+                store.clone(),
+                task_executor.clone(),
+            )),
+            parquet: Arc::new(DefaultParquetHandler::new(store.clone(), task_executor)),
             store,
         })
     }
@@ -59,10 +62,13 @@ impl<E: TaskExecutor> DefaultTableClient<E> {
             file_system: Arc::new(ObjectStoreFileSystemClient::new(
                 store.clone(),
                 prefix,
-                task_executor,
+                task_executor.clone(),
             )),
-            json: Arc::new(DefaultJsonHandler::new(store.clone())),
-            parquet: Arc::new(DefaultParquetHandler::new(store.clone())),
+            json: Arc::new(DefaultJsonHandler::new(
+                store.clone(),
+                task_executor.clone(),
+            )),
+            parquet: Arc::new(DefaultParquetHandler::new(store.clone(), task_executor)),
             store,
         }
     }

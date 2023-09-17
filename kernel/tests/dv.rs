@@ -7,8 +7,8 @@ use deltakernel::client::DefaultTableClient;
 use deltakernel::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::Table;
 
-#[tokio::test]
-async fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
+#[test]
+fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/"))?;
     let url = url::Url::from_directory_path(path).unwrap();
     let table_client = Arc::new(DefaultTableClient::try_new(
@@ -19,9 +19,9 @@ async fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
 
     let table = Table::new(url, table_client);
     let snapshot = table.snapshot(None)?;
-    let scan = snapshot.scan().await?.build();
+    let scan = snapshot.scan()?.build();
 
-    let stream = scan.execute().await?.into_iter();
+    let stream = scan.execute()?;
     for batch in stream {
         let rows = batch.num_rows();
         arrow::util::pretty::print_batches(&[batch])?;
@@ -30,8 +30,8 @@ async fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[tokio::test]
-async fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
+#[test]
+fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/"))?;
     let url = url::Url::from_directory_path(path).unwrap();
     let table_client = Arc::new(DefaultTableClient::try_new(
@@ -42,9 +42,9 @@ async fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
 
     let table = Table::new(url, table_client);
     let snapshot = table.snapshot(None)?;
-    let scan = snapshot.scan().await?.build();
+    let scan = snapshot.scan()?.build();
 
-    let stream = scan.execute().await?.into_iter();
+    let stream = scan.execute()?;
     for batch in stream {
         let rows = batch.num_rows();
         arrow::util::pretty::print_batches(&[batch]).unwrap();

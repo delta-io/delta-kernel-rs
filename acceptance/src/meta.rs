@@ -78,7 +78,7 @@ impl TestCaseInfo {
         Ok((latest, cases))
     }
 
-    async fn assert_snapshot_meta<JRC: Send, PRC: Send + Sync>(
+    fn assert_snapshot_meta<JRC: Send, PRC: Send + Sync>(
         &self,
         case: &TableVersionMetaData,
         snapshot: &Snapshot<JRC, PRC>,
@@ -86,8 +86,8 @@ impl TestCaseInfo {
         assert_eq!(snapshot.version(), case.version);
 
         // assert correct metadata is read
-        let metadata = snapshot.metadata().await?;
-        let protocol = snapshot.protocol().await?;
+        let metadata = snapshot.metadata()?;
+        let protocol = snapshot.protocol()?;
         let tvm = TableVersionMetaData {
             version: snapshot.version(),
             properties: metadata
@@ -111,11 +111,11 @@ impl TestCaseInfo {
         let (latest, versions) = self.versions().await?;
 
         let snapshot = table.snapshot(None)?;
-        self.assert_snapshot_meta(&latest, &snapshot).await?;
+        self.assert_snapshot_meta(&latest, &snapshot)?;
 
         for table_version in versions {
             let snapshot = table.snapshot(Some(table_version.version))?;
-            self.assert_snapshot_meta(&table_version, &snapshot).await?;
+            self.assert_snapshot_meta(&table_version, &snapshot)?;
         }
 
         Ok(())

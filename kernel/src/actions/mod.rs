@@ -529,11 +529,12 @@ mod tests {
     use super::*;
     use crate::actions::Protocol;
     use crate::client::json::DefaultJsonHandler;
+    use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::JsonHandler;
 
     fn action_batch() -> RecordBatch {
         let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultJsonHandler::new(store);
+        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
         let json_strings: StringArray = vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
@@ -596,7 +597,7 @@ mod tests {
     #[test]
     fn test_parse_add_partitioned() {
         let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultJsonHandler::new(store);
+        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
         let json_strings: StringArray = vec![
             r#"{"commitInfo":{"timestamp":1670892998177,"operation":"WRITE","operationParameters":{"mode":"Append","partitionBy":"[\"c1\",\"c2\"]"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"3","numOutputRows":"3","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,

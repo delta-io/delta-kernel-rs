@@ -97,10 +97,10 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let expected_data = vec![batch.clone(), batch];
 
     let snapshot = table.snapshot(None)?;
-    let scan = snapshot.scan().await?.build();
+    let scan = snapshot.scan()?.build();
 
     let mut files = 0;
-    let stream = scan.execute().await?.into_iter().zip(expected_data);
+    let stream = scan.execute()?.into_iter().zip(expected_data);
 
     for (data, expected) in stream {
         files += 1;
@@ -147,10 +147,10 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let expected_data = vec![batch.clone(), batch];
 
     let snapshot = table.snapshot(None).unwrap();
-    let scan = snapshot.scan().await?.build();
+    let scan = snapshot.scan()?.build();
 
     let mut files = 0;
-    let stream = scan.execute().await?.into_iter().zip(expected_data);
+    let stream = scan.execute()?.into_iter().zip(expected_data);
 
     for (data, expected) in stream {
         files += 1;
@@ -201,9 +201,9 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let expected_data = vec![batch];
 
     let snapshot = table.snapshot(None)?;
-    let scan = snapshot.scan().await?.build();
+    let scan = snapshot.scan()?.build();
 
-    let stream = scan.execute().await?.into_iter().zip(expected_data);
+    let stream = scan.execute()?.into_iter().zip(expected_data);
 
     let mut files = 0;
     for (data, expected) in stream {
@@ -266,10 +266,10 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(Expression::Column(String::from("ids"))),
         Box::new(Expression::Literal(2)),
     );
-    let scan = snapshot.scan().await?.with_predicate(predicate).build();
+    let scan = snapshot.scan()?.with_predicate(predicate).build();
 
     let mut files = 0;
-    let stream = scan.execute().await?.into_iter().zip(expected_data);
+    let stream = scan.execute()?.into_iter().zip(expected_data);
 
     for (data, expected) in stream {
         files += 1;

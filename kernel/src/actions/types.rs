@@ -226,9 +226,8 @@ impl DeletionVectorDescriptor {
 
                 let dv_data = fs_client
                     .read_files(vec![(path, None)])?
-                    .first()
-                    .ok_or(Error::MissingData("No deletion Vecor data".to_string()))?
-                    .clone();
+                    .next()
+                    .ok_or(Error::MissingData("No deletion Vector data".to_string()))??;
 
                 let mut cursor = Cursor::new(dv_data);
                 if let Some(offset) = offset {

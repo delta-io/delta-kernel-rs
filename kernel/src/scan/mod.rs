@@ -4,15 +4,15 @@ use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::{Fields, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use arrow_select::filter::filter_record_batch;
-use futures::stream::{StreamExt, TryStreamExt};
+use itertools::Itertools;
 use url::Url;
 
-use self::file_stream::LogReplayStream;
+use self::file_stream::log_replay_iter;
 use crate::actions::ActionType;
 use crate::expressions::Expression;
-use crate::schema::{Schema, SchemaRef};
+use crate::schema::SchemaRef;
 use crate::snapshot::LogSegment;
-use crate::{DeltaResult, FileMeta, TableClient};
+use crate::{Add, DeltaResult, FileMeta, TableClient};
 
 mod data_skipping;
 pub mod file_stream;
@@ -126,76 +126,55 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
     /// which yields record batches of scan files and their associated metadata. Rows of the scan
     /// files batches correspond to data reads, and the DeltaReader is used to materialize the scan
     /// files into actual table data.
-    pub fn files(&self) -> DeltaResult<LogReplayStream> {
-        // TODO use LogSegmentNEw replay ...
-        // TODO create function to generate native schema
-        let schema = ArrowSchema {
+    pub fn files(&self) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
+        let schema = Arc::new(ArrowSchema {
             fields: Fields::from_iter([ActionType::Add.field(), ActionType::Remove.field()]),
             metadata: Default::default(),
-        };
-        let schema = Arc::new(Schema::try_from(&schema).unwrap());
+        });
 
-        let json_handler = self.table_client.get_json_handler();
-        let commit_reads = json_handler.contextualize_file_reads(
-            // NOTE commit files are sorted in reverse on creations
-            self.log_segment.commit_files.clone(),
-            self.predicate.clone(),
-        )?;
+        let log_iter =
+            self.log_segment
+                .replay(self.table_client.as_ref(), schema, self.predicate.clone())?;
 
-        let parquet_handler = self.table_client.get_parquet_handler();
-        let checkpoint_reads = parquet_handler.contextualize_file_reads(
-            self.log_segment.checkpoint_files.clone(),
-            self.predicate.clone(),
-        )?;
-
-        let stream = json_handler
-            .read_json_files(commit_reads, schema.clone())?
-            .chain(parquet_handler.read_parquet_files(checkpoint_reads, schema.clone())?)
-            .boxed();
-
-        LogReplayStream::new(
-            stream,
-            self.predicate.clone(),
-            self.table_client.get_file_system_client(),
-            self.table_root.clone(),
-        )
+        Ok(log_replay_iter(log_iter, self.predicate.clone()))
     }
 
-    pub async fn execute(&self) -> DeltaResult<Vec<RecordBatch>> {
+    pub fn execute(&self) -> DeltaResult<Vec<RecordBatch>> {
         let parquet_handler = self.table_client.get_parquet_handler();
-        let mut stream = self.files()?.boxed();
 
-        let mut results = Vec::new();
-        while let Some(Ok(data)) = stream.next().await {
-            for file in data {
+        self.files()?
+            .map(|res| {
+                let add = res?;
                 let meta = FileMeta {
-                    last_modified: file.add.modification_time,
-                    size: file.add.size as usize,
-                    location: self.table_root.join(&file.add.path)?,
+                    last_modified: add.modification_time,
+                    size: add.size as usize,
+                    location: self.table_root.join(&add.path)?,
                 };
                 let context = parquet_handler.contextualize_file_reads(vec![meta], None)?;
                 let batches = parquet_handler
                     .read_parquet_files(context, self.schema.clone())?
-                    .try_collect::<Vec<_>>()
-                    .await?;
+                    .collect::<DeltaResult<Vec<_>>>()?;
+
                 if batches.is_empty() {
-                    continue;
+                    return Ok(None);
                 }
+
                 let schema = batches[0].schema();
                 let batch = concat_batches(&schema, &batches)?;
-                if let Some(dv) = file.dv {
-                    let vec: Vec<_> = (0..batch.num_rows())
+
+                if let Some(dv_descriptor) = add.deletion_vector {
+                    let fs_client = self.table_client.get_file_system_client();
+                    let dv = dv_descriptor.read(fs_client, self.table_root.clone())?;
+                    let mask: BooleanArray = (0..batch.num_rows())
                         .map(|i| Some(!dv.contains(i.try_into().expect("fit into u32"))))
                         .collect();
-                    let dv = BooleanArray::from(vec);
-                    results.push(filter_record_batch(&batch, &dv)?);
+                    Ok(Some(filter_record_batch(&batch, &mask)?))
                 } else {
-                    results.push(batch);
+                    Ok(Some(batch))
                 }
-            }
-        }
-
-        Ok(results)
+            })
+            .filter_map_ok(|batch| batch)
+            .collect()
     }
 }
 
@@ -203,15 +182,13 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
 mod tests {
     use std::path::PathBuf;
 
-    use futures::TryStreamExt;
-
     use super::*;
     use crate::client::DefaultTableClient;
     use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::Table;
 
-    #[tokio::test]
-    async fn test_scan_files() {
+    #[test]
+    fn test_scan_files() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -226,15 +203,19 @@ mod tests {
 
         let table = Table::new(url, table_client);
         let snapshot = table.snapshot(None).unwrap();
-        let scan = snapshot.scan().await.unwrap().build();
-        let files = scan.files().unwrap().try_collect::<Vec<_>>().await.unwrap();
+        let scan = snapshot.scan().unwrap().build();
+        let files: Vec<Add> = scan.files().unwrap().try_collect().unwrap();
 
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].len(), 1)
+        assert_eq!(
+            &files[0].path,
+            "part-00000-517f5d32-9c95-48e8-82b4-0229cc194867-c000.snappy.parquet"
+        );
+        assert!(&files[0].deletion_vector.is_none());
     }
 
-    #[tokio::test]
-    async fn test_scan_data() {
+    #[test]
+    fn test_scan_data() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -249,8 +230,8 @@ mod tests {
 
         let table = Table::new(url, table_client);
         let snapshot = table.snapshot(None).unwrap();
-        let scan = snapshot.scan().await.unwrap().build();
-        let files = scan.execute().await.unwrap();
+        let scan = snapshot.scan().unwrap().build();
+        let files = scan.execute().unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].num_rows(), 10)

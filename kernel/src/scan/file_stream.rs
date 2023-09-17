@@ -1,132 +1,89 @@
 use std::collections::HashSet;
-use std::pin::Pin;
-use std::sync::Arc;
-
-use arrow_arith::boolean::{is_not_null, or};
-use arrow_array::{BooleanArray, RecordBatch};
-use arrow_select::filter::filter_record_batch;
-use futures::stream::{BoxStream, Stream};
-use futures::task::{Context, Poll};
-use roaring::RoaringTreemap;
-use url::Url;
 
 use super::data_skipping::data_skipping_filter;
 use crate::actions::{parse_actions, Action, ActionType, Add};
 use crate::expressions::Expression;
-use crate::{DeltaResult, Error, FileSystemClient};
+use crate::DeltaResult;
+use arrow_array::RecordBatch;
 
-/// A stream of [`RecordBatch`]es that represent actions in the delta log.
-pub struct LogReplayStream {
-    stream: BoxStream<'static, DeltaResult<RecordBatch>>,
+struct LogReplayScanner {
     predicate: Option<Expression>,
+    /// A set of (data file path, dv_unique_id) pairs that have been seen thus
+    /// far in the log. This is used to filter out files with Remove actions as
+    /// well as duplicate entries in the log.
     seen: HashSet<(String, Option<String>)>,
-    // ages: HashMap<Version, HashSet<PathBuf>>
-    fs_client: Arc<dyn FileSystemClient>,
-    table_root: Url,
 }
 
-impl std::fmt::Debug for LogReplayStream {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        f.debug_struct("LogStream")
-            .field("predicate", &self.predicate)
-            .finish()
-    }
-}
-
-impl LogReplayStream {
+impl LogReplayScanner {
     /// Create a new [`LogReplayStream`] instance
-    pub(crate) fn new(
-        stream: BoxStream<'static, DeltaResult<RecordBatch>>,
-        predicate: Option<Expression>,
-        fs_client: Arc<dyn FileSystemClient>,
-        table_root: Url,
-    ) -> DeltaResult<Self> {
-        Ok(Self {
+    fn new(predicate: Option<Expression>) -> Self {
+        Self {
             predicate,
-            stream,
-            fs_client,
-            table_root,
             seen: Default::default(),
-        })
-    }
-}
-
-#[allow(missing_debug_implementations)]
-pub struct DataFile {
-    pub add: Add,
-    pub dv: Option<RoaringTreemap>,
-}
-
-impl Stream for LogReplayStream {
-    type Item = DeltaResult<Vec<DataFile>>;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        ctx: &mut Context<'_>,
-    ) -> Poll<Option<<Self as futures::Stream>::Item>> {
-        let stream = Pin::new(&mut self.stream);
-        match stream.poll_next(ctx) {
-            futures::task::Poll::Ready(value) => match value {
-                Some(Ok(actions)) => {
-                    let skipped = if let Some(predicate) = &self.predicate {
-                        data_skipping_filter(actions, predicate)?
-                    } else {
-                        let predicate = filter_nulls(&actions)?;
-                        filter_record_batch(&actions, &predicate)?
-                    };
-                    let filtered_actions =
-                        parse_actions(&skipped, &[ActionType::Remove, ActionType::Add])?
-                            .filter_map(|action| match action {
-                                Action::Add(add)
-                                    // TODO right now this may not work as expected if we have the same add
-                                    // file with different deletion vectors in the log - i.e. additional
-                                    // rows were deleted in separate op. Is this a case to consider?
-                                    if !self
-                                        .seen
-                                        .contains(&(add.path.clone(), add.dv_unique_id())) =>
-                                {
-                                    self.seen.insert((add.path.clone(), add.dv_unique_id()));
-                                    let dvv = add.deletion_vector.clone();
-                                    let dv = if let Some(dv_def) = dvv {
-                                        let dv_def = dv_def.clone();
-                                        let fut = dv_def.read(self.fs_client.clone(), self.table_root.clone()).unwrap();
-                                        Some(fut)
-                                    } else {
-                                        None
-                                    };
-                                    Some(DataFile {
-                                        add: add.clone(),
-                                        dv,
-                                    })
-                                }
-                                Action::Add(add) => {
-                                    self.seen.insert((add.path.clone(), add.dv_unique_id()));
-                                    None
-                                }
-                                Action::Remove(remove) => {
-                                    self.seen
-                                        .insert((remove.path.clone(), remove.dv_unique_id()));
-                                    None
-                                }
-                                _ => None,
-                            })
-                            .collect();
-                    futures::task::Poll::Ready(Some(Ok(filtered_actions)))
-                }
-                Some(Err(err)) => futures::task::Poll::Ready(Some(Err(err))),
-                None => futures::task::Poll::Ready(None),
-            },
-            _ => futures::task::Poll::Pending,
         }
     }
+
+    /// Extract Add actions from a single batch. This will filter out rows that
+    /// don't match the predicate and Add actions that have corresponding Remove
+    /// actions in the log.
+    fn process_batch(&mut self, actions: RecordBatch) -> DeltaResult<Vec<Add>> {
+        let actions = if let Some(predicate) = &self.predicate {
+            data_skipping_filter(actions, predicate)?
+        } else {
+            actions
+        };
+
+        let adds: Vec<Add> = parse_actions(&actions, &[ActionType::Remove, ActionType::Add])?
+            .filter_map(|action| match action {
+                Action::Add(add)
+                    // Note: each (add.path + add.dv_unique_id()) pair has a 
+                    // unique Add + Remove pair in the log. For example:
+                    // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
+                    if !self
+                        .seen
+                        .contains(&(add.path.clone(), add.dv_unique_id())) =>
+                {
+                    self.seen.insert((add.path.clone(), add.dv_unique_id()));
+                    Some(add)
+                }
+                Action::Add(add) => {
+                    self.seen.insert((add.path.clone(), add.dv_unique_id()));
+                    None
+                }
+                Action::Remove(remove) => {
+                    self.seen
+                        .insert((remove.path.clone(), remove.dv_unique_id()));
+                    None
+                }
+                _ => None,
+            })
+            .collect();
+
+        Ok(adds)
+    }
 }
 
-fn filter_nulls(batch: &RecordBatch) -> DeltaResult<BooleanArray> {
-    let add_array = batch
-        .column_by_name("add")
-        .ok_or(Error::MissingData("expected add column".into()))?;
-    let remove_array = batch
-        .column_by_name("remove")
-        .ok_or(Error::MissingData("expected remove column".into()))?;
-    Ok(or(&is_not_null(add_array)?, &is_not_null(remove_array)?)?)
+/// Given an iterator of actions and a predicate, returns a stream of [Add]
+pub fn log_replay_iter(
+    action_iter: impl Iterator<Item = DeltaResult<RecordBatch>>,
+    predicate: Option<Expression>,
+) -> impl Iterator<Item = DeltaResult<Add>> {
+    let mut log_scanner = LogReplayScanner::new(predicate);
+
+    action_iter.flat_map(
+        move |actions| -> Box<dyn Iterator<Item = DeltaResult<Add>>> {
+            match actions {
+                Ok(actions) => match log_scanner.process_batch(actions) {
+                    Ok(adds) => Box::new(adds.into_iter().map(Ok)),
+                    Err(err) => Box::new(std::iter::once(Err(err))),
+                },
+                Err(err) => Box::new(std::iter::once(Err(err))),
+            }
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    // TODO: add tests
 }
