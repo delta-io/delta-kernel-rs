@@ -38,13 +38,11 @@
 )]
 
 use std::ops::Range;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, StringArray};
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use bytes::Bytes;
-use futures::Stream;
 use url::Url;
 
 use self::schema::SchemaRef;
@@ -75,7 +73,7 @@ pub type FileSlice = (Url, Option<Range<usize>>);
 
 /// Data read from a Delta table file and the corresponding scan file information.
 pub type FileDataReadResult = (FileMeta, RecordBatch);
-pub type FileDataReadResultStream = Pin<Box<dyn Stream<Item = DeltaResult<RecordBatch>> + Send>>;
+pub type FileDataReadResultIterator = Box<dyn Iterator<Item = DeltaResult<RecordBatch>> + Send>;
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,7 +132,10 @@ pub trait FileSystemClient: Send + Sync {
         -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
 
     /// Read data specified by the start and end offset from the file.
-    fn read_files(&self, files: Vec<FileSlice>) -> DeltaResult<Vec<Bytes>>;
+    fn read_files(
+        &self,
+        files: Vec<FileSlice>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
 }
 
 /// Provides file handling functionality to Delta Kernel.
@@ -173,7 +174,6 @@ pub trait FileHandler {
 /// Delta Kernel can use this client to parse JSON strings into Row or read content from JSON files.
 /// Connectors can leverage this interface to provide their best implementation of the JSON parsing
 /// capability to Delta Kernel.
-#[async_trait::async_trait]
 pub trait JsonHandler: FileHandler {
     /// Parse the given json strings and return the fields requested by output schema as columns in a [`RecordBatch`].
     fn parse_json(
@@ -193,14 +193,13 @@ pub trait JsonHandler: FileHandler {
         &self,
         files: Vec<<Self as FileHandler>::FileReadContext>,
         physical_schema: SchemaRef,
-    ) -> DeltaResult<FileDataReadResultStream>;
+    ) -> DeltaResult<FileDataReadResultIterator>;
 }
 
 /// Provides Parquet file related functionalities to Delta Kernel.
 ///
 /// Connectors can leverage this interface to provide their own custom
 /// implementation of Parquet data file functionalities to Delta Kernel.
-#[async_trait::async_trait]
 pub trait ParquetHandler: FileHandler + Send + Sync {
     /// Read and parse the JSON format file at given locations and return
     /// the data as a RecordBatch with the columns requested by physical schema.
@@ -213,7 +212,7 @@ pub trait ParquetHandler: FileHandler + Send + Sync {
         &self,
         files: Vec<<Self as FileHandler>::FileReadContext>,
         physical_schema: SchemaRef,
-    ) -> DeltaResult<FileDataReadResultStream>;
+    ) -> DeltaResult<FileDataReadResultIterator>;
 }
 
 /// Interface encapsulating all clients needed by the Delta Kernel in order to read the Delta table.

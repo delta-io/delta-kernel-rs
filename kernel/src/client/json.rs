@@ -10,15 +10,16 @@ use arrow_json::ReaderBuilder;
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use arrow_select::concat::concat_batches;
 use bytes::{Buf, Bytes};
-use futures::stream::{StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{DynObjectStore, GetResultPayload};
 
 use super::file_handler::{FileOpenFuture, FileOpener};
+use crate::executor::TaskExecutor;
 use crate::file_handler::FileStream;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, Error, Expression, FileDataReadResultStream, FileHandler, FileMeta, JsonHandler,
+    DeltaResult, Error, Expression, FileDataReadResultIterator, FileHandler, FileMeta, JsonHandler,
 };
 
 #[derive(Debug)]
@@ -28,17 +29,31 @@ pub struct JsonReadContext {
 }
 
 #[derive(Debug)]
-pub struct DefaultJsonHandler {
+pub struct DefaultJsonHandler<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
+    task_executor: Arc<E>,
+    readahead: usize,
 }
 
-impl DefaultJsonHandler {
-    pub fn new(store: Arc<DynObjectStore>) -> Self {
-        Self { store }
+impl<E: TaskExecutor> DefaultJsonHandler<E> {
+    pub fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+        Self {
+            store,
+            task_executor,
+            readahead: 10,
+        }
+    }
+
+    /// Set the maximum number of batches to read ahead during [Self::read_json_files()].
+    ///
+    /// Defaults to 10.
+    pub fn with_readahead(mut self, readahead: usize) -> Self {
+        self.readahead = readahead;
+        self
     }
 }
 
-impl FileHandler for DefaultJsonHandler {
+impl<E: TaskExecutor> FileHandler for DefaultJsonHandler<E> {
     type FileReadContext = JsonReadContext;
 
     fn contextualize_file_reads(
@@ -56,8 +71,7 @@ impl FileHandler for DefaultJsonHandler {
     }
 }
 
-#[async_trait::async_trait]
-impl JsonHandler for DefaultJsonHandler {
+impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     fn parse_json(
         &self,
         json_strings: StringArray,
@@ -88,9 +102,9 @@ impl JsonHandler for DefaultJsonHandler {
         &self,
         files: Vec<<Self as FileHandler>::FileReadContext>,
         physical_schema: SchemaRef,
-    ) -> DeltaResult<FileDataReadResultStream> {
+    ) -> DeltaResult<FileDataReadResultIterator> {
         if files.is_empty() {
-            return Ok(futures::stream::empty().boxed());
+            return Ok(Box::new(std::iter::empty()));
         }
 
         let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
@@ -99,7 +113,18 @@ impl JsonHandler for DefaultJsonHandler {
 
         let files = files.into_iter().map(|f| f.meta).collect::<Vec<_>>();
         let stream = FileStream::new(files, schema, file_reader)?;
-        Ok(stream.boxed())
+
+        // This channel will become the output iterator
+        // The stream will execute in the background, and we allow up to `readahead`
+        // batches to be buffered in the channel.
+        let (sender, receiver) = std::sync::mpsc::sync_channel(self.readahead);
+
+        self.task_executor.spawn(stream.for_each(move |res| {
+            sender.send(res).ok();
+            futures::future::ready(())
+        }));
+
+        Ok(Box::new(receiver.into_iter()))
     }
 }
 
@@ -186,15 +211,15 @@ impl FileOpener for JsonOpener {
 mod tests {
     use std::path::PathBuf;
 
-    use object_store::{local::LocalFileSystem, ObjectStore};
-
     use super::*;
-    use crate::actions::get_log_schema;
+    use crate::{actions::get_log_schema, executor::tokio::TokioBackgroundExecutor};
+    use itertools::Itertools;
+    use object_store::{local::LocalFileSystem, ObjectStore};
 
     #[test]
     fn test_parse_json() {
         let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultJsonHandler::new(store);
+        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
         let json_strings: StringArray = vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
@@ -227,14 +252,13 @@ mod tests {
             size: meta.size,
         }];
 
-        let handler = DefaultJsonHandler::new(store);
+        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
         let physical_schema = Arc::new(get_log_schema());
         let context = handler.contextualize_file_reads(files, None).unwrap();
-        let data = handler
+        let data: Vec<RecordBatch> = handler
             .read_json_files(context, Arc::new(physical_schema.try_into().unwrap()))
             .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
+            .try_collect()
             .unwrap();
 
         assert_eq!(data.len(), 1);
