@@ -368,7 +368,7 @@ impl DataType {
     }
 
     pub fn decimal(precision: usize, scale: usize) -> Self {
-        DataType::Primitive(PrimitiveType::Decimal(format!("{},{}", precision, scale)))
+        DataType::Primitive(PrimitiveType::Decimal(precision as i32, scale as i32))
     }
 }
 

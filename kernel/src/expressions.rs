@@ -3,7 +3,7 @@ use arrow_array::{
 };
 use arrow_ord::cmp::lt;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fmt::{Display, Formatter},
 };
 
@@ -14,7 +14,7 @@ use crate::{
     DeltaResult, Error,
 };
 
-use self::scalars::{ColumnBounds, Scalar};
+use self::scalars::Scalar;
 
 pub mod scalars;
 
@@ -151,8 +151,7 @@ impl Expression {
                 "Cannot compare expressions of different types: {} and {}",
                 self.data_type(),
                 other.data_type()
-            ))
-            .into());
+            )));
         }
         Ok(Self::BinaryComparison {
             op,
@@ -199,8 +198,7 @@ impl Expression {
             return Err(Error::Generic(format!(
                 "Cannot use expression of type {} as boolean",
                 self.data_type()
-            ))
-            .into());
+            )));
         }
         Ok(())
     }
@@ -232,8 +230,7 @@ impl Expression {
                 op,
                 self.data_type(),
                 other.data_type()
-            ))
-            .into());
+            )));
         }
         Ok(Self::BinaryOperator {
             op,
@@ -249,7 +246,7 @@ impl Expression {
             match expr {
                 Self::Literal(_) => {}
                 Self::Column { .. } => {}
-                Self::BinaryOperator { left, right, op } => {
+                Self::BinaryOperator { left, right, .. } => {
                     stack.push(left);
                     stack.push(right);
                 }
@@ -267,92 +264,6 @@ impl Expression {
                 }
             }
         }
-    }
-
-    fn visit_mut(&mut self, mut visit_fn: impl FnMut(&mut Self)) {
-        let mut stack = vec![self];
-        while let Some(mut expr) = stack.pop() {
-            visit_fn(&mut expr);
-            match expr {
-                Self::Literal(_) => {}
-                Self::Column { .. } => {}
-                Self::BinaryOperator { left, right, op } => {
-                    stack.push(left);
-                    stack.push(right);
-                }
-                Self::BinaryComparison { left, right, .. } => {
-                    stack.push(left);
-                    stack.push(right);
-                }
-                Self::And { left, right } => {
-                    stack.push(left);
-                    stack.push(right);
-                }
-                Self::Or { left, right } => {
-                    stack.push(left);
-                    stack.push(right);
-                }
-            }
-        }
-    }
-
-    /// Rewrite the expression in a canonical form.
-    ///
-    /// For example, the expressions `x > 2` and `2 > x` should be considered
-    /// identical, but aren't.
-    ///
-    /// This is useful for comparing expressions for equality or to simplify
-    /// implementations that manipulate expressions.
-    ///
-    /// Rules:
-    ///  * In binary comparisons, the left side should be a column reference
-    fn canonicalize(&mut self) {
-        self.visit_mut(|expr| match expr {
-            Self::BinaryComparison { left, right, .. } => match (&mut **left, &mut **right) {
-                (Self::Column { .. }, Self::Literal(_)) => {}
-                (Self::Literal(_), Self::Column { .. }) => {
-                    std::mem::swap(left, right);
-                }
-                _ => {}
-            },
-            _ => {}
-        })
-    }
-
-    /// Simplify the expression, if possible.
-    ///
-    /// Does not nest.
-    fn simplify(&mut self) -> Self {
-        todo!()
-    }
-
-    fn rewrite_with_bounds(&mut self, bounds: &HashMap<String, ColumnBounds>) -> Self {
-        todo!()
-    }
-
-    /// Get the residual expression after applying the column values and bounds.
-    /// 
-    /// The column values are exactly values, such as those from partition values.
-    /// 
-    /// The column bounds are the min/max values for each column in the table,
-    /// as determined by the stats record batch.
-    fn get_residual(
-        &self,
-        column_values: &HashMap<String, Scalar>,
-        column_bounds: &HashMap<String, ColumnBounds>,
-    ) -> DeltaResult<Self> {
-        if self.data_type() != DataType::Primitive(PrimitiveType::Boolean) {
-            return Err(Error::Generic(format!(
-                "Cannot apply column bounds to expression of type {}",
-                self.data_type()
-            )));
-        }
-
-        // match self {
-        //     Self::Literal(_) => Ok(self.clone()),
-        //     Self
-        // }
-        todo!();
     }
 
     /// Apply the predicate to a stats record batch, returning a boolean array
@@ -373,7 +284,11 @@ impl Expression {
                 match op {
                     ComparisonOperator::LessThan => {
                         match (left.as_ref(), right.as_ref()) {
-                            (Expression::Column(name), Expression::Literal(l)) => {
+                            (Expression::Column { name, .. }, Expression::Literal(l)) => {
+                                let literal_value = match l {
+                                    Scalar::Integer(v) => *v,
+                                    _ => todo!(),
+                                };
                                 // column_min < value
                                 lt(
                                     stats
@@ -387,7 +302,7 @@ impl Expression {
                                         .as_any()
                                         .downcast_ref::<Int32Array>()
                                         .unwrap(),
-                                    &PrimitiveArray::<Int32Type>::new_scalar(*l),
+                                    &PrimitiveArray::<Int32Type>::new_scalar(literal_value),
                                 )
                             }
                             _ => todo!(),
@@ -399,40 +314,6 @@ impl Expression {
 
             _ => todo!(),
         }
-    }
-
-    /// Extract the names of all columns referenced by this expression.
-    pub(crate) fn columns(&self) -> HashSet<String> {
-        let mut columns = HashSet::new();
-
-        let mut stack = vec![self];
-
-        while let Some(expr) = stack.pop() {
-            match expr {
-                Expression::Literal(_) => {}
-                Expression::Column(c) => {
-                    columns.insert(c.to_string());
-                }
-                Expression::BinaryOperator { left, right, .. } => {
-                    stack.push(left);
-                    stack.push(right);
-                }
-                Expression::BinaryComparison { left, right, .. } => {
-                    stack.push(left);
-                    stack.push(right);
-                }
-                Expression::And { left, right } => {
-                    stack.push(left);
-                    stack.push(right);
-                }
-                Expression::Or { left, right } => {
-                    stack.push(left);
-                    stack.push(right);
-                }
-            }
-        }
-
-        columns
     }
 }
 
@@ -510,8 +391,6 @@ impl std::ops::Div<Expression> for Expression {
 
 #[cfg(test)]
 mod tests {
-    use crate::expressions::scalars::NullStatus;
-
     use super::Expression as Expr;
     use super::*;
 
@@ -560,144 +439,5 @@ mod tests {
             let result = format!("{}", expr);
             assert_eq!(result, expected);
         }
-    }
-
-    #[test]
-    fn test_canonicalize() {
-        let x_ref = Expr::column("x", DataType::integer());
-        let cases = vec![
-            // 10 = x -> x = 10
-            (
-                Expr::literal(10).eq(&x_ref).unwrap(),
-                x_ref.clone().eq(&Expr::literal(10)).unwrap(),
-            ),
-        ];
-
-        for (mut expr, expected) in cases {
-            expr.canonicalize();
-            assert_eq!(expr, expected);
-        }
-    }
-
-    #[test]
-    fn test_simplify() {
-        let x_ref = Expr::column("x", DataType::integer());
-        let cases = vec![
-            // x + 0 -> x
-            ((x_ref.clone() + Expr::literal(0)).unwrap(), x_ref.clone()),
-            // x + 1 -> x + 1
-            (
-                (x_ref.clone() + Expr::literal(1)).unwrap(),
-                (x_ref.clone() + Expr::literal(1)).unwrap(),
-            ),
-            // true AND (x > 0) -> x > 0
-            (
-                Expr::literal(true)
-                    .and(&x_ref.gt(&Expr::literal(0)).unwrap())
-                    .unwrap(),
-                x_ref.gt(&Expr::literal(0)).unwrap(),
-            ),
-            // (x > 0) AND false -> false
-            (
-                x_ref
-                    .gt(&Expr::literal(0))
-                    .unwrap()
-                    .and(&Expr::literal(false))
-                    .unwrap(),
-                Expr::literal(false),
-            ),
-            // (x > 0) OR false -> x > 0
-            (
-                x_ref
-                    .gt(&Expr::literal(0))
-                    .unwrap()
-                    .or(&Expr::literal(false))
-                    .unwrap(),
-                x_ref.gt(&Expr::literal(0)).unwrap(),
-            ),
-            // true OR (x > 0) -> true
-            (
-                Expr::literal(true)
-                    .or(&x_ref.gt(&Expr::literal(0)).unwrap())
-                    .unwrap(),
-                Expr::literal(true),
-            ),
-        ];
-
-        for (mut expr, expected) in cases {
-            expr.simplify();
-            assert_eq!(expr, expected);
-        }
-    }
-
-    #[test]
-    fn test_residual_from_values() {
-        let expr = Expr::column("x", DataType::integer())
-            .gt(&Expr::literal(0))
-            .unwrap();
-
-        // TODO: null handling
-        let cases = vec![
-            // x > 0 with x = 1 -> true
-            ("x", 1i32, Expr::literal(true)),
-            // x > 0 with x = -1 -> false
-            ("x", -1i32, Expr::literal(false)),
-            // x > 0 with y = -1 -> x > 0 (ignores irrelevant columns)
-            ("y", -1i32, Expr::column("x", DataType::integer()).gt(&Expr::literal(0)).unwrap()),
-        ];
-
-        for (col_name, value, expected) in cases {
-            let column_values: HashMap<String, Scalar> = [(col_name.to_owned(), Scalar::from(value))].into();
-            let result = expr.get_residual(&column_values, &HashMap::new()).unwrap();
-            assert_eq!(result, expected);
-        }
-    }
-
-    #[test]
-    fn test_residual_from_bounds() {
-
-        // x > 0 + minValues.x = 1 -> true
-        // x > 0 + minValues.x = -1 -> x > 0
-        // x > 0 + maxValues.x = -1 -> false
-        // x > 0 + maxValues.x = 1 -> x > 0
-        let expr = Expr::column("x", DataType::integer())
-            .gt(&Expr::literal(0))
-            .unwrap();
-
-        // x > 0 + minValues.x = 1 -> true
-        let bounds = ColumnBounds {
-            data_type: DataType::integer(),
-            min: Some(Scalar::from(0i32)),
-            max: None,
-            null_status: NullStatus::NeverNull,
-        };
-        let column_bounds: HashMap<String, ColumnBounds> = [("x".to_owned(), bounds)].into();
-        let expected = Expr::literal(true);
-        let result = expr.get_residual(&HashMap::new(), &column_bounds).unwrap();
-        assert_eq!(result, expected);
-        
-        // x > 0 + minValues.x = -1 -> x > 0
-        let bounds = ColumnBounds {
-            data_type: DataType::integer(),
-            min: Some(Scalar::from(-1i32)),
-            max: None,
-            null_status: NullStatus::NeverNull,
-        };
-        let column_bounds: HashMap<String, ColumnBounds> = [("x".to_owned(), bounds)].into();
-        let expected = expr.clone();
-        let result = expr.get_residual(&HashMap::new(), &column_bounds).unwrap();
-        assert_eq!(result, expected);
-
-        // x > 0 + maxValues.x = -1 -> false
-        let bounds = ColumnBounds {
-            data_type: DataType::integer(),
-            min: Some(Scalar::from(-1i32)),
-            max: None,
-            null_status: NullStatus::NeverNull,
-        };
-        let column_bounds: HashMap<String, ColumnBounds> = [("x".to_owned(), bounds)].into();
-        let expected = expr.clone();
-        let result = expr.get_residual(&HashMap::new(), &column_bounds).unwrap();
-        assert_eq!(result, expected);
     }
 }

@@ -55,21 +55,3 @@ impl From<bool> for Scalar {
         Self::Boolean(b)
     }
 }
-
-/// Status of nulls
-pub(crate) enum NullStatus {
-    /// Guaranteed to always be null
-    AlwaysNull,
-    /// Might be null (but not guaranteed to have any nulls)
-    MaybeNull,
-    /// Guaranteed to never be null
-    NeverNull,
-}
-
-pub(crate) struct ColumnBounds {
-    pub data_type: DataType,
-    pub min: Option<Scalar>,
-    pub max: Option<Scalar>,
-    pub null_status: NullStatus,
-}
-
