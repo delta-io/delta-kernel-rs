@@ -234,7 +234,7 @@ pub enum PrimitiveType {
     Float,
     /// f64: 8-byte double-precision floating-point numbers
     Double,
-    /// bool
+    /// bool: boolean values
     Boolean,
     Binary,
     Date,

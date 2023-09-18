@@ -62,7 +62,6 @@ impl Display for ComparisonOperator {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
-    // TODO: how to we handle scalar values?
     // TODO: how do we handle is null expressions?
     Literal(Scalar),
     Column {
