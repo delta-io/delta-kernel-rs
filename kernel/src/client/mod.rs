@@ -1,4 +1,12 @@
 //! # Default TableClient
+//!
+//! The default implementation of [`TableClient`] is [`DefaultTableClient`].
+//! This uses the [object_store], [parquet][::parquet], and [arrow_json] crates
+//! to read and write data.
+//!
+//! The underlying implementations use asynchronous IO. Async tasks are run on
+//! a separate thread pool, provided by the [`TaskExecutor`] trait. Read more in
+//! the [executor] module.
 
 use std::sync::Arc;
 
@@ -13,7 +21,6 @@ use crate::{
     DeltaResult, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler, TableClient,
 };
 
-pub mod arrow;
 pub mod executor;
 pub mod file_handler;
 pub mod filesystem;
@@ -24,8 +31,8 @@ pub mod parquet;
 pub struct DefaultTableClient<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
     file_system: Arc<ObjectStoreFileSystemClient<E>>,
-    json: Arc<DefaultJsonHandler>,
-    parquet: Arc<DefaultParquetHandler>,
+    json: Arc<DefaultJsonHandler<E>>,
+    parquet: Arc<DefaultParquetHandler<E>>,
 }
 
 impl<E: TaskExecutor> DefaultTableClient<E> {
@@ -46,10 +53,13 @@ impl<E: TaskExecutor> DefaultTableClient<E> {
             file_system: Arc::new(ObjectStoreFileSystemClient::new(
                 store.clone(),
                 prefix,
-                task_executor,
+                task_executor.clone(),
             )),
-            json: Arc::new(DefaultJsonHandler::new(store.clone())),
-            parquet: Arc::new(DefaultParquetHandler::new(store.clone())),
+            json: Arc::new(DefaultJsonHandler::new(
+                store.clone(),
+                task_executor.clone(),
+            )),
+            parquet: Arc::new(DefaultParquetHandler::new(store.clone(), task_executor)),
             store,
         })
     }
@@ -59,10 +69,13 @@ impl<E: TaskExecutor> DefaultTableClient<E> {
             file_system: Arc::new(ObjectStoreFileSystemClient::new(
                 store.clone(),
                 prefix,
-                task_executor,
+                task_executor.clone(),
             )),
-            json: Arc::new(DefaultJsonHandler::new(store.clone())),
-            parquet: Arc::new(DefaultParquetHandler::new(store.clone())),
+            json: Arc::new(DefaultJsonHandler::new(
+                store.clone(),
+                task_executor.clone(),
+            )),
+            parquet: Arc::new(DefaultParquetHandler::new(store.clone(), task_executor)),
             store,
         }
     }

@@ -4,17 +4,19 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef as ArrowSchemaRef;
-use futures::stream::{StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::DynObjectStore;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 
 use super::file_handler::{FileOpenFuture, FileOpener};
+use crate::executor::TaskExecutor;
 use crate::file_handler::FileStream;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, Error, Expression, FileDataReadResultStream, FileHandler, FileMeta, ParquetHandler,
+    DeltaResult, Error, Expression, FileDataReadResultIterator, FileHandler, FileMeta,
+    ParquetHandler,
 };
 
 #[derive(Debug)]
@@ -24,17 +26,31 @@ pub struct ParquetReadContext {
 }
 
 #[derive(Debug)]
-pub struct DefaultParquetHandler {
+pub struct DefaultParquetHandler<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
+    task_executor: Arc<E>,
+    readahead: usize,
 }
 
-impl DefaultParquetHandler {
-    pub fn new(store: Arc<DynObjectStore>) -> Self {
-        Self { store }
+impl<E: TaskExecutor> DefaultParquetHandler<E> {
+    pub fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+        Self {
+            store,
+            task_executor,
+            readahead: 10,
+        }
+    }
+
+    /// Max number of batches to read ahead while executing [Self::read_parquet_files()].
+    ///
+    /// Defaults to 10.
+    pub fn with_readahead(mut self, readahead: usize) -> Self {
+        self.readahead = readahead;
+        self
     }
 }
 
-impl FileHandler for DefaultParquetHandler {
+impl<E: TaskExecutor> FileHandler for DefaultParquetHandler<E> {
     type FileReadContext = ParquetReadContext;
 
     fn contextualize_file_reads(
@@ -49,16 +65,15 @@ impl FileHandler for DefaultParquetHandler {
     }
 }
 
-#[async_trait::async_trait]
-impl ParquetHandler for DefaultParquetHandler {
+impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     fn read_parquet_files(
         &self,
         files: Vec<<Self as FileHandler>::FileReadContext>,
         physical_schema: SchemaRef,
-    ) -> DeltaResult<FileDataReadResultStream> {
+    ) -> DeltaResult<FileDataReadResultIterator> {
         // TODO at the very least load only required columns ...
         if files.is_empty() {
-            return Ok(futures::stream::empty().boxed());
+            return Ok(Box::new(std::iter::empty()));
         }
 
         let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
@@ -66,7 +81,19 @@ impl ParquetHandler for DefaultParquetHandler {
 
         let files = files.into_iter().map(|f| f.meta).collect::<Vec<_>>();
         let stream = FileStream::new(files, schema, file_reader)?;
-        Ok(stream.boxed())
+
+        // This channel will become the output iterator.
+        // The stream will execute in the background and send results to this channel.
+        // The channel will buffer up to `readahead` results, allowing the background
+        // stream to get ahead of the consumer.
+        let (sender, receiver) = std::sync::mpsc::sync_channel(self.readahead);
+
+        self.task_executor.spawn(stream.for_each(move |res| {
+            sender.send(res).ok();
+            futures::future::ready(())
+        }));
+
+        Ok(Box::new(receiver.into_iter()))
     }
 }
 
@@ -135,7 +162,12 @@ impl FileOpener for ParquetOpener {
 mod tests {
     use std::path::PathBuf;
 
+    use arrow_array::RecordBatch;
     use object_store::{local::LocalFileSystem, ObjectStore};
+
+    use crate::executor::tokio::TokioBackgroundExecutor;
+
+    use itertools::Itertools;
 
     use super::*;
 
@@ -163,14 +195,13 @@ mod tests {
             size: meta.size,
         }];
 
-        let handler = DefaultParquetHandler::new(store);
+        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
         let context = handler.contextualize_file_reads(files, None).unwrap();
 
-        let data = handler
+        let data: Vec<RecordBatch> = handler
             .read_parquet_files(context, Arc::new(physical_schema.try_into().unwrap()))
             .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
+            .try_collect()
             .unwrap();
 
         assert_eq!(data.len(), 1);

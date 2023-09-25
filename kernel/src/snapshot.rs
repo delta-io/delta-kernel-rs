@@ -8,8 +8,6 @@ use std::sync::RwLock;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Fields, Schema as ArrowSchema};
-use futures::StreamExt;
-use futures::TryStreamExt;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -18,6 +16,7 @@ use crate::actions::{parse_action, Action, ActionType, Metadata, Protocol};
 use crate::path::LogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::Schema;
+use crate::Expression;
 use crate::{DeltaResult, Error, FileMeta, FileSystemClient, TableClient, Version};
 
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
@@ -36,46 +35,55 @@ impl LogSegment {
         self.commit_files.iter()
     }
 
-    // TODO just a stop gap implementation, eventually we likely want a stream of batches...
-    async fn replay<JRC: Send, PRC: Send>(
+    /// Read a stream of log data from this log segment.
+    ///
+    /// The log files will be read from most recent to oldest.
+    ///
+    /// `read_schema` is the schema to read the log files with. This can be used
+    /// to project the log files to a subset of the columns.
+    ///
+    /// `predicate` is an optional expression to filter the log files with.
+    pub fn replay<JRC: Send, PRC: Send>(
         &self,
         table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
-    ) -> DeltaResult<Vec<RecordBatch>> {
+        read_schema: Arc<ArrowSchema>,
+        predicate: Option<Expression>,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<RecordBatch>>> {
+        let mut commit_files: Vec<_> = self.commit_files().cloned().collect();
+
+        // NOTE this will already sort in reverse order
+        commit_files.sort_unstable_by(|a, b| b.location.cmp(&a.location));
+        let json_client = table_client.get_json_handler();
+        let read_contexts =
+            json_client.contextualize_file_reads(commit_files, predicate.clone())?;
+        let commit_stream = json_client
+            .read_json_files(read_contexts, Arc::new(read_schema.as_ref().try_into()?))?;
+
+        let parquet_client = table_client.get_parquet_handler();
+        let read_contexts =
+            parquet_client.contextualize_file_reads(self.checkpoint_files.clone(), predicate)?;
+        let checkpoint_stream = parquet_client
+            .read_parquet_files(read_contexts, Arc::new(read_schema.as_ref().try_into()?))?;
+
+        let batches = commit_stream.chain(checkpoint_stream);
+
+        Ok(batches)
+    }
+
+    fn read_metadata<JRC: Send, PRC: Send>(
+        &self,
+        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
+    ) -> DeltaResult<Option<(Metadata, Protocol)>> {
         let read_schema = Arc::new(ArrowSchema {
             fields: Fields::from_iter([ActionType::Metadata.field(), ActionType::Protocol.field()]),
             metadata: Default::default(),
         });
 
-        let mut commit_files: Vec<_> = self.commit_files().cloned().collect();
-        // NOTE this will already sort in reverse order
-        commit_files.sort_unstable_by(|a, b| b.location.cmp(&a.location));
-        let json_client = table_client.get_json_handler();
-        let read_contexts = json_client.contextualize_file_reads(commit_files, None)?;
-        let commit_stream = json_client
-            .read_json_files(read_contexts, Arc::new(read_schema.clone().try_into()?))?;
-
-        let parquet_client = table_client.get_parquet_handler();
-        let read_contexts =
-            parquet_client.contextualize_file_reads(self.checkpoint_files.clone(), None)?;
-        let checkpoint_stream = parquet_client
-            .read_parquet_files(read_contexts, Arc::new(read_schema.clone().try_into()?))?;
-
-        let batches = commit_stream
-            .chain(checkpoint_stream)
-            .try_collect::<Vec<_>>()
-            .await?;
-
-        Ok(batches)
-    }
-
-    async fn read_metadata<JRC: Send, PRC: Send>(
-        &self,
-        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
-    ) -> DeltaResult<Option<(Metadata, Protocol)>> {
-        let batches = self.replay(table_client).await?;
+        let batches = self.replay(table_client, read_schema, None)?;
         let mut metadata_opt = None;
         let mut protocol_opt = None;
         for batch in batches {
+            let batch = batch?;
             if let Ok(mut metas) = parse_action(&batch, &ActionType::Metadata) {
                 if let Some(Action::Metadata(meta)) = metas.next() {
                     metadata_opt = Some(meta.clone());
@@ -214,7 +222,7 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
         self.version
     }
 
-    async fn get_or_insert_metadata(&self) -> DeltaResult<(Metadata, Protocol)> {
+    fn get_or_insert_metadata(&self) -> DeltaResult<(Metadata, Protocol)> {
         {
             let read_lock = self
                 .metadata
@@ -227,8 +235,7 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
 
         let (metadata, protocol) = self
             .log_segment
-            .read_metadata(self.table_client.as_ref())
-            .await?
+            .read_metadata(self.table_client.as_ref())?
             .ok_or(Error::MissingMetadata)?;
         let mut meta = self
             .metadata
@@ -240,23 +247,23 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
     }
 
     /// Table [`Schema`] at this [`Snapshot`]s version.
-    pub async fn schema(&self) -> DeltaResult<Schema> {
-        self.metadata().await?.schema()
+    pub fn schema(&self) -> DeltaResult<Schema> {
+        self.metadata()?.schema()
     }
 
     /// Table [`Metadata`] at this [`Snapshot`]s version.
-    pub async fn metadata(&self) -> DeltaResult<Metadata> {
-        let (metadata, _) = self.get_or_insert_metadata().await?;
+    pub fn metadata(&self) -> DeltaResult<Metadata> {
+        let (metadata, _) = self.get_or_insert_metadata()?;
         Ok(metadata)
     }
 
-    pub async fn protocol(&self) -> DeltaResult<Protocol> {
-        let (_, protocol) = self.get_or_insert_metadata().await?;
+    pub fn protocol(&self) -> DeltaResult<Protocol> {
+        let (_, protocol) = self.get_or_insert_metadata()?;
         Ok(protocol)
     }
 
-    pub async fn scan(self) -> DeltaResult<ScanBuilder<JRC, PRC>> {
-        let schema = Arc::new(self.schema().await?);
+    pub fn scan(self) -> DeltaResult<ScanBuilder<JRC, PRC>> {
+        let schema = Arc::new(self.schema()?);
         Ok(ScanBuilder::new(
             self.table_root,
             schema,
@@ -293,11 +300,11 @@ fn read_last_checkpoint(
     log_root: &Url,
 ) -> DeltaResult<Option<CheckpointMetadata>> {
     let file_path = LogPath(log_root).child(LAST_CHECKPOINT_FILE_NAME)?;
-    match fs_client.read_files(vec![(file_path, None)]) {
-        Ok(data) => match data.first() {
-            Some(data) => Ok(Some(serde_json::from_slice(data)?)),
-            None => Ok(None),
-        },
+    match fs_client
+        .read_files(vec![(file_path, None)])
+        .and_then(|mut data| data.next().expect("read_files should return one file"))
+    {
+        Ok(data) => Ok(Some(serde_json::from_slice(&data)?)),
         Err(Error::FileNotFound(_)) => Ok(None),
         Err(err) => Err(err),
     }
@@ -419,8 +426,8 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn test_snapshot_read_metadata() {
+    #[test]
+    fn test_snapshot_read_metadata() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -428,7 +435,7 @@ mod tests {
         let client = default_table_client(&url);
         let snapshot = Snapshot::try_new(url, client, Some(1)).unwrap();
 
-        let protocol = snapshot.protocol().await.unwrap();
+        let protocol = snapshot.protocol().unwrap();
         let expected = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
@@ -439,12 +446,12 @@ mod tests {
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
         let expected: StructType = serde_json::from_str(schema_string).unwrap();
-        let schema = snapshot.schema().await.unwrap();
+        let schema = snapshot.schema().unwrap();
         assert_eq!(schema, expected);
     }
 
-    #[tokio::test]
-    async fn test_new_snapshot() {
+    #[test]
+    fn test_new_snapshot() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -452,7 +459,7 @@ mod tests {
         let client = default_table_client(&url);
         let snapshot = Snapshot::try_new(url, client, None).unwrap();
 
-        let protocol = snapshot.protocol().await.unwrap();
+        let protocol = snapshot.protocol().unwrap();
         let expected = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
@@ -463,7 +470,7 @@ mod tests {
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
         let expected: StructType = serde_json::from_str(schema_string).unwrap();
-        let schema = snapshot.schema().await.unwrap();
+        let schema = snapshot.schema().unwrap();
         assert_eq!(schema, expected);
     }
 

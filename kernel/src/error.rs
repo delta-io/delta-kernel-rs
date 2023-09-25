@@ -14,9 +14,11 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
+    #[cfg(feature = "parquet")]
     #[error("Arrow error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
 
+    #[cfg(feature = "object_store")]
     #[error("Error interacting with object store: {0}")]
     ObjectStore(object_store::Error),
 
@@ -48,6 +50,7 @@ pub enum Error {
     MissingMetadata,
 }
 
+#[cfg(feature = "object_store")]
 impl From<object_store::Error> for Error {
     fn from(value: object_store::Error) -> Self {
         match value {
