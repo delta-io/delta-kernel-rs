@@ -8,8 +8,8 @@ use arrow_arith::boolean::{and, or};
 use arrow_arith::numeric::{add, div, mul, sub};
 use arrow_array::RecordBatch as ColumnarBatch;
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum, Decimal128Array, Float32Array,
-    Int32Array, RecordBatch, Scalar as ArrowScalar, StringArray, TimestampMicrosecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+    Int32Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 
@@ -46,7 +46,7 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
     match expression {
         Expression::Literal(scalar) => Ok(scalar.to_array(batch.num_rows())),
         Expression::Column { name, .. } => batch
-            .column_by_name(&name)
+            .column_by_name(name)
             .ok_or(Error::MissingColumn(name.clone()))
             .cloned(),
         Expression::BinaryOperator { op, left, right } => {
@@ -119,7 +119,38 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
                 }
             }
         }
-        _ => todo!(),
+        Expression::And { left, right } => {
+            let left_arr = evaluate_expression(left.as_ref(), batch)?;
+            let left_arr = left_arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or(Error::Generic("expected boolean array".to_string()))?;
+            let right_arr = evaluate_expression(right.as_ref(), batch)?;
+            let right_arr = right_arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or(Error::Generic("expected boolean array".to_string()))?;
+            let result = and(left_arr, right_arr).map_err(|err| Error::GenericError {
+                source: Box::new(err),
+            })?;
+            Ok(Arc::new(result))
+        }
+        Expression::Or { left, right } => {
+            let left_arr = evaluate_expression(left.as_ref(), batch)?;
+            let left_arr = left_arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or(Error::Generic("expected boolean array".to_string()))?;
+            let right_arr = evaluate_expression(right.as_ref(), batch)?;
+            let right_arr = right_arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or(Error::Generic("expected boolean array".to_string()))?;
+            let result = or(left_arr, right_arr).map_err(|err| Error::GenericError {
+                source: Box::new(err),
+            })?;
+            Ok(Arc::new(result))
+        }
     }
 }
 
@@ -147,7 +178,7 @@ pub struct DefaultExpressionEvaluator {
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &ColumnarBatch) -> DeltaResult<ColumnarBatch> {
-        let result = evaluate_expression(&self.expression, batch)?;
+        let _result = evaluate_expression(&self.expression, batch)?;
         todo!()
     }
 }
@@ -226,7 +257,7 @@ mod tests {
             data_type: crate::schema::DataType::Primitive(crate::schema::PrimitiveType::Integer),
         };
         let column_b = Expression::Column {
-            name: "a".to_string(),
+            name: "b".to_string(),
             data_type: crate::schema::DataType::Primitive(crate::schema::PrimitiveType::Integer),
         };
 
@@ -285,6 +316,60 @@ mod tests {
         let expression = Box::new(column.clone().ne(&lit).unwrap());
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, false, true]));
+        assert_eq!(results.as_ref(), expected.as_ref());
+    }
+
+    #[test]
+    fn test_logical() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Boolean, false),
+            Field::new("b", DataType::Boolean, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(BooleanArray::from(vec![true, false])),
+                Arc::new(BooleanArray::from(vec![false, true])),
+            ],
+        )
+        .unwrap();
+        let column_a = Expression::Column {
+            name: "a".to_string(),
+            data_type: crate::schema::DataType::Primitive(crate::schema::PrimitiveType::Boolean),
+        };
+        let column_b = Expression::Column {
+            name: "b".to_string(),
+            data_type: crate::schema::DataType::Primitive(crate::schema::PrimitiveType::Boolean),
+        };
+
+        let expression = Box::new(column_a.clone().and(&column_b).unwrap());
+        let results = evaluate_expression(&expression, &batch).unwrap();
+        let expected = Arc::new(BooleanArray::from(vec![false, false]));
+        assert_eq!(results.as_ref(), expected.as_ref());
+
+        let expression = Box::new(
+            column_a
+                .clone()
+                .and(&Expression::literal(Scalar::Boolean(true)))
+                .unwrap(),
+        );
+        let results = evaluate_expression(&expression, &batch).unwrap();
+        let expected = Arc::new(BooleanArray::from(vec![true, false]));
+        assert_eq!(results.as_ref(), expected.as_ref());
+
+        let expression = Box::new(column_a.clone().or(&column_b).unwrap());
+        let results = evaluate_expression(&expression, &batch).unwrap();
+        let expected = Arc::new(BooleanArray::from(vec![true, true]));
+        assert_eq!(results.as_ref(), expected.as_ref());
+
+        let expression = Box::new(
+            column_a
+                .clone()
+                .or(&Expression::literal(Scalar::Boolean(false)))
+                .unwrap(),
+        );
+        let results = evaluate_expression(&expression, &batch).unwrap();
+        let expected = Arc::new(BooleanArray::from(vec![true, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
     }
 }
