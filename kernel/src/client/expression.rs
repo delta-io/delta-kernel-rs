@@ -4,16 +4,18 @@
 
 use std::sync::Arc;
 
+use arrow_arith::boolean::{and, or};
 use arrow_arith::numeric::{add, div, mul, sub};
 use arrow_array::RecordBatch as ColumnarBatch;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum, Decimal128Array, Float32Array,
     Int32Array, RecordBatch, Scalar as ArrowScalar, StringArray, TimestampMicrosecondArray,
 };
+use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 
 use crate::error::{DeltaResult, Error};
-use crate::expressions::BinaryOperator;
 use crate::expressions::{scalars::Scalar, Expression};
+use crate::expressions::{BinaryOperator, ComparisonOperator};
 use crate::schema::SchemaRef;
 use crate::{ExpressionEvaluator, ExpressionHandler};
 
@@ -40,16 +42,16 @@ impl Scalar {
     }
 }
 
-fn evaluate_expression(expression: &Box<Expression>, batch: &RecordBatch) -> DeltaResult<ArrayRef> {
-    match expression.as_ref() {
+fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaResult<ArrayRef> {
+    match expression {
         Expression::Literal(scalar) => Ok(scalar.to_array(batch.num_rows())),
         Expression::Column { name, .. } => batch
             .column_by_name(&name)
             .ok_or(Error::MissingColumn(name.clone()))
             .cloned(),
         Expression::BinaryOperator { op, left, right } => {
-            let left_arr = evaluate_expression(left, batch)?;
-            let right_arr = evaluate_expression(right, batch)?;
+            let left_arr = evaluate_expression(left.as_ref(), batch)?;
+            let right_arr = evaluate_expression(right.as_ref(), batch)?;
             match op {
                 BinaryOperator::Plus => {
                     add(&left_arr, &right_arr).map_err(|err| Error::GenericError {
@@ -73,6 +75,50 @@ fn evaluate_expression(expression: &Box<Expression>, batch: &RecordBatch) -> Del
                 }
             }
         }
+        Expression::BinaryComparison { op, left, right } => {
+            let left_arr = evaluate_expression(left.as_ref(), batch)?;
+            let right_arr = evaluate_expression(right.as_ref(), batch)?;
+            match op {
+                ComparisonOperator::LessThan => {
+                    let result = lt(&left_arr, &right_arr).map_err(|err| Error::GenericError {
+                        source: Box::new(err),
+                    })?;
+                    Ok(Arc::new(result))
+                }
+                ComparisonOperator::LessThanOrEqual => {
+                    let result =
+                        lt_eq(&left_arr, &right_arr).map_err(|err| Error::GenericError {
+                            source: Box::new(err),
+                        })?;
+                    Ok(Arc::new(result))
+                }
+                ComparisonOperator::GreaterThan => {
+                    let result = gt(&left_arr, &right_arr).map_err(|err| Error::GenericError {
+                        source: Box::new(err),
+                    })?;
+                    Ok(Arc::new(result))
+                }
+                ComparisonOperator::GreaterThanOrEqual => {
+                    let result =
+                        gt_eq(&left_arr, &right_arr).map_err(|err| Error::GenericError {
+                            source: Box::new(err),
+                        })?;
+                    Ok(Arc::new(result))
+                }
+                ComparisonOperator::Equal => {
+                    let result = eq(&left_arr, &right_arr).map_err(|err| Error::GenericError {
+                        source: Box::new(err),
+                    })?;
+                    Ok(Arc::new(result))
+                }
+                ComparisonOperator::NotEqual => {
+                    let result = neq(&left_arr, &right_arr).map_err(|err| Error::GenericError {
+                        source: Box::new(err),
+                    })?;
+                    Ok(Arc::new(result))
+                }
+            }
+        }
         _ => todo!(),
     }
 }
@@ -87,7 +133,7 @@ impl ExpressionHandler for DefaultExpressionHandler {
         expression: Expression,
     ) -> Arc<dyn ExpressionEvaluator> {
         Arc::new(DefaultExpressionEvaluator {
-            input_schema: schema,
+            _input_schema: schema,
             expression: Box::new(expression),
         })
     }
@@ -95,7 +141,7 @@ impl ExpressionHandler for DefaultExpressionHandler {
 
 #[derive(Debug)]
 pub struct DefaultExpressionEvaluator {
-    input_schema: SchemaRef,
+    _input_schema: SchemaRef,
     expression: Box<Expression>,
 }
 
@@ -197,6 +243,48 @@ mod tests {
         let expression = Box::new(column_a.clone().mul(column_b).unwrap());
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(Int32Array::from(vec![1, 4, 9]));
+        assert_eq!(results.as_ref(), expected.as_ref());
+    }
+
+    #[test]
+    fn test_binary_cmp() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let values = Int32Array::from(vec![1, 2, 3]);
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
+        let column = Expression::Column {
+            name: "a".to_string(),
+            data_type: crate::schema::DataType::Primitive(crate::schema::PrimitiveType::Integer),
+        };
+        let lit = Expression::Literal(Scalar::Integer(2));
+
+        let expression = Box::new(column.clone().lt(&lit).unwrap());
+        let results = evaluate_expression(&expression, &batch).unwrap();
+        let expected = Arc::new(BooleanArray::from(vec![true, false, false]));
+        assert_eq!(results.as_ref(), expected.as_ref());
+
+        let expression = Box::new(column.clone().lt_eq(&lit).unwrap());
+        let results = evaluate_expression(&expression, &batch).unwrap();
+        let expected = Arc::new(BooleanArray::from(vec![true, true, false]));
+        assert_eq!(results.as_ref(), expected.as_ref());
+
+        let expression = Box::new(column.clone().gt(&lit).unwrap());
+        let results = evaluate_expression(&expression, &batch).unwrap();
+        let expected = Arc::new(BooleanArray::from(vec![false, false, true]));
+        assert_eq!(results.as_ref(), expected.as_ref());
+
+        let expression = Box::new(column.clone().gt_eq(&lit).unwrap());
+        let results = evaluate_expression(&expression, &batch).unwrap();
+        let expected = Arc::new(BooleanArray::from(vec![false, true, true]));
+        assert_eq!(results.as_ref(), expected.as_ref());
+
+        let expression = Box::new(column.clone().eq(&lit).unwrap());
+        let results = evaluate_expression(&expression, &batch).unwrap();
+        let expected = Arc::new(BooleanArray::from(vec![false, true, false]));
+        assert_eq!(results.as_ref(), expected.as_ref());
+
+        let expression = Box::new(column.clone().ne(&lit).unwrap());
+        let results = evaluate_expression(&expression, &batch).unwrap();
+        let expected = Arc::new(BooleanArray::from(vec![true, false, true]));
         assert_eq!(results.as_ref(), expected.as_ref());
     }
 }
