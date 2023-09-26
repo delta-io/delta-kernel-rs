@@ -14,6 +14,7 @@ use object_store::{parse_url_opts, path::Path, DynObjectStore};
 use url::Url;
 
 use self::executor::TaskExecutor;
+use self::expression::DefaultExpressionHandler;
 use self::filesystem::ObjectStoreFileSystemClient;
 use self::json::{DefaultJsonHandler, JsonReadContext};
 use self::parquet::{DefaultParquetHandler, ParquetReadContext};
@@ -22,6 +23,7 @@ use crate::{
 };
 
 pub mod executor;
+pub mod expression;
 pub mod file_handler;
 pub mod filesystem;
 pub mod json;
@@ -33,6 +35,7 @@ pub struct DefaultTableClient<E: TaskExecutor> {
     file_system: Arc<ObjectStoreFileSystemClient<E>>,
     json: Arc<DefaultJsonHandler<E>>,
     parquet: Arc<DefaultParquetHandler<E>>,
+    expression: Arc<DefaultExpressionHandler>,
 }
 
 impl<E: TaskExecutor> DefaultTableClient<E> {
@@ -61,6 +64,7 @@ impl<E: TaskExecutor> DefaultTableClient<E> {
             )),
             parquet: Arc::new(DefaultParquetHandler::new(store.clone(), task_executor)),
             store,
+            expression: Arc::new(DefaultExpressionHandler {}),
         })
     }
 
@@ -77,6 +81,7 @@ impl<E: TaskExecutor> DefaultTableClient<E> {
             )),
             parquet: Arc::new(DefaultParquetHandler::new(store.clone(), task_executor)),
             store,
+            expression: Arc::new(DefaultExpressionHandler {}),
         }
     }
 }
@@ -92,7 +97,7 @@ impl<E: TaskExecutor> TableClient for DefaultTableClient<E> {
     type ParquetReadContext = ParquetReadContext;
 
     fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler> {
-        todo!()
+        self.expression.clone()
     }
 
     fn get_file_system_client(&self) -> Arc<dyn FileSystemClient> {
