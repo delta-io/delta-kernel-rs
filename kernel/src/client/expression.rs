@@ -105,3 +105,98 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
         todo!()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::Int32Array;
+    use arrow_schema::{DataType, Field, Schema};
+    use std::ops::Add;
+    use std::ops::Div;
+    use std::ops::Mul;
+    use std::ops::Sub;
+
+    #[test]
+    fn test_binary_op_scalar() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let values = Int32Array::from(vec![1, 2, 3]);
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
+        let column = Expression::Column {
+            name: "a".to_string(),
+            data_type: crate::schema::DataType::Primitive(crate::schema::PrimitiveType::Integer),
+        };
+
+        let expression = Box::new(
+            column
+                .clone()
+                .add(Expression::Literal(Scalar::Integer(1)))
+                .unwrap(),
+        );
+        let results = evaluate_expression(&expression, &batch).unwrap();
+        let expected = Arc::new(Int32Array::from(vec![2, 3, 4]));
+        assert_eq!(results.as_ref(), expected.as_ref());
+
+        let expression = Box::new(
+            column
+                .clone()
+                .sub(Expression::Literal(Scalar::Integer(1)))
+                .unwrap(),
+        );
+        let results = evaluate_expression(&expression, &batch).unwrap();
+        let expected = Arc::new(Int32Array::from(vec![0, 1, 2]));
+        assert_eq!(results.as_ref(), expected.as_ref());
+
+        let expression = Box::new(
+            column
+                .clone()
+                .mul(Expression::Literal(Scalar::Integer(2)))
+                .unwrap(),
+        );
+        let results = evaluate_expression(&expression, &batch).unwrap();
+        let expected = Arc::new(Int32Array::from(vec![2, 4, 6]));
+        assert_eq!(results.as_ref(), expected.as_ref());
+
+        // TODO handle type casting
+        let expression = Box::new(column.div(Expression::Literal(Scalar::Integer(1))).unwrap());
+        let results = evaluate_expression(&expression, &batch).unwrap();
+        let expected = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        assert_eq!(results.as_ref(), expected.as_ref())
+    }
+
+    #[test]
+    fn test_binary_op() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+        let values = Int32Array::from(vec![1, 2, 3]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(values.clone()), Arc::new(values)],
+        )
+        .unwrap();
+        let column_a = Expression::Column {
+            name: "a".to_string(),
+            data_type: crate::schema::DataType::Primitive(crate::schema::PrimitiveType::Integer),
+        };
+        let column_b = Expression::Column {
+            name: "a".to_string(),
+            data_type: crate::schema::DataType::Primitive(crate::schema::PrimitiveType::Integer),
+        };
+
+        let expression = Box::new(column_a.clone().add(column_b.clone()).unwrap());
+        let results = evaluate_expression(&expression, &batch).unwrap();
+        let expected = Arc::new(Int32Array::from(vec![2, 4, 6]));
+        assert_eq!(results.as_ref(), expected.as_ref());
+
+        let expression = Box::new(column_a.clone().sub(column_b.clone()).unwrap());
+        let results = evaluate_expression(&expression, &batch).unwrap();
+        let expected = Arc::new(Int32Array::from(vec![0, 0, 0]));
+        assert_eq!(results.as_ref(), expected.as_ref());
+
+        let expression = Box::new(column_a.clone().mul(column_b).unwrap());
+        let results = evaluate_expression(&expression, &batch).unwrap();
+        let expected = Arc::new(Int32Array::from(vec![1, 4, 9]));
+        assert_eq!(results.as_ref(), expected.as_ref());
+    }
+}
