@@ -164,7 +164,7 @@ pub trait FileHandler {
     ///   connector to use for further optimization. Filtering by this predicate is not required.
     fn contextualize_file_reads(
         &self,
-        files: Vec<FileMeta>,
+        files: &[FileMeta],
         predicate: Option<Expression>,
     ) -> DeltaResult<Vec<Self::FileReadContext>>;
 }
@@ -191,7 +191,7 @@ pub trait JsonHandler: FileHandler {
     /// - `physical_schema` - Select list of columns to read from the JSON file.
     fn read_json_files(
         &self,
-        files: Vec<<Self as FileHandler>::FileReadContext>,
+        files: &[Self::FileReadContext],
         physical_schema: SchemaRef,
     ) -> DeltaResult<FileDataReadResultIterator>;
 }

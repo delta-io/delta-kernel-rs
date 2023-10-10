@@ -150,7 +150,7 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
                     size: add.size as usize,
                     location: self.table_root.join(&add.path)?,
                 };
-                let context = parquet_handler.contextualize_file_reads(vec![meta], None)?;
+                let context = parquet_handler.contextualize_file_reads(&[meta], None)?;
                 let batches = parquet_handler
                     .read_parquet_files(context, self.schema.clone())?
                     .collect::<DeltaResult<Vec<_>>>()?;

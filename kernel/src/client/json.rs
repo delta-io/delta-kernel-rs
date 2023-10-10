@@ -58,14 +58,14 @@ impl<E: TaskExecutor> FileHandler for DefaultJsonHandler<E> {
 
     fn contextualize_file_reads(
         &self,
-        files: Vec<FileMeta>,
+        files: &[FileMeta],
         _predicate: Option<Expression>,
     ) -> DeltaResult<Vec<JsonReadContext>> {
         Ok(files
-            .into_iter()
+            .iter()
             .map(|meta| JsonReadContext {
                 store: self.store.clone(),
-                meta,
+                meta: meta.clone(),
             })
             .collect())
     }
@@ -100,7 +100,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
 
     fn read_json_files(
         &self,
-        files: Vec<<Self as FileHandler>::FileReadContext>,
+        files: &[Self::FileReadContext],
         physical_schema: SchemaRef,
     ) -> DeltaResult<FileDataReadResultIterator> {
         if files.is_empty() {
@@ -111,7 +111,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         let store = files.first().unwrap().store.clone();
         let file_reader = JsonOpener::new(1024, schema.clone(), store);
 
-        let files = files.into_iter().map(|f| f.meta).collect::<Vec<_>>();
+        let files = files.iter().map(|f| f.meta.clone()).collect::<Vec<_>>();
         let stream = FileStream::new(files, schema, file_reader)?;
 
         // This channel will become the output iterator
@@ -246,7 +246,7 @@ mod tests {
         let location = Path::from(url.path());
         let meta = store.head(&location).await.unwrap();
 
-        let files = vec![FileMeta {
+        let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp(),
             size: meta.size,
@@ -256,7 +256,7 @@ mod tests {
         let physical_schema = Arc::new(get_log_schema());
         let context = handler.contextualize_file_reads(files, None).unwrap();
         let data: Vec<RecordBatch> = handler
-            .read_json_files(context, Arc::new(physical_schema.try_into().unwrap()))
+            .read_json_files(&context, Arc::new(physical_schema.try_into().unwrap()))
             .unwrap()
             .try_collect()
             .unwrap();

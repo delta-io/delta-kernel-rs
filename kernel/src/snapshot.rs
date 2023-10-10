@@ -31,10 +31,6 @@ pub struct LogSegment {
 }
 
 impl LogSegment {
-    pub(crate) fn commit_files(&self) -> impl Iterator<Item = &FileMeta> {
-        self.commit_files.iter()
-    }
-
     /// Read a stream of log data from this log segment.
     ///
     /// The log files will be read from most recent to oldest.
@@ -49,19 +45,17 @@ impl LogSegment {
         read_schema: Arc<ArrowSchema>,
         predicate: Option<Expression>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<RecordBatch>>> {
-        let mut commit_files: Vec<_> = self.commit_files().cloned().collect();
-
-        // NOTE this will already sort in reverse order
-        commit_files.sort_unstable_by(|a, b| b.location.cmp(&a.location));
         let json_client = table_client.get_json_handler();
         let read_contexts =
-            json_client.contextualize_file_reads(commit_files, predicate.clone())?;
-        let commit_stream = json_client
-            .read_json_files(read_contexts, Arc::new(read_schema.as_ref().try_into()?))?;
+            json_client.contextualize_file_reads(&self.commit_files, predicate.clone())?;
+        let commit_stream = json_client.read_json_files(
+            read_contexts.as_slice(),
+            Arc::new(read_schema.as_ref().try_into()?),
+        )?;
 
         let parquet_client = table_client.get_parquet_handler();
         let read_contexts =
-            parquet_client.contextualize_file_reads(self.checkpoint_files.clone(), predicate)?;
+            parquet_client.contextualize_file_reads(&self.checkpoint_files, predicate)?;
         let checkpoint_stream = parquet_client
             .read_parquet_files(read_contexts, Arc::new(read_schema.as_ref().try_into()?))?;
 
