@@ -55,13 +55,15 @@ impl LogSegment {
         commit_files.sort_unstable_by(|a, b| b.location.cmp(&a.location));
         let json_client = table_client.get_json_handler();
         let read_contexts =
-            json_client.contextualize_file_reads(commit_files, predicate.clone())?;
-        let commit_stream = json_client
-            .read_json_files(read_contexts, Arc::new(read_schema.as_ref().try_into()?))?;
+            json_client.contextualize_file_reads(&commit_files, predicate.clone())?;
+        let commit_stream = json_client.read_json_files(
+            read_contexts.as_slice(),
+            Arc::new(read_schema.as_ref().try_into()?),
+        )?;
 
         let parquet_client = table_client.get_parquet_handler();
         let read_contexts =
-            parquet_client.contextualize_file_reads(self.checkpoint_files.clone(), predicate)?;
+            parquet_client.contextualize_file_reads(&self.checkpoint_files, predicate)?;
         let checkpoint_stream = parquet_client
             .read_parquet_files(read_contexts, Arc::new(read_schema.as_ref().try_into()?))?;
 

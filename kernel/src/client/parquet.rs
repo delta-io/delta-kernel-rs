@@ -55,12 +55,12 @@ impl<E: TaskExecutor> FileHandler for DefaultParquetHandler<E> {
 
     fn contextualize_file_reads(
         &self,
-        files: Vec<FileMeta>,
+        files: &[FileMeta],
         _predicate: Option<Expression>,
     ) -> DeltaResult<Vec<ParquetReadContext>> {
         Ok(files
-            .into_iter()
-            .map(|meta| ParquetReadContext { meta })
+            .iter()
+            .map(|meta| ParquetReadContext { meta: meta.clone() })
             .collect())
     }
 }
@@ -189,7 +189,7 @@ mod tests {
             .schema()
             .clone();
 
-        let files = vec![FileMeta {
+        let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp(),
             size: meta.size,
