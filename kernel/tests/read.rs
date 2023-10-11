@@ -264,7 +264,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = table.snapshot(None)?;
 
     let predicate = Expression::column("ids", DataType::Primitive(PrimitiveType::Integer))
-        .lt(&Expression::literal(2))
+        .lt(Expression::literal(2))
         .unwrap();
     let scan = snapshot.scan()?.with_predicate(predicate).build();
 

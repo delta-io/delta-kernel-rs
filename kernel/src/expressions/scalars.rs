@@ -88,6 +88,8 @@ impl From<bool> for Scalar {
     }
 }
 
+// TODO: add more From impls
+
 #[cfg(test)]
 mod tests {
     use super::*;

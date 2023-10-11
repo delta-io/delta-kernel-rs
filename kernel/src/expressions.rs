@@ -107,14 +107,14 @@ impl Display for Expression {
 
 impl Expression {
     /// Returns a set of columns referenced by this expression.
-    pub fn references(&self) -> HashSet<String> {
+    pub fn references(&self) -> HashSet<&str> {
         let mut set = HashSet::new();
 
-        self.visit(|expr| {
-            if let Self::Column { name, .. } = &expr {
-                set.insert(name.to_string());
+        for expr in self.walk() {
+            if let Self::Column { name, .. } = expr {
+                set.insert(name.as_str());
             }
-        });
+        }
 
         set
     }
@@ -144,7 +144,7 @@ impl Expression {
         Self::Literal(value.into())
     }
 
-    fn cmp_impl(&self, other: &Self, op: ComparisonOperator) -> DeltaResult<Self> {
+    fn cmp_impl(self, other: Self, op: ComparisonOperator) -> DeltaResult<Self> {
         if self.data_type() != other.data_type() {
             return Err(Error::Generic(format!(
                 "Cannot compare expressions of different types: {} and {}",
@@ -154,42 +154,42 @@ impl Expression {
         }
         Ok(Self::BinaryComparison {
             op,
-            left: Box::new(self.clone()),
-            right: Box::new(other.clone()),
+            left: Box::new(self),
+            right: Box::new(other),
         })
     }
 
     /// Create a new expression `self == other`
-    pub fn eq(&self, other: &Self) -> DeltaResult<Self> {
+    pub fn eq(self, other: Self) -> DeltaResult<Self> {
         self.cmp_impl(other, ComparisonOperator::Equal)
     }
 
     /// Create a new expression `self != other`
-    pub fn ne(&self, other: &Self) -> DeltaResult<Self> {
+    pub fn ne(self, other: Self) -> DeltaResult<Self> {
         self.cmp_impl(other, ComparisonOperator::NotEqual)
     }
 
     /// Create a new expression `self < other`
-    pub fn lt(&self, other: &Self) -> DeltaResult<Self> {
+    pub fn lt(self, other: Self) -> DeltaResult<Self> {
         self.cmp_impl(other, ComparisonOperator::LessThan)
     }
 
     /// Create a new expression `self > other`
-    pub fn gt(&self, other: &Self) -> DeltaResult<Self> {
+    pub fn gt(self, other: Self) -> DeltaResult<Self> {
         self.cmp_impl(other, ComparisonOperator::GreaterThan)
     }
 
     /// Create a new expression `self >= other`
-    pub fn gt_eq(&self, other: &Self) -> DeltaResult<Self> {
+    pub fn gt_eq(self, other: Self) -> DeltaResult<Self> {
         self.cmp_impl(other, ComparisonOperator::GreaterThanOrEqual)
     }
 
     /// Create a new expression `self <= other`
-    pub fn lt_eq(&self, other: &Self) -> DeltaResult<Self> {
+    pub fn lt_eq(self, other: Self) -> DeltaResult<Self> {
         self.cmp_impl(other, ComparisonOperator::LessThanOrEqual)
     }
 
-    fn assert_boolean(&self) -> DeltaResult<()> {
+    fn check_boolean(&self) -> DeltaResult<()> {
         if !matches!(
             self.data_type(),
             DataType::Primitive(PrimitiveType::Boolean)
@@ -203,26 +203,26 @@ impl Expression {
     }
 
     /// Create a new expression `self AND other`
-    pub fn and(&self, other: &Self) -> DeltaResult<Self> {
-        self.assert_boolean()?;
-        other.assert_boolean()?;
+    pub fn and(self, other: Self) -> DeltaResult<Self> {
+        self.check_boolean()?;
+        other.check_boolean()?;
         Ok(Self::And {
-            left: Box::new(self.clone()),
-            right: Box::new(other.clone()),
+            left: Box::new(self),
+            right: Box::new(other),
         })
     }
 
     /// Create a new expression `self OR other`
-    pub fn or(&self, other: &Self) -> DeltaResult<Self> {
-        self.assert_boolean()?;
-        other.assert_boolean()?;
+    pub fn or(self, other: Self) -> DeltaResult<Self> {
+        self.check_boolean()?;
+        other.check_boolean()?;
         Ok(Self::Or {
-            left: Box::new(self.clone()),
-            right: Box::new(other.clone()),
+            left: Box::new(self),
+            right: Box::new(other),
         })
     }
 
-    fn binary_op_impl(&self, other: &Expression, op: BinaryOperator) -> DeltaResult<Self> {
+    fn binary_op_impl(self, other: Self, op: BinaryOperator) -> DeltaResult<Self> {
         if self.data_type() != other.data_type() {
             return Err(Error::Generic(format!(
                 "Cannot apply operator {} to expressions of different types: {} and {}",
@@ -233,15 +233,15 @@ impl Expression {
         }
         Ok(Self::BinaryOperator {
             op,
-            left: Box::new(self.clone()),
-            right: Box::new(other.clone()),
+            left: Box::new(self),
+            right: Box::new(other),
         })
     }
 
-    fn visit(&self, mut visit_fn: impl FnMut(&Self)) {
+    fn walk(&self) -> impl Iterator<Item = &Self> + '_ {
         let mut stack = vec![self];
-        while let Some(expr) = stack.pop() {
-            visit_fn(expr);
+        std::iter::from_fn(move || {
+            let expr = stack.pop()?;
             match expr {
                 Self::Literal(_) => {}
                 Self::Column { .. } => {}
@@ -262,7 +262,8 @@ impl Expression {
                     stack.push(right);
                 }
             }
-        }
+            Some(expr)
+        })
     }
 
     /// Apply the predicate to a stats record batch, returning a boolean array
@@ -360,7 +361,7 @@ impl std::ops::Add<Expression> for Expression {
     type Output = DeltaResult<Self>;
 
     fn add(self, rhs: Expression) -> Self::Output {
-        self.binary_op_impl(&rhs, BinaryOperator::Plus)
+        self.binary_op_impl(rhs, BinaryOperator::Plus)
     }
 }
 
@@ -368,7 +369,7 @@ impl std::ops::Sub<Expression> for Expression {
     type Output = DeltaResult<Self>;
 
     fn sub(self, rhs: Expression) -> Self::Output {
-        self.binary_op_impl(&rhs, BinaryOperator::Minus)
+        self.binary_op_impl(rhs, BinaryOperator::Minus)
     }
 }
 
@@ -376,7 +377,7 @@ impl std::ops::Mul<Expression> for Expression {
     type Output = DeltaResult<Self>;
 
     fn mul(self, rhs: Expression) -> Self::Output {
-        self.binary_op_impl(&rhs, BinaryOperator::Multiply)
+        self.binary_op_impl(rhs, BinaryOperator::Multiply)
     }
 }
 
@@ -384,7 +385,7 @@ impl std::ops::Div<Expression> for Expression {
     type Output = DeltaResult<Self>;
 
     fn div(self, rhs: Expression) -> Self::Output {
-        self.binary_op_impl(&rhs, BinaryOperator::Divide)
+        self.binary_op_impl(rhs, BinaryOperator::Divide)
     }
 }
 
@@ -399,30 +400,31 @@ mod tests {
         let cases = [
             (col_ref.clone(), "Column(x)"),
             (
-                col_ref.clone().eq(&Expr::literal(2)).unwrap(),
+                col_ref.clone().eq(Expr::literal(2)).unwrap(),
                 "Column(x) = 2",
             ),
             (
                 col_ref
-                    .gt_eq(&Expr::literal(2))
+                    .clone()
+                    .gt_eq(Expr::literal(2))
                     .unwrap()
-                    .and(&(col_ref.lt_eq(&Expr::literal(10))).unwrap())
+                    .and(col_ref.clone().lt_eq(Expr::literal(10)).unwrap())
                     .unwrap(),
                 "Column(x) >= 2 AND Column(x) <= 10",
             ),
             (
                 col_ref
                     .clone()
-                    .gt(&Expr::literal(2))
+                    .gt(Expr::literal(2))
                     .unwrap()
-                    .or(&col_ref.lt(&Expr::literal(10)).unwrap())
+                    .or(col_ref.clone().lt(Expr::literal(10)).unwrap())
                     .unwrap(),
                 "(Column(x) > 2 OR Column(x) < 10)",
             ),
             (
                 (col_ref.clone() - Expr::literal(4))
                     .unwrap()
-                    .lt(&Expr::literal(10))
+                    .lt(Expr::literal(10))
                     .unwrap(),
                 "Column(x) - 4 < 10",
             ),
