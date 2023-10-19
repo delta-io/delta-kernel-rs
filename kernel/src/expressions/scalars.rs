@@ -43,7 +43,7 @@ impl Display for Scalar {
         match self {
             Self::Integer(i) => write!(f, "{}", i),
             Self::Float(fl) => write!(f, "{}", fl),
-            Self::String(s) => write!(f, "{}", s),
+            Self::String(s) => write!(f, "'{}'", s),
             Self::Boolean(b) => write!(f, "{}", b),
             Self::Timestamp(ts) => write!(f, "{}", ts),
             Self::Date(d) => write!(f, "{}", d),
@@ -85,6 +85,18 @@ impl From<i32> for Scalar {
 impl From<bool> for Scalar {
     fn from(b: bool) -> Self {
         Self::Boolean(b)
+    }
+}
+
+impl From<&str> for Scalar {
+    fn from(s: &str) -> Self {
+        Self::String(s.into())
+    }
+}
+
+impl From<String> for Scalar {
+    fn from(value: String) -> Self {
+        Self::String(value)
     }
 }
 
