@@ -218,15 +218,15 @@ impl Expression {
                                 lt(
                                     stats
                                         .column_by_name("minValues")
-                                        .unwrap()
+                                        .ok_or(ArrowError::SchemaError("No minValues column".to_string()))?
                                         .as_any()
                                         .downcast_ref::<StructArray>()
-                                        .unwrap()
+                                        .ok_or(ArrowError::SchemaError("minValues not struct".to_string()))?
                                         .column_by_name(name)
-                                        .unwrap()
+                                        .ok_or(ArrowError::SchemaError(format!("No such column: {}", name)))?
                                         .as_any()
                                         .downcast_ref::<Int32Array>()
-                                        .unwrap(),
+                                        .ok_or(ArrowError::SchemaError(format!("{} is not an int", name)))?
                                     &PrimitiveArray::<Int32Type>::new_scalar(literal_value),
                                 )
                             }
