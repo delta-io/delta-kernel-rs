@@ -262,10 +262,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
 
     let snapshot = table.snapshot(None)?;
 
-    let predicate = Expression::LessThan(
-        Box::new(Expression::Column(String::from("ids"))),
-        Box::new(Expression::Literal(2)),
-    );
+    let predicate = Expression::column("ids").lt(Expression::literal(2));
     let scan = snapshot.scan()?.with_predicate(predicate).build();
 
     let mut files = 0;

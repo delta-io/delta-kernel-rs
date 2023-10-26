@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::fmt::Formatter;
 use std::sync::Arc;
+use std::{collections::HashMap, fmt::Display};
 
 use serde::{Deserialize, Serialize};
 
@@ -221,18 +222,19 @@ fn default_true() -> bool {
 pub enum PrimitiveType {
     /// UTF-8 encoded string of characters
     String,
-    /// 8-byte signed integer. Range: -9223372036854775808 to 9223372036854775807
+    /// i64: 8-byte signed integer. Range: -9223372036854775808 to 9223372036854775807
     Long,
-    /// 4-byte signed integer. Range: -2147483648 to 2147483647
+    /// i32: 4-byte signed integer. Range: -2147483648 to 2147483647
     Integer,
-    /// 2-byte signed integer numbers. Range: -32768 to 32767
+    /// i16: 2-byte signed integer numbers. Range: -32768 to 32767
     Short,
-    /// 1-byte signed integer number. Range: -128 to 127
+    /// i8: 1-byte signed integer number. Range: -128 to 127
     Byte,
-    /// 4-byte single-precision floating-point numbers
+    /// f32: 4-byte single-precision floating-point numbers
     Float,
-    /// 8-byte double-precision floating-point numbers
+    /// f64: 8-byte double-precision floating-point numbers
     Double,
+    /// bool: boolean values
     Boolean,
     Binary,
     Date,
@@ -284,6 +286,27 @@ where
     Ok((precision, scale))
 }
 
+impl Display for PrimitiveType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PrimitiveType::String => write!(f, "string"),
+            PrimitiveType::Long => write!(f, "bigint"),
+            PrimitiveType::Integer => write!(f, "int"),
+            PrimitiveType::Short => write!(f, "smallint"),
+            PrimitiveType::Byte => write!(f, "tinyint"),
+            PrimitiveType::Float => write!(f, "float"),
+            PrimitiveType::Double => write!(f, "double"),
+            PrimitiveType::Boolean => write!(f, "boolean"),
+            PrimitiveType::Binary => write!(f, "binary"),
+            PrimitiveType::Date => write!(f, "date"),
+            PrimitiveType::Timestamp => write!(f, "timestamp"),
+            PrimitiveType::Decimal(precision, scale) => {
+                write!(f, "decimal({}, {})", precision, scale)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 #[serde(untagged, rename_all = "camelCase")]
 pub enum DataType {
@@ -297,6 +320,76 @@ pub enum DataType {
     /// A map stores an arbitrary length collection of key-value pairs
     /// with a single keyType and a single valueType
     Map(Box<MapType>),
+}
+
+impl DataType {
+    pub fn string() -> Self {
+        DataType::Primitive(PrimitiveType::String)
+    }
+
+    pub fn long() -> Self {
+        DataType::Primitive(PrimitiveType::Long)
+    }
+
+    pub fn integer() -> Self {
+        DataType::Primitive(PrimitiveType::Integer)
+    }
+
+    pub fn short() -> Self {
+        DataType::Primitive(PrimitiveType::Short)
+    }
+
+    pub fn byte() -> Self {
+        DataType::Primitive(PrimitiveType::Byte)
+    }
+
+    pub fn float() -> Self {
+        DataType::Primitive(PrimitiveType::Float)
+    }
+
+    pub fn double() -> Self {
+        DataType::Primitive(PrimitiveType::Double)
+    }
+
+    pub fn boolean() -> Self {
+        DataType::Primitive(PrimitiveType::Boolean)
+    }
+
+    pub fn binary() -> Self {
+        DataType::Primitive(PrimitiveType::Binary)
+    }
+
+    pub fn date() -> Self {
+        DataType::Primitive(PrimitiveType::Date)
+    }
+
+    pub fn timestamp() -> Self {
+        DataType::Primitive(PrimitiveType::Timestamp)
+    }
+
+    pub fn decimal(precision: usize, scale: usize) -> Self {
+        DataType::Primitive(PrimitiveType::Decimal(precision as i32, scale as i32))
+    }
+}
+
+impl Display for DataType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataType::Primitive(p) => write!(f, "{}", p),
+            DataType::Array(a) => write!(f, "array<{}>", a.element_type),
+            DataType::Struct(s) => {
+                write!(f, "struct<")?;
+                for (i, field) in s.fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {}", field.name, field.data_type)?;
+                }
+                write!(f, ">")
+            }
+            DataType::Map(m) => write!(f, "map<{}, {}>", m.key_type, m.value_type),
+        }
+    }
 }
 
 #[cfg(test)]
