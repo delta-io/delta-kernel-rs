@@ -104,6 +104,7 @@ pub struct Scan<JRC: Send, PRC: Send + Sync> {
 impl<JRC: Send, PRC: Send + Sync> std::fmt::Debug for Scan<JRC, PRC> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("Scan")
+            .field("schema", &self.schema)
             .field("predicate", &self.predicate)
             .finish()
     }

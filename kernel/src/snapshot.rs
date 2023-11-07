@@ -74,24 +74,23 @@ impl LogSegment {
         });
 
         let batches = self.replay(table_client, read_schema, None)?;
-        let mut metadata_opt = None;
-        let mut protocol_opt = None;
         for batch in batches {
             let batch = batch?;
-            if let Ok(mut metas) = parse_action(&batch, &ActionType::Metadata) {
-                if let Some(Action::Metadata(meta)) = metas.next() {
-                    metadata_opt = Some(meta.clone());
-                }
-            }
 
-            if let Ok(mut protos) = parse_action(&batch, &ActionType::Protocol) {
-                if let Some(Action::Protocol(proto)) = protos.next() {
-                    protocol_opt = Some(proto.clone());
-                }
-            }
+            let metadata_opt =
+                parse_action(&batch, &ActionType::Metadata)?.find_map(|action| match action {
+                    Action::Metadata(meta) => Some(meta),
+                    _ => None,
+                });
 
-            if let (Some(metadata), Some(protocol)) = (&metadata_opt, &protocol_opt) {
-                return Ok(Some((metadata.clone(), protocol.clone())));
+            let protocol_opt =
+                parse_action(&batch, &ActionType::Protocol)?.find_map(|action| match action {
+                    Action::Protocol(proto) => Some(proto),
+                    _ => None,
+                });
+
+            if let (Some(metadata), Some(protocol)) = (metadata_opt, protocol_opt) {
+                return Ok(Some((metadata, protocol)));
             }
         }
         Ok(None)
@@ -157,21 +156,11 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
             });
         }
 
-        // get the effective version from chosen files
-        let version_eff = if !commit_files.is_empty() {
-            commit_files
-                .first()
-                .and_then(|f| LogPath(&f.location).commit_version())
-                .unwrap()
-        } else if !checkpoint_files.is_empty() {
-            checkpoint_files
-                .first()
-                .and_then(|f| LogPath(&f.location).commit_version())
-                .unwrap()
-        } else {
-            // TODO more descriptive error
-            return Err(Error::MissingVersion);
-        };
+        let version_eff = commit_files
+            .first()
+            .or(checkpoint_files.first())
+            .and_then(|f| LogPath(&f.location).commit_version())
+            .ok_or(Error::MissingVersion)?;
 
         if let Some(v) = version {
             if version_eff != v {
@@ -186,13 +175,12 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
             checkpoint_files,
         };
 
-        Ok(Self {
+        Ok(Self::new(
             table_root,
             table_client,
             log_segment,
-            version: version_eff,
-            metadata: Default::default(),
-        })
+            version_eff,
+        ))
     }
 
     /// Create a new [`Snapshot`] instance.

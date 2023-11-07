@@ -47,10 +47,6 @@ impl LogReplayScanner {
                     self.seen.insert((add.path.clone(), add.dv_unique_id()));
                     Some(add)
                 }
-                Action::Add(add) => {
-                    self.seen.insert((add.path.clone(), add.dv_unique_id()));
-                    None
-                }
                 Action::Remove(remove) => {
                     self.seen
                         .insert((remove.path.clone(), remove.dv_unique_id()));

@@ -15,7 +15,7 @@ pub struct Table<JRC: Send, PRC: Send + Sync> {
 
 impl<JRC: Send, PRC: Send + Sync> std::fmt::Debug for Table<JRC, PRC> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        f.debug_struct("Snapshot")
+        f.debug_struct("Table")
             .field("location", &self.location)
             .finish()
     }
