@@ -91,26 +91,25 @@ pub(crate) fn parse_action(
 fn parse_action_metadata(arr: &StructArray) -> DeltaResult<Box<dyn Iterator<Item = Action>>> {
     let ids = cast_struct_column::<StringArray>(arr, "id")?;
     let schema_strings = cast_struct_column::<StringArray>(arr, "schemaString")?;
-    let metadata = ids
-        .into_iter()
-        .zip(schema_strings)
-        .filter_map(|(maybe_id, maybe_schema_string)| {
-            if let (Some(id), Some(schema_string)) = (maybe_id, maybe_schema_string) {
-                Some(Metadata::new(
-                    id,
-                    Format {
-                        provider: "parquet".into(),
-                        options: Default::default(),
-                    },
-                    schema_string,
-                    Vec::<String>::new(),
-                    None,
-                ))
-            } else {
-                None
-            }
-        })
-        .next();
+    let metadata =
+        ids.into_iter()
+            .zip(schema_strings)
+            .find_map(|(maybe_id, maybe_schema_string)| {
+                if let (Some(id), Some(schema_string)) = (maybe_id, maybe_schema_string) {
+                    Some(Metadata::new(
+                        id,
+                        Format {
+                            provider: "parquet".into(),
+                            options: Default::default(),
+                        },
+                        schema_string,
+                        Vec::<String>::new(),
+                        None,
+                    ))
+                } else {
+                    None
+                }
+            });
 
     if metadata.is_none() {
         return Ok(Box::new(std::iter::empty()));
@@ -181,17 +180,13 @@ fn parse_action_metadata(arr: &StructArray) -> DeltaResult<Box<dyn Iterator<Item
 fn parse_action_protocol(arr: &StructArray) -> DeltaResult<Box<dyn Iterator<Item = Action>>> {
     let min_reader = cast_struct_column::<Int32Array>(arr, "minReaderVersion")?;
     let min_writer = cast_struct_column::<Int32Array>(arr, "minWriterVersion")?;
-    let protocol = min_reader
-        .into_iter()
-        .zip(min_writer)
-        .filter_map(|(r, w)| {
-            if let (Some(min_reader_version), Some(min_wrriter_version)) = (r, w) {
-                Some(Protocol::new(min_reader_version, min_wrriter_version))
-            } else {
-                None
-            }
-        })
-        .next();
+    let protocol = min_reader.into_iter().zip(min_writer).find_map(|(r, w)| {
+        if let (Some(min_reader_version), Some(min_wrriter_version)) = (r, w) {
+            Some(Protocol::new(min_reader_version, min_wrriter_version))
+        } else {
+            None
+        }
+    });
 
     if protocol.is_none() {
         return Ok(Box::new(std::iter::empty()));
