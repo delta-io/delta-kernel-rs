@@ -1,0 +1,10 @@
+[package]
+name = "inspect-table"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+deltakernel = { path = "../../../kernel" , features = ["default", "tokio"]}
+clap = { version="^4.4", features = ["derive"] }
+url = "2"
