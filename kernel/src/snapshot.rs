@@ -156,11 +156,12 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
             });
         }
 
+        // get the effective version from chosen files
         let version_eff = commit_files
             .first()
             .or(checkpoint_files.first())
             .and_then(|f| LogPath(&f.location).commit_version())
-            .ok_or(Error::MissingVersion)?;
+            .ok_or(Error::MissingVersion)?; // TODO: A more descriptive error
 
         if let Some(v) = version {
             if version_eff != v {
