@@ -1,14 +1,17 @@
 use std::collections::HashSet;
+use std::sync::Arc;
+
+use arrow_array::RecordBatch;
+use either::Either;
 
 use super::data_skipping::data_skipping_filter;
 use crate::actions::{parse_actions, Action, ActionType, Add};
 use crate::expressions::Expression;
-use crate::DeltaResult;
-use arrow_array::RecordBatch;
-use either::Either;
+use crate::{DeltaResult, ExpressionEvaluator};
 
 struct LogReplayScanner {
     predicate: Option<Expression>,
+    evaluator: Option<Arc<dyn ExpressionEvaluator>>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
@@ -17,9 +20,10 @@ struct LogReplayScanner {
 
 impl LogReplayScanner {
     /// Create a new [`LogReplayStream`] instance
-    fn new(predicate: Option<Expression>) -> Self {
+    fn new(predicate: Option<Expression>, evaluator: Option<Arc<dyn ExpressionEvaluator>>) -> Self {
         Self {
             predicate,
+            evaluator,
             seen: Default::default(),
         }
     }
@@ -28,8 +32,9 @@ impl LogReplayScanner {
     /// don't match the predicate and Add actions that have corresponding Remove
     /// actions in the log.
     fn process_batch(&mut self, actions: RecordBatch) -> DeltaResult<Vec<Add>> {
-        let actions = if let Some(predicate) = &self.predicate {
-            data_skipping_filter(actions, predicate)?
+        let actions = if let (Some(predicate), Some(evaluator)) = (&self.predicate, &self.evaluator)
+        {
+            data_skipping_filter(actions, predicate, evaluator.as_ref())?
         } else {
             actions
         };
@@ -37,7 +42,7 @@ impl LogReplayScanner {
         let adds: Vec<Add> = parse_actions(&actions, &[ActionType::Remove, ActionType::Add])?
             .filter_map(|action| match action {
                 Action::Add(add)
-                    // Note: each (add.path + add.dv_unique_id()) pair has a 
+                    // Note: each (add.path + add.dv_unique_id()) pair has a
                     // unique Add + Remove pair in the log. For example:
                     // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
                     if !self
@@ -64,8 +69,9 @@ impl LogReplayScanner {
 pub fn log_replay_iter(
     action_iter: impl Iterator<Item = DeltaResult<RecordBatch>>,
     predicate: Option<Expression>,
+    evaluator: Option<Arc<dyn ExpressionEvaluator>>,
 ) -> impl Iterator<Item = DeltaResult<Add>> {
-    let mut log_scanner = LogReplayScanner::new(predicate);
+    let mut log_scanner = LogReplayScanner::new(predicate, evaluator);
 
     action_iter.flat_map(move |actions| match actions {
         Ok(actions) => match log_scanner.process_batch(actions) {

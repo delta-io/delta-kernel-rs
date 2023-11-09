@@ -10,7 +10,7 @@ use url::Url;
 use self::file_stream::log_replay_iter;
 use crate::actions::ActionType;
 use crate::expressions::Expression;
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::LogSegment;
 use crate::{Add, DeltaResult, FileMeta, TableClient};
 
@@ -132,12 +132,21 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
             fields: Fields::from_iter([ActionType::Add.field(), ActionType::Remove.field()]),
             metadata: Default::default(),
         });
+        let delta_schema = Arc::new(
+            <&arrow_schema::Schema as TryInto<StructType>>::try_into(schema.as_ref())?.clone(),
+        );
 
         let log_iter =
             self.log_segment
                 .replay(self.table_client.as_ref(), schema, self.predicate.clone())?;
 
-        Ok(log_replay_iter(log_iter, self.predicate.clone()))
+        let evaluator = self.predicate.as_ref().map(|p| {
+            self.table_client
+                .get_expression_handler()
+                .get_evaluator(delta_schema, p.clone())
+        });
+
+        Ok(log_replay_iter(log_iter, self.predicate.clone(), evaluator))
     }
 
     pub fn execute(&self) -> DeltaResult<Vec<RecordBatch>> {

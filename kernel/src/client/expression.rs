@@ -14,8 +14,8 @@ use arrow_array::{
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 
 use crate::error::{DeltaResult, Error};
+use crate::expressions::BinaryOperator;
 use crate::expressions::{scalars::Scalar, Expression};
-use crate::expressions::{BinaryOperator, ComparisonOperator};
 use crate::schema::SchemaRef;
 use crate::{ExpressionEvaluator, ExpressionHandler};
 
@@ -45,7 +45,7 @@ impl Scalar {
 fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaResult<ArrayRef> {
     match expression {
         Expression::Literal(scalar) => Ok(scalar.to_array(batch.num_rows())),
-        Expression::Column { name, .. } => batch
+        Expression::Column(name) => batch
             .column_by_name(name)
             .ok_or(Error::MissingColumn(name.clone()))
             .cloned(),
@@ -73,83 +73,77 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
                         source: Box::new(err),
                     })
                 }
-            }
-        }
-        Expression::BinaryComparison { op, left, right } => {
-            let left_arr = evaluate_expression(left.as_ref(), batch)?;
-            let right_arr = evaluate_expression(right.as_ref(), batch)?;
-            match op {
-                ComparisonOperator::LessThan => {
+                BinaryOperator::LessThan => {
                     let result = lt(&left_arr, &right_arr).map_err(|err| Error::GenericError {
                         source: Box::new(err),
                     })?;
                     Ok(Arc::new(result))
                 }
-                ComparisonOperator::LessThanOrEqual => {
+                BinaryOperator::LessThanOrEqual => {
                     let result =
                         lt_eq(&left_arr, &right_arr).map_err(|err| Error::GenericError {
                             source: Box::new(err),
                         })?;
                     Ok(Arc::new(result))
                 }
-                ComparisonOperator::GreaterThan => {
+                BinaryOperator::GreaterThan => {
                     let result = gt(&left_arr, &right_arr).map_err(|err| Error::GenericError {
                         source: Box::new(err),
                     })?;
                     Ok(Arc::new(result))
                 }
-                ComparisonOperator::GreaterThanOrEqual => {
+                BinaryOperator::GreaterThanOrEqual => {
                     let result =
                         gt_eq(&left_arr, &right_arr).map_err(|err| Error::GenericError {
                             source: Box::new(err),
                         })?;
                     Ok(Arc::new(result))
                 }
-                ComparisonOperator::Equal => {
+                BinaryOperator::Equal => {
                     let result = eq(&left_arr, &right_arr).map_err(|err| Error::GenericError {
                         source: Box::new(err),
                     })?;
                     Ok(Arc::new(result))
                 }
-                ComparisonOperator::NotEqual => {
+                BinaryOperator::NotEqual => {
                     let result = neq(&left_arr, &right_arr).map_err(|err| Error::GenericError {
                         source: Box::new(err),
                     })?;
                     Ok(Arc::new(result))
                 }
+                BinaryOperator::And => {
+                    let left_arr = evaluate_expression(left.as_ref(), batch)?;
+                    let left_arr = left_arr
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .ok_or(Error::Generic("expected boolean array".to_string()))?;
+                    let right_arr = evaluate_expression(right.as_ref(), batch)?;
+                    let right_arr = right_arr
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .ok_or(Error::Generic("expected boolean array".to_string()))?;
+                    let result = and(left_arr, right_arr).map_err(|err| Error::GenericError {
+                        source: Box::new(err),
+                    })?;
+                    Ok(Arc::new(result))
+                }
+                BinaryOperator::Or => {
+                    let left_arr = evaluate_expression(left.as_ref(), batch)?;
+                    let left_arr = left_arr
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .ok_or(Error::Generic("expected boolean array".to_string()))?;
+                    let right_arr = evaluate_expression(right.as_ref(), batch)?;
+                    let right_arr = right_arr
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .ok_or(Error::Generic("expected boolean array".to_string()))?;
+                    let result = or(left_arr, right_arr).map_err(|err| Error::GenericError {
+                        source: Box::new(err),
+                    })?;
+                    Ok(Arc::new(result))
+                }
             }
-        }
-        Expression::And { left, right } => {
-            let left_arr = evaluate_expression(left.as_ref(), batch)?;
-            let left_arr = left_arr
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or(Error::Generic("expected boolean array".to_string()))?;
-            let right_arr = evaluate_expression(right.as_ref(), batch)?;
-            let right_arr = right_arr
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or(Error::Generic("expected boolean array".to_string()))?;
-            let result = and(left_arr, right_arr).map_err(|err| Error::GenericError {
-                source: Box::new(err),
-            })?;
-            Ok(Arc::new(result))
-        }
-        Expression::Or { left, right } => {
-            let left_arr = evaluate_expression(left.as_ref(), batch)?;
-            let left_arr = left_arr
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or(Error::Generic("expected boolean array".to_string()))?;
-            let right_arr = evaluate_expression(right.as_ref(), batch)?;
-            let right_arr = right_arr
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or(Error::Generic("expected boolean array".to_string()))?;
-            let result = or(left_arr, right_arr).map_err(|err| Error::GenericError {
-                source: Box::new(err),
-            })?;
-            Ok(Arc::new(result))
         }
     }
 }
@@ -188,20 +182,14 @@ mod tests {
     use super::*;
     use arrow_array::Int32Array;
     use arrow_schema::{DataType, Field, Schema};
-    use std::ops::Add;
-    use std::ops::Div;
-    use std::ops::Mul;
-    use std::ops::Sub;
+    use std::ops::{Add, Div, Mul, Sub};
 
     #[test]
     fn test_binary_op_scalar() {
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
         let values = Int32Array::from(vec![1, 2, 3]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
-        let column = Expression::Column {
-            name: "a".to_string(),
-            data_type: crate::schema::DataType::Primitive(crate::schema::PrimitiveType::Integer),
-        };
+        let column = Expression::Column("a".to_string());
 
         let expression = Box::new(
             column
@@ -252,14 +240,8 @@ mod tests {
             vec![Arc::new(values.clone()), Arc::new(values)],
         )
         .unwrap();
-        let column_a = Expression::Column {
-            name: "a".to_string(),
-            data_type: crate::schema::DataType::Primitive(crate::schema::PrimitiveType::Integer),
-        };
-        let column_b = Expression::Column {
-            name: "b".to_string(),
-            data_type: crate::schema::DataType::Primitive(crate::schema::PrimitiveType::Integer),
-        };
+        let column_a = Expression::Column("a".to_string());
+        let column_b = Expression::Column("b".to_string());
 
         let expression = Box::new(column_a.clone().add(column_b.clone()).unwrap());
         let results = evaluate_expression(&expression, &batch).unwrap();
@@ -282,10 +264,7 @@ mod tests {
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
         let values = Int32Array::from(vec![1, 2, 3]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
-        let column = Expression::Column {
-            name: "a".to_string(),
-            data_type: crate::schema::DataType::Primitive(crate::schema::PrimitiveType::Integer),
-        };
+        let column = Expression::Column("a".to_string());
         let lit = Expression::Literal(Scalar::Integer(2));
 
         let expression = Box::new(column.clone().lt(&lit).unwrap());
@@ -333,14 +312,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let column_a = Expression::Column {
-            name: "a".to_string(),
-            data_type: crate::schema::DataType::Primitive(crate::schema::PrimitiveType::Boolean),
-        };
-        let column_b = Expression::Column {
-            name: "b".to_string(),
-            data_type: crate::schema::DataType::Primitive(crate::schema::PrimitiveType::Boolean),
-        };
+        let column_a = Expression::Column("a".to_string());
+        let column_b = Expression::Column("b".to_string());
 
         let expression = Box::new(column_a.clone().and(&column_b).unwrap());
         let results = evaluate_expression(&expression, &batch).unwrap();
