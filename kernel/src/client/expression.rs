@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use arrow_arith::boolean::{and, or};
+use arrow_arith::boolean::{and, is_null, not, or};
 use arrow_arith::numeric::{add, div, mul, sub};
 use arrow_array::RecordBatch as ColumnarBatch;
 use arrow_array::{
@@ -14,8 +14,8 @@ use arrow_array::{
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 
 use crate::error::{DeltaResult, Error};
-use crate::expressions::BinaryOperator;
 use crate::expressions::{scalars::Scalar, Expression};
+use crate::expressions::{BinaryOperator, UnaryOperator};
 use crate::schema::SchemaRef;
 use crate::{ExpressionEvaluator, ExpressionHandler};
 
@@ -49,7 +49,24 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
             .column_by_name(name)
             .ok_or(Error::MissingColumn(name.clone()))
             .cloned(),
-        Expression::BinaryOperator { op, left, right } => {
+        Expression::UnaryOperation { op, expr } => {
+            let arr = evaluate_expression(expr.as_ref(), batch)?;
+            match op {
+                UnaryOperator::Not => {
+                    let arr = arr
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .ok_or(Error::Generic("expected boolean array".to_string()))?;
+                    let result = not(arr)?;
+                    Ok(Arc::new(result))
+                }
+                UnaryOperator::IsNull => {
+                    let result = is_null(&arr)?;
+                    Ok(Arc::new(result))
+                }
+            }
+        }
+        Expression::BinaryOperation { op, left, right } => {
             let left_arr = evaluate_expression(left.as_ref(), batch)?;
             let right_arr = evaluate_expression(right.as_ref(), batch)?;
             match op {
@@ -191,38 +208,23 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
         let column = Expression::Column("a".to_string());
 
-        let expression = Box::new(
-            column
-                .clone()
-                .add(Expression::Literal(Scalar::Integer(1)))
-                .unwrap(),
-        );
+        let expression = Box::new(column.clone().add(Expression::Literal(Scalar::Integer(1))));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(Int32Array::from(vec![2, 3, 4]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
-        let expression = Box::new(
-            column
-                .clone()
-                .sub(Expression::Literal(Scalar::Integer(1)))
-                .unwrap(),
-        );
+        let expression = Box::new(column.clone().sub(Expression::Literal(Scalar::Integer(1))));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(Int32Array::from(vec![0, 1, 2]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
-        let expression = Box::new(
-            column
-                .clone()
-                .mul(Expression::Literal(Scalar::Integer(2)))
-                .unwrap(),
-        );
+        let expression = Box::new(column.clone().mul(Expression::Literal(Scalar::Integer(2))));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(Int32Array::from(vec![2, 4, 6]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
         // TODO handle type casting
-        let expression = Box::new(column.div(Expression::Literal(Scalar::Integer(1))).unwrap());
+        let expression = Box::new(column.div(Expression::Literal(Scalar::Integer(1))));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(Int32Array::from(vec![1, 2, 3]));
         assert_eq!(results.as_ref(), expected.as_ref())
@@ -243,17 +245,17 @@ mod tests {
         let column_a = Expression::Column("a".to_string());
         let column_b = Expression::Column("b".to_string());
 
-        let expression = Box::new(column_a.clone().add(column_b.clone()).unwrap());
+        let expression = Box::new(column_a.clone().add(column_b.clone()));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(Int32Array::from(vec![2, 4, 6]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
-        let expression = Box::new(column_a.clone().sub(column_b.clone()).unwrap());
+        let expression = Box::new(column_a.clone().sub(column_b.clone()));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(Int32Array::from(vec![0, 0, 0]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
-        let expression = Box::new(column_a.clone().mul(column_b).unwrap());
+        let expression = Box::new(column_a.clone().mul(column_b));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(Int32Array::from(vec![1, 4, 9]));
         assert_eq!(results.as_ref(), expected.as_ref());
@@ -267,32 +269,32 @@ mod tests {
         let column = Expression::Column("a".to_string());
         let lit = Expression::Literal(Scalar::Integer(2));
 
-        let expression = Box::new(column.clone().lt(&lit).unwrap());
+        let expression = Box::new(column.clone().lt(lit.clone()));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, false, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
-        let expression = Box::new(column.clone().lt_eq(&lit).unwrap());
+        let expression = Box::new(column.clone().lt_eq(lit.clone()));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, true, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
-        let expression = Box::new(column.clone().gt(&lit).unwrap());
+        let expression = Box::new(column.clone().gt(lit.clone()));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![false, false, true]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
-        let expression = Box::new(column.clone().gt_eq(&lit).unwrap());
+        let expression = Box::new(column.clone().gt_eq(lit.clone()));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![false, true, true]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
-        let expression = Box::new(column.clone().eq(&lit).unwrap());
+        let expression = Box::new(column.clone().eq(lit.clone()));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![false, true, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
-        let expression = Box::new(column.clone().ne(&lit).unwrap());
+        let expression = Box::new(column.clone().ne(lit.clone()));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, false, true]));
         assert_eq!(results.as_ref(), expected.as_ref());
@@ -315,7 +317,7 @@ mod tests {
         let column_a = Expression::Column("a".to_string());
         let column_b = Expression::Column("b".to_string());
 
-        let expression = Box::new(column_a.clone().and(&column_b).unwrap());
+        let expression = Box::new(column_a.clone().and(column_b.clone()));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![false, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
@@ -323,14 +325,13 @@ mod tests {
         let expression = Box::new(
             column_a
                 .clone()
-                .and(&Expression::literal(Scalar::Boolean(true)))
-                .unwrap(),
+                .and(Expression::literal(Scalar::Boolean(true))),
         );
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
-        let expression = Box::new(column_a.clone().or(&column_b).unwrap());
+        let expression = Box::new(column_a.clone().or(column_b));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, true]));
         assert_eq!(results.as_ref(), expected.as_ref());
@@ -338,8 +339,7 @@ mod tests {
         let expression = Box::new(
             column_a
                 .clone()
-                .or(&Expression::literal(Scalar::Boolean(false)))
-                .unwrap(),
+                .or(Expression::literal(Scalar::Boolean(false))),
         );
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, false]));

@@ -34,7 +34,7 @@ impl LogReplayScanner {
     fn process_batch(&mut self, actions: RecordBatch) -> DeltaResult<Vec<Add>> {
         let actions = if let (Some(predicate), Some(evaluator)) = (&self.predicate, &self.evaluator)
         {
-            data_skipping_filter(actions, predicate, evaluator.as_ref())?
+            data_skipping_filter(actions, predicate)?
         } else {
             actions
         };
