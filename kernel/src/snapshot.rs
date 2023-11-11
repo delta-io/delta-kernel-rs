@@ -73,27 +73,35 @@ impl LogSegment {
             metadata: Default::default(),
         });
 
+        let mut metadata_opt: Option<Metadata> = None;
+        let mut protocol_opt: Option<Protocol> = None;
+
         let batches = self.replay(table_client, read_schema, None)?;
         for batch in batches {
             let batch = batch?;
 
-            let metadata_opt =
-                parse_action(&batch, &ActionType::Metadata)?.find_map(|action| match action {
-                    Action::Metadata(meta) => Some(meta),
-                    _ => None,
-                });
+            if metadata_opt.is_none() {
+                if let Ok(mut action) = parse_action(&batch, &ActionType::Metadata) {
+                    if let Some(Action::Metadata(meta)) = action.next() {
+                        metadata_opt = Some(meta)
+                    }
+                }
+            }
 
-            let protocol_opt =
-                parse_action(&batch, &ActionType::Protocol)?.find_map(|action| match action {
-                    Action::Protocol(proto) => Some(proto),
-                    _ => None,
-                });
+            if protocol_opt.is_none() {
+                if let Ok(mut action) = parse_action(&batch, &ActionType::Protocol) {
+                    if let Some(Action::Protocol(proto)) = action.next() {
+                        protocol_opt = Some(proto)
+                    }
+                }
+            }
 
-            if let (Some(metadata), Some(protocol)) = (metadata_opt, protocol_opt) {
-                return Ok(Some((metadata, protocol)));
+            if metadata_opt.is_some() && protocol_opt.is_some() {
+                // found both, we can stop iterating
+                break;
             }
         }
-        Ok(None)
+        Ok(metadata_opt.zip(protocol_opt))
     }
 }
 
