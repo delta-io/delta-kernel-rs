@@ -22,7 +22,9 @@ use crate::{DeltaResult, Error, FileMeta, FileSystemClient, TableClient, Version
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 
 #[derive(Debug)]
-pub struct LogSegment {
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
+struct LogSegment {
     log_root: Url,
     /// Reverse order sorted commit files in the log segment
     pub(crate) commit_files: Vec<FileMeta>,
@@ -39,7 +41,7 @@ impl LogSegment {
     /// to project the log files to a subset of the columns.
     ///
     /// `predicate` is an optional expression to filter the log files with.
-    pub fn replay<JRC: Send, PRC: Send>(
+    pub(crate) fn replay<JRC: Send, PRC: Send>(
         &self,
         table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
         read_schema: Arc<ArrowSchema>,
@@ -193,7 +195,7 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
     }
 
     /// Create a new [`Snapshot`] instance.
-    pub fn new(
+    pub(crate) fn new(
         location: Url,
         client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
         log_segment: LogSegment,
@@ -266,21 +268,24 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CheckpointMetadata {
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
+struct CheckpointMetadata {
     /// The version of the table when the last checkpoint was made.
+    #[allow(unreachable_pub)] // used by acceptance tests (TODO make an fn accessor?)
     pub version: Version,
     /// The number of actions that are stored in the checkpoint.
-    pub size: i32,
+    pub(crate) size: i32,
     /// The number of fragments if the last checkpoint was written in multiple parts.
-    pub parts: Option<i32>,
+    pub(crate) parts: Option<i32>,
     /// The number of bytes of the checkpoint.
-    pub size_in_bytes: Option<i32>,
+    pub(crate) size_in_bytes: Option<i32>,
     /// The number of AddFile actions in the checkpoint.
-    pub num_of_add_files: Option<i32>,
+    pub(crate) num_of_add_files: Option<i32>,
     /// The schema of the checkpoint file.
-    pub checkpoint_schema: Option<Schema>,
+    pub(crate) checkpoint_schema: Option<Schema>,
     /// The checksum of the last checkpoint JSON.
-    pub checksum: Option<String>,
+    pub(crate) checksum: Option<String>,
 }
 
 /// Try reading the `_last_checkpoint` file.
