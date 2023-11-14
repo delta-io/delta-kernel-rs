@@ -2,7 +2,7 @@ use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::client::DefaultTableClient;
 use deltakernel::{DeltaResult, Table};
 
-use deltakernel::actions::{Action, ActionType, parse_actions};
+use deltakernel::actions::{parse_actions, Action, ActionType};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -38,12 +38,11 @@ enum Commands {
     Actions {
         /// Show the log in forward order (default is to show it going backwards in time)
         #[arg(short, long)]
-        forward: bool
+        forward: bool,
     },
 }
 
-
-fn main() -> () {
+fn main() {
     let cli = Cli::parse();
     let path = std::fs::canonicalize(PathBuf::from(cli.path));
     let Ok(path) = path else {
@@ -60,7 +59,10 @@ fn main() -> () {
         Arc::new(TokioBackgroundExecutor::new()),
     );
     let Ok(table_client) = table_client else {
-        println!("Failed to construct table client: {}", table_client.err().unwrap());
+        println!(
+            "Failed to construct table client: {}",
+            table_client.err().unwrap()
+        );
         return;
     };
     let table_client = Arc::new(table_client);
@@ -68,10 +70,13 @@ fn main() -> () {
     let table = Table::new(url, table_client.clone());
     let snapshot = table.snapshot(None);
     let Ok(snapshot) = snapshot else {
-        println!("Failed to construct latest snapshot: {}", snapshot.err().unwrap());
+        println!(
+            "Failed to construct latest snapshot: {}",
+            snapshot.err().unwrap()
+        );
         return;
     };
-    
+
     match &cli.command {
         Commands::TableVersion => {
             println!("Latest table version: {}", snapshot.version());
@@ -97,32 +102,30 @@ fn main() -> () {
                 ActionType::Add,
             ];
             let read_schema = Arc::new(ArrowSchema {
-                fields: action_types.as_ref().iter().map(|a| Arc::new(a.field())).collect(),
+                fields: action_types
+                    .as_ref()
+                    .iter()
+                    .map(|a| Arc::new(a.field()))
+                    .collect(),
                 metadata: Default::default(),
             });
-            
-            let batches = snapshot.get_log_segment().replay(
-                &*table_client,
-                read_schema,
-                None,
-            );
+
+            let batches = snapshot
+                .get_log_segment()
+                .replay(&*table_client, read_schema, None);
 
             let batch_vec = batches.unwrap().collect::<Vec<DeltaResult<RecordBatch>>>();
             let len = batch_vec.len() - 1;
-            
-            let batches: Box<dyn Iterator<Item = Result<RecordBatch, deltakernel::Error>>> = if *forward {
-                Box::new(batch_vec.into_iter().rev())
-            } else {
-                Box::new(batch_vec.into_iter())
-            };
+
+            let batches: Box<dyn Iterator<Item = Result<RecordBatch, deltakernel::Error>>> =
+                if *forward {
+                    Box::new(batch_vec.into_iter().rev())
+                } else {
+                    Box::new(batch_vec.into_iter())
+                };
 
             for (i, batch) in batches.enumerate() {
-                let index = 
-                if *forward {
-                    i
-                } else {
-                    len - i
-                };
+                let index = if *forward { i } else { len - i };
                 if i != 0 {
                     println!("\n\n");
                 }
@@ -139,6 +142,5 @@ fn main() -> () {
                 }
             }
         }
-            
     }
 }
