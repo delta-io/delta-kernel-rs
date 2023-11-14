@@ -107,8 +107,7 @@ fn main() -> () {
                 None,
             );
 
-            let batches = batches.unwrap();
-            let batch_vec = batches.collect::<Vec<DeltaResult<RecordBatch>>>();
+            let batch_vec = batches.unwrap().collect::<Vec<DeltaResult<RecordBatch>>>();
             let len = batch_vec.len() - 1;
             
             let batches: Box<dyn Iterator<Item = Result<RecordBatch, deltakernel::Error>>> = if *forward {
