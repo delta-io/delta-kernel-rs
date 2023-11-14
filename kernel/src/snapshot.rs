@@ -41,7 +41,9 @@ impl LogSegment {
     /// to project the log files to a subset of the columns.
     ///
     /// `predicate` is an optional expression to filter the log files with.
-    pub(crate) fn replay<JRC: Send, PRC: Send>(
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
+    fn replay<JRC: Send, PRC: Send>(
         &self,
         table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
         read_schema: Arc<ArrowSchema>,
@@ -213,6 +215,11 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
     /// Version of this [`Snapshot`] in the table.
     pub fn version(&self) -> Version {
         self.version
+    }
+
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    fn get_log_segment(&self) -> &LogSegment {
+        &self.log_segment
     }
 
     fn get_or_insert_metadata(&self) -> DeltaResult<(Metadata, Protocol)> {
