@@ -47,7 +47,9 @@ pub enum Action {
 }
 
 #[fix_hidden_lifetime_bug]
-pub(crate) fn parse_actions<'a>(
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
+fn parse_actions<'a>(
     batch: &RecordBatch,
     types: impl IntoIterator<Item = &'a ActionType>,
 ) -> DeltaResult<impl Iterator<Item = Action>> {

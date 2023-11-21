@@ -2,7 +2,10 @@
 members = [
     "acceptance",
     "kernel",
+    "kernel/examples/*",
 ]
+# Only check / build main crates by default (check all with `--workspace`)
+default-members = ["acceptance", "kernel"]
 resolver = "2"
 
 [workspace.package]
