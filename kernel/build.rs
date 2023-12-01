@@ -42,4 +42,3 @@ fn main() {
         .expect("generate_with_config should have worked for C")
         .write_to_file(output_file_h);
 }
-
