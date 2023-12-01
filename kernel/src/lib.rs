@@ -34,7 +34,6 @@
     unused_extern_crates,
     rust_2018_idioms,
     rust_2021_compatibility,
-    missing_debug_implementations
 )]
 
 use std::ops::Range;
@@ -50,6 +49,7 @@ use self::schema::SchemaRef;
 pub mod actions;
 pub mod error;
 pub mod expressions;
+pub mod ffi;
 pub mod path;
 pub mod scan;
 pub mod schema;
