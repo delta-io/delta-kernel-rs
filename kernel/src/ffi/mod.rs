@@ -11,7 +11,9 @@ pub struct EngineIterator {
     // Opaque data that will be iterated over. This data will be passed to the get_next function
     // each time a next item is requested from the iterator
     data: *mut c_void,
-    // A function that should advance the iterator and return the next time from the data
+    /// A function that should advance the iterator and return the next time from the data
+    /// If the iterator is complete, it should return null. It should be safe to
+    /// call `get_next()` multiple times if it is null.
     get_next: extern "C" fn(data: *mut c_void) -> *const c_void,
 }
 
