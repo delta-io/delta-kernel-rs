@@ -218,7 +218,7 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
     }
 
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    fn get_log_segment(&self) -> &LogSegment {
+    fn _get_log_segment(&self) -> &LogSegment {
         &self.log_segment
     }
 

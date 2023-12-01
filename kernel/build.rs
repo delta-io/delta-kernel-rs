@@ -1,8 +1,8 @@
 extern crate cbindgen;
 
+use cbindgen::{Config, Language};
 use std::env;
 use std::path::PathBuf;
-use cbindgen::{Config, Language};
 
 fn main() {
     let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -20,7 +20,7 @@ fn main() {
     config_hpp.namespace = Some(String::from("ffi"));
     cbindgen::generate_with_config(&crate_dir, config_hpp)
         .unwrap()
-        .write_to_file(&output_file_hpp);
+        .write_to_file(output_file_hpp);
 
     // generate c bindings
     let output_file_h = target_dir
@@ -31,6 +31,6 @@ fn main() {
     let mut config_h = Config::default();
     config_h.language = Language::C;
     cbindgen::generate_with_config(&crate_dir, config_h)
-      .unwrap()
-      .write_to_file(&output_file_h);
+        .unwrap()
+        .write_to_file(output_file_h);
 }

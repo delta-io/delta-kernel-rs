@@ -2,7 +2,6 @@
 ///
 /// Currently this only has a simple iterator type that a c/c++ engine could pass to kernel.
 /// TODO: Add more and update this comment :)
-
 use std::os::raw::c_void;
 
 /// Model iterators. This allows an engine to specify iteration however it likes, and we simply wrap
@@ -13,11 +12,12 @@ pub struct EngineIterator {
     // each time a next item is requested from the iterator
     data: *mut c_void,
     // A function that should advance the iterator and return the next time from the data
-    get_next: extern fn(data: *mut c_void) -> *const c_void,
+    get_next: extern "C" fn(data: *mut c_void) -> *const c_void,
 }
 
 /// test function to print for items. this assumes each item is an `int`
-#[no_mangle] extern "C" fn iterate(it: &mut EngineIterator) {
+#[no_mangle]
+extern "C" fn iterate(it: &mut EngineIterator) {
     for i in it {
         let i = i as *mut i32;
         let ii = unsafe { &*i };

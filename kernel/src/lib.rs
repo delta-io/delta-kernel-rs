@@ -33,7 +33,7 @@
     trivial_numeric_casts,
     unused_extern_crates,
     rust_2018_idioms,
-    rust_2021_compatibility,
+    rust_2021_compatibility
 )]
 
 use std::ops::Range;
