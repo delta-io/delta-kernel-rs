@@ -1,17 +1,14 @@
 use std::collections::HashSet;
-use std::sync::Arc;
-
-use arrow_array::RecordBatch;
-use either::Either;
 
 use super::data_skipping::data_skipping_filter;
 use crate::actions::{parse_actions, Action, ActionType, Add};
 use crate::expressions::Expression;
-use crate::{DeltaResult, ExpressionEvaluator};
+use crate::DeltaResult;
+use arrow_array::RecordBatch;
+use either::Either;
 
 struct LogReplayScanner {
     predicate: Option<Expression>,
-    evaluator: Option<Arc<dyn ExpressionEvaluator>>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
@@ -20,10 +17,9 @@ struct LogReplayScanner {
 
 impl LogReplayScanner {
     /// Create a new [`LogReplayStream`] instance
-    fn new(predicate: Option<Expression>, evaluator: Option<Arc<dyn ExpressionEvaluator>>) -> Self {
+    fn new(predicate: Option<Expression>) -> Self {
         Self {
             predicate,
-            evaluator,
             seen: Default::default(),
         }
     }
@@ -32,8 +28,7 @@ impl LogReplayScanner {
     /// don't match the predicate and Add actions that have corresponding Remove
     /// actions in the log.
     fn process_batch(&mut self, actions: RecordBatch) -> DeltaResult<Vec<Add>> {
-        let actions = if let (Some(predicate), Some(evaluator)) = (&self.predicate, &self.evaluator)
-        {
+        let actions = if let Some(predicate) = &self.predicate {
             data_skipping_filter(actions, predicate)?
         } else {
             actions
@@ -69,9 +64,8 @@ impl LogReplayScanner {
 pub fn log_replay_iter(
     action_iter: impl Iterator<Item = DeltaResult<RecordBatch>>,
     predicate: Option<Expression>,
-    evaluator: Option<Arc<dyn ExpressionEvaluator>>,
 ) -> impl Iterator<Item = DeltaResult<Add>> {
-    let mut log_scanner = LogReplayScanner::new(predicate, evaluator);
+    let mut log_scanner = LogReplayScanner::new(predicate);
 
     action_iter.flat_map(move |actions| match actions {
         Ok(actions) => match log_scanner.process_batch(actions) {
