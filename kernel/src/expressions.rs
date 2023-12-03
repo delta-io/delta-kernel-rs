@@ -1,12 +1,14 @@
-use arrow_array::{
-    array::PrimitiveArray, types::Int32Type, BooleanArray, Int32Array, RecordBatch, StructArray,
-};
-use arrow_ord::cmp::lt;
+//! expressions.
+
 use std::{
     collections::HashSet,
     fmt::{Display, Formatter},
 };
 
+use arrow_array::{
+    array::PrimitiveArray, types::Int32Type, BooleanArray, Int32Array, RecordBatch, StructArray,
+};
+use arrow_ord::cmp::lt;
 use arrow_schema::ArrowError;
 
 use self::scalars::Scalar;
@@ -14,21 +16,31 @@ use self::scalars::Scalar;
 pub mod scalars;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// A binary operator.
 pub enum BinaryOperator {
-    // Logical
+    /// Logical And
     And,
+    /// Logical Or
     Or,
-    // Arithmetic
+    /// Arithmetic Plus
     Plus,
+    /// Arithmetic Minus
     Minus,
+    /// Arithmetic Multiply
     Multiply,
+    /// Arithmetic Divide
     Divide,
-    // Comparison
+    /// Comparison Less Than
     LessThan,
+    /// Comparison Less Than Or Equal
     LessThanOrEqual,
+    /// Comparison Greater Than
     GreaterThan,
+    /// Comparison Greater Than Or Equal
     GreaterThanOrEqual,
+    /// Comparison Equal
     Equal,
+    /// Comparison Not Equal
     NotEqual,
 }
 
@@ -52,8 +64,11 @@ impl Display for BinaryOperator {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// A unary operator.
 pub enum UnaryOperator {
+    /// Unary Not
     Not,
+    /// Unary Is Null
     IsNull,
 }
 
@@ -68,13 +83,20 @@ pub enum Expression {
     Literal(Scalar),
     /// A column reference by name.
     Column(String),
+    /// A binary operation.
     BinaryOperation {
+        /// The operator.
         op: BinaryOperator,
+        /// The left-hand side of the operation.
         left: Box<Expression>,
+        /// The right-hand side of the operation.
         right: Box<Expression>,
     },
+    /// A unary operation.
     UnaryOperation {
+        /// The operator.
         op: UnaryOperator,
+        /// The expression.
         expr: Box<Expression>,
     },
     // TODO: support more expressions, such as IS IN, LIKE, etc.
@@ -251,46 +273,6 @@ impl Expression {
         }
     }
 }
-
-// impl Expression {
-//     fn to_arrow(&self, stats: &StructArray) -> Result<BooleanArray, ArrowError> {
-//         match self {
-//             Expression::LessThan(left, right) => {
-//                 lt_scalar(left.to_arrow(stats), right.to_arrow(stats))
-//             }
-//             Expression::Column(c) => todo!(),
-//             Expression::Literal(l) => todo!(),
-//         }
-//     }
-// }
-
-// transform data predicate into metadata predicate
-// WHERE x < 10 -> min(x) < 10
-// fn construct_metadata_filters(e: Expression) -> Expression {
-//     match e {
-//         // col < value
-//         Expression::LessThan(left, right) => {
-//             match (*left, *right.clone()) {
-//                 (Expression::Column(name), Expression::Literal(_)) => {
-//                     // column_min < value
-//                     Expression::LessThan(Box::new(min_stat_col(name)), right)
-//                 }
-//                 _ => todo!(),
-//             }
-//         }
-//         _ => todo!(),
-//     }
-// }
-
-// fn min_stat_col(col_name: Vec<String>) -> Expression {
-//     stat_col("min", col_name)
-// }
-//
-// fn stat_col(stat: &str, name: Vec<String>) -> Expression {
-//     let mut v = vec![stat.to_owned()];
-//     v.extend(name);
-//     Expression::Column(v)
-// }
 
 impl std::ops::Add<Expression> for Expression {
     type Output = Self;
