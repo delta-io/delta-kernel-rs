@@ -6,22 +6,23 @@ use std::sync::Arc;
 
 use arrow_arith::boolean::{and, is_null, not, or};
 use arrow_arith::numeric::{add, div, mul, sub};
-use arrow_array::RecordBatch as ColumnarBatch;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Int32Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray,
 };
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{scalars::Scalar, Expression};
 use crate::expressions::{BinaryOperator, UnaryOperator};
-use crate::schema::SchemaRef;
+use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::{ExpressionEvaluator, ExpressionHandler};
 
 // TODO leverage scalars / Datum
 
 impl Scalar {
+    /// Convert scalar to arrow array.
     pub fn to_array(&self, num_rows: usize) -> ArrayRef {
         use Scalar::*;
         match self {
@@ -37,7 +38,32 @@ impl Scalar {
                     .with_precision_and_scale(*precision, *scale)
                     .unwrap(),
             ),
-            Null(_) => todo!(),
+            Null(data_type) => match data_type {
+                DataType::Primitive(primitive) => match primitive {
+                    PrimitiveType::Byte => Arc::new(Int8Array::new_null(num_rows)),
+                    PrimitiveType::Short => Arc::new(Int16Array::new_null(num_rows)),
+                    PrimitiveType::Integer => Arc::new(Int32Array::new_null(num_rows)),
+                    PrimitiveType::Long => Arc::new(Int64Array::new_null(num_rows)),
+                    PrimitiveType::Float => Arc::new(Float32Array::new_null(num_rows)),
+                    PrimitiveType::Double => Arc::new(Float64Array::new_null(num_rows)),
+                    PrimitiveType::String => Arc::new(StringArray::new_null(num_rows)),
+                    PrimitiveType::Boolean => Arc::new(BooleanArray::new_null(num_rows)),
+                    PrimitiveType::Timestamp => {
+                        Arc::new(TimestampMicrosecondArray::new_null(num_rows))
+                    }
+                    PrimitiveType::Date => Arc::new(Date32Array::new_null(num_rows)),
+                    PrimitiveType::Binary => Arc::new(BinaryArray::new_null(num_rows)),
+                    PrimitiveType::Decimal(precision, scale) => Arc::new(
+                        Decimal128Array::new_null(num_rows)
+                            // TODO update datatype?
+                            .with_precision_and_scale(*precision as u8, *scale as i8)
+                            .unwrap(),
+                    ),
+                },
+                DataType::Array(_) => unimplemented!(),
+                DataType::Map { .. } => unimplemented!(),
+                DataType::Struct { .. } => unimplemented!(),
+            },
         }
     }
 }
@@ -188,7 +214,7 @@ pub struct DefaultExpressionEvaluator {
 }
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
-    fn evaluate(&self, batch: &ColumnarBatch) -> DeltaResult<ColumnarBatch> {
+    fn evaluate(&self, batch: &RecordBatch) -> DeltaResult<RecordBatch> {
         let _result = evaluate_expression(&self.expression, batch)?;
         todo!()
     }
