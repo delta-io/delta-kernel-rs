@@ -29,7 +29,7 @@ fn generate_commit(actions: Vec<TestAction>) -> String {
     actions
             .into_iter()
             .map(|test_action| match test_action {
-                TestAction::Add(path) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"ids\":0}},\"minValues\":{{\"ids\": 0}},\"maxValues\":{{\"ids\":2}}}}"}}}}"#, action = "add", path = path),
+                TestAction::Add(path) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 0}},\"maxValues\":{{\"id\":2}}}}"}}}}"#, action = "add", path = path),
                 TestAction::Remove(path) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true}}}}"#, action = "remove", path = path),
                 TestAction::Metadata => METADATA.into(),
             })
@@ -220,7 +220,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         actions
             .into_iter()
             .map(|test_action| match test_action {
-                TestAction::Add(path) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"ids\":0}},\"minValues\":{{\"ids\": 3}},\"maxValues\":{{\"ids\":5}}}}"}}}}"#, action = "add", path = path),
+                TestAction::Add(path) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 3}},\"maxValues\":{{\"id\":5}}}}"}}}}"#, action = "add", path = path),
                 TestAction::Remove(path) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true}}}}"#, action = "remove", path = path),
                 TestAction::Metadata => METADATA.into(),
             })
@@ -238,7 +238,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         ]),
     )
     .await?;
-    // storage.add_commit(1, &format!("{}\n", r#"{{"add":{{"path":"doesnotexist","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"ids\":0}},\"minValues\":{{\"ids\": 0}},\"maxValues\":{{\"ids\":2}}}}"}}}}"#));
+    // storage.add_commit(1, &format!("{}\n", r#"{{"add":{{"path":"doesnotexist","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 0}},\"maxValues\":{{\"id\":2}}}}"}}}}"#));
     add_commit(
         storage.as_ref(),
         1,
@@ -262,7 +262,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
 
     let snapshot = table.snapshot(None)?;
 
-    let predicate = Expression::column("ids").lt(Expression::literal(2));
+    let predicate = Expression::column("id").lt(Expression::literal(2i64));
     let scan = snapshot.scan()?.with_predicate(predicate).build();
 
     let mut files = 0;

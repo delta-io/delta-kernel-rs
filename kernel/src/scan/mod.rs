@@ -128,16 +128,16 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
     /// files batches correspond to data reads, and the DeltaReader is used to materialize the scan
     /// files into actual table data.
     pub fn files(&self) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
-        let schema = Arc::new(ArrowSchema {
+        let action_schema = Arc::new(ArrowSchema {
             fields: Fields::from_iter([ActionType::Add.field(), ActionType::Remove.field()]),
             metadata: Default::default(),
         });
 
         let log_iter =
             self.log_segment
-                .replay(self.table_client.as_ref(), schema, self.predicate.clone())?;
+                .replay(self.table_client.as_ref(), action_schema, self.predicate.clone())?;
 
-        Ok(log_replay_iter(log_iter, self.predicate.clone()))
+        Ok(log_replay_iter(log_iter, &self.schema, &self.predicate))
     }
 
     pub fn execute(&self) -> DeltaResult<Vec<RecordBatch>> {
