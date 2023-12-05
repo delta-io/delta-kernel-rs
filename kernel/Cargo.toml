@@ -7,13 +7,6 @@ license.workspace = true
 repository.workspace = true
 readme.workspace = true
 version.workspace = true
-build = "build.rs"
-
-[lib]
-crate-type = ["cdylib", "staticlib", "rlib"]
-
-[build-dependencies]
-cbindgen = "0.26.0"
 
 [dependencies]
 arrow-array = { version = "^46.0" }
@@ -28,8 +21,6 @@ either = "1.8"
 fix-hidden-lifetime-bug = "0.2"
 itertools = "0.11"
 lazy_static = "1.4"
-# for the cffi
-libc = "0.2.147"
 # need to generalize over arrow, arrow2 and diff parquet etc. (BYOP)
 regex = "1.8"
 roaring = "0.10.1"

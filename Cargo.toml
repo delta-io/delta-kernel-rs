@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "acceptance",
+    "ffi",
     "kernel",
     "kernel/examples/*",
 ]

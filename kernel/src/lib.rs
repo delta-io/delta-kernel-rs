@@ -49,7 +49,6 @@ use self::schema::SchemaRef;
 pub mod actions;
 pub mod error;
 pub mod expressions;
-pub mod ffi;
 pub mod path;
 pub mod scan;
 pub mod schema;

@@ -11,7 +11,9 @@ fn get_target_dir(manifest_dir: &str) -> PathBuf {
         // the header files
         PathBuf::from(target)
     } else {
-        PathBuf::from(manifest_dir).join("target")
+        let mut manifest_dir = PathBuf::from(manifest_dir);
+        manifest_dir.pop(); // go up, since we're a sub-crate
+        manifest_dir.join("target").join("ffi-headers")
     }
 }
 
