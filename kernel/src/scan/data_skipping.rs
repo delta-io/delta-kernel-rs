@@ -4,18 +4,13 @@ use std::sync::Arc;
 
 use arrow_arith::boolean::{is_not_null, not};
 use arrow_array::{
-    new_null_array,
     array::PrimitiveArray,
+    new_null_array,
     types::{Int32Type, Int64Type},
-    Array,
-    BooleanArray,
-    Datum,
-    RecordBatch,
-    StringArray,
-    StructArray,
+    Array, BooleanArray, Datum, RecordBatch, StringArray, StructArray,
 };
-use arrow_ord::cmp::{gt, gt_eq, lt, lt_eq};
 use arrow_json::ReaderBuilder;
+use arrow_ord::cmp::{gt, gt_eq, lt, lt_eq};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use arrow_select::concat::concat_batches;
 use arrow_select::filter::filter_record_batch;
@@ -47,7 +42,7 @@ trait MetadataFilterFn {
 /// Helper method for boxed data skipping predicates.
 impl MetadataFilterFn for Box<dyn MetadataFilterFn> {
     fn invoke(&self, stats: &RecordBatch) -> MetadataFilterResult {
-        self.as_ref().invoke(&stats)
+        self.as_ref().invoke(stats)
     }
 }
 
@@ -56,14 +51,16 @@ impl MetadataFilterFn for Box<dyn MetadataFilterFn> {
 struct MetadataFilterColumnFn {
     stat_name: &'static str,
     nested_names: Vec<String>,
-    col_name: String
+    col_name: String,
 }
 
 impl MetadataFilterColumnFn {
     /// Helper method for drilling down into a (possibly nested) stats column.
     /// A column such as minValues.a.b.c would be expressed as minValues [a, b] c.
-    fn column_as_struct<'a>(name: &str, column: &Option<&'a Arc<dyn Array>>)
-                            -> Result<&'a StructArray, ArrowError> {
+    fn column_as_struct<'a>(
+        name: &str,
+        column: &Option<&'a Arc<dyn Array>>,
+    ) -> Result<&'a StructArray, ArrowError> {
         column
             .ok_or(ArrowError::SchemaError(format!("No such column: {}", name)))?
             .as_any()
@@ -73,12 +70,15 @@ impl MetadataFilterColumnFn {
 
     /// Given a record batch of stats, extracts the requested stats column.
     fn invoke<'a>(&self, stats: &'a RecordBatch) -> Result<&'a Arc<dyn Array>, ArrowError> {
-        let mut col = Self::column_as_struct(&self.stat_name, &stats.column_by_name(&self.stat_name));
+        let mut col = Self::column_as_struct(self.stat_name, &stats.column_by_name(self.stat_name));
         for col_name in &self.nested_names {
-            col = Self::column_as_struct(&col_name, &col?.column_by_name(&col_name));
+            col = Self::column_as_struct(col_name, &col?.column_by_name(col_name));
         }
         col?.column_by_name(&self.col_name)
-            .ok_or(ArrowError::SchemaError(format!("No such column: {}", self.col_name)))
+            .ok_or(ArrowError::SchemaError(format!(
+                "No such column: {}",
+                self.col_name
+            )))
     }
 }
 
@@ -90,7 +90,7 @@ struct MetadataFilterAndFn {
 
 impl MetadataFilterFn for MetadataFilterAndFn {
     fn invoke(&self, stats: &RecordBatch) -> MetadataFilterResult {
-        arrow_arith::boolean::and(&self.left.invoke(&stats)?, &self.right.invoke(&stats)?)
+        arrow_arith::boolean::and(&self.left.invoke(stats)?, &self.right.invoke(stats)?)
     }
 }
 
@@ -102,7 +102,7 @@ struct MetadataFilterOrFn {
 
 impl MetadataFilterFn for MetadataFilterOrFn {
     fn invoke(&self, stats: &RecordBatch) -> MetadataFilterResult {
-        arrow_arith::boolean::or(&self.left.invoke(&stats)?, &self.right.invoke(&stats)?)
+        arrow_arith::boolean::or(&self.left.invoke(stats)?, &self.right.invoke(stats)?)
     }
 }
 
@@ -115,7 +115,7 @@ struct MetadataFilterComparisonFn {
 
 impl MetadataFilterFn for MetadataFilterComparisonFn {
     fn invoke(&self, stats: &RecordBatch) -> MetadataFilterResult {
-        (self.op)(&self.column.invoke(&stats)?, self.literal.as_ref())
+        (self.op)(&self.column.invoke(stats)?, self.literal.as_ref())
     }
 }
 
@@ -129,8 +129,9 @@ struct MetadataFilterEqComparisonFn {
 impl MetadataFilterFn for MetadataFilterEqComparisonFn {
     fn invoke(&self, stats: &RecordBatch) -> MetadataFilterResult {
         arrow_arith::boolean::and(
-            &lt_eq(&self.min_column.invoke(&stats)?, self.literal.as_ref())?,
-            &lt_eq(self.literal.as_ref(), &self.max_column.invoke(&stats)?)?)
+            &lt_eq(&self.min_column.invoke(stats)?, self.literal.as_ref())?,
+            &lt_eq(self.literal.as_ref(), &self.max_column.invoke(stats)?)?,
+        )
     }
 }
 
@@ -144,7 +145,6 @@ trait ProvidesMetadataFilter {
 }
 
 impl ProvidesMetadataFilter for Expression {
-
     fn extract_stats_column(&self, stat_name: &'static str) -> Option<MetadataFilterColumnFn> {
         match self {
             // TODO: split names like a.b.c into [a, b], c below
@@ -162,11 +162,13 @@ impl ProvidesMetadataFilter for Expression {
 
     fn extract_literal(&self) -> Option<Box<dyn Datum>> {
         match self {
-            Expression::Literal(Scalar::Long(v)) =>
-                Some(Box::new(PrimitiveArray::<Int64Type>::new_scalar(*v))),
-            Expression::Literal(Scalar::Integer(v)) =>
-                Some(Box::new(PrimitiveArray::<Int32Type>::new_scalar(*v))),
-            _ => None
+            Expression::Literal(Scalar::Long(v)) => {
+                Some(Box::new(PrimitiveArray::<Int64Type>::new_scalar(*v)))
+            }
+            Expression::Literal(Scalar::Integer(v)) => {
+                Some(Box::new(PrimitiveArray::<Int32Type>::new_scalar(*v)))
+            }
+            _ => None,
         }
     }
 
@@ -176,7 +178,11 @@ impl ProvidesMetadataFilter for Expression {
     fn extract_metadata_filters(&self) -> Option<Box<dyn MetadataFilterFn>> {
         match self {
             // <expr> AND <expr>
-            Expression::BinaryOperation { op: BinaryOperator::And, left, right } => {
+            Expression::BinaryOperation {
+                op: BinaryOperator::And,
+                left,
+                right,
+            } => {
                 println!("AND got left {} and right {}", left, right);
                 let left = left.extract_metadata_filters();
                 let right = right.extract_metadata_filters();
@@ -191,14 +197,19 @@ impl ProvidesMetadataFilter for Expression {
             }
 
             // <expr> OR <expr>
-            Expression::BinaryOperation { op: BinaryOperator::Or, left, right } => {
+            Expression::BinaryOperation {
+                op: BinaryOperator::Or,
+                left,
+                right,
+            } => {
                 let left = left.extract_metadata_filters();
                 let right = right.extract_metadata_filters();
                 // OR is valid only if both legs are valid.
-                left.zip(right).map(|(left, right)| -> Box<dyn MetadataFilterFn> {
-                    let f = MetadataFilterOrFn { left, right };
-                    Box::new(f)
-                })
+                left.zip(right)
+                    .map(|(left, right)| -> Box<dyn MetadataFilterFn> {
+                        let f = MetadataFilterOrFn { left, right };
+                        Box::new(f)
+                    })
             }
 
             // col <compare> value
@@ -206,15 +217,22 @@ impl ProvidesMetadataFilter for Expression {
                 let min_column = left.extract_stats_column("minValues");
                 let max_column = left.extract_stats_column("maxValues");
                 let literal = right.extract_literal();
-                let (op, column): (fn(&dyn Datum, &dyn Datum) -> MetadataFilterResult, _) = match op {
+
+                type Operation = fn(&dyn Datum, &dyn Datum) -> MetadataFilterResult;
+                let (op, column): (Operation, _) = match op {
                     BinaryOperator::Equal => {
                         // Equality filter compares the literal against both min and max stat columns
                         println!("Got an equality filter");
-                        return min_column.zip(max_column).zip(literal)
-                            .map(|((min_column, max_column), literal)| -> Box<dyn MetadataFilterFn> {
-                                let f = MetadataFilterEqComparisonFn { min_column, max_column, literal };
+                        return min_column.zip(max_column).zip(literal).map(
+                            |((min_column, max_column), literal)| -> Box<dyn MetadataFilterFn> {
+                                let f = MetadataFilterEqComparisonFn {
+                                    min_column,
+                                    max_column,
+                                    literal,
+                                };
                                 Box::new(f)
-                            });
+                            },
+                        );
                     }
 
                     BinaryOperator::LessThan => (lt, min_column),
@@ -224,10 +242,17 @@ impl ProvidesMetadataFilter for Expression {
 
                     _ => return None, // Incompatible operator
                 };
-                column.zip(literal).map(|(column, literal)| -> Box<dyn MetadataFilterFn> {
-                    let f = MetadataFilterComparisonFn { op, column, literal };
-                    Box::new(f)
-                })
+
+                column
+                    .zip(literal)
+                    .map(|(column, literal)| -> Box<dyn MetadataFilterFn> {
+                        let f = MetadataFilterComparisonFn {
+                            op,
+                            column,
+                            literal,
+                        };
+                        Box::new(f)
+                    })
             }
             _ => None,
         }
@@ -240,7 +265,10 @@ pub(crate) struct DataSkippingFilter {
 }
 
 impl DataSkippingFilter {
-    pub(crate) fn try_new(table_schema: &SchemaRef, predicate: &Option<Expression>) -> Option<DataSkippingFilter> {
+    pub(crate) fn try_new(
+        table_schema: &SchemaRef,
+        predicate: &Option<Expression>,
+    ) -> Option<DataSkippingFilter> {
         let predicate = match predicate {
             Some(predicate) => predicate,
             _ => return None,
@@ -250,19 +278,29 @@ impl DataSkippingFilter {
 
         // Build the stats read schema by extracting the column names referenced by the predicate,
         // extracting the corresponding field from the table schema, and inserting that field.
-        let data_fields: Vec<_> = table_schema.fields.iter()
+        let data_fields: Vec<_> = table_schema
+            .fields
+            .iter()
             .filter(|field| field_names.contains(&field.name.as_str()))
             .filter_map(|field| Field::try_from(field).ok())
             .collect::<Vec<_>>();
 
         let stats_schema = Schema::new(vec![
-            Field::new("minValues", DataType::Struct(data_fields.clone().into()), true),
+            Field::new(
+                "minValues",
+                DataType::Struct(data_fields.clone().into()),
+                true,
+            ),
             Field::new("maxValues", DataType::Struct(data_fields.into()), true),
         ]);
         let stats_schema = stats_schema.into();
 
-        predicate.extract_metadata_filters()
-            .map(|predicate| DataSkippingFilter { stats_schema, predicate } )
+        predicate
+            .extract_metadata_filters()
+            .map(|predicate| DataSkippingFilter {
+                stats_schema,
+                predicate,
+            })
     }
 
     pub(crate) fn apply(&self, actions: &RecordBatch) -> DeltaResult<RecordBatch> {
@@ -296,7 +334,7 @@ impl DataSkippingFilter {
         let skipping_vector = &is_not_null(&nullif(&skipping_vector, &not(&skipping_vector)?)?)?;
 
         let before_count = actions.num_rows();
-        let after = filter_record_batch(&actions, skipping_vector)?;
+        let after = filter_record_batch(actions, skipping_vector)?;
         debug!(
             "number of actions before/after data skipping: {before_count} / {}",
             after.num_rows()
@@ -304,20 +342,25 @@ impl DataSkippingFilter {
         Ok(after)
     }
 
-    fn hack_parse(stats_schema: &Arc<Schema>, json_string: Option<&str>) -> DeltaResult<RecordBatch> {
+    fn hack_parse(
+        stats_schema: &Arc<Schema>,
+        json_string: Option<&str>,
+    ) -> DeltaResult<RecordBatch> {
         match json_string {
             Some(s) => Ok(ReaderBuilder::new(stats_schema.clone())
-                          .build(BufReader::new(s.as_bytes()))?
-                          .collect::<Vec<_>>()
-                          .into_iter()
-                          .next()
-                          .transpose()?
-                          .ok_or(Error::MissingData("Expected data".into()))?),
+                .build(BufReader::new(s.as_bytes()))?
+                .collect::<Vec<_>>()
+                .into_iter()
+                .next()
+                .transpose()?
+                .ok_or(Error::MissingData("Expected data".into()))?),
             None => Ok(RecordBatch::try_new(
-                stats_schema.clone().into(),
-                stats_schema.fields.iter()
-                    .map(|field| new_null_array(&field.data_type(), 1))
-                    .collect()
+                stats_schema.clone(),
+                stats_schema
+                    .fields
+                    .iter()
+                    .map(|field| new_null_array(field.data_type(), 1))
+                    .collect(),
             )?),
         }
     }

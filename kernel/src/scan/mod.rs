@@ -133,9 +133,11 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
             metadata: Default::default(),
         });
 
-        let log_iter =
-            self.log_segment
-                .replay(self.table_client.as_ref(), action_schema, self.predicate.clone())?;
+        let log_iter = self.log_segment.replay(
+            self.table_client.as_ref(),
+            action_schema,
+            self.predicate.clone(),
+        )?;
 
         Ok(log_replay_iter(log_iter, &self.schema, &self.predicate))
     }

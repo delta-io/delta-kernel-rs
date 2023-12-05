@@ -1,13 +1,7 @@
-use arrow_array::{
-    array::PrimitiveArray, types::Int32Type, BooleanArray, Int32Array, RecordBatch, StructArray,
-};
-use arrow_ord::cmp::lt;
 use std::{
     collections::HashSet,
     fmt::{Display, Formatter},
 };
-
-use arrow_schema::ArrowError;
 
 use self::scalars::Scalar;
 
@@ -190,107 +184,7 @@ impl Expression {
             Some(expr)
         })
     }
-
-    /// Apply the predicate to a stats record batch, returning a boolean array
-    ///
-    /// The boolean array will represent a mask of the files that could match
-    /// the predicate.
-    ///
-    /// For example, if the predicate is `x > 2` and the stats record batch has
-    /// `maxValues.x = 1`, then the returned boolean array will have `false` at
-    /// that index.
-    pub(crate) fn construct_metadata_filters(
-        &self,
-        stats: RecordBatch,
-    ) -> Result<BooleanArray, ArrowError> {
-        match self {
-            // col < value
-            Expression::BinaryOperation { op, left, right } => {
-                match op {
-                    BinaryOperator::LessThan => {
-                        match (left.as_ref(), right.as_ref()) {
-                            (Expression::Column(name), Expression::Literal(l)) => {
-                                let literal_value = match l {
-                                    Scalar::Integer(v) => *v,
-                                    _ => todo!(),
-                                };
-                                // column_min < value
-                                lt(
-                                    stats
-                                        .column_by_name("minValues")
-                                        .ok_or(ArrowError::SchemaError(
-                                            "No minValues column".to_string(),
-                                        ))?
-                                        .as_any()
-                                        .downcast_ref::<StructArray>()
-                                        .ok_or(ArrowError::SchemaError(
-                                            "minValues not struct".to_string(),
-                                        ))?
-                                        .column_by_name(name)
-                                        .ok_or(ArrowError::SchemaError(format!(
-                                            "No such column: {}",
-                                            name
-                                        )))?
-                                        .as_any()
-                                        .downcast_ref::<Int32Array>()
-                                        .ok_or(ArrowError::SchemaError(format!(
-                                            "{} is not an int",
-                                            name
-                                        )))?,
-                                    &PrimitiveArray::<Int32Type>::new_scalar(literal_value),
-                                )
-                            }
-                            _ => todo!(),
-                        }
-                    }
-                    _ => todo!(),
-                }
-            }
-
-            _ => todo!(),
-        }
-    }
 }
-
-// impl Expression {
-//     fn to_arrow(&self, stats: &StructArray) -> Result<BooleanArray, ArrowError> {
-//         match self {
-//             Expression::LessThan(left, right) => {
-//                 lt_scalar(left.to_arrow(stats), right.to_arrow(stats))
-//             }
-//             Expression::Column(c) => todo!(),
-//             Expression::Literal(l) => todo!(),
-//         }
-//     }
-// }
-
-// transform data predicate into metadata predicate
-// WHERE x < 10 -> min(x) < 10
-// fn construct_metadata_filters(e: Expression) -> Expression {
-//     match e {
-//         // col < value
-//         Expression::LessThan(left, right) => {
-//             match (*left, *right.clone()) {
-//                 (Expression::Column(name), Expression::Literal(_)) => {
-//                     // column_min < value
-//                     Expression::LessThan(Box::new(min_stat_col(name)), right)
-//                 }
-//                 _ => todo!(),
-//             }
-//         }
-//         _ => todo!(),
-//     }
-// }
-
-// fn min_stat_col(col_name: Vec<String>) -> Expression {
-//     stat_col("min", col_name)
-// }
-//
-// fn stat_col(stat: &str, name: Vec<String>) -> Expression {
-//     let mut v = vec![stat.to_owned()];
-//     v.extend(name);
-//     Expression::Column(v)
-// }
 
 impl std::ops::Add<Expression> for Expression {
     type Output = Self;

@@ -20,7 +20,7 @@ struct LogReplayScanner {
 impl LogReplayScanner {
     /// Create a new [`LogReplayStream`] instance
     fn new(table_schema: &SchemaRef, predicate: &Option<Expression>) -> Self {
-        let filter = DataSkippingFilter::try_new(&table_schema, &predicate);
+        let filter = DataSkippingFilter::try_new(table_schema, predicate);
         Self {
             filter,
             seen: Default::default(),
@@ -32,7 +32,7 @@ impl LogReplayScanner {
     /// actions in the log.
     fn process_batch(&mut self, actions: &RecordBatch) -> DeltaResult<Vec<Add>> {
         let filtered_actions = match &self.filter {
-            Some(filter) => Some(filter.apply(&actions)?),
+            Some(filter) => Some(filter.apply(actions)?),
             None => None,
         };
         let actions = if let Some(filtered) = &filtered_actions {
@@ -41,7 +41,7 @@ impl LogReplayScanner {
             actions
         };
 
-        let adds: Vec<Add> = parse_actions(&actions, &[ActionType::Remove, ActionType::Add])?
+        let adds: Vec<Add> = parse_actions(actions, &[ActionType::Remove, ActionType::Add])?
             .filter_map(|action| match action {
                 Action::Add(add)
                     // Note: each (add.path + add.dv_unique_id()) pair has a 
@@ -74,7 +74,7 @@ pub fn log_replay_iter(
     table_schema: &SchemaRef,
     predicate: &Option<Expression>,
 ) -> impl Iterator<Item = DeltaResult<Add>> {
-    let mut log_scanner = LogReplayScanner::new(&table_schema, &predicate);
+    let mut log_scanner = LogReplayScanner::new(table_schema, predicate);
 
     action_iter.flat_map(move |actions| match actions {
         Ok(actions) => match log_scanner.process_batch(&actions) {
