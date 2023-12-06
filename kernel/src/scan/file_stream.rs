@@ -5,8 +5,10 @@ use crate::actions::{parse_actions, Action, ActionType, Add};
 use crate::expressions::Expression;
 use crate::schema::SchemaRef;
 use crate::DeltaResult;
+
 use arrow_array::RecordBatch;
 use either::Either;
+use tracing::debug;
 
 struct LogReplayScanner {
     filter: Option<DataSkippingFilter>,
@@ -51,7 +53,7 @@ impl LogReplayScanner {
                         .seen
                         .contains(&(add.path.clone(), add.dv_unique_id())) =>
                 {
-                    println!("Found file: {}", &add.path);
+                    debug!("Found file: {}", &add.path);
                     self.seen.insert((add.path.clone(), add.dv_unique_id()));
                     Some(add)
                 }

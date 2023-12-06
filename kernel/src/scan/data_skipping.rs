@@ -47,7 +47,6 @@ impl FnMetadataFilter for Box<dyn FnMetadataFilter> {
 }
 
 /// Every data skipping predicate has at least one leaf node that references a stats column.
-// TODO: This shouldn't be public, but rust weird about visiblity and impl
 struct FnMetadataFilterColumn {
     stat_name: &'static str,
     nested_names: Vec<String>,
@@ -137,9 +136,6 @@ impl FnMetadataFilter for FnMetadataFilterComparisonEq {
 
 trait ProvidesMetadataFilter {
     fn extract_metadata_filters(&self) -> Option<Box<dyn FnMetadataFilter>>;
-
-    // TODO: These aren't really part of the interface, but rust does not allow an impl to define
-    // any helper methods (private or otherwise).
     fn extract_stats_column(&self, stat_name: &'static str) -> Option<FnMetadataFilterColumn>;
     fn extract_literal(&self) -> Option<Box<dyn Datum>>;
 }
@@ -183,7 +179,7 @@ impl ProvidesMetadataFilter for Expression {
                 left,
                 right,
             } => {
-                println!("AND got left {} and right {}", left, right);
+                debug!("AND got left {} and right {}", left, right);
                 let left = left.extract_metadata_filters();
                 let right = right.extract_metadata_filters();
                 // If one leg of the AND is missing, it just degenerates to the other leg.
@@ -222,7 +218,7 @@ impl ProvidesMetadataFilter for Expression {
                 let (op, column): (Operation, _) = match op {
                     BinaryOperator::Equal => {
                         // Equality filter compares the literal against both min and max stat columns
-                        println!("Got an equality filter");
+                        debug!("Got an equality filter");
                         return min_column.zip(max_column).zip(literal).map(
                             |((min_column, max_column), literal)| -> Box<dyn FnMetadataFilter> {
                                 let f = FnMetadataFilterComparisonEq {
@@ -273,7 +269,7 @@ impl DataSkippingFilter {
             Some(predicate) => predicate,
             None => return None,
         };
-        println!("Creating a data skipping filter for {}", &predicate);
+        debug!("Creating a data skipping filter for {}", &predicate);
         let field_names: HashSet<_> = predicate.references();
 
         // Build the stats read schema by extracting the column names referenced by the predicate,
@@ -286,7 +282,7 @@ impl DataSkippingFilter {
             .collect();
         if data_fields.is_empty() {
             // The predicate didn't reference any eligible stats columns, so skip it.
-            return None
+            return None;
         }
 
         let stats_schema = Schema::new(vec![
