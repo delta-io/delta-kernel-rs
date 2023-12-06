@@ -63,9 +63,9 @@ impl TryFrom<&MapType> for ArrowField {
             "entries",
             ArrowDataType::Struct(
                 vec![
-                    ArrowField::new("key", ArrowDataType::try_from(a.key_type())?, false),
+                    ArrowField::new("keys", ArrowDataType::try_from(a.key_type())?, false),
                     ArrowField::new(
-                        "value",
+                        "values",
                         ArrowDataType::try_from(a.value_type())?,
                         a.value_contains_null(),
                     ),
@@ -142,12 +142,12 @@ impl TryFrom<&DataType> for ArrowDataType {
                     ArrowDataType::Struct(
                         vec![
                             ArrowField::new(
-                                "key",
+                                "keys",
                                 <ArrowDataType as TryFrom<&DataType>>::try_from(m.key_type())?,
                                 false,
                             ),
                             ArrowField::new(
-                                "value",
+                                "values",
                                 <ArrowDataType as TryFrom<&DataType>>::try_from(m.value_type())?,
                                 m.value_contains_null(),
                             ),

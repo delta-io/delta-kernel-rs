@@ -10,11 +10,9 @@ use itertools::izip;
 
 use crate::{DeltaResult, Error};
 
-pub(crate) mod arrow;
 pub(crate) mod schemas;
 pub(crate) mod types;
 
-pub use schemas::get_log_schema;
 pub use types::*;
 
 #[derive(Debug)]
@@ -33,9 +31,9 @@ pub enum ActionType {
     Protocol,
     /// modify the data in a table by removing individual logical files
     Remove,
-    /// The Row ID high-water mark tracks the largest ID that has been assigned to a row in the table.
-    RowIdHighWaterMark,
     Txn,
+    CheckpointMetadata,
+    Sidecar,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -503,14 +501,15 @@ fn cast_struct_column<T: 'static>(arr: &StructArray, name: impl AsRef<str>) -> D
         .ok_or(Error::MissingColumn(name.as_ref().into()))?
         .as_any()
         .downcast_ref::<T>()
-        .ok_or(Error::UnexpectedColumnType(
-            "Cannot downcast to expected type".into(),
-        ))
+        .ok_or(Error::UnexpectedColumnType(format!(
+            "Cannot downcast '{}' to expected type",
+            name.as_ref()
+        )))
 }
 
 fn struct_array_to_map(arr: &StructArray) -> DeltaResult<HashMap<String, Option<String>>> {
-    let keys = cast_struct_column::<StringArray>(arr, "key")?;
-    let values = cast_struct_column::<StringArray>(arr, "value")?;
+    let keys = cast_struct_column::<StringArray>(arr, "keys")?;
+    let values = cast_struct_column::<StringArray>(arr, "values")?;
     Ok(keys
         .into_iter()
         .zip(values)
@@ -522,9 +521,11 @@ fn struct_array_to_map(arr: &StructArray) -> DeltaResult<HashMap<String, Option<
 mod tests {
     use std::sync::Arc;
 
+    use arrow_schema::Schema as ArrowSchema;
     use object_store::local::LocalFileSystem;
 
     use super::*;
+    use crate::actions::schemas::log_schema;
     use crate::actions::Protocol;
     use crate::client::json::DefaultJsonHandler;
     use crate::executor::tokio::TokioBackgroundExecutor;
@@ -541,7 +542,7 @@ mod tests {
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
         ]
         .into();
-        let output_schema = Arc::new(get_log_schema());
+        let output_schema = Arc::new(ArrowSchema::try_from(log_schema()).unwrap());
         handler.parse_json(json_strings, output_schema).unwrap()
     }
 
@@ -606,7 +607,7 @@ mod tests {
             r#"{"add":{"path":"c1=6/c2=a/part-00011-10619b10-b691-4fd0-acc4-2a9608499d7c.c000.snappy.parquet","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998135,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":4},\"maxValues\":{\"c3\":4},\"nullCount\":{\"c3\":0}}"}}"#,
         ]
         .into();
-        let output_schema = Arc::new(get_log_schema());
+        let output_schema = Arc::new(ArrowSchema::try_from(log_schema()).unwrap());
         let batch = handler.parse_json(json_strings, output_schema).unwrap();
 
         let actions = parse_action(&batch, &ActionType::Add)

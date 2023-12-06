@@ -211,10 +211,12 @@ impl FileOpener for JsonOpener {
 mod tests {
     use std::path::PathBuf;
 
-    use super::*;
-    use crate::{actions::get_log_schema, executor::tokio::TokioBackgroundExecutor};
+    use arrow_schema::Schema as ArrowSchema;
     use itertools::Itertools;
     use object_store::{local::LocalFileSystem, ObjectStore};
+
+    use super::*;
+    use crate::{actions::schemas::log_schema, executor::tokio::TokioBackgroundExecutor};
 
     #[test]
     fn test_parse_json() {
@@ -228,7 +230,7 @@ mod tests {
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
         ]
         .into();
-        let output_schema = Arc::new(get_log_schema());
+        let output_schema = Arc::new(ArrowSchema::try_from(log_schema()).unwrap());
 
         let batch = handler.parse_json(json_strings, output_schema).unwrap();
         assert_eq!(batch.num_rows(), 4);
@@ -253,7 +255,7 @@ mod tests {
         }];
 
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
-        let physical_schema = Arc::new(get_log_schema());
+        let physical_schema = Arc::new(ArrowSchema::try_from(log_schema()).unwrap());
         let context = handler.contextualize_file_reads(files, None).unwrap();
         let data: Vec<RecordBatch> = handler
             .read_json_files(&context, Arc::new(physical_schema.try_into().unwrap()))

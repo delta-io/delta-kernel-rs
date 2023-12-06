@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow_array::{BooleanArray, RecordBatch};
-use arrow_schema::{Fields, Schema as ArrowSchema};
+use arrow_schema::{Field as ArrowField, Fields, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use arrow_select::filter::filter_record_batch;
 use itertools::Itertools;
@@ -118,7 +118,10 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
     /// files into actual table data.
     pub fn files(&self) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
         let schema = Arc::new(ArrowSchema {
-            fields: Fields::from_iter([ActionType::Add.field(), ActionType::Remove.field()]),
+            fields: Fields::from_iter([
+                ArrowField::try_from(ActionType::Add.schema_field())?,
+                ArrowField::try_from(ActionType::Remove.schema_field())?,
+            ]),
             metadata: Default::default(),
         });
 

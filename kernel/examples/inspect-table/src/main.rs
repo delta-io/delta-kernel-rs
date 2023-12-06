@@ -105,7 +105,7 @@ fn main() {
                 fields: action_types
                     .as_ref()
                     .iter()
-                    .map(|a| Arc::new(a.field()))
+                    .map(|a| Arc::new(a.schema_field().try_into().unwrap()))
                     .collect(),
                 metadata: Default::default(),
             });
