@@ -1,0 +1,19 @@
+[package]
+name = "deltakernel-ffi"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+version.workspace = true
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[build-dependencies]
+cbindgen = "0.26.0"
+deltakernel = { path = "../kernel" }
+libc = "0.2.147"
+

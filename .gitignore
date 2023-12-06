@@ -1,4 +1,5 @@
 /target
+/kernel/target
 /Cargo.lock
 acceptance/tests/dat/
 .vscode
