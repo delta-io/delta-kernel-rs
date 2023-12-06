@@ -189,7 +189,7 @@ impl TryFrom<&ArrowField> for StructField {
     fn try_from(arrow_field: &ArrowField) -> Result<Self, ArrowError> {
         Ok(StructField::new(
             arrow_field.name().clone(),
-            arrow_field.data_type().try_into()?,
+            DataType::try_from(arrow_field.data_type())?,
             arrow_field.is_nullable(),
         )
         .with_metadata(arrow_field.metadata().iter().map(|(k, v)| (k.clone(), v))))
