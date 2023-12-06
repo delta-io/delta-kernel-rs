@@ -119,8 +119,8 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
     pub fn files(&self) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
         let schema = Arc::new(ArrowSchema {
             fields: Fields::from_iter([
-                ArrowField::try_from(ActionType::Add.schema_field())?,
-                ArrowField::try_from(ActionType::Remove.schema_field())?,
+                ArrowField::try_from(ActionType::Add)?,
+                ArrowField::try_from(ActionType::Remove)?,
             ]),
             metadata: Default::default(),
         });

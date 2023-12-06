@@ -5,7 +5,16 @@ use arrow_schema::{
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
 
+use crate::actions::ActionType;
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
+
+impl TryFrom<ActionType> for ArrowField {
+    type Error = ArrowError;
+
+    fn try_from(value: ActionType) -> Result<Self, Self::Error> {
+        value.schema_field().try_into()
+    }
+}
 
 impl TryFrom<&StructType> for ArrowSchema {
     type Error = ArrowError;

@@ -73,8 +73,8 @@ impl LogSegment {
     ) -> DeltaResult<Option<(Metadata, Protocol)>> {
         let read_schema = Arc::new(ArrowSchema {
             fields: Fields::from_iter([
-                ArrowField::try_from(ActionType::Metadata.schema_field())?,
-                ArrowField::try_from(ActionType::Protocol.schema_field())?,
+                ArrowField::try_from(ActionType::Metadata)?,
+                ArrowField::try_from(ActionType::Protocol)?,
             ]),
             metadata: Default::default(),
         });
