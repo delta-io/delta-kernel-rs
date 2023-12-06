@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::io::BufReader;
 use std::sync::Arc;
 
-use arrow_arith::boolean::{is_not_null, not};
+use arrow_arith::boolean::is_null;
 use arrow_array::{
     array::PrimitiveArray,
     new_null_array,
@@ -271,7 +271,7 @@ impl DataSkippingFilter {
     ) -> Option<DataSkippingFilter> {
         let predicate = match predicate {
             Some(predicate) => predicate,
-            _ => return None,
+            None => return None,
         };
         println!("Creating a data skipping filter for {}", &predicate);
         let field_names: HashSet<_> = predicate.references();
@@ -283,7 +283,11 @@ impl DataSkippingFilter {
             .iter()
             .filter(|field| field_names.contains(&field.name.as_str()))
             .filter_map(|field| Field::try_from(field).ok())
-            .collect::<Vec<_>>();
+            .collect();
+        if data_fields.is_empty() {
+            // The predicate didn't reference any eligible stats columns, so skip it.
+            return None
+        }
 
         let stats_schema = Schema::new(vec![
             Field::new(
@@ -330,8 +334,21 @@ impl DataSkippingFilter {
                 .iter(),
         )?;
 
+        // Skipping happens in several steps:
+        //
+        // 1. The predicate produces false for any file whose stats prove we can safely skip it. A
+        //    value of true means the stats say we must keep the file, and null means we could not
+        //    determine whether the file is safe to skip, because its stats were missing/null.
+        //
+        // 2. The nullif(skip, skip) converts true (= keep) to null, producing a result
+        //    that contains only false (= skip) and null (= keep) values.
+        //
+        // 3. The is_null converts null to true, producing a result that contains only true (=
+        //    keep) and false (= skip) values.
+        //
+        // 4. The filter discards every file whose selection vector entry is false.
         let skipping_vector = self.predicate.invoke(&parsed_stats)?;
-        let skipping_vector = &is_not_null(&nullif(&skipping_vector, &not(&skipping_vector)?)?)?;
+        let skipping_vector = &is_null(&nullif(&skipping_vector, &skipping_vector)?)?;
 
         let before_count = actions.num_rows();
         let after = filter_record_batch(actions, skipping_vector)?;
