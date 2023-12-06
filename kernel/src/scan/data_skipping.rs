@@ -35,12 +35,12 @@ type MetadataFilterResult = Result<BooleanArray, ArrowError>;
 // to specify correct lifetimes when a closure outlives the state it captures. You can use move ||
 // syntax to make it compile, but the resulting closure is FnOnce because the compiler (incorrectly)
 // assumes that the closure taking ownership means that invoking it consumes the captured state.
-trait MetadataFilterFn {
+trait FnMetadataFilter {
     fn invoke(&self, stats: &RecordBatch) -> MetadataFilterResult;
 }
 
 /// Helper method for boxed data skipping predicates.
-impl MetadataFilterFn for Box<dyn MetadataFilterFn> {
+impl FnMetadataFilter for Box<dyn FnMetadataFilter> {
     fn invoke(&self, stats: &RecordBatch) -> MetadataFilterResult {
         self.as_ref().invoke(stats)
     }
@@ -48,13 +48,13 @@ impl MetadataFilterFn for Box<dyn MetadataFilterFn> {
 
 /// Every data skipping predicate has at least one leaf node that references a stats column.
 // TODO: This shouldn't be public, but rust weird about visiblity and impl
-struct MetadataFilterColumnFn {
+struct FnMetadataFilterColumn {
     stat_name: &'static str,
     nested_names: Vec<String>,
     col_name: String,
 }
 
-impl MetadataFilterColumnFn {
+impl FnMetadataFilterColumn {
     /// Helper method for drilling down into a (possibly nested) stats column.
     /// A column such as minValues.a.b.c would be expressed as minValues [a, b] c.
     fn column_as_struct<'a>(
@@ -83,50 +83,50 @@ impl MetadataFilterColumnFn {
 }
 
 /// <left> AND <right>
-struct MetadataFilterAndFn {
-    left: Box<dyn MetadataFilterFn>,
-    right: Box<dyn MetadataFilterFn>,
+struct FnMetadataFilterAnd {
+    left: Box<dyn FnMetadataFilter>,
+    right: Box<dyn FnMetadataFilter>,
 }
 
-impl MetadataFilterFn for MetadataFilterAndFn {
+impl FnMetadataFilter for FnMetadataFilterAnd {
     fn invoke(&self, stats: &RecordBatch) -> MetadataFilterResult {
         arrow_arith::boolean::and(&self.left.invoke(stats)?, &self.right.invoke(stats)?)
     }
 }
 
 /// <left> OR <right>
-struct MetadataFilterOrFn {
-    left: Box<dyn MetadataFilterFn>,
-    right: Box<dyn MetadataFilterFn>,
+struct FnMetadataFilterOr {
+    left: Box<dyn FnMetadataFilter>,
+    right: Box<dyn FnMetadataFilter>,
 }
 
-impl MetadataFilterFn for MetadataFilterOrFn {
+impl FnMetadataFilter for FnMetadataFilterOr {
     fn invoke(&self, stats: &RecordBatch) -> MetadataFilterResult {
         arrow_arith::boolean::or(&self.left.invoke(stats)?, &self.right.invoke(stats)?)
     }
 }
 
 /// <column> <op> <literal>, for open-ended comparisons such as < or >=.
-struct MetadataFilterComparisonFn {
+struct FnMetadataFilterComparison {
     op: fn(&dyn Datum, &dyn Datum) -> MetadataFilterResult,
-    column: MetadataFilterColumnFn,
+    column: FnMetadataFilterColumn,
     literal: Box<dyn Datum>,
 }
 
-impl MetadataFilterFn for MetadataFilterComparisonFn {
+impl FnMetadataFilter for FnMetadataFilterComparison {
     fn invoke(&self, stats: &RecordBatch) -> MetadataFilterResult {
         (self.op)(&self.column.invoke(stats)?, self.literal.as_ref())
     }
 }
 
 /// <column> = <literal> -- equality is a special case, requiring two column comparisons instead of one.
-struct MetadataFilterEqComparisonFn {
-    min_column: MetadataFilterColumnFn,
-    max_column: MetadataFilterColumnFn,
+struct FnMetadataFilterComparisonEq {
+    min_column: FnMetadataFilterColumn,
+    max_column: FnMetadataFilterColumn,
     literal: Box<dyn Datum>,
 }
 
-impl MetadataFilterFn for MetadataFilterEqComparisonFn {
+impl FnMetadataFilter for FnMetadataFilterComparisonEq {
     fn invoke(&self, stats: &RecordBatch) -> MetadataFilterResult {
         arrow_arith::boolean::and(
             &lt_eq(&self.min_column.invoke(stats)?, self.literal.as_ref())?,
@@ -136,20 +136,20 @@ impl MetadataFilterFn for MetadataFilterEqComparisonFn {
 }
 
 trait ProvidesMetadataFilter {
-    fn extract_metadata_filters(&self) -> Option<Box<dyn MetadataFilterFn>>;
+    fn extract_metadata_filters(&self) -> Option<Box<dyn FnMetadataFilter>>;
 
     // TODO: These aren't really part of the interface, but rust does not allow an impl to define
     // any helper methods (private or otherwise).
-    fn extract_stats_column(&self, stat_name: &'static str) -> Option<MetadataFilterColumnFn>;
+    fn extract_stats_column(&self, stat_name: &'static str) -> Option<FnMetadataFilterColumn>;
     fn extract_literal(&self) -> Option<Box<dyn Datum>>;
 }
 
 impl ProvidesMetadataFilter for Expression {
-    fn extract_stats_column(&self, stat_name: &'static str) -> Option<MetadataFilterColumnFn> {
+    fn extract_stats_column(&self, stat_name: &'static str) -> Option<FnMetadataFilterColumn> {
         match self {
             // TODO: split names like a.b.c into [a, b], c below
             Expression::Column(name) => {
-                let f = MetadataFilterColumnFn {
+                let f = FnMetadataFilterColumn {
                     stat_name,
                     nested_names: vec![], // TODO: Actually handle nested columns...
                     col_name: name.to_string(),
@@ -175,7 +175,7 @@ impl ProvidesMetadataFilter for Expression {
     /// Converts this expression to Some data skipping predicate over the given record batch, if the
     /// expression is eligible for data skipping. Otherwise None. The predicate is callable,
     /// converting a record batch to a boolean array.
-    fn extract_metadata_filters(&self) -> Option<Box<dyn MetadataFilterFn>> {
+    fn extract_metadata_filters(&self) -> Option<Box<dyn FnMetadataFilter>> {
         match self {
             // <expr> AND <expr>
             Expression::BinaryOperation {
@@ -189,7 +189,7 @@ impl ProvidesMetadataFilter for Expression {
                 // If one leg of the AND is missing, it just degenerates to the other leg.
                 match (left, right) {
                     (Some(left), Some(right)) => {
-                        let f = MetadataFilterAndFn { left, right };
+                        let f = FnMetadataFilterAnd { left, right };
                         Some(Box::new(f))
                     }
                     (left, right) => left.or(right),
@@ -206,8 +206,8 @@ impl ProvidesMetadataFilter for Expression {
                 let right = right.extract_metadata_filters();
                 // OR is valid only if both legs are valid.
                 left.zip(right)
-                    .map(|(left, right)| -> Box<dyn MetadataFilterFn> {
-                        let f = MetadataFilterOrFn { left, right };
+                    .map(|(left, right)| -> Box<dyn FnMetadataFilter> {
+                        let f = FnMetadataFilterOr { left, right };
                         Box::new(f)
                     })
             }
@@ -224,8 +224,8 @@ impl ProvidesMetadataFilter for Expression {
                         // Equality filter compares the literal against both min and max stat columns
                         println!("Got an equality filter");
                         return min_column.zip(max_column).zip(literal).map(
-                            |((min_column, max_column), literal)| -> Box<dyn MetadataFilterFn> {
-                                let f = MetadataFilterEqComparisonFn {
+                            |((min_column, max_column), literal)| -> Box<dyn FnMetadataFilter> {
+                                let f = FnMetadataFilterComparisonEq {
                                     min_column,
                                     max_column,
                                     literal,
@@ -245,8 +245,8 @@ impl ProvidesMetadataFilter for Expression {
 
                 column
                     .zip(literal)
-                    .map(|(column, literal)| -> Box<dyn MetadataFilterFn> {
-                        let f = MetadataFilterComparisonFn {
+                    .map(|(column, literal)| -> Box<dyn FnMetadataFilter> {
+                        let f = FnMetadataFilterComparison {
                             op,
                             column,
                             literal,
@@ -261,7 +261,7 @@ impl ProvidesMetadataFilter for Expression {
 
 pub(crate) struct DataSkippingFilter {
     stats_schema: Arc<Schema>,
-    predicate: Box<dyn MetadataFilterFn>,
+    predicate: Box<dyn FnMetadataFilter>,
 }
 
 impl DataSkippingFilter {
