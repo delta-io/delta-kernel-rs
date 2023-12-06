@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use deltakernel::client::DefaultTableClient;
 use deltakernel::executor::tokio::TokioBackgroundExecutor;
+use deltakernel::scan::ScanBuilder;
 use deltakernel::Table;
 
 #[test]
@@ -19,7 +20,7 @@ fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
 
     let table = Table::new(url, table_client);
     let snapshot = table.snapshot(None)?;
-    let scan = snapshot.scan()?.build();
+    let scan = ScanBuilder::try_new(snapshot)?.build();
 
     let stream = scan.execute()?;
     for batch in stream {
@@ -42,7 +43,7 @@ fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
 
     let table = Table::new(url, table_client);
     let snapshot = table.snapshot(None)?;
-    let scan = snapshot.scan()?.build();
+    let scan = ScanBuilder::try_new(snapshot)?.build();
 
     let stream = scan.execute()?;
     for batch in stream {

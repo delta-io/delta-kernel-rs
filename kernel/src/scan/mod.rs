@@ -5,14 +5,13 @@ use arrow_schema::{Fields, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use arrow_select::filter::filter_record_batch;
 use itertools::Itertools;
-use url::Url;
 
 use self::file_stream::log_replay_iter;
 use crate::actions::ActionType;
 use crate::expressions::Expression;
 use crate::schema::SchemaRef;
-use crate::snapshot::LogSegment;
-use crate::{Add, DeltaResult, FileMeta, TableClient};
+use crate::snapshot::Snapshot;
+use crate::{Add, DeltaResult, FileMeta};
 
 mod data_skipping;
 pub mod file_stream;
@@ -20,12 +19,10 @@ pub mod file_stream;
 // TODO projection: something like fn select(self, columns: &[&str])
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder<JRC: Send, PRC: Send> {
-    table_root: Url,
-    log_segment: LogSegment,
+    snapshot: Arc<Snapshot<JRC, PRC>>,
     snapshot_schema: SchemaRef,
     schema: Option<SchemaRef>,
     predicate: Option<Expression>,
-    table_client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
 }
 
 impl<JRC: Send, PRC: Send> std::fmt::Debug for ScanBuilder<JRC, PRC> {
@@ -39,20 +36,16 @@ impl<JRC: Send, PRC: Send> std::fmt::Debug for ScanBuilder<JRC, PRC> {
 
 impl<JRC: Send, PRC: Send + Sync> ScanBuilder<JRC, PRC> {
     /// Create a new [`ScanBuilder`] instance.
-    pub(crate) fn new(
-        table_root: Url,
-        snapshot_schema: SchemaRef,
-        log_segment: LogSegment,
-        table_client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
-    ) -> Self {
-        Self {
-            table_root,
+    // TODO(issues/75) -- once P&M are no longer lazy, self.schema() call below can no longer fail
+    // and we can change this method to new instead of try_new.
+    pub fn try_new(snapshot: Arc<Snapshot<JRC, PRC>>) -> DeltaResult<Self> {
+        let snapshot_schema = Arc::new(snapshot.schema()?);
+        Ok(Self {
+            snapshot,
             snapshot_schema,
-            log_segment,
             schema: None,
             predicate: None,
-            table_client,
-        }
+        })
     }
 
     /// Provide [`Schema`] for columns to select from the [`Snapshot`].
@@ -84,21 +77,17 @@ impl<JRC: Send, PRC: Send + Sync> ScanBuilder<JRC, PRC> {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
         let schema = self.schema.unwrap_or_else(|| self.snapshot_schema.clone());
         Scan {
-            table_root: self.table_root,
-            log_segment: self.log_segment,
+            snapshot: self.snapshot,
             schema,
             predicate: self.predicate,
-            table_client: self.table_client,
         }
     }
 }
 
 pub struct Scan<JRC: Send, PRC: Send + Sync> {
-    table_root: Url,
-    log_segment: LogSegment,
+    snapshot: Arc<Snapshot<JRC, PRC>>,
     schema: SchemaRef,
     predicate: Option<Expression>,
-    table_client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
 }
 
 impl<JRC: Send, PRC: Send + Sync> std::fmt::Debug for Scan<JRC, PRC> {
@@ -133,15 +122,17 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
             metadata: Default::default(),
         });
 
-        let log_iter =
-            self.log_segment
-                .replay(self.table_client.as_ref(), schema, self.predicate.clone())?;
+        let log_iter = self.snapshot.log_segment.replay(
+            self.snapshot.table_client.as_ref(),
+            schema,
+            self.predicate.clone(),
+        )?;
 
         Ok(log_replay_iter(log_iter, self.predicate.clone()))
     }
 
     pub fn execute(&self) -> DeltaResult<Vec<RecordBatch>> {
-        let parquet_handler = self.table_client.get_parquet_handler();
+        let parquet_handler = self.snapshot.table_client.get_parquet_handler();
 
         self.files()?
             .map(|res| {
@@ -149,7 +140,7 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
                 let meta = FileMeta {
                     last_modified: add.modification_time,
                     size: add.size as usize,
-                    location: self.table_root.join(&add.path)?,
+                    location: self.snapshot.table_root.join(&add.path)?,
                 };
                 let context = parquet_handler.contextualize_file_reads(&[meta], None)?;
                 let batches = parquet_handler
@@ -164,8 +155,8 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
                 let batch = concat_batches(&schema, &batches)?;
 
                 if let Some(dv_descriptor) = add.deletion_vector {
-                    let fs_client = self.table_client.get_file_system_client();
-                    let dv = dv_descriptor.read(fs_client, self.table_root.clone())?;
+                    let fs_client = self.snapshot.table_client.get_file_system_client();
+                    let dv = dv_descriptor.read(fs_client, self.snapshot.table_root.clone())?;
                     let mask: BooleanArray = (0..batch.num_rows())
                         .map(|i| Some(!dv.contains(i.try_into().expect("fit into u32"))))
                         .collect();
@@ -204,7 +195,7 @@ mod tests {
 
         let table = Table::new(url, table_client);
         let snapshot = table.snapshot(None).unwrap();
-        let scan = snapshot.scan().unwrap().build();
+        let scan = ScanBuilder::try_new(snapshot).unwrap().build();
         let files: Vec<Add> = scan.files().unwrap().try_collect().unwrap();
 
         assert_eq!(files.len(), 1);
@@ -231,7 +222,7 @@ mod tests {
 
         let table = Table::new(url, table_client);
         let snapshot = table.snapshot(None).unwrap();
-        let scan = snapshot.scan().unwrap().build();
+        let scan = ScanBuilder::try_new(snapshot).unwrap().build();
         let files = scan.execute().unwrap();
 
         assert_eq!(files.len(), 1);

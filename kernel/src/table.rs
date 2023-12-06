@@ -41,7 +41,7 @@ impl<JRC: Send, PRC: Send + Sync> Table<JRC, PRC> {
     /// Create a [`Snapshot`] of the table corresponding to `version`.
     ///
     /// If no version is supplied, a snapshot for the latest version will be created.
-    pub fn snapshot(&self, version: Option<Version>) -> DeltaResult<Snapshot<JRC, PRC>> {
+    pub fn snapshot(&self, version: Option<Version>) -> DeltaResult<Arc<Snapshot<JRC, PRC>>> {
         Snapshot::try_new(self.location.clone(), self.table_client.clone(), version)
     }
 }

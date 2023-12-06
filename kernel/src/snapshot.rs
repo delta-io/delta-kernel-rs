@@ -14,7 +14,6 @@ use url::Url;
 
 use crate::actions::{parse_action, Action, ActionType, Metadata, Protocol};
 use crate::path::LogPath;
-use crate::scan::ScanBuilder;
 use crate::schema::Schema;
 use crate::Expression;
 use crate::{DeltaResult, Error, FileMeta, FileSystemClient, TableClient, Version};
@@ -115,9 +114,9 @@ impl LogSegment {
 /// have a defined schema (which may change over time for any given table), specific version, and
 /// frozen log segment.
 pub struct Snapshot<JRC: Send, PRC: Send> {
-    table_root: Url,
-    table_client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
-    log_segment: LogSegment,
+    pub(crate) table_root: Url,
+    pub(crate) table_client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
+    pub(crate) log_segment: LogSegment,
     version: Version,
     metadata: Arc<RwLock<Option<(Metadata, Protocol)>>>,
 }
@@ -144,7 +143,7 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
         table_root: Url,
         table_client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
         version: Option<Version>,
-    ) -> DeltaResult<Self> {
+    ) -> DeltaResult<Arc<Self>> {
         let fs_client = table_client.get_file_system_client();
         let log_url = LogPath(&table_root).child("_delta_log/").unwrap();
 
@@ -188,12 +187,12 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
             checkpoint_files,
         };
 
-        Ok(Self::new(
+        Ok(Arc::new(Self::new(
             table_root,
             table_client,
             log_segment,
             version_eff,
-        ))
+        )))
     }
 
     /// Create a new [`Snapshot`] instance.
@@ -260,16 +259,6 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
     pub fn protocol(&self) -> DeltaResult<Protocol> {
         let (_, protocol) = self.get_or_insert_metadata()?;
         Ok(protocol)
-    }
-
-    pub fn scan(self) -> DeltaResult<ScanBuilder<JRC, PRC>> {
-        let schema = Arc::new(self.schema()?);
-        Ok(ScanBuilder::new(
-            self.table_root,
-            schema,
-            self.log_segment,
-            self.table_client,
-        ))
     }
 }
 
