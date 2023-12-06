@@ -111,7 +111,7 @@ fn main() {
             });
 
             let batches = snapshot
-                .get_log_segment()
+                ._get_log_segment()
                 .replay(&*table_client, read_schema, None);
 
             let batch_vec = batches.unwrap().collect::<Vec<DeltaResult<RecordBatch>>>();

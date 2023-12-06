@@ -6,6 +6,7 @@ use arrow::record_batch::RecordBatch;
 use deltakernel::client::DefaultTableClient;
 use deltakernel::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::expressions::Expression;
+use deltakernel::scan::ScanBuilder;
 use deltakernel::Table;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use parquet::arrow::arrow_writer::ArrowWriter;
@@ -97,7 +98,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let expected_data = vec![batch.clone(), batch];
 
     let snapshot = table.snapshot(None)?;
-    let scan = snapshot.scan()?.build();
+    let scan = ScanBuilder::try_new(snapshot)?.build();
 
     let mut files = 0;
     let stream = scan.execute()?.into_iter().zip(expected_data);
@@ -147,7 +148,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let expected_data = vec![batch.clone(), batch];
 
     let snapshot = table.snapshot(None).unwrap();
-    let scan = snapshot.scan()?.build();
+    let scan = ScanBuilder::try_new(snapshot)?.build();
 
     let mut files = 0;
     let stream = scan.execute()?.into_iter().zip(expected_data);
@@ -201,7 +202,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let expected_data = vec![batch];
 
     let snapshot = table.snapshot(None)?;
-    let scan = snapshot.scan()?.build();
+    let scan = ScanBuilder::try_new(snapshot)?.build();
 
     let stream = scan.execute()?.into_iter().zip(expected_data);
 
@@ -263,7 +264,9 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = table.snapshot(None)?;
 
     let predicate = Expression::column("id").lt(Expression::literal(2i64));
-    let scan = snapshot.scan()?.with_predicate(predicate).build();
+    let scan = ScanBuilder::try_new(snapshot)?
+        .with_predicate(predicate)
+        .build();
 
     let mut files = 0;
     let stream = scan.execute()?.into_iter().zip(expected_data);
