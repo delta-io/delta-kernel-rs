@@ -5,7 +5,8 @@ use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use deltakernel::client::DefaultTableClient;
 use deltakernel::executor::tokio::TokioBackgroundExecutor;
-use deltakernel::expressions::Expression;
+use deltakernel::expressions::{BinaryOperator, Expression};
+use deltakernel::scan::ScanBuilder;
 use deltakernel::Table;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use parquet::arrow::arrow_writer::ArrowWriter;
@@ -29,7 +30,7 @@ fn generate_commit(actions: Vec<TestAction>) -> String {
     actions
             .into_iter()
             .map(|test_action| match test_action {
-                TestAction::Add(path) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"ids\":0}},\"minValues\":{{\"ids\": 0}},\"maxValues\":{{\"ids\":2}}}}"}}}}"#, action = "add", path = path),
+                TestAction::Add(path) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 1}},\"maxValues\":{{\"id\":3}}}}"}}}}"#, action = "add", path = path),
                 TestAction::Remove(path) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true}}}}"#, action = "remove", path = path),
                 TestAction::Metadata => METADATA.into(),
             })
@@ -97,7 +98,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let expected_data = vec![batch.clone(), batch];
 
     let snapshot = table.snapshot(None)?;
-    let scan = snapshot.scan()?.build();
+    let scan = ScanBuilder::try_new(snapshot)?.build();
 
     let mut files = 0;
     let stream = scan.execute()?.into_iter().zip(expected_data);
@@ -147,7 +148,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let expected_data = vec![batch.clone(), batch];
 
     let snapshot = table.snapshot(None).unwrap();
-    let scan = snapshot.scan()?.build();
+    let scan = ScanBuilder::try_new(snapshot)?.build();
 
     let mut files = 0;
     let stream = scan.execute()?.into_iter().zip(expected_data);
@@ -201,7 +202,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let expected_data = vec![batch];
 
     let snapshot = table.snapshot(None)?;
-    let scan = snapshot.scan()?.build();
+    let scan = ScanBuilder::try_new(snapshot)?.build();
 
     let stream = scan.execute()?.into_iter().zip(expected_data);
 
@@ -220,13 +221,23 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         actions
             .into_iter()
             .map(|test_action| match test_action {
-                TestAction::Add(path) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"ids\":0}},\"minValues\":{{\"ids\": 3}},\"maxValues\":{{\"ids\":5}}}}"}}}}"#, action = "add", path = path),
+                TestAction::Add(path) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 5}},\"maxValues\":{{\"id\":7}}}}"}}}}"#, action = "add", path = path),
                 TestAction::Remove(path) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true}}}}"#, action = "remove", path = path),
                 TestAction::Metadata => METADATA.into(),
             })
             .fold(String::new(), |a, b| a + &b + "\n")
     }
-    let batch = generate_simple_batch()?;
+    fn generate_simple_batch2() -> Result<RecordBatch, ArrowError> {
+        let ids = Int32Array::from(vec![5, 7]);
+        let vals = StringArray::from(vec!["e", "g"]);
+        RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(ids) as ArrayRef),
+            ("val", Arc::new(vals) as ArrayRef),
+        ])
+    }
+
+    let batch1 = generate_simple_batch()?;
+    let batch2 = generate_simple_batch2()?;
     let storage = Arc::new(InMemory::new());
     // valid commit with min/max (0, 2)
     add_commit(
@@ -238,7 +249,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         ]),
     )
     .await?;
-    // storage.add_commit(1, &format!("{}\n", r#"{{"add":{{"path":"doesnotexist","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"ids\":0}},\"minValues\":{{\"ids\": 0}},\"maxValues\":{{\"ids\":2}}}}"}}}}"#));
+    // storage.add_commit(1, &format!("{}\n", r#"{{"add":{{"path":"doesnotexist","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 0}},\"maxValues\":{{\"id\":2}}}}"}}}}"#));
     add_commit(
         storage.as_ref(),
         1,
@@ -247,7 +258,11 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     storage
-        .put(&Path::from(PARQUET_FILE1), load_parquet(&batch).into())
+        .put(&Path::from(PARQUET_FILE1), load_parquet(&batch1).into())
+        .await?;
+
+    storage
+        .put(&Path::from(PARQUET_FILE2), load_parquet(&batch2).into())
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
@@ -258,20 +273,58 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     let table = Table::new(location, table_client);
-    let expected_data = vec![batch];
-
     let snapshot = table.snapshot(None)?;
 
-    let predicate = Expression::column("ids").lt(Expression::literal(2));
-    let scan = snapshot.scan()?.with_predicate(predicate).build();
+    // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
+    // we validate the boundary values where we expect the set of matched files to change.
+    //
+    // NOTE: For cases that match both batch1 and batch2, we list batch2 first because log replay
+    // returns most recently added files first.
+    use BinaryOperator::{Equal, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual};
+    let test_cases: Vec<(_, i64, _)> = vec![
+        (Equal, 0, vec![]),
+        (Equal, 1, vec![&batch1]),
+        (Equal, 3, vec![&batch1]),
+        (Equal, 4, vec![]),
+        (Equal, 5, vec![&batch2]),
+        (Equal, 7, vec![&batch2]),
+        (Equal, 8, vec![]),
+        (LessThan, 1, vec![]),
+        (LessThan, 2, vec![&batch1]),
+        (LessThan, 5, vec![&batch1]),
+        (LessThan, 6, vec![&batch2, &batch1]),
+        (LessThanOrEqual, 0, vec![]),
+        (LessThanOrEqual, 1, vec![&batch1]),
+        (LessThanOrEqual, 4, vec![&batch1]),
+        (LessThanOrEqual, 5, vec![&batch2, &batch1]),
+        (GreaterThan, 2, vec![&batch2, &batch1]),
+        (GreaterThan, 3, vec![&batch2]),
+        (GreaterThan, 6, vec![&batch2]),
+        (GreaterThan, 7, vec![]),
+        (GreaterThanOrEqual, 3, vec![&batch2, &batch1]),
+        (GreaterThanOrEqual, 4, vec![&batch2]),
+        (GreaterThanOrEqual, 7, vec![&batch2]),
+        (GreaterThanOrEqual, 8, vec![]),
+    ];
+    for (op, value, expected_batches) in test_cases {
+        let predicate = Expression::BinaryOperation {
+            op,
+            left: Box::new(Expression::column("id")),
+            right: Box::new(Expression::literal(value)),
+        };
+        let scan = ScanBuilder::try_new(snapshot.clone())?
+            .with_predicate(predicate)
+            .build();
 
-    let mut files = 0;
-    let stream = scan.execute()?.into_iter().zip(expected_data);
+        let expected_files = expected_batches.len();
+        let mut files_scanned = 0;
+        let stream = scan.execute()?.into_iter().zip(expected_batches);
 
-    for (data, expected) in stream {
-        files += 1;
-        assert_eq!(data, expected);
+        for (batch, expected) in stream {
+            files_scanned += 1;
+            assert_eq!(&batch, expected);
+        }
+        assert_eq!(expected_files, files_scanned);
     }
-    assert_eq!(1, files, "Expected to have scanned one file");
     Ok(())
 }
