@@ -27,6 +27,7 @@ impl Scalar {
         use Scalar::*;
         match self {
             Integer(val) => Arc::new(Int32Array::from(vec![*val; num_rows])),
+            Long(val) => Arc::new(Int64Array::from(vec![*val; num_rows])),
             Float(val) => Arc::new(Float32Array::from(vec![*val; num_rows])),
             String(val) => Arc::new(StringArray::from(vec![val.clone(); num_rows])),
             Boolean(val) => Arc::new(BooleanArray::from(vec![*val; num_rows])),
