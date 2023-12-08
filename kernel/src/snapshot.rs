@@ -4,7 +4,6 @@
 
 use std::cmp::Ordering;
 use std::sync::Arc;
-use std::sync::RwLock;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Fields, Schema as ArrowSchema};
@@ -35,6 +34,8 @@ impl LogSegment {
     /// Read a stream of log data from this log segment.
     ///
     /// The log files will be read from most recent to oldest.
+    /// The boolean flags indicates whether the data was read from
+    /// a commit file (true) or a checkpoint file (false).
     ///
     /// `read_schema` is the schema to read the log files with. This can be used
     /// to project the log files to a subset of the columns.
@@ -47,20 +48,23 @@ impl LogSegment {
         table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
         read_schema: Arc<ArrowSchema>,
         predicate: Option<Expression>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<RecordBatch>>> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(RecordBatch, bool)>>> {
         let json_client = table_client.get_json_handler();
         let read_contexts =
             json_client.contextualize_file_reads(&self.commit_files, predicate.clone())?;
-        let commit_stream = json_client.read_json_files(
-            read_contexts.as_slice(),
-            Arc::new(read_schema.as_ref().try_into()?),
-        )?;
+        let commit_stream = json_client
+            .read_json_files(
+                read_contexts.as_slice(),
+                Arc::new(read_schema.as_ref().try_into()?),
+            )?
+            .map_ok(|batch| (batch, true));
 
         let parquet_client = table_client.get_parquet_handler();
         let read_contexts =
             parquet_client.contextualize_file_reads(&self.checkpoint_files, predicate)?;
         let checkpoint_stream = parquet_client
-            .read_parquet_files(read_contexts, Arc::new(read_schema.as_ref().try_into()?))?;
+            .read_parquet_files(read_contexts, Arc::new(read_schema.as_ref().try_into()?))?
+            .map_ok(|batch| (batch, false));
 
         let batches = commit_stream.chain(checkpoint_stream);
 
@@ -79,9 +83,12 @@ impl LogSegment {
         let mut metadata_opt: Option<Metadata> = None;
         let mut protocol_opt: Option<Protocol> = None;
 
+        // TODO should we request teh checkpoint iterator only if we don't find the metadata in the commit files?
+        // since the engine might pre-fetch data o.a.? On the other hand, if the engine is smart about it, it should not be
+        // too much extra work to request the checkpoint iterator as well.
         let batches = self.replay(table_client, read_schema, None)?;
-        for batch in batches {
-            let batch = batch?;
+        for maybe_batch in batches {
+            let (batch, _) = maybe_batch?;
 
             if metadata_opt.is_none() {
                 if let Ok(mut action) = parse_action(&batch, &ActionType::Metadata) {
@@ -118,7 +125,9 @@ pub struct Snapshot<JRC: Send, PRC: Send> {
     pub(crate) table_client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
     pub(crate) log_segment: LogSegment,
     version: Version,
-    metadata: Arc<RwLock<Option<(Metadata, Protocol)>>>,
+    metadata: Metadata,
+    protocol: Protocol,
+    schema: Schema,
 }
 
 impl<JRC: Send, PRC: Send> std::fmt::Debug for Snapshot<JRC, PRC> {
@@ -187,28 +196,36 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
             checkpoint_files,
         };
 
-        Ok(Arc::new(Self::new(
+        Ok(Arc::new(Self::new_with_log_segment(
             table_root,
             table_client,
             log_segment,
             version_eff,
-        )))
+        )?))
     }
 
     /// Create a new [`Snapshot`] instance.
-    pub(crate) fn new(
+    pub(crate) fn new_with_log_segment(
         location: Url,
         client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
         log_segment: LogSegment,
         version: Version,
-    ) -> Self {
-        Self {
+    ) -> DeltaResult<Self> {
+        let (metadata, protocol) = log_segment
+            .read_metadata(client.as_ref())?
+            .ok_or(Error::MissingMetadata)?;
+
+        let schema = metadata.schema()?;
+
+        Ok(Self {
             table_root: location,
             table_client: client,
             log_segment,
             version,
-            metadata: Default::default(),
-        }
+            metadata,
+            protocol,
+            schema,
+        })
     }
 
     /// Version of this [`Snapshot`] in the table.
@@ -221,44 +238,18 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
         &self.log_segment
     }
 
-    fn get_or_insert_metadata(&self) -> DeltaResult<(Metadata, Protocol)> {
-        {
-            let read_lock = self
-                .metadata
-                .read()
-                .map_err(|_| Error::Generic("failed to get read lock".into()))?;
-            if let Some((metadata, protocol)) = read_lock.as_ref() {
-                return Ok((metadata.clone(), protocol.clone()));
-            }
-        } // drop the read_lock
-
-        let (metadata, protocol) = self
-            .log_segment
-            .read_metadata(self.table_client.as_ref())?
-            .ok_or(Error::MissingMetadata)?;
-        let mut meta = self
-            .metadata
-            .write()
-            .map_err(|_| Error::Generic("failed to get write lock".into()))?;
-        *meta = Some((metadata.clone(), protocol.clone()));
-
-        Ok((metadata, protocol))
-    }
-
     /// Table [`Schema`] at this [`Snapshot`]s version.
-    pub fn schema(&self) -> DeltaResult<Schema> {
-        self.metadata()?.schema()
+    pub fn schema(&self) -> &Schema {
+        &self.schema
     }
 
     /// Table [`Metadata`] at this [`Snapshot`]s version.
-    pub fn metadata(&self) -> DeltaResult<Metadata> {
-        let (metadata, _) = self.get_or_insert_metadata()?;
-        Ok(metadata)
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
     }
 
-    pub fn protocol(&self) -> DeltaResult<Protocol> {
-        let (_, protocol) = self.get_or_insert_metadata()?;
-        Ok(protocol)
+    pub fn protocol(&self) -> &Protocol {
+        &self.protocol
     }
 }
 
@@ -427,19 +418,19 @@ mod tests {
         let client = default_table_client(&url);
         let snapshot = Snapshot::try_new(url, client, Some(1)).unwrap();
 
-        let protocol = snapshot.protocol().unwrap();
+        let protocol = snapshot.protocol();
         let expected = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
             reader_features: Some(vec!["deletionVectors".into()]),
             writer_features: Some(vec!["deletionVectors".into()]),
         };
-        assert_eq!(protocol, expected);
+        assert_eq!(protocol, &expected);
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
         let expected: StructType = serde_json::from_str(schema_string).unwrap();
-        let schema = snapshot.schema().unwrap();
-        assert_eq!(schema, expected);
+        let schema = snapshot.schema();
+        assert_eq!(schema, &expected);
     }
 
     #[test]
@@ -451,19 +442,19 @@ mod tests {
         let client = default_table_client(&url);
         let snapshot = Snapshot::try_new(url, client, None).unwrap();
 
-        let protocol = snapshot.protocol().unwrap();
+        let protocol = snapshot.protocol();
         let expected = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
             reader_features: Some(vec!["deletionVectors".into()]),
             writer_features: Some(vec!["deletionVectors".into()]),
         };
-        assert_eq!(protocol, expected);
+        assert_eq!(protocol, &expected);
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
         let expected: StructType = serde_json::from_str(schema_string).unwrap();
-        let schema = snapshot.schema().unwrap();
-        assert_eq!(schema, expected);
+        let schema = snapshot.schema();
+        assert_eq!(schema, &expected);
     }
 
     #[test]

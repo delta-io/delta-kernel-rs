@@ -46,13 +46,7 @@ impl TestCaseInfo {
         let expected_root = self.root_dir.join("expected");
         let store = LocalFileSystem::new_with_prefix(&expected_root).unwrap();
 
-        let files = store
-            .list(None)
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let files = store.list(None).try_collect::<Vec<_>>().await.unwrap();
 
         let raw_cases = files.into_iter().filter(|meta| {
             meta.location.filename() == Some("table_version_metadata.json")
@@ -86,14 +80,14 @@ impl TestCaseInfo {
         assert_eq!(snapshot.version(), case.version);
 
         // assert correct metadata is read
-        let metadata = snapshot.metadata()?;
-        let protocol = snapshot.protocol()?;
+        let metadata = snapshot.metadata();
+        let protocol = snapshot.protocol();
         let tvm = TableVersionMetaData {
             version: snapshot.version(),
             properties: metadata
                 .configuration
-                .into_iter()
-                .map(|(k, v)| (k, v.unwrap()))
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone().unwrap()))
                 .collect(),
             min_reader_version: protocol.min_reader_version as u32,
             min_writer_version: protocol.min_writer_version as u32,

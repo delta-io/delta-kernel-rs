@@ -36,16 +36,14 @@ impl<JRC: Send, PRC: Send> std::fmt::Debug for ScanBuilder<JRC, PRC> {
 
 impl<JRC: Send, PRC: Send + Sync> ScanBuilder<JRC, PRC> {
     /// Create a new [`ScanBuilder`] instance.
-    // TODO(issues/75) -- once P&M are no longer lazy, self.schema() call below can no longer fail
-    // and we can change this method to new instead of try_new.
-    pub fn try_new(snapshot: Arc<Snapshot<JRC, PRC>>) -> DeltaResult<Self> {
-        let snapshot_schema = Arc::new(snapshot.schema()?);
-        Ok(Self {
+    pub fn new(snapshot: Arc<Snapshot<JRC, PRC>>) -> Self {
+        let snapshot_schema = Arc::new(snapshot.schema().clone());
+        Self {
             snapshot,
             snapshot_schema,
             schema: None,
             predicate: None,
-        })
+        }
     }
 
     /// Provide [`Schema`] for columns to select from the [`Snapshot`].
@@ -195,7 +193,7 @@ mod tests {
 
         let table = Table::new(url, table_client);
         let snapshot = table.snapshot(None).unwrap();
-        let scan = ScanBuilder::try_new(snapshot).unwrap().build();
+        let scan = ScanBuilder::new(snapshot).build();
         let files: Vec<Add> = scan.files().unwrap().try_collect().unwrap();
 
         assert_eq!(files.len(), 1);
@@ -222,7 +220,7 @@ mod tests {
 
         let table = Table::new(url, table_client);
         let snapshot = table.snapshot(None).unwrap();
-        let scan = ScanBuilder::try_new(snapshot).unwrap().build();
+        let scan = ScanBuilder::new(snapshot).build();
         let files = scan.execute().unwrap();
 
         assert_eq!(files.len(), 1);

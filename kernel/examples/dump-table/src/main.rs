@@ -1,5 +1,6 @@
 use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::client::DefaultTableClient;
+use deltakernel::scan::ScanBuilder;
 use deltakernel::Table;
 
 use std::collections::HashMap;
@@ -109,7 +110,7 @@ fn main() {
         return;
     };
 
-    let scan = snapshot.scan().unwrap().build();
+    let scan = ScanBuilder::new(snapshot).build();
 
     let schema = scan.schema();
     let header_names = schema.fields.iter().map(|field| {

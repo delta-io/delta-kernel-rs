@@ -1,5 +1,6 @@
 use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::client::DefaultTableClient;
+use deltakernel::scan::ScanBuilder;
 use deltakernel::{DeltaResult, Table};
 
 use deltakernel::actions::{parse_actions, Action, ActionType};
@@ -82,14 +83,14 @@ fn main() {
             println!("Latest table version: {}", snapshot.version());
         }
         Commands::Metadata => {
-            println!("{:#?}", snapshot.metadata().unwrap());
+            println!("{:#?}", snapshot.metadata());
         }
         Commands::Schema => {
-            println!("{:#?}", snapshot.schema().unwrap());
+            println!("{:#?}", snapshot.schema());
         }
         Commands::Adds => {
             use deltakernel::Add;
-            let scan = snapshot.scan().unwrap().build();
+            let scan = ScanBuilder::new(snapshot).build();
             let files: Vec<Add> = scan.files().unwrap().map(|r| r.unwrap()).collect();
             println!("{:#?}", files);
         }
@@ -114,10 +115,12 @@ fn main() {
                 ._get_log_segment()
                 .replay(&*table_client, read_schema, None);
 
-            let batch_vec = batches.unwrap().collect::<Vec<DeltaResult<RecordBatch>>>();
+            let batch_vec = batches
+                .unwrap()
+                .collect::<Vec<DeltaResult<(RecordBatch, bool)>>>();
             let len = batch_vec.len() - 1;
 
-            let batches: Box<dyn Iterator<Item = Result<RecordBatch, deltakernel::Error>>> =
+            let batches: Box<dyn Iterator<Item = Result<(RecordBatch, bool), deltakernel::Error>>> =
                 if *forward {
                     Box::new(batch_vec.into_iter().rev())
                 } else {
@@ -130,7 +133,7 @@ fn main() {
                     println!("\n\n");
                 }
                 println!("-- at {:0>20} --", index);
-                let batch = batch.unwrap();
+                let (batch, _) = batch.unwrap();
                 let actions = parse_actions(&batch, action_types.as_ref()).unwrap();
                 for action in actions {
                     match action {
