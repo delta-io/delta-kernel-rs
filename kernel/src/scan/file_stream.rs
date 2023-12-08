@@ -22,9 +22,8 @@ struct LogReplayScanner {
 impl LogReplayScanner {
     /// Create a new [`LogReplayStream`] instance
     fn new(table_schema: &SchemaRef, predicate: &Option<Expression>) -> Self {
-        let filter = DataSkippingFilter::try_new(table_schema, predicate);
         Self {
-            filter,
+            filter: DataSkippingFilter::new(table_schema, predicate),
             seen: Default::default(),
         }
     }

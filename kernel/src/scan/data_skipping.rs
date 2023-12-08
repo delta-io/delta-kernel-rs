@@ -29,12 +29,8 @@ use crate::schema::SchemaRef;
 /// be evaluated.
 type MetadataFilterResult = Result<BooleanArray, ArrowError>;
 
-/// Trait representing a data skipping predicate, which can convert a record batch of stats into a
-/// data skipping filter result.
-// TODO: This whole trait hierarchy should really just be a bunch of closures, but it's ~impossible
-// to specify correct lifetimes when a closure outlives the state it captures. You can use move ||
-// syntax to make it compile, but the resulting closure is FnOnce because the compiler (incorrectly)
-// assumes that the closure taking ownership means that invoking it consumes the captured state.
+/// Trait representing a data skipping predicate expression tree, which can be invoked to convert a
+/// record batch of stats into a data skipping filter result.
 trait FnMetadataFilter {
     fn invoke(&self, stats: &RecordBatch) -> MetadataFilterResult;
 }
@@ -261,7 +257,12 @@ pub(crate) struct DataSkippingFilter {
 }
 
 impl DataSkippingFilter {
-    pub(crate) fn try_new(
+    /// Creates a new data skipping filter. Returns None if there is no predicate, or the predicate
+    /// is ineligible for data skipping.
+    ///
+    /// NOTE: None is equivalent to a trivial filter that always returns TRUE (= keeps all files),
+    /// but using an Option lets the engine easily avoid the overhead of applying trivial filters.
+    pub(crate) fn new(
         table_schema: &SchemaRef,
         predicate: &Option<Expression>,
     ) -> Option<DataSkippingFilter> {
