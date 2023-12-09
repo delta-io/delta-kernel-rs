@@ -1,14 +1,14 @@
 use std::collections::HashSet;
 
+use arrow_array::RecordBatch;
+use either::Either;
+use tracing::debug;
+
 use super::data_skipping::DataSkippingFilter;
 use crate::actions::{parse_actions, Action, ActionType, Add};
 use crate::expressions::Expression;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, TableClient};
-
-use arrow_array::RecordBatch;
-use either::Either;
-use tracing::debug;
 
 struct LogReplayScanner {
     filter: Option<DataSkippingFilter>,

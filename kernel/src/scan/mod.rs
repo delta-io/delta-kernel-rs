@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use arrow_array::{BooleanArray, RecordBatch};
-use arrow_schema::{Field as ArrowField, Fields, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use arrow_select::filter::filter_record_batch;
 use itertools::Itertools;
@@ -9,7 +8,7 @@ use itertools::Itertools;
 use self::file_stream::log_replay_iter;
 use crate::actions::ActionType;
 use crate::expressions::Expression;
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::Snapshot;
 use crate::{Add, DeltaResult, FileMeta, TableClient};
 
@@ -99,6 +98,9 @@ impl std::fmt::Debug for Scan {
 impl Scan {
     /// Get a shred reference to the [`Schema`] of the scan.
     ///
+    /// This is the schema of the columns that will be returned by the scan,
+    /// and not the schema of the entire table.
+    ///
     /// [`Schema`]: crate::schema::Schema
     pub fn schema(&self) -> &SchemaRef {
         &self.read_schema
@@ -117,19 +119,16 @@ impl Scan {
         &self,
         table_client: &dyn TableClient,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
-        let action_schema = Arc::new(ArrowSchema {
-            fields: Fields::from_iter([
-                // TODO as these conversions should be infallible, we could use `unwrap` here
-                // and avoid wrapping the result in a `DeltaResult`.
-                ArrowField::try_from(ActionType::Add)?,
-                ArrowField::try_from(ActionType::Remove)?,
-            ]),
-            metadata: Default::default(),
-        });
+        lazy_static::lazy_static! {
+            static ref ACTION_SCHEMA: SchemaRef = Arc::new(StructType::new(vec![
+                ActionType::Add.schema_field().clone(),
+                ActionType::Remove.schema_field().clone(),
+            ]));
+        }
 
         let log_iter = self.snapshot.log_segment.replay(
             table_client,
-            action_schema,
+            ACTION_SCHEMA.clone(),
             self.predicate.clone(),
         )?;
 

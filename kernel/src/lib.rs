@@ -40,7 +40,6 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
-use arrow_schema::SchemaRef as ArrowSchemaRef;
 use bytes::Bytes;
 use url::Url;
 
@@ -147,7 +146,7 @@ pub trait JsonHandler {
     fn parse_json(
         &self,
         json_strings: StringArray,
-        output_schema: ArrowSchemaRef,
+        output_schema: SchemaRef,
     ) -> DeltaResult<RecordBatch>;
 
     /// Read and parse the JSON format file at given locations and return

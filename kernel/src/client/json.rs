@@ -48,8 +48,9 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     fn parse_json(
         &self,
         json_strings: StringArray,
-        output_schema: ArrowSchemaRef,
+        output_schema: SchemaRef,
     ) -> DeltaResult<RecordBatch> {
+        let output_schema: ArrowSchemaRef = Arc::new(output_schema.as_ref().try_into()?);
         // TODO concatenating to a single string is probably not needed if we use the
         // lower level RawDecoder APIs
         let data = json_strings
@@ -202,7 +203,7 @@ mod tests {
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
         ]
         .into();
-        let output_schema = Arc::new(ArrowSchema::try_from(log_schema()).unwrap());
+        let output_schema = Arc::new(log_schema().clone());
 
         let batch = handler.parse_json(json_strings, output_schema).unwrap();
         assert_eq!(batch.num_rows(), 4);

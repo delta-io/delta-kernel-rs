@@ -521,7 +521,6 @@ fn struct_array_to_map(arr: &StructArray) -> DeltaResult<HashMap<String, Option<
 mod tests {
     use std::sync::Arc;
 
-    use arrow_schema::Schema as ArrowSchema;
     use object_store::local::LocalFileSystem;
 
     use super::*;
@@ -542,7 +541,7 @@ mod tests {
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
         ]
         .into();
-        let output_schema = Arc::new(ArrowSchema::try_from(log_schema()).unwrap());
+        let output_schema = Arc::new(log_schema().clone());
         handler.parse_json(json_strings, output_schema).unwrap()
     }
 
@@ -607,7 +606,7 @@ mod tests {
             r#"{"add":{"path":"c1=6/c2=a/part-00011-10619b10-b691-4fd0-acc4-2a9608499d7c.c000.snappy.parquet","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998135,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":4},\"maxValues\":{\"c3\":4},\"nullCount\":{\"c3\":0}}"}}"#,
         ]
         .into();
-        let output_schema = Arc::new(ArrowSchema::try_from(log_schema()).unwrap());
+        let output_schema = Arc::new(log_schema().clone());
         let batch = handler.parse_json(json_strings, output_schema).unwrap();
 
         let actions = parse_action(&batch, &ActionType::Add)
