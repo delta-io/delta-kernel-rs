@@ -3,222 +3,123 @@ use std::io::BufReader;
 use std::sync::Arc;
 
 use arrow_arith::boolean::is_null;
-use arrow_array::{
-    array::PrimitiveArray,
-    new_null_array,
-    types::{Int32Type, Int64Type},
-    Array, BooleanArray, Datum, RecordBatch, StringArray, StructArray,
-};
+use arrow_array::{new_null_array, Array, BooleanArray, RecordBatch, StringArray, StructArray};
 use arrow_json::ReaderBuilder;
-use arrow_ord::cmp::{gt, gt_eq, lt, lt_eq};
-use arrow_schema::{ArrowError, DataType, Field, Schema};
+use arrow_schema::Schema as ArrowSchema;
 use arrow_select::concat::concat_batches;
 use arrow_select::filter::filter_record_batch;
 use arrow_select::nullif::nullif;
 use tracing::debug;
 
-use crate::expressions::scalars::Scalar;
-use crate::expressions::BinaryOperator;
-
 use crate::error::{DeltaResult, Error};
-use crate::scan::Expression;
-use crate::schema::SchemaRef;
+use crate::expressions::{BinaryOperator, Expression, VariadicOperator};
+use crate::schema::{SchemaRef, StructField, StructType};
+use crate::{ExpressionEvaluator, TableClient};
 
-/// Data skipping predicates produce boolean arrays as output, where true means the predicate was
-/// satisfied, false means the predicate was not satisfied, and null means the predicate could not
-/// be evaluated.
-type MetadataFilterResult = Result<BooleanArray, ArrowError>;
+fn rewite(expr: &Expression) -> Option<Expression> {
+    use BinaryOperator::*;
+    use Expression::*;
+    use VariadicOperator::*;
 
-/// Trait representing a data skipping predicate expression tree, which can be invoked to convert a
-/// record batch of stats into a data skipping filter result.
-trait FnMetadataFilter {
-    fn invoke(&self, stats: &RecordBatch) -> MetadataFilterResult;
-}
-
-/// Helper method for boxed data skipping predicates.
-impl FnMetadataFilter for Box<dyn FnMetadataFilter> {
-    fn invoke(&self, stats: &RecordBatch) -> MetadataFilterResult {
-        self.as_ref().invoke(stats)
-    }
-}
-
-/// Every data skipping predicate has at least one leaf node that references a stats column.
-struct FnMetadataFilterColumn {
-    stat_name: &'static str,
-    nested_names: Vec<String>,
-    col_name: String,
-}
-
-impl FnMetadataFilterColumn {
-    /// Helper method for drilling down into a (possibly nested) stats column.
-    /// A column such as minValues.a.b.c would be expressed as minValues [a, b] c.
-    fn column_as_struct<'a>(
-        name: &str,
-        column: &Option<&'a Arc<dyn Array>>,
-    ) -> Result<&'a StructArray, ArrowError> {
-        column
-            .ok_or(ArrowError::SchemaError(format!("No such column: {}", name)))?
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .ok_or(ArrowError::SchemaError(format!("{} is not a struct", name)))
-    }
-
-    /// Given a record batch of stats, extracts the requested stats column.
-    fn invoke<'a>(&self, stats: &'a RecordBatch) -> Result<&'a Arc<dyn Array>, ArrowError> {
-        let mut col = Self::column_as_struct(self.stat_name, &stats.column_by_name(self.stat_name));
-        for col_name in &self.nested_names {
-            col = Self::column_as_struct(col_name, &col?.column_by_name(col_name));
-        }
-        col?.column_by_name(&self.col_name)
-            .ok_or(ArrowError::SchemaError(format!(
-                "No such column: {}",
-                self.col_name
-            )))
-    }
-}
-
-/// <left> AND <right>
-struct FnMetadataFilterAnd {
-    left: Box<dyn FnMetadataFilter>,
-    right: Box<dyn FnMetadataFilter>,
-}
-
-impl FnMetadataFilter for FnMetadataFilterAnd {
-    fn invoke(&self, stats: &RecordBatch) -> MetadataFilterResult {
-        arrow_arith::boolean::and(&self.left.invoke(stats)?, &self.right.invoke(stats)?)
-    }
-}
-
-/// <left> OR <right>
-struct FnMetadataFilterOr {
-    left: Box<dyn FnMetadataFilter>,
-    right: Box<dyn FnMetadataFilter>,
-}
-
-impl FnMetadataFilter for FnMetadataFilterOr {
-    fn invoke(&self, stats: &RecordBatch) -> MetadataFilterResult {
-        arrow_arith::boolean::or(&self.left.invoke(stats)?, &self.right.invoke(stats)?)
-    }
-}
-
-/// <column> <op> <literal>, for open-ended comparisons such as < or >=.
-struct FnMetadataFilterComparison {
-    op: fn(&dyn Datum, &dyn Datum) -> MetadataFilterResult,
-    column: FnMetadataFilterColumn,
-    literal: Box<dyn Datum>,
-}
-
-impl FnMetadataFilter for FnMetadataFilterComparison {
-    fn invoke(&self, stats: &RecordBatch) -> MetadataFilterResult {
-        (self.op)(&self.column.invoke(stats)?, self.literal.as_ref())
-    }
-}
-
-/// <column> = <literal> -- equality is a special case, requiring two column comparisons instead of one.
-struct FnMetadataFilterComparisonEq {
-    min_column: FnMetadataFilterColumn,
-    max_column: FnMetadataFilterColumn,
-    literal: Box<dyn Datum>,
-}
-
-impl FnMetadataFilter for FnMetadataFilterComparisonEq {
-    fn invoke(&self, stats: &RecordBatch) -> MetadataFilterResult {
-        arrow_arith::boolean::and(
-            &lt_eq(&self.min_column.invoke(stats)?, self.literal.as_ref())?,
-            &lt_eq(self.literal.as_ref(), &self.max_column.invoke(stats)?)?,
-        )
-    }
-}
-
-trait ProvidesMetadataFilter {
-    fn extract_metadata_filters(&self) -> Option<Box<dyn FnMetadataFilter>>;
-    fn extract_stats_column(&self, stat_name: &'static str) -> Option<FnMetadataFilterColumn>;
-    fn extract_literal(&self) -> Option<Box<dyn Datum>>;
-}
-
-impl ProvidesMetadataFilter for Expression {
-    fn extract_stats_column(&self, stat_name: &'static str) -> Option<FnMetadataFilterColumn> {
-        match self {
-            // TODO: split names like a.b.c into [a, b], c below
-            Expression::Column(name) => {
-                let f = FnMetadataFilterColumn {
-                    stat_name,
-                    nested_names: vec![], // TODO: Actually handle nested columns...
-                    col_name: name.to_string(),
-                };
-                Some(f)
-            }
-            _ => None,
-        }
-    }
-
-    fn extract_literal(&self) -> Option<Box<dyn Datum>> {
-        match self {
-            Expression::Literal(Scalar::Long(v)) => {
-                Some(Box::new(PrimitiveArray::<Int64Type>::new_scalar(*v)))
-            }
-            Expression::Literal(Scalar::Integer(v)) => {
-                Some(Box::new(PrimitiveArray::<Int32Type>::new_scalar(*v)))
-            }
-            _ => None,
-        }
-    }
-
-    /// Converts this expression to Some data skipping predicate over the given record batch, if the
-    /// expression is eligible for data skipping. Otherwise None. The predicate is callable,
-    /// converting a record batch to a boolean array.
-    fn extract_metadata_filters(&self) -> Option<Box<dyn FnMetadataFilter>> {
-        match self {
-            // col <compare> value
-            Expression::BinaryOperation { op, left, right } => {
-                let min_column = left.extract_stats_column("minValues");
-                let max_column = left.extract_stats_column("maxValues");
-                let literal = right.extract_literal();
-
-                type Operation = fn(&dyn Datum, &dyn Datum) -> MetadataFilterResult;
-                let (op, column): (Operation, _) = match op {
-                    BinaryOperator::Equal => {
-                        // Equality filter compares the literal against both min and max stat columns
-                        debug!("Got an equality filter");
-                        return min_column.zip(max_column).zip(literal).map(
-                            |((min_column, max_column), literal)| -> Box<dyn FnMetadataFilter> {
-                                let f = FnMetadataFilterComparisonEq {
-                                    min_column,
-                                    max_column,
-                                    literal,
-                                };
-                                Box::new(f)
+    match expr {
+        BinaryOperation { op, left, right } => match op {
+            LessThan | LessThanOrEqual => match (left.as_ref(), right.as_ref()) {
+                // column <lt | lt_eq> value
+                (Column(col), Literal(value)) => Some(BinaryOperation {
+                    op: op.clone(),
+                    left: Box::new(Column(format!("minValues.{}", col))),
+                    right: Box::new(Literal(value.clone())),
+                }),
+                // value <lt | lt_eq> column
+                (Literal(value), Column(col)) => Some(BinaryOperation {
+                    op: match op {
+                        LessThan => GreaterThan,
+                        LessThanOrEqual => GreaterThanOrEqual,
+                        _ => unreachable!(),
+                    },
+                    left: Box::new(Column(format!("maxValues.{}", col))),
+                    right: Box::new(Literal(value.clone())),
+                }),
+                _ => None,
+            },
+            GreaterThan | GreaterThanOrEqual => match (left.as_ref(), right.as_ref()) {
+                // column <gt | gt_eq> value
+                (Column(col), Literal(value)) => Some(BinaryOperation {
+                    op: op.clone(),
+                    left: Box::new(Column(format!("maxValues.{}", col))),
+                    right: Box::new(Literal(value.clone())),
+                }),
+                // value <gt | gt_eq> column
+                (Literal(value), Column(col)) => Some(BinaryOperation {
+                    op: match op {
+                        GreaterThan => LessThan,
+                        GreaterThanOrEqual => LessThanOrEqual,
+                        _ => unreachable!(),
+                    },
+                    left: Box::new(Column(format!("minValues.{}", col))),
+                    right: Box::new(Literal(value.clone())),
+                }),
+                _ => None,
+            },
+            // column == value
+            // column == value is equivalent to min values being less than or equal to value
+            // and max values being greater than or equal to value
+            Equal => match (left.as_ref(), right.as_ref()) {
+                (Column(col), Literal(value)) | (Literal(value), Column(col)) => {
+                    Some(VariadicOperation {
+                        op: And,
+                        exprs: vec![
+                            BinaryOperation {
+                                op: GreaterThanOrEqual,
+                                left: Box::new(Column(format!("maxValues.{}", col))),
+                                right: Box::new(Literal(value.clone())),
                             },
-                        );
-                    }
-
-                    BinaryOperator::LessThan => (lt, min_column),
-                    BinaryOperator::LessThanOrEqual => (lt_eq, min_column),
-                    BinaryOperator::GreaterThan => (gt, max_column),
-                    BinaryOperator::GreaterThanOrEqual => (gt_eq, max_column),
-
-                    _ => return None, // Incompatible operator
-                };
-
-                column
-                    .zip(literal)
-                    .map(|(column, literal)| -> Box<dyn FnMetadataFilter> {
-                        let f = FnMetadataFilterComparison {
-                            op,
-                            column,
-                            literal,
-                        };
-                        Box::new(f)
+                            BinaryOperation {
+                                op: LessThanOrEqual,
+                                left: Box::new(Column(format!("minValues.{}", col))),
+                                right: Box::new(Literal(value.clone())),
+                            },
+                        ],
                     })
-            }
+                }
+                _ => None,
+            },
+            // column != value
+            // column != value is equivalent to min values being strictly greater than value
+            // or max values being strictly less than value
+            NotEqual => match (left.as_ref(), right.as_ref()) {
+                (Column(col), Literal(value)) | (Literal(value), Column(col)) => {
+                    Some(VariadicOperation {
+                        op: Or,
+                        exprs: vec![
+                            BinaryOperation {
+                                op: LessThan,
+                                left: Box::new(Column(format!("maxValues.{}", col))),
+                                right: Box::new(Literal(value.clone())),
+                            },
+                            BinaryOperation {
+                                op: GreaterThan,
+                                left: Box::new(Column(format!("minValues.{}", col))),
+                                right: Box::new(Literal(value.clone())),
+                            },
+                        ],
+                    })
+                }
+                _ => None,
+            },
             _ => None,
-        }
+        },
+        VariadicOperation { op, exprs } => Some(VariadicOperation {
+            op: op.clone(),
+            exprs: exprs.iter().filter_map(rewite).collect::<Vec<_>>(),
+        }),
+        _ => None,
     }
 }
 
 pub(crate) struct DataSkippingFilter {
-    stats_schema: Arc<Schema>,
-    predicate: Box<dyn FnMetadataFilter>,
+    stats_schema: SchemaRef,
+    evaluator: Arc<dyn ExpressionEvaluator>,
 }
 
 impl DataSkippingFilter {
@@ -227,14 +128,16 @@ impl DataSkippingFilter {
     ///
     /// NOTE: None is equivalent to a trivial filter that always returns TRUE (= keeps all files),
     /// but using an Option lets the engine easily avoid the overhead of applying trivial filters.
-    pub(crate) fn new(
+    pub(crate) fn new<JRC: Send, PRC: Send>(
+        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
         table_schema: &SchemaRef,
         predicate: &Option<Expression>,
-    ) -> Option<DataSkippingFilter> {
+    ) -> Option<Self> {
         let predicate = match predicate {
             Some(predicate) => predicate,
             None => return None,
         };
+
         debug!("Creating a data skipping filter for {}", &predicate);
         let field_names: HashSet<_> = predicate.references();
 
@@ -244,29 +147,27 @@ impl DataSkippingFilter {
             .fields
             .iter()
             .filter(|field| field_names.contains(&field.name.as_str()))
-            .filter_map(|field| Field::try_from(field).ok())
+            .cloned()
             .collect();
         if data_fields.is_empty() {
             // The predicate didn't reference any eligible stats columns, so skip it.
             return None;
         }
 
-        let stats_schema = Schema::new(vec![
-            Field::new(
-                "minValues",
-                DataType::Struct(data_fields.clone().into()),
-                true,
-            ),
-            Field::new("maxValues", DataType::Struct(data_fields.into()), true),
-        ]);
-        let stats_schema = stats_schema.into();
+        let stats_schema = Arc::new(StructType::new(vec![
+            StructField::new("minValues", StructType::new(data_fields.clone()), true),
+            StructField::new("maxValues", StructType::new(data_fields.clone()), true),
+        ]));
 
-        predicate
-            .extract_metadata_filters()
-            .map(|predicate| DataSkippingFilter {
-                stats_schema,
-                predicate,
-            })
+        let skipping_predicate = rewite(predicate)?;
+        let evaluator = table_client
+            .get_expression_handler()
+            .get_evaluator(stats_schema.clone(), skipping_predicate);
+
+        Some(Self {
+            stats_schema,
+            evaluator,
+        })
     }
 
     pub(crate) fn apply(&self, actions: &RecordBatch) -> DeltaResult<RecordBatch> {
@@ -287,11 +188,13 @@ impl DataSkippingFilter {
                 "Expected type 'StringArray'.".into(),
             ))?;
 
+        let stats_schema = Arc::new(self.stats_schema.as_ref().try_into()?);
+
         let parsed_stats = concat_batches(
-            &self.stats_schema,
+            &stats_schema,
             stats
                 .iter()
-                .map(|json_string| Self::hack_parse(&self.stats_schema, json_string))
+                .map(|json_string| Self::hack_parse(&stats_schema, json_string))
                 .collect::<Result<Vec<_>, _>>()?
                 .iter(),
         )?;
@@ -309,8 +212,16 @@ impl DataSkippingFilter {
         //    keep) and false (= skip) values.
         //
         // 4. The filter discards every file whose selection vector entry is false.
-        let skipping_vector = self.predicate.invoke(&parsed_stats)?;
-        let skipping_vector = &is_null(&nullif(&skipping_vector, &skipping_vector)?)?;
+        let skipping_vector = self.evaluator.evaluate(&parsed_stats)?;
+        let skipping_vector = skipping_vector
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or(Error::UnexpectedColumnType(
+                "Expected type 'BooleanArray'.".into(),
+            ))?;
+
+        // let skipping_vector = self.predicate.invoke(&parsed_stats)?;
+        let skipping_vector = &is_null(&nullif(skipping_vector, skipping_vector)?)?;
 
         let before_count = actions.num_rows();
         let after = filter_record_batch(actions, skipping_vector)?;
@@ -322,7 +233,7 @@ impl DataSkippingFilter {
     }
 
     fn hack_parse(
-        stats_schema: &Arc<Schema>,
+        stats_schema: &Arc<ArrowSchema>,
         json_string: Option<&str>,
     ) -> DeltaResult<RecordBatch> {
         match json_string {
@@ -341,6 +252,162 @@ impl DataSkippingFilter {
                     .map(|field| new_null_array(field.data_type(), 1))
                     .collect(),
             )?),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expressions::Scalar;
+
+    #[test]
+    fn test_rewrite_basic_comparison() {
+        let column = Expression::Column("a".to_string());
+        let lit_int = Expression::Literal(Scalar::Integer(1));
+
+        let cases = [
+            (
+                column.clone().lt(lit_int.clone()),
+                Expression::BinaryOperation {
+                    op: BinaryOperator::LessThan,
+                    left: Box::new(Expression::Column("minValues.a".to_string())),
+                    right: Box::new(lit_int.clone()),
+                },
+            ),
+            (
+                lit_int.clone().lt(column.clone()),
+                Expression::BinaryOperation {
+                    op: BinaryOperator::GreaterThan,
+                    left: Box::new(Expression::Column("maxValues.a".to_string())),
+                    right: Box::new(lit_int.clone()),
+                },
+            ),
+            (
+                column.clone().gt(lit_int.clone()),
+                Expression::BinaryOperation {
+                    op: BinaryOperator::GreaterThan,
+                    left: Box::new(Expression::Column("maxValues.a".to_string())),
+                    right: Box::new(lit_int.clone()),
+                },
+            ),
+            (
+                lit_int.clone().gt(column.clone()),
+                Expression::BinaryOperation {
+                    op: BinaryOperator::LessThan,
+                    left: Box::new(Expression::Column("minValues.a".to_string())),
+                    right: Box::new(lit_int.clone()),
+                },
+            ),
+            (
+                column.clone().lt_eq(lit_int.clone()),
+                Expression::BinaryOperation {
+                    op: BinaryOperator::LessThanOrEqual,
+                    left: Box::new(Expression::Column("minValues.a".to_string())),
+                    right: Box::new(lit_int.clone()),
+                },
+            ),
+            (
+                lit_int.clone().lt_eq(column.clone()),
+                Expression::BinaryOperation {
+                    op: BinaryOperator::GreaterThanOrEqual,
+                    left: Box::new(Expression::Column("maxValues.a".to_string())),
+                    right: Box::new(lit_int.clone()),
+                },
+            ),
+            (
+                column.clone().gt_eq(lit_int.clone()),
+                Expression::BinaryOperation {
+                    op: BinaryOperator::GreaterThanOrEqual,
+                    left: Box::new(Expression::Column("maxValues.a".to_string())),
+                    right: Box::new(lit_int.clone()),
+                },
+            ),
+            (
+                lit_int.clone().gt_eq(column.clone()),
+                Expression::BinaryOperation {
+                    op: BinaryOperator::LessThanOrEqual,
+                    left: Box::new(Expression::Column("minValues.a".to_string())),
+                    right: Box::new(lit_int.clone()),
+                },
+            ),
+            (
+                column.clone().eq(lit_int.clone()),
+                Expression::VariadicOperation {
+                    op: VariadicOperator::And,
+                    exprs: vec![
+                        Expression::BinaryOperation {
+                            op: BinaryOperator::GreaterThanOrEqual,
+                            left: Box::new(Expression::Column("maxValues.a".to_string())),
+                            right: Box::new(lit_int.clone()),
+                        },
+                        Expression::BinaryOperation {
+                            op: BinaryOperator::LessThanOrEqual,
+                            left: Box::new(Expression::Column("minValues.a".to_string())),
+                            right: Box::new(lit_int.clone()),
+                        },
+                    ],
+                },
+            ),
+            (
+                lit_int.clone().eq(column.clone()),
+                Expression::VariadicOperation {
+                    op: VariadicOperator::And,
+                    exprs: vec![
+                        Expression::BinaryOperation {
+                            op: BinaryOperator::GreaterThanOrEqual,
+                            left: Box::new(Expression::Column("maxValues.a".to_string())),
+                            right: Box::new(lit_int.clone()),
+                        },
+                        Expression::BinaryOperation {
+                            op: BinaryOperator::LessThanOrEqual,
+                            left: Box::new(Expression::Column("minValues.a".to_string())),
+                            right: Box::new(lit_int.clone()),
+                        },
+                    ],
+                },
+            ),
+            (
+                column.clone().ne(lit_int.clone()),
+                Expression::VariadicOperation {
+                    op: VariadicOperator::Or,
+                    exprs: vec![
+                        Expression::BinaryOperation {
+                            op: BinaryOperator::LessThan,
+                            left: Box::new(Expression::Column("maxValues.a".to_string())),
+                            right: Box::new(lit_int.clone()),
+                        },
+                        Expression::BinaryOperation {
+                            op: BinaryOperator::GreaterThan,
+                            left: Box::new(Expression::Column("minValues.a".to_string())),
+                            right: Box::new(lit_int.clone()),
+                        },
+                    ],
+                },
+            ),
+            (
+                lit_int.clone().ne(column.clone()),
+                Expression::VariadicOperation {
+                    op: VariadicOperator::Or,
+                    exprs: vec![
+                        Expression::BinaryOperation {
+                            op: BinaryOperator::LessThan,
+                            left: Box::new(Expression::Column("maxValues.a".to_string())),
+                            right: Box::new(lit_int.clone()),
+                        },
+                        Expression::BinaryOperation {
+                            op: BinaryOperator::GreaterThan,
+                            left: Box::new(Expression::Column("minValues.a".to_string())),
+                            right: Box::new(lit_int.clone()),
+                        },
+                    ],
+                },
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let rewritten = rewite(&input).unwrap();
+            assert_eq!(rewritten, expected)
         }
     }
 }
