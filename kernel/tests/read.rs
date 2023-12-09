@@ -1,8 +1,10 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int32Array, StringArray};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use arrow_select::concat::concat_batches;
 use deltakernel::client::DefaultTableClient;
 use deltakernel::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::expressions::{BinaryOperator, Expression};
@@ -347,5 +349,76 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         }
         assert_eq!(expected_files, files_scanned);
     }
+    Ok(())
+}
+
+macro_rules! assert_batches_sorted_eq {
+    ($EXPECTED_LINES: expr, $CHUNKS: expr) => {
+        let mut expected_lines: Vec<String> = $EXPECTED_LINES.iter().map(|&s| s.into()).collect();
+
+        // sort except for header + footer
+        let num_lines = expected_lines.len();
+        if num_lines > 3 {
+            expected_lines.as_mut_slice()[2..num_lines - 1].sort_unstable()
+        }
+
+        let formatted = arrow::util::pretty::pretty_format_batches($CHUNKS)
+            .unwrap()
+            .to_string();
+        // fix for windows: \r\n -->
+
+        let mut actual_lines: Vec<&str> = formatted.trim().lines().collect();
+
+        // sort except for header + footer
+        let num_lines = actual_lines.len();
+        if num_lines > 3 {
+            actual_lines.as_mut_slice()[2..num_lines - 1].sort_unstable()
+        }
+
+        assert_eq!(
+            expected_lines, actual_lines,
+            "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
+            expected_lines, actual_lines
+        );
+    };
+}
+
+fn read_table_data(path: &str, expected: Vec<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::fs::canonicalize(PathBuf::from(path))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let table_client = DefaultTableClient::try_new(
+        &url,
+        std::iter::empty::<(&str, &str)>(),
+        Arc::new(TokioBackgroundExecutor::new()),
+    )?;
+
+    let table = Table::new(url);
+    let snapshot = table.snapshot(&table_client, None)?;
+    let scan = ScanBuilder::new(snapshot).build();
+
+    let batches = scan.execute(&table_client)?;
+    let schema = batches[0].schema();
+    let batch = concat_batches(&schema, &batches)?;
+
+    assert_batches_sorted_eq!(&expected, &[batch]);
+    Ok(())
+}
+
+#[test]
+fn data() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+--------+--------+---------+",
+        "| letter | number | a_float |",
+        "+--------+--------+---------+",
+        "|        | 6      | 6.6     |",
+        "| a      | 1      | 1.1     |",
+        "| a      | 4      | 4.4     |",
+        "| b      | 2      | 2.2     |",
+        "| c      | 3      | 3.3     |",
+        "| e      | 5      | 5.5     |",
+        "+--------+--------+---------+",
+    ];
+    read_table_data("./tests/data/basic_partitioned", expected)?;
+
     Ok(())
 }

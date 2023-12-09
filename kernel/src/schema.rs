@@ -137,6 +137,10 @@ impl StructType {
         }
     }
 
+    pub fn field(&self, name: impl AsRef<str>) -> Option<&StructField> {
+        self.fields.iter().find(|f| f.name == name.as_ref())
+    }
+
     pub fn fields(&self) -> Vec<&StructField> {
         self.fields.iter().collect()
     }
@@ -246,18 +250,18 @@ pub enum PrimitiveType {
         deserialize_with = "deserialize_decimal",
         untagged
     )]
-    Decimal(i32, i32),
+    Decimal(u8, i8),
 }
 
 fn serialize_decimal<S: serde::Serializer>(
-    precision: &i32,
-    scale: &i32,
+    precision: &u8,
+    scale: &i8,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(&format!("decimal({},{})", precision, scale))
 }
 
-fn deserialize_decimal<'de, D>(deserializer: D) -> Result<(i32, i32), D::Error>
+fn deserialize_decimal<'de, D>(deserializer: D) -> Result<(u8, i8), D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -272,13 +276,13 @@ where
     let mut parts = str_value[8..str_value.len() - 1].split(',');
     let precision = parts
         .next()
-        .and_then(|part| part.trim().parse::<i32>().ok())
+        .and_then(|part| part.trim().parse::<u8>().ok())
         .ok_or_else(|| {
             serde::de::Error::custom(format!("Invalid precision in decimal: {}", str_value))
         })?;
     let scale = parts
         .next()
-        .and_then(|part| part.trim().parse::<i32>().ok())
+        .and_then(|part| part.trim().parse::<i8>().ok())
         .ok_or_else(|| {
             serde::de::Error::custom(format!("Invalid scale in decimal: {}", str_value))
         })?;
@@ -353,8 +357,8 @@ impl DataType {
     pub const DATE: Self = DataType::Primitive(PrimitiveType::Date);
     pub const TIMESTAMP: Self = DataType::Primitive(PrimitiveType::Timestamp);
 
-    pub fn decimal(precision: usize, scale: usize) -> Self {
-        DataType::Primitive(PrimitiveType::Decimal(precision as i32, scale as i32))
+    pub fn decimal(precision: u8, scale: i8) -> Self {
+        DataType::Primitive(PrimitiveType::Decimal(precision, scale))
     }
 }
 

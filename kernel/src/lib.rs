@@ -43,7 +43,7 @@ use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use bytes::Bytes;
 use url::Url;
 
-use self::schema::SchemaRef;
+use self::schema::{DataType, SchemaRef};
 
 pub mod actions;
 pub mod error;
@@ -115,6 +115,7 @@ pub trait ExpressionHandler {
         &self,
         schema: SchemaRef,
         expression: Expression,
+        output_type: DataType,
     ) -> Arc<dyn ExpressionEvaluator>;
 }
 

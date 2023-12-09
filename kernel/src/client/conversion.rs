@@ -103,20 +103,10 @@ impl TryFrom<&DataType> for ArrowDataType {
                     PrimitiveType::Boolean => Ok(ArrowDataType::Boolean),
                     PrimitiveType::Binary => Ok(ArrowDataType::Binary),
                     PrimitiveType::Decimal(precision, scale) => {
-                        let precision = u8::try_from(*precision).map_err(|_| {
-                            ArrowError::SchemaError(format!(
-                                "Invalid precision for decimal: {}",
-                                precision
-                            ))
-                        })?;
-                        let scale = i8::try_from(*scale).map_err(|_| {
-                            ArrowError::SchemaError(format!("Invalid scale for decimal: {}", scale))
-                        })?;
-
-                        if precision <= 38 {
-                            Ok(ArrowDataType::Decimal128(precision, scale))
-                        } else if precision <= 76 {
-                            Ok(ArrowDataType::Decimal256(precision, scale))
+                        if precision <= &38 {
+                            Ok(ArrowDataType::Decimal128(*precision, *scale))
+                        } else if precision <= &76 {
+                            Ok(ArrowDataType::Decimal256(*precision, *scale))
                         } else {
                             Err(ArrowError::SchemaError(format!(
                                 "Precision too large to be represented in Arrow: {}",
@@ -226,12 +216,12 @@ impl TryFrom<&ArrowDataType> for DataType {
             ArrowDataType::Binary => Ok(DataType::Primitive(PrimitiveType::Binary)),
             ArrowDataType::FixedSizeBinary(_) => Ok(DataType::Primitive(PrimitiveType::Binary)),
             ArrowDataType::LargeBinary => Ok(DataType::Primitive(PrimitiveType::Binary)),
-            ArrowDataType::Decimal128(p, s) => Ok(DataType::Primitive(PrimitiveType::Decimal(
-                *p as i32, *s as i32,
-            ))),
-            ArrowDataType::Decimal256(p, s) => Ok(DataType::Primitive(PrimitiveType::Decimal(
-                *p as i32, *s as i32,
-            ))),
+            ArrowDataType::Decimal128(p, s) => {
+                Ok(DataType::Primitive(PrimitiveType::Decimal(*p, *s)))
+            }
+            ArrowDataType::Decimal256(p, s) => {
+                Ok(DataType::Primitive(PrimitiveType::Decimal(*p, *s)))
+            }
             ArrowDataType::Date32 => Ok(DataType::Primitive(PrimitiveType::Date)),
             ArrowDataType::Date64 => Ok(DataType::Primitive(PrimitiveType::Date)),
             ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => {

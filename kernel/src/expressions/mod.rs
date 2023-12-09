@@ -77,6 +77,8 @@ pub enum Expression {
     Literal(Scalar),
     /// A column reference by name.
     Column(String),
+    ///
+    Struct(Vec<Expression>),
     /// A binary operation.
     BinaryOperation {
         /// The operator.
@@ -113,6 +115,11 @@ impl Display for Expression {
         match self {
             Self::Literal(l) => write!(f, "{}", l),
             Self::Column(name) => write!(f, "Column({})", name),
+            Self::Struct(exprs) => write!(
+                f,
+                "Struct({})",
+                &exprs.iter().map(|e| format!("{e}")).join(", ")
+            ),
             Self::BinaryOperation { op, left, right } => write!(f, "{} {} {}", left, op, right),
             Self::UnaryOperation { op, expr } => match op {
                 UnaryOperator::Not => write!(f, "NOT {}", expr),
@@ -261,6 +268,9 @@ impl Expression {
             match expr {
                 Self::Literal(_) => {}
                 Self::Column { .. } => {}
+                Self::Struct(exprs) => {
+                    stack.extend(exprs.iter());
+                }
                 Self::BinaryOperation { left, right, .. } => {
                     stack.push(left);
                     stack.push(right);

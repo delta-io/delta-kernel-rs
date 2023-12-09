@@ -13,7 +13,7 @@ use tracing::debug;
 
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{BinaryOperator, Expression as Expr, VariadicOperator};
-use crate::schema::{SchemaRef, StructField, StructType};
+use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{EngineInterface, ExpressionEvaluator};
 
 /// Returns <op2> (if any) such that B <op2> A is equivalent to A <op> B.
@@ -141,9 +141,11 @@ impl DataSkippingFilter {
         ]));
 
         let skipping_predicate = as_data_skipping_predicate(predicate)?;
-        let evaluator = table_client
-            .get_expression_handler()
-            .get_evaluator(stats_schema.clone(), skipping_predicate);
+        let evaluator = table_client.get_expression_handler().get_evaluator(
+            stats_schema.clone(),
+            skipping_predicate,
+            DataType::BOOLEAN,
+        );
 
         Some(Self {
             stats_schema,
