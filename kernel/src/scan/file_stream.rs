@@ -46,7 +46,7 @@ impl LogReplayScanner {
             actions
         };
 
-        let required_action_types = if is_log_batch {
+        let schema_to_use = if is_log_batch {
             vec![ActionType::Remove, ActionType::Add]
         } else {
             vec![ActionType::Add]
@@ -64,12 +64,16 @@ impl LogReplayScanner {
                 {
                     debug!("Found file: {}", &add.path);
                     if is_log_batch {
+                        // Remember file actions from this batch so we can ignore duplicates 
+                        // as we process batches from older commit and/or checkpoint files. We
+                        // don't need to track checkpoint batches because they are already the
+                        // oldest actions and can never replace anything.
                         self.seen.insert((add.path.clone(), add.dv_unique_id()));
                     }
                     Some(add)
                 }
                 Action::Remove(remove) => {
-                    // Remove actions are only parsed in log batches, so no need to check here.
+                    // Remove actions always come from log batches, so no need to check here.
                     self.seen
                         .insert((remove.path.clone(), remove.dv_unique_id()));
                     None
@@ -83,7 +87,7 @@ impl LogReplayScanner {
 }
 
 /// Given an iterator of record batch, bool tuples and a predicate, returns an iterator of [Add]s.
-/// THe boolean flag indicates whether the record batch is a log or checkpoint batch.
+/// The boolean flag indicates whether the record batch is a log or checkpoint batch.
 pub fn log_replay_iter(
     action_iter: impl Iterator<Item = DeltaResult<(RecordBatch, bool)>>,
     table_schema: &SchemaRef,
