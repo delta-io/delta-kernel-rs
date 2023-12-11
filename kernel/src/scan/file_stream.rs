@@ -47,12 +47,14 @@ impl LogReplayScanner {
         };
 
         let schema_to_use = if is_log_batch {
-            vec![ActionType::Remove, ActionType::Add]
+            vec![ActionType::Add, ActionType::Remove]
         } else {
+            // All checkpoint actions are already reconciled and Remove actions in checkpoint files
+            // only serve as tombstones for vacuum jobs. So no need to load them here.
             vec![ActionType::Add]
         };
 
-        let adds: Vec<Add> = parse_actions(actions, &required_action_types)?
+        let adds: Vec<Add> = parse_actions(actions, &schema_to_use)?
             .filter_map(|action| match action {
                 Action::Add(add)
                     // Note: each (add.path + add.dv_unique_id()) pair has a 
@@ -64,7 +66,7 @@ impl LogReplayScanner {
                 {
                     debug!("Found file: {}", &add.path);
                     if is_log_batch {
-                        // Remember file actions from this batch so we can ignore duplicates 
+                        // Remember file actions from this batch so we can ignore duplicates
                         // as we process batches from older commit and/or checkpoint files. We
                         // don't need to track checkpoint batches because they are already the
                         // oldest actions and can never replace anything.

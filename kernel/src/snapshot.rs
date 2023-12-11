@@ -196,7 +196,7 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
             checkpoint_files,
         };
 
-        Ok(Arc::new(Self::new_with_log_segment(
+        Ok(Arc::new(Self::new_from_log_segment(
             table_root,
             table_client,
             log_segment,
@@ -205,7 +205,7 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
     }
 
     /// Create a new [`Snapshot`] instance.
-    pub(crate) fn new_with_log_segment(
+    pub(crate) fn new_from_log_segment(
         location: Url,
         client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
         log_segment: LogSegment,
