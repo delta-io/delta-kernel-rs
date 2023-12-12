@@ -16,7 +16,7 @@ use arrow_schema::ArrowError;
 
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{scalars::Scalar, Expression};
-use crate::expressions::{BinaryOperator, UnaryOperator};
+use crate::expressions::{BinaryOperator, UnaryOperator, VariadicOperator};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::{ExpressionEvaluator, ExpressionHandler};
 
@@ -103,13 +103,7 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
                 }
             }
         }
-        BinaryOperation {
-            op:
-                op @ (Plus | Minus | Multiply | Divide | LessThan | LessThanOrEqual | GreaterThan
-                | GreaterThanOrEqual | Equal | NotEqual),
-            left,
-            right,
-        } => {
+        BinaryOperation { op, left, right } => {
             let left_arr = evaluate_expression(left.as_ref(), batch)?;
             let right_arr = evaluate_expression(right.as_ref(), batch)?;
 
@@ -125,34 +119,43 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
                 GreaterThanOrEqual => |l, r| gt_eq(l, r).map(|arr| Arc::new(arr) as Arc<dyn Array>),
                 Equal => |l, r| eq(l, r).map(|arr| Arc::new(arr) as Arc<dyn Array>),
                 NotEqual => |l, r| neq(l, r).map(|arr| Arc::new(arr) as Arc<dyn Array>),
-                // NOTE: enumerating unreacherable cases exlicitly to avoid future bugs
-                And | Or => unreachable!(),
             };
 
             eval(&left_arr, &right_arr).map_err(|err| Error::GenericError {
                 source: Box::new(err),
             })
         }
-        BinaryOperation { op, left, right } => match op {
-            And | Or => {
-                let left_arr = evaluate_expression(left.as_ref(), batch)?;
-                let left_arr = downcast_bool(&left_arr)?;
-                let right_arr = evaluate_expression(right.as_ref(), batch)?;
-                let right_arr = downcast_bool(&right_arr)?;
-                let eval = match op {
-                    And => and,
-                    Or => or,
-                    _ => unreachable!(),
-                };
-                let result = eval(left_arr, right_arr).map_err(|err| Error::GenericError {
-                    source: Box::new(err),
-                })?;
-                Ok(Arc::new(result))
+        VariadicOperation { op, exprs } => {
+            let mut arrs = Vec::with_capacity(exprs.len());
+            for expr in exprs {
+                let arr = evaluate_expression(expr, batch)?;
+                arrs.push(arr);
             }
-            // NOTE: enumerating unreacherable cases exlicitly to avoid future bugs
-            Plus | Minus | Multiply | Divide | LessThan | LessThanOrEqual | GreaterThan
-            | GreaterThanOrEqual | Equal | NotEqual => unreachable!(),
-        },
+            let arrs = arrs
+                .iter()
+                .map(|arr| downcast_bool(arr))
+                .collect::<DeltaResult<Vec<_>>>()?;
+            let result = match arrs.len() {
+                0 => match op {
+                    VariadicOperator::And => BooleanArray::from(vec![true; batch.num_rows()]),
+                    VariadicOperator::Or => BooleanArray::from(vec![false; batch.num_rows()]),
+                },
+                1 => match op {
+                    VariadicOperator::And | VariadicOperator::Or => arrs[0].clone(),
+                },
+                // Safety: Since we evaluated the expression, we know that all the arrays are of the same length
+                // and we already downcasted to boolean. So we can safely unwrap.
+                _ => match op {
+                    VariadicOperator::And => arrs[1..]
+                        .iter()
+                        .fold(arrs[0].clone(), |acc, arr| and(&acc, arr).unwrap()),
+                    VariadicOperator::Or => arrs[1..]
+                        .iter()
+                        .fold(arrs[0].clone(), |acc, arr| or(&acc, arr).unwrap()),
+                },
+            };
+            Ok(Arc::new(result))
+        }
     }
 }
 
@@ -308,7 +311,7 @@ mod tests {
         let column_a = Expression::Column("a".to_string());
         let column_b = Expression::Column("b".to_string());
 
-        let expression = Box::new(column_a.clone().and(column_b.clone()));
+        let expression = Box::new(column_a.clone().and([column_b.clone()]));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![false, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
@@ -316,13 +319,13 @@ mod tests {
         let expression = Box::new(
             column_a
                 .clone()
-                .and(Expression::literal(Scalar::Boolean(true))),
+                .and([Expression::literal(Scalar::Boolean(true))]),
         );
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
-        let expression = Box::new(column_a.clone().or(column_b));
+        let expression = Box::new(column_a.clone().or([column_b]));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, true]));
         assert_eq!(results.as_ref(), expected.as_ref());
@@ -330,7 +333,7 @@ mod tests {
         let expression = Box::new(
             column_a
                 .clone()
-                .or(Expression::literal(Scalar::Boolean(false))),
+                .or([Expression::literal(Scalar::Boolean(false))]),
         );
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, false]));

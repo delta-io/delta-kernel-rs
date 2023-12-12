@@ -169,41 +169,6 @@ impl ProvidesMetadataFilter for Expression {
     /// converting a record batch to a boolean array.
     fn extract_metadata_filters(&self) -> Option<Box<dyn FnMetadataFilter>> {
         match self {
-            // <expr> AND <expr>
-            Expression::BinaryOperation {
-                op: BinaryOperator::And,
-                left,
-                right,
-            } => {
-                debug!("AND got left {} and right {}", left, right);
-                let left = left.extract_metadata_filters();
-                let right = right.extract_metadata_filters();
-                // If one leg of the AND is missing, it just degenerates to the other leg.
-                match (left, right) {
-                    (Some(left), Some(right)) => {
-                        let f = FnMetadataFilterAnd { left, right };
-                        Some(Box::new(f))
-                    }
-                    (left, right) => left.or(right),
-                }
-            }
-
-            // <expr> OR <expr>
-            Expression::BinaryOperation {
-                op: BinaryOperator::Or,
-                left,
-                right,
-            } => {
-                let left = left.extract_metadata_filters();
-                let right = right.extract_metadata_filters();
-                // OR is valid only if both legs are valid.
-                left.zip(right)
-                    .map(|(left, right)| -> Box<dyn FnMetadataFilter> {
-                        let f = FnMetadataFilterOr { left, right };
-                        Box::new(f)
-                    })
-            }
-
             // col <compare> value
             Expression::BinaryOperation { op, left, right } => {
                 let min_column = left.extract_stats_column("minValues");

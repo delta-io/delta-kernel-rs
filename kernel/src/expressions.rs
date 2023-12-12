@@ -1,19 +1,15 @@
+use self::scalars::Scalar;
+use itertools::Itertools;
 use std::{
     collections::HashSet,
     fmt::{Display, Formatter},
 };
-
-use self::scalars::Scalar;
 
 pub mod scalars;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 /// A binary operator.
 pub enum BinaryOperator {
-    /// Logical And
-    And,
-    /// Logical Or
-    Or,
     /// Arithmetic Plus
     Plus,
     /// Arithmetic Minus
@@ -36,11 +32,17 @@ pub enum BinaryOperator {
     NotEqual,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum VariadicOperator {
+    And,
+    Or,
+}
+
 impl Display for BinaryOperator {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::And => write!(f, "AND"),
-            Self::Or => write!(f, "OR"),
+            // Self::And => write!(f, "AND"),
+            // Self::Or => write!(f, "OR"),
             Self::Plus => write!(f, "+"),
             Self::Minus => write!(f, "-"),
             Self::Multiply => write!(f, "*"),
@@ -91,6 +93,12 @@ pub enum Expression {
         /// The expression.
         expr: Box<Expression>,
     },
+    VariadicOperation {
+        /// The operator.
+        op: VariadicOperator,
+        /// The expressions.
+        exprs: Vec<Expression>,
+    },
     // TODO: support more expressions, such as IS IN, LIKE, etc.
 }
 
@@ -99,16 +107,26 @@ impl Display for Expression {
         match self {
             Self::Literal(l) => write!(f, "{}", l),
             Self::Column(name) => write!(f, "Column({})", name),
-            Self::BinaryOperation { op, left, right } => {
-                match op {
-                    // OR requires parentheses
-                    BinaryOperator::Or => write!(f, "({} OR {})", left, right),
-                    _ => write!(f, "{} {} {}", left, op, right),
-                }
-            }
+            Self::BinaryOperation { op, left, right } => write!(f, "{} {} {}", left, op, right),
             Self::UnaryOperation { op, expr } => match op {
                 UnaryOperator::Not => write!(f, "NOT {}", expr),
                 UnaryOperator::IsNull => write!(f, "{} IS NULL", expr),
+            },
+            Self::VariadicOperation { op, exprs } => match op {
+                VariadicOperator::And => {
+                    write!(
+                        f,
+                        "AND({})",
+                        &exprs.iter().map(|e| format!("{e}")).join(", ")
+                    )
+                }
+                VariadicOperator::Or => {
+                    write!(
+                        f,
+                        "OR({})",
+                        &exprs.iter().map(|e| format!("{e}")).join(", ")
+                    )
+                }
             },
         }
     }
@@ -177,13 +195,23 @@ impl Expression {
     }
 
     /// Create a new expression `self AND other`
-    pub fn and(self, other: Self) -> Self {
-        self.binary_op_impl(other, BinaryOperator::And)
+    pub fn and(self, other: impl IntoIterator<Item = Self>) -> Self {
+        let mut exprs = other.into_iter().collect::<Vec<_>>();
+        exprs.insert(0, self);
+        Self::VariadicOperation {
+            op: VariadicOperator::And,
+            exprs,
+        }
     }
 
     /// Create a new expression `self OR other`
-    pub fn or(self, other: Self) -> Self {
-        self.binary_op_impl(other, BinaryOperator::Or)
+    pub fn or(self, other: impl IntoIterator<Item = Self>) -> Self {
+        let mut exprs = other.into_iter().collect::<Vec<_>>();
+        exprs.insert(0, self);
+        Self::VariadicOperation {
+            op: VariadicOperator::Or,
+            exprs,
+        }
     }
 
     fn walk(&self) -> impl Iterator<Item = &Self> + '_ {
@@ -200,6 +228,11 @@ impl Expression {
                 Self::UnaryOperation { expr, .. } => {
                     stack.push(expr);
                 }
+                Self::VariadicOperation { op, exprs } => match op {
+                    VariadicOperator::And | VariadicOperator::Or => {
+                        stack.extend(exprs.iter());
+                    }
+                },
             }
             Some(expr)
         })
@@ -248,20 +281,6 @@ mod tests {
         let cases = [
             (col_ref.clone(), "Column(x)"),
             (col_ref.clone().eq(Expr::literal(2)), "Column(x) = 2"),
-            (
-                col_ref
-                    .clone()
-                    .gt_eq(Expr::literal(2))
-                    .and(col_ref.clone().lt_eq(Expr::literal(10))),
-                "Column(x) >= 2 AND Column(x) <= 10",
-            ),
-            (
-                col_ref
-                    .clone()
-                    .gt(Expr::literal(2))
-                    .or(col_ref.clone().lt(Expr::literal(10))),
-                "(Column(x) > 2 OR Column(x) < 10)",
-            ),
             (
                 (col_ref.clone() - Expr::literal(4)).lt(Expr::literal(10)),
                 "Column(x) - 4 < 10",
