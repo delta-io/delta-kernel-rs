@@ -136,23 +136,21 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
                 .map(|arr| downcast_bool(arr))
                 .collect::<DeltaResult<Vec<_>>>()?;
             let result = match arrs.len() {
-                0 => match op {
-                    VariadicOperator::And => BooleanArray::from(vec![true; batch.num_rows()]),
-                    VariadicOperator::Or => BooleanArray::from(vec![false; batch.num_rows()]),
-                },
-                1 => match op {
-                    VariadicOperator::And | VariadicOperator::Or => arrs[0].clone(),
-                },
-                // Safety: Since we evaluated the expression, we know that all the arrays are of the same length
-                // and we already downcasted to boolean. So we can safely unwrap.
-                _ => match op {
-                    VariadicOperator::And => arrs[1..]
+                0 => {
+                    BooleanArray::from(vec![matches!(op, VariadicOperator::And); batch.num_rows()])
+                }
+                1 => arrs[0].clone(),
+                _ => {
+                    let eval = match op {
+                        VariadicOperator::And => and,
+                        VariadicOperator::Or => or,
+                    };
+                    // Safety: Since we evaluated the expression, we know that all the arrays are of the same length
+                    // and we already downcasted to boolean. So we can safely unwrap.
+                    arrs[1..]
                         .iter()
-                        .fold(arrs[0].clone(), |acc, arr| and(&acc, arr).unwrap()),
-                    VariadicOperator::Or => arrs[1..]
-                        .iter()
-                        .fold(arrs[0].clone(), |acc, arr| or(&acc, arr).unwrap()),
-                },
+                        .fold(arrs[0].clone(), |acc, arr| eval(&acc, arr).unwrap())
+                }
             };
             Ok(Arc::new(result))
         }
