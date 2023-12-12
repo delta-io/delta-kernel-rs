@@ -1,17 +1,18 @@
 //! Default Expression handler.
 //!
 //! Expression handling based on arrow-rs compute kernels.
-
+#![allow(trivial_casts)]
 use std::sync::Arc;
 
 use arrow_arith::boolean::{and, is_null, not, or};
 use arrow_arith::numeric::{add, div, mul, sub};
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum, Decimal128Array, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
     TimestampMicrosecondArray,
 };
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
+use arrow_schema::ArrowError;
 
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{scalars::Scalar, Expression};
@@ -20,6 +21,12 @@ use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::{ExpressionEvaluator, ExpressionHandler};
 
 // TODO leverage scalars / Datum
+
+fn downcast_bool(arr: &dyn Array) -> DeltaResult<&BooleanArray> {
+    arr.as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or(Error::Generic("expected boolean array".to_string()))
+}
 
 impl Scalar {
     /// Convert scalar to arrow array.
@@ -70,13 +77,16 @@ impl Scalar {
 }
 
 fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaResult<ArrayRef> {
+    use BinaryOperator::*;
+    use Expression::*;
+
     match expression {
-        Expression::Literal(scalar) => Ok(scalar.to_array(batch.num_rows())),
-        Expression::Column(name) => batch
+        Literal(scalar) => Ok(scalar.to_array(batch.num_rows())),
+        Column(name) => batch
             .column_by_name(name)
             .ok_or(Error::MissingColumn(name.clone()))
             .cloned(),
-        Expression::UnaryOperation { op, expr } => {
+        UnaryOperation { op, expr } => {
             let arr = evaluate_expression(expr.as_ref(), batch)?;
             match op {
                 UnaryOperator::Not => {
@@ -93,102 +103,56 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
                 }
             }
         }
-        Expression::BinaryOperation { op, left, right } => {
+        BinaryOperation {
+            op:
+                op @ (Plus | Minus | Multiply | Divide | LessThan | LessThanOrEqual | GreaterThan
+                | GreaterThanOrEqual | Equal | NotEqual),
+            left,
+            right,
+        } => {
             let left_arr = evaluate_expression(left.as_ref(), batch)?;
             let right_arr = evaluate_expression(right.as_ref(), batch)?;
-            match op {
-                BinaryOperator::Plus => {
-                    add(&left_arr, &right_arr).map_err(|err| Error::GenericError {
-                        source: Box::new(err),
-                    })
-                }
-                BinaryOperator::Minus => {
-                    sub(&left_arr, &right_arr).map_err(|err| Error::GenericError {
-                        source: Box::new(err),
-                    })
-                }
-                BinaryOperator::Multiply => {
-                    mul(&left_arr, &right_arr).map_err(|err| Error::GenericError {
-                        source: Box::new(err),
-                    })
-                }
-                BinaryOperator::Divide => {
-                    div(&left_arr, &right_arr).map_err(|err| Error::GenericError {
-                        source: Box::new(err),
-                    })
-                }
-                BinaryOperator::LessThan => {
-                    let result = lt(&left_arr, &right_arr).map_err(|err| Error::GenericError {
-                        source: Box::new(err),
-                    })?;
-                    Ok(Arc::new(result))
-                }
-                BinaryOperator::LessThanOrEqual => {
-                    let result =
-                        lt_eq(&left_arr, &right_arr).map_err(|err| Error::GenericError {
-                            source: Box::new(err),
-                        })?;
-                    Ok(Arc::new(result))
-                }
-                BinaryOperator::GreaterThan => {
-                    let result = gt(&left_arr, &right_arr).map_err(|err| Error::GenericError {
-                        source: Box::new(err),
-                    })?;
-                    Ok(Arc::new(result))
-                }
-                BinaryOperator::GreaterThanOrEqual => {
-                    let result =
-                        gt_eq(&left_arr, &right_arr).map_err(|err| Error::GenericError {
-                            source: Box::new(err),
-                        })?;
-                    Ok(Arc::new(result))
-                }
-                BinaryOperator::Equal => {
-                    let result = eq(&left_arr, &right_arr).map_err(|err| Error::GenericError {
-                        source: Box::new(err),
-                    })?;
-                    Ok(Arc::new(result))
-                }
-                BinaryOperator::NotEqual => {
-                    let result = neq(&left_arr, &right_arr).map_err(|err| Error::GenericError {
-                        source: Box::new(err),
-                    })?;
-                    Ok(Arc::new(result))
-                }
-                BinaryOperator::And => {
-                    let left_arr = evaluate_expression(left.as_ref(), batch)?;
-                    let left_arr = left_arr
-                        .as_any()
-                        .downcast_ref::<BooleanArray>()
-                        .ok_or(Error::Generic("expected boolean array".to_string()))?;
-                    let right_arr = evaluate_expression(right.as_ref(), batch)?;
-                    let right_arr = right_arr
-                        .as_any()
-                        .downcast_ref::<BooleanArray>()
-                        .ok_or(Error::Generic("expected boolean array".to_string()))?;
-                    let result = and(left_arr, right_arr).map_err(|err| Error::GenericError {
-                        source: Box::new(err),
-                    })?;
-                    Ok(Arc::new(result))
-                }
-                BinaryOperator::Or => {
-                    let left_arr = evaluate_expression(left.as_ref(), batch)?;
-                    let left_arr = left_arr
-                        .as_any()
-                        .downcast_ref::<BooleanArray>()
-                        .ok_or(Error::Generic("expected boolean array".to_string()))?;
-                    let right_arr = evaluate_expression(right.as_ref(), batch)?;
-                    let right_arr = right_arr
-                        .as_any()
-                        .downcast_ref::<BooleanArray>()
-                        .ok_or(Error::Generic("expected boolean array".to_string()))?;
-                    let result = or(left_arr, right_arr).map_err(|err| Error::GenericError {
-                        source: Box::new(err),
-                    })?;
-                    Ok(Arc::new(result))
-                }
-            }
+
+            type Operation = fn(&dyn Datum, &dyn Datum) -> Result<Arc<dyn Array>, ArrowError>;
+            let eval: Operation = match op {
+                Plus => add,
+                Minus => sub,
+                Multiply => mul,
+                Divide => div,
+                LessThan => |l, r| lt(l, r).map(|arr| Arc::new(arr) as Arc<dyn Array>),
+                LessThanOrEqual => |l, r| lt_eq(l, r).map(|arr| Arc::new(arr) as Arc<dyn Array>),
+                GreaterThan => |l, r| gt(l, r).map(|arr| Arc::new(arr) as Arc<dyn Array>),
+                GreaterThanOrEqual => |l, r| gt_eq(l, r).map(|arr| Arc::new(arr) as Arc<dyn Array>),
+                Equal => |l, r| eq(l, r).map(|arr| Arc::new(arr) as Arc<dyn Array>),
+                NotEqual => |l, r| neq(l, r).map(|arr| Arc::new(arr) as Arc<dyn Array>),
+                // NOTE: enumerating unreacherable cases exlicitly to avoid future bugs
+                And | Or => unreachable!(),
+            };
+
+            eval(&left_arr, &right_arr).map_err(|err| Error::GenericError {
+                source: Box::new(err),
+            })
         }
+        BinaryOperation { op, left, right } => match op {
+            And | Or => {
+                let left_arr = evaluate_expression(left.as_ref(), batch)?;
+                let left_arr = downcast_bool(&left_arr)?;
+                let right_arr = evaluate_expression(right.as_ref(), batch)?;
+                let right_arr = downcast_bool(&right_arr)?;
+                let eval = match op {
+                    And => and,
+                    Or => or,
+                    _ => unreachable!(),
+                };
+                let result = eval(left_arr, right_arr).map_err(|err| Error::GenericError {
+                    source: Box::new(err),
+                })?;
+                Ok(Arc::new(result))
+            }
+            // NOTE: enumerating unreacherable cases exlicitly to avoid future bugs
+            Plus | Minus | Multiply | Divide | LessThan | LessThanOrEqual | GreaterThan
+            | GreaterThanOrEqual | Equal | NotEqual => unreachable!(),
+        },
     }
 }
 
