@@ -89,18 +89,8 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
         UnaryOperation { op, expr } => {
             let arr = evaluate_expression(expr.as_ref(), batch)?;
             match op {
-                UnaryOperator::Not => {
-                    let arr = arr
-                        .as_any()
-                        .downcast_ref::<BooleanArray>()
-                        .ok_or(Error::Generic("expected boolean array".to_string()))?;
-                    let result = not(arr)?;
-                    Ok(Arc::new(result))
-                }
-                UnaryOperator::IsNull => {
-                    let result = is_null(&arr)?;
-                    Ok(Arc::new(result))
-                }
+                UnaryOperator::Not => Ok(Arc::new(not(downcast_bool(&arr)?)?)),
+                UnaryOperator::IsNull => Ok(Arc::new(is_null(&arr)?)),
             }
         }
         BinaryOperation { op, left, right } => {
