@@ -164,6 +164,12 @@ impl Expression {
         }
     }
 
+    fn variadic_op_impl(self, other: impl IntoIterator<Item = Self>, op: VariadicOperator) -> Self {
+        let mut exprs = other.into_iter().collect::<Vec<_>>();
+        exprs.insert(0, self);
+        Self::VariadicOperation { op, exprs }
+    }
+
     /// Create a new expression `self == other`
     pub fn eq(self, other: Self) -> Self {
         self.binary_op_impl(other, BinaryOperator::Equal)
@@ -196,22 +202,12 @@ impl Expression {
 
     /// Create a new expression `self AND other`
     pub fn and(self, other: impl IntoIterator<Item = Self>) -> Self {
-        let mut exprs = other.into_iter().collect::<Vec<_>>();
-        exprs.insert(0, self);
-        Self::VariadicOperation {
-            op: VariadicOperator::And,
-            exprs,
-        }
+        self.variadic_op_impl(other, VariadicOperator::And)
     }
 
     /// Create a new expression `self OR other`
     pub fn or(self, other: impl IntoIterator<Item = Self>) -> Self {
-        let mut exprs = other.into_iter().collect::<Vec<_>>();
-        exprs.insert(0, self);
-        Self::VariadicOperation {
-            op: VariadicOperator::Or,
-            exprs,
-        }
+        self.variadic_op_impl(other, VariadicOperator::Or)
     }
 
     fn walk(&self) -> impl Iterator<Item = &Self> + '_ {

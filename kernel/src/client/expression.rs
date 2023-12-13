@@ -22,7 +22,7 @@ use crate::{ExpressionEvaluator, ExpressionHandler};
 
 // TODO leverage scalars / Datum
 
-fn downcast_bool(arr: &dyn Array) -> DeltaResult<&BooleanArray> {
+fn downcast_to_bool(arr: &dyn Array) -> DeltaResult<&BooleanArray> {
     arr.as_any()
         .downcast_ref::<BooleanArray>()
         .ok_or(Error::Generic("expected boolean array".to_string()))
@@ -89,7 +89,7 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
         UnaryOperation { op, expr } => {
             let arr = evaluate_expression(expr.as_ref(), batch)?;
             match op {
-                UnaryOperator::Not => Ok(Arc::new(not(downcast_bool(&arr)?)?)),
+                UnaryOperator::Not => Ok(Arc::new(not(downcast_to_bool(&arr)?)?)),
                 UnaryOperator::IsNull => Ok(Arc::new(is_null(&arr)?)),
             }
         }
@@ -123,7 +123,7 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
             }
             let arrs = arrs
                 .iter()
-                .map(|arr| downcast_bool(arr))
+                .map(|arr| downcast_to_bool(arr))
                 .collect::<DeltaResult<Vec<_>>>()?;
             let result = match arrs.len() {
                 0 => {
