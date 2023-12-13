@@ -113,15 +113,14 @@ impl LogSegment {
 /// throughout time, `Snapshot`s represent a view of a table at a specific point in time; they
 /// have a defined schema (which may change over time for any given table), specific version, and
 /// frozen log segment.
-pub struct Snapshot<JRC: Send, PRC: Send> {
+pub struct Snapshot {
     pub(crate) table_root: Url,
-    pub(crate) table_client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
     pub(crate) log_segment: LogSegment,
     version: Version,
     metadata: Arc<RwLock<Option<(Metadata, Protocol)>>>,
 }
 
-impl<JRC: Send, PRC: Send> std::fmt::Debug for Snapshot<JRC, PRC> {
+impl std::fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Snapshot")
             .field("path", &self.log_segment.log_root.as_str())
@@ -131,7 +130,7 @@ impl<JRC: Send, PRC: Send> std::fmt::Debug for Snapshot<JRC, PRC> {
     }
 }
 
-impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
+impl Snapshot {
     /// Create a new [`Snapshot`] instance for the given version.
     ///
     /// # Parameters
@@ -139,9 +138,9 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
     /// - `location`: url pointing at the table root (where `_delta_log` folder is located)
     /// - `table_client`: Implementation of [`TableClient`] apis.
     /// - `version`: target version of the [`Snapshot`]
-    pub fn try_new(
+    pub fn try_new<JRC: Send, PRC: Send>(
         table_root: Url,
-        table_client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
+        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
         version: Option<Version>,
     ) -> DeltaResult<Arc<Self>> {
         let fs_client = table_client.get_file_system_client();
@@ -187,24 +186,13 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
             checkpoint_files,
         };
 
-        Ok(Arc::new(Self::new(
-            table_root,
-            table_client,
-            log_segment,
-            version_eff,
-        )))
+        Ok(Arc::new(Self::new(table_root, log_segment, version_eff)))
     }
 
     /// Create a new [`Snapshot`] instance.
-    pub(crate) fn new(
-        location: Url,
-        client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
-        log_segment: LogSegment,
-        version: Version,
-    ) -> Self {
+    pub(crate) fn new(location: Url, log_segment: LogSegment, version: Version) -> Self {
         Self {
             table_root: location,
-            table_client: client,
             log_segment,
             version,
             metadata: Default::default(),
@@ -216,12 +204,10 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
         self.version
     }
 
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    fn _get_log_segment(&self) -> &LogSegment {
-        &self.log_segment
-    }
-
-    fn get_or_insert_metadata(&self) -> DeltaResult<(Metadata, Protocol)> {
+    fn get_or_insert_metadata<JRC: Send, PRC: Send>(
+        &self,
+        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
+    ) -> DeltaResult<(Metadata, Protocol)> {
         {
             let read_lock = self
                 .metadata
@@ -234,7 +220,7 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
 
         let (metadata, protocol) = self
             .log_segment
-            .read_metadata(self.table_client.as_ref())?
+            .read_metadata(table_client)?
             .ok_or(Error::MissingMetadata)?;
         let mut meta = self
             .metadata
@@ -246,18 +232,27 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
     }
 
     /// Table [`Schema`] at this [`Snapshot`]s version.
-    pub fn schema(&self) -> DeltaResult<Schema> {
-        self.metadata()?.schema()
+    pub fn schema<JRC: Send, PRC: Send>(
+        &self,
+        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
+    ) -> DeltaResult<Schema> {
+        self.metadata(table_client)?.schema()
     }
 
     /// Table [`Metadata`] at this [`Snapshot`]s version.
-    pub fn metadata(&self) -> DeltaResult<Metadata> {
-        let (metadata, _) = self.get_or_insert_metadata()?;
+    pub fn metadata<JRC: Send, PRC: Send>(
+        &self,
+        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
+    ) -> DeltaResult<Metadata> {
+        let (metadata, _) = self.get_or_insert_metadata(table_client)?;
         Ok(metadata)
     }
 
-    pub fn protocol(&self) -> DeltaResult<Protocol> {
-        let (_, protocol) = self.get_or_insert_metadata()?;
+    pub fn protocol<JRC: Send, PRC: Send>(
+        &self,
+        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
+    ) -> DeltaResult<Protocol> {
+        let (_, protocol) = self.get_or_insert_metadata(table_client)?;
         Ok(protocol)
     }
 }
@@ -407,15 +402,13 @@ mod tests {
     use crate::filesystem::ObjectStoreFileSystemClient;
     use crate::schema::StructType;
 
-    fn default_table_client(url: &Url) -> Arc<DefaultTableClient<TokioBackgroundExecutor>> {
-        Arc::new(
-            DefaultTableClient::try_new(
-                url,
-                HashMap::<String, String>::new(),
-                Arc::new(TokioBackgroundExecutor::new()),
-            )
-            .unwrap(),
+    fn default_table_client(url: &Url) -> DefaultTableClient<TokioBackgroundExecutor> {
+        DefaultTableClient::try_new(
+            url,
+            HashMap::<String, String>::new(),
+            Arc::new(TokioBackgroundExecutor::new()),
         )
+        .unwrap()
     }
 
     #[test]
@@ -425,9 +418,9 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let client = default_table_client(&url);
-        let snapshot = Snapshot::try_new(url, client, Some(1)).unwrap();
+        let snapshot = Snapshot::try_new(url, &client, Some(1)).unwrap();
 
-        let protocol = snapshot.protocol().unwrap();
+        let protocol = snapshot.protocol(&client).unwrap();
         let expected = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
@@ -438,7 +431,7 @@ mod tests {
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
         let expected: StructType = serde_json::from_str(schema_string).unwrap();
-        let schema = snapshot.schema().unwrap();
+        let schema = snapshot.schema(&client).unwrap();
         assert_eq!(schema, expected);
     }
 
@@ -449,9 +442,9 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let client = default_table_client(&url);
-        let snapshot = Snapshot::try_new(url, client, None).unwrap();
+        let snapshot = Snapshot::try_new(url, &client, None).unwrap();
 
-        let protocol = snapshot.protocol().unwrap();
+        let protocol = snapshot.protocol(&client).unwrap();
         let expected = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
@@ -462,7 +455,7 @@ mod tests {
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
         let expected: StructType = serde_json::from_str(schema_string).unwrap();
-        let schema = snapshot.schema().unwrap();
+        let schema = snapshot.schema(&client).unwrap();
         assert_eq!(schema, expected);
     }
 
@@ -493,7 +486,7 @@ mod tests {
         .unwrap();
         let location = url::Url::from_directory_path(path).unwrap();
         let table_client = default_table_client(&location);
-        let snapshot = Snapshot::try_new(location, table_client, None).unwrap();
+        let snapshot = Snapshot::try_new(location, &table_client, None).unwrap();
 
         assert_eq!(snapshot.log_segment.checkpoint_files.len(), 1);
         assert_eq!(
