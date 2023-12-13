@@ -12,8 +12,11 @@ build = "build.rs"
 [lib]
 crate-type = ["cdylib", "staticlib"]
 
+[dependencies]
+url = "2"
+deltakernel = { path = "../kernel", features = ["developer-visibility", "tokio"] }
+
 [build-dependencies]
 cbindgen = "0.26.0"
-deltakernel = { path = "../kernel" }
 libc = "0.2.147"
 

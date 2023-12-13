@@ -1,0 +1,10 @@
+after_includes = """
+
+// ======================================================================================
+// Missing forward declarations from deltakernel crate, added manually via cbindgen.toml
+// ======================================================================================
+struct Snapshot;
+struct TokioBackgroundExecutor;
+template<typename E> struct DefaultTableClient;
+// ======================================================================================
+"""
