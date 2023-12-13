@@ -1,5 +1,6 @@
 use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::client::DefaultTableClient;
+use deltakernel::scan::ScanBuilder;
 use deltakernel::{DeltaResult, Table};
 
 use deltakernel::actions::{parse_actions, Action, ActionType};
@@ -65,10 +66,9 @@ fn main() {
         );
         return;
     };
-    let table_client = Arc::new(table_client);
 
-    let table = Table::new(url, table_client.clone());
-    let snapshot = table.snapshot(None);
+    let table = Table::new(url);
+    let snapshot = table.snapshot(&table_client, None);
     let Ok(snapshot) = snapshot else {
         println!(
             "Failed to construct latest snapshot: {}",
@@ -82,15 +82,19 @@ fn main() {
             println!("Latest table version: {}", snapshot.version());
         }
         Commands::Metadata => {
-            println!("{:#?}", snapshot.metadata().unwrap());
+            println!("{:#?}", snapshot.metadata(&table_client).unwrap());
         }
         Commands::Schema => {
-            println!("{:#?}", snapshot.schema().unwrap());
+            println!("{:#?}", snapshot.schema(&table_client).unwrap());
         }
         Commands::Adds => {
             use deltakernel::Add;
-            let scan = snapshot.scan().unwrap().build();
-            let files: Vec<Add> = scan.files().unwrap().map(|r| r.unwrap()).collect();
+            let scan = ScanBuilder::new(snapshot).build(&table_client).unwrap();
+            let files: Vec<Add> = scan
+                .files(&table_client)
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
             println!("{:#?}", files);
         }
         Commands::Actions { forward } => {
@@ -111,8 +115,8 @@ fn main() {
             });
 
             let batches = snapshot
-                ._get_log_segment()
-                .replay(&*table_client, read_schema, None);
+                ._log_segment()
+                .replay(&table_client, read_schema, None);
 
             let batch_vec = batches.unwrap().collect::<Vec<DeltaResult<RecordBatch>>>();
             let len = batch_vec.len() - 1;

@@ -199,6 +199,12 @@ impl Snapshot {
         }
     }
 
+    /// Log segment this snapshot uses
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    fn _log_segment(&self) -> &LogSegment {
+        &self.log_segment
+    }
+
     /// Version of this [`Snapshot`] in the table.
     pub fn version(&self) -> Version {
         self.version
