@@ -195,7 +195,7 @@ impl Snapshot {
             checkpoint_files,
         };
 
-        Ok(Arc::new(Self::new_from_log_segment(
+        Ok(Arc::new(Self::try_new_from_log_segment(
             table_root,
             log_segment,
             version_eff,
@@ -204,7 +204,7 @@ impl Snapshot {
     }
 
     /// Create a new [`Snapshot`] instance.
-    pub(crate) fn new_from_log_segment<JRC: Send, PRC: Send>(
+    pub(crate) fn try_new_from_log_segment<JRC: Send, PRC: Send>(
         location: Url,
         log_segment: LogSegment,
         version: Version,
