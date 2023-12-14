@@ -68,20 +68,16 @@ impl ScanBuilder {
     ///
     /// This is lazy and performs no 'work' at this point. The [`Scan`] type itself can be used
     /// to fetch the files and associated metadata required to perform actual data reads.
-    pub fn build<JRC: Send, PRC: Send + Sync>(
-        self,
-        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
-    ) -> DeltaResult<Scan> {
+    pub fn build(self) -> Scan {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
-        let read_schema = match self.schema {
-            Some(schema) => schema,
-            None => Arc::new(self.snapshot.schema(table_client)?.clone()),
-        };
-        Ok(Scan {
+        let read_schema = self
+            .schema
+            .unwrap_or_else(|| self.snapshot.schema().clone().into());
+        Scan {
             snapshot: self.snapshot,
             read_schema,
             predicate: self.predicate,
-        })
+        }
     }
 }
 
@@ -207,7 +203,7 @@ mod tests {
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&table_client, None).unwrap();
-        let scan = ScanBuilder::new(snapshot).build(&table_client).unwrap();
+        let scan = ScanBuilder::new(snapshot).build();
         let files: Vec<Add> = scan.files(&table_client).unwrap().try_collect().unwrap();
 
         assert_eq!(files.len(), 1);
@@ -232,7 +228,7 @@ mod tests {
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&table_client, None).unwrap();
-        let scan = ScanBuilder::new(snapshot).build(&table_client).unwrap();
+        let scan = ScanBuilder::new(snapshot).build();
         let files = scan.execute(&table_client).unwrap();
 
         assert_eq!(files.len(), 1);

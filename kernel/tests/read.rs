@@ -98,7 +98,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let expected_data = vec![batch.clone(), batch];
 
     let snapshot = table.snapshot(&table_client, None)?;
-    let scan = ScanBuilder::new(snapshot).build(&table_client)?;
+    let scan = ScanBuilder::new(snapshot).build();
 
     let mut files = 0;
     let stream = scan.execute(&table_client)?.into_iter().zip(expected_data);
@@ -148,7 +148,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let expected_data = vec![batch.clone(), batch];
 
     let snapshot = table.snapshot(&table_client, None).unwrap();
-    let scan = ScanBuilder::new(snapshot).build(&table_client)?;
+    let scan = ScanBuilder::new(snapshot).build();
 
     let mut files = 0;
     let stream = scan.execute(&table_client)?.into_iter().zip(expected_data);
@@ -202,7 +202,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let expected_data = vec![batch];
 
     let snapshot = table.snapshot(&table_client, None)?;
-    let scan = ScanBuilder::new(snapshot).build(&table_client)?;
+    let scan = ScanBuilder::new(snapshot).build();
 
     let stream = scan.execute(&table_client)?.into_iter().zip(expected_data);
 
@@ -314,7 +314,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         };
         let scan = ScanBuilder::new(snapshot.clone())
             .with_predicate(predicate)
-            .build(&table_client)?;
+            .build();
 
         let expected_files = expected_batches.len();
         let mut files_scanned = 0;

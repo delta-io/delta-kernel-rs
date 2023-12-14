@@ -20,7 +20,7 @@ fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
 
     let table = Table::new(url);
     let snapshot = table.snapshot(&table_client, None)?;
-    let scan = ScanBuilder::new(snapshot).build(&table_client)?;
+    let scan = ScanBuilder::new(snapshot).build();
 
     let stream = scan.execute(&table_client)?;
     for batch in stream {
@@ -43,7 +43,7 @@ fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
 
     let table = Table::new(url);
     let snapshot = table.snapshot(&table_client, None)?;
-    let scan = ScanBuilder::new(snapshot).build(&table_client)?;
+    let scan = ScanBuilder::new(snapshot).build();
 
     let stream = scan.execute(&table_client)?;
     for batch in stream {
