@@ -1,5 +1,6 @@
 use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::client::DefaultTableClient;
+use deltakernel::scan::ScanBuilder;
 use deltakernel::Table;
 
 use std::collections::HashMap;
@@ -97,10 +98,9 @@ fn main() {
         );
         return;
     };
-    let table_client = Arc::new(table_client);
 
-    let table = Table::new(url, table_client.clone());
-    let snapshot = table.snapshot(None);
+    let table = Table::new(url);
+    let snapshot = table.snapshot(&table_client, None);
     let Ok(snapshot) = snapshot else {
         println!(
             "Failed to construct latest snapshot: {}",
@@ -109,7 +109,7 @@ fn main() {
         return;
     };
 
-    let scan = snapshot.scan().unwrap().build();
+    let scan = ScanBuilder::new(snapshot).build(&table_client).unwrap();
 
     let schema = scan.schema();
     let header_names = schema.fields.iter().map(|field| {
@@ -127,7 +127,7 @@ fn main() {
     }
     table.set_header(header_names);
 
-    for batch in scan.execute().unwrap() {
+    for batch in scan.execute(&table_client).unwrap() {
         for row in 0..batch.num_rows() {
             let table_row =
                 (0..batch.num_columns()).map(|col| extract_value(batch.column(col), row));

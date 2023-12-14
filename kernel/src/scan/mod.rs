@@ -11,21 +11,20 @@ use crate::actions::ActionType;
 use crate::expressions::Expression;
 use crate::schema::SchemaRef;
 use crate::snapshot::Snapshot;
-use crate::{Add, DeltaResult, FileMeta};
+use crate::{Add, DeltaResult, FileMeta, TableClient};
 
 mod data_skipping;
 pub mod file_stream;
 
 // TODO projection: something like fn select(self, columns: &[&str])
 /// Builder to scan a snapshot of a table.
-pub struct ScanBuilder<JRC: Send, PRC: Send> {
-    snapshot: Arc<Snapshot<JRC, PRC>>,
-    snapshot_schema: SchemaRef,
+pub struct ScanBuilder {
+    snapshot: Arc<Snapshot>,
     schema: Option<SchemaRef>,
     predicate: Option<Expression>,
 }
 
-impl<JRC: Send, PRC: Send> std::fmt::Debug for ScanBuilder<JRC, PRC> {
+impl std::fmt::Debug for ScanBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("ScanBuilder")
             .field("schema", &self.schema)
@@ -34,18 +33,14 @@ impl<JRC: Send, PRC: Send> std::fmt::Debug for ScanBuilder<JRC, PRC> {
     }
 }
 
-impl<JRC: Send, PRC: Send + Sync> ScanBuilder<JRC, PRC> {
+impl ScanBuilder {
     /// Create a new [`ScanBuilder`] instance.
-    // TODO(issues/75) -- once P&M are no longer lazy, self.schema() call below can no longer fail
-    // and we can change this method to new instead of try_new.
-    pub fn try_new(snapshot: Arc<Snapshot<JRC, PRC>>) -> DeltaResult<Self> {
-        let snapshot_schema = Arc::new(snapshot.schema()?);
-        Ok(Self {
+    pub fn new(snapshot: Arc<Snapshot>) -> Self {
+        Self {
             snapshot,
-            snapshot_schema,
             schema: None,
             predicate: None,
-        })
+        }
     }
 
     /// Provide [`Schema`] for columns to select from the [`Snapshot`].
@@ -73,38 +68,44 @@ impl<JRC: Send, PRC: Send + Sync> ScanBuilder<JRC, PRC> {
     ///
     /// This is lazy and performs no 'work' at this point. The [`Scan`] type itself can be used
     /// to fetch the files and associated metadata required to perform actual data reads.
-    pub fn build(self) -> Scan<JRC, PRC> {
+    pub fn build<JRC: Send, PRC: Send + Sync>(
+        self,
+        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
+    ) -> DeltaResult<Scan> {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
-        let schema = self.schema.unwrap_or_else(|| self.snapshot_schema.clone());
-        Scan {
+        let read_schema = match self.schema {
+            Some(schema) => schema,
+            None => Arc::new(self.snapshot.schema(table_client)?.clone()),
+        };
+        Ok(Scan {
             snapshot: self.snapshot,
-            schema,
+            read_schema,
             predicate: self.predicate,
-        }
+        })
     }
 }
 
-pub struct Scan<JRC: Send, PRC: Send + Sync> {
-    snapshot: Arc<Snapshot<JRC, PRC>>,
-    schema: SchemaRef,
+pub struct Scan {
+    snapshot: Arc<Snapshot>,
+    read_schema: SchemaRef,
     predicate: Option<Expression>,
 }
 
-impl<JRC: Send, PRC: Send + Sync> std::fmt::Debug for Scan<JRC, PRC> {
+impl std::fmt::Debug for Scan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("Scan")
-            .field("schema", &self.schema)
+            .field("schema", &self.read_schema)
             .field("predicate", &self.predicate)
             .finish()
     }
 }
 
-impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
+impl Scan {
     /// Get a shred reference to the [`Schema`] of the scan.
     ///
     /// [`Schema`]: crate::schema::Schema
     pub fn schema(&self) -> &SchemaRef {
-        &self.schema
+        &self.read_schema
     }
 
     /// Get the predicate [`Expression`] of the scan.
@@ -116,8 +117,11 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
     /// which yields record batches of scan files and their associated metadata. Rows of the scan
     /// files batches correspond to data reads, and the DeltaReader is used to materialize the scan
     /// files into actual table data.
-    pub fn files(&self) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
-        let schema = Arc::new(ArrowSchema {
+    pub fn files<JRC: Send, PRC: Send + Sync>(
+        &self,
+        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
+        let action_schema = Arc::new(ArrowSchema {
             fields: Fields::from_iter([
                 ArrowField::try_from(ActionType::Add)?,
                 ArrowField::try_from(ActionType::Remove)?,
@@ -126,18 +130,25 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
         });
 
         let log_iter = self.snapshot.log_segment.replay(
-            self.snapshot.table_client.as_ref(),
-            schema,
+            table_client,
+            action_schema,
             self.predicate.clone(),
         )?;
 
-        Ok(log_replay_iter(log_iter, self.predicate.clone()))
+        Ok(log_replay_iter(
+            log_iter,
+            &self.read_schema,
+            &self.predicate,
+        ))
     }
 
-    pub fn execute(&self) -> DeltaResult<Vec<RecordBatch>> {
-        let parquet_handler = self.snapshot.table_client.get_parquet_handler();
+    pub fn execute<JRC: Send, PRC: Send + Sync>(
+        &self,
+        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
+    ) -> DeltaResult<Vec<RecordBatch>> {
+        let parquet_handler = table_client.get_parquet_handler();
 
-        self.files()?
+        self.files(table_client)?
             .map(|res| {
                 let add = res?;
                 let meta = FileMeta {
@@ -147,7 +158,7 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
                 };
                 let context = parquet_handler.contextualize_file_reads(&[meta], None)?;
                 let batches = parquet_handler
-                    .read_parquet_files(context, self.schema.clone())?
+                    .read_parquet_files(context, self.read_schema.clone())?
                     .collect::<DeltaResult<Vec<_>>>()?;
 
                 if batches.is_empty() {
@@ -158,7 +169,7 @@ impl<JRC: Send, PRC: Send + Sync + 'static> Scan<JRC, PRC> {
                 let batch = concat_batches(&schema, &batches)?;
 
                 if let Some(dv_descriptor) = add.deletion_vector {
-                    let fs_client = self.snapshot.table_client.get_file_system_client();
+                    let fs_client = table_client.get_file_system_client();
                     let dv = dv_descriptor.read(fs_client, self.snapshot.table_root.clone())?;
                     let mask: BooleanArray = (0..batch.num_rows())
                         .map(|i| Some(!dv.contains(i.try_into().expect("fit into u32"))))
@@ -187,19 +198,17 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let table_client = Arc::new(
-            DefaultTableClient::try_new(
-                &url,
-                std::iter::empty::<(&str, &str)>(),
-                Arc::new(TokioBackgroundExecutor::new()),
-            )
-            .unwrap(),
-        );
+        let table_client = DefaultTableClient::try_new(
+            &url,
+            std::iter::empty::<(&str, &str)>(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        )
+        .unwrap();
 
-        let table = Table::new(url, table_client);
-        let snapshot = table.snapshot(None).unwrap();
-        let scan = ScanBuilder::try_new(snapshot).unwrap().build();
-        let files: Vec<Add> = scan.files().unwrap().try_collect().unwrap();
+        let table = Table::new(url);
+        let snapshot = table.snapshot(&table_client, None).unwrap();
+        let scan = ScanBuilder::new(snapshot).build(&table_client).unwrap();
+        let files: Vec<Add> = scan.files(&table_client).unwrap().try_collect().unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(
@@ -214,19 +223,17 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let table_client = Arc::new(
-            DefaultTableClient::try_new(
-                &url,
-                std::iter::empty::<(&str, &str)>(),
-                Arc::new(TokioBackgroundExecutor::new()),
-            )
-            .unwrap(),
-        );
+        let table_client = DefaultTableClient::try_new(
+            &url,
+            std::iter::empty::<(&str, &str)>(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        )
+        .unwrap();
 
-        let table = Table::new(url, table_client);
-        let snapshot = table.snapshot(None).unwrap();
-        let scan = ScanBuilder::try_new(snapshot).unwrap().build();
-        let files = scan.execute().unwrap();
+        let table = Table::new(url);
+        let snapshot = table.snapshot(&table_client, None).unwrap();
+        let scan = ScanBuilder::new(snapshot).build(&table_client).unwrap();
+        let files = scan.execute(&table_client).unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].num_rows(), 10)

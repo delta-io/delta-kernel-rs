@@ -1,14 +1,18 @@
 use std::collections::HashSet;
 
-use super::data_skipping::data_skipping_filter;
+use super::data_skipping::DataSkippingFilter;
 use crate::actions::{parse_actions, Action, ActionType, Add};
 use crate::expressions::Expression;
+use crate::schema::SchemaRef;
 use crate::DeltaResult;
+
 use arrow_array::RecordBatch;
 use either::Either;
+use tracing::debug;
 
 struct LogReplayScanner {
-    predicate: Option<Expression>,
+    filter: Option<DataSkippingFilter>,
+
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
@@ -17,9 +21,9 @@ struct LogReplayScanner {
 
 impl LogReplayScanner {
     /// Create a new [`LogReplayStream`] instance
-    fn new(predicate: Option<Expression>) -> Self {
+    fn new(table_schema: &SchemaRef, predicate: &Option<Expression>) -> Self {
         Self {
-            predicate,
+            filter: DataSkippingFilter::new(table_schema, predicate),
             seen: Default::default(),
         }
     }
@@ -27,14 +31,18 @@ impl LogReplayScanner {
     /// Extract Add actions from a single batch. This will filter out rows that
     /// don't match the predicate and Add actions that have corresponding Remove
     /// actions in the log.
-    fn process_batch(&mut self, actions: RecordBatch) -> DeltaResult<Vec<Add>> {
-        let actions = if let Some(predicate) = &self.predicate {
-            data_skipping_filter(actions, predicate)?
+    fn process_batch(&mut self, actions: &RecordBatch) -> DeltaResult<Vec<Add>> {
+        let filtered_actions = match &self.filter {
+            Some(filter) => Some(filter.apply(actions)?),
+            None => None,
+        };
+        let actions = if let Some(filtered) = &filtered_actions {
+            filtered
         } else {
             actions
         };
 
-        let adds: Vec<Add> = parse_actions(&actions, &[ActionType::Remove, ActionType::Add])?
+        let adds: Vec<Add> = parse_actions(actions, &[ActionType::Remove, ActionType::Add])?
             .filter_map(|action| match action {
                 Action::Add(add)
                     // Note: each (add.path + add.dv_unique_id()) pair has a 
@@ -44,6 +52,7 @@ impl LogReplayScanner {
                         .seen
                         .contains(&(add.path.clone(), add.dv_unique_id())) =>
                 {
+                    debug!("Found file: {}", &add.path);
                     self.seen.insert((add.path.clone(), add.dv_unique_id()));
                     Some(add)
                 }
@@ -63,12 +72,13 @@ impl LogReplayScanner {
 /// Given an iterator of actions and a predicate, returns a stream of [Add]
 pub fn log_replay_iter(
     action_iter: impl Iterator<Item = DeltaResult<RecordBatch>>,
-    predicate: Option<Expression>,
+    table_schema: &SchemaRef,
+    predicate: &Option<Expression>,
 ) -> impl Iterator<Item = DeltaResult<Add>> {
-    let mut log_scanner = LogReplayScanner::new(predicate);
+    let mut log_scanner = LogReplayScanner::new(table_schema, predicate);
 
     action_iter.flat_map(move |actions| match actions {
-        Ok(actions) => match log_scanner.process_batch(actions) {
+        Ok(actions) => match log_scanner.process_batch(&actions) {
             Ok(adds) => Either::Left(adds.into_iter().map(Ok)),
             Err(err) => Either::Right(std::iter::once(Err(err))),
         },
