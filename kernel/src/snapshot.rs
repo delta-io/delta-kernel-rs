@@ -83,12 +83,12 @@ impl LogSegment {
         let mut metadata_opt: Option<Metadata> = None;
         let mut protocol_opt: Option<Protocol> = None;
 
-        // TODO should we request teh checkpoint iterator only if we don't find the metadata in the commit files?
+        // TODO should we request the checkpoint iterator only if we don't find the metadata in the commit files?
         // since the engine might pre-fetch data o.a.? On the other hand, if the engine is smart about it, it should not be
         // too much extra work to request the checkpoint iterator as well.
         let batches = self.replay(table_client, read_schema, None)?;
-        for maybe_batch in batches {
-            let (batch, _) = maybe_batch?;
+        for batch in batches {
+            let (batch, _) = batch?;
 
             if metadata_opt.is_none() {
                 if let Ok(mut action) = parse_action(&batch, &ActionType::Metadata) {
