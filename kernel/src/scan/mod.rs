@@ -20,7 +20,6 @@ pub mod file_stream;
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder<JRC: Send, PRC: Send> {
     snapshot: Arc<Snapshot<JRC, PRC>>,
-    snapshot_schema: SchemaRef,
     schema: Option<SchemaRef>,
     predicate: Option<Expression>,
 }
@@ -37,10 +36,8 @@ impl<JRC: Send, PRC: Send> std::fmt::Debug for ScanBuilder<JRC, PRC> {
 impl<JRC: Send, PRC: Send + Sync> ScanBuilder<JRC, PRC> {
     /// Create a new [`ScanBuilder`] instance.
     pub fn new(snapshot: Arc<Snapshot<JRC, PRC>>) -> Self {
-        let snapshot_schema = Arc::new(snapshot.schema().clone());
         Self {
             snapshot,
-            snapshot_schema,
             schema: None,
             predicate: None,
         }
@@ -73,7 +70,9 @@ impl<JRC: Send, PRC: Send + Sync> ScanBuilder<JRC, PRC> {
     /// to fetch the files and associated metadata required to perform actual data reads.
     pub fn build(self) -> Scan<JRC, PRC> {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
-        let schema = self.schema.unwrap_or_else(|| self.snapshot_schema.clone());
+        let schema = self
+            .schema
+            .unwrap_or_else(|| self.snapshot.schema().clone().into());
         Scan {
             snapshot: self.snapshot,
             schema,
