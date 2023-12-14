@@ -5,7 +5,16 @@ use arrow_schema::{
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
 
+use crate::actions::ActionType;
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
+
+impl TryFrom<ActionType> for ArrowField {
+    type Error = ArrowError;
+
+    fn try_from(value: ActionType) -> Result<Self, Self::Error> {
+        value.schema_field().try_into()
+    }
+}
 
 impl TryFrom<&StructType> for ArrowSchema {
     type Error = ArrowError;
@@ -63,9 +72,9 @@ impl TryFrom<&MapType> for ArrowField {
             "entries",
             ArrowDataType::Struct(
                 vec![
-                    ArrowField::new("key", ArrowDataType::try_from(a.key_type())?, false),
+                    ArrowField::new("keys", ArrowDataType::try_from(a.key_type())?, false),
                     ArrowField::new(
-                        "value",
+                        "values",
                         ArrowDataType::try_from(a.value_type())?,
                         a.value_contains_null(),
                     ),
@@ -142,12 +151,12 @@ impl TryFrom<&DataType> for ArrowDataType {
                     ArrowDataType::Struct(
                         vec![
                             ArrowField::new(
-                                "key",
+                                "keys",
                                 <ArrowDataType as TryFrom<&DataType>>::try_from(m.key_type())?,
                                 false,
                             ),
                             ArrowField::new(
-                                "value",
+                                "values",
                                 <ArrowDataType as TryFrom<&DataType>>::try_from(m.value_type())?,
                                 m.value_contains_null(),
                             ),
@@ -189,7 +198,7 @@ impl TryFrom<&ArrowField> for StructField {
     fn try_from(arrow_field: &ArrowField) -> Result<Self, ArrowError> {
         Ok(StructField::new(
             arrow_field.name().clone(),
-            arrow_field.data_type().try_into()?,
+            DataType::try_from(arrow_field.data_type())?,
             arrow_field.is_nullable(),
         )
         .with_metadata(arrow_field.metadata().iter().map(|(k, v)| (k.clone(), v))))

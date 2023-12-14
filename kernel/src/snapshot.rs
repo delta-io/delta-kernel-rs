@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_schema::{Fields, Schema as ArrowSchema};
+use arrow_schema::{Field as ArrowField, Fields, Schema as ArrowSchema};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -76,7 +76,10 @@ impl LogSegment {
         table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
     ) -> DeltaResult<Option<(Metadata, Protocol)>> {
         let read_schema = Arc::new(ArrowSchema {
-            fields: Fields::from_iter([ActionType::Metadata.field(), ActionType::Protocol.field()]),
+            fields: Fields::from_iter([
+                ArrowField::try_from(ActionType::Metadata)?,
+                ArrowField::try_from(ActionType::Protocol)?,
+            ]),
             metadata: Default::default(),
         });
 

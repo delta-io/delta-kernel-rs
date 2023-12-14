@@ -74,10 +74,10 @@ pub struct StructField {
 
 impl StructField {
     /// Creates a new field
-    pub fn new(name: impl Into<String>, data_type: DataType, nullable: bool) -> Self {
+    pub fn new(name: impl Into<String>, data_type: impl Into<DataType>, nullable: bool) -> Self {
         Self {
             name: name.into(),
-            data_type,
+            data_type: data_type.into(),
             nullable,
             metadata: HashMap::default(),
         }
@@ -322,50 +322,36 @@ pub enum DataType {
     Map(Box<MapType>),
 }
 
+impl From<MapType> for DataType {
+    fn from(map_type: MapType) -> Self {
+        DataType::Map(Box::new(map_type))
+    }
+}
+
+impl From<StructType> for DataType {
+    fn from(struct_type: StructType) -> Self {
+        DataType::Struct(Box::new(struct_type))
+    }
+}
+
+impl From<ArrayType> for DataType {
+    fn from(array_type: ArrayType) -> Self {
+        DataType::Array(Box::new(array_type))
+    }
+}
+
 impl DataType {
-    pub fn string() -> Self {
-        DataType::Primitive(PrimitiveType::String)
-    }
-
-    pub fn long() -> Self {
-        DataType::Primitive(PrimitiveType::Long)
-    }
-
-    pub fn integer() -> Self {
-        DataType::Primitive(PrimitiveType::Integer)
-    }
-
-    pub fn short() -> Self {
-        DataType::Primitive(PrimitiveType::Short)
-    }
-
-    pub fn byte() -> Self {
-        DataType::Primitive(PrimitiveType::Byte)
-    }
-
-    pub fn float() -> Self {
-        DataType::Primitive(PrimitiveType::Float)
-    }
-
-    pub fn double() -> Self {
-        DataType::Primitive(PrimitiveType::Double)
-    }
-
-    pub fn boolean() -> Self {
-        DataType::Primitive(PrimitiveType::Boolean)
-    }
-
-    pub fn binary() -> Self {
-        DataType::Primitive(PrimitiveType::Binary)
-    }
-
-    pub fn date() -> Self {
-        DataType::Primitive(PrimitiveType::Date)
-    }
-
-    pub fn timestamp() -> Self {
-        DataType::Primitive(PrimitiveType::Timestamp)
-    }
+    pub const STRING: Self = DataType::Primitive(PrimitiveType::String);
+    pub const LONG: Self = DataType::Primitive(PrimitiveType::Long);
+    pub const INTEGER: Self = DataType::Primitive(PrimitiveType::Integer);
+    pub const SHORT: Self = DataType::Primitive(PrimitiveType::Short);
+    pub const BYTE: Self = DataType::Primitive(PrimitiveType::Byte);
+    pub const FLOAT: Self = DataType::Primitive(PrimitiveType::Float);
+    pub const DOUBLE: Self = DataType::Primitive(PrimitiveType::Double);
+    pub const BOOLEAN: Self = DataType::Primitive(PrimitiveType::Boolean);
+    pub const BINARY: Self = DataType::Primitive(PrimitiveType::Binary);
+    pub const DATE: Self = DataType::Primitive(PrimitiveType::Date);
+    pub const TIMESTAMP: Self = DataType::Primitive(PrimitiveType::Timestamp);
 
     pub fn decimal(precision: usize, scale: usize) -> Self {
         DataType::Primitive(PrimitiveType::Decimal(precision as i32, scale as i32))
