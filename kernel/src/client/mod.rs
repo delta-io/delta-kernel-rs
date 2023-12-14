@@ -22,6 +22,7 @@ use crate::{
     DeltaResult, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler, TableClient,
 };
 
+pub mod conversion;
 pub mod executor;
 pub mod expression;
 pub mod file_handler;
