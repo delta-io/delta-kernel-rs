@@ -120,9 +120,8 @@ impl LogSegment {
 /// throughout time, `Snapshot`s represent a view of a table at a specific point in time; they
 /// have a defined schema (which may change over time for any given table), specific version, and
 /// frozen log segment.
-pub struct Snapshot<JRC: Send, PRC: Send> {
+pub struct Snapshot {
     pub(crate) table_root: Url,
-    pub(crate) table_client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
     pub(crate) log_segment: LogSegment,
     version: Version,
     metadata: Metadata,
@@ -130,7 +129,7 @@ pub struct Snapshot<JRC: Send, PRC: Send> {
     schema: Schema,
 }
 
-impl<JRC: Send, PRC: Send> std::fmt::Debug for Snapshot<JRC, PRC> {
+impl std::fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Snapshot")
             .field("path", &self.log_segment.log_root.as_str())
@@ -140,7 +139,7 @@ impl<JRC: Send, PRC: Send> std::fmt::Debug for Snapshot<JRC, PRC> {
     }
 }
 
-impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
+impl Snapshot {
     /// Create a new [`Snapshot`] instance for the given version.
     ///
     /// # Parameters
@@ -148,9 +147,9 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
     /// - `location`: url pointing at the table root (where `_delta_log` folder is located)
     /// - `table_client`: Implementation of [`TableClient`] apis.
     /// - `version`: target version of the [`Snapshot`]
-    pub fn try_new(
+    pub fn try_new<JRC: Send, PRC: Send>(
         table_root: Url,
-        table_client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
+        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
         version: Option<Version>,
     ) -> DeltaResult<Arc<Self>> {
         let fs_client = table_client.get_file_system_client();
@@ -198,28 +197,26 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
 
         Ok(Arc::new(Self::new_from_log_segment(
             table_root,
-            table_client,
             log_segment,
             version_eff,
+            table_client,
         )?))
     }
 
     /// Create a new [`Snapshot`] instance.
-    pub(crate) fn new_from_log_segment(
+    pub(crate) fn new_from_log_segment<JRC: Send, PRC: Send>(
         location: Url,
-        client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
         log_segment: LogSegment,
         version: Version,
+        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
     ) -> DeltaResult<Self> {
         let (metadata, protocol) = log_segment
-            .read_metadata(client.as_ref())?
+            .read_metadata(table_client)?
             .ok_or(Error::MissingMetadata)?;
 
         let schema = metadata.schema()?;
-
         Ok(Self {
             table_root: location,
-            table_client: client,
             log_segment,
             version,
             metadata,
@@ -228,14 +225,15 @@ impl<JRC: Send, PRC: Send + Sync> Snapshot<JRC, PRC> {
         })
     }
 
+    /// Log segment this snapshot uses
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    fn _log_segment(&self) -> &LogSegment {
+        &self.log_segment
+    }
+
     /// Version of this [`Snapshot`] in the table.
     pub fn version(&self) -> Version {
         self.version
-    }
-
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    fn _get_log_segment(&self) -> &LogSegment {
-        &self.log_segment
     }
 
     /// Table [`Schema`] at this [`Snapshot`]s version.
@@ -398,15 +396,13 @@ mod tests {
     use crate::filesystem::ObjectStoreFileSystemClient;
     use crate::schema::StructType;
 
-    fn default_table_client(url: &Url) -> Arc<DefaultTableClient<TokioBackgroundExecutor>> {
-        Arc::new(
-            DefaultTableClient::try_new(
-                url,
-                HashMap::<String, String>::new(),
-                Arc::new(TokioBackgroundExecutor::new()),
-            )
-            .unwrap(),
+    fn default_table_client(url: &Url) -> DefaultTableClient<TokioBackgroundExecutor> {
+        DefaultTableClient::try_new(
+            url,
+            HashMap::<String, String>::new(),
+            Arc::new(TokioBackgroundExecutor::new()),
         )
+        .unwrap()
     }
 
     #[test]
@@ -416,7 +412,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let client = default_table_client(&url);
-        let snapshot = Snapshot::try_new(url, client, Some(1)).unwrap();
+        let snapshot = Snapshot::try_new(url, &client, Some(1)).unwrap();
 
         let expected = Protocol {
             min_reader_version: 3,
@@ -438,7 +434,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let client = default_table_client(&url);
-        let snapshot = Snapshot::try_new(url, client, None).unwrap();
+        let snapshot = Snapshot::try_new(url, &client, None).unwrap();
 
         let expected = Protocol {
             min_reader_version: 3,
@@ -480,7 +476,7 @@ mod tests {
         .unwrap();
         let location = url::Url::from_directory_path(path).unwrap();
         let table_client = default_table_client(&location);
-        let snapshot = Snapshot::try_new(location, table_client, None).unwrap();
+        let snapshot = Snapshot::try_new(location, &table_client, None).unwrap();
 
         assert_eq!(snapshot.log_segment.checkpoint_files.len(), 1);
         assert_eq!(

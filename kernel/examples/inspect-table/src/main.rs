@@ -66,10 +66,9 @@ fn main() {
         );
         return;
     };
-    let table_client = Arc::new(table_client);
 
-    let table = Table::new(url, table_client.clone());
-    let snapshot = table.snapshot(None);
+    let table = Table::new(url);
+    let snapshot = table.snapshot(&table_client, None);
     let Ok(snapshot) = snapshot else {
         println!(
             "Failed to construct latest snapshot: {}",
@@ -91,7 +90,11 @@ fn main() {
         Commands::Adds => {
             use deltakernel::Add;
             let scan = ScanBuilder::new(snapshot).build();
-            let files: Vec<Add> = scan.files().unwrap().map(|r| r.unwrap()).collect();
+            let files: Vec<Add> = scan
+                .files(&table_client)
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
             println!("{:#?}", files);
         }
         Commands::Actions { forward } => {
@@ -112,8 +115,8 @@ fn main() {
             });
 
             let batches = snapshot
-                ._get_log_segment()
-                .replay(&*table_client, read_schema, None);
+                ._log_segment()
+                .replay(&table_client, read_schema, None);
 
             let batch_vec = batches
                 .unwrap()

@@ -88,20 +88,20 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let table_client = Arc::new(DefaultTableClient::new(
+    let table_client = DefaultTableClient::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
-    ));
+    );
 
-    let table = Table::new(location, table_client);
+    let table = Table::new(location);
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.snapshot(None)?;
+    let snapshot = table.snapshot(&table_client, None)?;
     let scan = ScanBuilder::new(snapshot).build();
 
     let mut files = 0;
-    let stream = scan.execute()?.into_iter().zip(expected_data);
+    let stream = scan.execute(&table_client)?.into_iter().zip(expected_data);
 
     for (data, expected) in stream {
         files += 1;
@@ -138,20 +138,20 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let table_client = Arc::new(DefaultTableClient::new(
+    let table_client = DefaultTableClient::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
-    ));
+    );
 
-    let table = Table::new(location, table_client);
+    let table = Table::new(location);
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.snapshot(None).unwrap();
+    let snapshot = table.snapshot(&table_client, None).unwrap();
     let scan = ScanBuilder::new(snapshot).build();
 
     let mut files = 0;
-    let stream = scan.execute()?.into_iter().zip(expected_data);
+    let stream = scan.execute(&table_client)?.into_iter().zip(expected_data);
 
     for (data, expected) in stream {
         files += 1;
@@ -192,19 +192,19 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let table_client = Arc::new(DefaultTableClient::new(
+    let table_client = DefaultTableClient::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
-    ));
+    );
 
-    let table = Table::new(location, table_client);
+    let table = Table::new(location);
     let expected_data = vec![batch];
 
-    let snapshot = table.snapshot(None)?;
+    let snapshot = table.snapshot(&table_client, None)?;
     let scan = ScanBuilder::new(snapshot).build();
 
-    let stream = scan.execute()?.into_iter().zip(expected_data);
+    let stream = scan.execute(&table_client)?.into_iter().zip(expected_data);
 
     let mut files = 0;
     for (data, expected) in stream {
@@ -266,14 +266,14 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let table_client = Arc::new(DefaultTableClient::new(
+    let table_client = DefaultTableClient::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
-    ));
+    );
 
-    let table = Table::new(location, table_client);
-    let snapshot = table.snapshot(None)?;
+    let table = Table::new(location);
+    let snapshot = table.snapshot(&table_client, None)?;
 
     // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
     // we validate the boundary values where we expect the set of matched files to change.
@@ -318,7 +318,10 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
 
         let expected_files = expected_batches.len();
         let mut files_scanned = 0;
-        let stream = scan.execute()?.into_iter().zip(expected_batches);
+        let stream = scan
+            .execute(&table_client)?
+            .into_iter()
+            .zip(expected_batches);
 
         for (batch, expected) in stream {
             files_scanned += 1;

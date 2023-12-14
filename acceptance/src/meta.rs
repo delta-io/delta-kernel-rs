@@ -72,10 +72,10 @@ impl TestCaseInfo {
         Ok((latest, cases))
     }
 
-    fn assert_snapshot_meta<JRC: Send, PRC: Send + Sync>(
+    fn assert_snapshot_meta(
         &self,
         case: &TableVersionMetaData,
-        snapshot: &Snapshot<JRC, PRC>,
+        snapshot: &Snapshot,
     ) -> TestResult<()> {
         assert_eq!(snapshot.version(), case.version);
 
@@ -100,15 +100,16 @@ impl TestCaseInfo {
         &self,
         table_client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
     ) -> TestResult<()> {
-        let table = Table::new(self.table_root()?, table_client);
+        let table_client = table_client.as_ref();
+        let table = Table::new(self.table_root()?);
 
         let (latest, versions) = self.versions().await?;
 
-        let snapshot = table.snapshot(None)?;
+        let snapshot = table.snapshot(table_client, None)?;
         self.assert_snapshot_meta(&latest, &snapshot)?;
 
         for table_version in versions {
-            let snapshot = table.snapshot(Some(table_version.version))?;
+            let snapshot = table.snapshot(table_client, Some(table_version.version))?;
             self.assert_snapshot_meta(&table_version, &snapshot)?;
         }
 
