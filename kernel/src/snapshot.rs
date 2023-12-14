@@ -418,19 +418,17 @@ mod tests {
         let client = default_table_client(&url);
         let snapshot = Snapshot::try_new(url, client, Some(1)).unwrap();
 
-        let protocol = snapshot.protocol();
         let expected = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
             reader_features: Some(vec!["deletionVectors".into()]),
             writer_features: Some(vec!["deletionVectors".into()]),
         };
-        assert_eq!(protocol, &expected);
+        assert_eq!(snapshot.protocol(), &expected);
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
         let expected: StructType = serde_json::from_str(schema_string).unwrap();
-        let schema = snapshot.schema();
-        assert_eq!(schema, &expected);
+        assert_eq!(snapshot.schema(), &expected);
     }
 
     #[test]
@@ -442,19 +440,17 @@ mod tests {
         let client = default_table_client(&url);
         let snapshot = Snapshot::try_new(url, client, None).unwrap();
 
-        let protocol = snapshot.protocol();
         let expected = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
             reader_features: Some(vec!["deletionVectors".into()]),
             writer_features: Some(vec!["deletionVectors".into()]),
         };
-        assert_eq!(protocol, &expected);
+        assert_eq!(snapshot.protocol(), &expected);
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
         let expected: StructType = serde_json::from_str(schema_string).unwrap();
-        let schema = snapshot.schema();
-        assert_eq!(schema, &expected);
+        assert_eq!(snapshot.schema(), &expected);
     }
 
     #[test]
