@@ -109,9 +109,19 @@ fn rewite(expr: &Expression) -> Option<Expression> {
             },
             _ => None,
         },
-        VariadicOperation { op, exprs } => Some(VariadicOperation {
+        VariadicOperation {
+            op: op @ VariadicOperator::And,
+            exprs,
+        } => Some(VariadicOperation {
             op: op.clone(),
             exprs: exprs.iter().filter_map(rewite).collect::<Vec<_>>(),
+        }),
+        VariadicOperation {
+            op: op @ VariadicOperator::Or,
+            exprs,
+        } => Some(VariadicOperation {
+            op: op.clone(),
+            exprs: exprs.iter().map(rewite).collect::<Option<Vec<_>>>()?,
         }),
         _ => None,
     }
@@ -156,7 +166,7 @@ impl DataSkippingFilter {
 
         let stats_schema = Arc::new(StructType::new(vec![
             StructField::new("minValues", StructType::new(data_fields.clone()), true),
-            StructField::new("maxValues", StructType::new(data_fields.clone()), true),
+            StructField::new("maxValues", StructType::new(data_fields), true),
         ]));
 
         let skipping_predicate = rewite(predicate)?;
