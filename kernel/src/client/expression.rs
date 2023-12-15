@@ -76,7 +76,7 @@ impl Scalar {
     }
 }
 
-fn wrap_ord_result(arr: BooleanArray) -> ArrayRef {
+fn wrap_comparison_result(arr: BooleanArray) -> ArrayRef {
     Arc::new(arr) as Arc<dyn Array>
 }
 
@@ -107,12 +107,12 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
                 Minus => sub,
                 Multiply => mul,
                 Divide => div,
-                LessThan => |l, r| lt(l, r).map(wrap_ord_result),
-                LessThanOrEqual => |l, r| lt_eq(l, r).map(wrap_ord_result),
-                GreaterThan => |l, r| gt(l, r).map(wrap_ord_result),
-                GreaterThanOrEqual => |l, r| gt_eq(l, r).map(wrap_ord_result),
-                Equal => |l, r| eq(l, r).map(wrap_ord_result),
-                NotEqual => |l, r| neq(l, r).map(wrap_ord_result),
+                LessThan => |l, r| lt(l, r).map(wrap_comparison_result),
+                LessThanOrEqual => |l, r| lt_eq(l, r).map(wrap_comparison_result),
+                GreaterThan => |l, r| gt(l, r).map(wrap_comparison_result),
+                GreaterThanOrEqual => |l, r| gt_eq(l, r).map(wrap_comparison_result),
+                Equal => |l, r| eq(l, r).map(wrap_comparison_result),
+                NotEqual => |l, r| neq(l, r).map(wrap_comparison_result),
             };
 
             eval(&left_arr, &right_arr).map_err(|err| Error::GenericError {
@@ -120,33 +120,19 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
             })
         }
         VariadicOperation { op, exprs } => {
-            let mut arrs = Vec::with_capacity(exprs.len());
-            for expr in exprs {
-                let arr = evaluate_expression(expr, batch)?;
-                arrs.push(arr);
-            }
-            let arrs = arrs
-                .iter()
-                .map(|arr| downcast_to_bool(arr))
-                .collect::<DeltaResult<Vec<_>>>()?;
-            let result = match arrs.len() {
-                0 => {
-                    BooleanArray::from(vec![matches!(op, VariadicOperator::And); batch.num_rows()])
-                }
-                1 => arrs[0].clone(),
-                _ => {
-                    let eval = match op {
-                        VariadicOperator::And => and,
-                        VariadicOperator::Or => or,
-                    };
-                    // Safety: Since we evaluated the expression, we know that all the arrays are of the same length
-                    // and we already downcasted to boolean. So we can safely unwrap.
-                    arrs[1..]
-                        .iter()
-                        .fold(arrs[0].clone(), |acc, arr| eval(&acc, arr).unwrap())
-                }
+            let reducer = match op {
+                VariadicOperator::And => and,
+                VariadicOperator::Or => or,
             };
-            Ok(Arc::new(result))
+            exprs
+                .iter()
+                .map(|expr| evaluate_expression(expr, batch))
+                .reduce(|l, r| {
+                    Ok(reducer(downcast_to_bool(&l?)?, downcast_to_bool(&r?)?)
+                        .map(wrap_comparison_result)?)
+                })
+                .transpose()?
+                .ok_or(Error::Generic("empty expression".to_string()))
         }
     }
 }

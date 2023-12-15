@@ -166,6 +166,9 @@ impl Expression {
 
     fn variadic_op_impl(self, other: impl IntoIterator<Item = Self>, op: VariadicOperator) -> Self {
         let mut exprs = other.into_iter().collect::<Vec<_>>();
+        if exprs.is_empty() {
+            return self;
+        }
         exprs.insert(0, self);
         Self::VariadicOperation { op, exprs }
     }
@@ -284,6 +287,20 @@ mod tests {
             (
                 (col_ref.clone() + Expr::literal(4)) / Expr::literal(10) * Expr::literal(42),
                 "Column(x) + 4 / 10 * 42",
+            ),
+            (
+                col_ref
+                    .clone()
+                    .gt_eq(Expr::literal(2))
+                    .and([col_ref.clone().lt_eq(Expr::literal(10))]),
+                "AND(Column(x) >= 2, Column(x) <= 10)",
+            ),
+            (
+                col_ref
+                    .clone()
+                    .gt(Expr::literal(2))
+                    .or([col_ref.clone().lt(Expr::literal(10))]),
+                "OR(Column(x) > 2, Column(x) < 10)",
             ),
             (col_ref.eq(Expr::literal("foo")), "Column(x) = 'foo'"),
         ];
