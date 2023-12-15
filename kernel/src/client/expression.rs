@@ -290,7 +290,7 @@ mod tests {
         let column_a = Expression::Column("a".to_string());
         let column_b = Expression::Column("b".to_string());
 
-        let expression = Box::new(column_a.clone().and([column_b.clone()]));
+        let expression = Box::new(column_a.clone().and(column_b.clone()));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![false, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
@@ -298,13 +298,13 @@ mod tests {
         let expression = Box::new(
             column_a
                 .clone()
-                .and([Expression::literal(Scalar::Boolean(true))]),
+                .and(Expression::literal(Scalar::Boolean(true))),
         );
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
-        let expression = Box::new(column_a.clone().or([column_b]));
+        let expression = Box::new(column_a.clone().or(column_b));
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, true]));
         assert_eq!(results.as_ref(), expected.as_ref());
@@ -312,7 +312,7 @@ mod tests {
         let expression = Box::new(
             column_a
                 .clone()
-                .or([Expression::literal(Scalar::Boolean(false))]),
+                .or(Expression::literal(Scalar::Boolean(false))),
         );
         let results = evaluate_expression(&expression, &batch).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, false]));

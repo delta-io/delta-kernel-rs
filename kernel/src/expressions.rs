@@ -204,12 +204,22 @@ impl Expression {
     }
 
     /// Create a new expression `self AND other`
-    pub fn and(self, other: impl IntoIterator<Item = Self>) -> Self {
+    pub fn and(self, other: Self) -> Self {
+        self.and_many([other])
+    }
+
+    /// Create a new expression `self AND others`
+    pub fn and_many(self, other: impl IntoIterator<Item = Self>) -> Self {
         self.variadic_op_impl(other, VariadicOperator::And)
     }
 
+    /// Create a new expression `self AND other`
+    pub fn or(self, other: Self) -> Self {
+        self.or_many([other])
+    }
+
     /// Create a new expression `self OR other`
-    pub fn or(self, other: impl IntoIterator<Item = Self>) -> Self {
+    pub fn or_many(self, other: impl IntoIterator<Item = Self>) -> Self {
         self.variadic_op_impl(other, VariadicOperator::Or)
     }
 
@@ -292,14 +302,21 @@ mod tests {
                 col_ref
                     .clone()
                     .gt_eq(Expr::literal(2))
-                    .and([col_ref.clone().lt_eq(Expr::literal(10))]),
+                    .and(col_ref.clone().lt_eq(Expr::literal(10))),
                 "AND(Column(x) >= 2, Column(x) <= 10)",
+            ),
+            (
+                col_ref.clone().gt_eq(Expr::literal(2)).and_many([
+                    col_ref.clone().lt_eq(Expr::literal(10)),
+                    col_ref.clone().lt_eq(Expr::literal(100)),
+                ]),
+                "AND(Column(x) >= 2, Column(x) <= 10, Column(x) <= 100)",
             ),
             (
                 col_ref
                     .clone()
                     .gt(Expr::literal(2))
-                    .or([col_ref.clone().lt(Expr::literal(10))]),
+                    .or(col_ref.clone().lt(Expr::literal(10))),
                 "OR(Column(x) > 2, Column(x) < 10)",
             ),
             (col_ref.eq(Expr::literal("foo")), "Column(x) = 'foo'"),
