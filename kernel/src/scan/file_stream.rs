@@ -57,7 +57,7 @@ impl LogReplayScanner {
         let adds: Vec<Add> = parse_actions(actions, &schema_to_use)?
             .filter_map(|action| match action {
                 Action::Add(add)
-                    // Note: each (add.path + add.dv_unique_id()) pair has a 
+                    // Note: each (add.path + add.dv_unique_id()) pair has a
                     // unique Add + Remove pair in the log. For example:
                     // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
                     if !self

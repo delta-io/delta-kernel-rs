@@ -1,36 +1,48 @@
+use self::scalars::Scalar;
+use itertools::Itertools;
 use std::{
     collections::HashSet,
     fmt::{Display, Formatter},
 };
 
-use self::scalars::Scalar;
-
 pub mod scalars;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// A binary operator.
 pub enum BinaryOperator {
-    // Logical
+    /// Arithmetic Plus
+    Plus,
+    /// Arithmetic Minus
+    Minus,
+    /// Arithmetic Multiply
+    Multiply,
+    /// Arithmetic Divide
+    Divide,
+    /// Comparison Less Than
+    LessThan,
+    /// Comparison Less Than Or Equal
+    LessThanOrEqual,
+    /// Comparison Greater Than
+    GreaterThan,
+    /// Comparison Greater Than Or Equal
+    GreaterThanOrEqual,
+    /// Comparison Equal
+    Equal,
+    /// Comparison Not Equal
+    NotEqual,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum VariadicOperator {
     And,
     Or,
-    // Arithmetic
-    Plus,
-    Minus,
-    Multiply,
-    Divide,
-    // Comparison
-    LessThan,
-    LessThanOrEqual,
-    GreaterThan,
-    GreaterThanOrEqual,
-    Equal,
-    NotEqual,
 }
 
 impl Display for BinaryOperator {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::And => write!(f, "AND"),
-            Self::Or => write!(f, "OR"),
+            // Self::And => write!(f, "AND"),
+            // Self::Or => write!(f, "OR"),
             Self::Plus => write!(f, "+"),
             Self::Minus => write!(f, "-"),
             Self::Multiply => write!(f, "*"),
@@ -46,8 +58,11 @@ impl Display for BinaryOperator {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// A unary operator.
 pub enum UnaryOperator {
+    /// Unary Not
     Not,
+    /// Unary Is Null
     IsNull,
 }
 
@@ -62,14 +77,27 @@ pub enum Expression {
     Literal(Scalar),
     /// A column reference by name.
     Column(String),
+    /// A binary operation.
     BinaryOperation {
+        /// The operator.
         op: BinaryOperator,
+        /// The left-hand side of the operation.
         left: Box<Expression>,
+        /// The right-hand side of the operation.
         right: Box<Expression>,
     },
+    /// A unary operation.
     UnaryOperation {
+        /// The operator.
         op: UnaryOperator,
+        /// The expression.
         expr: Box<Expression>,
+    },
+    VariadicOperation {
+        /// The operator.
+        op: VariadicOperator,
+        /// The expressions.
+        exprs: Vec<Expression>,
     },
     // TODO: support more expressions, such as IS IN, LIKE, etc.
 }
@@ -79,16 +107,26 @@ impl Display for Expression {
         match self {
             Self::Literal(l) => write!(f, "{}", l),
             Self::Column(name) => write!(f, "Column({})", name),
-            Self::BinaryOperation { op, left, right } => {
-                match op {
-                    // OR requires parentheses
-                    BinaryOperator::Or => write!(f, "({} OR {})", left, right),
-                    _ => write!(f, "{} {} {}", left, op, right),
-                }
-            }
+            Self::BinaryOperation { op, left, right } => write!(f, "{} {} {}", left, op, right),
             Self::UnaryOperation { op, expr } => match op {
                 UnaryOperator::Not => write!(f, "NOT {}", expr),
                 UnaryOperator::IsNull => write!(f, "{} IS NULL", expr),
+            },
+            Self::VariadicOperation { op, exprs } => match op {
+                VariadicOperator::And => {
+                    write!(
+                        f,
+                        "AND({})",
+                        &exprs.iter().map(|e| format!("{e}")).join(", ")
+                    )
+                }
+                VariadicOperator::Or => {
+                    write!(
+                        f,
+                        "OR({})",
+                        &exprs.iter().map(|e| format!("{e}")).join(", ")
+                    )
+                }
             },
         }
     }
@@ -126,6 +164,15 @@ impl Expression {
         }
     }
 
+    fn variadic_op_impl(self, other: impl IntoIterator<Item = Self>, op: VariadicOperator) -> Self {
+        let mut exprs = other.into_iter().collect::<Vec<_>>();
+        if exprs.is_empty() {
+            return self;
+        }
+        exprs.insert(0, self);
+        Self::VariadicOperation { op, exprs }
+    }
+
     /// Create a new expression `self == other`
     pub fn eq(self, other: Self) -> Self {
         self.binary_op_impl(other, BinaryOperator::Equal)
@@ -158,12 +205,22 @@ impl Expression {
 
     /// Create a new expression `self AND other`
     pub fn and(self, other: Self) -> Self {
-        self.binary_op_impl(other, BinaryOperator::And)
+        self.and_many([other])
+    }
+
+    /// Create a new expression `self AND others`
+    pub fn and_many(self, other: impl IntoIterator<Item = Self>) -> Self {
+        self.variadic_op_impl(other, VariadicOperator::And)
+    }
+
+    /// Create a new expression `self AND other`
+    pub fn or(self, other: Self) -> Self {
+        self.or_many([other])
     }
 
     /// Create a new expression `self OR other`
-    pub fn or(self, other: Self) -> Self {
-        self.binary_op_impl(other, BinaryOperator::Or)
+    pub fn or_many(self, other: impl IntoIterator<Item = Self>) -> Self {
+        self.variadic_op_impl(other, VariadicOperator::Or)
     }
 
     fn walk(&self) -> impl Iterator<Item = &Self> + '_ {
@@ -180,6 +237,11 @@ impl Expression {
                 Self::UnaryOperation { expr, .. } => {
                     stack.push(expr);
                 }
+                Self::VariadicOperation { op, exprs } => match op {
+                    VariadicOperator::And | VariadicOperator::Or => {
+                        stack.extend(exprs.iter());
+                    }
+                },
             }
             Some(expr)
         })
@@ -229,26 +291,33 @@ mod tests {
             (col_ref.clone(), "Column(x)"),
             (col_ref.clone().eq(Expr::literal(2)), "Column(x) = 2"),
             (
-                col_ref
-                    .clone()
-                    .gt_eq(Expr::literal(2))
-                    .and(col_ref.clone().lt_eq(Expr::literal(10))),
-                "Column(x) >= 2 AND Column(x) <= 10",
-            ),
-            (
-                col_ref
-                    .clone()
-                    .gt(Expr::literal(2))
-                    .or(col_ref.clone().lt(Expr::literal(10))),
-                "(Column(x) > 2 OR Column(x) < 10)",
-            ),
-            (
                 (col_ref.clone() - Expr::literal(4)).lt(Expr::literal(10)),
                 "Column(x) - 4 < 10",
             ),
             (
                 (col_ref.clone() + Expr::literal(4)) / Expr::literal(10) * Expr::literal(42),
                 "Column(x) + 4 / 10 * 42",
+            ),
+            (
+                col_ref
+                    .clone()
+                    .gt_eq(Expr::literal(2))
+                    .and(col_ref.clone().lt_eq(Expr::literal(10))),
+                "AND(Column(x) >= 2, Column(x) <= 10)",
+            ),
+            (
+                col_ref.clone().gt_eq(Expr::literal(2)).and_many([
+                    col_ref.clone().lt_eq(Expr::literal(10)),
+                    col_ref.clone().lt_eq(Expr::literal(100)),
+                ]),
+                "AND(Column(x) >= 2, Column(x) <= 10, Column(x) <= 100)",
+            ),
+            (
+                col_ref
+                    .clone()
+                    .gt(Expr::literal(2))
+                    .or(col_ref.clone().lt(Expr::literal(10))),
+                "OR(Column(x) > 2, Column(x) < 10)",
             ),
             (col_ref.eq(Expr::literal("foo")), "Column(x) = 'foo'"),
         ];

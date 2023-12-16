@@ -14,9 +14,8 @@ use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{DynObjectStore, GetResultPayload};
 
-use super::file_handler::{FileOpenFuture, FileOpener};
-use crate::executor::TaskExecutor;
-use crate::file_handler::FileStream;
+use super::executor::TaskExecutor;
+use super::file_handler::{FileOpenFuture, FileOpener, FileStream};
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, Error, Expression, FileDataReadResultIterator, FileHandler, FileMeta, JsonHandler,

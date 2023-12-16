@@ -45,23 +45,11 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
 
         let store = self.inner.clone();
 
-        // This channel will report whether initialization succeeded
-        let (res_sender, res_receiver) =
-            std::sync::mpsc::channel::<Result<(), object_store::Error>>();
         // This channel will become the iterator
         let (sender, receiver) = std::sync::mpsc::sync_channel(4_000);
 
         self.task_executor.spawn(async move {
-            let mut stream = match store.list_with_offset(Some(&prefix), &offset).await {
-                Ok(stream) => {
-                    res_sender.send(Ok(())).ok();
-                    stream
-                }
-                Err(e) => {
-                    res_sender.send(Err(e)).ok();
-                    return;
-                }
-            };
+            let mut stream = store.list_with_offset(Some(&prefix), &offset);
 
             while let Some(meta) = stream.next().await {
                 match meta {
@@ -82,9 +70,6 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
                 }
             }
         });
-
-        // Wait for successful init
-        res_receiver.recv().unwrap()?;
 
         Ok(Box::new(receiver.into_iter()))
     }

@@ -114,7 +114,7 @@ pub trait ExpressionHandler {
     /// [`Schema`]: arrow_schema::Schema
     fn get_evaluator(
         &self,
-        schema: ArrowSchemaRef,
+        schema: SchemaRef,
         expression: Expression,
     ) -> Arc<dyn ExpressionEvaluator>;
 }
