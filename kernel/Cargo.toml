@@ -11,9 +11,6 @@ version.workspace = true
 [dependencies]
 arrow-array = { version = "^49.0" }
 arrow-arith = { version = "^49.0" }
-arrow-json = { version = "^49.0" }
-arrow-ord = { version = "^49.0" }
-arrow-schema = { version = "^49.0" }
 arrow-select = { version = "^49.0" }
 bytes = "1.4"
 chrono = { version = "0.4" }
@@ -36,6 +33,9 @@ z85 = "3.0.5"
 visibility = "0.1.0"
 
 # Used in default client
+arrow-json = { version = "^49.0", optional = true }
+arrow-ord = { version = "^49.0", optional = true }
+arrow-schema = { version = "^49.0", optional = true }
 futures = { version = "0.3", optional = true }
 object_store = { version = "^0.8.0", optional = true }
 parquet = { version = "^49.0", optional = true, features = [
@@ -48,7 +48,14 @@ tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
 
 [features]
 default = ["default-client"]
-default-client = ["futures", "object_store", "parquet"]
+default-client = [
+  "arrow-json",
+  "arrow-ord",
+  "arrow-schema",
+  "futures",
+  "object_store",
+  "parquet",
+]
 developer-visibility = []
 
 [dev-dependencies]

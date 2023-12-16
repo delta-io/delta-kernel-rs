@@ -1,12 +1,8 @@
 use std::collections::HashSet;
-use std::io::BufReader;
 use std::sync::Arc;
 
 use arrow_arith::boolean::is_null;
-use arrow_array::{new_null_array, Array, BooleanArray, RecordBatch, StringArray, StructArray};
-use arrow_json::ReaderBuilder;
-use arrow_schema::Schema as ArrowSchema;
-use arrow_select::concat::concat_batches;
+use arrow_array::{Array, BooleanArray, RecordBatch, StringArray, StructArray};
 use arrow_select::filter::filter_record_batch;
 use arrow_select::nullif::nullif;
 use tracing::debug;
@@ -14,7 +10,7 @@ use tracing::debug;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{BinaryOperator, Expression as Expr, VariadicOperator};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
-use crate::{EngineInterface, ExpressionEvaluator};
+use crate::{EngineInterface, ExpressionEvaluator, JsonHandler};
 
 /// Returns <op2> (if any) such that B <op2> A is equivalent to A <op> B.
 fn commute(op: &BinaryOperator) -> Option<BinaryOperator> {
@@ -101,6 +97,7 @@ fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
 pub(crate) struct DataSkippingFilter {
     stats_schema: SchemaRef,
     evaluator: Arc<dyn ExpressionEvaluator>,
+    json_handler: Arc<dyn JsonHandler>,
 }
 
 impl DataSkippingFilter {
@@ -140,16 +137,16 @@ impl DataSkippingFilter {
             StructField::new("maxValues", StructType::new(data_fields), true),
         ]));
 
-        let skipping_predicate = as_data_skipping_predicate(predicate)?;
         let evaluator = table_client.get_expression_handler().get_evaluator(
             stats_schema.clone(),
-            skipping_predicate,
+            as_data_skipping_predicate(predicate)?,
             DataType::BOOLEAN,
         );
 
         Some(Self {
             stats_schema,
             evaluator,
+            json_handler: table_client.get_json_handler(),
         })
     }
 
@@ -171,16 +168,9 @@ impl DataSkippingFilter {
                 "Expected type 'StringArray'.",
             ))?;
 
-        let stats_schema = Arc::new(self.stats_schema.as_ref().try_into()?);
-
-        let parsed_stats = concat_batches(
-            &stats_schema,
-            stats
-                .iter()
-                .map(|json_string| Self::hack_parse(&stats_schema, json_string))
-                .collect::<Result<Vec<_>, _>>()?
-                .iter(),
-        )?;
+        let parsed_stats = self
+            .json_handler
+            .parse_json(stats.clone(), self.stats_schema.clone())?;
 
         // Skipping happens in several steps:
         //
@@ -203,7 +193,6 @@ impl DataSkippingFilter {
                 "Expected type 'BooleanArray'.",
             ))?;
 
-        // let skipping_vector = self.predicate.invoke(&parsed_stats)?;
         let skipping_vector = &is_null(&nullif(skipping_vector, skipping_vector)?)?;
 
         let before_count = actions.num_rows();
@@ -213,29 +202,6 @@ impl DataSkippingFilter {
             after.num_rows()
         );
         Ok(after)
-    }
-
-    fn hack_parse(
-        stats_schema: &Arc<ArrowSchema>,
-        json_string: Option<&str>,
-    ) -> DeltaResult<RecordBatch> {
-        match json_string {
-            Some(s) => Ok(ReaderBuilder::new(stats_schema.clone())
-                .build(BufReader::new(s.as_bytes()))?
-                .collect::<Vec<_>>()
-                .into_iter()
-                .next()
-                .transpose()?
-                .ok_or(Error::missing_data("Expected data"))?),
-            None => Ok(RecordBatch::try_new(
-                stats_schema.clone(),
-                stats_schema
-                    .fields
-                    .iter()
-                    .map(|field| new_null_array(field.data_type(), 1))
-                    .collect(),
-            )?),
-        }
     }
 }
 

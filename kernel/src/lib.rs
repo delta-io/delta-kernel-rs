@@ -103,14 +103,16 @@ pub trait ExpressionEvaluator {
 /// fill up partition column values and any computation on data using Expressions.
 pub trait ExpressionHandler {
     /// Create an [`ExpressionEvaluator`] that can evaluate the given [`Expression`]
-    /// on columnar batches with the given [`Schema`].
+    /// on columnar batches with the given [`Schema`] to produce data of [`DataType`].
     ///
     /// # Parameters
     ///
     /// - `schema`: Schema of the input data.
     /// - `expression`: Expression to evaluate.
+    /// - `output_type`: Expected result data type.
     ///
-    /// [`Schema`]: arrow_schema::Schema
+    /// [`Schema`]: crate::schema::StructType
+    /// [`DataType`]: crate::schema::DataType
     fn get_evaluator(
         &self,
         schema: SchemaRef,

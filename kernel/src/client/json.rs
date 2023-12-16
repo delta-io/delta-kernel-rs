@@ -1,13 +1,13 @@
 //! Default Json handler implementation
 
-use std::io::{BufReader, Cursor};
+use std::io::{BufRead, BufReader, Cursor};
 use std::ops::Range;
 use std::sync::Arc;
 use std::task::{ready, Poll};
 
-use arrow_array::{RecordBatch, StringArray};
-use arrow_json::ReaderBuilder;
-use arrow_schema::SchemaRef as ArrowSchemaRef;
+use arrow_array::{new_null_array, Array, RecordBatch, StringArray};
+use arrow_json::{reader::Decoder, ReaderBuilder};
+use arrow_schema::{ArrowError, SchemaRef as ArrowSchemaRef};
 use arrow_select::concat::concat_batches;
 use bytes::{Buf, Bytes};
 use futures::{StreamExt, TryStreamExt};
@@ -21,9 +21,14 @@ use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta
 
 #[derive(Debug)]
 pub struct DefaultJsonHandler<E: TaskExecutor> {
+    /// The object store to read files from
     store: Arc<DynObjectStore>,
+    /// The executor to run async tasks on
     task_executor: Arc<E>,
+    /// The maximun number of batches to read ahead
     readahead: usize,
+    /// The number of rows to read per batch
+    batch_size: usize,
 }
 
 impl<E: TaskExecutor> DefaultJsonHandler<E> {
@@ -32,6 +37,7 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
             store,
             task_executor,
             readahead: 10,
+            batch_size: 1024,
         }
     }
 
@@ -42,6 +48,58 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
         self.readahead = readahead;
         self
     }
+
+    /// Set the number of rows to read per batch during [Self::parse_json()].
+    ///
+    /// Defaults to 1024.
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size;
+        self
+    }
+}
+
+fn read_from_json<R: BufRead>(
+    mut reader: R,
+    decoder: &mut Decoder,
+) -> Result<Vec<RecordBatch>, ArrowError> {
+    let mut next = move || {
+        loop {
+            // Decoder is agnostic that buf doesn't contain whole records
+            let buf = reader.fill_buf()?;
+            if buf.is_empty() {
+                break; // Input exhausted
+            }
+            let read = buf.len();
+            let decoded = decoder.decode(buf)?;
+
+            // Consume the number of bytes read
+            reader.consume(decoded);
+            if decoded != read {
+                break; // Read batch size
+            }
+        }
+        decoder.flush()
+    };
+    std::iter::from_fn(move || next().transpose()).collect::<Result<Vec<_>, _>>()
+}
+
+fn insert_nulls(
+    batches: &mut Vec<RecordBatch>,
+    null_count: usize,
+    schema: ArrowSchemaRef,
+) -> Result<(), ArrowError> {
+    let columns = schema
+        .fields
+        .iter()
+        .map(|field| new_null_array(field.data_type(), null_count))
+        .collect();
+    batches.push(RecordBatch::try_new(schema, columns)?);
+    Ok(())
+}
+
+#[inline]
+fn get_reader(data: &[u8]) -> BufReader<Cursor<&[u8]>> {
+    BufReader::new(Cursor::new(data))
 }
 
 impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
@@ -50,24 +108,56 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         json_strings: StringArray,
         output_schema: SchemaRef,
     ) -> DeltaResult<RecordBatch> {
-        let output_schema: ArrowSchemaRef = Arc::new(output_schema.as_ref().try_into()?);
-        // TODO concatenating to a single string is probably not needed if we use the
-        // lower level RawDecoder APIs
-        let data = json_strings
-            .into_iter()
-            .filter_map(|d| {
-                d.map(|dd| {
-                    let mut data = dd.as_bytes().to_vec();
-                    data.extend("\n".as_bytes());
-                    data
-                })
-            })
-            .flatten()
-            .collect::<Vec<_>>();
+        let json_strings = json_strings
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                Error::Generic(format!(
+                    "Expected json_strings to be a StringArray, found {:?}",
+                    json_strings
+                ))
+            })?;
 
-        let batches = ReaderBuilder::new(output_schema.clone())
-            .build(Cursor::new(data))?
-            .collect::<Result<Vec<_>, _>>()?;
+        let output_schema: ArrowSchemaRef = Arc::new(output_schema.as_ref().try_into()?);
+        let mut decoder = ReaderBuilder::new(output_schema.clone())
+            .with_batch_size(self.batch_size)
+            .build_decoder()?;
+        let mut batches = Vec::new();
+
+        let mut null_count = 0;
+        let mut value_count = 0;
+        let mut value_start = 0;
+
+        for it in 0..json_strings.len() {
+            if json_strings.is_null(it) {
+                if value_count > 0 {
+                    let slice = json_strings.slice(value_start, value_count);
+                    let batch = read_from_json(get_reader(slice.value_data()), &mut decoder)?;
+                    batches.extend(batch);
+                    value_count = 0;
+                }
+                null_count += 1;
+                continue;
+            }
+            if value_count == 0 {
+                value_start = it;
+            }
+            if null_count > 0 {
+                insert_nulls(&mut batches, null_count, output_schema.clone())?;
+                null_count = 0;
+            }
+            value_count += 1;
+        }
+
+        if null_count > 0 {
+            insert_nulls(&mut batches, null_count, output_schema.clone())?;
+        }
+
+        if value_count > 0 {
+            let slice = json_strings.slice(value_start, value_count);
+            let batch = read_from_json(get_reader(slice.value_data()), &mut decoder)?;
+            batches.extend(batch);
+        }
 
         Ok(concat_batches(&output_schema, &batches)?)
     }
@@ -84,8 +174,10 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
 
         let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
         let store = self.store.clone();
-        let file_reader = JsonOpener::new(1024, schema.clone(), store);
-        let stream = FileStream::new(files.to_vec(), schema, file_reader)?;
+        let file_reader = JsonOpener::new(self.batch_size, schema.clone(), store);
+
+        let files = files.to_vec();
+        let stream = FileStream::new(files, schema, file_reader)?;
 
         // This channel will become the output iterator
         // The stream will execute in the background, and we allow up to `readahead`
@@ -223,7 +315,7 @@ mod tests {
 
         let files = &[FileMeta {
             location: url.clone(),
-            last_modified: meta.last_modified.timestamp(),
+            last_modified: meta.last_modified.timestamp_millis(),
             size: meta.size,
         }];
 

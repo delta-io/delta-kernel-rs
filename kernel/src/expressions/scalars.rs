@@ -141,12 +141,12 @@ impl PrimitiveType {
 
         match self {
             String => Ok(Scalar::String(raw.to_string())),
-            Byte => self.str_parse_scalar(raw, |i| Scalar::Byte(i)),
-            Short => self.str_parse_scalar(raw, |i| Scalar::Short(i)),
-            Integer => self.str_parse_scalar(raw, |i| Scalar::Integer(i)),
-            Long => self.str_parse_scalar(raw, |i| Scalar::Long(i)),
-            Float => self.str_parse_scalar(raw, |i| Scalar::Float(i)),
-            Double => self.str_parse_scalar(raw, |i| Scalar::Double(i)),
+            Byte => self.str_parse_scalar(raw, Scalar::Byte),
+            Short => self.str_parse_scalar(raw, Scalar::Short),
+            Integer => self.str_parse_scalar(raw, Scalar::Integer),
+            Long => self.str_parse_scalar(raw, Scalar::Long),
+            Float => self.str_parse_scalar(raw, Scalar::Float),
+            Double => self.str_parse_scalar(raw, Scalar::Double),
             Boolean => {
                 if raw.eq_ignore_ascii_case("true") {
                     Ok(Scalar::Boolean(true))

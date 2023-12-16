@@ -168,11 +168,9 @@ fn evaluate_expression(
                 None,
             )?))
         }
-        (Struct(_), _) => {
-            return Err(Error::Generic(
-                "Data type is required to evaluate struct expressions".to_string(),
-            ))
-        }
+        (Struct(_), _) => Err(Error::Generic(
+            "Data type is required to evaluate struct expressions".to_string(),
+        )),
         (UnaryOperation { op, expr }, _) => {
             let arr = evaluate_expression(expr.as_ref(), batch, None)?;
             Ok(match op {
