@@ -80,6 +80,46 @@ fn wrap_comparison_result(arr: BooleanArray) -> ArrayRef {
     Arc::new(arr) as Arc<dyn Array>
 }
 
+trait ProvidesColumnByName {
+    fn column_by_name(&self, name: &str) -> Option<&Arc<dyn Array>>;
+}
+
+impl ProvidesColumnByName for RecordBatch {
+    fn column_by_name(&self, name: &str) -> Option<&Arc<dyn Array>> {
+        self.column_by_name(name)
+    }
+}
+
+impl ProvidesColumnByName for StructArray {
+    fn column_by_name(&self, name: &str) -> Option<&Arc<dyn Array>> {
+        self.column_by_name(name)
+    }
+}
+
+fn extract_column<'a>(
+    array: &'a dyn ProvidesColumnByName,
+    path_step: &str,
+    remaining_path_steps: &mut impl Iterator<Item = &'a str>,
+) -> Result<&'a Arc<dyn Array>, ArrowError> {
+    let child = array
+        .column_by_name(path_step)
+        .ok_or(ArrowError::SchemaError(format!(
+            "No such field: {}",
+            path_step,
+        )))?;
+    if let Some(next_path_step) = remaining_path_steps.next() {
+        // This is not the last path step. Drill deeper.
+        extract_column(
+            column_as_struct(path_step, &Some(child))?,
+            next_path_step,
+            remaining_path_steps,
+        )
+    } else {
+        // Last path step. Return it.
+        Ok(child)
+    }
+}
+
 fn column_as_struct<'a>(
     name: &str,
     column: &Option<&'a Arc<dyn Array>>,
@@ -91,25 +131,6 @@ fn column_as_struct<'a>(
         .ok_or(ArrowError::SchemaError(format!("{} is not a struct", name)))
 }
 
-fn extract_field<'a>(
-    struct_array: &'a StructArray,
-    field_name: &str,
-    path: &mut Vec<&str>,
-) -> Result<&'a Arc<dyn Array>, ArrowError> {
-    let next_field_name = path.pop();
-    if let Some(next_field) = next_field_name {
-        let next_arr = column_as_struct(field_name, &struct_array.column_by_name(field_name))?;
-        extract_field(next_arr, next_field, path)
-    } else {
-        struct_array
-            .column_by_name(field_name)
-            .ok_or(ArrowError::SchemaError(format!(
-                "No such field: {}",
-                field_name
-            )))
-    }
-}
-
 fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaResult<ArrayRef> {
     use BinaryOperator::*;
     use Expression::*;
@@ -118,15 +139,11 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
         Literal(scalar) => Ok(scalar.to_array(batch.num_rows())?),
         Column(name) => {
             if name.contains('.') {
-                let mut path = name.split('.').collect::<Vec<&str>>();
-                path.reverse();
-                // we have at least two elements - this is the first
-                let field = path.pop().unwrap();
-                let struct_array = column_as_struct(field, &batch.column_by_name(field))?;
-                // we have at least two elements - this is the second
-                let field = path.pop().unwrap();
-                let arr = extract_field(struct_array, field, &mut path)?;
-                Ok(arr.clone())
+                let mut path = name.split('.');
+                // Safety: we know that the first path step exists, because we checked for '.'
+                let arr = extract_column(batch, path.next().unwrap(), &mut path).cloned()?;
+                // NOTE: need to assign first so that rust can figure out lifetimes
+                Ok(arr)
             } else {
                 batch
                     .column_by_name(name)

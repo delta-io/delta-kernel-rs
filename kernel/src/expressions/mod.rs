@@ -102,6 +102,18 @@ pub enum Expression {
     // TODO: support more expressions, such as IS IN, LIKE, etc.
 }
 
+impl<T: Into<Scalar>> From<T> for Expression {
+    fn from(value: T) -> Self {
+        Self::literal(value)
+    }
+}
+
+impl From<&Expression> for Expression {
+    fn from(expr: &Expression) -> Self {
+        expr.clone()
+    }
+}
+
 impl Display for Expression {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -156,51 +168,65 @@ impl Expression {
         Self::Literal(value.into())
     }
 
-    fn binary_op_impl(self, other: Self, op: BinaryOperator) -> Self {
-        Self::BinaryOperation {
+    pub fn unary(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
+        Self::UnaryOperation {
             op,
-            left: Box::new(self),
-            right: Box::new(other),
+            expr: Box::new(expr.into()),
         }
     }
 
-    fn variadic_op_impl(self, other: impl IntoIterator<Item = Self>, op: VariadicOperator) -> Self {
+    pub fn binary(
+        op: BinaryOperator,
+        lhs: impl Into<Expression>,
+        rhs: impl Into<Expression>,
+    ) -> Self {
+        Self::BinaryOperation {
+            op,
+            left: Box::new(lhs.into()),
+            right: Box::new(rhs.into()),
+        }
+    }
+
+    pub fn variadic(op: VariadicOperator, other: impl IntoIterator<Item = Self>) -> Self {
         let mut exprs = other.into_iter().collect::<Vec<_>>();
         if exprs.is_empty() {
-            return self;
+            // TODO this might break if we introduce new variadic operators?
+            return Self::literal(matches!(op, VariadicOperator::And));
         }
-        exprs.insert(0, self);
+        if exprs.len() == 1 {
+            return exprs.pop().unwrap();
+        }
         Self::VariadicOperation { op, exprs }
     }
 
     /// Create a new expression `self == other`
     pub fn eq(self, other: Self) -> Self {
-        self.binary_op_impl(other, BinaryOperator::Equal)
+        Self::binary(BinaryOperator::Equal, self, other)
     }
 
     /// Create a new expression `self != other`
     pub fn ne(self, other: Self) -> Self {
-        self.binary_op_impl(other, BinaryOperator::NotEqual)
+        Self::binary(BinaryOperator::NotEqual, self, other)
     }
 
     /// Create a new expression `self < other`
     pub fn lt(self, other: Self) -> Self {
-        self.binary_op_impl(other, BinaryOperator::LessThan)
+        Self::binary(BinaryOperator::LessThan, self, other)
     }
 
     /// Create a new expression `self > other`
     pub fn gt(self, other: Self) -> Self {
-        self.binary_op_impl(other, BinaryOperator::GreaterThan)
+        Self::binary(BinaryOperator::GreaterThan, self, other)
     }
 
     /// Create a new expression `self >= other`
     pub fn gt_eq(self, other: Self) -> Self {
-        self.binary_op_impl(other, BinaryOperator::GreaterThanOrEqual)
+        Self::binary(BinaryOperator::GreaterThanOrEqual, self, other)
     }
 
     /// Create a new expression `self <= other`
     pub fn lt_eq(self, other: Self) -> Self {
-        self.binary_op_impl(other, BinaryOperator::LessThanOrEqual)
+        Self::binary(BinaryOperator::LessThanOrEqual, self, other)
     }
 
     /// Create a new expression `self AND other`
@@ -210,7 +236,7 @@ impl Expression {
 
     /// Create a new expression `self AND others`
     pub fn and_many(self, other: impl IntoIterator<Item = Self>) -> Self {
-        self.variadic_op_impl(other, VariadicOperator::And)
+        Self::variadic(VariadicOperator::And, std::iter::once(self).chain(other))
     }
 
     /// Create a new expression `self AND other`
@@ -220,7 +246,7 @@ impl Expression {
 
     /// Create a new expression `self OR other`
     pub fn or_many(self, other: impl IntoIterator<Item = Self>) -> Self {
-        self.variadic_op_impl(other, VariadicOperator::Or)
+        Self::variadic(VariadicOperator::Or, std::iter::once(self).chain(other))
     }
 
     fn walk(&self) -> impl Iterator<Item = &Self> + '_ {
@@ -252,7 +278,7 @@ impl std::ops::Add<Expression> for Expression {
     type Output = Self;
 
     fn add(self, rhs: Expression) -> Self::Output {
-        self.binary_op_impl(rhs, BinaryOperator::Plus)
+        Self::binary(BinaryOperator::Plus, self, rhs)
     }
 }
 
@@ -260,7 +286,7 @@ impl std::ops::Sub<Expression> for Expression {
     type Output = Self;
 
     fn sub(self, rhs: Expression) -> Self::Output {
-        self.binary_op_impl(rhs, BinaryOperator::Minus)
+        Self::binary(BinaryOperator::Minus, self, rhs)
     }
 }
 
@@ -268,7 +294,7 @@ impl std::ops::Mul<Expression> for Expression {
     type Output = Self;
 
     fn mul(self, rhs: Expression) -> Self::Output {
-        self.binary_op_impl(rhs, BinaryOperator::Multiply)
+        Self::binary(BinaryOperator::Multiply, self, rhs)
     }
 }
 
@@ -276,7 +302,7 @@ impl std::ops::Div<Expression> for Expression {
     type Output = Self;
 
     fn div(self, rhs: Expression) -> Self::Output {
-        self.binary_op_impl(rhs, BinaryOperator::Divide)
+        Self::binary(BinaryOperator::Divide, self, rhs)
     }
 }
 

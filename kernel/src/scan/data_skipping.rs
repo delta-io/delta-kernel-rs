@@ -12,116 +12,84 @@ use arrow_select::nullif::nullif;
 use tracing::debug;
 
 use crate::error::{DeltaResult, Error};
-use crate::expressions::{BinaryOperator, Expression, VariadicOperator};
+use crate::expressions::{BinaryOperator, Expression as Expr, VariadicOperator};
 use crate::schema::{SchemaRef, StructField, StructType};
 use crate::{ExpressionEvaluator, TableClient};
 
-fn rewite(expr: &Expression) -> Option<Expression> {
+/// Returns <op2> (if any) such that B <op2> A is equivalent to A <op> B.
+fn commute(op: &BinaryOperator) -> Option<BinaryOperator> {
     use BinaryOperator::*;
-    use Expression::*;
+    match op {
+        GreaterThan => Some(LessThan),
+        GreaterThanOrEqual => Some(LessThanOrEqual),
+        LessThan => Some(GreaterThan),
+        LessThanOrEqual => Some(GreaterThanOrEqual),
+        Equal | NotEqual | Plus | Multiply => Some(op.clone()),
+        _ => None,
+    }
+}
+
+fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
+    use BinaryOperator::*;
+    use Expr::*;
     use VariadicOperator::*;
 
     match expr {
-        BinaryOperation { op, left, right } => match op {
-            LessThan | LessThanOrEqual => match (left.as_ref(), right.as_ref()) {
-                // column <lt | lt_eq> value
-                (Column(col), Literal(value)) => Some(BinaryOperation {
-                    op: op.clone(),
-                    left: Box::new(Column(format!("minValues.{}", col))),
-                    right: Box::new(Literal(value.clone())),
-                }),
-                // value <lt | lt_eq> column
-                (Literal(value), Column(col)) => Some(BinaryOperation {
-                    op: match op {
-                        LessThan => GreaterThan,
-                        LessThanOrEqual => GreaterThanOrEqual,
-                        _ => unreachable!(),
-                    },
-                    left: Box::new(Column(format!("maxValues.{}", col))),
-                    right: Box::new(Literal(value.clone())),
-                }),
-                _ => None,
-            },
-            GreaterThan | GreaterThanOrEqual => match (left.as_ref(), right.as_ref()) {
-                // column <gt | gt_eq> value
-                (Column(col), Literal(value)) => Some(BinaryOperation {
-                    op: op.clone(),
-                    left: Box::new(Column(format!("maxValues.{}", col))),
-                    right: Box::new(Literal(value.clone())),
-                }),
-                // value <gt | gt_eq> column
-                (Literal(value), Column(col)) => Some(BinaryOperation {
-                    op: match op {
-                        GreaterThan => LessThan,
-                        GreaterThanOrEqual => LessThanOrEqual,
-                        _ => unreachable!(),
-                    },
-                    left: Box::new(Column(format!("minValues.{}", col))),
-                    right: Box::new(Literal(value.clone())),
-                }),
-                _ => None,
-            },
-            // column == value
-            // column == value is equivalent to min values being less than or equal to value
-            // and max values being greater than or equal to value
-            Equal => match (left.as_ref(), right.as_ref()) {
-                (Column(col), Literal(value)) | (Literal(value), Column(col)) => {
-                    Some(VariadicOperation {
-                        op: And,
-                        exprs: vec![
-                            BinaryOperation {
-                                op: GreaterThanOrEqual,
-                                left: Box::new(Column(format!("maxValues.{}", col))),
-                                right: Box::new(Literal(value.clone())),
-                            },
-                            BinaryOperation {
-                                op: LessThanOrEqual,
-                                left: Box::new(Column(format!("minValues.{}", col))),
-                                right: Box::new(Literal(value.clone())),
-                            },
-                        ],
-                    })
+        BinaryOperation { op, left, right } => {
+            let (op, col, val) = match (left.as_ref(), right.as_ref()) {
+                (Column(col), Literal(val)) => (op.clone(), col, val),
+                (Literal(val), Column(col)) => (commute(op)?, col, val),
+                _ => return None, // unsupported combination of operands
+            };
+            let stats_col = match op {
+                LessThan | LessThanOrEqual => "minValues",
+                GreaterThan | GreaterThanOrEqual => "maxValues",
+                Equal => {
+                    let exprs = [
+                        Expr::binary(LessThanOrEqual, Column(col.clone()), Literal(val.clone())),
+                        Expr::binary(LessThanOrEqual, Literal(val.clone()), Column(col.clone())),
+                    ];
+                    return as_data_skipping_predicate(&Expr::variadic(And, exprs));
                 }
-                _ => None,
-            },
-            // column != value
-            // column != value is equivalent to min values being strictly greater than value
-            // or max values being strictly less than value
-            NotEqual => match (left.as_ref(), right.as_ref()) {
-                (Column(col), Literal(value)) | (Literal(value), Column(col)) => {
-                    Some(VariadicOperation {
-                        op: Or,
-                        exprs: vec![
-                            BinaryOperation {
-                                op: LessThan,
-                                left: Box::new(Column(format!("maxValues.{}", col))),
-                                right: Box::new(Literal(value.clone())),
-                            },
-                            BinaryOperation {
-                                op: GreaterThan,
-                                left: Box::new(Column(format!("minValues.{}", col))),
-                                right: Box::new(Literal(value.clone())),
-                            },
-                        ],
-                    })
+                NotEqual => {
+                    let exprs = [
+                        Expr::binary(
+                            GreaterThan,
+                            Column(format!("minValues.{}", col)),
+                            Literal(val.clone()),
+                        ),
+                        Expr::binary(
+                            LessThan,
+                            Column(format!("maxValues.{}", col)),
+                            Literal(val.clone()),
+                        ),
+                    ];
+                    return Some(Expr::variadic(Or, exprs));
                 }
-                _ => None,
-            },
-            _ => None,
-        },
+                _ => return None, // unsupported operation
+            };
+            let col = format!("{}.{}", stats_col, col);
+            Some(Expr::binary(op, Column(col), Literal(val.clone())))
+        }
         VariadicOperation {
             op: op @ VariadicOperator::And,
             exprs,
         } => Some(VariadicOperation {
             op: op.clone(),
-            exprs: exprs.iter().filter_map(rewite).collect::<Vec<_>>(),
+            exprs: exprs
+                .iter()
+                .filter_map(as_data_skipping_predicate)
+                .collect::<Vec<_>>(),
         }),
         VariadicOperation {
             op: op @ VariadicOperator::Or,
             exprs,
         } => Some(VariadicOperation {
             op: op.clone(),
-            exprs: exprs.iter().map(rewite).collect::<Option<Vec<_>>>()?,
+            exprs: exprs
+                .iter()
+                .map(as_data_skipping_predicate)
+                .collect::<Option<Vec<_>>>()?,
         }),
         _ => None,
     }
@@ -141,7 +109,7 @@ impl DataSkippingFilter {
     pub(crate) fn new<JRC: Send, PRC: Send>(
         table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
         table_schema: &SchemaRef,
-        predicate: &Option<Expression>,
+        predicate: &Option<Expr>,
     ) -> Option<Self> {
         let predicate = match predicate {
             Some(predicate) => predicate,
@@ -169,7 +137,7 @@ impl DataSkippingFilter {
             StructField::new("maxValues", StructType::new(data_fields), true),
         ]));
 
-        let skipping_predicate = rewite(predicate)?;
+        let skipping_predicate = as_data_skipping_predicate(predicate)?;
         let evaluator = table_client
             .get_expression_handler()
             .get_evaluator(stats_schema.clone(), skipping_predicate);
@@ -269,154 +237,91 @@ impl DataSkippingFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expressions::Scalar;
 
     #[test]
     fn test_rewrite_basic_comparison() {
-        let column = Expression::Column("a".to_string());
-        let lit_int = Expression::Literal(Scalar::Integer(1));
+        let column = Expr::column("a");
+        let lit_int = Expr::literal(1_i32);
+        let min_col = Expr::column("minValues.a");
+        let max_col = Expr::column("maxValues.a");
 
         let cases = [
             (
                 column.clone().lt(lit_int.clone()),
-                Expression::BinaryOperation {
-                    op: BinaryOperator::LessThan,
-                    left: Box::new(Expression::Column("minValues.a".to_string())),
-                    right: Box::new(lit_int.clone()),
-                },
+                Expr::binary(BinaryOperator::LessThan, &min_col, &lit_int),
             ),
             (
                 lit_int.clone().lt(column.clone()),
-                Expression::BinaryOperation {
-                    op: BinaryOperator::GreaterThan,
-                    left: Box::new(Expression::Column("maxValues.a".to_string())),
-                    right: Box::new(lit_int.clone()),
-                },
+                Expr::binary(BinaryOperator::GreaterThan, &max_col, &lit_int),
             ),
             (
                 column.clone().gt(lit_int.clone()),
-                Expression::BinaryOperation {
-                    op: BinaryOperator::GreaterThan,
-                    left: Box::new(Expression::Column("maxValues.a".to_string())),
-                    right: Box::new(lit_int.clone()),
-                },
+                Expr::binary(BinaryOperator::GreaterThan, &max_col, &lit_int),
             ),
             (
                 lit_int.clone().gt(column.clone()),
-                Expression::BinaryOperation {
-                    op: BinaryOperator::LessThan,
-                    left: Box::new(Expression::Column("minValues.a".to_string())),
-                    right: Box::new(lit_int.clone()),
-                },
+                Expr::binary(BinaryOperator::LessThan, &min_col, &lit_int),
             ),
             (
                 column.clone().lt_eq(lit_int.clone()),
-                Expression::BinaryOperation {
-                    op: BinaryOperator::LessThanOrEqual,
-                    left: Box::new(Expression::Column("minValues.a".to_string())),
-                    right: Box::new(lit_int.clone()),
-                },
+                Expr::binary(BinaryOperator::LessThanOrEqual, &min_col, &lit_int),
             ),
             (
                 lit_int.clone().lt_eq(column.clone()),
-                Expression::BinaryOperation {
-                    op: BinaryOperator::GreaterThanOrEqual,
-                    left: Box::new(Expression::Column("maxValues.a".to_string())),
-                    right: Box::new(lit_int.clone()),
-                },
+                Expr::binary(BinaryOperator::GreaterThanOrEqual, &max_col, &lit_int),
             ),
             (
                 column.clone().gt_eq(lit_int.clone()),
-                Expression::BinaryOperation {
-                    op: BinaryOperator::GreaterThanOrEqual,
-                    left: Box::new(Expression::Column("maxValues.a".to_string())),
-                    right: Box::new(lit_int.clone()),
-                },
+                Expr::binary(BinaryOperator::GreaterThanOrEqual, &max_col, &lit_int),
             ),
             (
                 lit_int.clone().gt_eq(column.clone()),
-                Expression::BinaryOperation {
-                    op: BinaryOperator::LessThanOrEqual,
-                    left: Box::new(Expression::Column("minValues.a".to_string())),
-                    right: Box::new(lit_int.clone()),
-                },
+                Expr::binary(BinaryOperator::LessThanOrEqual, &min_col, &lit_int),
             ),
             (
                 column.clone().eq(lit_int.clone()),
-                Expression::VariadicOperation {
-                    op: VariadicOperator::And,
-                    exprs: vec![
-                        Expression::BinaryOperation {
-                            op: BinaryOperator::GreaterThanOrEqual,
-                            left: Box::new(Expression::Column("maxValues.a".to_string())),
-                            right: Box::new(lit_int.clone()),
-                        },
-                        Expression::BinaryOperation {
-                            op: BinaryOperator::LessThanOrEqual,
-                            left: Box::new(Expression::Column("minValues.a".to_string())),
-                            right: Box::new(lit_int.clone()),
-                        },
+                Expr::variadic(
+                    VariadicOperator::And,
+                    [
+                        Expr::binary(BinaryOperator::LessThanOrEqual, &min_col, &lit_int),
+                        Expr::binary(BinaryOperator::GreaterThanOrEqual, &max_col, &lit_int),
                     ],
-                },
+                ),
             ),
             (
                 lit_int.clone().eq(column.clone()),
-                Expression::VariadicOperation {
-                    op: VariadicOperator::And,
-                    exprs: vec![
-                        Expression::BinaryOperation {
-                            op: BinaryOperator::GreaterThanOrEqual,
-                            left: Box::new(Expression::Column("maxValues.a".to_string())),
-                            right: Box::new(lit_int.clone()),
-                        },
-                        Expression::BinaryOperation {
-                            op: BinaryOperator::LessThanOrEqual,
-                            left: Box::new(Expression::Column("minValues.a".to_string())),
-                            right: Box::new(lit_int.clone()),
-                        },
+                Expr::variadic(
+                    VariadicOperator::And,
+                    [
+                        Expr::binary(BinaryOperator::LessThanOrEqual, &min_col, &lit_int),
+                        Expr::binary(BinaryOperator::GreaterThanOrEqual, &max_col, &lit_int),
                     ],
-                },
+                ),
             ),
             (
                 column.clone().ne(lit_int.clone()),
-                Expression::VariadicOperation {
-                    op: VariadicOperator::Or,
-                    exprs: vec![
-                        Expression::BinaryOperation {
-                            op: BinaryOperator::LessThan,
-                            left: Box::new(Expression::Column("maxValues.a".to_string())),
-                            right: Box::new(lit_int.clone()),
-                        },
-                        Expression::BinaryOperation {
-                            op: BinaryOperator::GreaterThan,
-                            left: Box::new(Expression::Column("minValues.a".to_string())),
-                            right: Box::new(lit_int.clone()),
-                        },
+                Expr::variadic(
+                    VariadicOperator::Or,
+                    [
+                        Expr::binary(BinaryOperator::GreaterThan, &min_col, &lit_int),
+                        Expr::binary(BinaryOperator::LessThan, &max_col, &lit_int),
                     ],
-                },
+                ),
             ),
             (
                 lit_int.clone().ne(column.clone()),
-                Expression::VariadicOperation {
-                    op: VariadicOperator::Or,
-                    exprs: vec![
-                        Expression::BinaryOperation {
-                            op: BinaryOperator::LessThan,
-                            left: Box::new(Expression::Column("maxValues.a".to_string())),
-                            right: Box::new(lit_int.clone()),
-                        },
-                        Expression::BinaryOperation {
-                            op: BinaryOperator::GreaterThan,
-                            left: Box::new(Expression::Column("minValues.a".to_string())),
-                            right: Box::new(lit_int.clone()),
-                        },
+                Expr::variadic(
+                    VariadicOperator::Or,
+                    [
+                        Expr::binary(BinaryOperator::GreaterThan, &min_col, &lit_int),
+                        Expr::binary(BinaryOperator::LessThan, &max_col, &lit_int),
                     ],
-                },
+                ),
             ),
         ];
 
         for (input, expected) in cases {
-            let rewritten = rewite(&input).unwrap();
+            let rewritten = as_data_skipping_predicate(&input).unwrap();
             assert_eq!(rewritten, expected)
         }
     }
