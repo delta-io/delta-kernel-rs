@@ -32,47 +32,48 @@ impl Scalar {
     /// Convert scalar to arrow array.
     pub fn to_array(&self, num_rows: usize) -> DeltaResult<ArrayRef> {
         use Scalar::*;
-        match self {
-            Integer(val) => Ok(Arc::new(Int32Array::from_value(*val, num_rows))),
-            Long(val) => Ok(Arc::new(Int64Array::from_value(*val, num_rows))),
-            Float(val) => Ok(Arc::new(Float32Array::from_value(*val, num_rows))),
-            String(val) => Ok(Arc::new(StringArray::from(vec![val.clone(); num_rows]))),
-            Boolean(val) => Ok(Arc::new(BooleanArray::from(vec![*val; num_rows]))),
-            Timestamp(val) => Ok(Arc::new(TimestampMicrosecondArray::from_value(
-                *val, num_rows,
-            ))),
-            Date(val) => Ok(Arc::new(Date32Array::from_value(*val, num_rows))),
-            Binary(val) => Ok(Arc::new(BinaryArray::from(vec![val.as_slice(); num_rows]))),
-            Decimal(val, precision, scale) => Ok(Arc::new(
+        let arr: Arc<dyn Array> = match self {
+            Integer(val) => Arc::new(Int32Array::from_value(*val, num_rows)),
+            Long(val) => Arc::new(Int64Array::from_value(*val, num_rows)),
+            Float(val) => Arc::new(Float32Array::from_value(*val, num_rows)),
+            String(val) => Arc::new(StringArray::from(vec![val.clone(); num_rows])),
+            Boolean(val) => Arc::new(BooleanArray::from(vec![*val; num_rows])),
+            Timestamp(val) => Arc::new(TimestampMicrosecondArray::from_value(*val, num_rows)),
+            Date(val) => Arc::new(Date32Array::from_value(*val, num_rows)),
+            Binary(val) => Arc::new(BinaryArray::from(vec![val.as_slice(); num_rows])),
+            Decimal(val, precision, scale) => Arc::new(
                 Decimal128Array::from_value(*val, num_rows)
                     .with_precision_and_scale(*precision, *scale)?,
-            )),
+            ),
             Null(data_type) => match data_type {
-                DataType::Primitive(primitive) => match primitive {
-                    PrimitiveType::Byte => Ok(Arc::new(Int8Array::new_null(num_rows))),
-                    PrimitiveType::Short => Ok(Arc::new(Int16Array::new_null(num_rows))),
-                    PrimitiveType::Integer => Ok(Arc::new(Int32Array::new_null(num_rows))),
-                    PrimitiveType::Long => Ok(Arc::new(Int64Array::new_null(num_rows))),
-                    PrimitiveType::Float => Ok(Arc::new(Float32Array::new_null(num_rows))),
-                    PrimitiveType::Double => Ok(Arc::new(Float64Array::new_null(num_rows))),
-                    PrimitiveType::String => Ok(Arc::new(StringArray::new_null(num_rows))),
-                    PrimitiveType::Boolean => Ok(Arc::new(BooleanArray::new_null(num_rows))),
-                    PrimitiveType::Timestamp => {
-                        Ok(Arc::new(TimestampMicrosecondArray::new_null(num_rows)))
+                DataType::Primitive(primitive) => {
+                    match primitive {
+                        PrimitiveType::Byte => Arc::new(Int8Array::new_null(num_rows)),
+                        PrimitiveType::Short => Arc::new(Int16Array::new_null(num_rows)),
+                        PrimitiveType::Integer => Arc::new(Int32Array::new_null(num_rows)),
+                        PrimitiveType::Long => Arc::new(Int64Array::new_null(num_rows)),
+                        PrimitiveType::Float => Arc::new(Float32Array::new_null(num_rows)),
+                        PrimitiveType::Double => Arc::new(Float64Array::new_null(num_rows)),
+                        PrimitiveType::String => Arc::new(StringArray::new_null(num_rows)),
+                        PrimitiveType::Boolean => Arc::new(BooleanArray::new_null(num_rows)),
+                        PrimitiveType::Timestamp => {
+                            Arc::new(TimestampMicrosecondArray::new_null(num_rows))
+                        }
+                        PrimitiveType::Date => Arc::new(Date32Array::new_null(num_rows)),
+                        PrimitiveType::Binary => Arc::new(BinaryArray::new_null(num_rows)),
+                        PrimitiveType::Decimal(precision, scale) => Arc::new(
+                            Decimal128Array::new_null(num_rows)
+                                // TODO update datatype?
+                                .with_precision_and_scale(*precision as u8, *scale as i8)?,
+                        ),
                     }
-                    PrimitiveType::Date => Ok(Arc::new(Date32Array::new_null(num_rows))),
-                    PrimitiveType::Binary => Ok(Arc::new(BinaryArray::new_null(num_rows))),
-                    PrimitiveType::Decimal(precision, scale) => Ok(Arc::new(
-                        Decimal128Array::new_null(num_rows)
-                            // TODO update datatype?
-                            .with_precision_and_scale(*precision as u8, *scale as i8)?,
-                    )),
-                },
+                }
                 DataType::Array(_) => unimplemented!(),
                 DataType::Map { .. } => unimplemented!(),
                 DataType::Struct { .. } => unimplemented!(),
             },
-        }
+        };
+        Ok(arr)
     }
 }
 
@@ -92,10 +93,10 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
             .cloned(),
         UnaryOperation { op, expr } => {
             let arr = evaluate_expression(expr.as_ref(), batch)?;
-            match op {
-                UnaryOperator::Not => Ok(Arc::new(not(downcast_to_bool(&arr)?)?)),
-                UnaryOperator::IsNull => Ok(Arc::new(is_null(&arr)?)),
-            }
+            Ok(match op {
+                UnaryOperator::Not => Arc::new(not(downcast_to_bool(&arr)?)?),
+                UnaryOperator::IsNull => Arc::new(is_null(&arr)?),
+            })
         }
         BinaryOperation { op, left, right } => {
             let left_arr = evaluate_expression(left.as_ref(), batch)?;
