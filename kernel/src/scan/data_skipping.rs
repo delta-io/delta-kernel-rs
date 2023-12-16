@@ -1,10 +1,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_arith::boolean::is_null;
-use arrow_array::{Array, BooleanArray, RecordBatch, StringArray, StructArray};
+use arrow_array::{Array, BooleanArray, RecordBatch, StructArray};
 use arrow_select::filter::filter_record_batch;
-use arrow_select::nullif::nullif;
 use tracing::debug;
 
 use crate::error::{DeltaResult, Error};
@@ -96,7 +94,9 @@ fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
 
 pub(crate) struct DataSkippingFilter {
     stats_schema: SchemaRef,
-    evaluator: Arc<dyn ExpressionEvaluator>,
+    select_stats_evaluator: Arc<dyn ExpressionEvaluator>,
+    skipping_evaluator: Arc<dyn ExpressionEvaluator>,
+    filter_evaluator: Arc<dyn ExpressionEvaluator>,
     json_handler: Arc<dyn JsonHandler>,
 }
 
@@ -111,6 +111,17 @@ impl DataSkippingFilter {
         table_schema: &SchemaRef,
         predicate: &Option<Expr>,
     ) -> Option<Self> {
+        lazy_static::lazy_static!(
+            static ref PREDICATE_SCHEMA: DataType = StructType::new(vec![
+                StructField::new("predicate", DataType::BOOLEAN, true),
+            ]).into();
+            static ref FILTER_EXPR: Expr = Expr::is_null(Expr::null_if(
+                Expr::column("predicate"),
+                Expr::column("predicate"),
+            ));
+            static ref STATS_EXPR: Expr = Expr::column("add.stats");
+        );
+
         let predicate = match predicate {
             Some(predicate) => predicate,
             None => return None,
@@ -137,41 +148,6 @@ impl DataSkippingFilter {
             StructField::new("maxValues", StructType::new(data_fields), true),
         ]));
 
-        let evaluator = table_client.get_expression_handler().get_evaluator(
-            stats_schema.clone(),
-            as_data_skipping_predicate(predicate)?,
-            DataType::BOOLEAN,
-        );
-
-        Some(Self {
-            stats_schema,
-            evaluator,
-            json_handler: table_client.get_json_handler(),
-        })
-    }
-
-    pub(crate) fn apply(&self, actions: &RecordBatch) -> DeltaResult<RecordBatch> {
-        let adds = actions
-            .column_by_name("add")
-            .ok_or(Error::missing_column("Column 'add' not found."))?
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .ok_or(Error::unexpected_column_type(
-                "Expected type 'StructArray'.",
-            ))?;
-        let stats = adds
-            .column_by_name("stats")
-            .ok_or(Error::missing_column("Column 'stats' not found."))?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or(Error::unexpected_column_type(
-                "Expected type 'StringArray'.",
-            ))?;
-
-        let parsed_stats = self
-            .json_handler
-            .parse_json(stats.clone(), self.stats_schema.clone())?;
-
         // Skipping happens in several steps:
         //
         // 1. The predicate produces false for any file whose stats prove we can safely skip it. A
@@ -185,15 +161,54 @@ impl DataSkippingFilter {
         //    keep) and false (= skip) values.
         //
         // 4. The filter discards every file whose selection vector entry is false.
-        let skipping_vector = self.evaluator.evaluate(&parsed_stats)?;
+        let skipping_evaluator = table_client.get_expression_handler().get_evaluator(
+            stats_schema.clone(),
+            Expr::struct_expr([as_data_skipping_predicate(predicate)?]),
+            PREDICATE_SCHEMA.clone(),
+        );
+
+        let filter_evaluator = table_client.get_expression_handler().get_evaluator(
+            stats_schema.clone(),
+            FILTER_EXPR.clone(),
+            DataType::BOOLEAN,
+        );
+
+        let select_stats_evaluator = table_client.get_expression_handler().get_evaluator(
+            stats_schema.clone(),
+            STATS_EXPR.clone(),
+            DataType::STRING,
+        );
+
+        Some(Self {
+            stats_schema,
+            select_stats_evaluator,
+            skipping_evaluator,
+            filter_evaluator,
+            json_handler: table_client.get_json_handler(),
+        })
+    }
+
+    pub(crate) fn apply(&self, actions: &RecordBatch) -> DeltaResult<RecordBatch> {
+        let stats = self.select_stats_evaluator.evaluate(actions)?;
+        let parsed_stats = self
+            .json_handler
+            .parse_json(stats, self.stats_schema.clone())?;
+
+        let skipping_predicate = self.skipping_evaluator.evaluate(&parsed_stats)?;
+        let skipping_predicate = skipping_predicate
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or(Error::UnexpectedColumnType(
+                "Expected type 'StructArray'.".into(),
+            ))?
+            .into();
+        let skipping_vector = self.filter_evaluator.evaluate(&skipping_predicate)?;
         let skipping_vector = skipping_vector
             .as_any()
             .downcast_ref::<BooleanArray>()
             .ok_or(Error::unexpected_column_type(
                 "Expected type 'BooleanArray'.",
             ))?;
-
-        let skipping_vector = &is_null(&nullif(skipping_vector, skipping_vector)?)?;
 
         let before_count = actions.num_rows();
         let after = filter_record_batch(actions, skipping_vector)?;

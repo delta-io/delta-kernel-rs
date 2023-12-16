@@ -101,6 +101,13 @@ pub enum Expression {
         /// The expressions.
         exprs: Vec<Expression>,
     },
+    // TODO how to model required functions?
+    NullIf {
+        /// The expression to evaluate.
+        expr: Box<Expression>,
+        /// The expression to compare against.
+        if_expr: Box<Expression>,
+    },
     // TODO: support more expressions, such as IS IN, LIKE, etc.
 }
 
@@ -141,6 +148,7 @@ impl Display for Expression {
                     )
                 }
             },
+            Self::NullIf { expr, if_expr } => write!(f, "NULLIF({}, {})", expr, if_expr),
         }
     }
 }
@@ -167,6 +175,11 @@ impl Expression {
     /// Create a new expression for a literal value
     pub fn literal(value: impl Into<Scalar>) -> Self {
         Self::Literal(value.into())
+    }
+
+    /// Create a new struct expression
+    pub fn struct_expr(exprs: impl IntoIterator<Item = Self>) -> Self {
+        Self::Struct(exprs.into_iter().collect())
     }
 
     /// Creates a new unary expression OP expr
@@ -261,6 +274,14 @@ impl Expression {
         Self::or_from([self, other])
     }
 
+    /// Create a new expression `NULLIF(self, other)`
+    pub fn null_if(self, other: Self) -> Self {
+        Self::NullIf {
+            expr: Box::new(self),
+            if_expr: Box::new(other),
+        }
+    }
+
     fn walk(&self) -> impl Iterator<Item = &Self> + '_ {
         let mut stack = vec![self];
         std::iter::from_fn(move || {
@@ -280,6 +301,10 @@ impl Expression {
                 }
                 Self::VariadicOperation { exprs, .. } => {
                     stack.extend(exprs.iter());
+                }
+                Self::NullIf { expr, if_expr } => {
+                    stack.push(expr);
+                    stack.push(if_expr);
                 }
             }
             Some(expr)

@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::task::{ready, Poll};
 
-use arrow_array::{new_null_array, Array, RecordBatch, StringArray};
+use arrow_array::{new_null_array, Array, ArrayRef, RecordBatch, StringArray};
 use arrow_json::{reader::Decoder, ReaderBuilder};
 use arrow_schema::{ArrowError, SchemaRef as ArrowSchemaRef};
 use arrow_select::concat::concat_batches;
@@ -105,7 +105,7 @@ fn get_reader(data: &[u8]) -> BufReader<Cursor<&[u8]>> {
 impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     fn parse_json(
         &self,
-        json_strings: StringArray,
+        json_strings: ArrayRef,
         output_schema: SchemaRef,
     ) -> DeltaResult<RecordBatch> {
         let json_strings = json_strings
@@ -117,7 +117,6 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
                     json_strings
                 ))
             })?;
-
         let output_schema: ArrowSchemaRef = Arc::new(output_schema.as_ref().try_into()?);
         let mut decoder = ReaderBuilder::new(output_schema.clone())
             .with_batch_size(self.batch_size)
@@ -276,6 +275,7 @@ impl FileOpener for JsonOpener {
 mod tests {
     use std::path::PathBuf;
 
+    use arrow_array::ArrayRef;
     use arrow_schema::Schema as ArrowSchema;
     use itertools::Itertools;
     use object_store::{local::LocalFileSystem, ObjectStore};
@@ -288,13 +288,12 @@ mod tests {
         let store = Arc::new(LocalFileSystem::new());
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
-        let json_strings: StringArray = vec![
+        let json_strings: ArrayRef = Arc::new(StringArray::from(vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
             r#"{"commitInfo":{"timestamp":1677811178585,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isolationLevel":"WriteSerializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"10","numOutputBytes":"635"},"engineInfo":"Databricks-Runtime/<unknown>","txnId":"a6a94671-55ef-450e-9546-b8465b9147de"}}"#,
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
-        ]
-        .into();
+        ]));
         let output_schema = Arc::new(log_schema().clone());
 
         let batch = handler.parse_json(json_strings, output_schema).unwrap();

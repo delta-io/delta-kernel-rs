@@ -39,7 +39,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, RecordBatch};
 use bytes::Bytes;
 use url::Url;
 
@@ -148,7 +148,7 @@ pub trait JsonHandler {
     /// Parse the given json strings and return the fields requested by output schema as columns in a [`RecordBatch`].
     fn parse_json(
         &self,
-        json_strings: StringArray,
+        json_strings: ArrayRef,
         output_schema: SchemaRef,
     ) -> DeltaResult<RecordBatch>;
 

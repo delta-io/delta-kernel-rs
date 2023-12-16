@@ -164,15 +164,18 @@ impl Scan {
             .partition_columns
             .iter()
             .map(|column| {
-                Ok((
-                    column,
-                    self.schema()
-                        .field(column)
-                        .ok_or(Error::Generic("Unexpected partition column".to_string()))?,
-                ))
+                self.schema()
+                    .field(column)
+                    .ok_or(Error::Generic("Unexpected partition column".to_string()))
             })
             .collect::<DeltaResult<Vec<_>>>()?;
         partition_fields.reverse();
+
+        let select_fields = read_schema
+            .fields()
+            .iter()
+            .map(|f| Expression::Column(f.name().to_string()))
+            .collect_vec();
 
         self.files(engine_interface)?
             .map(|res| {
@@ -198,9 +201,9 @@ impl Scan {
                 } else {
                     let mut fields =
                         Vec::with_capacity(partition_fields.len() + batch.num_columns());
-                    for (column, field) in &partition_fields {
+                    for field in &partition_fields {
                         let value_expression =
-                            if let Some(Some(value)) = add.partition_values.get(*column) {
+                            if let Some(Some(value)) = add.partition_values.get(field.name()) {
                                 Expression::Literal(get_partition_value(value, field.data_type())?)
                             } else {
                                 // TODO: is it allowed to assume null for missing partition values?
@@ -208,10 +211,7 @@ impl Scan {
                             };
                         fields.push(value_expression);
                     }
-
-                    for field in read_schema.fields() {
-                        fields.push(Expression::Column(field.name().to_string()));
-                    }
+                    fields.extend(select_fields.clone());
 
                     let evaluator = engine_interface.get_expression_handler().get_evaluator(
                         read_schema.clone(),

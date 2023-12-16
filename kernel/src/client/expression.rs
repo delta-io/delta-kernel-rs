@@ -13,6 +13,7 @@ use arrow_array::{
 };
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{ArrowError, Schema as ArrowSchema};
+use arrow_select::nullif::nullif;
 
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{BinaryOperator, Expression, Scalar, UnaryOperator, VariadicOperator};
@@ -219,6 +220,13 @@ fn evaluate_expression(
                     )
                 })
         }
+        (NullIf { expr, if_expr }, _) => {
+            let expr_arr = evaluate_expression(expr.as_ref(), batch, None)?;
+            let if_expr_arr =
+                evaluate_expression(if_expr.as_ref(), batch, Some(&DataType::BOOLEAN))?;
+            let if_expr_arr = downcast_to_bool(&if_expr_arr)?;
+            Ok(nullif(&expr_arr, if_expr_arr)?)
+        }
     }
 }
 
@@ -249,14 +257,15 @@ pub struct DefaultExpressionEvaluator {
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &RecordBatch) -> DeltaResult<ArrayRef> {
-        let input_schema: ArrowSchema = self.input_schema.as_ref().try_into()?;
-        if batch.schema().as_ref() != &input_schema {
-            return Err(Error::Generic(format!(
-                "input schema does not match batch schema: {:?} != {:?}",
-                input_schema,
-                batch.schema()
-            )));
-        };
+        let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into()?;
+        // TODO: make sure we have matching schemas for validation
+        // if batch.schema().as_ref() != &input_schema {
+        //     return Err(Error::Generic(format!(
+        //         "input schema does not match batch schema: {:?} != {:?}",
+        //         input_schema,
+        //         batch.schema()
+        //     )));
+        // };
         evaluate_expression(&self.expression, batch, Some(&self.output_type))
     }
 }
