@@ -43,27 +43,28 @@ impl LogSegment {
     /// `predicate` is an optional expression to filter the log files with.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-    fn replay<JRC: Send, PRC: Send>(
+    fn replay(
         &self,
-        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
+        table_client: &dyn TableClient,
         read_schema: Arc<ArrowSchema>,
         predicate: Option<Expression>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(RecordBatch, bool)>>> {
         let json_client = table_client.get_json_handler();
-        let read_contexts =
-            json_client.contextualize_file_reads(&self.commit_files, predicate.clone())?;
         let commit_stream = json_client
             .read_json_files(
-                read_contexts.as_slice(),
+                &self.commit_files,
                 Arc::new(read_schema.as_ref().try_into()?),
+                predicate.clone(),
             )?
             .map_ok(|batch| (batch, true));
 
         let parquet_client = table_client.get_parquet_handler();
-        let read_contexts =
-            parquet_client.contextualize_file_reads(&self.checkpoint_files, predicate)?;
         let checkpoint_stream = parquet_client
-            .read_parquet_files(read_contexts, Arc::new(read_schema.as_ref().try_into()?))?
+            .read_parquet_files(
+                &self.checkpoint_files,
+                Arc::new(read_schema.as_ref().try_into()?),
+                predicate,
+            )?
             .map_ok(|batch| (batch, false));
 
         let batches = commit_stream.chain(checkpoint_stream);
@@ -71,9 +72,9 @@ impl LogSegment {
         Ok(batches)
     }
 
-    fn read_metadata<JRC: Send, PRC: Send>(
+    fn read_metadata(
         &self,
-        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
+        table_client: &dyn TableClient,
     ) -> DeltaResult<Option<(Metadata, Protocol)>> {
         let read_schema = Arc::new(ArrowSchema {
             fields: Fields::from_iter([
@@ -150,9 +151,9 @@ impl Snapshot {
     /// - `location`: url pointing at the table root (where `_delta_log` folder is located)
     /// - `table_client`: Implementation of [`TableClient`] apis.
     /// - `version`: target version of the [`Snapshot`]
-    pub fn try_new<JRC: Send, PRC: Send>(
+    pub fn try_new(
         table_root: Url,
-        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
+        table_client: &dyn TableClient,
         version: Option<Version>,
     ) -> DeltaResult<Arc<Self>> {
         let fs_client = table_client.get_file_system_client();
@@ -207,11 +208,11 @@ impl Snapshot {
     }
 
     /// Create a new [`Snapshot`] instance.
-    pub(crate) fn try_new_from_log_segment<JRC: Send, PRC: Send>(
+    pub(crate) fn try_new_from_log_segment(
         location: Url,
         log_segment: LogSegment,
         version: Version,
-        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
+        table_client: &dyn TableClient,
     ) -> DeltaResult<Self> {
         let (metadata, protocol) = log_segment
             .read_metadata(table_client)?
