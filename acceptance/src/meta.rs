@@ -96,10 +96,7 @@ impl TestCaseInfo {
         Ok(())
     }
 
-    pub async fn assert_metadata<JRC: Send, PRC: Send + Sync>(
-        &self,
-        table_client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
-    ) -> TestResult<()> {
+    pub async fn assert_metadata(&self, table_client: Arc<dyn TableClient>) -> TestResult<()> {
         let table_client = table_client.as_ref();
         let table = Table::new(self.table_root()?);
 

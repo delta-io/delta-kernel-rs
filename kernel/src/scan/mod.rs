@@ -113,9 +113,9 @@ impl Scan {
     /// which yields record batches of scan files and their associated metadata. Rows of the scan
     /// files batches correspond to data reads, and the DeltaReader is used to materialize the scan
     /// files into actual table data.
-    pub fn files<JRC: Send, PRC: Send + Sync>(
+    pub fn files(
         &self,
-        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
+        table_client: &dyn TableClient,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
         let action_schema = Arc::new(ArrowSchema {
             fields: Fields::from_iter([
@@ -138,10 +138,7 @@ impl Scan {
         ))
     }
 
-    pub fn execute<JRC: Send, PRC: Send + Sync>(
-        &self,
-        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
-    ) -> DeltaResult<Vec<RecordBatch>> {
+    pub fn execute(&self, table_client: &dyn TableClient) -> DeltaResult<Vec<RecordBatch>> {
         let parquet_handler = table_client.get_parquet_handler();
 
         self.files(table_client)?
@@ -152,9 +149,8 @@ impl Scan {
                     size: add.size as usize,
                     location: self.snapshot.table_root.join(&add.path)?,
                 };
-                let context = parquet_handler.contextualize_file_reads(&[meta], None)?;
                 let batches = parquet_handler
-                    .read_parquet_files(context, self.read_schema.clone())?
+                    .read_parquet_files(&[meta], self.read_schema.clone(), None)?
                     .collect::<DeltaResult<Vec<_>>>()?;
 
                 if batches.is_empty() {

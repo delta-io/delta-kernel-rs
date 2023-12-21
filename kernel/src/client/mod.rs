@@ -16,8 +16,8 @@ use url::Url;
 use self::executor::TaskExecutor;
 use self::expression::DefaultExpressionHandler;
 use self::filesystem::ObjectStoreFileSystemClient;
-use self::json::{DefaultJsonHandler, JsonReadContext};
-use self::parquet::{DefaultParquetHandler, ParquetReadContext};
+use self::json::DefaultJsonHandler;
+use self::parquet::DefaultParquetHandler;
 use crate::{
     DeltaResult, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler, TableClient,
 };
@@ -94,9 +94,6 @@ impl<E: TaskExecutor> DefaultTableClient<E> {
 }
 
 impl<E: TaskExecutor> TableClient for DefaultTableClient<E> {
-    type JsonReadContext = JsonReadContext;
-    type ParquetReadContext = ParquetReadContext;
-
     fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler> {
         self.expression.clone()
     }
@@ -105,13 +102,11 @@ impl<E: TaskExecutor> TableClient for DefaultTableClient<E> {
         self.file_system.clone()
     }
 
-    fn get_json_handler(&self) -> Arc<dyn JsonHandler<FileReadContext = Self::JsonReadContext>> {
+    fn get_json_handler(&self) -> Arc<dyn JsonHandler> {
         self.json.clone()
     }
 
-    fn get_parquet_handler(
-        &self,
-    ) -> Arc<dyn ParquetHandler<FileReadContext = Self::ParquetReadContext>> {
+    fn get_parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         self.parquet.clone()
     }
 }
