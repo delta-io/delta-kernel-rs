@@ -21,8 +21,8 @@ struct LogReplayScanner {
 
 impl LogReplayScanner {
     /// Create a new [`LogReplayScanner`] instance
-    fn new<JRC: Send, PRC: Send>(
-        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
+    fn new(
+        table_client: &dyn TableClient,
         table_schema: &SchemaRef,
         predicate: &Option<Expression>,
     ) -> Self {
@@ -94,8 +94,8 @@ impl LogReplayScanner {
 
 /// Given an iterator of (record batch, bool) tuples and a predicate, returns an iterator of [Add]s.
 /// The boolean flag indicates whether the record batch is a log or checkpoint batch.
-pub fn log_replay_iter<JRC: Send, PRC: Send>(
-    table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
+pub fn log_replay_iter(
+    table_client: &dyn TableClient,
     action_iter: impl Iterator<Item = DeltaResult<(RecordBatch, bool)>>,
     table_schema: &SchemaRef,
     predicate: &Option<Expression>,

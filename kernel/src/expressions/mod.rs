@@ -108,12 +108,6 @@ impl<T: Into<Scalar>> From<T> for Expression {
     }
 }
 
-impl From<&Expression> for Expression {
-    fn from(expr: &Expression) -> Self {
-        expr.clone()
-    }
-}
-
 impl Display for Expression {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {

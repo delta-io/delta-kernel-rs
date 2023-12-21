@@ -29,6 +29,18 @@ fn commute(op: &BinaryOperator) -> Option<BinaryOperator> {
     }
 }
 
+/// Rewrites a predicate to a predicate that can be used to skip files based on their stats.
+/// Returns `None` if the predicate is not eligible for data skipping.
+///
+/// We normalize each binary operation to a comparison between a column and a literal value
+/// and rewite that in terms of the min/max values of the column.
+/// For example, `1 < a` is rewritten as `minValues.a > 1`.
+///
+/// The variadic operations are rewritten as follows:
+/// - `AND` is rewritten as a conjunction of the rewritten operands where we just skip
+///   operands that are not eligible for data skipping.
+/// - `OR` is rewritten only if all operands are eligible for data skipping. Otherwise,
+///   the whole OR expression is dropped.
 fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
     use BinaryOperator::*;
     use Expr::*;
@@ -106,8 +118,8 @@ impl DataSkippingFilter {
     ///
     /// NOTE: None is equivalent to a trivial filter that always returns TRUE (= keeps all files),
     /// but using an Option lets the engine easily avoid the overhead of applying trivial filters.
-    pub(crate) fn new<JRC: Send, PRC: Send>(
-        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
+    pub(crate) fn new(
+        table_client: &dyn TableClient,
         table_schema: &SchemaRef,
         predicate: &Option<Expr>,
     ) -> Option<Self> {
@@ -248,43 +260,75 @@ mod tests {
         let cases = [
             (
                 column.clone().lt(lit_int.clone()),
-                Expr::binary(BinaryOperator::LessThan, &min_col, &lit_int),
+                Expr::binary(BinaryOperator::LessThan, min_col.clone(), lit_int.clone()),
             ),
             (
                 lit_int.clone().lt(column.clone()),
-                Expr::binary(BinaryOperator::GreaterThan, &max_col, &lit_int),
+                Expr::binary(
+                    BinaryOperator::GreaterThan,
+                    max_col.clone(),
+                    lit_int.clone(),
+                ),
             ),
             (
                 column.clone().gt(lit_int.clone()),
-                Expr::binary(BinaryOperator::GreaterThan, &max_col, &lit_int),
+                Expr::binary(
+                    BinaryOperator::GreaterThan,
+                    max_col.clone(),
+                    lit_int.clone(),
+                ),
             ),
             (
                 lit_int.clone().gt(column.clone()),
-                Expr::binary(BinaryOperator::LessThan, &min_col, &lit_int),
+                Expr::binary(BinaryOperator::LessThan, min_col.clone(), lit_int.clone()),
             ),
             (
                 column.clone().lt_eq(lit_int.clone()),
-                Expr::binary(BinaryOperator::LessThanOrEqual, &min_col, &lit_int),
+                Expr::binary(
+                    BinaryOperator::LessThanOrEqual,
+                    min_col.clone(),
+                    lit_int.clone(),
+                ),
             ),
             (
                 lit_int.clone().lt_eq(column.clone()),
-                Expr::binary(BinaryOperator::GreaterThanOrEqual, &max_col, &lit_int),
+                Expr::binary(
+                    BinaryOperator::GreaterThanOrEqual,
+                    max_col.clone(),
+                    lit_int.clone(),
+                ),
             ),
             (
                 column.clone().gt_eq(lit_int.clone()),
-                Expr::binary(BinaryOperator::GreaterThanOrEqual, &max_col, &lit_int),
+                Expr::binary(
+                    BinaryOperator::GreaterThanOrEqual,
+                    max_col.clone(),
+                    lit_int.clone(),
+                ),
             ),
             (
                 lit_int.clone().gt_eq(column.clone()),
-                Expr::binary(BinaryOperator::LessThanOrEqual, &min_col, &lit_int),
+                Expr::binary(
+                    BinaryOperator::LessThanOrEqual,
+                    min_col.clone(),
+                    lit_int.clone(),
+                ),
             ),
             (
                 column.clone().eq(lit_int.clone()),
                 Expr::variadic(
                     VariadicOperator::And,
                     [
-                        Expr::binary(BinaryOperator::LessThanOrEqual, &min_col, &lit_int),
-                        Expr::binary(BinaryOperator::GreaterThanOrEqual, &max_col, &lit_int),
+                        Expr::binary(
+                            BinaryOperator::LessThanOrEqual,
+                            min_col.clone(),
+                            lit_int.clone(),
+                        ),
+                        Expr::binary(
+                            BinaryOperator::GreaterThanOrEqual,
+                            max_col.clone(),
+                            lit_int.clone(),
+                        ),
                     ],
                 ),
             ),
@@ -293,8 +337,16 @@ mod tests {
                 Expr::variadic(
                     VariadicOperator::And,
                     [
-                        Expr::binary(BinaryOperator::LessThanOrEqual, &min_col, &lit_int),
-                        Expr::binary(BinaryOperator::GreaterThanOrEqual, &max_col, &lit_int),
+                        Expr::binary(
+                            BinaryOperator::LessThanOrEqual,
+                            min_col.clone(),
+                            lit_int.clone(),
+                        ),
+                        Expr::binary(
+                            BinaryOperator::GreaterThanOrEqual,
+                            max_col.clone(),
+                            lit_int.clone(),
+                        ),
                     ],
                 ),
             ),
@@ -303,8 +355,12 @@ mod tests {
                 Expr::variadic(
                     VariadicOperator::Or,
                     [
-                        Expr::binary(BinaryOperator::GreaterThan, &min_col, &lit_int),
-                        Expr::binary(BinaryOperator::LessThan, &max_col, &lit_int),
+                        Expr::binary(
+                            BinaryOperator::GreaterThan,
+                            min_col.clone(),
+                            lit_int.clone(),
+                        ),
+                        Expr::binary(BinaryOperator::LessThan, max_col.clone(), lit_int.clone()),
                     ],
                 ),
             ),
@@ -313,8 +369,12 @@ mod tests {
                 Expr::variadic(
                     VariadicOperator::Or,
                     [
-                        Expr::binary(BinaryOperator::GreaterThan, &min_col, &lit_int),
-                        Expr::binary(BinaryOperator::LessThan, &max_col, &lit_int),
+                        Expr::binary(
+                            BinaryOperator::GreaterThan,
+                            min_col.clone(),
+                            lit_int.clone(),
+                        ),
+                        Expr::binary(BinaryOperator::LessThan, max_col.clone(), lit_int.clone()),
                     ],
                 ),
             ),
