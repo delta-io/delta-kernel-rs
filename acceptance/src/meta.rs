@@ -46,13 +46,7 @@ impl TestCaseInfo {
         let expected_root = self.root_dir.join("expected");
         let store = LocalFileSystem::new_with_prefix(&expected_root).unwrap();
 
-        let files = store
-            .list(None)
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let files = store.list(None).try_collect::<Vec<_>>().await.unwrap();
 
         let raw_cases = files.into_iter().filter(|meta| {
             meta.location.filename() == Some("table_version_metadata.json")
@@ -78,23 +72,22 @@ impl TestCaseInfo {
         Ok((latest, cases))
     }
 
-    fn assert_snapshot_meta<JRC: Send, PRC: Send + Sync>(
+    fn assert_snapshot_meta(
         &self,
         case: &TableVersionMetaData,
         snapshot: &Snapshot,
-        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
     ) -> TestResult<()> {
         assert_eq!(snapshot.version(), case.version);
 
         // assert correct metadata is read
-        let metadata = snapshot.metadata(table_client)?;
-        let protocol = snapshot.protocol(table_client)?;
+        let metadata = snapshot.metadata();
+        let protocol = snapshot.protocol();
         let tvm = TableVersionMetaData {
             version: snapshot.version(),
             properties: metadata
                 .configuration
-                .into_iter()
-                .map(|(k, v)| (k, v.unwrap()))
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone().unwrap()))
                 .collect(),
             min_reader_version: protocol.min_reader_version as u32,
             min_writer_version: protocol.min_writer_version as u32,
@@ -103,21 +96,18 @@ impl TestCaseInfo {
         Ok(())
     }
 
-    pub async fn assert_metadata<JRC: Send, PRC: Send + Sync>(
-        &self,
-        table_client: Arc<dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>>,
-    ) -> TestResult<()> {
+    pub async fn assert_metadata(&self, table_client: Arc<dyn TableClient>) -> TestResult<()> {
         let table_client = table_client.as_ref();
         let table = Table::new(self.table_root()?);
 
         let (latest, versions) = self.versions().await?;
 
         let snapshot = table.snapshot(table_client, None)?;
-        self.assert_snapshot_meta(&latest, &snapshot, table_client)?;
+        self.assert_snapshot_meta(&latest, &snapshot)?;
 
         for table_version in versions {
             let snapshot = table.snapshot(table_client, Some(table_version.version))?;
-            self.assert_snapshot_meta(&table_version, &snapshot, table_client)?;
+            self.assert_snapshot_meta(&table_version, &snapshot)?;
         }
 
         Ok(())

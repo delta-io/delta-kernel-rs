@@ -34,9 +34,9 @@ impl Table {
     /// Create a [`Snapshot`] of the table corresponding to `version`.
     ///
     /// If no version is supplied, a snapshot for the latest version will be created.
-    pub fn snapshot<JRC: Send, PRC: Send + Sync>(
+    pub fn snapshot(
         &self,
-        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
+        table_client: &dyn TableClient,
         version: Option<Version>,
     ) -> DeltaResult<Arc<Snapshot>> {
         Snapshot::try_new(self.location.clone(), table_client, version)

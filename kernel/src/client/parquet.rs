@@ -14,16 +14,7 @@ use super::file_handler::{FileOpenFuture, FileOpener};
 use crate::executor::TaskExecutor;
 use crate::file_handler::FileStream;
 use crate::schema::SchemaRef;
-use crate::{
-    DeltaResult, Error, Expression, FileDataReadResultIterator, FileHandler, FileMeta,
-    ParquetHandler,
-};
-
-#[derive(Debug)]
-pub struct ParquetReadContext {
-    // pub(crate) reader: ParquetObjectReader,
-    pub(crate) meta: FileMeta,
-}
+use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, ParquetHandler};
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -50,26 +41,12 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     }
 }
 
-impl<E: TaskExecutor> FileHandler for DefaultParquetHandler<E> {
-    type FileReadContext = ParquetReadContext;
-
-    fn contextualize_file_reads(
-        &self,
-        files: &[FileMeta],
-        _predicate: Option<Expression>,
-    ) -> DeltaResult<Vec<ParquetReadContext>> {
-        Ok(files
-            .iter()
-            .map(|meta| ParquetReadContext { meta: meta.clone() })
-            .collect())
-    }
-}
-
 impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     fn read_parquet_files(
         &self,
-        files: Vec<<Self as FileHandler>::FileReadContext>,
+        files: &[FileMeta],
         physical_schema: SchemaRef,
+        _predicate: Option<Expression>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         // TODO at the very least load only required columns ...
         if files.is_empty() {
@@ -78,9 +55,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
         let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
         let file_reader = ParquetOpener::new(1024, schema.clone(), self.store.clone());
-
-        let files = files.into_iter().map(|f| f.meta).collect::<Vec<_>>();
-        let stream = FileStream::new(files, schema, file_reader)?;
+        let stream = FileStream::new(files.to_vec(), schema, file_reader)?;
 
         // This channel will become the output iterator.
         // The stream will execute in the background and send results to this channel.
@@ -196,10 +171,8 @@ mod tests {
         }];
 
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
-        let context = handler.contextualize_file_reads(files, None).unwrap();
-
         let data: Vec<RecordBatch> = handler
-            .read_parquet_files(context, Arc::new(physical_schema.try_into().unwrap()))
+            .read_parquet_files(files, Arc::new(physical_schema.try_into().unwrap()), None)
             .unwrap()
             .try_collect()
             .unwrap();

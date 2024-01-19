@@ -82,14 +82,14 @@ fn main() {
             println!("Latest table version: {}", snapshot.version());
         }
         Commands::Metadata => {
-            println!("{:#?}", snapshot.metadata(&table_client).unwrap());
+            println!("{:#?}", snapshot.metadata());
         }
         Commands::Schema => {
-            println!("{:#?}", snapshot.schema(&table_client).unwrap());
+            println!("{:#?}", snapshot.schema());
         }
         Commands::Adds => {
             use deltakernel::Add;
-            let scan = ScanBuilder::new(snapshot).build(&table_client).unwrap();
+            let scan = ScanBuilder::new(snapshot).build();
             let files: Vec<Add> = scan
                 .files(&table_client)
                 .unwrap()
@@ -109,7 +109,7 @@ fn main() {
                 fields: action_types
                     .as_ref()
                     .iter()
-                    .map(|a| Arc::new(a.field()))
+                    .map(|a| Arc::new(a.schema_field().try_into().unwrap()))
                     .collect(),
                 metadata: Default::default(),
             });
@@ -118,10 +118,12 @@ fn main() {
                 ._log_segment()
                 .replay(&table_client, read_schema, None);
 
-            let batch_vec = batches.unwrap().collect::<Vec<DeltaResult<RecordBatch>>>();
+            let batch_vec = batches
+                .unwrap()
+                .collect::<Vec<DeltaResult<(RecordBatch, bool)>>>();
             let len = batch_vec.len() - 1;
 
-            let batches: Box<dyn Iterator<Item = Result<RecordBatch, deltakernel::Error>>> =
+            let batches: Box<dyn Iterator<Item = Result<(RecordBatch, bool), deltakernel::Error>>> =
                 if *forward {
                     Box::new(batch_vec.into_iter().rev())
                 } else {
@@ -134,7 +136,7 @@ fn main() {
                     println!("\n\n");
                 }
                 println!("-- at {:0>20} --", index);
-                let batch = batch.unwrap();
+                let (batch, _) = batch.unwrap();
                 let actions = parse_actions(&batch, action_types.as_ref()).unwrap();
                 for action in actions {
                     match action {

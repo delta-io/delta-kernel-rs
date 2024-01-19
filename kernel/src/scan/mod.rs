@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow_array::{BooleanArray, RecordBatch};
-use arrow_schema::{Fields, Schema as ArrowSchema};
+use arrow_schema::{Field as ArrowField, Fields, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use arrow_select::filter::filter_record_batch;
 use itertools::Itertools;
@@ -68,20 +68,16 @@ impl ScanBuilder {
     ///
     /// This is lazy and performs no 'work' at this point. The [`Scan`] type itself can be used
     /// to fetch the files and associated metadata required to perform actual data reads.
-    pub fn build<JRC: Send, PRC: Send + Sync>(
-        self,
-        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
-    ) -> DeltaResult<Scan> {
+    pub fn build(self) -> Scan {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
-        let read_schema = match self.schema {
-            Some(schema) => schema,
-            None => Arc::new(self.snapshot.schema(table_client)?.clone()),
-        };
-        Ok(Scan {
+        let read_schema = self
+            .schema
+            .unwrap_or_else(|| self.snapshot.schema().clone().into());
+        Scan {
             snapshot: self.snapshot,
             read_schema,
             predicate: self.predicate,
-        })
+        }
     }
 }
 
@@ -117,12 +113,15 @@ impl Scan {
     /// which yields record batches of scan files and their associated metadata. Rows of the scan
     /// files batches correspond to data reads, and the DeltaReader is used to materialize the scan
     /// files into actual table data.
-    pub fn files<JRC: Send, PRC: Send + Sync>(
+    pub fn files(
         &self,
-        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
+        table_client: &dyn TableClient,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
         let action_schema = Arc::new(ArrowSchema {
-            fields: Fields::from_iter([ActionType::Add.field(), ActionType::Remove.field()]),
+            fields: Fields::from_iter([
+                ArrowField::try_from(ActionType::Add)?,
+                ArrowField::try_from(ActionType::Remove)?,
+            ]),
             metadata: Default::default(),
         });
 
@@ -139,10 +138,7 @@ impl Scan {
         ))
     }
 
-    pub fn execute<JRC: Send, PRC: Send + Sync>(
-        &self,
-        table_client: &dyn TableClient<JsonReadContext = JRC, ParquetReadContext = PRC>,
-    ) -> DeltaResult<Vec<RecordBatch>> {
+    pub fn execute(&self, table_client: &dyn TableClient) -> DeltaResult<Vec<RecordBatch>> {
         let parquet_handler = table_client.get_parquet_handler();
 
         self.files(table_client)?
@@ -153,9 +149,8 @@ impl Scan {
                     size: add.size as usize,
                     location: self.snapshot.table_root.join(&add.path)?,
                 };
-                let context = parquet_handler.contextualize_file_reads(&[meta], None)?;
                 let batches = parquet_handler
-                    .read_parquet_files(context, self.read_schema.clone())?
+                    .read_parquet_files(&[meta], self.read_schema.clone(), None)?
                     .collect::<DeltaResult<Vec<_>>>()?;
 
                 if batches.is_empty() {
@@ -204,7 +199,7 @@ mod tests {
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&table_client, None).unwrap();
-        let scan = ScanBuilder::new(snapshot).build(&table_client).unwrap();
+        let scan = ScanBuilder::new(snapshot).build();
         let files: Vec<Add> = scan.files(&table_client).unwrap().try_collect().unwrap();
 
         assert_eq!(files.len(), 1);
@@ -229,7 +224,7 @@ mod tests {
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&table_client, None).unwrap();
-        let scan = ScanBuilder::new(snapshot).build(&table_client).unwrap();
+        let scan = ScanBuilder::new(snapshot).build();
         let files = scan.execute(&table_client).unwrap();
 
         assert_eq!(files.len(), 1);

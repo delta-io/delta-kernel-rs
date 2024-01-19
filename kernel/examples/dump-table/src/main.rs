@@ -109,7 +109,7 @@ fn main() {
         return;
     };
 
-    let scan = ScanBuilder::new(snapshot).build(&table_client).unwrap();
+    let scan = ScanBuilder::new(snapshot).build();
 
     let schema = scan.schema();
     let header_names = schema.fields.iter().map(|field| {

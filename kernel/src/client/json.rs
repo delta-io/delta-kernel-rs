@@ -14,19 +14,10 @@ use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{DynObjectStore, GetResultPayload};
 
-use super::file_handler::{FileOpenFuture, FileOpener};
-use crate::executor::TaskExecutor;
-use crate::file_handler::FileStream;
+use super::executor::TaskExecutor;
+use super::file_handler::{FileOpenFuture, FileOpener, FileStream};
 use crate::schema::SchemaRef;
-use crate::{
-    DeltaResult, Error, Expression, FileDataReadResultIterator, FileHandler, FileMeta, JsonHandler,
-};
-
-#[derive(Debug)]
-pub struct JsonReadContext {
-    pub(crate) store: Arc<DynObjectStore>,
-    pub(crate) meta: FileMeta,
-}
+use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, JsonHandler};
 
 #[derive(Debug)]
 pub struct DefaultJsonHandler<E: TaskExecutor> {
@@ -50,24 +41,6 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
     pub fn with_readahead(mut self, readahead: usize) -> Self {
         self.readahead = readahead;
         self
-    }
-}
-
-impl<E: TaskExecutor> FileHandler for DefaultJsonHandler<E> {
-    type FileReadContext = JsonReadContext;
-
-    fn contextualize_file_reads(
-        &self,
-        files: &[FileMeta],
-        _predicate: Option<Expression>,
-    ) -> DeltaResult<Vec<JsonReadContext>> {
-        Ok(files
-            .iter()
-            .map(|meta| JsonReadContext {
-                store: self.store.clone(),
-                meta: meta.clone(),
-            })
-            .collect())
     }
 }
 
@@ -100,19 +73,18 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
 
     fn read_json_files(
         &self,
-        files: &[Self::FileReadContext],
+        files: &[FileMeta],
         physical_schema: SchemaRef,
+        _predicate: Option<Expression>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         if files.is_empty() {
             return Ok(Box::new(std::iter::empty()));
         }
 
         let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
-        let store = files.first().unwrap().store.clone();
+        let store = self.store.clone();
         let file_reader = JsonOpener::new(1024, schema.clone(), store);
-
-        let files = files.iter().map(|f| f.meta.clone()).collect::<Vec<_>>();
-        let stream = FileStream::new(files, schema, file_reader)?;
+        let stream = FileStream::new(files.to_vec(), schema, file_reader)?;
 
         // This channel will become the output iterator
         // The stream will execute in the background, and we allow up to `readahead`
@@ -211,10 +183,12 @@ impl FileOpener for JsonOpener {
 mod tests {
     use std::path::PathBuf;
 
-    use super::*;
-    use crate::{actions::get_log_schema, executor::tokio::TokioBackgroundExecutor};
+    use arrow_schema::Schema as ArrowSchema;
     use itertools::Itertools;
     use object_store::{local::LocalFileSystem, ObjectStore};
+
+    use super::*;
+    use crate::{actions::schemas::log_schema, executor::tokio::TokioBackgroundExecutor};
 
     #[test]
     fn test_parse_json() {
@@ -228,7 +202,7 @@ mod tests {
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
         ]
         .into();
-        let output_schema = Arc::new(get_log_schema());
+        let output_schema = Arc::new(ArrowSchema::try_from(log_schema()).unwrap());
 
         let batch = handler.parse_json(json_strings, output_schema).unwrap();
         assert_eq!(batch.num_rows(), 4);
@@ -253,10 +227,9 @@ mod tests {
         }];
 
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
-        let physical_schema = Arc::new(get_log_schema());
-        let context = handler.contextualize_file_reads(files, None).unwrap();
+        let physical_schema = Arc::new(ArrowSchema::try_from(log_schema()).unwrap());
         let data: Vec<RecordBatch> = handler
-            .read_json_files(&context, Arc::new(physical_schema.try_into().unwrap()))
+            .read_json_files(files, Arc::new(physical_schema.try_into().unwrap()), None)
             .unwrap()
             .try_collect()
             .unwrap();

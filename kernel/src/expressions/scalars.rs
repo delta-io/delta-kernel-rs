@@ -17,7 +17,7 @@ pub enum Scalar {
     Timestamp(i64),
     Date(i32),
     Binary(Vec<u8>),
-    Decimal(i128, i32, i32),
+    Decimal(i128, u8, i8),
     Null(DataType),
 }
 
