@@ -19,7 +19,7 @@ use self::filesystem::ObjectStoreFileSystemClient;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
 use crate::{
-    DeltaResult, EngineClient, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler,
+    DataExtractor, DeltaResult, EngineClient, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler,
 };
 
 pub mod conversion;
@@ -108,5 +108,9 @@ impl<E: TaskExecutor> EngineClient for DefaultTableClient<E> {
 
     fn get_parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         self.parquet.clone()
+    }
+
+    fn get_data_extactor(&self) -> Arc<dyn DataExtractor> {
+        unimplemented!()
     }
 }
