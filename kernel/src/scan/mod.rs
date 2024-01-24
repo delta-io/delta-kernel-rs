@@ -10,7 +10,7 @@ use crate::actions::ActionType;
 use crate::expressions::Expression;
 use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::Snapshot;
-use crate::{Add, DeltaResult, FileMeta, TableClient};
+use crate::{Add, DeltaResult, EngineClient, FileMeta};
 
 mod data_skipping;
 pub mod file_stream;
@@ -117,7 +117,7 @@ impl Scan {
     /// files into actual table data.
     pub fn files(
         &self,
-        table_client: &dyn TableClient,
+        engine_client: &dyn EngineClient,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
         lazy_static::lazy_static! {
             static ref ACTION_SCHEMA: SchemaRef = Arc::new(StructType::new(vec![
@@ -127,7 +127,7 @@ impl Scan {
         }
 
         let log_iter = self.snapshot.log_segment.replay(
-            table_client,
+            engine_client,
             ACTION_SCHEMA.clone(),
             self.predicate.clone(),
         )?;
@@ -140,10 +140,10 @@ impl Scan {
         ))
     }
 
-    pub fn execute(&self, table_client: &dyn TableClient) -> DeltaResult<Vec<RecordBatch>> {
-        let parquet_handler = table_client.get_parquet_handler();
+    pub fn execute(&self, engine_client: &dyn EngineClient) -> DeltaResult<Vec<RecordBatch>> {
+        let parquet_handler = engine_client.get_parquet_handler();
 
-        self.files(table_client)?
+        self.files(engine_client)?
             .map(|res| {
                 let add = res?;
                 let meta = FileMeta {
@@ -163,7 +163,7 @@ impl Scan {
                 let batch = concat_batches(&schema, &batches)?;
 
                 if let Some(dv_descriptor) = add.deletion_vector {
-                    let fs_client = table_client.get_file_system_client();
+                    let fs_client = engine_client.get_file_system_client();
                     let dv = dv_descriptor.read(fs_client, self.snapshot.table_root.clone())?;
                     let mask: BooleanArray = (0..batch.num_rows())
                         .map(|i| Some(!dv.contains(i.try_into().expect("fit into u32"))))
@@ -192,7 +192,7 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let table_client = DefaultTableClient::try_new(
+        let engine_client = DefaultTableClient::try_new(
             &url,
             std::iter::empty::<(&str, &str)>(),
             Arc::new(TokioBackgroundExecutor::new()),
@@ -200,9 +200,9 @@ mod tests {
         .unwrap();
 
         let table = Table::new(url);
-        let snapshot = table.snapshot(&table_client, None).unwrap();
+        let snapshot = table.snapshot(&engine_client, None).unwrap();
         let scan = ScanBuilder::new(snapshot).build();
-        let files: Vec<Add> = scan.files(&table_client).unwrap().try_collect().unwrap();
+        let files: Vec<Add> = scan.files(&engine_client).unwrap().try_collect().unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(
@@ -217,7 +217,7 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let table_client = DefaultTableClient::try_new(
+        let engine_client = DefaultTableClient::try_new(
             &url,
             std::iter::empty::<(&str, &str)>(),
             Arc::new(TokioBackgroundExecutor::new()),
@@ -225,9 +225,9 @@ mod tests {
         .unwrap();
 
         let table = Table::new(url);
-        let snapshot = table.snapshot(&table_client, None).unwrap();
+        let snapshot = table.snapshot(&engine_client, None).unwrap();
         let scan = ScanBuilder::new(snapshot).build();
-        let files = scan.execute(&table_client).unwrap();
+        let files = scan.execute(&engine_client).unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].num_rows(), 10)
