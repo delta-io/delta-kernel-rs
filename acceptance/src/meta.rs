@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use deltakernel::snapshot::Snapshot;
-use deltakernel::{Error, Table, TableClient, Version};
+use deltakernel::{EngineClient, Error, Table, Version};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssertionError {
@@ -96,17 +96,17 @@ impl TestCaseInfo {
         Ok(())
     }
 
-    pub async fn assert_metadata(&self, table_client: Arc<dyn TableClient>) -> TestResult<()> {
-        let table_client = table_client.as_ref();
+    pub async fn assert_metadata(&self, engine_client: Arc<dyn EngineClient>) -> TestResult<()> {
+        let engine_client = engine_client.as_ref();
         let table = Table::new(self.table_root()?);
 
         let (latest, versions) = self.versions().await?;
 
-        let snapshot = table.snapshot(table_client, None)?;
+        let snapshot = table.snapshot(engine_client, None)?;
         self.assert_snapshot_meta(&latest, &snapshot)?;
 
         for table_version in versions {
-            let snapshot = table.snapshot(table_client, Some(table_version.version))?;
+            let snapshot = table.snapshot(engine_client, Some(table_version.version))?;
             self.assert_snapshot_meta(&table_version, &snapshot)?;
         }
 

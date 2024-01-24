@@ -1,6 +1,6 @@
 //! # Default TableClient
 //!
-//! The default implementation of [`TableClient`] is [`DefaultTableClient`].
+//! The default implementation of [`EngineClient`] is [`DefaultTableClient`].
 //! This uses the [object_store], [parquet][::parquet], and [arrow_json] crates
 //! to read and write data.
 //!
@@ -19,7 +19,7 @@ use self::filesystem::ObjectStoreFileSystemClient;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
 use crate::{
-    DeltaResult, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler, TableClient,
+    DeltaResult, EngineClient, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler,
 };
 
 pub mod conversion;
@@ -93,7 +93,7 @@ impl<E: TaskExecutor> DefaultTableClient<E> {
     }
 }
 
-impl<E: TaskExecutor> TableClient for DefaultTableClient<E> {
+impl<E: TaskExecutor> EngineClient for DefaultTableClient<E> {
     fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler> {
         self.expression.clone()
     }
