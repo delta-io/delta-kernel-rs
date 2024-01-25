@@ -32,6 +32,7 @@ pub enum DataItem<'a> {
     U32(u32),
     U64(u64),
     Str(&'a str),
+    StrList(Vec<&'a str>),
     Map(&'a dyn MapItem),
 }
 

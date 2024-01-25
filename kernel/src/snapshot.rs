@@ -217,8 +217,12 @@ impl Snapshot {
         let (metadata, protocol) = log_segment
             .read_metadata(engine_client)?
             .ok_or(Error::MissingMetadata)?;
-
-        let schema = metadata.schema()?;
+        use crate::schema::DataType;
+        let schema = if let DataType::Struct(ref ms) = crate::actions::schemas::METADATA_FIELD.data_type {
+            *((*ms).clone())
+        } else {
+            panic!("metaData schema is wrong")
+        };
         Ok(Self {
             table_root: location,
             log_segment,

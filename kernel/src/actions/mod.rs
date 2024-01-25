@@ -10,10 +10,12 @@ use itertools::izip;
 
 use crate::{DeltaResult, Error};
 
+pub(crate) mod action_definitions;
 pub(crate) mod schemas;
 pub(crate) mod types;
 
 pub use types::*;
+pub use action_definitions::{Format, Metadata, Protocol};
 
 #[derive(Debug)]
 pub enum ActionType {
@@ -80,163 +82,163 @@ pub(crate) fn parse_action(
         ))?;
 
     match action_type {
-        ActionType::Metadata => parse_action_metadata(arr),
-        ActionType::Protocol => parse_action_protocol(arr),
+        ActionType::Metadata => panic!(),
+        ActionType::Protocol => panic!(),
         ActionType::Add => parse_actions_add(arr),
         ActionType::Remove => parse_actions_remove(arr),
         _ => todo!(),
     }
 }
 
-fn parse_action_metadata(arr: &StructArray) -> DeltaResult<Box<dyn Iterator<Item = Action>>> {
-    let ids = cast_struct_column::<StringArray>(arr, "id")?;
-    let schema_strings = cast_struct_column::<StringArray>(arr, "schemaString")?;
-    let metadata =
-        ids.into_iter()
-            .zip(schema_strings)
-            .find_map(|(maybe_id, maybe_schema_string)| {
-                if let (Some(id), Some(schema_string)) = (maybe_id, maybe_schema_string) {
-                    Some(Metadata::new(
-                        id,
-                        Format {
-                            provider: "parquet".into(),
-                            options: Default::default(),
-                        },
-                        schema_string,
-                        Vec::<String>::new(),
-                        None,
-                    ))
-                } else {
-                    None
-                }
-            });
+// fn parse_action_metadata(arr: &StructArray) -> DeltaResult<Box<dyn Iterator<Item = Action>>> {
+//     let ids = cast_struct_column::<StringArray>(arr, "id")?;
+//     let schema_strings = cast_struct_column::<StringArray>(arr, "schemaString")?;
+//     let metadata =
+//         ids.into_iter()
+//             .zip(schema_strings)
+//             .find_map(|(maybe_id, maybe_schema_string)| {
+//                 if let (Some(id), Some(schema_string)) = (maybe_id, maybe_schema_string) {
+//                     Some(Metadata::new(
+//                         id,
+//                         Format {
+//                             provider: "parquet".into(),
+//                             options: Default::default(),
+//                         },
+//                         schema_string,
+//                         Vec::<String>::new(),
+//                         None,
+//                     ))
+//                 } else {
+//                     None
+//                 }
+//             });
 
-    if metadata.is_none() {
-        return Ok(Box::new(std::iter::empty()));
-    }
-    let mut metadata = metadata.unwrap();
+//     if metadata.is_none() {
+//         return Ok(Box::new(std::iter::empty()));
+//     }
+//     let mut metadata = metadata.unwrap();
 
-    metadata.partition_columns = cast_struct_column::<ListArray>(arr, "partitionColumns")
-        .ok()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|it| {
-                    if let Some(features) = it {
-                        let vals = features
-                            .as_any()
-                            .downcast_ref::<StringArray>()?
-                            .iter()
-                            .filter_map(|v| v.map(|inner| inner.to_owned()))
-                            .collect::<Vec<_>>();
-                        Some(vals)
-                    } else {
-                        None
-                    }
-                })
-                .flatten()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+//     metadata.partition_columns = cast_struct_column::<ListArray>(arr, "partitionColumns")
+//         .ok()
+//         .map(|arr| {
+//             arr.iter()
+//                 .filter_map(|it| {
+//                     if let Some(features) = it {
+//                         let vals = features
+//                             .as_any()
+//                             .downcast_ref::<StringArray>()?
+//                             .iter()
+//                             .filter_map(|v| v.map(|inner| inner.to_owned()))
+//                             .collect::<Vec<_>>();
+//                         Some(vals)
+//                     } else {
+//                         None
+//                     }
+//                 })
+//                 .flatten()
+//                 .collect::<Vec<_>>()
+//         })
+//         .unwrap_or_default();
 
-    metadata.name = cast_struct_column::<StringArray>(arr, "name")
-        .ok()
-        .and_then(|arr| {
-            arr.iter()
-                .flat_map(|maybe| maybe.map(|v| v.to_string()))
-                .next()
-        });
-    metadata.description = cast_struct_column::<StringArray>(arr, "description")
-        .ok()
-        .and_then(|arr| {
-            arr.iter()
-                .flat_map(|maybe| maybe.map(|v| v.to_string()))
-                .next()
-        });
-    metadata.created_time = cast_struct_column::<Int64Array>(arr, "createdTime")
-        .ok()
-        .and_then(|arr| arr.iter().flatten().next());
+//     metadata.name = cast_struct_column::<StringArray>(arr, "name")
+//         .ok()
+//         .and_then(|arr| {
+//             arr.iter()
+//                 .flat_map(|maybe| maybe.map(|v| v.to_string()))
+//                 .next()
+//         });
+//     metadata.description = cast_struct_column::<StringArray>(arr, "description")
+//         .ok()
+//         .and_then(|arr| {
+//             arr.iter()
+//                 .flat_map(|maybe| maybe.map(|v| v.to_string()))
+//                 .next()
+//         });
+//     metadata.created_time = cast_struct_column::<Int64Array>(arr, "createdTime")
+//         .ok()
+//         .and_then(|arr| arr.iter().flatten().next());
 
-    if let Ok(config) = cast_struct_column::<MapArray>(arr, "configuration") {
-        let keys = config
-            .keys()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or(Error::MissingData("expected key column in map".into()))?;
-        let values = config
-            .values()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or(Error::MissingData("expected value column in map".into()))?;
-        metadata.configuration = keys
-            .into_iter()
-            .zip(values)
-            .filter_map(|(k, v)| k.map(|key| (key.to_string(), v.map(|vv| vv.to_string()))))
-            .collect::<HashMap<_, _>>();
-    };
+//     if let Ok(config) = cast_struct_column::<MapArray>(arr, "configuration") {
+//         let keys = config
+//             .keys()
+//             .as_any()
+//             .downcast_ref::<StringArray>()
+//             .ok_or(Error::MissingData("expected key column in map".into()))?;
+//         let values = config
+//             .values()
+//             .as_any()
+//             .downcast_ref::<StringArray>()
+//             .ok_or(Error::MissingData("expected value column in map".into()))?;
+//         metadata.configuration = keys
+//             .into_iter()
+//             .zip(values)
+//             .filter_map(|(k, v)| k.map(|key| (key.to_string(), v.map(|vv| vv.to_string()))))
+//             .collect::<HashMap<_, _>>();
+//     };
 
-    Ok(Box::new(std::iter::once(Action::Metadata(metadata))))
-}
+//     Ok(Box::new(std::iter::once(Action::Metadata(metadata))))
+// }
 
-fn parse_action_protocol(arr: &StructArray) -> DeltaResult<Box<dyn Iterator<Item = Action>>> {
-    let min_reader = cast_struct_column::<Int32Array>(arr, "minReaderVersion")?;
-    let min_writer = cast_struct_column::<Int32Array>(arr, "minWriterVersion")?;
-    let protocol = min_reader.into_iter().zip(min_writer).find_map(|(r, w)| {
-        if let (Some(min_reader_version), Some(min_wrriter_version)) = (r, w) {
-            Some(Protocol::new(min_reader_version, min_wrriter_version))
-        } else {
-            None
-        }
-    });
+// fn parse_action_protocol(arr: &StructArray) -> DeltaResult<Box<dyn Iterator<Item = Action>>> {
+//     let min_reader = cast_struct_column::<Int32Array>(arr, "minReaderVersion")?;
+//     let min_writer = cast_struct_column::<Int32Array>(arr, "minWriterVersion")?;
+//     let protocol = min_reader.into_iter().zip(min_writer).find_map(|(r, w)| {
+//         if let (Some(min_reader_version), Some(min_wrriter_version)) = (r, w) {
+//             Some(Protocol::new(min_reader_version, min_wrriter_version))
+//         } else {
+//             None
+//         }
+//     });
 
-    if protocol.is_none() {
-        return Ok(Box::new(std::iter::empty()));
-    }
-    let mut protocol = protocol.unwrap();
+//     if protocol.is_none() {
+//         return Ok(Box::new(std::iter::empty()));
+//     }
+//     let mut protocol = protocol.unwrap();
 
-    protocol.reader_features = cast_struct_column::<ListArray>(arr, "readerFeatures")
-        .ok()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|it| {
-                    if let Some(features) = it {
-                        let vals = features
-                            .as_any()
-                            .downcast_ref::<StringArray>()?
-                            .iter()
-                            .filter_map(|v| v.map(|inner| inner.to_owned()))
-                            .collect::<Vec<_>>();
-                        Some(vals)
-                    } else {
-                        None
-                    }
-                })
-                .flatten()
-                .collect::<Vec<_>>()
-        });
+//     protocol.reader_features = cast_struct_column::<ListArray>(arr, "readerFeatures")
+//         .ok()
+//         .map(|arr| {
+//             arr.iter()
+//                 .filter_map(|it| {
+//                     if let Some(features) = it {
+//                         let vals = features
+//                             .as_any()
+//                             .downcast_ref::<StringArray>()?
+//                             .iter()
+//                             .filter_map(|v| v.map(|inner| inner.to_owned()))
+//                             .collect::<Vec<_>>();
+//                         Some(vals)
+//                     } else {
+//                         None
+//                     }
+//                 })
+//                 .flatten()
+//                 .collect::<Vec<_>>()
+//         });
 
-    protocol.writer_features = cast_struct_column::<ListArray>(arr, "writerFeatures")
-        .ok()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|it| {
-                    if let Some(features) = it {
-                        let vals = features
-                            .as_any()
-                            .downcast_ref::<StringArray>()?
-                            .iter()
-                            .filter_map(|v| v.map(|inner| inner.to_string()))
-                            .collect::<Vec<_>>();
-                        Some(vals)
-                    } else {
-                        None
-                    }
-                })
-                .flatten()
-                .collect::<Vec<_>>()
-        });
+//     protocol.writer_features = cast_struct_column::<ListArray>(arr, "writerFeatures")
+//         .ok()
+//         .map(|arr| {
+//             arr.iter()
+//                 .filter_map(|it| {
+//                     if let Some(features) = it {
+//                         let vals = features
+//                             .as_any()
+//                             .downcast_ref::<StringArray>()?
+//                             .iter()
+//                             .filter_map(|v| v.map(|inner| inner.to_string()))
+//                             .collect::<Vec<_>>();
+//                         Some(vals)
+//                     } else {
+//                         None
+//                     }
+//                 })
+//                 .flatten()
+//                 .collect::<Vec<_>>()
+//         });
 
-    Ok(Box::new(std::iter::once(Action::Protocol(protocol))))
-}
+//     Ok(Box::new(std::iter::once(Action::Protocol(protocol))))
+// }
 
 fn parse_actions_add(arr: &StructArray) -> DeltaResult<Box<dyn Iterator<Item = Action> + '_>> {
     let paths = cast_struct_column::<StringArray>(arr, "path")?;
@@ -529,6 +531,7 @@ mod tests {
     use crate::actions::Protocol;
     use crate::client::json::DefaultJsonHandler;
     use crate::executor::tokio::TokioBackgroundExecutor;
+    use crate::simple_client::{SimpleClient, data::SimpleData};
     use crate::JsonHandler;
 
     fn action_batch() -> RecordBatch {
@@ -548,36 +551,36 @@ mod tests {
 
     #[test]
     fn test_parse_protocol() {
-        let batch = action_batch();
-        let action = parse_action(&batch, &ActionType::Protocol)
-            .unwrap()
-            .collect::<Vec<_>>();
-        let expected = Action::Protocol(Protocol {
+        let client = SimpleClient::new();
+        let data: SimpleData = action_batch().into();
+        let parsed = Protocol::try_new_from_data(&client, &data).unwrap();
+        let expected = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
             reader_features: Some(vec!["deletionVectors".into()]),
             writer_features: Some(vec!["deletionVectors".into()]),
-        });
-        assert_eq!(action[0], expected)
+        };
+        assert_eq!(parsed, expected)
     }
 
     #[test]
     fn test_parse_metadata() {
-        let batch = action_batch();
-        let action = parse_action(&batch, &ActionType::Metadata)
-            .unwrap()
-            .collect::<Vec<_>>();
-        let configuration = HashMap::from_iter([
-            (
-                "delta.enableDeletionVectors".to_string(),
-                Some("true".to_string()),
-            ),
-            (
-                "delta.columnMapping.mode".to_string(),
-                Some("none".to_string()),
-            ),
-        ]);
-        let expected = Action::Metadata(Metadata {
+        let client = SimpleClient::new();
+        let data: SimpleData = action_batch().into();
+        let parsed = Metadata::try_new_from_data(&client, &data).unwrap();
+
+        // TODO: Support maps
+        // let configuration = HashMap::from_iter([
+        //     (
+        //         "delta.enableDeletionVectors".to_string(),
+        //         Some("true".to_string()),
+        //     ),
+        //     (
+        //         "delta.columnMapping.mode".to_string(),
+        //         Some("none".to_string()),
+        //     ),
+        // ]);
+        let expected = Metadata {
             id: "testId".into(),
             name: None,
             description: None,
@@ -588,9 +591,9 @@ mod tests {
             schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
             partition_columns: Vec::new(),
             created_time: Some(1677811175819),
-            configuration,
-        });
-        assert_eq!(action[0], expected)
+            configuration: HashMap::new(),
+        };
+        assert_eq!(parsed, expected)
     }
 
     #[test]

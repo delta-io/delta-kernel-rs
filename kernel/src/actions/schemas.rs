@@ -7,7 +7,7 @@ use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
 lazy_static! {
     // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#change-metadata
-    static ref METADATA_FIELD: StructField = StructField::new(
+    pub static ref METADATA_FIELD: StructField = StructField::new(
         "metaData",
         StructType::new(vec![
             StructField::new("id", DataType::STRING, false),
@@ -49,7 +49,7 @@ lazy_static! {
         true,
     );
     // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#protocol-evolution
-    static ref PROTOCOL_FIELD: StructField = StructField::new(
+    pub static ref PROTOCOL_FIELD: StructField = StructField::new(
         "protocol",
         StructType::new(vec![
             StructField::new("minReaderVersion", DataType::INTEGER, false),

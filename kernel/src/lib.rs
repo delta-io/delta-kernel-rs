@@ -62,6 +62,9 @@ pub use error::{DeltaResult, Error};
 pub use expressions::Expression;
 pub use table::Table;
 
+// TODO: Feature flag
+pub mod simple_client;
+
 #[cfg(feature = "default-client")]
 pub mod client;
 #[cfg(feature = "default-client")]
