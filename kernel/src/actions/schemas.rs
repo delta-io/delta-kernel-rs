@@ -99,7 +99,7 @@ lazy_static! {
         true,
     );
     // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#add-file-and-remove-file
-    static ref ADD_FIELD: StructField = StructField::new(
+    pub static ref ADD_FIELD: StructField = StructField::new(
         "add",
         StructType::new(vec![
             StructField::new("path", DataType::STRING, false),
@@ -117,7 +117,7 @@ lazy_static! {
         true,
     );
     // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#add-file-and-remove-file
-    static ref REMOVE_FIELD: StructField = StructField::new(
+    pub static ref REMOVE_FIELD: StructField = StructField::new(
         "remove",
         StructType::new(vec![
             StructField::new("path", DataType::STRING, false),

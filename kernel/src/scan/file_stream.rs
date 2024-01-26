@@ -4,7 +4,7 @@ use super::data_skipping::DataSkippingFilter;
 use crate::actions::{parse_actions, Action, ActionType, Add};
 use crate::expressions::Expression;
 use crate::schema::SchemaRef;
-use crate::DeltaResult;
+use crate::{DeltaResult, EngineData};
 
 use arrow_array::RecordBatch;
 use either::Either;
@@ -33,18 +33,20 @@ impl LogReplayScanner {
     /// actions in the log.
     fn process_batch(
         &mut self,
-        actions: &RecordBatch,
+        actions: &Box<dyn EngineData>,
         is_log_batch: bool,
     ) -> DeltaResult<Vec<Add>> {
-        let filtered_actions = match &self.filter {
-            Some(filter) => Some(filter.apply(actions)?),
-            None => None,
-        };
-        let actions = if let Some(filtered) = &filtered_actions {
-            filtered
-        } else {
-            actions
-        };
+        // let filtered_actions = match &self.filter {
+        //     Some(filter) => Some(filter.apply(actions)?),
+        //     None => None,
+        // };
+
+        // TODO: Add back DataSkippingFilter
+        // let actions = if let Some(filtered) = &filtered_actions {
+        //     filtered
+        // } else {
+        //     actions
+        // };
 
         let schema_to_use = if is_log_batch {
             vec![ActionType::Add, ActionType::Remove]
@@ -54,44 +56,45 @@ impl LogReplayScanner {
             vec![ActionType::Add]
         };
 
-        let adds: Vec<Add> = parse_actions(actions, &schema_to_use)?
-            .filter_map(|action| match action {
-                Action::Add(add)
-                    // Note: each (add.path + add.dv_unique_id()) pair has a
-                    // unique Add + Remove pair in the log. For example:
-                    // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
-                    if !self
-                        .seen
-                        .contains(&(add.path.clone(), add.dv_unique_id())) =>
-                {
-                    debug!("Found file: {}", &add.path);
-                    if is_log_batch {
-                        // Remember file actions from this batch so we can ignore duplicates
-                        // as we process batches from older commit and/or checkpoint files. We
-                        // don't need to track checkpoint batches because they are already the
-                        // oldest actions and can never replace anything.
-                        self.seen.insert((add.path.clone(), add.dv_unique_id()));
-                    }
-                    Some(add)
-                }
-                Action::Remove(remove) => {
-                    // Remove actions always come from log batches, so no need to check here.
-                    self.seen
-                        .insert((remove.path.clone(), remove.dv_unique_id()));
-                    None
-                }
-                _ => None,
-            })
-            .collect();
+        // let adds: Vec<Add> = parse_actions(actions, &schema_to_use)?
+        //     .filter_map(|action| match action {
+        //         Action::Add(add)
+        //             // Note: each (add.path + add.dv_unique_id()) pair has a
+        //             // unique Add + Remove pair in the log. For example:
+        //             // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
+        //             if !self
+        //                 .seen
+        //                 .contains(&(add.path.clone(), add.dv_unique_id())) =>
+        //         {
+        //             debug!("Found file: {}", &add.path);
+        //             if is_log_batch {
+        //                 // Remember file actions from this batch so we can ignore duplicates
+        //                 // as we process batches from older commit and/or checkpoint files. We
+        //                 // don't need to track checkpoint batches because they are already the
+        //                 // oldest actions and can never replace anything.
+        //                 self.seen.insert((add.path.clone(), add.dv_unique_id()));
+        //             }
+        //             Some(add)
+        //         }
+        //         Action::Remove(remove) => {
+        //             // Remove actions always come from log batches, so no need to check here.
+        //             self.seen
+        //                 .insert((remove.path.clone(), remove.dv_unique_id()));
+        //             None
+        //         }
+        //         _ => None,
+        //     })
+        //     .collect();
 
-        Ok(adds)
+        // Ok(adds)
+        Ok(vec!())
     }
 }
 
 /// Given an iterator of (record batch, bool) tuples and a predicate, returns an iterator of [Add]s.
 /// The boolean flag indicates whether the record batch is a log or checkpoint batch.
 pub fn log_replay_iter(
-    action_iter: impl Iterator<Item = DeltaResult<(RecordBatch, bool)>>,
+    action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
     table_schema: &SchemaRef,
     predicate: &Option<Expression>,
 ) -> impl Iterator<Item = DeltaResult<Add>> {

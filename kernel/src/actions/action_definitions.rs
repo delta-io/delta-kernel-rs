@@ -61,6 +61,10 @@ impl Metadata {
             .extracted
             .ok_or(Error::Generic("Failed to extract metadata".to_string()))
     }
+
+    pub fn schema(&self) -> DeltaResult<StructType> {
+        Ok(serde_json::from_str(&self.schema_string)?)
+    }
 }
 
 #[derive(Default)]

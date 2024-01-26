@@ -9,7 +9,7 @@ use itertools::Itertools;
 use self::file_stream::log_replay_iter;
 use crate::actions::ActionType;
 use crate::expressions::Expression;
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::Snapshot;
 use crate::{Add, DeltaResult, EngineClient, FileMeta};
 
@@ -117,13 +117,10 @@ impl Scan {
         &self,
         engine_client: &dyn EngineClient,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
-        let action_schema = Arc::new(ArrowSchema {
-            fields: Fields::from_iter([
-                ArrowField::try_from(ActionType::Add)?,
-                ArrowField::try_from(ActionType::Remove)?,
-            ]),
-            metadata: Default::default(),
-        });
+        let action_schema = Arc::new(StructType::new(vec![
+            crate::actions::schemas::ADD_FIELD.clone(),
+            crate::actions::schemas::REMOVE_FIELD.clone(),
+        ]));
 
         let log_iter = self.snapshot.log_segment.replay(
             engine_client,
@@ -139,40 +136,41 @@ impl Scan {
     }
 
     pub fn execute(&self, engine_client: &dyn EngineClient) -> DeltaResult<Vec<RecordBatch>> {
-        let parquet_handler = engine_client.get_parquet_handler();
+        // let parquet_handler = engine_client.get_parquet_handler();
 
-        self.files(engine_client)?
-            .map(|res| {
-                let add = res?;
-                let meta = FileMeta {
-                    last_modified: add.modification_time,
-                    size: add.size as usize,
-                    location: self.snapshot.table_root.join(&add.path)?,
-                };
-                let batches = parquet_handler
-                    .read_parquet_files(&[meta], self.read_schema.clone(), None)?
-                    .collect::<DeltaResult<Vec<_>>>()?;
+        // self.files(engine_client)?
+        //     .map(|res| {
+        //         let add = res?;
+        //         let meta = FileMeta {
+        //             last_modified: add.modification_time,
+        //             size: add.size as usize,
+        //             location: self.snapshot.table_root.join(&add.path)?,
+        //         };
+        //         let batches = parquet_handler
+        //             .read_parquet_files(&[meta], self.read_schema.clone(), None)?
+        //             .collect::<DeltaResult<Vec<_>>>()?;
 
-                if batches.is_empty() {
-                    return Ok(None);
-                }
+        //         if batches.is_empty() {
+        //             return Ok(None);
+        //         }
 
-                let schema = batches[0].schema();
-                let batch = concat_batches(&schema, &batches)?;
+        //         let schema = batches[0].schema();
+        //         let batch = concat_batches(&schema, &batches)?;
 
-                if let Some(dv_descriptor) = add.deletion_vector {
-                    let fs_client = engine_client.get_file_system_client();
-                    let dv = dv_descriptor.read(fs_client, self.snapshot.table_root.clone())?;
-                    let mask: BooleanArray = (0..batch.num_rows())
-                        .map(|i| Some(!dv.contains(i.try_into().expect("fit into u32"))))
-                        .collect();
-                    Ok(Some(filter_record_batch(&batch, &mask)?))
-                } else {
-                    Ok(Some(batch))
-                }
-            })
-            .filter_map_ok(|batch| batch)
-            .collect()
+        //         if let Some(dv_descriptor) = add.deletion_vector {
+        //             let fs_client = engine_client.get_file_system_client();
+        //             let dv = dv_descriptor.read(fs_client, self.snapshot.table_root.clone())?;
+        //             let mask: BooleanArray = (0..batch.num_rows())
+        //                 .map(|i| Some(!dv.contains(i.try_into().expect("fit into u32"))))
+        //                 .collect();
+        //             Ok(Some(filter_record_batch(&batch, &mask)?))
+        //         } else {
+        //             Ok(Some(batch))
+        //         }
+        //     })
+        //     .filter_map_ok(|batch| batch)
+        //     .collect()
+        Ok(vec!())
     }
 }
 

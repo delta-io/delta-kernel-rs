@@ -113,7 +113,7 @@ pub trait TypeTag: 'static {
 ///   }
 /// }
 /// ```
-pub trait EngineData {
+pub trait EngineData: Send {
     fn type_tag(&self) -> &dyn TypeTag;
 
     fn as_any(&self) -> &dyn Any;

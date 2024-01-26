@@ -5,16 +5,14 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
-use arrow_schema::{Field as ArrowField, Fields, Schema as ArrowSchema};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::actions::{parse_action, Action, ActionType, Metadata, Protocol};
 use crate::path::LogPath;
-use crate::schema::Schema;
-use crate::Expression;
+use crate::schema::{Schema, StructType, SchemaRef};
+use crate::{Expression, EngineData};
 use crate::{DeltaResult, EngineClient, Error, FileMeta, FileSystemClient, Version};
 
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
@@ -46,14 +44,14 @@ impl LogSegment {
     fn replay(
         &self,
         engine_client: &dyn EngineClient,
-        read_schema: Arc<ArrowSchema>,
+        read_schema: SchemaRef,
         predicate: Option<Expression>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(RecordBatch, bool)>>> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>> {
         let json_client = engine_client.get_json_handler();
         let commit_stream = json_client
             .read_json_files(
                 &self.commit_files,
-                Arc::new(read_schema.as_ref().try_into()?),
+                read_schema.clone(),
                 predicate.clone(),
             )?
             .map_ok(|batch| (batch, true));
@@ -62,7 +60,7 @@ impl LogSegment {
         let checkpoint_stream = parquet_client
             .read_parquet_files(
                 &self.checkpoint_files,
-                Arc::new(read_schema.as_ref().try_into()?),
+                read_schema,
                 predicate,
             )?
             .map_ok(|batch| (batch, false));
@@ -72,47 +70,34 @@ impl LogSegment {
         Ok(batches)
     }
 
-    fn read_metadata(
-        &self,
-        engine_client: &dyn EngineClient,
-    ) -> DeltaResult<Option<(Metadata, Protocol)>> {
-        let read_schema = Arc::new(ArrowSchema {
-            fields: Fields::from_iter([
-                ArrowField::try_from(ActionType::Metadata)?,
-                ArrowField::try_from(ActionType::Protocol)?,
-            ]),
-            metadata: Default::default(),
-        });
-
+    fn read_metadata(&self, engine_client: &dyn EngineClient) -> DeltaResult<Option<(Metadata, Protocol)>> {
+        //let metadata_schema = crate::actions::schemas::METADATA_SCHEMA.clone();
+        let schema = StructType::new(vec![
+            crate::actions::schemas::METADATA_FIELD.clone(),
+            crate::actions::schemas::PROTOCOL_FIELD.clone(),
+        ]);
+        let data_batches = self.replay(engine_client, Arc::new(schema), None)?;
         let mut metadata_opt: Option<Metadata> = None;
         let mut protocol_opt: Option<Protocol> = None;
-
-        // TODO should we request the checkpoint iterator only if we don't find the metadata in the commit files?
-        // since the engine might pre-fetch data o.a.? On the other hand, if the engine is smart about it, it should not be
-        // too much extra work to request the checkpoint iterator as well.
-        let batches = self.replay(engine_client, read_schema, None)?;
-        for batch in batches {
+        for batch in data_batches {
             let (batch, _) = batch?;
-
             if metadata_opt.is_none() {
-                if let Ok(mut action) = parse_action(&batch, &ActionType::Metadata) {
-                    if let Some(Action::Metadata(meta)) = action.next() {
-                        metadata_opt = Some(meta)
-                    }
+                match crate::actions::action_definitions::Metadata::try_new_from_data(
+                    engine_client,
+                    batch.as_ref(),
+                ) {
+                    Ok(md) => metadata_opt = Some(md.into()),
+                    _ => {}
                 }
             }
-
             if protocol_opt.is_none() {
-                if let Ok(mut action) = parse_action(&batch, &ActionType::Protocol) {
-                    if let Some(Action::Protocol(proto)) = action.next() {
-                        protocol_opt = Some(proto)
-                    }
+                match crate::actions::action_definitions::Protocol::try_new_from_data(
+                    engine_client,
+                    batch.as_ref(),
+                ) {
+                    Ok(p) => protocol_opt = Some(p.into()),
+                    _ => {}
                 }
-            }
-
-            if metadata_opt.is_some() && protocol_opt.is_some() {
-                // found both, we can stop iterating
-                break;
             }
         }
         Ok(metadata_opt.zip(protocol_opt))
@@ -217,12 +202,7 @@ impl Snapshot {
         let (metadata, protocol) = log_segment
             .read_metadata(engine_client)?
             .ok_or(Error::MissingMetadata)?;
-        use crate::schema::DataType;
-        let schema = if let DataType::Struct(ref ms) = crate::actions::schemas::METADATA_FIELD.data_type {
-            *((*ms).clone())
-        } else {
-            panic!("metaData schema is wrong")
-        };
+        let schema = metadata.schema()?;
         Ok(Self {
             table_root: location,
             log_segment,
@@ -403,6 +383,7 @@ mod tests {
     use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::filesystem::ObjectStoreFileSystemClient;
     use crate::schema::StructType;
+    use crate::simple_client::SimpleClient;
 
     fn default_engine_client(url: &Url) -> DefaultTableClient<TokioBackgroundExecutor> {
         DefaultTableClient::try_new(
@@ -413,13 +394,17 @@ mod tests {
         .unwrap()
     }
 
+    fn get_simple_client() -> SimpleClient {
+        SimpleClient::new()
+    }
+
     #[test]
     fn test_snapshot_read_metadata() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
-        let client = default_engine_client(&url);
+        let client = get_simple_client();
         let snapshot = Snapshot::try_new(url, &client, Some(1)).unwrap();
 
         let expected = Protocol {
