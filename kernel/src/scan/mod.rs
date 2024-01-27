@@ -7,8 +7,8 @@ use arrow_select::filter::filter_record_batch;
 use itertools::Itertools;
 
 use self::file_stream::log_replay_iter;
-use crate::actions::ActionType;
 use crate::actions::action_definitions::Add;
+use crate::actions::ActionType;
 use crate::expressions::Expression;
 use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::Snapshot;

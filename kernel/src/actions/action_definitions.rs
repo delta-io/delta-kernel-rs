@@ -2,8 +2,6 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use tracing::debug;
-
 use crate::{
     engine_data::{DataItem, DataVisitor, EngineData},
     schema::StructType,
@@ -11,42 +9,42 @@ use crate::{
 };
 
 /// Generic struct to allow us to visit a type or hold an error that the type couldn't be parsed
-struct Vistitor<T> {
+struct Visitor<T> {
     extracted: Option<DeltaResult<T>>,
     extract_fn: fn(vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>,
 }
 
-impl<T> Vistitor<T> {
+impl<T> Visitor<T> {
     fn new(extract_fn: fn(vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>) -> Self {
-        Vistitor {
+        Visitor {
             extracted: None,
             extract_fn,
         }
     }
 }
 
-impl<T> DataVisitor for Vistitor<T> {
+impl<T> DataVisitor for Visitor<T> {
     fn visit(&mut self, vals: &[Option<DataItem<'_>>]) {
         self.extracted = Some((self.extract_fn)(vals));
     }
 }
 
 /// Generic struct to allow us to visit a type repeatedly or hold an error that the type couldn't be parsed
-pub(crate) struct MultiVistitor<T> {
+pub(crate) struct MultiVisitor<T> {
     pub(crate) extracted: Vec<DeltaResult<T>>,
     extract_fn: fn(vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>,
 }
 
-impl<T> MultiVistitor<T> {
+impl<T> MultiVisitor<T> {
     pub(crate) fn new(extract_fn: fn(vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>) -> Self {
-        MultiVistitor {
-            extracted: vec!(),
+        MultiVisitor {
+            extracted: vec![],
             extract_fn,
         }
     }
 }
 
-impl<T> DataVisitor for MultiVistitor<T> {
+impl<T> DataVisitor for MultiVisitor<T> {
     fn visit(&mut self, vals: &[Option<DataItem<'_>>]) {
         self.extracted.push((self.extract_fn)(vals));
     }
@@ -54,7 +52,8 @@ impl<T> DataVisitor for MultiVistitor<T> {
 
 macro_rules! extract_required_item {
     ($item: expr, $as_func: ident, $typ: expr, $err_msg_missing: expr, $err_msg_type: expr) => {
-        $item.as_ref()
+        $item
+            .as_ref()
             .ok_or(Error::Extract($typ, $err_msg_missing))?
             .$as_func()
             .ok_or(Error::Extract($typ, $err_msg_type))?
@@ -63,13 +62,12 @@ macro_rules! extract_required_item {
 
 macro_rules! extract_opt_item {
     ($item: expr, $as_func: ident, $typ: expr, $err_msg_type: expr) => {
-        $item.as_ref()
-            .map(|item| {
-                item.$as_func().ok_or(Error::Extract($typ, $err_msg_type))
-            }).transpose()?
+        $item
+            .as_ref()
+            .map(|item| item.$as_func().ok_or(Error::Extract($typ, $err_msg_type)))
+            .transpose()?
     };
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Format {
@@ -114,10 +112,12 @@ impl Metadata {
         data: &dyn EngineData,
     ) -> DeltaResult<Metadata> {
         let extractor = engine_client.get_data_extactor();
-        let mut visitor = Vistitor::new(visit_metadata);
+        let mut visitor = Visitor::new(visit_metadata);
         let schema = StructType::new(vec![crate::actions::schemas::METADATA_FIELD.clone()]);
         extractor.extract(data, Arc::new(schema), &mut visitor);
-        visitor.extracted.unwrap_or_else(|| Err(Error::Generic("Didn't get expected metadata".to_string())))
+        visitor
+            .extracted
+            .unwrap_or_else(|| Err(Error::Generic("Didn't get expected metadata".to_string())))
     }
 
     pub fn schema(&self) -> DeltaResult<StructType> {
@@ -126,49 +126,56 @@ impl Metadata {
 }
 
 fn visit_metadata(vals: &[Option<DataItem<'_>>]) -> DeltaResult<Metadata> {
-    let id = vals[0]
-        .as_ref()
-        .expect("MetaData must have an id")
-        .as_str()
-        .expect("id must be str");
-    let name = vals[1]
-        .as_ref()
-        .map(|name_data| name_data.as_str().expect("name must be a str").to_string());
-    let description = vals[2].as_ref().map(|desc_data| {
-        desc_data
-            .as_str()
-            .expect("description must be a str")
-            .to_string()
-    });
+    let id = extract_required_item!(
+        vals[0],
+        as_str,
+        "Metadata",
+        "Metadata must have an id",
+        "id must be str"
+    )
+    .to_string();
+
+    let name =
+        extract_opt_item!(vals[1], as_str, "Metadata", "name must be str").map(|n| n.to_string());
+
+    let description = extract_opt_item!(vals[1], as_str, "Metadata", "description must be str")
+        .map(|d| d.to_string());
+
     // get format out of primitives
-    let format_provider = vals[3]
-        .as_ref()
-        .expect("format.provider must exist")
-        .as_str()
-        .expect("format.provider must be a str")
-        .to_string();
+    let format_provider = extract_required_item!(
+        vals[3],
+        as_str,
+        "Format",
+        "Format must have a provider",
+        "format.provider must be a str"
+    )
+    .to_string();
 
     // todo: extract relevant values out of the options map at vals[4]
 
-    let schema_string = vals[5]
-        .as_ref()
-        .expect("schema_string must exist")
-        .as_str()
-        .expect("schema_string must be a str")
-        .to_string();
+    let schema_string = extract_required_item!(
+        vals[5],
+        as_str,
+        "Metadata",
+        "schema_string must exist",
+        "schema_string must be a str"
+    )
+    .to_string();
 
     // todo: partition_columns from vals[6]
 
-    let created_time = vals[7]
-        .as_ref()
-        .expect("Action must have a created_time")
-        .as_i64()
-        .expect("created_time must be i64");
+    let created_time = extract_required_item!(
+        vals[7],
+        as_i64,
+        "Metadata",
+        "Metadata must have a created_time",
+        "created_time must be i64"
+    );
 
     // todo: config vals from vals[8]
 
     Ok(Metadata {
-        id: id.to_string(),
+        id,
         name,
         description,
         format: Format {
@@ -204,58 +211,54 @@ impl Protocol {
         data: &dyn EngineData,
     ) -> DeltaResult<Protocol> {
         let extractor = engine_client.get_data_extactor();
-        let mut visitor = ProtocolVisitor::default();
+        let mut visitor = Visitor::new(visit_protocol);
         let schema = StructType::new(vec![crate::actions::schemas::PROTOCOL_FIELD.clone()]);
         extractor.extract(data, Arc::new(schema), &mut visitor);
         visitor
             .extracted
-            .ok_or(Error::Generic("Failed to extract protocol".to_string()))
+            .unwrap_or_else(|| Err(Error::Generic("Didn't get expected Protocol".to_string())))
     }
 }
 
-#[derive(Default)]
-pub(crate) struct ProtocolVisitor {
-    pub(crate) extracted: Option<Protocol>,
-}
+fn visit_protocol(vals: &[Option<DataItem<'_>>]) -> DeltaResult<Protocol> {
+    let min_reader_version = extract_required_item!(
+        vals[0],
+        as_i32,
+        "Protocol",
+        "Protocol must have a minReaderVersion",
+        "minReaderVersion must be i32"
+    );
 
-impl DataVisitor for ProtocolVisitor {
-    fn visit(&mut self, vals: &[Option<DataItem<'_>>]) {
-        let min_reader_version = vals[0]
-            .as_ref()
-            .expect("Protocol must have a minReaderVersion")
-            .as_i32()
-            .expect("minReaderVersion must be i32");
-        let min_writer_version = vals[1]
-            .as_ref()
-            .expect("Protocol must have a minWriterVersion")
-            .as_i32()
-            .expect("minWriterVersion must be i32");
+    let min_writer_version = extract_required_item!(
+        vals[1],
+        as_i32,
+        "Protocol",
+        "Protocol must have a minWriterVersion",
+        "minWriterVersion must be i32"
+    );
 
-        let reader_features = vals[2].as_ref().map(|rf_di| {
-            if let DataItem::StrList(lst) = rf_di {
-                lst.iter().map(|f| f.to_string()).collect()
-            } else {
-                panic!("readerFeatures must be a string list")
-            }
-        });
+    let reader_features = vals[2].as_ref().map(|rf_di| {
+        if let DataItem::StrList(lst) = rf_di {
+            lst.iter().map(|f| f.to_string()).collect()
+        } else {
+            panic!("readerFeatures must be a string list")
+        }
+    });
 
-        let writer_features = vals[3].as_ref().map(|rf_di| {
-            if let DataItem::StrList(lst) = rf_di {
-                lst.iter().map(|f| f.to_string()).collect()
-            } else {
-                panic!("readerFeatures must be a string list")
-            }
-        });
+    let writer_features = vals[3].as_ref().map(|rf_di| {
+        if let DataItem::StrList(lst) = rf_di {
+            lst.iter().map(|f| f.to_string()).collect()
+        } else {
+            panic!("readerFeatures must be a string list")
+        }
+    });
 
-        let extracted = Protocol {
-            min_reader_version,
-            min_writer_version,
-            reader_features,
-            writer_features,
-        };
-        debug!("Extracted: {:#?}", extracted);
-        self.extracted = Some(extracted)
-    }
+    Ok(Protocol {
+        min_reader_version,
+        min_writer_version,
+        reader_features,
+        writer_features,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,7 +309,7 @@ impl Add {
         data: &dyn EngineData,
     ) -> DeltaResult<Add> {
         let extractor = engine_client.get_data_extactor();
-        let mut visitor = Vistitor::new(visit_add);
+        let mut visitor = Visitor::new(visit_add);
         let schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
         extractor.extract(data, Arc::new(schema), &mut visitor);
         visitor.extracted.expect("Didn't get Add")
@@ -348,21 +351,11 @@ pub(crate) fn visit_add(vals: &[Option<DataItem<'_>>]) -> DeltaResult<Add> {
         "modification_time must be bool"
     );
 
-    let stats = extract_opt_item!(
-        vals[5],
-        as_str,
-        "Add",
-        "stats must be str"
-    );
+    let stats = extract_opt_item!(vals[5], as_str, "Add", "stats must be str");
 
     // todo extract tags
 
-    let base_row_id = extract_opt_item!(
-        vals[7],
-        as_i64,
-        "Add",
-        "base_row_id must be i64"
-    );
+    let base_row_id = extract_opt_item!(vals[7], as_i64, "Add", "base_row_id must be i64");
 
     let default_row_commit_version = extract_opt_item!(
         vals[8],

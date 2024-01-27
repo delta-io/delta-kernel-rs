@@ -6,7 +6,7 @@ use crate::actions::action_definitions::Add;
 //use crate::actions::{parse_actions, Action, ActionType, Add};
 use crate::expressions::Expression;
 use crate::schema::{SchemaRef, StructType};
-use crate::{DeltaResult, EngineData, DataExtractor};
+use crate::{DataExtractor, DeltaResult, EngineData};
 
 use arrow_array::RecordBatch;
 use either::Either;
@@ -61,15 +61,11 @@ impl LogReplayScanner {
 
         let schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
 
-        println!("PROCESS BATCH");
-        use crate::actions::action_definitions::MultiVistitor;
         use crate::actions::action_definitions::visit_add;
-        let mut multi_add_visitor = MultiVistitor::new(visit_add);
+        use crate::actions::action_definitions::MultiVisitor;
+        let mut multi_add_visitor = MultiVisitor::new(visit_add);
         data_extractor.extract(actions.as_ref(), Arc::new(schema), &mut multi_add_visitor);
         let adds: Vec<DeltaResult<Add>> = multi_add_visitor.extracted;
-
-        println!("EXTRACTED: {:#?}", adds);
-
         adds.into_iter().collect()
 
         // let adds: Vec<Add> = parse_actions(actions, &schema_to_use)?
@@ -117,10 +113,12 @@ pub fn log_replay_iter(
     let mut log_scanner = LogReplayScanner::new(table_schema, predicate);
 
     action_iter.flat_map(move |actions| match actions {
-        Ok((batch, is_log_batch)) => match log_scanner.process_batch(&batch, &data_extractor, is_log_batch) {
-            Ok(adds) => Either::Left(adds.into_iter().map(Ok)),
-            Err(err) => Either::Right(std::iter::once(Err(err))),
-        },
+        Ok((batch, is_log_batch)) => {
+            match log_scanner.process_batch(&batch, &data_extractor, is_log_batch) {
+                Ok(adds) => Either::Left(adds.into_iter().map(Ok)),
+                Err(err) => Either::Right(std::iter::once(Err(err))),
+            }
+        }
         Err(err) => Either::Right(std::iter::once(Err(err))),
     })
 }
