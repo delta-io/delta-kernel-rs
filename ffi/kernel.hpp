@@ -15,6 +15,8 @@ template<typename E> struct DefaultTableClient;
 
 struct KernelExpressionVisitorState;
 
+struct KernelScanFileIterator;
+
 /// Model iterators. This allows an engine to specify iteration however it likes, and we simply wrap
 /// the engine functions. The engine retains ownership of the iterator.
 struct EngineIterator {
@@ -37,11 +39,6 @@ struct EngineSchemaVisitor {
   void (*visit_string)(void *data, uintptr_t sibling_list_id, const char *name);
   void (*visit_integer)(void *data, uintptr_t sibling_list_id, const char *name);
   void (*visit_long)(void *data, uintptr_t sibling_list_id, const char *name);
-};
-
-struct FileList {
-  char **files;
-  int32_t file_count;
 };
 
 struct EnginePredicate {
@@ -88,8 +85,16 @@ uintptr_t visit_expression_literal_long(KernelExpressionVisitorState *state, int
 /// # Safety
 ///
 /// Caller is responsible to pass a valid snapshot pointer.
-FileList get_scan_files(const Snapshot *snapshot,
-                        const KernelDefaultTableClient *table_client,
-                        EnginePredicate *predicate);
+KernelScanFileIterator *kernel_scan_files_init(const Snapshot *snapshot,
+                                               const KernelDefaultTableClient *table_client,
+                                               EnginePredicate *predicate);
+
+void kernel_scan_files_next(KernelScanFileIterator *files,
+                            void *engine_context,
+                            void (*engine_visitor)(void *engine_context,
+                                                   const char *ptr,
+                                                   uintptr_t len));
+
+void kernel_scan_files_free(KernelScanFileIterator *files);
 
 } // extern "C"

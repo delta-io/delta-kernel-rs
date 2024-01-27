@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use url::Url;
 
 use deltakernel::expressions::{scalars::Scalar, BinaryOperator, Expression};
@@ -173,7 +173,7 @@ pub extern "C" fn visit_schema(
         }
     }
 
-    visit_struct_fields(visitor, &snapshot.schema())
+    visit_struct_fields(visitor, snapshot.schema())
 }
 
 // A set that can identify its contents by address
@@ -371,10 +371,25 @@ pub extern "C" fn visit_expression_literal_long(
     wrap_expression(state, Expression::Literal(Scalar::from(value)))
 }
 
-#[repr(C)]
-pub struct FileList {
-    files: *mut *mut c_char,
-    file_count: i32,
+pub struct KernelScanFileIterator {
+    // Box -> Wrap its unsized content this struct is fixed-size with thin pointers.
+    // Mutex -> We need to protect the iterator against multi-threaded engine access.
+    // Item = String -> Owned items because rust can't correctly express lifetimes for borrowed items
+    // (we would need a way to assert that item lifetimes are bounded by the iterator's lifetime).
+    files: Box<Mutex<dyn Iterator<Item = String>>>,
+
+    // The iterator has an internal borrowed reference to the Snapshot it came from. Rust can't
+    // track that across the FFI boundary, so it's up to us to keep the Snapshot alive.
+    _snapshot: Arc<Snapshot>,
+
+    // The iterator also has an internal borrowed reference to the table client it came from.
+    _table_client: Arc<KernelDefaultTableClient>,
+}
+
+impl Drop for KernelScanFileIterator {
+    fn drop(&mut self) {
+        println!("dropping KernelScanFileIterator");
+    }
 }
 
 /// Get a FileList for all the files that need to be read from the table. NB: This _consumes_ the
@@ -384,14 +399,14 @@ pub struct FileList {
 ///
 /// Caller is responsible to pass a valid snapshot pointer.
 #[no_mangle]
-pub unsafe extern "C" fn get_scan_files(
+pub extern "C" fn kernel_scan_files_init(
     snapshot: *const Snapshot,
     table_client: *const KernelDefaultTableClient,
     predicate: Option<&mut EnginePredicate>,
-) -> FileList {
-    let snapshot: Arc<Snapshot> = unsafe { Arc::from_raw(snapshot) };
+) -> *mut KernelScanFileIterator {
+    let snapshot: Arc<Snapshot> = unsafe { Arc::from_raw(snapshot.clone()) };
     let table_client = unsafe { Arc::from_raw(table_client) };
-    let mut scan_builder = ScanBuilder::new(snapshot);
+    let mut scan_builder = ScanBuilder::new(snapshot.clone());
     if let Some(predicate) = predicate {
         // TODO: There is a lot of redundancy between the various visit_expression_XXX methods here,
         // vs. ProvidesMetadataFilter trait and the class hierarchy that supports it. Can we justify
@@ -410,19 +425,29 @@ pub unsafe extern "C" fn get_scan_files(
         .build()
         .files(table_client.as_ref())
         .unwrap();
-    let mut file_count = 0;
-    let mut files: Vec<*mut i8> = scan_adds
-        .into_iter()
-        .map(|add| {
-            file_count += 1;
-            CString::new(add.unwrap().path).unwrap().into_raw()
-        })
-        .collect();
-    let ptr = files.as_mut_ptr();
-    std::mem::forget(files);
-    println!("{} files survived pruning", file_count);
-    FileList {
-        files: ptr,
-        file_count,
+    let files = scan_adds.map(|add| add.unwrap().path);
+    let files = KernelScanFileIterator {
+        files: Box::new(Mutex::new(files)),
+        _snapshot: snapshot,
+        _table_client: table_client,
+    };
+    Box::into_raw(Box::new(files))
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_scan_files_next(
+    files: &mut KernelScanFileIterator,
+    engine_context: *mut c_void,
+    engine_visitor: extern "C" fn(engine_context: *mut c_void, ptr: *const c_char, len: usize),
+) {
+    let mut files = files.files.lock().unwrap();
+    if let Some(file) = files.next() {
+        println!("Got file: {}", file);
+        (engine_visitor)(engine_context, file.as_ptr().cast(), file.len());
     }
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_scan_files_free(files: *mut KernelScanFileIterator) {
+    let _ = unsafe { Box::from_raw(files) };
 }
