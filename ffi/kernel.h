@@ -69,9 +69,7 @@ const Snapshot *snapshot(const char *path, const KernelDefaultTableClient *table
  */
 uint64_t version(const Snapshot *snapshot);
 
-uintptr_t visit_schema(const Snapshot *snapshot,
-                       const KernelDefaultTableClient *table_client,
-                       struct EngineSchemaVisitor *visitor);
+uintptr_t visit_schema(const Snapshot *snapshot, struct EngineSchemaVisitor *visitor);
 
 uintptr_t visit_expression_and(struct KernelExpressionVisitorState *state,
                                struct EngineIterator *children);

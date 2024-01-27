@@ -62,9 +62,7 @@ const Snapshot *snapshot(const char *path, const KernelDefaultTableClient *table
 /// Get the version of the specified snapshot
 uint64_t version(const Snapshot *snapshot);
 
-uintptr_t visit_schema(const Snapshot *snapshot,
-                       const KernelDefaultTableClient *table_client,
-                       EngineSchemaVisitor *visitor);
+uintptr_t visit_schema(const Snapshot *snapshot, EngineSchemaVisitor *visitor);
 
 uintptr_t visit_expression_and(KernelExpressionVisitorState *state, EngineIterator *children);
 

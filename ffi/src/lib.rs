@@ -141,7 +141,6 @@ pub struct EngineSchemaVisitor {
 #[no_mangle]
 pub extern "C" fn visit_schema(
     snapshot: &Snapshot,
-    table_client: &KernelDefaultTableClient,
     visitor: &mut EngineSchemaVisitor,
 ) -> usize {
     // Visit all the fields of a struct and return the list of children
@@ -174,8 +173,7 @@ pub extern "C" fn visit_schema(
         }
     }
 
-    let schema: StructType = snapshot.schema(table_client).unwrap();
-    visit_struct_fields(visitor, &schema)
+    visit_struct_fields(visitor, &snapshot.schema())
 }
 
 // A set that can identify its contents by address
@@ -269,8 +267,8 @@ fn unwrap_c_string(s: *const c_char) -> String {
 fn unwrap_kernel_expression(
     state: &mut KernelExpressionVisitorState,
     exprid: usize,
-) -> Option<Box<Expression>> {
-    state.inflight_expressions.take(exprid).map(Box::new)
+) -> Option<Expression> {
+    state.inflight_expressions.take(exprid)
 }
 
 fn visit_expression_binary(
@@ -279,8 +277,8 @@ fn visit_expression_binary(
     a: usize,
     b: usize,
 ) -> usize {
-    let left = unwrap_kernel_expression(state, a);
-    let right = unwrap_kernel_expression(state, b);
+    let left = unwrap_kernel_expression(state, a).map(Box::new);
+    let right = unwrap_kernel_expression(state, b).map(Box::new);
     match left.zip(right) {
         Some((left, right)) => {
             wrap_expression(state, Expression::BinaryOperation { op, left, right })
@@ -295,28 +293,9 @@ pub extern "C" fn visit_expression_and(
     state: &mut KernelExpressionVisitorState,
     children: &mut EngineIterator,
 ) -> usize {
-    let mut children = children.flat_map(|child| unwrap_kernel_expression(state, child as usize));
-    let left = match children.next() {
-        Some(left) => left,
-        _ => return 0,
-    };
-    let right = match children.next() {
-        Some(right) => right,
-        _ => return wrap_expression(state, *left),
-    };
-    let mut result = Expression::BinaryOperation {
-        op: BinaryOperator::And,
-        left,
-        right,
-    };
-    for child in children {
-        let left = Box::new(result);
-        result = Expression::BinaryOperation {
-            op: BinaryOperator::And,
-            left,
-            right: child,
-        };
-    }
+    let result = Expression::and_from(
+        children.flat_map(|child| unwrap_kernel_expression(state, child as usize))
+    );
     wrap_expression(state, result)
 }
 
@@ -424,12 +403,11 @@ pub unsafe extern "C" fn get_scan_files(
         let exprid = (predicate.visitor)(predicate.predicate, &mut visitor_state);
         if let Some(predicate) = unwrap_kernel_expression(&mut visitor_state, exprid) {
             println!("Got predicate: {}", predicate);
-            scan_builder = scan_builder.with_predicate(*predicate);
+            scan_builder = scan_builder.with_predicate(predicate);
         }
     }
     let scan_adds = scan_builder
-        .build(table_client.as_ref())
-        .unwrap()
+        .build()
         .files(table_client.as_ref())
         .unwrap();
     let mut file_count = 0;
