@@ -75,9 +75,6 @@ pub type Version = u64;
 
 pub type FileSlice = (Url, Option<Range<usize>>);
 
-// We temporarily allow returning a RecordBatch OR EngineData. This will be cleaned up when the
-// DefaultClient is ported over to the new way of passing data
-
 /// Data read from a Delta table file and the corresponding scan file information.
 pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
 pub type FileDataReadResultIterator =
