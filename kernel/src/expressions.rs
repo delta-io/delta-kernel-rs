@@ -156,21 +156,25 @@ impl Expression {
         Self::Literal(value.into())
     }
 
+    pub fn and_from(exprs: impl IntoIterator<Item = Self>) -> Self {
+        Self::variadic_op_from(exprs, VariadicOperator::And)
+    }
+
+    pub fn or_from(exprs: impl IntoIterator<Item = Self>) -> Self {
+        Self::variadic_op_from(exprs, VariadicOperator::Or)
+    }
+
+    fn variadic_op_from(exprs: impl IntoIterator<Item = Self>, op: VariadicOperator) -> Self {
+        let exprs = exprs.into_iter().collect::<Vec<_>>();
+        Self::VariadicOperation {op, exprs}
+    }
+
     fn binary_op_impl(self, other: Self, op: BinaryOperator) -> Self {
         Self::BinaryOperation {
             op,
             left: Box::new(self),
             right: Box::new(other),
         }
-    }
-
-    fn variadic_op_impl(self, other: impl IntoIterator<Item = Self>, op: VariadicOperator) -> Self {
-        let mut exprs = other.into_iter().collect::<Vec<_>>();
-        if exprs.is_empty() {
-            return self;
-        }
-        exprs.insert(0, self);
-        Self::VariadicOperation { op, exprs }
     }
 
     /// Create a new expression `self == other`
@@ -205,22 +209,12 @@ impl Expression {
 
     /// Create a new expression `self AND other`
     pub fn and(self, other: Self) -> Self {
-        self.and_many([other])
-    }
-
-    /// Create a new expression `self AND others`
-    pub fn and_many(self, other: impl IntoIterator<Item = Self>) -> Self {
-        self.variadic_op_impl(other, VariadicOperator::And)
-    }
-
-    /// Create a new expression `self AND other`
-    pub fn or(self, other: Self) -> Self {
-        self.or_many([other])
+        Self::and_from([self, other])
     }
 
     /// Create a new expression `self OR other`
-    pub fn or_many(self, other: impl IntoIterator<Item = Self>) -> Self {
-        self.variadic_op_impl(other, VariadicOperator::Or)
+    pub fn or(self, other: Self) -> Self {
+        Self::or_from([self, other])
     }
 
     fn walk(&self) -> impl Iterator<Item = &Self> + '_ {
@@ -237,11 +231,9 @@ impl Expression {
                 Self::UnaryOperation { expr, .. } => {
                     stack.push(expr);
                 }
-                Self::VariadicOperation { op, exprs } => match op {
-                    VariadicOperator::And | VariadicOperator::Or => {
-                        stack.extend(exprs.iter());
-                    }
-                },
+                Self::VariadicOperation { exprs, .. } => {
+                    stack.extend(exprs.iter());
+                }
             }
             Some(expr)
         })
@@ -306,7 +298,8 @@ mod tests {
                 "AND(Column(x) >= 2, Column(x) <= 10)",
             ),
             (
-                col_ref.clone().gt_eq(Expr::literal(2)).and_many([
+                Expr::and_from([
+                    col_ref.clone().gt_eq(Expr::literal(2)),
                     col_ref.clone().lt_eq(Expr::literal(10)),
                     col_ref.clone().lt_eq(Expr::literal(100)),
                 ]),
