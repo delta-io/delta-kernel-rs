@@ -18,7 +18,7 @@ lazy_static! {
                 StructType::new(vec![
                     StructField::new("provider", DataType::STRING, false),
                     StructField::new(
-                        "configuration",
+                        "options",
                         MapType::new(
                             DataType::STRING,
                             DataType::STRING,

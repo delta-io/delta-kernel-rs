@@ -14,8 +14,8 @@ pub(crate) mod action_definitions;
 pub(crate) mod schemas;
 pub(crate) mod types;
 
-pub use types::*;
 pub use action_definitions::{Format, Metadata, Protocol};
+pub use types::*;
 
 #[derive(Debug)]
 pub enum ActionType {
@@ -531,7 +531,7 @@ mod tests {
     use crate::actions::Protocol;
     use crate::client::json::DefaultJsonHandler;
     use crate::executor::tokio::TokioBackgroundExecutor;
-    use crate::simple_client::{SimpleClient, data::SimpleData};
+    use crate::simple_client::{data::SimpleData, SimpleClient};
     use crate::JsonHandler;
 
     fn action_batch() -> RecordBatch {

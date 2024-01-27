@@ -5,6 +5,9 @@ pub enum Error {
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
 
+    #[error("Error extracting type {0}: {1}")]
+    Extract(&'static str, &'static str),
+
     #[error("Generic delta kernel error: {0}")]
     Generic(String),
 

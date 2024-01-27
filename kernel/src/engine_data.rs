@@ -1,5 +1,3 @@
-use crate::schema::SchemaRef;
-
 use std::any::{Any, TypeId};
 
 macro_rules! gen_casts {

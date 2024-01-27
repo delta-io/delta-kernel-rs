@@ -3,10 +3,11 @@ use crate::schema::{Schema, SchemaRef};
 use crate::DeltaResult;
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Int64Type, Int32Type};
-use arrow_array::{RecordBatch, StructArray, Array};
+use arrow_array::types::{Int32Type, Int64Type};
+use arrow_array::{Array, RecordBatch, StructArray};
 use arrow_schema::{DataType, Schema as ArrowSchema};
-use tracing::{debug, warn, error};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use tracing::{debug, error, warn};
 use url::Url;
 
 use std::any::Any;
@@ -61,6 +62,15 @@ impl SimpleData {
         Ok(SimpleData { data })
     }
 
+    // todo: fix all the unwrapping
+    pub fn try_create_from_parquet(_schema: SchemaRef, location: Url) -> DeltaResult<Self> {
+        let file = File::open(location.to_file_path().unwrap()).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let mut reader = builder.build().unwrap();
+        let data = reader.next().unwrap().unwrap();
+        Ok(SimpleData { data })
+    }
+
     /// extract a row of data. will recurse into struct types
     fn extract_row<'a>(
         &'a self,
@@ -72,61 +82,82 @@ impl SimpleData {
     ) {
         // check each requested column in the row
         for field in schema.fields.iter() {
-            let col = array.column_by_name(&field.name).expect("No such name");
-            if col.is_null(row) {
-                debug!("Pushing None for {}", field.name);
-                res_arry.push(None);
-            } else {
-                *had_data = true;
-                match col.data_type() {
-                    DataType::Struct(_arrow_fields) => {
-                        match &field.data_type {
-                            crate::schema::DataType::Struct(field_struct) => {
-                                //let inner_schema = Arc::new(ArrowSchema::new(arrow_fields.clone()));
-                                let struct_array = col.as_struct();
-                                self.extract_row(struct_array, field_struct, row, had_data, res_arry);
-                            }
-                            _ => panic!("schema mismatch")
-                        }
-                    }
-                    DataType::Boolean => {
-                        let val = col.as_boolean().value(row);
-                        debug!("For {} pushing: {}", field.name, val);
-                        res_arry.push(Some(DataItem::Bool(val)));
-                    }
-                    DataType::Int32 => {
-                        let val = col.as_primitive::<Int32Type>().value(row);
-                        debug!("For {} pushing: {}", field.name, val);
-                        res_arry.push(Some(DataItem::I32(val)));
-                    }
-                    DataType::Int64 => {
-                        let val = col.as_primitive::<Int64Type>().value(row);
-                        debug!("For {} pushing: {}", field.name, val);
-                        res_arry.push(Some(DataItem::I64(val)));
-                    }
-                    DataType::Utf8 => {
-                        let val = col.as_string::<i32>().value(row);
-                        debug!("For {} pushing: {}", field.name, val);
-                        res_arry.push(Some(DataItem::Str(val)));
-                    }
-                    DataType::List(_) => {
-                        let arry: &'a arrow_array::GenericListArray<i32> = col.as_list::<i32>();
-                        let sarry: &'a arrow_array::GenericByteArray<arrow_array::types::GenericStringType<i32>> = arry.values().as_string::<i32>();
-                        let mut lst = vec!();
-                        for i in 0..sarry.len() {
-                            lst.push(sarry.value(i));
-                        }
-                        //println!("HERE: {:#?}", sarry.value_data());
-                        //warn!("ignoring list");
-                        res_arry.push(Some(DataItem::StrList(lst)));
-                    }
-                    DataType::Map(_,_) => {
-                        warn!("ignoring map");
+            match array.column_by_name(&field.name) {
+                None => {
+                    // check if this is nullable or not
+                    if field.nullable {
+                        debug!("Pulling None since column not present for {}", field.name);
                         res_arry.push(None);
+                    } else {
+                        panic!("Didn't find non-nullable column: {}", field.name);
                     }
-                    typ @ _ => {
-                        error!("CAN'T EXTRACT: {}", typ);
-                        unimplemented!()
+                }
+                Some(col) => {
+                    if col.is_null(row) {
+                        debug!("Pushing None for {}", field.name);
+                        res_arry.push(None);
+                    } else {
+                        *had_data = true;
+                        match col.data_type() {
+                            DataType::Struct(_arrow_fields) => {
+                                match &field.data_type {
+                                    crate::schema::DataType::Struct(field_struct) => {
+                                        //let inner_schema = Arc::new(ArrowSchema::new(arrow_fields.clone()));
+                                        let struct_array = col.as_struct();
+                                        self.extract_row(
+                                            struct_array,
+                                            field_struct,
+                                            row,
+                                            had_data,
+                                            res_arry,
+                                        );
+                                    }
+                                    _ => panic!("schema mismatch"),
+                                }
+                            }
+                            DataType::Boolean => {
+                                let val = col.as_boolean().value(row);
+                                debug!("For {} pushing: {}", field.name, val);
+                                res_arry.push(Some(DataItem::Bool(val)));
+                            }
+                            DataType::Int32 => {
+                                let val = col.as_primitive::<Int32Type>().value(row);
+                                debug!("For {} pushing: {}", field.name, val);
+                                res_arry.push(Some(DataItem::I32(val)));
+                            }
+                            DataType::Int64 => {
+                                let val = col.as_primitive::<Int64Type>().value(row);
+                                debug!("For {} pushing: {}", field.name, val);
+                                res_arry.push(Some(DataItem::I64(val)));
+                            }
+                            DataType::Utf8 => {
+                                let val = col.as_string::<i32>().value(row);
+                                debug!("For {} pushing: {}", field.name, val);
+                                res_arry.push(Some(DataItem::Str(val)));
+                            }
+                            DataType::List(_) => {
+                                let arry: &'a arrow_array::GenericListArray<i32> =
+                                    col.as_list::<i32>();
+                                let sarry: &'a arrow_array::GenericByteArray<
+                                    arrow_array::types::GenericStringType<i32>,
+                                > = arry.values().as_string::<i32>();
+                                let mut lst = vec![];
+                                for i in 0..sarry.len() {
+                                    lst.push(sarry.value(i));
+                                }
+                                //println!("HERE: {:#?}", sarry.value_data());
+                                //warn!("ignoring list");
+                                res_arry.push(Some(DataItem::StrList(lst)));
+                            }
+                            DataType::Map(_, _) => {
+                                warn!("ignoring map");
+                                res_arry.push(None);
+                            }
+                            typ @ _ => {
+                                error!("CAN'T EXTRACT: {}", typ);
+                                unimplemented!()
+                            }
+                        }
                     }
                 }
             }
@@ -152,9 +183,7 @@ impl SimpleData {
 
 impl From<RecordBatch> for SimpleData {
     fn from(value: RecordBatch) -> Self {
-        SimpleData {
-            data: value,
-        }
+        SimpleData { data: value }
     }
 }
 
@@ -181,7 +210,6 @@ impl From<RecordBatch> for SimpleData {
 //         format_builder.append(true).unwrap();
 //         let format_config_array = format_builder.finish();
 
-        
 //         let format_fields = Fields::from(vec![
 //             Field::new("provider", DataType::Utf8, false),
 //             Field::new("configuration", format_config_array.data_type().clone(), true),

@@ -57,7 +57,7 @@ pub mod snapshot;
 pub mod table;
 
 pub use actions::{types::*, ActionType};
-pub use engine_data::{EngineData, DataVisitor};
+pub use engine_data::{DataVisitor, EngineData};
 pub use error::{DeltaResult, Error};
 pub use expressions::Expression;
 pub use table::Table;
@@ -80,7 +80,8 @@ pub type FileSlice = (Url, Option<Range<usize>>);
 
 /// Data read from a Delta table file and the corresponding scan file information.
 pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
-pub type FileDataReadResultIterator = Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
+pub type FileDataReadResultIterator =
+    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,11 +1,12 @@
 //! This module implements a simple, single threaded, EngineClient
 
-use crate::{DataExtractor, EngineClient, JsonHandler, ExpressionHandler, FileSystemClient, ParquetHandler};
 use crate::engine_data::{DataVisitor, EngineData, TypeTag};
 use crate::schema::SchemaRef;
+use crate::{
+    DataExtractor, EngineClient, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler,
+};
 
 use std::sync::Arc;
-
 
 pub mod data;
 mod fs_client;
@@ -69,7 +70,7 @@ impl EngineClient for SimpleClient {
     fn get_parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         self.parquet_handler.clone()
     }
-    
+
     fn get_json_handler(&self) -> Arc<dyn JsonHandler> {
         self.json_handler.clone()
     }

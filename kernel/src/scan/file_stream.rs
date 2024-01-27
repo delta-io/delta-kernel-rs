@@ -1,10 +1,12 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use super::data_skipping::DataSkippingFilter;
-use crate::actions::{parse_actions, Action, ActionType, Add};
+use crate::actions::action_definitions::Add;
+//use crate::actions::{parse_actions, Action, ActionType, Add};
 use crate::expressions::Expression;
-use crate::schema::SchemaRef;
-use crate::{DeltaResult, EngineData};
+use crate::schema::{SchemaRef, StructType};
+use crate::{DeltaResult, EngineData, DataExtractor};
 
 use arrow_array::RecordBatch;
 use either::Either;
@@ -34,6 +36,7 @@ impl LogReplayScanner {
     fn process_batch(
         &mut self,
         actions: &Box<dyn EngineData>,
+        data_extractor: &Arc<dyn DataExtractor>,
         is_log_batch: bool,
     ) -> DeltaResult<Vec<Add>> {
         // let filtered_actions = match &self.filter {
@@ -48,13 +51,26 @@ impl LogReplayScanner {
         //     actions
         // };
 
-        let schema_to_use = if is_log_batch {
-            vec![ActionType::Add, ActionType::Remove]
-        } else {
-            // All checkpoint actions are already reconciled and Remove actions in checkpoint files
-            // only serve as tombstones for vacuum jobs. So no need to load them here.
-            vec![ActionType::Add]
-        };
+        // let schema_to_use = if is_log_batch {
+        //     vec![ActionType::Add, ActionType::Remove]
+        // } else {
+        //     // All checkpoint actions are already reconciled and Remove actions in checkpoint files
+        //     // only serve as tombstones for vacuum jobs. So no need to load them here.
+        //     vec![ActionType::Add]
+        // };
+
+        let schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
+
+        println!("PROCESS BATCH");
+        use crate::actions::action_definitions::MultiVistitor;
+        use crate::actions::action_definitions::visit_add;
+        let mut multi_add_visitor = MultiVistitor::new(visit_add);
+        data_extractor.extract(actions.as_ref(), Arc::new(schema), &mut multi_add_visitor);
+        let adds: Vec<DeltaResult<Add>> = multi_add_visitor.extracted;
+
+        println!("EXTRACTED: {:#?}", adds);
+
+        adds.into_iter().collect()
 
         // let adds: Vec<Add> = parse_actions(actions, &schema_to_use)?
         //     .filter_map(|action| match action {
@@ -87,7 +103,6 @@ impl LogReplayScanner {
         //     .collect();
 
         // Ok(adds)
-        Ok(vec!())
     }
 }
 
@@ -95,13 +110,14 @@ impl LogReplayScanner {
 /// The boolean flag indicates whether the record batch is a log or checkpoint batch.
 pub fn log_replay_iter(
     action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
+    data_extractor: Arc<dyn DataExtractor>,
     table_schema: &SchemaRef,
     predicate: &Option<Expression>,
 ) -> impl Iterator<Item = DeltaResult<Add>> {
     let mut log_scanner = LogReplayScanner::new(table_schema, predicate);
 
     action_iter.flat_map(move |actions| match actions {
-        Ok((batch, is_log_batch)) => match log_scanner.process_batch(&batch, is_log_batch) {
+        Ok((batch, is_log_batch)) => match log_scanner.process_batch(&batch, &data_extractor, is_log_batch) {
             Ok(adds) => Either::Left(adds.into_iter().map(Ok)),
             Err(err) => Either::Right(std::iter::once(Err(err))),
         },

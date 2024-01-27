@@ -19,7 +19,8 @@ use self::filesystem::ObjectStoreFileSystemClient;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
 use crate::{
-    DataExtractor, DeltaResult, EngineClient, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler,
+    DataExtractor, DeltaResult, EngineClient, ExpressionHandler, FileSystemClient, JsonHandler,
+    ParquetHandler,
 };
 
 pub mod conversion;

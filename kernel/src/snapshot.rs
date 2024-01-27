@@ -9,11 +9,11 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::actions::{parse_action, Action, ActionType, Metadata, Protocol};
+use crate::actions::{Metadata, Protocol};
 use crate::path::LogPath;
-use crate::schema::{Schema, StructType, SchemaRef};
-use crate::{Expression, EngineData};
+use crate::schema::{Schema, SchemaRef, StructType};
 use crate::{DeltaResult, EngineClient, Error, FileMeta, FileSystemClient, Version};
+use crate::{EngineData, Expression};
 
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 
@@ -49,20 +49,12 @@ impl LogSegment {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>> {
         let json_client = engine_client.get_json_handler();
         let commit_stream = json_client
-            .read_json_files(
-                &self.commit_files,
-                read_schema.clone(),
-                predicate.clone(),
-            )?
+            .read_json_files(&self.commit_files, read_schema.clone(), predicate.clone())?
             .map_ok(|batch| (batch, true));
 
         let parquet_client = engine_client.get_parquet_handler();
         let checkpoint_stream = parquet_client
-            .read_parquet_files(
-                &self.checkpoint_files,
-                read_schema,
-                predicate,
-            )?
+            .read_parquet_files(&self.checkpoint_files, read_schema, predicate)?
             .map_ok(|batch| (batch, false));
 
         let batches = commit_stream.chain(checkpoint_stream);
@@ -70,7 +62,10 @@ impl LogSegment {
         Ok(batches)
     }
 
-    fn read_metadata(&self, engine_client: &dyn EngineClient) -> DeltaResult<Option<(Metadata, Protocol)>> {
+    fn read_metadata(
+        &self,
+        engine_client: &dyn EngineClient,
+    ) -> DeltaResult<Option<(Metadata, Protocol)>> {
         //let metadata_schema = crate::actions::schemas::METADATA_SCHEMA.clone();
         let schema = StructType::new(vec![
             crate::actions::schemas::METADATA_FIELD.clone(),
@@ -373,30 +368,15 @@ fn list_log_files(
 mod tests {
     use super::*;
 
-    use std::collections::HashMap;
     use std::path::PathBuf;
 
     use object_store::local::LocalFileSystem;
     use object_store::path::Path;
 
-    use crate::client::DefaultTableClient;
     use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::filesystem::ObjectStoreFileSystemClient;
     use crate::schema::StructType;
     use crate::simple_client::SimpleClient;
-
-    fn default_engine_client(url: &Url) -> DefaultTableClient<TokioBackgroundExecutor> {
-        DefaultTableClient::try_new(
-            url,
-            HashMap::<String, String>::new(),
-            Arc::new(TokioBackgroundExecutor::new()),
-        )
-        .unwrap()
-    }
-
-    fn get_simple_client() -> SimpleClient {
-        SimpleClient::new()
-    }
 
     #[test]
     fn test_snapshot_read_metadata() {
@@ -404,7 +384,7 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
-        let client = get_simple_client();
+        let client = SimpleClient::new();
         let snapshot = Snapshot::try_new(url, &client, Some(1)).unwrap();
 
         let expected = Protocol {
@@ -426,7 +406,7 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
-        let client = default_engine_client(&url);
+        let client = SimpleClient::new();
         let snapshot = Snapshot::try_new(url, &client, None).unwrap();
 
         let expected = Protocol {
@@ -468,7 +448,7 @@ mod tests {
         ))
         .unwrap();
         let location = url::Url::from_directory_path(path).unwrap();
-        let engine_client = default_engine_client(&location);
+        let engine_client = SimpleClient::new();
         let snapshot = Snapshot::try_new(location, &engine_client, None).unwrap();
 
         assert_eq!(snapshot.log_segment.checkpoint_files.len(), 1);

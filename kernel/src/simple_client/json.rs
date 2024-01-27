@@ -1,7 +1,10 @@
 use arrow_array::{RecordBatch, StringArray};
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 
-use crate::{JsonHandler, FileMeta, schema::SchemaRef, Expression, FileDataReadResultIterator, DeltaResult, EngineData};
+use crate::{
+    schema::SchemaRef, DeltaResult, EngineData, Expression, FileDataReadResultIterator, FileMeta,
+    JsonHandler,
+};
 
 pub(crate) struct SimpleJsonHandler {}
 impl JsonHandler for SimpleJsonHandler {
@@ -14,10 +17,13 @@ impl JsonHandler for SimpleJsonHandler {
         if files.is_empty() {
             return Ok(Box::new(std::iter::empty()));
         }
-        let mut res = vec!();
+        let mut res = vec![];
         for file in files.iter() {
-            let d = super::data::SimpleData::try_create_from_json(schema.clone(), file.location.clone())?;
-            let b: Box<dyn EngineData > = Box::new(d);
+            let d = super::data::SimpleData::try_create_from_json(
+                schema.clone(),
+                file.location.clone(),
+            )?;
+            let b: Box<dyn EngineData> = Box::new(d);
             res.push(Ok(b));
         }
         Ok(Box::new(res.into_iter()))

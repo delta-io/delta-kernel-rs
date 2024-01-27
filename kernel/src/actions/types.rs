@@ -9,49 +9,6 @@ use crate::schema::StructType;
 use crate::{DeltaResult, Error, FileSystemClient};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Protocol {
-    /// The minimum version of the Delta read protocol that a client must implement
-    /// in order to correctly read this table
-    pub min_reader_version: i32,
-    /// The minimum version of the Delta write protocol that a client must implement
-    /// in order to correctly write this table
-    pub min_writer_version: i32,
-    /// A collection of features that a client must implement in order to correctly
-    /// read this table (exist only when minReaderVersion is set to 3)
-    pub reader_features: Option<Vec<String>>,
-    /// A collection of features that a client must implement in order to correctly
-    /// write this table (exist only when minWriterVersion is set to 7)
-    pub writer_features: Option<Vec<String>>,
-}
-
-impl Protocol {
-    pub fn new(min_reader_version: i32, min_wrriter_version: i32) -> Self {
-        Self {
-            min_reader_version,
-            min_writer_version: min_wrriter_version,
-            reader_features: None,
-            writer_features: None,
-        }
-    }
-
-    pub fn with_reader_features(
-        mut self,
-        reader_features: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.reader_features = Some(reader_features.into_iter().map(|c| c.into()).collect());
-        self
-    }
-
-    pub fn with_writer_features(
-        mut self,
-        writer_features: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.writer_features = Some(writer_features.into_iter().map(|c| c.into()).collect());
-        self
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletionVectorDescriptor {
     /// A single character to indicate how to access the DV. Legal options are: ['u', 'i', 'p'].
     pub storage_type: String,
