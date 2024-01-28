@@ -96,11 +96,11 @@ impl ProvidesColumnByName for StructArray {
     }
 }
 
-fn extract_column<'a>(
-    array: &'a dyn ProvidesColumnByName,
+fn extract_column<'array, 'path>(
+    array: &'array dyn ProvidesColumnByName,
     path_step: &str,
-    remaining_path_steps: &mut impl Iterator<Item = &'a str>,
-) -> Result<&'a Arc<dyn Array>, ArrowError> {
+    remaining_path_steps: &mut impl Iterator<Item = &'path str>,
+) -> Result<&'array Arc<dyn Array>, ArrowError> {
     let child = array
         .column_by_name(path_step)
         .ok_or(ArrowError::SchemaError(format!(
@@ -138,12 +138,12 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
     match expression {
         Literal(scalar) => Ok(scalar.to_array(batch.num_rows())?),
         Column(name) => {
+            // TODO properly handle nested columns
+            // https://github.com/delta-incubator/delta-kernel-rs/issues/86
             if name.contains('.') {
                 let mut path = name.split('.');
                 // Safety: we know that the first path step exists, because we checked for '.'
-                let arr = extract_column(batch, path.next().unwrap(), &mut path).cloned()?;
-                // NOTE: need to assign first so that rust can figure out lifetimes
-                Ok(arr)
+                Ok(extract_column(batch, path.next().unwrap(), &mut path).cloned()?)
             } else {
                 batch
                     .column_by_name(name)
