@@ -6,14 +6,13 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_schema::{Field as ArrowField, Fields, Schema as ArrowSchema};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::actions::{parse_action, Action, ActionType, Metadata, Protocol};
 use crate::path::LogPath;
-use crate::schema::Schema;
+use crate::schema::{Schema, SchemaRef, StructType};
 use crate::Expression;
 use crate::{DeltaResult, Error, FileMeta, FileSystemClient, TableClient, Version};
 
@@ -46,25 +45,17 @@ impl LogSegment {
     fn replay(
         &self,
         table_client: &dyn TableClient,
-        read_schema: Arc<ArrowSchema>,
+        read_schema: SchemaRef,
         predicate: Option<Expression>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(RecordBatch, bool)>>> {
         let json_client = table_client.get_json_handler();
         let commit_stream = json_client
-            .read_json_files(
-                &self.commit_files,
-                Arc::new(read_schema.as_ref().try_into()?),
-                predicate.clone(),
-            )?
+            .read_json_files(&self.commit_files, read_schema.clone(), predicate.clone())?
             .map_ok(|batch| (batch, true));
 
         let parquet_client = table_client.get_parquet_handler();
         let checkpoint_stream = parquet_client
-            .read_parquet_files(
-                &self.checkpoint_files,
-                Arc::new(read_schema.as_ref().try_into()?),
-                predicate,
-            )?
+            .read_parquet_files(&self.checkpoint_files, read_schema.clone(), predicate)?
             .map_ok(|batch| (batch, false));
 
         let batches = commit_stream.chain(checkpoint_stream);
@@ -76,13 +67,12 @@ impl LogSegment {
         &self,
         table_client: &dyn TableClient,
     ) -> DeltaResult<Option<(Metadata, Protocol)>> {
-        let read_schema = Arc::new(ArrowSchema {
-            fields: Fields::from_iter([
-                ArrowField::try_from(ActionType::Metadata)?,
-                ArrowField::try_from(ActionType::Protocol)?,
-            ]),
-            metadata: Default::default(),
-        });
+        lazy_static::lazy_static! {
+            static ref ACTION_SCHEMA: SchemaRef = Arc::new(StructType::new(vec![
+                ActionType::Metadata.schema_field().clone(),
+                ActionType::Protocol.schema_field().clone(),
+            ]));
+        }
 
         let mut metadata_opt: Option<Metadata> = None;
         let mut protocol_opt: Option<Protocol> = None;
@@ -90,7 +80,7 @@ impl LogSegment {
         // TODO should we request the checkpoint iterator only if we don't find the metadata in the commit files?
         // since the engine might pre-fetch data o.a.? On the other hand, if the engine is smart about it, it should not be
         // too much extra work to request the checkpoint iterator as well.
-        let batches = self.replay(table_client, read_schema, None)?;
+        let batches = self.replay(table_client, ACTION_SCHEMA.clone(), None)?;
         for batch in batches {
             let (batch, _) = batch?;
 

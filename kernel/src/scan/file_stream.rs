@@ -1,14 +1,14 @@
 use std::collections::HashSet;
 
+use arrow_array::RecordBatch;
+use either::Either;
+use tracing::debug;
+
 use super::data_skipping::DataSkippingFilter;
 use crate::actions::{parse_actions, Action, ActionType, Add};
 use crate::expressions::Expression;
 use crate::schema::SchemaRef;
-use crate::DeltaResult;
-
-use arrow_array::RecordBatch;
-use either::Either;
-use tracing::debug;
+use crate::{DeltaResult, TableClient};
 
 struct LogReplayScanner {
     filter: Option<DataSkippingFilter>,
@@ -20,10 +20,14 @@ struct LogReplayScanner {
 }
 
 impl LogReplayScanner {
-    /// Create a new [`LogReplayStream`] instance
-    fn new(table_schema: &SchemaRef, predicate: &Option<Expression>) -> Self {
+    /// Create a new [`LogReplayScanner`] instance
+    fn new(
+        table_client: &dyn TableClient,
+        table_schema: &SchemaRef,
+        predicate: &Option<Expression>,
+    ) -> Self {
         Self {
-            filter: DataSkippingFilter::new(table_schema, predicate),
+            filter: DataSkippingFilter::new(table_client, table_schema, predicate),
             seen: Default::default(),
         }
     }
@@ -91,11 +95,12 @@ impl LogReplayScanner {
 /// Given an iterator of (record batch, bool) tuples and a predicate, returns an iterator of [Add]s.
 /// The boolean flag indicates whether the record batch is a log or checkpoint batch.
 pub fn log_replay_iter(
+    table_client: &dyn TableClient,
     action_iter: impl Iterator<Item = DeltaResult<(RecordBatch, bool)>>,
     table_schema: &SchemaRef,
     predicate: &Option<Expression>,
 ) -> impl Iterator<Item = DeltaResult<Add>> {
-    let mut log_scanner = LogReplayScanner::new(table_schema, predicate);
+    let mut log_scanner = LogReplayScanner::new(table_client, table_schema, predicate);
 
     action_iter.flat_map(move |actions| match actions {
         Ok((batch, is_log_batch)) => match log_scanner.process_batch(&batch, is_log_batch) {
