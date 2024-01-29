@@ -44,7 +44,6 @@ fn commute(op: &BinaryOperator) -> Option<BinaryOperator> {
 fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
     use BinaryOperator::*;
     use Expr::*;
-    use VariadicOperator::*;
 
     match expr {
         BinaryOperation { op, left, right } => {
@@ -58,25 +57,23 @@ fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
                 GreaterThan | GreaterThanOrEqual => "maxValues",
                 Equal => {
                     let exprs = [
-                        Expr::binary(LessThanOrEqual, Column(col.clone()), Literal(val.clone())),
-                        Expr::binary(LessThanOrEqual, Literal(val.clone()), Column(col.clone())),
+                        Expr::le(Column(col.clone()), Literal(val.clone())),
+                        Expr::le(Literal(val.clone()), Column(col.clone())),
                     ];
-                    return as_data_skipping_predicate(&Expr::variadic(And, exprs));
+                    return as_data_skipping_predicate(&Expr::and_from(exprs));
                 }
                 NotEqual => {
                     let exprs = [
-                        Expr::binary(
-                            GreaterThan,
+                        Expr::gt(
                             Column(format!("minValues.{}", col)),
                             Literal(val.clone()),
                         ),
-                        Expr::binary(
-                            LessThan,
+                        Expr::lt(
                             Column(format!("maxValues.{}", col)),
                             Literal(val.clone()),
                         ),
                     ];
-                    return Some(Expr::variadic(Or, exprs));
+                    return Some(Expr::or_from(exprs));
                 }
                 _ => return None, // unsupported operation
             };
@@ -260,123 +257,63 @@ mod tests {
         let cases = [
             (
                 column.clone().lt(lit_int.clone()),
-                Expr::binary(BinaryOperator::LessThan, min_col.clone(), lit_int.clone()),
+                Expr::lt(min_col.clone(), lit_int.clone()),
             ),
             (
                 lit_int.clone().lt(column.clone()),
-                Expr::binary(
-                    BinaryOperator::GreaterThan,
-                    max_col.clone(),
-                    lit_int.clone(),
-                ),
+                Expr::gt(max_col.clone(), lit_int.clone()),
             ),
             (
                 column.clone().gt(lit_int.clone()),
-                Expr::binary(
-                    BinaryOperator::GreaterThan,
-                    max_col.clone(),
-                    lit_int.clone(),
-                ),
+                Expr::gt(max_col.clone(), lit_int.clone()),
             ),
             (
                 lit_int.clone().gt(column.clone()),
-                Expr::binary(BinaryOperator::LessThan, min_col.clone(), lit_int.clone()),
+                Expr::lt(min_col.clone(), lit_int.clone()),
             ),
             (
                 column.clone().lt_eq(lit_int.clone()),
-                Expr::binary(
-                    BinaryOperator::LessThanOrEqual,
-                    min_col.clone(),
-                    lit_int.clone(),
-                ),
+                Expr::le(min_col.clone(), lit_int.clone()),
             ),
             (
                 lit_int.clone().lt_eq(column.clone()),
-                Expr::binary(
-                    BinaryOperator::GreaterThanOrEqual,
-                    max_col.clone(),
-                    lit_int.clone(),
-                ),
+                Expr::ge(max_col.clone(), lit_int.clone()),
             ),
             (
                 column.clone().gt_eq(lit_int.clone()),
-                Expr::binary(
-                    BinaryOperator::GreaterThanOrEqual,
-                    max_col.clone(),
-                    lit_int.clone(),
-                ),
+                Expr::ge(max_col.clone(), lit_int.clone()),
             ),
             (
                 lit_int.clone().gt_eq(column.clone()),
-                Expr::binary(
-                    BinaryOperator::LessThanOrEqual,
-                    min_col.clone(),
-                    lit_int.clone(),
-                ),
+                Expr::le(min_col.clone(), lit_int.clone()),
             ),
             (
                 column.clone().eq(lit_int.clone()),
-                Expr::variadic(
-                    VariadicOperator::And,
-                    [
-                        Expr::binary(
-                            BinaryOperator::LessThanOrEqual,
-                            min_col.clone(),
-                            lit_int.clone(),
-                        ),
-                        Expr::binary(
-                            BinaryOperator::GreaterThanOrEqual,
-                            max_col.clone(),
-                            lit_int.clone(),
-                        ),
-                    ],
-                ),
+                Expr::and_from([
+                    Expr::le(min_col.clone(), lit_int.clone()),
+                    Expr::ge(max_col.clone(), lit_int.clone()),
+                ]),
             ),
             (
                 lit_int.clone().eq(column.clone()),
-                Expr::variadic(
-                    VariadicOperator::And,
-                    [
-                        Expr::binary(
-                            BinaryOperator::LessThanOrEqual,
-                            min_col.clone(),
-                            lit_int.clone(),
-                        ),
-                        Expr::binary(
-                            BinaryOperator::GreaterThanOrEqual,
-                            max_col.clone(),
-                            lit_int.clone(),
-                        ),
-                    ],
-                ),
+                Expr::and_from([
+                    Expr::le(min_col.clone(), lit_int.clone()),
+                    Expr::ge(max_col.clone(), lit_int.clone()),
+                ]),
             ),
             (
                 column.clone().ne(lit_int.clone()),
-                Expr::variadic(
-                    VariadicOperator::Or,
-                    [
-                        Expr::binary(
-                            BinaryOperator::GreaterThan,
-                            min_col.clone(),
-                            lit_int.clone(),
-                        ),
-                        Expr::binary(BinaryOperator::LessThan, max_col.clone(), lit_int.clone()),
-                    ],
-                ),
+                Expr::or_from([
+                    Expr::gt(min_col.clone(), lit_int.clone()),
+                    Expr::lt(max_col.clone(), lit_int.clone()),
+                ]),
             ),
             (
                 lit_int.clone().ne(column.clone()),
-                Expr::variadic(
-                    VariadicOperator::Or,
-                    [
-                        Expr::binary(
-                            BinaryOperator::GreaterThan,
-                            min_col.clone(),
-                            lit_int.clone(),
-                        ),
-                        Expr::binary(BinaryOperator::LessThan, max_col.clone(), lit_int.clone()),
-                    ],
-                ),
+                Expr::or_from([
+                    Expr::gt(min_col.clone(), lit_int.clone()),
+                    Expr::lt(max_col.clone(), lit_int.clone()),
+                ]),
             ),
         ];
 
