@@ -154,19 +154,19 @@ impl DataSkippingFilter {
     pub(crate) fn apply(&self, actions: &RecordBatch) -> DeltaResult<RecordBatch> {
         let adds = actions
             .column_by_name("add")
-            .ok_or(Error::MissingColumn("Column 'add' not found.".into()))?
+            .ok_or(Error::missing_column("Column 'add' not found."))?
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or(Error::UnexpectedColumnType(
-                "Expected type 'StructArray'.".into(),
+            .ok_or(Error::unexpected_column_type(
+                "Expected type 'StructArray'.",
             ))?;
         let stats = adds
             .column_by_name("stats")
-            .ok_or(Error::MissingColumn("Column 'stats' not found.".into()))?
+            .ok_or(Error::missing_column("Column 'stats' not found."))?
             .as_any()
             .downcast_ref::<StringArray>()
-            .ok_or(Error::UnexpectedColumnType(
-                "Expected type 'StringArray'.".into(),
+            .ok_or(Error::unexpected_column_type(
+                "Expected type 'StringArray'.",
             ))?;
 
         let stats_schema = Arc::new(self.stats_schema.as_ref().try_into()?);
@@ -197,8 +197,8 @@ impl DataSkippingFilter {
         let skipping_vector = skipping_vector
             .as_any()
             .downcast_ref::<BooleanArray>()
-            .ok_or(Error::UnexpectedColumnType(
-                "Expected type 'BooleanArray'.".into(),
+            .ok_or(Error::unexpected_column_type(
+                "Expected type 'BooleanArray'.",
             ))?;
 
         // let skipping_vector = self.predicate.invoke(&parsed_stats)?;
@@ -224,7 +224,7 @@ impl DataSkippingFilter {
                 .into_iter()
                 .next()
                 .transpose()?
-                .ok_or(Error::MissingData("Expected data".into()))?),
+                .ok_or(Error::missing_data("Expected data"))?),
             None => Ok(RecordBatch::try_new(
                 stats_schema.clone(),
                 stats_schema
