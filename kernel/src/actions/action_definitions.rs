@@ -189,6 +189,9 @@ fn visit_metadata(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResul
         if let Some(mode) = map.get("delta.columnMapping.mode") {
             configuration.insert("delta.columnMapping.mode".to_string(), Some(mode.to_string()));
         }
+        if let Some(enable) = map.get("delta.enableDeletionVectors") {
+            configuration.insert("delta.enableDeletionVectors".to_string(), Some(enable.to_string()));
+        }
     }
 
     Ok(Metadata {
@@ -350,7 +353,7 @@ pub(crate) fn visit_add(_row_index: usize, vals: &[Option<DataItem<'_>>]) -> Del
         "path must be str"
     );
 
-    // TODO: Support partition_values
+    // TODO(nick): Support partition_values
 
     let size = extract_required_item!(
         vals[2],
@@ -378,7 +381,7 @@ pub(crate) fn visit_add(_row_index: usize, vals: &[Option<DataItem<'_>>]) -> Del
 
     let stats = extract_opt_item!(vals[5], as_str, "Add", "stats must be str");
 
-    // todo extract tags
+    // TODO(nick) extract tags
 
     let base_row_id = extract_opt_item!(vals[7], as_i64, "Add", "base_row_id must be i64");
 

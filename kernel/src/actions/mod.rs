@@ -569,17 +569,16 @@ mod tests {
         let data: SimpleData = action_batch().into();
         let parsed = Metadata::try_new_from_data(&client, &data).unwrap();
 
-        // TODO: Support maps
-        // let configuration = HashMap::from_iter([
-        //     (
-        //         "delta.enableDeletionVectors".to_string(),
-        //         Some("true".to_string()),
-        //     ),
-        //     (
-        //         "delta.columnMapping.mode".to_string(),
-        //         Some("none".to_string()),
-        //     ),
-        // ]);
+        let configuration = HashMap::from_iter([
+            (
+                "delta.enableDeletionVectors".to_string(),
+                Some("true".to_string()),
+            ),
+            (
+                "delta.columnMapping.mode".to_string(),
+                Some("none".to_string()),
+            ),
+        ]);
         let expected = Metadata {
             id: "testId".into(),
             name: None,
@@ -591,7 +590,7 @@ mod tests {
             schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
             partition_columns: Vec::new(),
             created_time: Some(1677811175819),
-            configuration: HashMap::new(),
+            configuration,
         };
         assert_eq!(parsed, expected)
     }
