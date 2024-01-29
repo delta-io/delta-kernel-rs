@@ -64,14 +64,8 @@ fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
                 }
                 NotEqual => {
                     let exprs = [
-                        Expr::gt(
-                            Column(format!("minValues.{}", col)),
-                            Literal(val.clone()),
-                        ),
-                        Expr::lt(
-                            Column(format!("maxValues.{}", col)),
-                            Literal(val.clone()),
-                        ),
+                        Expr::gt(Column(format!("minValues.{}", col)), Literal(val.clone())),
+                        Expr::lt(Column(format!("maxValues.{}", col)), Literal(val.clone())),
                     ];
                     return Some(Expr::or_from(exprs));
                 }
