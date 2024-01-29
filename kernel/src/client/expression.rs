@@ -9,14 +9,13 @@ use arrow_arith::numeric::{add, div, mul, sub};
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum, Decimal128Array, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
-    TimestampMicrosecondArray,
+    StructArray, TimestampMicrosecondArray,
 };
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::ArrowError;
 
 use crate::error::{DeltaResult, Error};
-use crate::expressions::{scalars::Scalar, Expression};
-use crate::expressions::{BinaryOperator, UnaryOperator, VariadicOperator};
+use crate::expressions::{BinaryOperator, Expression, Scalar, UnaryOperator, VariadicOperator};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::{ExpressionEvaluator, ExpressionHandler};
 
@@ -81,16 +80,77 @@ fn wrap_comparison_result(arr: BooleanArray) -> ArrayRef {
     Arc::new(arr) as Arc<dyn Array>
 }
 
+trait ProvidesColumnByName {
+    fn column_by_name(&self, name: &str) -> Option<&Arc<dyn Array>>;
+}
+
+impl ProvidesColumnByName for RecordBatch {
+    fn column_by_name(&self, name: &str) -> Option<&Arc<dyn Array>> {
+        self.column_by_name(name)
+    }
+}
+
+impl ProvidesColumnByName for StructArray {
+    fn column_by_name(&self, name: &str) -> Option<&Arc<dyn Array>> {
+        self.column_by_name(name)
+    }
+}
+
+fn extract_column<'array, 'path>(
+    array: &'array dyn ProvidesColumnByName,
+    path_step: &str,
+    remaining_path_steps: &mut impl Iterator<Item = &'path str>,
+) -> Result<&'array Arc<dyn Array>, ArrowError> {
+    let child = array
+        .column_by_name(path_step)
+        .ok_or(ArrowError::SchemaError(format!(
+            "No such field: {}",
+            path_step,
+        )))?;
+    if let Some(next_path_step) = remaining_path_steps.next() {
+        // This is not the last path step. Drill deeper.
+        extract_column(
+            column_as_struct(path_step, &Some(child))?,
+            next_path_step,
+            remaining_path_steps,
+        )
+    } else {
+        // Last path step. Return it.
+        Ok(child)
+    }
+}
+
+fn column_as_struct<'a>(
+    name: &str,
+    column: &Option<&'a Arc<dyn Array>>,
+) -> Result<&'a StructArray, ArrowError> {
+    column
+        .ok_or(ArrowError::SchemaError(format!("No such column: {}", name)))?
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or(ArrowError::SchemaError(format!("{} is not a struct", name)))
+}
+
 fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaResult<ArrayRef> {
     use BinaryOperator::*;
     use Expression::*;
 
     match expression {
         Literal(scalar) => Ok(scalar.to_array(batch.num_rows())?),
-        Column(name) => batch
-            .column_by_name(name)
-            .ok_or(Error::MissingColumn(name.clone()))
-            .cloned(),
+        Column(name) => {
+            // TODO properly handle nested columns
+            // https://github.com/delta-incubator/delta-kernel-rs/issues/86
+            if name.contains('.') {
+                let mut path = name.split('.');
+                // Safety: we know that the first path step exists, because we checked for '.'
+                Ok(extract_column(batch, path.next().unwrap(), &mut path).cloned()?)
+            } else {
+                batch
+                    .column_by_name(name)
+                    .ok_or(Error::MissingColumn(name.clone()))
+                    .cloned()
+            }
+        }
         UnaryOperation { op, expr } => {
             let arr = evaluate_expression(expr.as_ref(), batch)?;
             Ok(match op {
@@ -161,10 +221,8 @@ pub struct DefaultExpressionEvaluator {
 }
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
-    fn evaluate(&self, batch: &RecordBatch) -> DeltaResult<RecordBatch> {
-        let _result = evaluate_expression(&self.expression, batch)?;
-        // TODO handled in #83
-        todo!()
+    fn evaluate(&self, batch: &RecordBatch) -> DeltaResult<ArrayRef> {
+        evaluate_expression(&self.expression, batch)
     }
 }
 
@@ -172,8 +230,40 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
 mod tests {
     use super::*;
     use arrow_array::Int32Array;
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Fields, Schema};
     use std::ops::{Add, Div, Mul, Sub};
+
+    #[test]
+    fn test_extract_column() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let values = Int32Array::from(vec![1, 2, 3]);
+        let batch =
+            RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values.clone())]).unwrap();
+        let column = Expression::Column("a".to_string());
+
+        let results = evaluate_expression(&column, &batch).unwrap();
+        assert_eq!(results.as_ref(), &values);
+
+        let schema = Schema::new(vec![Field::new(
+            "b",
+            DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int32, false)])),
+            false,
+        )]);
+
+        let struct_values: ArrayRef = Arc::new(values.clone());
+        let struct_array = StructArray::from(vec![(
+            Arc::new(Field::new("a", DataType::Int32, false)),
+            struct_values,
+        )]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(struct_array.clone())],
+        )
+        .unwrap();
+        let column = Expression::Column("b.a".to_string());
+        let results = evaluate_expression(&column, &batch).unwrap();
+        assert_eq!(results.as_ref(), &values);
+    }
 
     #[test]
     fn test_binary_op_scalar() {

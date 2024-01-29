@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use url::Url;
 
-use deltakernel::expressions::{scalars::Scalar, BinaryOperator, Expression};
+use deltakernel::expressions::{Scalar, BinaryOperator, Expression};
 use deltakernel::scan::ScanBuilder;
 use deltakernel::schema::{DataType, PrimitiveType, StructField, StructType};
 use deltakernel::snapshot::Snapshot;
