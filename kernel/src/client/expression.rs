@@ -24,7 +24,7 @@ use crate::{ExpressionEvaluator, ExpressionHandler};
 fn downcast_to_bool(arr: &dyn Array) -> DeltaResult<&BooleanArray> {
     arr.as_any()
         .downcast_ref::<BooleanArray>()
-        .ok_or(Error::Generic("expected boolean array".to_string()))
+        .ok_or(Error::generic("expected boolean array"))
 }
 
 impl Scalar {
@@ -147,7 +147,7 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
             } else {
                 batch
                     .column_by_name(name)
-                    .ok_or(Error::MissingColumn(name.clone()))
+                    .ok_or(Error::missing_column(name))
                     .cloned()
             }
         }
@@ -176,9 +176,7 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
                 NotEqual => |l, r| neq(l, r).map(wrap_comparison_result),
             };
 
-            eval(&left_arr, &right_arr).map_err(|err| Error::GenericError {
-                source: Box::new(err),
-            })
+            eval(&left_arr, &right_arr).map_err(Error::generic_err)
         }
         VariadicOperation { op, exprs } => {
             let reducer = match op {
@@ -239,7 +237,7 @@ mod tests {
         let values = Int32Array::from(vec![1, 2, 3]);
         let batch =
             RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values.clone())]).unwrap();
-        let column = Expression::Column("a".to_string());
+        let column = Expression::column("a");
 
         let results = evaluate_expression(&column, &batch).unwrap();
         assert_eq!(results.as_ref(), &values);
@@ -260,7 +258,7 @@ mod tests {
             vec![Arc::new(struct_array.clone())],
         )
         .unwrap();
-        let column = Expression::Column("b.a".to_string());
+        let column = Expression::column("b.a");
         let results = evaluate_expression(&column, &batch).unwrap();
         assert_eq!(results.as_ref(), &values);
     }
@@ -270,7 +268,7 @@ mod tests {
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
         let values = Int32Array::from(vec![1, 2, 3]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
-        let column = Expression::Column("a".to_string());
+        let column = Expression::column("a");
 
         let expression = Box::new(column.clone().add(Expression::Literal(Scalar::Integer(1))));
         let results = evaluate_expression(&expression, &batch).unwrap();
@@ -306,8 +304,8 @@ mod tests {
             vec![Arc::new(values.clone()), Arc::new(values)],
         )
         .unwrap();
-        let column_a = Expression::Column("a".to_string());
-        let column_b = Expression::Column("b".to_string());
+        let column_a = Expression::column("a");
+        let column_b = Expression::column("b");
 
         let expression = Box::new(column_a.clone().add(column_b.clone()));
         let results = evaluate_expression(&expression, &batch).unwrap();
@@ -330,7 +328,7 @@ mod tests {
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
         let values = Int32Array::from(vec![1, 2, 3]);
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
-        let column = Expression::Column("a".to_string());
+        let column = Expression::column("a");
         let lit = Expression::Literal(Scalar::Integer(2));
 
         let expression = Box::new(column.clone().lt(lit.clone()));
@@ -378,8 +376,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let column_a = Expression::Column("a".to_string());
-        let column_b = Expression::Column("b".to_string());
+        let column_a = Expression::column("a");
+        let column_b = Expression::column("b");
 
         let expression = Box::new(column_a.clone().and(column_b.clone()));
         let results = evaluate_expression(&expression, &batch).unwrap();

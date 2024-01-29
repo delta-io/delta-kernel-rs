@@ -50,11 +50,36 @@ pub enum Error {
     MissingMetadata,
 }
 
+// Convenience constructors for Error types that take a String argument
+impl Error {
+    pub fn generic_err(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self::GenericError { source: source.into() }
+    }
+    pub fn generic(msg: impl ToString) -> Self {
+        Self::Generic(msg.to_string())
+    }
+    pub fn file_not_found(path: impl ToString) -> Self {
+        Self::FileNotFound(path.to_string())
+    }
+    pub fn missing_column(name: impl ToString) -> Self {
+        Self::MissingColumn(name.to_string())
+    }
+    pub fn unexpected_column_type(name: impl ToString) -> Self {
+        Self::UnexpectedColumnType(name.to_string())
+    }
+    pub fn missing_data(name: impl ToString) -> Self {
+        Self::MissingData(name.to_string())
+    }
+    pub fn deletion_vector(msg: impl ToString) -> Self {
+        Self::DeletionVector(msg.to_string())
+    }
+}
+
 #[cfg(feature = "object_store")]
 impl From<object_store::Error> for Error {
     fn from(value: object_store::Error) -> Self {
         match value {
-            object_store::Error::NotFound { path, .. } => Self::FileNotFound(path),
+            object_store::Error::NotFound { path, .. } => Self::file_not_found(path),
             err => Self::ObjectStore(err),
         }
     }

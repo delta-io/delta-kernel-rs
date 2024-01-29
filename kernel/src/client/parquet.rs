@@ -124,10 +124,7 @@ impl FileOpener for ParquetOpener {
                 .with_batch_size(batch_size)
                 .build()?;
 
-            let adapted = stream.map_err(|e| Error::GenericError {
-                source: Box::new(e),
-            });
-
+            let adapted = stream.map_err(Error::generic_err);
             Ok(adapted.boxed())
         }))
     }
