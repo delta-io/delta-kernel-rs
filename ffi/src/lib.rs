@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use url::Url;
 
-use deltakernel::expressions::{Scalar, BinaryOperator, Expression};
+use deltakernel::expressions::{BinaryOperator, Expression, Scalar};
 use deltakernel::scan::ScanBuilder;
 use deltakernel::schema::{DataType, PrimitiveType, StructField, StructType};
 use deltakernel::snapshot::Snapshot;
@@ -139,10 +139,7 @@ pub struct EngineSchemaVisitor {
 }
 
 #[no_mangle]
-pub extern "C" fn visit_schema(
-    snapshot: &Snapshot,
-    visitor: &mut EngineSchemaVisitor,
-) -> usize {
+pub extern "C" fn visit_schema(snapshot: &Snapshot, visitor: &mut EngineSchemaVisitor) -> usize {
     // Visit all the fields of a struct and return the list of children
     fn visit_struct_fields(visitor: &EngineSchemaVisitor, s: &StructType) -> usize {
         let child_list_id = (visitor.make_field_list)(visitor.data, s.fields.len());
@@ -294,7 +291,7 @@ pub extern "C" fn visit_expression_and(
     children: &mut EngineIterator,
 ) -> usize {
     let result = Expression::and_from(
-        children.flat_map(|child| unwrap_kernel_expression(state, child as usize))
+        children.flat_map(|child| unwrap_kernel_expression(state, child as usize)),
     );
     wrap_expression(state, result)
 }
@@ -404,7 +401,7 @@ pub extern "C" fn kernel_scan_files_init(
     table_client: *const KernelDefaultTableClient,
     predicate: Option<&mut EnginePredicate>,
 ) -> *mut KernelScanFileIterator {
-    let snapshot: Arc<Snapshot> = unsafe { Arc::from_raw(snapshot.clone()) };
+    let snapshot: Arc<Snapshot> = unsafe { Arc::from_raw(snapshot) };
     let table_client = unsafe { Arc::from_raw(table_client) };
     let mut scan_builder = ScanBuilder::new(snapshot.clone());
     if let Some(predicate) = predicate {
@@ -421,10 +418,7 @@ pub extern "C" fn kernel_scan_files_init(
             scan_builder = scan_builder.with_predicate(predicate);
         }
     }
-    let scan_adds = scan_builder
-        .build()
-        .files(table_client.as_ref())
-        .unwrap();
+    let scan_adds = scan_builder.build().files(table_client.as_ref()).unwrap();
     let files = scan_adds.map(|add| add.unwrap().path);
     let files = KernelScanFileIterator {
         files: Box::new(Mutex::new(files)),
