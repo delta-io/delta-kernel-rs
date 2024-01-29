@@ -181,9 +181,10 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
             })
         }
         VariadicOperation { op, exprs } => {
-            let reducer = match op {
-                VariadicOperator::And => and,
-                VariadicOperator::Or => or,
+            type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
+            let (reducer, default): (Operation, _) = match op {
+                VariadicOperator::And => (and, true),
+                VariadicOperator::Or => (or, false),
             };
             exprs
                 .iter()
@@ -192,8 +193,7 @@ fn evaluate_expression(expression: &Expression, batch: &RecordBatch) -> DeltaRes
                     Ok(reducer(downcast_to_bool(&l?)?, downcast_to_bool(&r?)?)
                         .map(wrap_comparison_result)?)
                 })
-                .transpose()?
-                .ok_or(Error::Generic("empty expression".to_string()))
+                .unwrap_or_else(|| evaluate_expression(&Expression::literal(default), batch))
         }
     }
 }
