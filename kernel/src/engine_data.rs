@@ -16,6 +16,12 @@ macro_rules! gen_casts {
     };
 }
 
+// a list that can go inside a DataItem
+pub trait ListItem {
+    fn len(&self, row_index: usize) -> usize;
+    fn get<'a>(&'a self, row_index: usize, list_index: usize) -> String;
+}
+
 // a map that can go inside a DataItem
 pub trait MapItem {
     fn get<'a>(&'a self, key: &str) -> Option<&'a str>;
@@ -30,7 +36,7 @@ pub enum DataItem<'a> {
     U32(u32),
     U64(u64),
     Str(&'a str),
-    StrList(Vec<&'a str>),
+    List(&'a dyn ListItem),
     Map(&'a dyn MapItem),
 }
 
@@ -53,7 +59,8 @@ impl<'a> DataItem<'a> {
 pub trait DataVisitor {
     // Receive some data from a call to `extract`. The data in [vals] should not be assumed to live
     // beyond the call to this funtion (i.e. it should be copied if needed)
-    fn visit(&mut self, vals: &[Option<DataItem<'_>>]);
+    // The row_index parameter must be the index of the found row in the data batch being processed.
+    fn visit(&mut self, row_index: usize, vals: &[Option<DataItem<'_>>]);
 }
 
 /// A TypeTag identifies the class that an Engine is using to represent data read by its

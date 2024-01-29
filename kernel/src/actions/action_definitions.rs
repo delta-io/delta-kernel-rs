@@ -11,11 +11,11 @@ use crate::{
 /// Generic struct to allow us to visit a type or hold an error that the type couldn't be parsed
 struct Visitor<T> {
     extracted: Option<DeltaResult<T>>,
-    extract_fn: fn(vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>,
+    extract_fn: fn(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>,
 }
 
 impl<T> Visitor<T> {
-    fn new(extract_fn: fn(vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>) -> Self {
+    fn new(extract_fn: fn(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>) -> Self {
         Visitor {
             extracted: None,
             extract_fn,
@@ -24,19 +24,19 @@ impl<T> Visitor<T> {
 }
 
 impl<T> DataVisitor for Visitor<T> {
-    fn visit(&mut self, vals: &[Option<DataItem<'_>>]) {
-        self.extracted = Some((self.extract_fn)(vals));
+    fn visit(&mut self, row_index: usize, vals: &[Option<DataItem<'_>>]) {
+        self.extracted = Some((self.extract_fn)(row_index, vals));
     }
 }
 
 /// Generic struct to allow us to visit a type repeatedly or hold an error that the type couldn't be parsed
 pub(crate) struct MultiVisitor<T> {
     pub(crate) extracted: Vec<DeltaResult<T>>,
-    extract_fn: fn(vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>,
+    extract_fn: fn(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>,
 }
 
 impl<T> MultiVisitor<T> {
-    pub(crate) fn new(extract_fn: fn(vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>) -> Self {
+    pub(crate) fn new(extract_fn: fn(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>) -> Self {
         MultiVisitor {
             extracted: vec![],
             extract_fn,
@@ -45,8 +45,8 @@ impl<T> MultiVisitor<T> {
 }
 
 impl<T> DataVisitor for MultiVisitor<T> {
-    fn visit(&mut self, vals: &[Option<DataItem<'_>>]) {
-        self.extracted.push((self.extract_fn)(vals));
+    fn visit(&mut self, row_index: usize, vals: &[Option<DataItem<'_>>]) {
+        self.extracted.push((self.extract_fn)(row_index, vals));
     }
 }
 
@@ -125,7 +125,7 @@ impl Metadata {
     }
 }
 
-fn visit_metadata(vals: &[Option<DataItem<'_>>]) -> DeltaResult<Metadata> {
+fn visit_metadata(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<Metadata> {
     let id = extract_required_item!(
         vals[0],
         as_str,
@@ -151,7 +151,7 @@ fn visit_metadata(vals: &[Option<DataItem<'_>>]) -> DeltaResult<Metadata> {
     )
     .to_string();
 
-    // todo: extract relevant values out of the options map at vals[4]
+    // options for format is always empty, so skip vals[4]
 
     let schema_string = extract_required_item!(
         vals[5],
@@ -162,6 +162,17 @@ fn visit_metadata(vals: &[Option<DataItem<'_>>]) -> DeltaResult<Metadata> {
     )
     .to_string();
 
+    let partition_columns = vals[6].as_ref().ok_or(Error::Extract("Metadata", "Metadata must have partition_columns"))?;
+    let partition_columns = if let DataItem::List(lst) = partition_columns {
+        let mut partition_columns = vec!();
+        for i in 0..lst.len(row_index) {
+            partition_columns.push(lst.get(row_index, i));
+        }
+        Ok(partition_columns)
+    } else {
+        Err(Error::Extract("Metadata", "partition_columns must be a list"))
+    }?;
+    
     // todo: partition_columns from vals[6]
 
     let created_time = extract_required_item!(
@@ -172,7 +183,13 @@ fn visit_metadata(vals: &[Option<DataItem<'_>>]) -> DeltaResult<Metadata> {
         "created_time must be i64"
     );
 
-    // todo: config vals from vals[8]
+    let mut configuration = HashMap::new();
+    if let Some(m) = vals[8].as_ref() {
+        let map = m.as_map().ok_or(Error::Extract("Metadata", "configuration must be a map"))?;
+        if let Some(mode) = map.get("delta.columnMapping.mode") {
+            configuration.insert("delta.columnMapping.mode".to_string(), Some(mode.to_string()));
+        }
+    }
 
     Ok(Metadata {
         id,
@@ -183,9 +200,9 @@ fn visit_metadata(vals: &[Option<DataItem<'_>>]) -> DeltaResult<Metadata> {
             options: HashMap::new(),
         },
         schema_string,
-        partition_columns: vec![],
+        partition_columns,
         created_time: Some(created_time),
-        configuration: HashMap::new(),
+        configuration,
     })
 }
 
@@ -220,7 +237,7 @@ impl Protocol {
     }
 }
 
-fn visit_protocol(vals: &[Option<DataItem<'_>>]) -> DeltaResult<Protocol> {
+fn visit_protocol(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<Protocol> {
     let min_reader_version = extract_required_item!(
         vals[0],
         as_i32,
@@ -238,20 +255,28 @@ fn visit_protocol(vals: &[Option<DataItem<'_>>]) -> DeltaResult<Protocol> {
     );
 
     let reader_features = vals[2].as_ref().map(|rf_di| {
-        if let DataItem::StrList(lst) = rf_di {
-            lst.iter().map(|f| f.to_string()).collect()
+        if let DataItem::List(lst) = rf_di {
+            let mut reader_features = vec!();
+            for i in 0..lst.len(row_index) {
+                reader_features.push(lst.get(row_index, i));
+            }
+            Ok(reader_features)
         } else {
-            panic!("readerFeatures must be a string list")
+            Err(Error::Extract("Protocol", "readerFeatures must be a string list"))
         }
-    });
+    }).transpose()?;
 
-    let writer_features = vals[3].as_ref().map(|rf_di| {
-        if let DataItem::StrList(lst) = rf_di {
-            lst.iter().map(|f| f.to_string()).collect()
+    let writer_features = vals[3].as_ref().map(|wf_di| {
+        if let DataItem::List(lst) = wf_di {
+            let mut writer_features = vec!();
+            for i in 0..lst.len(row_index) {
+                writer_features.push(lst.get(row_index, i));
+            }
+            Ok(writer_features)
         } else {
-            panic!("readerFeatures must be a string list")
+            Err(Error::Extract("Protocol", "writerFeatures must be a string list"))
         }
-    });
+    }).transpose()?;
 
     Ok(Protocol {
         min_reader_version,
@@ -316,7 +341,7 @@ impl Add {
     }
 }
 
-pub(crate) fn visit_add(vals: &[Option<DataItem<'_>>]) -> DeltaResult<Add> {
+pub(crate) fn visit_add(_row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<Add> {
     let path = extract_required_item!(
         vals[0],
         as_str,

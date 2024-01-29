@@ -1,10 +1,10 @@
-use crate::engine_data::{DataItem, DataVisitor, EngineData, TypeTag};
+use crate::engine_data::{DataItem, DataVisitor, EngineData, TypeTag, MapItem, ListItem};
 use crate::schema::{Schema, SchemaRef};
 use crate::DeltaResult;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, Int64Type};
-use arrow_array::{Array, RecordBatch, StructArray};
+use arrow_array::{Array, RecordBatch, StructArray, MapArray, GenericListArray};
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tracing::{debug, error, warn};
@@ -46,6 +46,37 @@ impl ProvidesColumnByName for RecordBatch {
 impl ProvidesColumnByName for StructArray {
     fn column_by_name(&self, name: &str) -> Option<&Arc<dyn Array>> {
         self.column_by_name(name)
+    }
+}
+
+impl ListItem for GenericListArray<i32> {
+    fn len(&self, row_index: usize) -> usize {
+        self.value(row_index).len()
+    }
+
+    fn get<'a>(&'a self, row_index: usize, index: usize) -> String {
+        let arry = self.value(row_index);
+        let sarry = arry.as_string::<i32>();
+        sarry.value(index).to_string()
+    }
+}
+
+// TODO: This is likely wrong and needs to only scan the correct row
+impl MapItem for MapArray {
+    fn get<'a>(&'a self, key: &str) -> Option<&'a str> {
+        let keys = self.keys().as_string::<i32>();
+        let mut idx = 0;
+        for map_key in keys.iter() {
+            if let Some(map_key) = map_key {
+                if key == map_key {
+                    // found the item
+                    let vals = self.values().as_string::<i32>();
+                    return Some(vals.value(idx))
+                }
+            }
+            idx+=1;
+        }
+        None
     }
 }
 
@@ -136,22 +167,10 @@ impl SimpleData {
                                 res_arry.push(Some(DataItem::Str(val)));
                             }
                             DataType::List(_) => {
-                                let arry: &'a arrow_array::GenericListArray<i32> =
-                                    col.as_list::<i32>();
-                                let sarry: &'a arrow_array::GenericByteArray<
-                                    arrow_array::types::GenericStringType<i32>,
-                                > = arry.values().as_string::<i32>();
-                                let mut lst = vec![];
-                                for i in 0..sarry.len() {
-                                    lst.push(sarry.value(i));
-                                }
-                                //println!("HERE: {:#?}", sarry.value_data());
-                                //warn!("ignoring list");
-                                res_arry.push(Some(DataItem::StrList(lst)));
+                                res_arry.push(Some(DataItem::List(col.as_list::<i32>())));
                             }
                             DataType::Map(_, _) => {
-                                warn!("ignoring map");
-                                res_arry.push(None);
+                                res_arry.push(Some(DataItem::Map(col.as_map())));
                             }
                             typ @ _ => {
                                 error!("CAN'T EXTRACT: {}", typ);
@@ -171,7 +190,7 @@ impl SimpleData {
             let mut had_data = false;
             self.extract_row(&self.data, &schema, row, &mut had_data, &mut res_arry);
             if had_data {
-                visitor.visit(&res_arry);
+                visitor.visit(row, &res_arry);
             }
         }
     }

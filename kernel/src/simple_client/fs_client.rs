@@ -46,7 +46,6 @@ impl FileSystemClient for SimpleFilesystemClient {
                                 },
                             )
                             .unwrap_or(0);
-                        println!("Adding {:#?}", ent);
                         Url::from_file_path(ent.path())
                             .map(|location| FileMeta {
                                 location,
