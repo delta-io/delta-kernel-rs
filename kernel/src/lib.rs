@@ -39,8 +39,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, StringArray};
-use arrow_schema::SchemaRef as ArrowSchemaRef;
+use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use bytes::Bytes;
 use url::Url;
 
@@ -95,7 +94,7 @@ pub trait ExpressionEvaluator {
     ///
     /// Contains one value for each row of the input.
     /// The data type of the output is same as the type output of the expression this evaluator is using.
-    fn evaluate(&self, batch: &RecordBatch) -> DeltaResult<RecordBatch>;
+    fn evaluate(&self, batch: &RecordBatch) -> DeltaResult<ArrayRef>;
 }
 
 /// Provides expression evaluation capability to Delta Kernel.
@@ -147,7 +146,7 @@ pub trait JsonHandler {
     fn parse_json(
         &self,
         json_strings: StringArray,
-        output_schema: ArrowSchemaRef,
+        output_schema: SchemaRef,
     ) -> DeltaResult<RecordBatch>;
 
     /// Read and parse the JSON format file at given locations and return

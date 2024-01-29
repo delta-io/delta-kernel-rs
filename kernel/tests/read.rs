@@ -280,7 +280,9 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     //
     // NOTE: For cases that match both batch1 and batch2, we list batch2 first because log replay
     // returns most recently added files first.
-    use BinaryOperator::{Equal, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual};
+    use BinaryOperator::{
+        Equal, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual, NotEqual,
+    };
     let test_cases: Vec<(_, i64, _)> = vec![
         (Equal, 0, vec![]),
         (Equal, 1, vec![&batch1]),
@@ -305,6 +307,13 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         (GreaterThanOrEqual, 4, vec![&batch2]),
         (GreaterThanOrEqual, 7, vec![&batch2]),
         (GreaterThanOrEqual, 8, vec![]),
+        (NotEqual, 0, vec![&batch2, &batch1]),
+        (NotEqual, 1, vec![&batch2]),
+        (NotEqual, 3, vec![&batch2]),
+        (NotEqual, 4, vec![&batch2, &batch1]),
+        (NotEqual, 5, vec![&batch1]),
+        (NotEqual, 7, vec![&batch1]),
+        (NotEqual, 8, vec![&batch2, &batch1]),
     ];
     for (op, value, expected_batches) in test_cases {
         let predicate = Expression::BinaryOperation {

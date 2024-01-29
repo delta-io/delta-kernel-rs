@@ -1,6 +1,7 @@
 use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::client::DefaultTableClient;
 use deltakernel::scan::ScanBuilder;
+use deltakernel::schema::StructType;
 use deltakernel::{DeltaResult, Table};
 
 use deltakernel::actions::{parse_actions, Action, ActionType};
@@ -10,7 +11,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_schema::Schema as ArrowSchema;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -98,21 +98,20 @@ fn main() {
             println!("{:#?}", files);
         }
         Commands::Actions { forward } => {
-            let action_types = [
+            let action_types = vec![
                 //ActionType::CommitInfo,
                 ActionType::Metadata,
                 ActionType::Protocol,
                 ActionType::Remove,
                 ActionType::Add,
             ];
-            let read_schema = Arc::new(ArrowSchema {
-                fields: action_types
-                    .as_ref()
+            let read_schema = Arc::new(StructType::new(
+                action_types
                     .iter()
-                    .map(|a| Arc::new(a.schema_field().try_into().unwrap()))
+                    .map(|a| a.schema_field())
+                    .cloned()
                     .collect(),
-                metadata: Default::default(),
-            });
+            ));
 
             let batches = snapshot
                 ._log_segment()
@@ -137,7 +136,7 @@ fn main() {
                 }
                 println!("-- at {:0>20} --", index);
                 let (batch, _) = batch.unwrap();
-                let actions = parse_actions(&batch, action_types.as_ref()).unwrap();
+                let actions = parse_actions(&batch, &action_types).unwrap();
                 for action in actions {
                     match action {
                         Action::Metadata(md) => println!("{:#?}", md),

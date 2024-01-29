@@ -1,7 +1,5 @@
-use std::{
-    cmp::Ordering,
-    fmt::{Display, Formatter},
-};
+use std::cmp::Ordering;
+use std::fmt::{Display, Formatter};
 
 use crate::schema::{DataType, PrimitiveType};
 
