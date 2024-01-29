@@ -72,11 +72,11 @@ pub(crate) fn parse_action(
 
     let arr = batch
         .column_by_name(column_name)
-        .ok_or(Error::MissingColumn(column_name.into()))?
+        .ok_or(Error::missing_column(column_name))?
         .as_any()
         .downcast_ref::<StructArray>()
-        .ok_or(Error::UnexpectedColumnType(
-            "Cannot downcast to StructArray".into(),
+        .ok_or(Error::unexpected_column_type(
+            "Cannot downcast to StructArray",
         ))?;
 
     match action_type {
@@ -161,12 +161,12 @@ fn parse_action_metadata(arr: &StructArray) -> DeltaResult<Box<dyn Iterator<Item
             .keys()
             .as_any()
             .downcast_ref::<StringArray>()
-            .ok_or(Error::MissingData("expected key column in map".into()))?;
+            .ok_or(Error::missing_data("expected key column in map"))?;
         let values = config
             .values()
             .as_any()
             .downcast_ref::<StringArray>()
-            .ok_or(Error::MissingData("expected value column in map".into()))?;
+            .ok_or(Error::missing_data("expected value column in map"))?;
         metadata.configuration = keys
             .into_iter()
             .zip(values)
@@ -498,10 +498,10 @@ fn parse_dv(
 
 fn cast_struct_column<T: 'static>(arr: &StructArray, name: impl AsRef<str>) -> DeltaResult<&T> {
     arr.column_by_name(name.as_ref())
-        .ok_or(Error::MissingColumn(name.as_ref().into()))?
+        .ok_or(Error::missing_column(name.as_ref()))?
         .as_any()
         .downcast_ref::<T>()
-        .ok_or(Error::UnexpectedColumnType(format!(
+        .ok_or(Error::unexpected_column_type(format!(
             "Cannot downcast '{}' to expected type",
             name.as_ref()
         )))

@@ -153,8 +153,8 @@ impl Expression {
     }
 
     /// Create an new expression for a column reference
-    pub fn column(name: impl Into<String>) -> Self {
-        Self::Column(name.into())
+    pub fn column(name: impl ToString) -> Self {
+        Self::Column(name.to_string())
     }
 
     /// Create a new expression for a literal value
