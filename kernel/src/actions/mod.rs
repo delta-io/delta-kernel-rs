@@ -75,7 +75,9 @@ pub(crate) fn parse_action(
         .ok_or(Error::missing_column(column_name))?
         .as_any()
         .downcast_ref::<StructArray>()
-        .ok_or(Error::unexpected_column_type("Cannot downcast to StructArray"))?;
+        .ok_or(Error::unexpected_column_type(
+            "Cannot downcast to StructArray",
+        ))?;
 
     match action_type {
         ActionType::Metadata => parse_action_metadata(arr),

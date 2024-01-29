@@ -178,8 +178,7 @@ impl DeletionVectorDescriptor {
                 }
                 let decoded = z85::decode(&self.path_or_inline_dv[(prefix_len as usize)..])
                     .map_err(|_| Error::deletion_vector("Failed to decode DV uuid"))?;
-                let uuid = uuid::Uuid::from_slice(&decoded)
-                    .map_err(Error::deletion_vector)?;
+                let uuid = uuid::Uuid::from_slice(&decoded).map_err(Error::deletion_vector)?;
                 let mut dv_suffix = format!("deletion_vector_{uuid}.bin");
                 if prefix_len > 0 {
                     dv_suffix = format!(
@@ -213,8 +212,7 @@ impl DeletionVectorDescriptor {
             None => {
                 let bytes = z85::decode(&self.path_or_inline_dv)
                     .map_err(|_| Error::deletion_vector("Failed to decode DV"))?;
-                RoaringTreemap::deserialize_from(&bytes[12..])
-                    .map_err(Error::deletion_vector)
+                RoaringTreemap::deserialize_from(&bytes[12..]).map_err(Error::deletion_vector)
             }
             Some(path) => {
                 let offset = self.offset;
@@ -237,23 +235,18 @@ impl DeletionVectorDescriptor {
                 }
 
                 let mut buf = vec![0; 4];
-                cursor
-                    .read(&mut buf)
-                    .map_err(Error::deletion_vector)?;
-                let magic =
-                    i32::from_le_bytes(buf.try_into().map_err(|_| {
-                        Error::deletion_vector("filed to read magic bytes")
-                    })?);
+                cursor.read(&mut buf).map_err(Error::deletion_vector)?;
+                let magic = i32::from_le_bytes(
+                    buf.try_into()
+                        .map_err(|_| Error::deletion_vector("filed to read magic bytes"))?,
+                );
                 println!("magic  --> : {}", magic);
                 // assert!(magic == 1681511377);
 
                 let mut buf = vec![0; size_in_bytes as usize];
-                cursor
-                    .read(&mut buf)
-                    .map_err(Error::deletion_vector)?;
+                cursor.read(&mut buf).map_err(Error::deletion_vector)?;
 
-                RoaringTreemap::deserialize_from(Cursor::new(buf))
-                    .map_err(Error::deletion_vector)
+                RoaringTreemap::deserialize_from(Cursor::new(buf)).map_err(Error::deletion_vector)
             }
         }
     }

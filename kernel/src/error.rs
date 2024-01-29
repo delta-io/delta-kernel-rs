@@ -53,7 +53,9 @@ pub enum Error {
 // Convenience constructors for Error types that take a String argument
 impl Error {
     pub fn generic_err(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
-        Self::GenericError { source: source.into() }
+        Self::GenericError {
+            source: source.into(),
+        }
     }
     pub fn generic(msg: impl ToString) -> Self {
         Self::Generic(msg.to_string())
