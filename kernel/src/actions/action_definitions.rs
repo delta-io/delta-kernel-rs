@@ -1,11 +1,18 @@
 //! Define the Delta actions that exist, and how to parse them out of [EngineData]
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    io::{Cursor, Read},
+    sync::Arc,
+};
+
+use roaring::RoaringTreemap;
+use url::Url;
 
 use crate::{
     engine_data::{DataItem, DataVisitor, EngineData},
     schema::StructType,
-    DeltaResult, EngineClient, Error,
+    DeltaResult, EngineClient, Error, FileSystemClient,
 };
 
 /// Generic struct to allow us to visit a type or hold an error that the type couldn't be parsed
@@ -15,7 +22,9 @@ struct Visitor<T> {
 }
 
 impl<T> Visitor<T> {
-    fn new(extract_fn: fn(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>) -> Self {
+    fn new(
+        extract_fn: fn(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>,
+    ) -> Self {
         Visitor {
             extracted: None,
             extract_fn,
@@ -36,7 +45,9 @@ pub(crate) struct MultiVisitor<T> {
 }
 
 impl<T> MultiVisitor<T> {
-    pub(crate) fn new(extract_fn: fn(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>) -> Self {
+    pub(crate) fn new(
+        extract_fn: fn(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>,
+    ) -> Self {
         MultiVisitor {
             extracted: vec![],
             extract_fn,
@@ -162,17 +173,23 @@ fn visit_metadata(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResul
     )
     .to_string();
 
-    let partition_columns = vals[6].as_ref().ok_or(Error::Extract("Metadata", "Metadata must have partition_columns"))?;
+    let partition_columns = vals[6].as_ref().ok_or(Error::Extract(
+        "Metadata",
+        "Metadata must have partition_columns",
+    ))?;
     let partition_columns = if let DataItem::List(lst) = partition_columns {
-        let mut partition_columns = vec!();
+        let mut partition_columns = vec![];
         for i in 0..lst.len(row_index) {
             partition_columns.push(lst.get(row_index, i));
         }
         Ok(partition_columns)
     } else {
-        Err(Error::Extract("Metadata", "partition_columns must be a list"))
+        Err(Error::Extract(
+            "Metadata",
+            "partition_columns must be a list",
+        ))
     }?;
-    
+
     // todo: partition_columns from vals[6]
 
     let created_time = extract_required_item!(
@@ -185,12 +202,20 @@ fn visit_metadata(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResul
 
     let mut configuration = HashMap::new();
     if let Some(m) = vals[8].as_ref() {
-        let map = m.as_map().ok_or(Error::Extract("Metadata", "configuration must be a map"))?;
+        let map = m
+            .as_map()
+            .ok_or(Error::Extract("Metadata", "configuration must be a map"))?;
         if let Some(mode) = map.get("delta.columnMapping.mode") {
-            configuration.insert("delta.columnMapping.mode".to_string(), Some(mode.to_string()));
+            configuration.insert(
+                "delta.columnMapping.mode".to_string(),
+                Some(mode.to_string()),
+            );
         }
         if let Some(enable) = map.get("delta.enableDeletionVectors") {
-            configuration.insert("delta.enableDeletionVectors".to_string(), Some(enable.to_string()));
+            configuration.insert(
+                "delta.enableDeletionVectors".to_string(),
+                Some(enable.to_string()),
+            );
         }
     }
 
@@ -257,29 +282,41 @@ fn visit_protocol(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResul
         "minWriterVersion must be i32"
     );
 
-    let reader_features = vals[2].as_ref().map(|rf_di| {
-        if let DataItem::List(lst) = rf_di {
-            let mut reader_features = vec!();
-            for i in 0..lst.len(row_index) {
-                reader_features.push(lst.get(row_index, i));
+    let reader_features = vals[2]
+        .as_ref()
+        .map(|rf_di| {
+            if let DataItem::List(lst) = rf_di {
+                let mut reader_features = vec![];
+                for i in 0..lst.len(row_index) {
+                    reader_features.push(lst.get(row_index, i));
+                }
+                Ok(reader_features)
+            } else {
+                Err(Error::Extract(
+                    "Protocol",
+                    "readerFeatures must be a string list",
+                ))
             }
-            Ok(reader_features)
-        } else {
-            Err(Error::Extract("Protocol", "readerFeatures must be a string list"))
-        }
-    }).transpose()?;
+        })
+        .transpose()?;
 
-    let writer_features = vals[3].as_ref().map(|wf_di| {
-        if let DataItem::List(lst) = wf_di {
-            let mut writer_features = vec!();
-            for i in 0..lst.len(row_index) {
-                writer_features.push(lst.get(row_index, i));
+    let writer_features = vals[3]
+        .as_ref()
+        .map(|wf_di| {
+            if let DataItem::List(lst) = wf_di {
+                let mut writer_features = vec![];
+                for i in 0..lst.len(row_index) {
+                    writer_features.push(lst.get(row_index, i));
+                }
+                Ok(writer_features)
+            } else {
+                Err(Error::Extract(
+                    "Protocol",
+                    "writerFeatures must be a string list",
+                ))
             }
-            Ok(writer_features)
-        } else {
-            Err(Error::Extract("Protocol", "writerFeatures must be a string list"))
-        }
-    }).transpose()?;
+        })
+        .transpose()?;
 
     Ok(Protocol {
         min_reader_version,
@@ -287,6 +324,131 @@ fn visit_protocol(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResul
         reader_features,
         writer_features,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionVectorDescriptor {
+    /// A single character to indicate how to access the DV. Legal options are: ['u', 'i', 'p'].
+    pub storage_type: String,
+
+    /// Three format options are currently proposed:
+    /// - If `storageType = 'u'` then `<random prefix - optional><base85 encoded uuid>`:
+    ///   The deletion vector is stored in a file with a path relative to the data
+    ///   directory of this Delta table, and the file name can be reconstructed from
+    ///   the UUID. See Derived Fields for how to reconstruct the file name. The random
+    ///   prefix is recovered as the extra characters before the (20 characters fixed length) uuid.
+    /// - If `storageType = 'i'` then `<base85 encoded bytes>`: The deletion vector
+    ///   is stored inline in the log. The format used is the `RoaringBitmapArray`
+    ///   format also used when the DV is stored on disk and described in [Deletion Vector Format].
+    /// - If `storageType = 'p'` then `<absolute path>`: The DV is stored in a file with an
+    ///   absolute path given by this path, which has the same format as the `path` field
+    ///   in the `add`/`remove` actions.
+    ///
+    /// [Deletion Vector Format]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Deletion-Vector-Format
+    pub path_or_inline_dv: String,
+
+    /// Start of the data for this DV in number of bytes from the beginning of the file it is stored in.
+    /// Always None (absent in JSON) when `storageType = 'i'`.
+    pub offset: Option<i32>,
+
+    /// Size of the serialized DV in bytes (raw data size, i.e. before base85 encoding, if inline).
+    pub size_in_bytes: i32,
+
+    /// Number of rows the given DV logically removes from the file.
+    pub cardinality: i64,
+}
+
+impl DeletionVectorDescriptor {
+    pub fn unique_id(&self) -> String {
+        if let Some(offset) = self.offset {
+            format!("{}{}@{offset}", self.storage_type, self.path_or_inline_dv)
+        } else {
+            format!("{}{}", self.storage_type, self.path_or_inline_dv)
+        }
+    }
+
+    pub fn absolute_path(&self, parent: &Url) -> DeltaResult<Option<Url>> {
+        match self.storage_type.as_str() {
+            "u" => {
+                let prefix_len = self.path_or_inline_dv.len() as i32 - 20;
+                if prefix_len < 0 {
+                    return Err(Error::DeletionVector("Invalid length".to_string()));
+                }
+                let decoded = z85::decode(&self.path_or_inline_dv[(prefix_len as usize)..])
+                    .map_err(|_| Error::DeletionVector("Failed to decode DV uuid".to_string()))?;
+                let uuid = uuid::Uuid::from_slice(&decoded)
+                    .map_err(|err| Error::DeletionVector(err.to_string()))?;
+                let dv_suffix = if prefix_len > 0 {
+                    format!(
+                        "{}/deletion_vector_{uuid}.bin",
+                        &self.path_or_inline_dv[..(prefix_len as usize)]
+                    )
+                } else {
+                    format!("deletion_vector_{uuid}.bin")
+                };
+                let dv_path = parent
+                    .join(&dv_suffix)
+                    .map_err(|_| Error::DeletionVector(format!("invalid path: {}", dv_suffix)))?;
+                Ok(Some(dv_path))
+            }
+            "p" => Ok(Some(Url::parse(&self.path_or_inline_dv).map_err(|_| {
+                Error::DeletionVector(format!("invalid path: {}", self.path_or_inline_dv))
+            })?)),
+            "i" => Ok(None),
+            other => Err(Error::DeletionVector(format!(
+                "Unknown storage format: '{other}'."
+            ))),
+        }
+    }
+
+    pub fn read(
+        &self,
+        fs_client: Arc<dyn FileSystemClient>,
+        parent: Url,
+    ) -> DeltaResult<RoaringTreemap> {
+        match self.absolute_path(&parent)? {
+            None => {
+                let bytes = z85::decode(&self.path_or_inline_dv)
+                    .map_err(|_| Error::DeletionVector("Failed to decode DV".to_string()))?;
+                RoaringTreemap::deserialize_from(&bytes[12..])
+                    .map_err(|err| Error::DeletionVector(err.to_string()))
+            }
+            Some(path) => {
+                let offset = self.offset;
+                let size_in_bytes = self.size_in_bytes;
+
+                let dv_data = fs_client
+                    .read_files(vec![(path, None)])?
+                    .next()
+                    .ok_or(Error::MissingData("No deletion Vector data".to_string()))??;
+
+                let mut cursor = Cursor::new(dv_data);
+                if let Some(offset) = offset {
+                    // TODO should we read the datasize from the DV file?
+                    // offset plus datasize bytes
+                    cursor.set_position((offset + 4) as u64);
+                }
+
+                let mut buf = vec![0; 4];
+                cursor
+                    .read(&mut buf)
+                    .map_err(|err| Error::DeletionVector(err.to_string()))?;
+                // let magic =
+                //     i32::from_le_bytes(buf.try_into().map_err(|_| {
+                //         Error::DeletionVector("filed to read magic bytes".to_string())
+                //     })?);
+                // assert!(magic == 1681511377);
+
+                let mut buf = vec![0; size_in_bytes as usize];
+                cursor
+                    .read(&mut buf)
+                    .map_err(|err| Error::DeletionVector(err.to_string()))?;
+
+                RoaringTreemap::deserialize_from(Cursor::new(buf))
+                    .map_err(|err| Error::DeletionVector(err.to_string()))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,7 +482,7 @@ pub struct Add {
     pub tags: HashMap<String, Option<String>>,
 
     /// Information about deletion vector (DV) associated with this add action
-    //pub deletion_vector: Option<DeletionVectorDescriptor>,
+    pub deletion_vector: Option<DeletionVectorDescriptor>,
 
     /// Default generated Row ID of the first row in the file. The default generated Row IDs
     /// of the other rows in the file can be reconstructed by adding the physical index of the
@@ -381,12 +543,61 @@ pub(crate) fn visit_add(_row_index: usize, vals: &[Option<DataItem<'_>>]) -> Del
 
     let stats = extract_opt_item!(vals[5], as_str, "Add", "stats must be str");
 
-    // TODO(nick) extract tags
+    // TODO(nick) extract tags at vals[6]
 
-    let base_row_id = extract_opt_item!(vals[7], as_i64, "Add", "base_row_id must be i64");
+    let deletion_vector = if vals[7].is_some() {
+        // there is a storageType, so the whole DV must be there
+        let storage_type = extract_required_item!(
+            vals[7],
+            as_str,
+            "Add",
+            "DV must have storageType",
+            "storageType must be a string"
+        )
+        .to_string();
+
+        let path_or_inline_dv = extract_required_item!(
+            vals[8],
+            as_str,
+            "Add",
+            "DV must have pathOrInlineDv",
+            "pathOrInlineDv must be a string"
+        )
+        .to_string();
+
+        let offset = extract_opt_item!(vals[9], as_i32, "Add", "offset must be i32");
+
+        let size_in_bytes = extract_required_item!(
+            vals[10],
+            as_i32,
+            "Add",
+            "DV must have sizeInBytes",
+            "sizeInBytes must be i32"
+        );
+
+        let cardinality = extract_required_item!(
+            vals[11],
+            as_i64,
+            "Add",
+            "DV must have cardinality",
+            "cardinality must be i64"
+        );
+
+        Some(DeletionVectorDescriptor {
+            storage_type,
+            path_or_inline_dv,
+            offset,
+            size_in_bytes,
+            cardinality,
+        })
+    } else {
+        None
+    };
+
+    let base_row_id = extract_opt_item!(vals[12], as_i64, "Add", "base_row_id must be i64");
 
     let default_row_commit_version = extract_opt_item!(
-        vals[8],
+        vals[13],
         as_i64,
         "Add",
         "default_row_commit_version must be i64"
@@ -400,7 +611,105 @@ pub(crate) fn visit_add(_row_index: usize, vals: &[Option<DataItem<'_>>]) -> Del
         data_change,
         stats: stats.map(|s| s.to_string()),
         tags: HashMap::new(),
+        deletion_vector,
         base_row_id,
         default_row_commit_version,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use url::Url;
+
+    use crate::{simple_client::SimpleClient, EngineClient};
+
+    use super::DeletionVectorDescriptor;
+
+    fn dv_relateive() -> DeletionVectorDescriptor {
+        DeletionVectorDescriptor {
+            storage_type: "u".to_string(),
+            path_or_inline_dv: "ab^-aqEH.-t@S}K{vb[*k^".to_string(),
+            offset: Some(4),
+            size_in_bytes: 40,
+            cardinality: 6,
+        }
+    }
+
+    fn dv_absolute() -> DeletionVectorDescriptor {
+        DeletionVectorDescriptor {
+            storage_type: "p".to_string(),
+            path_or_inline_dv:
+                "s3://mytable/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin".to_string(),
+            offset: Some(4),
+            size_in_bytes: 40,
+            cardinality: 6,
+        }
+    }
+
+    fn dv_inline() -> DeletionVectorDescriptor {
+        DeletionVectorDescriptor {
+            storage_type: "i".to_string(),
+            path_or_inline_dv: "wi5b=000010000siXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L".to_string(),
+            offset: None,
+            size_in_bytes: 40,
+            cardinality: 6,
+        }
+    }
+
+    fn dv_example() -> DeletionVectorDescriptor {
+        DeletionVectorDescriptor {
+            storage_type: "u".to_string(),
+            path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
+            offset: Some(1),
+            size_in_bytes: 36,
+            cardinality: 2,
+        }
+    }
+
+    #[test]
+    fn test_deletion_vector_absolute_path() {
+        let parent = Url::parse("s3://mytable/").unwrap();
+
+        let relative = dv_relateive();
+        let expected =
+            Url::parse("s3://mytable/ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin")
+                .unwrap();
+        assert_eq!(expected, relative.absolute_path(&parent).unwrap().unwrap());
+
+        let absolute = dv_absolute();
+        let expected =
+            Url::parse("s3://mytable/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin")
+                .unwrap();
+        assert_eq!(expected, absolute.absolute_path(&parent).unwrap().unwrap());
+
+        let inline = dv_inline();
+        assert_eq!(None, inline.absolute_path(&parent).unwrap());
+
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let parent = url::Url::from_directory_path(path).unwrap();
+        let dv_url = parent
+            .join("deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin")
+            .unwrap();
+        let example = dv_example();
+        assert_eq!(dv_url, example.absolute_path(&parent).unwrap().unwrap());
+    }
+
+    #[test]
+    fn test_deletion_vector_read() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let parent = url::Url::from_directory_path(path).unwrap();
+        let simple_client = SimpleClient::new();
+        let fs_client = simple_client.get_file_system_client();
+
+        let example = dv_example();
+        let tree_map = example.read(fs_client, parent).unwrap();
+
+        let expected: Vec<u64> = vec![0, 9];
+        let found = tree_map.iter().collect::<Vec<_>>();
+        assert_eq!(found, expected)
+    }
 }

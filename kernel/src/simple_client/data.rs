@@ -1,10 +1,10 @@
-use crate::engine_data::{DataItem, DataVisitor, EngineData, TypeTag, MapItem, ListItem};
+use crate::engine_data::{DataItem, DataVisitor, EngineData, ListItem, MapItem, TypeTag};
 use crate::schema::{Schema, SchemaRef};
 use crate::DeltaResult;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, Int64Type};
-use arrow_array::{Array, RecordBatch, StructArray, MapArray, GenericListArray};
+use arrow_array::{Array, GenericListArray, MapArray, RecordBatch, StructArray};
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tracing::{debug, error, warn};
@@ -71,10 +71,10 @@ impl MapItem for MapArray {
                 if key == map_key {
                     // found the item
                     let vals = self.values().as_string::<i32>();
-                    return Some(vals.value(idx))
+                    return Some(vals.value(idx));
                 }
             }
-            idx+=1;
+            idx += 1;
         }
         None
     }
@@ -117,35 +117,42 @@ impl SimpleData {
                 None => {
                     // check if this is nullable or not
                     if field.nullable {
-                        debug!("Pulling None since column not present for {}", field.name);
+                        debug!("Pushing None since column not present for {}", field.name);
+                        // TODO(nick): This is probably wrong if there is a nullable struct type. we
+                        // just need a helper that can recurse the kernel schema type and push Nones
                         res_arry.push(None);
                     } else {
                         panic!("Didn't find non-nullable column: {}", field.name);
                     }
                 }
                 Some(col) => {
+                    // check first if a struct and just recurse no matter what
+                    if let DataType::Struct(_arrow_fields) = col.data_type() {
+                        match &field.data_type {
+                            crate::schema::DataType::Struct(field_struct) => {
+                                debug!(
+                                    "Recurse into {} with schema {:#?}",
+                                    field.name, field_struct
+                                );
+                                let struct_array = col.as_struct();
+                                self.extract_row(
+                                    struct_array,
+                                    field_struct,
+                                    row,
+                                    had_data,
+                                    res_arry,
+                                );
+                            }
+                            _ => panic!("schema mismatch"),
+                        }
+                    }
                     if col.is_null(row) {
                         debug!("Pushing None for {}", field.name);
                         res_arry.push(None);
                     } else {
                         *had_data = true;
                         match col.data_type() {
-                            DataType::Struct(_arrow_fields) => {
-                                match &field.data_type {
-                                    crate::schema::DataType::Struct(field_struct) => {
-                                        //let inner_schema = Arc::new(ArrowSchema::new(arrow_fields.clone()));
-                                        let struct_array = col.as_struct();
-                                        self.extract_row(
-                                            struct_array,
-                                            field_struct,
-                                            row,
-                                            had_data,
-                                            res_arry,
-                                        );
-                                    }
-                                    _ => panic!("schema mismatch"),
-                                }
-                            }
+                            DataType::Struct(_) => {} // handled above
                             DataType::Boolean => {
                                 let val = col.as_boolean().value(row);
                                 debug!("For {} pushing: {}", field.name, val);
