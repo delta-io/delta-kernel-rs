@@ -1,14 +1,9 @@
 use std::sync::Arc;
 
-use arrow_array::{BooleanArray, RecordBatch};
-use arrow_schema::{Field as ArrowField, Fields, Schema as ArrowSchema};
-use arrow_select::concat::concat_batches;
-use arrow_select::filter::filter_record_batch;
-use itertools::Itertools;
+use roaring::RoaringTreemap;
 
 use self::file_stream::log_replay_iter;
 use crate::actions::action_definitions::Add;
-use crate::actions::ActionType;
 use crate::expressions::Expression;
 use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::Snapshot;
@@ -153,28 +148,29 @@ impl Scan {
                     size: add.size as usize,
                     location: self.snapshot.table_root.join(&add.path)?,
                 };
-                parquet_handler.read_parquet_files(&[meta], self.read_schema.clone(), None)
+
+                let v = parquet_handler.read_parquet_files(&[meta], self.read_schema.clone(), None);
+                if let Some(dv_descriptor) = add.deletion_vector {
+                    let fs_client = engine_client.get_file_system_client();
+                    let _dv = dv_descriptor.read(fs_client, self.snapshot.table_root.clone())?;
+
+                    //  TODO(nick) settle on a way to communicate the DV
+
+                    // let mask: BooleanArray = (0..v.len())
+                    //     .map(|i| Some(!dv.contains(i.try_into().expect("fit into u32"))))
+                    //     .collect();
+                    //Ok(Some(filter_record_batch(&batch, &mask)?))
+                }
+                v
             })
             .collect();
         Ok(v)
         // if batches.is_empty() {
         //     return Ok(None);
         // }
-
         // let schema = batches[0].schema();
         // let batch = concat_batches(&schema, &batches)?;
 
-        // TODO: DVs
-        // if let Some(dv_descriptor) = add.deletion_vector {
-        //     let fs_client = engine_client.get_file_system_client();
-        //     let dv = dv_descriptor.read(fs_client, self.snapshot.table_root.clone())?;
-        //     let mask: BooleanArray = (0..batch.num_rows())
-        //         .map(|i| Some(!dv.contains(i.try_into().expect("fit into u32"))))
-        //         .collect();
-        //     Ok(Some(filter_record_batch(&batch, &mask)?))
-        // } else {
-        //     Ok(Some(batch))
-        // }
         // })
         //.filter_map_ok(|batch| batch)
         //.collect()
@@ -183,6 +179,7 @@ impl Scan {
 
 #[cfg(all(test, feature = "default-client"))]
 mod tests {
+    use itertools::Itertools;
     use std::path::PathBuf;
 
     use super::*;
