@@ -1,9 +1,9 @@
-//! # TableClient interfaces
+//! # Engineinterface interfaces
 //!
-//! The TableClient interfaces allow connectors to bring their own implementation of functionality
+//! The Engineinterface interfaces allow connectors to bring their own implementation of functionality
 //! such as reading parquet files, listing files in a file system, parsing a JSON string etc.
 //!
-//! The [`TableClient`] trait exposes methods to get sub-clients which expose the core
+//! The [`Engineinterface`] trait exposes methods to get sub-clients which expose the core
 //! functionalities customizable by connectors.
 //!
 //! ## Expression handling
@@ -189,7 +189,7 @@ pub trait ParquetHandler: Send + Sync {
 /// Interface encapsulating all clients needed by the Delta Kernel in order to read the Delta table.
 ///
 /// Connectors are expected to pass an implementation of this interface when reading a Delta table.
-pub trait TableClient {
+pub trait EngineInterface {
     /// Get the connector provided [`ExpressionHandler`].
     fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler>;
 

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::snapshot::Snapshot;
-use crate::{DeltaResult, TableClient, Version};
+use crate::{DeltaResult, EngineInterface, Version};
 
 /// In-memory representation of a Delta table, which acts as an immutable root entity for reading
 /// the different versions (see [`Snapshot`]) of the table located in storage.
@@ -36,10 +36,10 @@ impl Table {
     /// If no version is supplied, a snapshot for the latest version will be created.
     pub fn snapshot(
         &self,
-        table_client: &dyn TableClient,
+        engine_interface: &dyn EngineInterface,
         version: Option<Version>,
     ) -> DeltaResult<Arc<Snapshot>> {
-        Snapshot::try_new(self.location.clone(), table_client, version)
+        Snapshot::try_new(self.location.clone(), engine_interface, version)
     }
 }
 
@@ -57,7 +57,7 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let table_client = DefaultTableClient::try_new(
+        let engine_interface = DefaultTableClient::try_new(
             &url,
             HashMap::<String, String>::new(),
             Arc::new(TokioBackgroundExecutor::new()),
@@ -65,7 +65,7 @@ mod tests {
         .unwrap();
 
         let table = Table::new(url);
-        let snapshot = table.snapshot(&table_client, None).unwrap();
+        let snapshot = table.snapshot(&engine_interface, None).unwrap();
         assert_eq!(snapshot.version(), 1)
     }
 }

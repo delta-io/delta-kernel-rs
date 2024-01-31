@@ -8,7 +8,7 @@ use super::data_skipping::DataSkippingFilter;
 use crate::actions::{parse_actions, Action, ActionType, Add};
 use crate::expressions::Expression;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, TableClient};
+use crate::{DeltaResult, EngineInterface};
 
 struct LogReplayScanner {
     filter: Option<DataSkippingFilter>,
@@ -22,7 +22,7 @@ struct LogReplayScanner {
 impl LogReplayScanner {
     /// Create a new [`LogReplayScanner`] instance
     fn new(
-        table_client: &dyn TableClient,
+        table_client: &dyn EngineInterface,
         table_schema: &SchemaRef,
         predicate: &Option<Expression>,
     ) -> Self {
@@ -95,7 +95,7 @@ impl LogReplayScanner {
 /// Given an iterator of (record batch, bool) tuples and a predicate, returns an iterator of [Add]s.
 /// The boolean flag indicates whether the record batch is a log or checkpoint batch.
 pub fn log_replay_iter(
-    table_client: &dyn TableClient,
+    table_client: &dyn EngineInterface,
     action_iter: impl Iterator<Item = DeltaResult<(RecordBatch, bool)>>,
     table_schema: &SchemaRef,
     predicate: &Option<Expression>,

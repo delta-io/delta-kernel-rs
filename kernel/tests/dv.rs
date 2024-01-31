@@ -12,17 +12,17 @@ use deltakernel::Table;
 fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/"))?;
     let url = url::Url::from_directory_path(path).unwrap();
-    let table_client = DefaultTableClient::try_new(
+    let engine_interface = DefaultTableClient::try_new(
         &url,
         std::iter::empty::<(&str, &str)>(),
         Arc::new(TokioBackgroundExecutor::new()),
     )?;
 
     let table = Table::new(url);
-    let snapshot = table.snapshot(&table_client, None)?;
+    let snapshot = table.snapshot(&engine_interface, None)?;
     let scan = ScanBuilder::new(snapshot).build();
 
-    let stream = scan.execute(&table_client)?;
+    let stream = scan.execute(&engine_interface)?;
     for batch in stream {
         let rows = batch.num_rows();
         arrow::util::pretty::print_batches(&[batch])?;
@@ -35,17 +35,17 @@ fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
 fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/"))?;
     let url = url::Url::from_directory_path(path).unwrap();
-    let table_client = DefaultTableClient::try_new(
+    let engine_interface = DefaultTableClient::try_new(
         &url,
         std::iter::empty::<(&str, &str)>(),
         Arc::new(TokioBackgroundExecutor::new()),
     )?;
 
     let table = Table::new(url);
-    let snapshot = table.snapshot(&table_client, None)?;
+    let snapshot = table.snapshot(&engine_interface, None)?;
     let scan = ScanBuilder::new(snapshot).build();
 
-    let stream = scan.execute(&table_client)?;
+    let stream = scan.execute(&engine_interface)?;
     for batch in stream {
         let rows = batch.num_rows();
         arrow::util::pretty::print_batches(&[batch]).unwrap();

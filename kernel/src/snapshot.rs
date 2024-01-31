@@ -14,7 +14,7 @@ use crate::actions::{parse_action, Action, ActionType, Metadata, Protocol};
 use crate::path::LogPath;
 use crate::schema::{Schema, SchemaRef, StructType};
 use crate::Expression;
-use crate::{DeltaResult, Error, FileMeta, FileSystemClient, TableClient, Version};
+use crate::{DeltaResult, EngineInterface, Error, FileMeta, FileSystemClient, Version};
 
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 
@@ -44,16 +44,16 @@ impl LogSegment {
     #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
     fn replay(
         &self,
-        table_client: &dyn TableClient,
+        engine_interface: &dyn EngineInterface,
         read_schema: SchemaRef,
         predicate: Option<Expression>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(RecordBatch, bool)>>> {
-        let json_client = table_client.get_json_handler();
+        let json_client = engine_interface.get_json_handler();
         let commit_stream = json_client
             .read_json_files(&self.commit_files, read_schema.clone(), predicate.clone())?
             .map_ok(|batch| (batch, true));
 
-        let parquet_client = table_client.get_parquet_handler();
+        let parquet_client = engine_interface.get_parquet_handler();
         let checkpoint_stream = parquet_client
             .read_parquet_files(&self.checkpoint_files, read_schema.clone(), predicate)?
             .map_ok(|batch| (batch, false));
@@ -65,7 +65,7 @@ impl LogSegment {
 
     fn read_metadata(
         &self,
-        table_client: &dyn TableClient,
+        engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<Option<(Metadata, Protocol)>> {
         lazy_static::lazy_static! {
             static ref ACTION_SCHEMA: SchemaRef = Arc::new(StructType::new(vec![
@@ -80,7 +80,7 @@ impl LogSegment {
         // TODO should we request the checkpoint iterator only if we don't find the metadata in the commit files?
         // since the engine might pre-fetch data o.a.? On the other hand, if the engine is smart about it, it should not be
         // too much extra work to request the checkpoint iterator as well.
-        let batches = self.replay(table_client, ACTION_SCHEMA.clone(), None)?;
+        let batches = self.replay(engine_interface, ACTION_SCHEMA.clone(), None)?;
         for batch in batches {
             let (batch, _) = batch?;
 
@@ -139,14 +139,14 @@ impl Snapshot {
     /// # Parameters
     ///
     /// - `location`: url pointing at the table root (where `_delta_log` folder is located)
-    /// - `table_client`: Implementation of [`TableClient`] apis.
+    /// - `engine_interface`: Implementation of [`Engineinterface`] apis.
     /// - `version`: target version of the [`Snapshot`]
     pub fn try_new(
         table_root: Url,
-        table_client: &dyn TableClient,
+        engine_interface: &dyn EngineInterface,
         version: Option<Version>,
     ) -> DeltaResult<Arc<Self>> {
-        let fs_client = table_client.get_file_system_client();
+        let fs_client = engine_interface.get_file_system_client();
         let log_url = LogPath(&table_root).child("_delta_log/").unwrap();
 
         // List relevant files from log
@@ -193,7 +193,7 @@ impl Snapshot {
             table_root,
             log_segment,
             version_eff,
-            table_client,
+            engine_interface,
         )?))
     }
 
@@ -202,10 +202,10 @@ impl Snapshot {
         location: Url,
         log_segment: LogSegment,
         version: Version,
-        table_client: &dyn TableClient,
+        engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<Self> {
         let (metadata, protocol) = log_segment
-            .read_metadata(table_client)?
+            .read_metadata(engine_interface)?
             .ok_or(Error::MissingMetadata)?;
 
         let schema = metadata.schema()?;
@@ -390,7 +390,7 @@ mod tests {
     use crate::filesystem::ObjectStoreFileSystemClient;
     use crate::schema::StructType;
 
-    fn default_table_client(url: &Url) -> DefaultTableClient<TokioBackgroundExecutor> {
+    fn default_engine_interface(url: &Url) -> DefaultTableClient<TokioBackgroundExecutor> {
         DefaultTableClient::try_new(
             url,
             HashMap::<String, String>::new(),
@@ -405,7 +405,7 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
-        let client = default_table_client(&url);
+        let client = default_engine_interface(&url);
         let snapshot = Snapshot::try_new(url, &client, Some(1)).unwrap();
 
         let expected = Protocol {
@@ -427,7 +427,7 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
-        let client = default_table_client(&url);
+        let client = default_engine_interface(&url);
         let snapshot = Snapshot::try_new(url, &client, None).unwrap();
 
         let expected = Protocol {
@@ -469,8 +469,8 @@ mod tests {
         ))
         .unwrap();
         let location = url::Url::from_directory_path(path).unwrap();
-        let table_client = default_table_client(&location);
-        let snapshot = Snapshot::try_new(location, &table_client, None).unwrap();
+        let engine_interface = default_engine_interface(&location);
+        let snapshot = Snapshot::try_new(location, &engine_interface, None).unwrap();
 
         assert_eq!(snapshot.log_segment.checkpoint_files.len(), 1);
         assert_eq!(
