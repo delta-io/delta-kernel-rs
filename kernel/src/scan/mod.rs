@@ -10,7 +10,7 @@ use crate::actions::ActionType;
 use crate::expressions::Expression;
 use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::Snapshot;
-use crate::{Add, DeltaResult, EngineClient, FileMeta};
+use crate::{Add, DeltaResult, EngineInterface, FileMeta};
 
 mod data_skipping;
 pub mod file_stream;
@@ -117,7 +117,7 @@ impl Scan {
     /// files into actual table data.
     pub fn files(
         &self,
-        engine_client: &dyn EngineClient,
+        engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
         lazy_static::lazy_static! {
             static ref ACTION_SCHEMA: SchemaRef = Arc::new(StructType::new(vec![
@@ -127,23 +127,23 @@ impl Scan {
         }
 
         let log_iter = self.snapshot.log_segment.replay(
-            engine_client,
+            engine_interface,
             ACTION_SCHEMA.clone(),
             self.predicate.clone(),
         )?;
 
         Ok(log_replay_iter(
-            table_client,
+            engine_interface,
             log_iter,
             &self.read_schema,
             &self.predicate,
         ))
     }
 
-    pub fn execute(&self, engine_client: &dyn EngineClient) -> DeltaResult<Vec<RecordBatch>> {
-        let parquet_handler = engine_client.get_parquet_handler();
+    pub fn execute(&self, engine_interface: &dyn EngineInterface) -> DeltaResult<Vec<RecordBatch>> {
+        let parquet_handler = engine_interface.get_parquet_handler();
 
-        self.files(engine_client)?
+        self.files(engine_interface)?
             .map(|res| {
                 let add = res?;
                 let meta = FileMeta {
@@ -163,7 +163,7 @@ impl Scan {
                 let batch = concat_batches(&schema, &batches)?;
 
                 if let Some(dv_descriptor) = add.deletion_vector {
-                    let fs_client = engine_client.get_file_system_client();
+                    let fs_client = engine_interface.get_file_system_client();
                     let dv = dv_descriptor.read(fs_client, self.snapshot.table_root.clone())?;
                     let mask: BooleanArray = (0..batch.num_rows())
                         .map(|i| Some(!dv.contains(i.try_into().expect("fit into u32"))))
@@ -192,7 +192,7 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine_client = DefaultTableClient::try_new(
+        let engine_interface = DefaultTableClient::try_new(
             &url,
             std::iter::empty::<(&str, &str)>(),
             Arc::new(TokioBackgroundExecutor::new()),
@@ -200,9 +200,9 @@ mod tests {
         .unwrap();
 
         let table = Table::new(url);
-        let snapshot = table.snapshot(&engine_client, None).unwrap();
+        let snapshot = table.snapshot(&engine_interface, None).unwrap();
         let scan = ScanBuilder::new(snapshot).build();
-        let files: Vec<Add> = scan.files(&engine_client).unwrap().try_collect().unwrap();
+        let files: Vec<Add> = scan.files(&engine_interface).unwrap().try_collect().unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(
@@ -217,7 +217,7 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine_client = DefaultTableClient::try_new(
+        let engine_interface = DefaultTableClient::try_new(
             &url,
             std::iter::empty::<(&str, &str)>(),
             Arc::new(TokioBackgroundExecutor::new()),
@@ -225,9 +225,9 @@ mod tests {
         .unwrap();
 
         let table = Table::new(url);
-        let snapshot = table.snapshot(&engine_client, None).unwrap();
+        let snapshot = table.snapshot(&engine_interface, None).unwrap();
         let scan = ScanBuilder::new(snapshot).build();
-        let files = scan.execute(&engine_client).unwrap();
+        let files = scan.execute(&engine_interface).unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].num_rows(), 10)

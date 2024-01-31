@@ -86,21 +86,21 @@ fn main() {
         println!("Invalid url");
         return;
     };
-    let engine_client = DefaultTableClient::try_new(
+    let engine_interface = DefaultTableClient::try_new(
         &url,
         HashMap::<String, String>::new(),
         Arc::new(TokioBackgroundExecutor::new()),
     );
-    let Ok(engine_client) = engine_client else {
+    let Ok(engine_interface) = engine_interface else {
         println!(
             "Failed to construct table client: {}",
-            engine_client.err().unwrap()
+            engine_interface.err().unwrap()
         );
         return;
     };
 
     let table = Table::new(url);
-    let snapshot = table.snapshot(&engine_client, None);
+    let snapshot = table.snapshot(&engine_interface, None);
     let Ok(snapshot) = snapshot else {
         println!(
             "Failed to construct latest snapshot: {}",
@@ -127,7 +127,7 @@ fn main() {
     }
     table.set_header(header_names);
 
-    for batch in scan.execute(&engine_client).unwrap() {
+    for batch in scan.execute(&engine_interface).unwrap() {
         for row in 0..batch.num_rows() {
             let table_row =
                 (0..batch.num_columns()).map(|col| extract_value(batch.column(col), row));

@@ -14,7 +14,7 @@ use tracing::debug;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{BinaryOperator, Expression as Expr, VariadicOperator};
 use crate::schema::{SchemaRef, StructField, StructType};
-use crate::{ExpressionEvaluator, TableClient};
+use crate::{ExpressionEvaluator, EngineInterface};
 
 /// Returns <op2> (if any) such that B <op2> A is equivalent to A <op> B.
 fn commute(op: &BinaryOperator) -> Option<BinaryOperator> {
@@ -110,7 +110,7 @@ impl DataSkippingFilter {
     /// NOTE: None is equivalent to a trivial filter that always returns TRUE (= keeps all files),
     /// but using an Option lets the engine easily avoid the overhead of applying trivial filters.
     pub(crate) fn new(
-        table_client: &dyn TableClient,
+        table_client: &dyn EngineInterface,
         table_schema: &SchemaRef,
         predicate: &Option<Expr>,
     ) -> Option<Self> {
