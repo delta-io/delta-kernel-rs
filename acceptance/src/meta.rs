@@ -96,7 +96,10 @@ impl TestCaseInfo {
         Ok(())
     }
 
-    pub async fn assert_metadata(&self, engine_interface: Arc<dyn EngineInterface>) -> TestResult<()> {
+    pub async fn assert_metadata(
+        &self,
+        engine_interface: Arc<dyn EngineInterface>,
+    ) -> TestResult<()> {
         let engine_interface = engine_interface.as_ref();
         let table = Table::new(self.table_root()?);
 

@@ -27,7 +27,9 @@ fn reader_test(path: &Path) -> datatest_stable::Result<()> {
                 .unwrap(),
             );
 
-            case.assert_metadata(engine_interface.clone()).await.unwrap();
+            case.assert_metadata(engine_interface.clone())
+                .await
+                .unwrap();
         });
     Ok(())
 }

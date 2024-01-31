@@ -101,7 +101,10 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let scan = ScanBuilder::new(snapshot).build();
 
     let mut files = 0;
-    let stream = scan.execute(&engine_interface)?.into_iter().zip(expected_data);
+    let stream = scan
+        .execute(&engine_interface)?
+        .into_iter()
+        .zip(expected_data);
 
     for (data, expected) in stream {
         files += 1;
@@ -151,7 +154,10 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let scan = ScanBuilder::new(snapshot).build();
 
     let mut files = 0;
-    let stream = scan.execute(&engine_interface)?.into_iter().zip(expected_data);
+    let stream = scan
+        .execute(&engine_interface)?
+        .into_iter()
+        .zip(expected_data);
 
     for (data, expected) in stream {
         files += 1;
@@ -204,7 +210,10 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = table.snapshot(&engine_interface, None)?;
     let scan = ScanBuilder::new(snapshot).build();
 
-    let stream = scan.execute(&engine_interface)?.into_iter().zip(expected_data);
+    let stream = scan
+        .execute(&engine_interface)?
+        .into_iter()
+        .zip(expected_data);
 
     let mut files = 0;
     for (data, expected) in stream {
