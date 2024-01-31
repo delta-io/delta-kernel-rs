@@ -526,7 +526,8 @@ pub(crate) fn visit_add(_row_index: usize, vals: &[Option<DataItem<'_>>]) -> Del
         "Add",
         "Add must have path",
         "path must be str"
-    ).to_string();
+    )
+    .to_string();
 
     // TODO(nick): Support partition_values
 
@@ -689,21 +690,21 @@ impl Remove {
     }
 }
 
-pub(crate) fn visit_remove(_row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<Remove> {
+pub(crate) fn visit_remove(
+    _row_index: usize,
+    vals: &[Option<DataItem<'_>>],
+) -> DeltaResult<Remove> {
     let path = extract_required_item!(
         vals[0],
         as_str,
         "Remove",
         "Remove must have path",
         "path must be str"
-    ).to_string();
+    )
+    .to_string();
 
-    let deletion_timestamp = extract_opt_item!(
-        vals[1],
-        as_i64,
-        "Remove",
-        "deletion_timestamp must be i64"
-    );
+    let deletion_timestamp =
+        extract_opt_item!(vals[1], as_i64, "Remove", "deletion_timestamp must be i64");
 
     let data_change = extract_required_item!(
         vals[2],
@@ -722,12 +723,7 @@ pub(crate) fn visit_remove(_row_index: usize, vals: &[Option<DataItem<'_>>]) -> 
 
     // TODO(nick) handle partition values in vals[4]
 
-    let size = extract_opt_item!(
-        vals[5],
-        as_i64,
-        "Remove",
-        "size must be i64"
-    );
+    let size = extract_opt_item!(vals[5], as_i64, "Remove", "size must be i64");
 
     // TODO(nick) stats are skipped in vals[6] and tags are skipped in vals[7]
 

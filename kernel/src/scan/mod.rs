@@ -93,7 +93,7 @@ impl ScanResult {
                 let index = row_index + self.offset;
                 !mask.contains(index)
             }
-            None => true
+            None => true,
         }
     }
 }
@@ -154,14 +154,10 @@ impl Scan {
     }
 
     // TODO: Docs for this, also, return type is... wonky
-    pub fn execute(
-        &self,
-        engine_client: &dyn EngineClient,
-    ) -> DeltaResult<Vec<ScanResult>> {
-        println!("EXECUTE SCAN");
+    pub fn execute(&self, engine_client: &dyn EngineClient) -> DeltaResult<Vec<ScanResult>> {
         let parquet_handler = engine_client.get_parquet_handler();
         let data_extractor = engine_client.get_data_extactor();
-        let mut results: Vec<ScanResult> = vec!();
+        let mut results: Vec<ScanResult> = vec![];
         let files = self.files(engine_client)?;
         for add_result in files {
             let add = add_result?;
@@ -170,16 +166,19 @@ impl Scan {
                 size: add.size as usize,
                 location: self.snapshot.table_root.join(&add.path)?,
             };
-            println!("Reading {:?}", meta);
-            let read_results = parquet_handler.read_parquet_files(&[meta], self.read_schema.clone(), None)?;
-            let dv_mask = add.deletion_vector.as_ref().map(|dv_descriptor| {
-                let fs_client = engine_client.get_file_system_client();
-                dv_descriptor.read(fs_client, self.snapshot.table_root.clone())
-            }).transpose()?;
+            let read_results =
+                parquet_handler.read_parquet_files(&[meta], self.read_schema.clone(), None)?;
+            let dv_mask = add
+                .deletion_vector
+                .as_ref()
+                .map(|dv_descriptor| {
+                    let fs_client = engine_client.get_file_system_client();
+                    dv_descriptor.read(fs_client, self.snapshot.table_root.clone())
+                })
+                .transpose()?;
 
             let mut offset = 0;
             for read_result in read_results {
-                println!("Got a result");
                 let len = if let Ok(ref res) = read_result {
                     data_extractor.length(&**res)
                 } else {

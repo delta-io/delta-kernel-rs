@@ -58,14 +58,26 @@ impl LogReplayScanner {
         //     // only serve as tombstones for vacuum jobs. So no need to load them here.
         //     vec![ActionType::Add]
         // };
-        use crate::actions::action_definitions::{MultiVisitor, visit_add, visit_remove};
+        use crate::actions::action_definitions::{visit_add, visit_remove, MultiVisitor};
         let add_schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
         let mut multi_add_visitor = MultiVisitor::new(visit_add);
-        data_extractor.extract(actions.as_ref(), Arc::new(add_schema), &mut multi_add_visitor);
+        data_extractor.extract(
+            actions.as_ref(),
+            Arc::new(add_schema),
+            &mut multi_add_visitor,
+        );
 
-        let remove_schema = StructType::new(vec![crate::actions::schemas::REMOVE_FIELD.clone()]);
         let mut multi_remove_visitor = MultiVisitor::new(visit_remove);
-        data_extractor.extract(actions.as_ref(), Arc::new(remove_schema), &mut multi_remove_visitor);
+        let remove_schema = StructType::new(vec![crate::actions::schemas::REMOVE_FIELD.clone()]);
+        if is_log_batch {
+            // All checkpoint actions are already reconciled and Remove actions in checkpoint files
+            // only serve as tombstones for vacuum jobs. So only load them if we're not a checkpoint
+            data_extractor.extract(
+                actions.as_ref(),
+                Arc::new(remove_schema),
+                &mut multi_remove_visitor,
+            );
+        }
 
         for remove in multi_remove_visitor.extracted.into_iter() {
             if let Ok(remove) = remove {
@@ -75,8 +87,9 @@ impl LogReplayScanner {
         }
 
         let adds: Vec<DeltaResult<Add>> = multi_add_visitor.extracted;
-        adds.into_iter().filter_map(|action| {
-            match action {
+        adds.into_iter()
+            .filter_map(|action| {
+                match action {
                 Ok(add)
                 // Note: each (add.path + add.dv_unique_id()) pair has a
                 // unique Add + Remove pair in the log. For example:
@@ -97,7 +110,8 @@ impl LogReplayScanner {
                 }
                 _ => None
             }
-        }).collect()
+            })
+            .collect()
     }
 }
 
