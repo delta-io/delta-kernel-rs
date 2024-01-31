@@ -1,5 +1,5 @@
-use std::path::PathBuf;
-use std::{fs::DirEntry, time::SystemTime};
+use std::path::{Path, PathBuf};
+use std::{fs, time::SystemTime};
 
 use bytes::Bytes;
 use itertools::Itertools;
@@ -15,24 +15,48 @@ impl FileSystemClient for SimpleFilesystemClient {
     // TODO: Skip things that are less than specified path
     fn list_from(
         &self,
-        path: &Url,
+        url_path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
-        if path.scheme() == "file" {
-            let path = path.path();
-            let last_slash = path.rfind('/').ok_or(Error::Generic(format!(
-                "Invalid path for list_from: {}",
-                path
-            )))?;
-            let all_ents: std::io::Result<Vec<DirEntry>> = std::fs::read_dir(&path[0..last_slash])?
+        if url_path.scheme() == "file" {
+            let path = Path::new(url_path.path());
+            let (path_to_read, min_file_name) = if path.is_dir() {
+                // passed path is an existing dir, don't strip anything and don't filter the results
+                (path, None)
+            } else {
+                // path doesn't exist, assume final part is a filename. strip that and use it as the
+                // min_file_name to return
+                let parent = path.parent().ok_or_else(|| {
+                    Error::Generic(format!("Invalid path for list_from: {:?}", path))
+                })?;
+                let file_name = path.file_name().ok_or_else(|| {
+                    Error::Generic(format!("Invalid path for list_from: {:?}", path))
+                })?;
+                (parent, Some(file_name))
+            };
+
+            let all_ents: std::io::Result<Vec<fs::DirEntry>> = std::fs::read_dir(path_to_read)?
                 .sorted_by_key(|ent_res| {
                     ent_res
                         .as_ref()
                         .map(|ent| ent.path())
                         .unwrap_or_else(|_| PathBuf::new())
                 })
+                .filter(|ent_res| {
+                    match ent_res {
+                        Ok(ent) => {
+                            if let Some(min_file_name) = min_file_name {
+                                ent.file_name() >= *min_file_name
+                            } else {
+                                true
+                            }
+                        }
+                        Err(_) => true, // keep errors so line below will return them
+                    }
+                })
                 .collect();
             let all_ents = all_ents?; // any errors in reading dir entries will force a return here
                                       // now all_ents is a sorted list of DirEntries, we can just map over it
+
             let it = all_ents.into_iter().map(|ent| {
                 ent.metadata()
                     .map_err(|e| Error::IOError(e))
@@ -76,5 +100,53 @@ impl FileSystemClient for SimpleFilesystemClient {
             }
         });
         Ok(Box::new(iter))
+    }
+}
+
+mod tests {
+    use std::fs::File;
+    use std::io::Write;
+
+    use url::Url;
+
+    use super::SimpleFilesystemClient;
+    use crate::FileSystemClient;
+
+    #[test]
+    fn test_list_from() -> Result<(), Box<dyn std::error::Error>> {
+        let client = SimpleFilesystemClient;
+        let tmp_dir = tempfile::tempdir().unwrap();
+        for i in 0..3 {
+            let path = tmp_dir.path().join(format!("000{i}.json"));
+            let mut f = File::create(path)?;
+            writeln!(f, "null")?;
+        }
+        let url_path = tmp_dir.path().join("0001.json");
+        let url = Url::from_file_path(url_path).unwrap();
+        let list = client.list_from(&url)?;
+        let mut file_count = 0;
+        for _ in list {
+            file_count += 1;
+        }
+        assert_eq!(file_count, 2);
+
+        let url_path = tmp_dir.path().join("");
+        let url = Url::from_file_path(url_path).unwrap();
+        let list = client.list_from(&url)?;
+        file_count = 0;
+        for _ in list {
+            file_count += 1;
+        }
+        assert_eq!(file_count, 3);
+
+        let url_path = tmp_dir.path().join("0001");
+        let url = Url::from_file_path(url_path).unwrap();
+        let list = client.list_from(&url)?;
+        file_count = 0;
+        for _ in list {
+            file_count += 1;
+        }
+        assert_eq!(file_count, 2);
+        Ok(())
     }
 }
