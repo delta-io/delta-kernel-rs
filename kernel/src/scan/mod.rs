@@ -153,7 +153,7 @@ impl Scan {
         ))
     }
 
-    // TODO: Docs for this, also, return type is... wonky
+    // TODO (nick): Docs for this, also, return type is... wonky
     pub fn execute(&self, engine_client: &dyn EngineClient) -> DeltaResult<Vec<ScanResult>> {
         let parquet_handler = engine_client.get_parquet_handler();
         let data_extractor = engine_client.get_data_extactor();
@@ -209,7 +209,6 @@ impl Scan {
         //             let fs_client = engine_client.get_file_system_client();
         //             dv_descriptor.read(fs_client, self.snapshot.table_root.clone())
         //         }).transpose()?;
-        //             //  TODO(nick) settle on a way to communicate the DV
 
         //             // let mask: BooleanArray = (0..v.len())
         //             //     .map(|i| Some(!dv.contains(i.try_into().expect("fit into u32"))))
@@ -264,7 +263,7 @@ mod tests {
             &files[0].path,
             "part-00000-517f5d32-9c95-48e8-82b4-0229cc194867-c000.snappy.parquet"
         );
-        //TODO assert!(&files[0].deletion_vector.is_none());
+        assert!(&files[0].deletion_vector.is_none());
     }
 
     #[test]
@@ -273,6 +272,7 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let engine_client = SimpleClient::new();
+        let data_extractor = engine_client.get_data_extactor();
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine_client, None).unwrap();
@@ -280,6 +280,7 @@ mod tests {
         let files = scan.execute(&engine_client).unwrap();
 
         assert_eq!(files.len(), 1);
-        //assert_eq!(files[0].num_rows(), 10)
+        let num_rows = data_extractor.length(&**files[0].raw_data.as_ref().unwrap());
+        assert_eq!(num_rows, 10)
     }
 }

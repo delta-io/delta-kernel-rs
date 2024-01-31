@@ -44,7 +44,7 @@ impl LogReplayScanner {
         //     None => None,
         // };
 
-        // TODO: Add back DataSkippingFilter
+        // TODO (nick): Add back DataSkippingFilter
         // let actions = if let Some(filtered) = &filtered_actions {
         //     filtered
         // } else {
