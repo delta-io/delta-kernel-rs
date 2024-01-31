@@ -65,8 +65,7 @@ impl Scalar {
                     PrimitiveType::Binary => Arc::new(BinaryArray::new_null(num_rows)),
                     PrimitiveType::Decimal(precision, scale) => Arc::new(
                         Decimal128Array::new_null(num_rows)
-                            .with_precision_and_scale(*precision, *scale)
-                            .unwrap(),
+                            .with_precision_and_scale(*precision, *scale)?,
                     ),
                 },
                 DataType::Array(_) => unimplemented!(),
@@ -199,7 +198,7 @@ fn evaluate_expression(
 
             eval(&left_arr, &right_arr).map_err(Error::generic_err)
         }
-        (VariadicOperation { op, exprs }, _) => {
+        (VariadicOperation { op, exprs }, Some(&DataType::BOOLEAN)) => {
             type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
             let (reducer, default): (Operation, _) = match op {
                 VariadicOperator::And => (and, true),
@@ -207,18 +206,19 @@ fn evaluate_expression(
             };
             exprs
                 .iter()
-                .map(|expr| evaluate_expression(expr, batch, Some(&DataType::BOOLEAN)))
+                .map(|expr| evaluate_expression(expr, batch, result_type))
                 .reduce(|l, r| {
                     Ok(reducer(downcast_to_bool(&l?)?, downcast_to_bool(&r?)?)
                         .map(wrap_comparison_result)?)
                 })
                 .unwrap_or_else(|| {
-                    evaluate_expression(
-                        &Expression::literal(default),
-                        batch,
-                        Some(&DataType::BOOLEAN),
-                    )
+                    evaluate_expression(&Expression::literal(default), batch, result_type)
                 })
+        }
+        (VariadicOperation { .. }, _) => {
+            // NOTE: this panics as it would be a bug in our code if we get here. However it does swallow
+            // the error message from the compiler if we add variants to the enum and forget to add them here.
+            unreachable!("We unly support variadic operations for boolean expressions right now.")
         }
         (NullIf { expr, if_expr }, _) => {
             let expr_arr = evaluate_expression(expr.as_ref(), batch, None)?;

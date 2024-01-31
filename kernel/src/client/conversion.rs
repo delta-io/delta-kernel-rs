@@ -22,8 +22,7 @@ impl TryFrom<&StructType> for ArrowSchema {
     fn try_from(s: &StructType) -> Result<Self, ArrowError> {
         let fields = s
             .fields()
-            .iter()
-            .map(|f| <ArrowField as TryFrom<&StructField>>::try_from(*f))
+            .map(|f| <ArrowField as TryFrom<&StructField>>::try_from(f))
             .collect::<Result<Vec<ArrowField>, ArrowError>>()?;
 
         Ok(ArrowSchema::new(fields))
@@ -105,11 +104,10 @@ impl TryFrom<&DataType> for ArrowDataType {
                     PrimitiveType::Decimal(precision, scale) => {
                         if precision <= &38 {
                             Ok(ArrowDataType::Decimal128(*precision, *scale))
-                        } else if precision <= &76 {
-                            Ok(ArrowDataType::Decimal256(*precision, *scale))
                         } else {
+                            // NOTE: since we are converting from delta, we should never get here.
                             Err(ArrowError::SchemaError(format!(
-                                "Precision too large to be represented in Arrow: {}",
+                                "Precision too large to be represented as Delta type: {} > 38",
                                 precision
                             )))
                         }
@@ -127,8 +125,7 @@ impl TryFrom<&DataType> for ArrowDataType {
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(
                 s.fields()
-                    .iter()
-                    .map(|f| <ArrowField as TryFrom<&StructField>>::try_from(*f))
+                    .map(|f| <ArrowField as TryFrom<&StructField>>::try_from(f))
                     .collect::<Result<Vec<ArrowField>, ArrowError>>()?
                     .into(),
             )),

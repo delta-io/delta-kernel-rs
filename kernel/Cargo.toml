@@ -15,6 +15,7 @@ bytes = "1.4"
 chrono = { version = "0.4" }
 either = "1.8"
 fix-hidden-lifetime-bug = "0.2"
+indexmap = "2.2.1"
 itertools = "0.12"
 lazy_static = "1.4"
 regex = "1.8"

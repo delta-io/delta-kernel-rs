@@ -173,7 +173,6 @@ impl Scan {
 
         let select_fields = read_schema
             .fields()
-            .iter()
             .map(|f| Expression::Column(f.name().to_string()))
             .collect_vec();
 
@@ -202,13 +201,12 @@ impl Scan {
                     let mut fields =
                         Vec::with_capacity(partition_fields.len() + batch.num_columns());
                     for field in &partition_fields {
-                        let value_expression =
-                            if let Some(Some(value)) = add.partition_values.get(field.name()) {
+                        let value_expression = match add.partition_values.get(field.name()) {
+                            Some(Some(value)) => {
                                 Expression::Literal(get_partition_value(value, field.data_type())?)
-                            } else {
-                                // TODO: is it allowed to assume null for missing partition values?
-                                Expression::Literal(Scalar::Null(field.data_type().clone()))
-                            };
+                            }
+                            _ => Expression::Literal(Scalar::Null(field.data_type().clone())),
+                        };
                         fields.push(value_expression);
                     }
                     fields.extend(select_fields.clone());

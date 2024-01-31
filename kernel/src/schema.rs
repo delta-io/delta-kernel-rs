@@ -2,12 +2,13 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 use std::{collections::HashMap, fmt::Display};
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 #[serde(untagged)]
 pub enum MetadataValue {
     Number(i32),
@@ -59,7 +60,7 @@ impl AsRef<str> for ColumnMetadataKey {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 pub struct StructField {
     /// Name of this (possibly nested) column
     pub name: String,
@@ -121,32 +122,70 @@ impl StructField {
 
 /// A struct is used to represent both the top-level schema of the table
 /// as well as struct columns that contain nested columns.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Eq)]
 pub struct StructType {
-    #[serde(rename = "type")]
     pub type_name: String,
     /// The type of element stored in this array
-    pub fields: Vec<StructField>,
+    pub fields: IndexMap<String, StructField>,
 }
 
 impl StructType {
     pub fn new(fields: Vec<StructField>) -> Self {
         Self {
             type_name: "struct".into(),
-            fields,
+            fields: fields.into_iter().map(|f| (f.name.clone(), f)).collect(),
         }
     }
 
     pub fn field(&self, name: impl AsRef<str>) -> Option<&StructField> {
-        self.fields.iter().find(|f| f.name == name.as_ref())
+        self.fields.get(name.as_ref())
     }
 
-    pub fn fields(&self) -> Vec<&StructField> {
-        self.fields.iter().collect()
+    pub fn fields(&self) -> impl Iterator<Item = &StructField> {
+        self.fields.values()
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StructTypeSerDeHelper {
+    #[serde(rename = "type")]
+    type_name: String,
+    fields: Vec<StructField>,
+}
+
+impl Serialize for StructType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        StructTypeSerDeHelper {
+            type_name: self.type_name.clone(),
+            fields: self.fields.values().cloned().collect(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for StructType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        Self: Sized,
+    {
+        let helper = StructTypeSerDeHelper::deserialize(deserializer)?;
+        Ok(Self {
+            type_name: helper.type_name,
+            fields: helper
+                .fields
+                .into_iter()
+                .map(|f| (f.name.clone(), f))
+                .collect(),
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ArrayType {
     #[serde(rename = "type")]
@@ -177,7 +216,7 @@ impl ArrayType {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MapType {
     #[serde(rename = "type")]
@@ -221,7 +260,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum PrimitiveType {
     /// UTF-8 encoded string of characters
@@ -311,7 +350,7 @@ impl Display for PrimitiveType {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 #[serde(untagged, rename_all = "camelCase")]
 pub enum DataType {
     /// UTF-8 encoded string of characters
@@ -369,7 +408,7 @@ impl Display for DataType {
             DataType::Array(a) => write!(f, "array<{}>", a.element_type),
             DataType::Struct(s) => {
                 write!(f, "struct<")?;
-                for (i, field) in s.fields.iter().enumerate() {
+                for (i, (_, field)) in s.fields.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
