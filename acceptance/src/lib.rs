@@ -1,4 +1,4 @@
-//! Helpers to validate implementaions of Engineinterfaces
+//! Helpers to validate Engineinterface implementations
 
 pub mod meta;
 pub use meta::*;
