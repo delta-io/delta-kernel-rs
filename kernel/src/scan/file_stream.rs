@@ -58,47 +58,46 @@ impl LogReplayScanner {
         //     // only serve as tombstones for vacuum jobs. So no need to load them here.
         //     vec![ActionType::Add]
         // };
-
-        let schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
-
-        use crate::actions::action_definitions::visit_add;
-        use crate::actions::action_definitions::MultiVisitor;
+        use crate::actions::action_definitions::{MultiVisitor, visit_add, visit_remove};
+        let add_schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
         let mut multi_add_visitor = MultiVisitor::new(visit_add);
-        data_extractor.extract(actions.as_ref(), Arc::new(schema), &mut multi_add_visitor);
+        data_extractor.extract(actions.as_ref(), Arc::new(add_schema), &mut multi_add_visitor);
+
+        let remove_schema = StructType::new(vec![crate::actions::schemas::REMOVE_FIELD.clone()]);
+        let mut multi_remove_visitor = MultiVisitor::new(visit_remove);
+        data_extractor.extract(actions.as_ref(), Arc::new(remove_schema), &mut multi_remove_visitor);
+
+        for remove in multi_remove_visitor.extracted.into_iter() {
+            if let Ok(remove) = remove {
+                self.seen
+                    .insert((remove.path.clone(), remove.dv_unique_id()));
+            }
+        }
+
         let adds: Vec<DeltaResult<Add>> = multi_add_visitor.extracted;
-        adds.into_iter().collect()
-
-        // let adds: Vec<Add> = parse_actions(actions, &schema_to_use)?
-        //     .filter_map(|action| match action {
-        //         Action::Add(add)
-        //             // Note: each (add.path + add.dv_unique_id()) pair has a
-        //             // unique Add + Remove pair in the log. For example:
-        //             // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
-        //             if !self
-        //                 .seen
-        //                 .contains(&(add.path.clone(), add.dv_unique_id())) =>
-        //         {
-        //             debug!("Found file: {}", &add.path);
-        //             if is_log_batch {
-        //                 // Remember file actions from this batch so we can ignore duplicates
-        //                 // as we process batches from older commit and/or checkpoint files. We
-        //                 // don't need to track checkpoint batches because they are already the
-        //                 // oldest actions and can never replace anything.
-        //                 self.seen.insert((add.path.clone(), add.dv_unique_id()));
-        //             }
-        //             Some(add)
-        //         }
-        //         Action::Remove(remove) => {
-        //             // Remove actions always come from log batches, so no need to check here.
-        //             self.seen
-        //                 .insert((remove.path.clone(), remove.dv_unique_id()));
-        //             None
-        //         }
-        //         _ => None,
-        //     })
-        //     .collect();
-
-        // Ok(adds)
+        adds.into_iter().filter_map(|action| {
+            match action {
+                Ok(add)
+                // Note: each (add.path + add.dv_unique_id()) pair has a
+                // unique Add + Remove pair in the log. For example:
+                // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
+                    if !self
+                    .seen
+                    .contains(&(add.path.clone(), add.dv_unique_id())) =>
+                {
+                    debug!("Found file: {}, is log {}", &add.path, is_log_batch);
+                    if is_log_batch {
+                        // Remember file actions from this batch so we can ignore duplicates
+                        // as we process batches from older commit and/or checkpoint files. We
+                        // don't need to track checkpoint batches because they are already the
+                        // oldest actions and can never replace anything.
+                        self.seen.insert((add.path.clone(), add.dv_unique_id()));
+                    }
+                    Some(Ok(add))
+                }
+                _ => None
+            }
+        }).collect()
     }
 }
 

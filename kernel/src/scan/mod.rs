@@ -77,6 +77,27 @@ impl ScanBuilder {
     }
 }
 
+/// Rows can be dropped from a scan due to deletion vectors, so we communicate back both EngineData
+/// and information regarding whether a row should be included or not
+//pub type ScanResultIter = Box<dyn Iterator<Item = DeltaResult<ScanResult>> + Send>;
+pub struct ScanResult {
+    pub raw_data: DeltaResult<Box<dyn EngineData>>,
+    offset: u64,
+    mask: Option<RoaringTreemap>,
+}
+
+impl ScanResult {
+    pub fn contains(&self, row_index: u64) -> bool {
+        match self.mask.as_ref() {
+            Some(mask) => {
+                let index = row_index + self.offset;
+                !mask.contains(index)
+            }
+            None => true
+        }
+    }
+}
+
 pub struct Scan {
     snapshot: Arc<Snapshot>,
     read_schema: SchemaRef,
@@ -136,35 +157,76 @@ impl Scan {
     pub fn execute(
         &self,
         engine_client: &dyn EngineClient,
-    ) -> DeltaResult<Vec<FileDataReadResultIterator>> {
+    ) -> DeltaResult<Vec<ScanResult>> {
+        println!("EXECUTE SCAN");
         let parquet_handler = engine_client.get_parquet_handler();
+        let data_extractor = engine_client.get_data_extactor();
+        let mut results: Vec<ScanResult> = vec!();
+        let files = self.files(engine_client)?;
+        for add_result in files {
+            let add = add_result?;
+            let meta = FileMeta {
+                last_modified: add.modification_time,
+                size: add.size as usize,
+                location: self.snapshot.table_root.join(&add.path)?,
+            };
+            println!("Reading {:?}", meta);
+            let read_results = parquet_handler.read_parquet_files(&[meta], self.read_schema.clone(), None)?;
+            let dv_mask = add.deletion_vector.as_ref().map(|dv_descriptor| {
+                let fs_client = engine_client.get_file_system_client();
+                dv_descriptor.read(fs_client, self.snapshot.table_root.clone())
+            }).transpose()?;
 
-        let v: Vec<FileDataReadResultIterator> = self
-            .files(engine_client)?
-            .flat_map(|res| {
-                let add = res?;
-                let meta = FileMeta {
-                    last_modified: add.modification_time,
-                    size: add.size as usize,
-                    location: self.snapshot.table_root.join(&add.path)?,
+            let mut offset = 0;
+            for read_result in read_results {
+                println!("Got a result");
+                let len = if let Ok(ref res) = read_result {
+                    data_extractor.length(&**res)
+                } else {
+                    0
                 };
+                let scan_result = ScanResult {
+                    raw_data: read_result,
+                    offset,
+                    mask: dv_mask.clone(),
+                };
+                offset += len as u64;
+                results.push(scan_result);
+            }
+        }
+        Ok(results)
+        // let v: Vec<ScanResultIter> = self
+        //     .files(engine_client)?
+        //     .flat_map(|res| {
+        //         let add = res?;
+        //         let meta = FileMeta {
+        //             last_modified: add.modification_time,
+        //             size: add.size as usize,
+        //             location: self.snapshot.table_root.join(&add.path)?,
+        //         };
 
-                let v = parquet_handler.read_parquet_files(&[meta], self.read_schema.clone(), None);
-                if let Some(dv_descriptor) = add.deletion_vector {
-                    let fs_client = engine_client.get_file_system_client();
-                    let _dv = dv_descriptor.read(fs_client, self.snapshot.table_root.clone())?;
+        //         let read_results = parquet_handler.read_parquet_files(&[meta], self.read_schema.clone(), None);
+        //         let dv_mask = add.deletion_vector.as_ref().map(|dv_descriptor| {
+        //             let fs_client = engine_client.get_file_system_client();
+        //             dv_descriptor.read(fs_client, self.snapshot.table_root.clone())
+        //         }).transpose()?;
+        //             //  TODO(nick) settle on a way to communicate the DV
 
-                    //  TODO(nick) settle on a way to communicate the DV
-
-                    // let mask: BooleanArray = (0..v.len())
-                    //     .map(|i| Some(!dv.contains(i.try_into().expect("fit into u32"))))
-                    //     .collect();
-                    //Ok(Some(filter_record_batch(&batch, &mask)?))
-                }
-                v
-            })
-            .collect();
-        Ok(v)
+        //             // let mask: BooleanArray = (0..v.len())
+        //             //     .map(|i| Some(!dv.contains(i.try_into().expect("fit into u32"))))
+        //             //     .collect();
+        //             //Ok(Some(filter_record_batch(&batch, &mask)?))
+        //         //}
+        //         let ret: DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanResult>>>> = read_results.map(|result| result.map(|data| {
+        //             ScanResult {
+        //                 raw_data: data,
+        //                 offset: 0,
+        //                 mask: dv_mask,
+        //             }
+        //         }));
+        //     })
+        //     .collect();
+        // Ok(v)
         // if batches.is_empty() {
         //     return Ok(None);
         // }

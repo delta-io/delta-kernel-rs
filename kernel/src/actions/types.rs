@@ -201,12 +201,12 @@ pub struct Remove {
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
     pub path: String,
 
+    /// The time this logical file was created, as milliseconds since the epoch.
+    pub deletion_timestamp: Option<i64>,
+
     /// When `false` the logical file must already be present in the table or the records
     /// in the added file must be contained in one or more remove actions in the same version.
     pub data_change: bool,
-
-    /// The time this logical file was created, as milliseconds since the epoch.
-    pub deletion_timestamp: Option<i64>,
 
     /// When true the fields `partition_values`, `size`, and `tags` are present
     pub extended_file_metadata: Option<bool>,

@@ -18,14 +18,18 @@ fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let scan = ScanBuilder::new(snapshot).build();
 
     let stream = scan.execute(&engine_client)?;
+    let mut total_rows = 0;
     for res in stream {
-        for batch in res {
-            let batch = batch?;
-            let rows = extractor.length(&*batch);
-            //     arrow::util::pretty::print_batches(&[batch]).unwrap();
-            assert_eq!(rows, 8);
+        if let Ok(ref data) = res.raw_data {
+            let rows = extractor.length(&**data);
+            for i in 0..rows {
+                if res.contains(i as u64) {
+                    total_rows += 1;
+                }
+            }
         }
     }
+    assert_eq!(total_rows, 8);
     Ok(())
 }
 
@@ -41,13 +45,17 @@ fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let scan = ScanBuilder::new(snapshot).build();
 
     let stream = scan.execute(&engine_client)?;
+    let mut total_rows = 0;
     for res in stream {
-        for batch in res {
-            let batch = batch?;
-            let rows = extractor.length(&*batch);
-            //     arrow::util::pretty::print_batches(&[batch]).unwrap();
-            assert_eq!(rows, 10);
+        if let Ok(ref data) = res.raw_data {
+            let rows = extractor.length(&**data);
+            for i in 0..rows {
+                if res.contains(i as u64) {
+                    total_rows += 1;
+                }
+            }
         }
     }
+    assert_eq!(total_rows, 10);
     Ok(())
 }

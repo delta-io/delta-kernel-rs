@@ -15,6 +15,13 @@ use crate::{
     DeltaResult, EngineClient, Error, FileSystemClient,
 };
 
+enum Action {
+    Add(Add),
+    Metadata(Metadata),
+    Protocol(Protocol),
+    Remove(Remove),
+}
+
 /// Generic struct to allow us to visit a type or hold an error that the type couldn't be parsed
 struct Visitor<T> {
     extracted: Option<DeltaResult<T>>,
@@ -502,7 +509,13 @@ impl Add {
         let mut visitor = Visitor::new(visit_add);
         let schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
         extractor.extract(data, Arc::new(schema), &mut visitor);
-        visitor.extracted.expect("Didn't get Add")
+        visitor
+            .extracted
+            .unwrap_or_else(|| Err(Error::Generic("Didn't get expected Add".to_string())))
+    }
+
+    pub fn dv_unique_id(&self) -> Option<String> {
+        self.deletion_vector.as_ref().map(|dv| dv.unique_id())
     }
 }
 
@@ -513,7 +526,7 @@ pub(crate) fn visit_add(_row_index: usize, vals: &[Option<DataItem<'_>>]) -> Del
         "Add",
         "Add must have path",
         "path must be str"
-    );
+    ).to_string();
 
     // TODO(nick): Support partition_values
 
@@ -604,13 +617,186 @@ pub(crate) fn visit_add(_row_index: usize, vals: &[Option<DataItem<'_>>]) -> Del
     );
 
     Ok(Add {
-        path: path.to_string(),
+        path,
         partition_values: HashMap::new(),
         size,
         modification_time,
         data_change,
         stats: stats.map(|s| s.to_string()),
         tags: HashMap::new(),
+        deletion_vector,
+        base_row_id,
+        default_row_commit_version,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Remove {
+    /// A relative path to a data file from the root of the table or an absolute path to a file
+    /// that should be added to the table. The path is a URI as specified by
+    /// [RFC 2396 URI Generic Syntax], which needs to be decoded to get the data file path.
+    ///
+    /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
+    pub path: String,
+
+    /// When `false` the logical file must already be present in the table or the records
+    /// in the added file must be contained in one or more remove actions in the same version.
+    pub data_change: bool,
+
+    /// The time this logical file was created, as milliseconds since the epoch.
+    pub deletion_timestamp: Option<i64>,
+
+    /// When true the fields `partition_values`, `size`, and `tags` are present
+    pub extended_file_metadata: Option<bool>,
+
+    /// A map from partition column to value for this logical file.
+    pub partition_values: Option<HashMap<String, Option<String>>>,
+
+    /// The size of this data file in bytes
+    pub size: Option<i64>,
+
+    /// Map containing metadata about this logical file.
+    pub tags: Option<HashMap<String, Option<String>>>,
+
+    /// Information about deletion vector (DV) associated with this add action
+    pub deletion_vector: Option<DeletionVectorDescriptor>,
+
+    /// Default generated Row ID of the first row in the file. The default generated Row IDs
+    /// of the other rows in the file can be reconstructed by adding the physical index of the
+    /// row within the file to the base Row ID
+    pub base_row_id: Option<i64>,
+
+    /// First commit version in which an add action with the same path was committed to the table.
+    pub default_row_commit_version: Option<i64>,
+}
+
+impl Remove {
+    pub fn try_new_from_data(
+        engine_client: &dyn EngineClient,
+        data: &dyn EngineData,
+    ) -> DeltaResult<Remove> {
+        let extractor = engine_client.get_data_extactor();
+        let mut visitor = Visitor::new(visit_remove);
+        let schema = StructType::new(vec![crate::actions::schemas::REMOVE_FIELD.clone()]);
+        extractor.extract(data, Arc::new(schema), &mut visitor);
+        visitor
+            .extracted
+            .unwrap_or_else(|| Err(Error::Generic("Didn't get expected remove".to_string())))
+    }
+
+    pub fn dv_unique_id(&self) -> Option<String> {
+        self.deletion_vector.as_ref().map(|dv| dv.unique_id())
+    }
+}
+
+pub(crate) fn visit_remove(_row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<Remove> {
+    let path = extract_required_item!(
+        vals[0],
+        as_str,
+        "Remove",
+        "Remove must have path",
+        "path must be str"
+    ).to_string();
+
+    let deletion_timestamp = extract_opt_item!(
+        vals[1],
+        as_i64,
+        "Remove",
+        "deletion_timestamp must be i64"
+    );
+
+    let data_change = extract_required_item!(
+        vals[2],
+        as_bool,
+        "Remove",
+        "Remove must have data_change",
+        "data_change must be a bool"
+    );
+
+    let extended_file_metadata = extract_opt_item!(
+        vals[3],
+        as_bool,
+        "Remove",
+        "extended_file_metadata must be bool"
+    );
+
+    // TODO(nick) handle partition values in vals[4]
+
+    let size = extract_opt_item!(
+        vals[5],
+        as_i64,
+        "Remove",
+        "size must be i64"
+    );
+
+    // TODO(nick) stats are skipped in vals[6] and tags are skipped in vals[7]
+
+    let deletion_vector = if vals[8].is_some() {
+        // there is a storageType, so the whole DV must be there
+        let storage_type = extract_required_item!(
+            vals[8],
+            as_str,
+            "Remove",
+            "DV must have storageType",
+            "storageType must be a string"
+        )
+        .to_string();
+
+        let path_or_inline_dv = extract_required_item!(
+            vals[9],
+            as_str,
+            "Remove",
+            "DV must have pathOrInlineDv",
+            "pathOrInlineDv must be a string"
+        )
+        .to_string();
+
+        let offset = extract_opt_item!(vals[10], as_i32, "Remove", "offset must be i32");
+
+        let size_in_bytes = extract_required_item!(
+            vals[11],
+            as_i32,
+            "Remove",
+            "DV must have sizeInBytes",
+            "sizeInBytes must be i32"
+        );
+
+        let cardinality = extract_required_item!(
+            vals[12],
+            as_i64,
+            "Remove",
+            "DV must have cardinality",
+            "cardinality must be i64"
+        );
+
+        Some(DeletionVectorDescriptor {
+            storage_type,
+            path_or_inline_dv,
+            offset,
+            size_in_bytes,
+            cardinality,
+        })
+    } else {
+        None
+    };
+
+    let base_row_id = extract_opt_item!(vals[13], as_i64, "Remove", "base_row_id must be i64");
+
+    let default_row_commit_version = extract_opt_item!(
+        vals[14],
+        as_i64,
+        "Remove",
+        "default_row_commit_version must be i64"
+    );
+
+    Ok(Remove {
+        path,
+        data_change,
+        deletion_timestamp,
+        extended_file_metadata,
+        partition_values: None,
+        size,
+        tags: None,
         deletion_vector,
         base_row_id,
         default_row_commit_version,
