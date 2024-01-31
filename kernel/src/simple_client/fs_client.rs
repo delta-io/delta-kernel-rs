@@ -12,7 +12,6 @@ pub(crate) struct SimpleFilesystemClient;
 impl FileSystemClient for SimpleFilesystemClient {
     /// List the paths in the same directory that are lexicographically greater or equal to
     /// (UTF-8 sorting) the given `path`. The result is sorted by the file name.
-    // TODO: Skip things that are less than specified path
     fn list_from(
         &self,
         url_path: &Url,
