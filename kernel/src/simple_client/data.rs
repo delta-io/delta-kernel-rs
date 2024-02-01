@@ -65,7 +65,7 @@ impl ListItem for GenericListArray<i32> {
         self.value(row_index).len()
     }
 
-    fn get<'a>(&'a self, row_index: usize, index: usize) -> String {
+    fn get(&self, row_index: usize, index: usize) -> String {
         let arry = self.value(row_index);
         let sarry = arry.as_string::<i32>();
         sarry.value(index).to_string()
@@ -76,8 +76,7 @@ impl ListItem for GenericListArray<i32> {
 impl MapItem for MapArray {
     fn get<'a>(&'a self, key: &str) -> Option<&'a str> {
         let keys = self.keys().as_string::<i32>();
-        let mut idx = 0;
-        for map_key in keys.iter() {
+        for (idx, map_key) in keys.iter().enumerate() {
             if let Some(map_key) = map_key {
                 if key == map_key {
                     // found the item
@@ -85,7 +84,6 @@ impl MapItem for MapArray {
                     return Some(vals.value(idx));
                 }
             }
-            idx += 1;
         }
         None
     }
@@ -115,7 +113,6 @@ impl SimpleData {
 
     /// extract a row of data. will recurse into struct types
     fn extract_row<'a>(
-        &'a self,
         array: &'a dyn ProvidesColumnByName,
         schema: &Schema,
         row: usize,
@@ -146,7 +143,7 @@ impl SimpleData {
                                     field.name, field_struct
                                 );
                                 let struct_array = col.as_struct();
-                                self.extract_row(
+                                SimpleData::extract_row(
                                     struct_array,
                                     field_struct,
                                     row,
@@ -190,7 +187,7 @@ impl SimpleData {
                             DataType::Map(_, _) => {
                                 res_arry.push(Some(DataItem::Map(col.as_map())));
                             }
-                            typ @ _ => {
+                            typ => {
                                 error!("CAN'T EXTRACT: {}", typ);
                                 unimplemented!()
                             }
@@ -206,7 +203,7 @@ impl SimpleData {
             debug!("Extracting row: {}", row);
             let mut res_arry: Vec<Option<DataItem<'_>>> = vec![];
             let mut had_data = false;
-            self.extract_row(&self.data, &schema, row, &mut had_data, &mut res_arry);
+            SimpleData::extract_row(&self.data, &schema, row, &mut had_data, &mut res_arry);
             if had_data {
                 visitor.visit(row, &res_arry);
             }

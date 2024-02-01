@@ -57,26 +57,24 @@ impl FileSystemClient for SimpleFilesystemClient {
                                       // now all_ents is a sorted list of DirEntries, we can just map over it
 
             let it = all_ents.into_iter().map(|ent| {
-                ent.metadata()
-                    .map_err(|e| Error::IOError(e))
-                    .and_then(|metadata| {
-                        let last_modified: u64 = metadata
-                            .modified()
-                            .map(
-                                |modified| match modified.duration_since(SystemTime::UNIX_EPOCH) {
-                                    Ok(d) => d.as_secs(),
-                                    Err(_) => 0,
-                                },
-                            )
-                            .unwrap_or(0);
-                        Url::from_file_path(ent.path())
-                            .map(|location| FileMeta {
-                                location,
-                                last_modified: last_modified as i64,
-                                size: metadata.len() as usize,
-                            })
-                            .map_err(|_| Error::Generic(format!("Invalid path: {:?}", ent.path())))
-                    })
+                ent.metadata().map_err(Error::IOError).and_then(|metadata| {
+                    let last_modified: u64 = metadata
+                        .modified()
+                        .map(
+                            |modified| match modified.duration_since(SystemTime::UNIX_EPOCH) {
+                                Ok(d) => d.as_secs(),
+                                Err(_) => 0,
+                            },
+                        )
+                        .unwrap_or(0);
+                    Url::from_file_path(ent.path())
+                        .map(|location| FileMeta {
+                            location,
+                            last_modified: last_modified as i64,
+                            size: metadata.len() as usize,
+                        })
+                        .map_err(|_| Error::Generic(format!("Invalid path: {:?}", ent.path())))
+                })
             });
             Ok(Box::new(it))
         } else {

@@ -33,7 +33,7 @@ impl LogReplayScanner {
     /// actions in the log.
     fn process_batch(
         &mut self,
-        actions: &Box<dyn EngineData>,
+        actions: &dyn EngineData,
         data_extractor: &Arc<dyn DataExtractor>,
         is_log_batch: bool,
     ) -> DeltaResult<Vec<Add>> {
@@ -59,29 +59,19 @@ impl LogReplayScanner {
         use crate::actions::action_definitions::{visit_add, visit_remove, MultiVisitor};
         let add_schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
         let mut multi_add_visitor = MultiVisitor::new(visit_add);
-        data_extractor.extract(
-            actions.as_ref(),
-            Arc::new(add_schema),
-            &mut multi_add_visitor,
-        );
+        data_extractor.extract(actions, Arc::new(add_schema), &mut multi_add_visitor);
 
         let mut multi_remove_visitor = MultiVisitor::new(visit_remove);
         let remove_schema = StructType::new(vec![crate::actions::schemas::REMOVE_FIELD.clone()]);
         if is_log_batch {
             // All checkpoint actions are already reconciled and Remove actions in checkpoint files
             // only serve as tombstones for vacuum jobs. So only load them if we're not a checkpoint
-            data_extractor.extract(
-                actions.as_ref(),
-                Arc::new(remove_schema),
-                &mut multi_remove_visitor,
-            );
+            data_extractor.extract(actions, Arc::new(remove_schema), &mut multi_remove_visitor);
         }
 
-        for remove in multi_remove_visitor.extracted.into_iter() {
-            if let Ok(remove) = remove {
-                self.seen
-                    .insert((remove.path.clone(), remove.dv_unique_id()));
-            }
+        for remove in multi_remove_visitor.extracted.into_iter().flatten() {
+            self.seen
+                .insert((remove.path.clone(), remove.dv_unique_id()));
         }
 
         let adds: Vec<DeltaResult<Add>> = multi_add_visitor.extracted;
@@ -125,7 +115,7 @@ pub fn log_replay_iter(
 
     action_iter.flat_map(move |actions| match actions {
         Ok((batch, is_log_batch)) => {
-            match log_scanner.process_batch(&batch, &data_extractor, is_log_batch) {
+            match log_scanner.process_batch(batch.as_ref(), &data_extractor, is_log_batch) {
                 Ok(adds) => Either::Left(adds.into_iter().map(Ok)),
                 Err(err) => Either::Right(std::iter::once(Err(err))),
             }

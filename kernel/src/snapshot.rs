@@ -77,21 +77,19 @@ impl LogSegment {
         for batch in data_batches {
             let (batch, _) = batch?;
             if metadata_opt.is_none() {
-                match crate::actions::action_definitions::Metadata::try_new_from_data(
+                if let Ok(md) = crate::actions::action_definitions::Metadata::try_new_from_data(
                     engine_client,
                     batch.as_ref(),
                 ) {
-                    Ok(md) => metadata_opt = Some(md.into()),
-                    _ => {}
+                    metadata_opt = Some(md)
                 }
             }
             if protocol_opt.is_none() {
-                match crate::actions::action_definitions::Protocol::try_new_from_data(
+                if let Ok(p) = crate::actions::action_definitions::Protocol::try_new_from_data(
                     engine_client,
                     batch.as_ref(),
                 ) {
-                    Ok(p) => protocol_opt = Some(p.into()),
-                    _ => {}
+                    protocol_opt = Some(p)
                 }
             }
         }

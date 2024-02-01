@@ -19,7 +19,7 @@ macro_rules! gen_casts {
 // a list that can go inside a DataItem
 pub trait ListItem {
     fn len(&self, row_index: usize) -> usize;
-    fn get<'a>(&'a self, row_index: usize, list_index: usize) -> String;
+    fn get(&self, row_index: usize, list_index: usize) -> String;
 }
 
 // a map that can go inside a DataItem
