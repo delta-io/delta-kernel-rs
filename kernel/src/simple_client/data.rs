@@ -7,7 +7,7 @@ use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::{Array, GenericListArray, MapArray, RecordBatch, StructArray};
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 use url::Url;
 
 use std::any::Any;
@@ -15,12 +15,19 @@ use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
 
+#[derive(Debug)]
 pub struct SimpleDataTypeTag;
 impl TypeTag for SimpleDataTypeTag {}
 
 /// SimpleData holds a RecordBatch
 pub struct SimpleData {
     data: RecordBatch,
+}
+
+impl SimpleData {
+    pub fn new(data: RecordBatch) -> Self {
+        SimpleData { data }
+    }
 }
 
 impl EngineData for SimpleData {

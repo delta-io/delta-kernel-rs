@@ -15,13 +15,6 @@ use crate::{
     DeltaResult, EngineClient, Error, FileSystemClient,
 };
 
-enum Action {
-    Add(Add),
-    Metadata(Metadata),
-    Protocol(Protocol),
-    Remove(Remove),
-}
-
 /// Generic struct to allow us to visit a type or hold an error that the type couldn't be parsed
 struct Visitor<T> {
     extracted: Option<DeltaResult<T>>,
@@ -632,47 +625,47 @@ pub(crate) fn visit_add(_row_index: usize, vals: &[Option<DataItem<'_>>]) -> Del
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Remove {
+pub(crate) struct Remove {
     /// A relative path to a data file from the root of the table or an absolute path to a file
     /// that should be added to the table. The path is a URI as specified by
     /// [RFC 2396 URI Generic Syntax], which needs to be decoded to get the data file path.
     ///
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
-    pub path: String,
+    pub(crate) path: String,
 
     /// When `false` the logical file must already be present in the table or the records
     /// in the added file must be contained in one or more remove actions in the same version.
-    pub data_change: bool,
+    pub(crate) data_change: bool,
 
     /// The time this logical file was created, as milliseconds since the epoch.
-    pub deletion_timestamp: Option<i64>,
+    pub(crate) deletion_timestamp: Option<i64>,
 
     /// When true the fields `partition_values`, `size`, and `tags` are present
-    pub extended_file_metadata: Option<bool>,
+    pub(crate) extended_file_metadata: Option<bool>,
 
     /// A map from partition column to value for this logical file.
-    pub partition_values: Option<HashMap<String, Option<String>>>,
+    pub(crate) partition_values: Option<HashMap<String, Option<String>>>,
 
     /// The size of this data file in bytes
-    pub size: Option<i64>,
+    pub(crate) size: Option<i64>,
 
     /// Map containing metadata about this logical file.
-    pub tags: Option<HashMap<String, Option<String>>>,
+    pub(crate) tags: Option<HashMap<String, Option<String>>>,
 
     /// Information about deletion vector (DV) associated with this add action
-    pub deletion_vector: Option<DeletionVectorDescriptor>,
+    pub(crate) deletion_vector: Option<DeletionVectorDescriptor>,
 
     /// Default generated Row ID of the first row in the file. The default generated Row IDs
     /// of the other rows in the file can be reconstructed by adding the physical index of the
     /// row within the file to the base Row ID
-    pub base_row_id: Option<i64>,
+    pub(crate) base_row_id: Option<i64>,
 
     /// First commit version in which an add action with the same path was committed to the table.
-    pub default_row_commit_version: Option<i64>,
+    pub(crate) default_row_commit_version: Option<i64>,
 }
 
 impl Remove {
-    pub fn try_new_from_data(
+    pub(crate) fn try_new_from_data(
         engine_client: &dyn EngineClient,
         data: &dyn EngineData,
     ) -> DeltaResult<Remove> {
@@ -685,7 +678,7 @@ impl Remove {
             .unwrap_or_else(|| Err(Error::Generic("Didn't get expected remove".to_string())))
     }
 
-    pub fn dv_unique_id(&self) -> Option<String> {
+    pub(crate) fn dv_unique_id(&self) -> Option<String> {
         self.deletion_vector.as_ref().map(|dv| dv.unique_id())
     }
 }

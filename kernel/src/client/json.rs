@@ -17,7 +17,10 @@ use object_store::{DynObjectStore, GetResultPayload};
 use super::executor::TaskExecutor;
 use super::file_handler::{FileOpenFuture, FileOpener, FileStream};
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, JsonHandler};
+use crate::simple_client::data::SimpleData;
+use crate::{
+    DeltaResult, EngineData, Error, Expression, FileDataReadResultIterator, FileMeta, JsonHandler,
+};
 
 #[derive(Debug)]
 pub struct DefaultJsonHandler<E: TaskExecutor> {
@@ -95,8 +98,12 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             sender.send(res).ok();
             futures::future::ready(())
         }));
-        panic!("Not yet");
-        //Ok(Box::new(receiver.into_iter()))
+        Ok(Box::new(receiver.into_iter().map(|rbr| {
+            rbr.map(|rb| {
+                let b: Box<dyn EngineData> = Box::new(SimpleData::new(rb));
+                b
+            })
+        })))
     }
 }
 

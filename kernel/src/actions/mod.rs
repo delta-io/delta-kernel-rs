@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 
 use arrow_array::{
-    BooleanArray, Int32Array, Int64Array, ListArray, MapArray, RecordBatch, StringArray,
-    StructArray,
+    BooleanArray, Int32Array, Int64Array, MapArray, RecordBatch, StringArray, StructArray,
 };
 use either::Either;
 use fix_hidden_lifetime_bug::fix_hidden_lifetime_bug;

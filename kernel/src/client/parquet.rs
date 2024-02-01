@@ -14,7 +14,11 @@ use super::file_handler::{FileOpenFuture, FileOpener};
 use crate::executor::TaskExecutor;
 use crate::file_handler::FileStream;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, ParquetHandler};
+use crate::simple_client::data::SimpleData;
+use crate::{
+    DeltaResult, EngineData, Error, Expression, FileDataReadResultIterator, FileMeta,
+    ParquetHandler,
+};
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -67,9 +71,12 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             sender.send(res).ok();
             futures::future::ready(())
         }));
-
-        panic!("Not yet");
-        //Ok(Box::new(receiver.into_iter()))
+        Ok(Box::new(receiver.into_iter().map(|rbr| {
+            rbr.map(|rb| {
+                let b: Box<dyn EngineData> = Box::new(SimpleData::new(rb));
+                b
+            })
+        })))
     }
 }
 

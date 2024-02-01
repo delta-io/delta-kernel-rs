@@ -3,12 +3,10 @@ use std::sync::Arc;
 
 use super::data_skipping::DataSkippingFilter;
 use crate::actions::action_definitions::Add;
-//use crate::actions::{parse_actions, Action, ActionType, Add};
 use crate::expressions::Expression;
 use crate::schema::{SchemaRef, StructType};
 use crate::{DataExtractor, DeltaResult, EngineData};
 
-use arrow_array::RecordBatch;
 use either::Either;
 use tracing::debug;
 

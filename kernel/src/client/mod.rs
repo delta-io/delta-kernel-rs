@@ -19,8 +19,8 @@ use self::filesystem::ObjectStoreFileSystemClient;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
 use crate::{
-    DataExtractor, DeltaResult, EngineClient, ExpressionHandler, FileSystemClient, JsonHandler,
-    ParquetHandler,
+    simple_client::SimpleDataExtractor, DataExtractor, DeltaResult, EngineClient,
+    ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler,
 };
 
 pub mod conversion;
@@ -38,6 +38,7 @@ pub struct DefaultTableClient<E: TaskExecutor> {
     json: Arc<DefaultJsonHandler<E>>,
     parquet: Arc<DefaultParquetHandler<E>>,
     expression: Arc<DefaultExpressionHandler>,
+    extractor: Arc<SimpleDataExtractor>,
 }
 
 impl<E: TaskExecutor> DefaultTableClient<E> {
@@ -67,6 +68,7 @@ impl<E: TaskExecutor> DefaultTableClient<E> {
             parquet: Arc::new(DefaultParquetHandler::new(store.clone(), task_executor)),
             store,
             expression: Arc::new(DefaultExpressionHandler {}),
+            extractor: Arc::new(SimpleDataExtractor::new()),
         })
     }
 
@@ -84,6 +86,7 @@ impl<E: TaskExecutor> DefaultTableClient<E> {
             parquet: Arc::new(DefaultParquetHandler::new(store.clone(), task_executor)),
             store,
             expression: Arc::new(DefaultExpressionHandler {}),
+            extractor: Arc::new(SimpleDataExtractor::new()),
         }
     }
 }
@@ -112,6 +115,6 @@ impl<E: TaskExecutor> EngineClient for DefaultTableClient<E> {
     }
 
     fn get_data_extactor(&self) -> Arc<dyn DataExtractor> {
-        unimplemented!()
+        self.extractor.clone()
     }
 }

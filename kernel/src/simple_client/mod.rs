@@ -13,9 +13,19 @@ mod fs_client;
 mod json;
 mod parquet;
 
-struct SimpleDataExtractor {
+#[derive(Debug)]
+pub(crate) struct SimpleDataExtractor {
     expected_tag: data::SimpleDataTypeTag,
 }
+
+impl SimpleDataExtractor {
+    pub(crate) fn new() -> Self {
+        SimpleDataExtractor {
+            expected_tag: data::SimpleDataTypeTag,
+        }
+    }
+}
+
 impl DataExtractor for SimpleDataExtractor {
     fn extract(&self, blob: &dyn EngineData, schema: SchemaRef, visitor: &mut dyn DataVisitor) {
         assert!(self.expected_tag.eq(blob.type_tag()));

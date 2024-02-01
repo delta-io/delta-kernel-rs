@@ -102,6 +102,7 @@ impl FileSystemClient for SimpleFilesystemClient {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use std::fs::File;
     use std::io::Write;
