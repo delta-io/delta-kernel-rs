@@ -408,7 +408,7 @@ impl Display for DataType {
             DataType::Array(a) => write!(f, "array<{}>", a.element_type),
             DataType::Struct(s) => {
                 write!(f, "struct<")?;
-                for (i, (_, field)) in s.fields.iter().enumerate() {
+                for (i, field) in s.fields().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }

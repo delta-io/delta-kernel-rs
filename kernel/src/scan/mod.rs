@@ -146,7 +146,6 @@ impl Scan {
         let read_schema = Arc::new(StructType::new(
             self.schema()
                 .fields()
-                .into_iter()
                 .filter(|f| {
                     !self
                         .snapshot

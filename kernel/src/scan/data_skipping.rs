@@ -115,10 +115,7 @@ impl DataSkippingFilter {
             static ref PREDICATE_SCHEMA: DataType = StructType::new(vec![
                 StructField::new("predicate", DataType::BOOLEAN, true),
             ]).into();
-            static ref FILTER_EXPR: Expr = Expr::is_null(Expr::null_if(
-                Expr::column("predicate"),
-                Expr::column("predicate"),
-            ));
+            static ref FILTER_EXPR: Expr = Expr::column("predicate").distinct(Expr::literal(false));
             static ref STATS_EXPR: Expr = Expr::column("add.stats");
         );
 

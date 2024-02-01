@@ -22,7 +22,7 @@ impl TryFrom<&StructType> for ArrowSchema {
     fn try_from(s: &StructType) -> Result<Self, ArrowError> {
         let fields = s
             .fields()
-            .map(|f| <ArrowField as TryFrom<&StructField>>::try_from(f))
+            .map(TryInto::try_into)
             .collect::<Result<Vec<ArrowField>, ArrowError>>()?;
 
         Ok(ArrowSchema::new(fields))
@@ -125,7 +125,7 @@ impl TryFrom<&DataType> for ArrowDataType {
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(
                 s.fields()
-                    .map(|f| <ArrowField as TryFrom<&StructField>>::try_from(f))
+                    .map(TryInto::try_into)
                     .collect::<Result<Vec<ArrowField>, ArrowError>>()?
                     .into(),
             )),
@@ -213,12 +213,7 @@ impl TryFrom<&ArrowDataType> for DataType {
             ArrowDataType::Binary => Ok(DataType::Primitive(PrimitiveType::Binary)),
             ArrowDataType::FixedSizeBinary(_) => Ok(DataType::Primitive(PrimitiveType::Binary)),
             ArrowDataType::LargeBinary => Ok(DataType::Primitive(PrimitiveType::Binary)),
-            ArrowDataType::Decimal128(p, s) => {
-                Ok(DataType::Primitive(PrimitiveType::Decimal(*p, *s)))
-            }
-            ArrowDataType::Decimal256(p, s) => {
-                Ok(DataType::Primitive(PrimitiveType::Decimal(*p, *s)))
-            }
+            ArrowDataType::Decimal128(p, s) => Ok(DataType::decimal(*p, *s)),
             ArrowDataType::Date32 => Ok(DataType::Primitive(PrimitiveType::Date)),
             ArrowDataType::Date64 => Ok(DataType::Primitive(PrimitiveType::Date)),
             ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => {

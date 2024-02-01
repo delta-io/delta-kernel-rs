@@ -11,9 +11,8 @@ use arrow_array::{
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
     StructArray, TimestampMicrosecondArray,
 };
-use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
+use arrow_ord::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{ArrowError, Schema as ArrowSchema};
-use arrow_select::nullif::nullif;
 
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{BinaryOperator, Expression, Scalar, UnaryOperator, VariadicOperator};
@@ -216,17 +215,22 @@ fn evaluate_expression(
                 })
         }
         (VariadicOperation { .. }, _) => {
-            // NOTE: this panics as it would be a bug in our code if we get here. However it does swallow
+            // NOTE: If we get here, it would be a bug in our code. However it does swallow
             // the error message from the compiler if we add variants to the enum and forget to add them here.
-            unreachable!("We unly support variadic operations for boolean expressions right now.")
+            Err(Error::Generic(format!(
+                "Current variadic expressions are expected to return boolean results, got {:?}",
+                result_type
+            )))
         }
-        (NullIf { expr, if_expr }, _) => {
-            let expr_arr = evaluate_expression(expr.as_ref(), batch, None)?;
-            let if_expr_arr =
-                evaluate_expression(if_expr.as_ref(), batch, Some(&DataType::BOOLEAN))?;
-            let if_expr_arr = downcast_to_bool(&if_expr_arr)?;
-            Ok(nullif(&expr_arr, if_expr_arr)?)
+        (Distinct { lhs, rhs }, Some(&DataType::BOOLEAN)) => {
+            let lhs_arr = evaluate_expression(lhs.as_ref(), batch, None)?;
+            let rhs_arr = evaluate_expression(rhs.as_ref(), batch, None)?;
+            Ok(distinct(&lhs_arr, &rhs_arr).map(wrap_comparison_result)?)
         }
+        (Distinct { .. }, _) => Err(Error::Generic(format!(
+            "Distinct will always return boolean result, got {:?}",
+            result_type
+        ))),
     }
 }
 
@@ -272,6 +276,7 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use arrow_array::Int32Array;
     use arrow_schema::{DataType, Field, Fields, Schema};
@@ -426,7 +431,9 @@ mod tests {
         let column_b = Expression::column("b");
 
         let expression = Box::new(column_a.clone().and(column_b.clone()));
-        let results = evaluate_expression(&expression, &batch, None).unwrap();
+        let results =
+            evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN))
+                .unwrap();
         let expected = Arc::new(BooleanArray::from(vec![false, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
@@ -435,12 +442,16 @@ mod tests {
                 .clone()
                 .and(Expression::literal(Scalar::Boolean(true))),
         );
-        let results = evaluate_expression(&expression, &batch, None).unwrap();
+        let results =
+            evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN))
+                .unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
         let expression = Box::new(column_a.clone().or(column_b));
-        let results = evaluate_expression(&expression, &batch, None).unwrap();
+        let results =
+            evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN))
+                .unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, true]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
@@ -449,7 +460,9 @@ mod tests {
                 .clone()
                 .or(Expression::literal(Scalar::Boolean(false))),
         );
-        let results = evaluate_expression(&expression, &batch, None).unwrap();
+        let results =
+            evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN))
+                .unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
     }

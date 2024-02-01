@@ -41,8 +41,6 @@ pub enum VariadicOperator {
 impl Display for BinaryOperator {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            // Self::And => write!(f, "AND"),
-            // Self::Or => write!(f, "OR"),
             Self::Plus => write!(f, "+"),
             Self::Minus => write!(f, "-"),
             Self::Multiply => write!(f, "*"),
@@ -101,12 +99,11 @@ pub enum Expression {
         /// The expressions.
         exprs: Vec<Expression>,
     },
-    // TODO how to model required functions?
-    NullIf {
-        /// The expression to evaluate.
-        expr: Box<Expression>,
-        /// The expression to compare against.
-        if_expr: Box<Expression>,
+    Distinct {
+        /// left hand side of the distinct
+        lhs: Box<Expression>,
+        /// right hand side of the distinct
+        rhs: Box<Expression>,
     },
     // TODO: support more expressions, such as IS IN, LIKE, etc.
 }
@@ -148,7 +145,7 @@ impl Display for Expression {
                     )
                 }
             },
-            Self::NullIf { expr, if_expr } => write!(f, "NULLIF({}, {})", expr, if_expr),
+            Self::Distinct { lhs, rhs } => write!(f, "DISTINCT({}, {})", lhs, rhs),
         }
     }
 }
@@ -274,11 +271,11 @@ impl Expression {
         Self::or_from([self, other])
     }
 
-    /// Create a new expression `NULLIF(self, other)`
-    pub fn null_if(self, other: Self) -> Self {
-        Self::NullIf {
-            expr: Box::new(self),
-            if_expr: Box::new(other),
+    /// Create a new expression `DISTINCT(self, other)`
+    pub fn distinct(self, other: Self) -> Self {
+        Self::Distinct {
+            lhs: Box::new(self),
+            rhs: Box::new(other),
         }
     }
 
@@ -302,9 +299,9 @@ impl Expression {
                 Self::VariadicOperation { exprs, .. } => {
                     stack.extend(exprs.iter());
                 }
-                Self::NullIf { expr, if_expr } => {
-                    stack.push(expr);
-                    stack.push(if_expr);
+                Self::Distinct { lhs, rhs } => {
+                    stack.push(lhs);
+                    stack.push(rhs);
                 }
             }
             Some(expr)
