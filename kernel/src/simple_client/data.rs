@@ -28,6 +28,10 @@ impl SimpleData {
     pub fn new(data: RecordBatch) -> Self {
         SimpleData { data }
     }
+
+    pub fn into_record_batch(self) -> RecordBatch {
+        self.data
+    }
 }
 
 impl EngineData for SimpleData {
