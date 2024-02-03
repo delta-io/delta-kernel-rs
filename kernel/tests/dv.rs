@@ -23,7 +23,7 @@ fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(ref data) = res.raw_data {
             let rows = extractor.length(&**data);
             for i in 0..rows {
-                if res.contains(i as u64) {
+                if res.mask.as_ref().is_none() || res.mask.as_ref().unwrap()[i] {
                     total_rows += 1;
                 }
             }
@@ -50,7 +50,7 @@ fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(ref data) = res.raw_data {
             let rows = extractor.length(&**data);
             for i in 0..rows {
-                if res.contains(i as u64) {
+                if res.mask.as_ref().is_none() || res.mask.as_ref().unwrap()[i] {
                     total_rows += 1;
                 }
             }

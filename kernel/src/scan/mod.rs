@@ -81,21 +81,11 @@ impl ScanBuilder {
 /// and information regarding whether a row should be included or not
 //pub type ScanResultIter = Box<dyn Iterator<Item = DeltaResult<ScanResult>> + Send>;
 pub struct ScanResult {
+    /// Raw engine data as read from the disk for a particular file included in the query
     pub raw_data: DeltaResult<Box<dyn EngineData>>,
-    offset: u64,
-    mask: Option<RoaringTreemap>,
-}
-
-impl ScanResult {
-    pub fn contains(&self, row_index: u64) -> bool {
-        match self.mask.as_ref() {
-            Some(mask) => {
-                let index = row_index + self.offset;
-                !mask.contains(index)
-            }
-            None => true,
-        }
-    }
+    /// If an item at mask[i] is true, that row is valid, otherwise if it is false, the row at that
+    /// row index is invalid and should be ignored. If this is None, all rows are valid.
+    pub mask: Option<Vec<bool>>,
 }
 
 pub struct Scan {
@@ -168,7 +158,7 @@ impl Scan {
             };
             let read_results =
                 parquet_handler.read_parquet_files(&[meta], self.read_schema.clone(), None)?;
-            let dv_mask = add
+            let dv_treemap = add
                 .deletion_vector
                 .as_ref()
                 .map(|dv_descriptor| {
@@ -177,19 +167,26 @@ impl Scan {
                 })
                 .transpose()?;
 
-            let mut offset = 0;
+            let mut dv_mask = dv_treemap.map(|mask| {
+                super::actions::action_definitions::treemap_to_bools(mask)
+            });
+
             for read_result in read_results {
                 let len = if let Ok(ref res) = read_result {
                     data_extractor.length(&**res)
                 } else {
                     0
                 };
+
+                // need to split the dv_mask. what's left in dv_mask covers this result, and rest
+                // will cover the following results
+                let rest = dv_mask.as_mut().map(|mask| mask.split_off(len));
+
                 let scan_result = ScanResult {
                     raw_data: read_result,
-                    offset,
-                    mask: dv_mask.clone(),
+                    mask: dv_mask,
                 };
-                offset += len as u64;
+                dv_mask = rest;
                 results.push(scan_result);
             }
         }

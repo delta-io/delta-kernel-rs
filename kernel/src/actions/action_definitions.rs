@@ -792,10 +792,37 @@ pub(crate) fn visit_remove(
     })
 }
 
+pub(crate) fn treemap_to_bools(treemap: RoaringTreemap) -> Vec<bool> {
+    fn combine(high_bits: u32, low_bits: u32) -> usize {
+        ((u64::from(high_bits) << 32) | u64::from(low_bits)) as usize
+    }
+
+    match treemap.max() {
+        Some(max) => {
+            // there are values in the map
+            //TODO(nick) panic if max is > MAX_USIZE
+            let mut result = vec![true; max as usize + 1];
+            let bitmaps = treemap.bitmaps();
+            for (index, bitmap) in bitmaps {
+                for bit in bitmap.iter() {
+                    let vec_index = combine(index, bit);
+                    result[vec_index] = false;
+                }
+            }
+            result
+        }
+        None => {
+            // empty set, return empty vec
+            vec!()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
+    use roaring::RoaringTreemap;
     use url::Url;
 
     use crate::{simple_client::SimpleClient, EngineClient};
@@ -886,5 +913,27 @@ mod tests {
         let expected: Vec<u64> = vec![0, 9];
         let found = tree_map.iter().collect::<Vec<_>>();
         assert_eq!(found, expected)
+    }
+
+    // this test is ignored by default as it's expensive to allocate such big vecs full of `true`. you can run it via:
+    // cargo test actions::action_definitions::tests::test_dv_to_bools
+    #[test] #[ignore]
+    fn test_dv_to_bools() {
+        let mut rb = RoaringTreemap::new();
+        rb.insert(0);
+        rb.insert(2);
+        rb.insert(7);
+        rb.insert(30854);
+        rb.insert(4294967297);
+        rb.insert(4294967300);
+        let bools = super::treemap_to_bools(rb);
+        let mut expected = vec![true; 4294967301];
+        expected[0] = false;
+        expected[2] = false;
+        expected[7] = false;
+        expected[30854] = false;
+        expected[4294967297] = false;
+        expected[4294967300] = false;
+        assert_eq!(bools, expected);
     }
 }
