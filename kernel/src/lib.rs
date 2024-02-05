@@ -39,8 +39,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, StringArray};
-use arrow_schema::SchemaRef as ArrowSchemaRef;
+use arrow_array::RecordBatch;
 use bytes::Bytes;
 use url::Url;
 
