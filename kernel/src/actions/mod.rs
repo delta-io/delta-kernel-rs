@@ -522,21 +522,31 @@ fn struct_array_to_map(arr: &StructArray) -> DeltaResult<HashMap<String, Option<
 mod tests {
     use std::sync::Arc;
 
-    use arrow_schema::Schema as ArrowSchema;
-    use object_store::local::LocalFileSystem;
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 
     use super::*;
     use crate::actions::schemas::log_schema;
     use crate::actions::Protocol;
-    use crate::client::json::DefaultJsonHandler;
-    use crate::executor::tokio::TokioBackgroundExecutor;
-    use crate::simple_client::{data::SimpleData, SimpleClient};
-    use crate::JsonHandler;
+    use crate::simple_client::{data::SimpleData, json::SimpleJsonHandler, SimpleClient};
+    use crate::{EngineData, JsonHandler};
 
-    fn action_batch() -> RecordBatch {
-        let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+    fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
+        let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
+        let schema = Arc::new(ArrowSchema::new(vec![string_field]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
+            .expect("Can't convert to record batch");
+        Box::new(SimpleData::new(batch))
+    }
 
+    fn engine_data_to_simple_data(engine_data: Box<dyn EngineData>) -> Box<SimpleData> {
+        let raw = Box::into_raw(engine_data) as *mut SimpleData;
+        // TODO: Remove unsafe when https://rust-lang.github.io/rfcs/3324-dyn-upcasting.html is
+        // stable
+        unsafe { Box::from_raw(raw) }
+    }
+
+    fn action_batch() -> Box<SimpleData> {
+        let handler = SimpleJsonHandler {};
         let json_strings: StringArray = vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
             r#"{"commitInfo":{"timestamp":1677811178585,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isolationLevel":"WriteSerializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"10","numOutputBytes":"635"},"engineInfo":"Databricks-Runtime/<unknown>","txnId":"a6a94671-55ef-450e-9546-b8465b9147de"}}"#,
@@ -544,15 +554,18 @@ mod tests {
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
         ]
         .into();
-        let output_schema = Arc::new(ArrowSchema::try_from(log_schema()).unwrap());
-        handler.parse_json(json_strings, output_schema).unwrap()
+        let output_schema = Arc::new(log_schema().clone());
+        let parsed = handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        engine_data_to_simple_data(parsed)
     }
 
     #[test]
     fn test_parse_protocol() {
         let client = SimpleClient::new();
-        let data: SimpleData = action_batch().into();
-        let parsed = Protocol::try_new_from_data(&client, &data).unwrap();
+        let data = action_batch();
+        let parsed = Protocol::try_new_from_data(&client, data.as_ref()).unwrap();
         let expected = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
@@ -565,8 +578,8 @@ mod tests {
     #[test]
     fn test_parse_metadata() {
         let client = SimpleClient::new();
-        let data: SimpleData = action_batch().into();
-        let parsed = Metadata::try_new_from_data(&client, &data).unwrap();
+        let data = action_batch();
+        let parsed = Metadata::try_new_from_data(&client, data.as_ref()).unwrap();
 
         let configuration = HashMap::from_iter([
             (
@@ -596,9 +609,7 @@ mod tests {
 
     #[test]
     fn test_parse_add_partitioned() {
-        let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
-
+        let handler = SimpleJsonHandler {};
         let json_strings: StringArray = vec![
             r#"{"commitInfo":{"timestamp":1670892998177,"operation":"WRITE","operationParameters":{"mode":"Append","partitionBy":"[\"c1\",\"c2\"]"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"3","numOutputRows":"3","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
@@ -608,9 +619,11 @@ mod tests {
             r#"{"add":{"path":"c1=6/c2=a/part-00011-10619b10-b691-4fd0-acc4-2a9608499d7c.c000.snappy.parquet","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998135,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":4},\"maxValues\":{\"c3\":4},\"nullCount\":{\"c3\":0}}"}}"#,
         ]
         .into();
-        let output_schema = Arc::new(ArrowSchema::try_from(log_schema()).unwrap());
-        let batch = handler.parse_json(json_strings, output_schema).unwrap();
-
+        let output_schema = Arc::new(log_schema().clone());
+        let batch = handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        let batch = engine_data_to_simple_data(batch).into_record_batch();
         let actions = parse_action(&batch, &ActionType::Add)
             .unwrap()
             .collect::<Vec<_>>();

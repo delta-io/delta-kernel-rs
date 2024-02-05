@@ -5,6 +5,9 @@ pub enum Error {
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
 
+    #[error("Invalid engine data type. Could not convert to {0}")]
+    EngineDataType(String),
+
     #[error("Error extracting type {0}: {1}")]
     Extract(&'static str, &'static str),
 

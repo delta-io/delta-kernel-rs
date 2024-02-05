@@ -149,15 +149,16 @@ pub trait FileSystemClient: Send + Sync {
 /// Connectors can leverage this interface to provide their best implementation of the JSON parsing
 /// capability to Delta Kernel.
 pub trait JsonHandler {
-    /// Parse the given json strings and return the fields requested by output schema as columns in a [`RecordBatch`].
+    /// Parse the given json strings and return the fields requested by output schema as columns in [`EngineData`].
+    /// json_strings MUST be a single column batch of engine data, and the column type must be string
     fn parse_json(
         &self,
-        json_strings: StringArray,
-        output_schema: ArrowSchemaRef,
-    ) -> DeltaResult<RecordBatch>;
+        json_strings: Box<dyn EngineData>,
+        output_schema: SchemaRef,
+    ) -> DeltaResult<Box<dyn EngineData>>;
 
     /// Read and parse the JSON format file at given locations and return
-    /// the data as a RecordBatch with the columns requested by physical schema.
+    /// the data as EngineData with the columns requested by physical schema.
     ///
     /// # Parameters
     ///
@@ -178,7 +179,7 @@ pub trait JsonHandler {
 /// implementation of Parquet data file functionalities to Delta Kernel.
 pub trait ParquetHandler: Send + Sync {
     /// Read and parse the JSON format file at given locations and return
-    /// the data as a RecordBatch with the columns requested by physical schema.
+    /// the data as EngineData with the columns requested by physical schema.
     ///
     /// # Parameters
     ///

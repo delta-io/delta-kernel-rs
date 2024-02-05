@@ -813,7 +813,7 @@ pub(crate) fn treemap_to_bools(treemap: RoaringTreemap) -> Vec<bool> {
         }
         None => {
             // empty set, return empty vec
-            vec!()
+            vec![]
         }
     }
 }
@@ -917,7 +917,8 @@ mod tests {
 
     // this test is ignored by default as it's expensive to allocate such big vecs full of `true`. you can run it via:
     // cargo test actions::action_definitions::tests::test_dv_to_bools
-    #[test] #[ignore]
+    #[test]
+    #[ignore]
     fn test_dv_to_bools() {
         let mut rb = RoaringTreemap::new();
         rb.insert(0);

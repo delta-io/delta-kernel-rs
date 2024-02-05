@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 pub mod data;
 mod fs_client;
-mod json;
+pub(crate) mod json;
 mod parquet;
 
 #[derive(Debug)]
