@@ -55,7 +55,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     ) -> DeltaResult<Box<dyn EngineData>> {
         // TODO concatenating to a single string is probably not needed if we use the
         // lower level RawDecoder APIs
-        let json_strings = SimpleData::from_engine_data(json_strings)?.into_record_batch();
+        let json_strings = SimpleData::try_from_engine_data(json_strings)?.into_record_batch();
         if json_strings.num_columns() != 1 {
             return Err(Error::MissingColumn("Expected single column".into()));
         }
@@ -238,16 +238,18 @@ mod tests {
         let engine_data = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
-        let batch = SimpleData::from_engine_data(engine_data).unwrap().into_record_batch();
+        let batch = SimpleData::try_from_engine_data(engine_data)
+            .unwrap()
+            .into_record_batch();
         assert_eq!(batch.num_rows(), 4);
     }
 
     fn into_record_batch(
         engine_data: DeltaResult<Box<dyn EngineData>>,
     ) -> DeltaResult<RecordBatch> {
-        engine_data.and_then(|ed| {
-            SimpleData::from_engine_data(ed)
-        }).map(|sd| sd.into_record_batch())
+        engine_data
+            .and_then(|ed| SimpleData::try_from_engine_data(ed))
+            .map(|sd| sd.into_record_batch())
     }
 
     #[tokio::test]

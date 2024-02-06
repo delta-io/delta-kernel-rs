@@ -401,7 +401,7 @@ mod tests {
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
-        SimpleData::from_engine_data(parsed).unwrap()
+        SimpleData::try_from_engine_data(parsed).unwrap()
     }
 
     #[test]
@@ -466,7 +466,9 @@ mod tests {
         let batch = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
-        let batch = SimpleData::from_engine_data(batch).unwrap().into_record_batch();
+        let batch = SimpleData::try_from_engine_data(batch)
+            .unwrap()
+            .into_record_batch();
         let actions = parse_action(&batch, &ActionType::Add)
             .unwrap()
             .collect::<Vec<_>>();

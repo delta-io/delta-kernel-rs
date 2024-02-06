@@ -157,9 +157,9 @@ mod tests {
     fn into_record_batch(
         engine_data: DeltaResult<Box<dyn EngineData>>,
     ) -> DeltaResult<RecordBatch> {
-        engine_data.and_then(|ed| {
-            SimpleData::from_engine_data(ed)
-        }).map(|sd| sd.into_record_batch())
+        engine_data
+            .and_then(|ed| SimpleData::try_from_engine_data(ed))
+            .map(|sd| sd.into_record_batch())
     }
 
     #[tokio::test]

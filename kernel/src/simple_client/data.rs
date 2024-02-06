@@ -31,10 +31,11 @@ impl SimpleData {
     }
 
     /// Utility constructor to get a Box<SimpleData> out of a Box<dyn EngineData>
-    pub fn from_engine_data(engine_data: Box<dyn EngineData>) -> DeltaResult<Box<Self>> {
-        engine_data.into_any().downcast::<SimpleData>().map_err(|_| {
-            Error::EngineDataType("SimpleData".into())
-        })
+    pub fn try_from_engine_data(engine_data: Box<dyn EngineData>) -> DeltaResult<Box<Self>> {
+        engine_data
+            .into_any()
+            .downcast::<SimpleData>()
+            .map_err(|_| Error::EngineDataType("SimpleData".into()))
     }
 
     pub fn into_record_batch(self) -> RecordBatch {

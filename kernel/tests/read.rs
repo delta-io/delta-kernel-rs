@@ -8,7 +8,7 @@ use deltakernel::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::expressions::{BinaryOperator, Expression};
 use deltakernel::scan::ScanBuilder;
 use deltakernel::simple_client::data::SimpleData;
-use deltakernel::{Table, EngineData};
+use deltakernel::{EngineData, Table};
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -68,7 +68,9 @@ async fn add_commit(
 }
 
 fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
-    SimpleData::from_engine_data(engine_data).unwrap().into_record_batch()
+    SimpleData::try_from_engine_data(engine_data)
+        .unwrap()
+        .into_record_batch()
 }
 
 #[tokio::test]

@@ -41,7 +41,7 @@ impl JsonHandler for SimpleJsonHandler {
     ) -> DeltaResult<Box<dyn EngineData>> {
         // TODO: This is taken from the default client as it's the same. We should share an
         // implementation at some point
-        let json_strings = SimpleData::from_engine_data(json_strings)?.into_record_batch();
+        let json_strings = SimpleData::try_from_engine_data(json_strings)?.into_record_batch();
         if json_strings.num_columns() != 1 {
             return Err(Error::MissingColumn("Expected single column".into()));
         }
