@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use std::sync::Arc;
 
+use crate::{DeltaResult, Error, FileSystemClient};
 use roaring::RoaringTreemap;
 use url::Url;
-use crate::{DeltaResult, Error, FileSystemClient};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletionVectorDescriptor {
