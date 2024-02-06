@@ -24,12 +24,6 @@ pub struct SimpleData {
     data: RecordBatch,
 }
 
-fn to_box_sd(value: Box<dyn std::any::Any>) -> DeltaResult<Box<SimpleData>> {
-    value.downcast::<SimpleData>().map_err(|_| {
-        Error::EngineDataType("SimpleData".into())
-    })
-}
-
 impl SimpleData {
     /// Create a new SimpleData from a RecordBatch
     pub fn new(data: RecordBatch) -> Self {
@@ -38,7 +32,9 @@ impl SimpleData {
 
     /// Utility constructor to get a Box<SimpleData> out of a Box<dyn EngineData>
     pub fn from_engine_data(engine_data: Box<dyn EngineData>) -> DeltaResult<Box<Self>> {
-        to_box_sd(engine_data.into_any())
+        engine_data.into_any().downcast::<SimpleData>().map_err(|_| {
+            Error::EngineDataType("SimpleData".into())
+        })
     }
 
     pub fn into_record_batch(self) -> RecordBatch {
