@@ -102,7 +102,8 @@ pub trait TypeTag: 'static {
 ///    fn type_tag(&self) -> &dyn TypeTag {
 ///        &MyTypeTag
 ///    }
-///    fn as_any(&self) -> &(dyn Any + 'static) { todo!() }
+///    fn as_any(&self) -> &(dyn Any + 'static) { self }
+///    fn into_any(self: Box<Self>) -> Box<dyn Any> { self }
 /// }
 /// struct MyDataExtractor {
 ///   expected_tag: MyTypeTag,
@@ -123,4 +124,6 @@ pub trait EngineData: Send {
     fn type_tag(&self) -> &dyn TypeTag;
 
     fn as_any(&self) -> &dyn Any;
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any>;
 }

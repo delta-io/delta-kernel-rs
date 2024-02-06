@@ -157,12 +157,9 @@ mod tests {
     fn into_record_batch(
         engine_data: DeltaResult<Box<dyn EngineData>>,
     ) -> DeltaResult<RecordBatch> {
-        engine_data.map(|ed| {
-            let raw = Box::into_raw(ed) as *mut SimpleData;
-            // TODO: Remove unsafe when https://rust-lang.github.io/rfcs/3324-dyn-upcasting.html is
-            // stable
-            unsafe { Box::from_raw(raw) }.into_record_batch()
-        })
+        engine_data.and_then(|ed| {
+            SimpleData::from_engine_data(ed)
+        }).map(|sd| sd.into_record_batch())
     }
 
     #[tokio::test]

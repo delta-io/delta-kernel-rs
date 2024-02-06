@@ -41,11 +41,7 @@ impl JsonHandler for SimpleJsonHandler {
     ) -> DeltaResult<Box<dyn EngineData>> {
         // TODO: This is taken from the default client as it's the same. We should share an
         // implementation at some point
-        let raw = Box::into_raw(json_strings) as *mut SimpleData;
-        // TODO: Remove unsafe when https://rust-lang.github.io/rfcs/3324-dyn-upcasting.html is
-        // stable
-        let simple_data = unsafe { Box::from_raw(raw) };
-        let json_strings = simple_data.into_record_batch();
+        let json_strings = SimpleData::from_engine_data(json_strings)?.into_record_batch();
         if json_strings.num_columns() != 1 {
             return Err(Error::MissingColumn("Expected single column".into()));
         }

@@ -388,13 +388,6 @@ mod tests {
         Box::new(SimpleData::new(batch))
     }
 
-    fn engine_data_to_simple_data(engine_data: Box<dyn EngineData>) -> Box<SimpleData> {
-        let raw = Box::into_raw(engine_data) as *mut SimpleData;
-        // TODO: Remove unsafe when https://rust-lang.github.io/rfcs/3324-dyn-upcasting.html is
-        // stable
-        unsafe { Box::from_raw(raw) }
-    }
-
     fn action_batch() -> Box<SimpleData> {
         let handler = SimpleJsonHandler {};
         let json_strings: StringArray = vec![
@@ -408,7 +401,7 @@ mod tests {
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
-        engine_data_to_simple_data(parsed)
+        SimpleData::from_engine_data(parsed).unwrap()
     }
 
     #[test]
@@ -473,7 +466,7 @@ mod tests {
         let batch = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
-        let batch = engine_data_to_simple_data(batch).into_record_batch();
+        let batch = SimpleData::from_engine_data(batch).unwrap().into_record_batch();
         let actions = parse_action(&batch, &ActionType::Add)
             .unwrap()
             .collect::<Vec<_>>();

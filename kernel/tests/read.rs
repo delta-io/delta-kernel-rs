@@ -8,7 +8,7 @@ use deltakernel::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::expressions::{BinaryOperator, Expression};
 use deltakernel::scan::ScanBuilder;
 use deltakernel::simple_client::data::SimpleData;
-use deltakernel::Table;
+use deltakernel::{Table, EngineData};
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -67,6 +67,10 @@ async fn add_commit(
     Ok(())
 }
 
+fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
+    SimpleData::from_engine_data(engine_data).unwrap().into_record_batch()
+}
+
 #[tokio::test]
 async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
@@ -105,11 +109,9 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let stream = scan.execute(&engine_client)?.into_iter().zip(expected_data);
 
     for (data, expected) in stream {
-        let engine_data = data.raw_data?;
-        let raw = Box::into_raw(engine_data) as *mut SimpleData;
-        let simple_data = unsafe { Box::from_raw(raw) };
+        let raw_data = data.raw_data?;
         files += 1;
-        assert_eq!(simple_data.into_record_batch(), expected);
+        assert_eq!(into_record_batch(raw_data), expected);
     }
     assert_eq!(2, files, "Expected to have scanned two files");
     Ok(())
@@ -158,11 +160,9 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let stream = scan.execute(&engine_client)?.into_iter().zip(expected_data);
 
     for (data, expected) in stream {
-        let engine_data = data.raw_data?;
-        let raw = Box::into_raw(engine_data) as *mut SimpleData;
-        let simple_data = unsafe { Box::from_raw(raw) };
+        let raw_data = data.raw_data?;
         files += 1;
-        assert_eq!(simple_data.into_record_batch(), expected);
+        assert_eq!(into_record_batch(raw_data), expected);
     }
     assert_eq!(2, files, "Expected to have scanned two files");
 
@@ -215,11 +215,9 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut files = 0;
     for (data, expected) in stream {
-        let engine_data = data.raw_data?;
-        let raw = Box::into_raw(engine_data) as *mut SimpleData;
-        let simple_data = unsafe { Box::from_raw(raw) };
+        let raw_data = data.raw_data?;
         files += 1;
-        assert_eq!(simple_data.into_record_batch(), expected);
+        assert_eq!(into_record_batch(raw_data), expected);
     }
     assert_eq!(1, files, "Expected to have scanned one file");
     Ok(())
@@ -334,11 +332,9 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
             .zip(expected_batches);
 
         for (batch, expected) in stream {
-            let engine_data = batch.raw_data?;
-            let raw = Box::into_raw(engine_data) as *mut SimpleData;
-            let simple_data = unsafe { Box::from_raw(raw) };
+            let raw_data = batch.raw_data?;
             files_scanned += 1;
-            assert_eq!(&simple_data.into_record_batch(), expected);
+            assert_eq!(into_record_batch(raw_data), expected.clone());
         }
         assert_eq!(expected_files, files_scanned);
     }

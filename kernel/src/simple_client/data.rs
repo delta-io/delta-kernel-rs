@@ -1,6 +1,6 @@
 use crate::engine_data::{DataItem, DataVisitor, EngineData, ListItem, MapItem, TypeTag};
 use crate::schema::{Schema, SchemaRef};
-use crate::DeltaResult;
+use crate::{DeltaResult, Error};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, Int64Type};
@@ -24,9 +24,21 @@ pub struct SimpleData {
     data: RecordBatch,
 }
 
+fn to_box_sd(value: Box<dyn std::any::Any>) -> DeltaResult<Box<SimpleData>> {
+    value.downcast::<SimpleData>().map_err(|_| {
+        Error::EngineDataType("SimpleData".into())
+    })
+}
+
 impl SimpleData {
+    /// Create a new SimpleData from a RecordBatch
     pub fn new(data: RecordBatch) -> Self {
         SimpleData { data }
+    }
+
+    /// Utility constructor to get a Box<SimpleData> out of a Box<dyn EngineData>
+    pub fn from_engine_data(engine_data: Box<dyn EngineData>) -> DeltaResult<Box<Self>> {
+        to_box_sd(engine_data.into_any())
     }
 
     pub fn into_record_batch(self) -> RecordBatch {
@@ -44,6 +56,10 @@ impl EngineData for SimpleData {
     }
 
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
         self
     }
 }
@@ -249,13 +265,6 @@ mod tests {
         Box::new(SimpleData::new(batch))
     }
 
-    fn engine_data_to_simple_data(engine_data: Box<dyn EngineData>) -> Box<SimpleData> {
-        let raw = Box::into_raw(engine_data) as *mut SimpleData;
-        // TODO: Remove unsafe when https://rust-lang.github.io/rfcs/3324-dyn-upcasting.html is
-        // stable
-        unsafe { Box::from_raw(raw) }
-    }
-
     #[test]
     fn test_md_extract() {
         let client = SimpleClient::new();
@@ -268,8 +277,7 @@ mod tests {
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
-        let s: Box<dyn EngineData> = engine_data_to_simple_data(parsed);
-        let metadata = Metadata::try_new_from_data(&client, s.as_ref());
+        let metadata = Metadata::try_new_from_data(&client, parsed.as_ref());
         assert!(metadata.is_ok());
         let metadata = metadata.unwrap();
         assert_eq!(metadata.id, "aff5cb91-8cd9-4195-aef9-446908507302");

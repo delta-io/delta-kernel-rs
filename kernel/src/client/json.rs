@@ -55,11 +55,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     ) -> DeltaResult<Box<dyn EngineData>> {
         // TODO concatenating to a single string is probably not needed if we use the
         // lower level RawDecoder APIs
-        let raw = Box::into_raw(json_strings) as *mut SimpleData;
-        // TODO: Remove unsafe when https://rust-lang.github.io/rfcs/3324-dyn-upcasting.html is
-        // stable
-        let simple_data = unsafe { Box::from_raw(raw) };
-        let json_strings = simple_data.into_record_batch();
+        let json_strings = SimpleData::from_engine_data(json_strings)?.into_record_batch();
         if json_strings.num_columns() != 1 {
             return Err(Error::MissingColumn("Expected single column".into()));
         }
@@ -225,13 +221,6 @@ mod tests {
         Box::new(SimpleData::new(batch))
     }
 
-    fn engine_data_to_simple_data(engine_data: Box<dyn EngineData>) -> Box<SimpleData> {
-        let raw = Box::into_raw(engine_data) as *mut SimpleData;
-        // TODO: Remove unsafe when https://rust-lang.github.io/rfcs/3324-dyn-upcasting.html is
-        // stable
-        unsafe { Box::from_raw(raw) }
-    }
-
     #[test]
     fn test_parse_json() {
         let store = Arc::new(LocalFileSystem::new());
@@ -249,19 +238,16 @@ mod tests {
         let engine_data = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
-        let batch = engine_data_to_simple_data(engine_data).into_record_batch();
+        let batch = SimpleData::from_engine_data(engine_data).unwrap().into_record_batch();
         assert_eq!(batch.num_rows(), 4);
     }
 
     fn into_record_batch(
         engine_data: DeltaResult<Box<dyn EngineData>>,
     ) -> DeltaResult<RecordBatch> {
-        engine_data.map(|ed| {
-            let raw = Box::into_raw(ed) as *mut SimpleData;
-            // TODO: Remove unsafe when https://rust-lang.github.io/rfcs/3324-dyn-upcasting.html is
-            // stable
-            unsafe { Box::from_raw(raw) }.into_record_batch()
-        })
+        engine_data.and_then(|ed| {
+            SimpleData::from_engine_data(ed)
+        }).map(|sd| sd.into_record_batch())
     }
 
     #[tokio::test]
