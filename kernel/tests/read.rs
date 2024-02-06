@@ -333,13 +333,12 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
             .into_iter()
             .zip(expected_batches);
 
-        for (_batch, _expected) in stream {
-            // let engine_data = batch.raw_data?;
-            // let raw = Box::into_raw(engine_data) as *mut SimpleData;
-            // let simple_data = unsafe { Box::from_raw(raw) };
+        for (batch, expected) in stream {
+            let engine_data = batch.raw_data?;
+            let raw = Box::into_raw(engine_data) as *mut SimpleData;
+            let simple_data = unsafe { Box::from_raw(raw) };
             files_scanned += 1;
-            // TODO (nick) need skipping support
-            // assert_eq!(&simple_data.into_record_batch(), expected);
+            assert_eq!(&simple_data.into_record_batch(), expected);
         }
         assert_eq!(expected_files, files_scanned);
     }

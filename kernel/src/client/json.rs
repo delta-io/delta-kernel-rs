@@ -1,6 +1,5 @@
 //! Default Json handler implementation
 
-use std::any::Any;
 use std::io::{BufReader, Cursor};
 use std::ops::Range;
 use std::sync::Arc;

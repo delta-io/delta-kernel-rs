@@ -1,13 +1,11 @@
 use std::sync::Arc;
 
-use roaring::RoaringTreemap;
-
 use self::file_stream::log_replay_iter;
 use crate::actions::action_definitions::Add;
 use crate::expressions::Expression;
 use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::Snapshot;
-use crate::{DeltaResult, EngineClient, EngineData, FileDataReadResultIterator, FileMeta};
+use crate::{DeltaResult, EngineClient, EngineData, FileMeta};
 
 mod data_skipping;
 pub mod file_stream;
@@ -190,46 +188,6 @@ impl Scan {
             }
         }
         Ok(results)
-        // let v: Vec<ScanResultIter> = self
-        //     .files(engine_client)?
-        //     .flat_map(|res| {
-        //         let add = res?;
-        //         let meta = FileMeta {
-        //             last_modified: add.modification_time,
-        //             size: add.size as usize,
-        //             location: self.snapshot.table_root.join(&add.path)?,
-        //         };
-
-        //         let read_results = parquet_handler.read_parquet_files(&[meta], self.read_schema.clone(), None);
-        //         let dv_mask = add.deletion_vector.as_ref().map(|dv_descriptor| {
-        //             let fs_client = engine_client.get_file_system_client();
-        //             dv_descriptor.read(fs_client, self.snapshot.table_root.clone())
-        //         }).transpose()?;
-
-        //             // let mask: BooleanArray = (0..v.len())
-        //             //     .map(|i| Some(!dv.contains(i.try_into().expect("fit into u32"))))
-        //             //     .collect();
-        //             //Ok(Some(filter_record_batch(&batch, &mask)?))
-        //         //}
-        //         let ret: DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanResult>>>> = read_results.map(|result| result.map(|data| {
-        //             ScanResult {
-        //                 raw_data: data,
-        //                 offset: 0,
-        //                 mask: dv_mask,
-        //             }
-        //         }));
-        //     })
-        //     .collect();
-        // Ok(v)
-        // if batches.is_empty() {
-        //     return Ok(None);
-        // }
-        // let schema = batches[0].schema();
-        // let batch = concat_batches(&schema, &batches)?;
-
-        // })
-        //.filter_map_ok(|batch| batch)
-        //.collect()
     }
 }
 

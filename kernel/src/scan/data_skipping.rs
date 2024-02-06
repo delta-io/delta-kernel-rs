@@ -17,8 +17,8 @@ use arrow_select::filter::filter_record_batch;
 use arrow_select::nullif::nullif;
 use tracing::debug;
 
-use crate::expressions::scalars::Scalar;
 use crate::expressions::BinaryOperator;
+use crate::{expressions::scalars::Scalar, simple_client::data::SimpleData, EngineData};
 
 use crate::error::{DeltaResult, Error};
 use crate::scan::Expression;
@@ -269,7 +269,12 @@ impl DataSkippingFilter {
             })
     }
 
-    pub(crate) fn apply(&self, actions: &RecordBatch) -> DeltaResult<RecordBatch> {
+    pub(crate) fn apply(&self, actions: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+        let actions = actions
+            .as_any()
+            .downcast_ref::<SimpleData>()
+            .ok_or(Error::EngineDataType("SimpleData".into()))?
+            .record_batch();
         let adds = actions
             .column_by_name("add")
             .ok_or(Error::MissingColumn("Column 'add' not found.".into()))?
@@ -318,7 +323,8 @@ impl DataSkippingFilter {
             "number of actions before/after data skipping: {before_count} / {}",
             after.num_rows()
         );
-        Ok(after)
+        let res = Box::new(SimpleData::new(after));
+        Ok(res)
     }
 
     fn hack_parse(

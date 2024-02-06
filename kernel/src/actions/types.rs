@@ -4,8 +4,6 @@ use std::sync::Arc;
 
 use roaring::RoaringTreemap;
 use url::Url;
-
-use crate::schema::StructType;
 use crate::{DeltaResult, Error, FileSystemClient};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

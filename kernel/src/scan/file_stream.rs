@@ -37,25 +37,16 @@ impl LogReplayScanner {
         data_extractor: &Arc<dyn DataExtractor>,
         is_log_batch: bool,
     ) -> DeltaResult<Vec<Add>> {
-        // let filtered_actions = match &self.filter {
-        //     Some(filter) => Some(filter.apply(actions)?),
-        //     None => None,
-        // };
+        let filtered_actions = self
+            .filter
+            .as_ref()
+            .map(|filter| filter.apply(actions))
+            .transpose()?;
+        let actions = match filtered_actions {
+            Some(ref filtered_actions) => filtered_actions.as_ref(),
+            None => actions,
+        };
 
-        // TODO (nick): Add back DataSkippingFilter
-        // let actions = if let Some(filtered) = &filtered_actions {
-        //     filtered
-        // } else {
-        //     actions
-        // };
-
-        // let schema_to_use = if is_log_batch {
-        //     vec![ActionType::Add, ActionType::Remove]
-        // } else {
-        //     // All checkpoint actions are already reconciled and Remove actions in checkpoint files
-        //     // only serve as tombstones for vacuum jobs. So no need to load them here.
-        //     vec![ActionType::Add]
-        // };
         use crate::actions::action_definitions::{visit_add, visit_remove, MultiVisitor};
         let add_schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
         let mut multi_add_visitor = MultiVisitor::new(visit_add);
