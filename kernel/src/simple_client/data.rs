@@ -223,85 +223,53 @@ impl From<RecordBatch> for SimpleData {
 
 // test disabled because creating a record batch is tricky :)
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use arrow_array::{Int64Array, StringArray, ListArray, builder::{StringBuilder, MapBuilder}};
-//     use arrow_schema::{DataType, Field, Fields, Schema};
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
 
-//     fn create_metadata_batch(metadata_schema: Schema) -> RecordBatch {
-//         let id_array = StringArray::from(vec![Some("id")]);
-//         let ct_array = Int64Array::from(vec![1]);
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 
-//         let prov_array = StringArray::from(vec![Some("parquet")]);
-//         let schema_array = StringArray::from(vec![Some("schema!")]);
+    use crate::actions::action_definitions::Metadata;
+    use crate::{
+        actions::schemas::log_schema,
+        simple_client::{data::SimpleData, SimpleClient},
+        EngineClient, EngineData,
+    };
 
-//         let format_key_builder = StringBuilder::new();
-//         let format_val_builder = StringBuilder::new();
-//         let mut format_builder = MapBuilder::new(None, format_key_builder, format_val_builder);
-//         format_builder.keys().append_value("conf_key");
-//         format_builder.values().append_value("conf_val");
-//         format_builder.append(true).unwrap();
-//         let format_config_array = format_builder.finish();
+    fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
+        let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
+        let schema = Arc::new(ArrowSchema::new(vec![string_field]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
+            .expect("Can't convert to record batch");
+        Box::new(SimpleData::new(batch))
+    }
 
-//         let format_fields = Fields::from(vec![
-//             Field::new("provider", DataType::Utf8, false),
-//             Field::new("configuration", format_config_array.data_type().clone(), true),
-//         ]);
-//         let format_array = StructArray::new(
-//             format_fields,
-//             vec![
-//                 Arc::new(prov_array),
-//                 Arc::new(format_config_array)
-//             ],
-//             None
-//         );
+    fn engine_data_to_simple_data(engine_data: Box<dyn EngineData>) -> Box<SimpleData> {
+        let raw = Box::into_raw(engine_data) as *mut SimpleData;
+        // TODO: Remove unsafe when https://rust-lang.github.io/rfcs/3324-dyn-upcasting.html is
+        // stable
+        unsafe { Box::from_raw(raw) }
+    }
 
-//         let partition_array = ListArray::from_iter_primitive::<Int32Type, _, _>(vec!(
-//             Some(vec![Some(0)]),
-//         ));
-
-//         let key_builder = StringBuilder::new();
-//         let val_builder = StringBuilder::new();
-//         let mut builder = MapBuilder::new(None, key_builder, val_builder);
-//         builder.keys().append_value("conf_key");
-//         builder.values().append_value("conf_val");
-//         builder.append(true).unwrap();
-//         let config_array = builder.finish();
-
-//         RecordBatch::try_new(
-//             Arc::new(metadata_schema),
-//             vec![
-//                 Arc::new(id_array),
-//                 Arc::new(StringArray::new_null(1)), // name
-//                 Arc::new(StringArray::new_null(1)), // desc
-//                 Arc::new(format_array),
-//                 Arc::new(schema_array), // schemaString
-//                 Arc::new(partition_array), // partitionColumns
-//                 Arc::new(ct_array),
-//                 Arc::new(config_array), // configuration
-//             ],
-//         )
-//         .unwrap()
-//     }
-
-//     #[test]
-//     fn test_md_extract() {
-//         use crate::schema::{DataType, PrimitiveType, StructField, StructType};
-//         let metadata_schema = crate::actions::schemas::METADATA_FIELDS.clone();
-//         let s = SimpleData {
-//             data: create_metadata_batch(
-//                 crate::actions::schemas::METADATA_SCHEMA.as_ref().try_into().unwrap()
-//             ),
-//         };
-//         let mut metadata_visitor = crate::actions::action_definitions::MetadataVisitor::default();
-//         s.extract(Arc::new(metadata_schema), &mut metadata_visitor);
-
-//         println!("Got: {:?}", metadata_visitor.extracted);
-
-//         assert!(metadata_visitor.extracted.is_some());
-//         let metadata = metadata_visitor.extracted.unwrap();
-//         assert!(metadata.id == "id");
-//         assert!(metadata.created_time == Some(1));
-//     }
-// }
+    #[test]
+    fn test_md_extract() {
+        let client = SimpleClient::new();
+        let handler = client.get_json_handler();
+        let json_strings: StringArray = vec![
+            r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
+        ]
+        .into();
+        let output_schema = Arc::new(log_schema().clone());
+        let parsed = handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        let s: Box<dyn EngineData> = engine_data_to_simple_data(parsed);
+        let metadata = Metadata::try_new_from_data(&client, s.as_ref());
+        assert!(metadata.is_ok());
+        let metadata = metadata.unwrap();
+        assert_eq!(metadata.id, "aff5cb91-8cd9-4195-aef9-446908507302");
+        assert_eq!(metadata.created_time, Some(1670892997849));
+        assert_eq!(metadata.partition_columns, vec!("c1", "c2"))
+    }
+}
