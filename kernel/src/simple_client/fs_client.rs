@@ -22,8 +22,8 @@ impl FileSystemClient for SimpleFilesystemClient {
                 // passed path is an existing dir, don't strip anything and don't filter the results
                 (path, None)
             } else {
-                // path doesn't exist, assume final part is a filename. strip that and use it as the
-                // min_file_name to return
+                // path doesn't exist, or is not a dir, assume the final part is a filename. strip
+                // that and use it as the min_file_name to return
                 let parent = path.parent().ok_or_else(|| {
                     Error::Generic(format!("Invalid path for list_from: {:?}", path))
                 })?;
