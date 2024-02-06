@@ -75,17 +75,22 @@ impl ScanBuilder {
     }
 }
 
-/// Rows can be dropped from a scan due to deletion vectors, so we communicate back both EngineData
-/// and information regarding whether a row should be included or not
-//pub type ScanResultIter = Box<dyn Iterator<Item = DeltaResult<ScanResult>> + Send>;
+/// A vector of this type is returned from calling [`Scan::execute`]. Each [`ScanResult`] contains
+/// the raw [`EngineData`] as read by the engines [`crate::ParquetHandler`], and a boolean
+/// mask. Rows can be dropped from a scan due to deletion vectors, so we communicate back both
+/// EngineData and information regarding whether a row should be included or not See the docs below
+/// for [`ScanResult::mask`] for details on the mask.
 pub struct ScanResult {
     /// Raw engine data as read from the disk for a particular file included in the query
     pub raw_data: DeltaResult<Box<dyn EngineData>>,
-    /// If an item at mask[i] is true, that row is valid, otherwise if it is false, the row at that
-    /// row index is invalid and should be ignored. If this is None, all rows are valid.
+    /// If an item at mask\[i\] is true, the row at that row index is valid, otherwise if it is
+    /// false, the row at that row index is invalid and should be ignored. If this is None, all rows
+    /// are valid.
     pub mask: Option<Vec<bool>>,
 }
 
+/// The result of building a scan over a table. This can be used to get the actual data from
+/// scanning the table.
 pub struct Scan {
     snapshot: Arc<Snapshot>,
     read_schema: SchemaRef,
@@ -114,10 +119,8 @@ impl Scan {
         &self.predicate
     }
 
-    /// This is the main method to 'materialize' the scan. It returns a `ScanFileBatchIterator`
-    /// which yields record batches of scan files and their associated metadata. Rows of the scan
-    /// files batches correspond to data reads, and the DeltaReader is used to materialize the scan
-    /// files into actual table data.
+    /// Get an iterator of Add actions that should be included in scan for a query. This handles
+    /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible)
     pub fn files(
         &self,
         engine_client: &dyn EngineClient,
@@ -141,7 +144,12 @@ impl Scan {
         ))
     }
 
-    // TODO (nick): Docs for this, also, return type is... wonky
+    /// This is the main method to 'materialize' the scan. It returns a [`Result`] of
+    /// `Vec<`[`ScanResult`]`>`. This calls [`Scan::files`] to get a set of `Add` actions for the scan,
+    /// and then uses the `engine_client`'s [`crate::ParquetHandler`] to read the actual table
+    /// data. Each [`ScanResult`] encapsulates the raw data and an optional boolean vector built
+    /// from the deletion vector if it was present. See the documentation for [`ScanResult`] for
+    /// more details.
     pub fn execute(&self, engine_client: &dyn EngineClient) -> DeltaResult<Vec<ScanResult>> {
         let parquet_handler = engine_client.get_parquet_handler();
         let data_extractor = engine_client.get_data_extactor();

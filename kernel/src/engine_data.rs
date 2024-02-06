@@ -54,8 +54,9 @@ impl<'a> DataItem<'a> {
     );
 }
 
-/// A `DataVisitor` can be called back to visit extracted data. Aside from calling [`visit`] on the
-/// visitor passed to [`extract`], engines do not need to worry about this trait.
+/// A `DataVisitor` can be called back to visit extracted data. Aside from calling
+/// [`DataVisitor::visit`] on the visitor passed to [`crate::DataExtractor::extract`], engines do
+/// not need to worry about this trait.
 pub trait DataVisitor {
     // Receive some data from a call to `extract`. The data in [vals] should not be assumed to live
     // beyond the call to this funtion (i.e. it should be copied if needed)

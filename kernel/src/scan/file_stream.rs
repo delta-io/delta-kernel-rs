@@ -94,7 +94,7 @@ impl LogReplayScanner {
     }
 }
 
-/// Given an iterator of (record batch, bool) tuples and a predicate, returns an iterator of [Add]s.
+/// Given an iterator of (record batch, bool) tuples and a predicate, returns an iterator of `Adds`.
 /// The boolean flag indicates whether the record batch is a log or checkpoint batch.
 pub fn log_replay_iter(
     action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
