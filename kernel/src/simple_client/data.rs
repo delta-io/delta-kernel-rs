@@ -11,6 +11,7 @@ use tracing::{debug, error};
 use url::Url;
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
@@ -103,6 +104,18 @@ impl MapItem for MapArray {
             }
         }
         None
+    }
+
+    fn materialize(&self) -> HashMap<String, Option<String>> {
+        let mut ret = HashMap::new();
+        let keys = self.keys().as_string::<i32>();
+        let values = self.values().as_string::<i32>();
+        for (key, value) in keys.iter().zip(values.iter()) {
+            if let Some(key) = key {
+                ret.insert(key.into(), value.map(|v| v.into()));
+            }
+        }
+        ret
     }
 }
 

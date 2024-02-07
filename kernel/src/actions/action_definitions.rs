@@ -200,24 +200,13 @@ fn visit_metadata(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResul
         "created_time must be i64"
     );
 
-    let mut configuration = HashMap::new();
-    if let Some(m) = vals[8].as_ref() {
-        let map = m
-            .as_map()
-            .ok_or(Error::Extract("Metadata", "configuration must be a map"))?;
-        if let Some(mode) = map.get("delta.columnMapping.mode") {
-            configuration.insert(
-                "delta.columnMapping.mode".to_string(),
-                Some(mode.to_string()),
-            );
+    let configuration = match vals[8].as_ref() {
+        Some(map_item) => {
+            let map = map_item.as_map().ok_or(Error::Extract("Metadata", "configuration must be a map"))?;
+            map.materialize()
         }
-        if let Some(enable) = map.get("delta.enableDeletionVectors") {
-            configuration.insert(
-                "delta.enableDeletionVectors".to_string(),
-                Some(enable.to_string()),
-            );
-        }
-    }
+        None => HashMap::new(),
+    };
 
     Ok(Metadata {
         id,
