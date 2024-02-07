@@ -203,7 +203,7 @@ fn visit_metadata(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResul
     let configuration = match vals[8].as_ref() {
         Some(map_item) => {
             let map = map_item.as_map().ok_or(Error::Extract("Metadata", "configuration must be a map"))?;
-            map.materialize()
+            map.materialize(row_index)
         }
         None => HashMap::new(),
     };
@@ -501,7 +501,7 @@ impl Add {
     }
 }
 
-pub(crate) fn visit_add(_row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<Add> {
+pub(crate) fn visit_add(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<Add> {
     let path = extract_required_item!(
         vals[0],
         as_str,
@@ -511,7 +511,13 @@ pub(crate) fn visit_add(_row_index: usize, vals: &[Option<DataItem<'_>>]) -> Del
     )
     .to_string();
 
-    // TODO(nick): Support partition_values
+    let partition_values = extract_required_item!(
+        vals[1],
+        as_map,
+        "Add",
+        "Add must have partitionValues",
+        "partitionValues must be a map"
+    ).materialize(row_index);
 
     let size = extract_required_item!(
         vals[2],
@@ -601,7 +607,7 @@ pub(crate) fn visit_add(_row_index: usize, vals: &[Option<DataItem<'_>>]) -> Del
 
     Ok(Add {
         path,
-        partition_values: HashMap::new(),
+        partition_values,
         size,
         modification_time,
         data_change,
@@ -810,12 +816,15 @@ pub(crate) fn treemap_to_bools(treemap: RoaringTreemap) -> Vec<bool> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, sync::Arc};
 
+    use arrow_array::{StringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use roaring::RoaringTreemap;
     use url::Url;
 
-    use crate::{simple_client::SimpleClient, EngineClient};
+    use super::*;
+    use crate::{simple_client::{SimpleClient, data::SimpleData, json::SimpleJsonHandler}, EngineClient, actions::schemas::log_schema, JsonHandler};
 
     use super::DeletionVectorDescriptor;
 
@@ -926,5 +935,136 @@ mod tests {
         expected[4294967297] = false;
         expected[4294967300] = false;
         assert_eq!(bools, expected);
+    }
+    fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
+        let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
+        let schema = Arc::new(ArrowSchema::new(vec![string_field]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
+            .expect("Can't convert to record batch");
+        Box::new(SimpleData::new(batch))
+    }
+
+    fn action_batch() -> Box<SimpleData> {
+        let handler = SimpleJsonHandler {};
+        let json_strings: StringArray = vec![
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
+            r#"{"commitInfo":{"timestamp":1677811178585,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isolationLevel":"WriteSerializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"10","numOutputBytes":"635"},"engineInfo":"Databricks-Runtime/<unknown>","txnId":"a6a94671-55ef-450e-9546-b8465b9147de"}}"#,
+            r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
+            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
+        ]
+        .into();
+        let output_schema = Arc::new(log_schema().clone());
+        let parsed = handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        SimpleData::try_from_engine_data(parsed).unwrap()
+    }
+
+    #[test]
+    fn test_parse_protocol() {
+        let client = SimpleClient::new();
+        let data = action_batch();
+        let parsed = Protocol::try_new_from_data(&client, data.as_ref()).unwrap();
+        let expected = Protocol {
+            min_reader_version: 3,
+            min_writer_version: 7,
+            reader_features: Some(vec!["deletionVectors".into()]),
+            writer_features: Some(vec!["deletionVectors".into()]),
+        };
+        assert_eq!(parsed, expected)
+    }
+
+    #[test]
+    fn test_parse_metadata() {
+        let client = SimpleClient::new();
+        let data = action_batch();
+        let parsed = Metadata::try_new_from_data(&client, data.as_ref()).unwrap();
+
+        let configuration = HashMap::from_iter([
+            (
+                "delta.enableDeletionVectors".to_string(),
+                Some("true".to_string()),
+            ),
+            (
+                "delta.columnMapping.mode".to_string(),
+                Some("none".to_string()),
+            ),
+        ]);
+        let expected = Metadata {
+            id: "testId".into(),
+            name: None,
+            description: None,
+            format: Format {
+                provider: "parquet".into(),
+                options: Default::default(),
+            },
+            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
+            partition_columns: Vec::new(),
+            created_time: Some(1677811175819),
+            configuration,
+        };
+        assert_eq!(parsed, expected)
+    }
+
+    #[test]
+    fn test_parse_add_partitioned() {
+        let client = SimpleClient::new();
+        let json_handler = client.get_json_handler();
+        let data_extractor = client.get_data_extactor();
+        let json_strings: StringArray = vec![
+            r#"{"commitInfo":{"timestamp":1670892998177,"operation":"WRITE","operationParameters":{"mode":"Append","partitionBy":"[\"c1\",\"c2\"]"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"3","numOutputRows":"3","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
+            r#"{"add":{"path":"c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet","partitionValues":{"c1":"4","c2":"c"},"size":452,"modificationTime":1670892998135,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":5},\"maxValues\":{\"c3\":5},\"nullCount\":{\"c3\":0}}"}}"#,
+            r#"{"add":{"path":"c1=5/c2=b/part-00007-4e73fa3b-2c88-424a-8051-f8b54328ffdb.c000.snappy.parquet","partitionValues":{"c1":"5","c2":"b"},"size":452,"modificationTime":1670892998136,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":6},\"maxValues\":{\"c3\":6},\"nullCount\":{\"c3\":0}}"}}"#,
+            r#"{"add":{"path":"c1=6/c2=a/part-00011-10619b10-b691-4fd0-acc4-2a9608499d7c.c000.snappy.parquet","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":4},\"maxValues\":{\"c3\":4},\"nullCount\":{\"c3\":0}}"}}"#,
+        ]
+        .into();
+        let output_schema = Arc::new(log_schema().clone());
+        let batch = json_handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        let add_schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
+        let mut multi_add_visitor = MultiVisitor::new(visit_add);
+        data_extractor.extract(batch.as_ref(), Arc::new(add_schema), &mut multi_add_visitor);
+        let add1 = Add {
+            path: "c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet".into(),
+            partition_values: HashMap::from([
+                ("c1".to_string(), Some("4".to_string())),
+                ("c2".to_string(), Some("c".to_string())),
+            ]),
+            size: 452,
+            modification_time: 1670892998135,
+            data_change: true,
+            stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":5},\"maxValues\":{\"c3\":5},\"nullCount\":{\"c3\":0}}".into()),
+            tags: HashMap::new(),
+            deletion_vector: None,
+            base_row_id: None,
+            default_row_commit_version: None,
+        };
+        let add2 = Add {
+            path: "c1=5/c2=b/part-00007-4e73fa3b-2c88-424a-8051-f8b54328ffdb.c000.snappy.parquet".into(),
+            partition_values: HashMap::from([
+                ("c1".to_string(), Some("5".to_string())),
+                ("c2".to_string(), Some("b".to_string())),
+            ]),
+            modification_time: 1670892998136,
+            stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":6},\"maxValues\":{\"c3\":6},\"nullCount\":{\"c3\":0}}".into()),
+            ..add1.clone()
+        };
+        let add3 = Add {
+            path: "c1=6/c2=a/part-00011-10619b10-b691-4fd0-acc4-2a9608499d7c.c000.snappy.parquet".into(),
+            partition_values: HashMap::from([
+                ("c1".to_string(), Some("6".to_string())),
+                ("c2".to_string(), Some("a".to_string())),
+            ]),
+            modification_time: 1670892998137,
+            stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":4},\"maxValues\":{\"c3\":4},\"nullCount\":{\"c3\":0}}".into()),
+            ..add1.clone()
+        };
+        let expected = vec!(add1, add2, add3);
+        for (add, expected) in multi_add_visitor.extracted.into_iter().zip(expected.into_iter()) {
+            assert_eq!(add.unwrap(), expected);
+        }
     }
 }

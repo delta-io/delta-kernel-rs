@@ -92,9 +92,12 @@ impl ListItem for GenericListArray<i32> {
 
 // TODO: This is likely wrong and needs to only scan the correct row
 impl MapItem for MapArray {
-    fn get<'a>(&'a self, key: &str) -> Option<&'a str> {
+    fn get<'a>(&'a self, row_index: usize, key: &str) -> Option<&'a str> {
+        let offsets = self.offsets();
+        let start_offset = offsets[row_index] as usize;
+        let count = offsets[row_index + 1] as usize - start_offset;
         let keys = self.keys().as_string::<i32>();
-        for (idx, map_key) in keys.iter().enumerate() {
+        for (idx,  map_key) in keys.iter().enumerate().skip(start_offset).take(count) {
             if let Some(map_key) = map_key {
                 if key == map_key {
                     // found the item
@@ -106,10 +109,12 @@ impl MapItem for MapArray {
         None
     }
 
-    fn materialize(&self) -> HashMap<String, Option<String>> {
+    fn materialize(&self, row_index: usize) -> HashMap<String, Option<String>> {
         let mut ret = HashMap::new();
-        let keys = self.keys().as_string::<i32>();
-        let values = self.values().as_string::<i32>();
+        let map_val = self.value(row_index);
+        let cols = map_val.columns();
+        let keys = cols[0].as_string::<i32>();
+        let values = cols[1].as_string::<i32>();
         for (key, value) in keys.iter().zip(values.iter()) {
             if let Some(key) = key {
                 ret.insert(key.into(), value.map(|v| v.into()));

@@ -24,8 +24,8 @@ pub trait ListItem {
 
 // a map that can go inside a DataItem
 pub trait MapItem {
-    fn get<'a>(&'a self, key: &str) -> Option<&'a str>;
-    fn materialize(&self) -> HashMap<String, Option<String>>;
+    fn get<'a>(&'a self, row_index: usize, key: &str) -> Option<&'a str>;
+    fn materialize(&self, row_index: usize) -> HashMap<String, Option<String>>;
 }
 
 pub enum DataItem<'a> {
