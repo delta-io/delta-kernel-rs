@@ -202,7 +202,9 @@ fn visit_metadata(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResul
 
     let configuration = match vals[8].as_ref() {
         Some(map_item) => {
-            let map = map_item.as_map().ok_or(Error::Extract("Metadata", "configuration must be a map"))?;
+            let map = map_item
+                .as_map()
+                .ok_or(Error::Extract("Metadata", "configuration must be a map"))?;
             map.materialize(row_index)
         }
         None => HashMap::new(),
@@ -517,7 +519,8 @@ pub(crate) fn visit_add(row_index: usize, vals: &[Option<DataItem<'_>>]) -> Delt
         "Add",
         "Add must have partitionValues",
         "partitionValues must be a map"
-    ).materialize(row_index);
+    )
+    .materialize(row_index);
 
     let size = extract_required_item!(
         vals[2],
@@ -818,13 +821,17 @@ pub(crate) fn treemap_to_bools(treemap: RoaringTreemap) -> Vec<bool> {
 mod tests {
     use std::{path::PathBuf, sync::Arc};
 
-    use arrow_array::{StringArray, RecordBatch};
+    use arrow_array::{RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use roaring::RoaringTreemap;
     use url::Url;
 
     use super::*;
-    use crate::{simple_client::{SimpleClient, data::SimpleData, json::SimpleJsonHandler}, EngineClient, actions::schemas::log_schema, JsonHandler};
+    use crate::{
+        actions::schemas::log_schema,
+        simple_client::{data::SimpleData, json::SimpleJsonHandler, SimpleClient},
+        EngineClient, JsonHandler,
+    };
 
     use super::DeletionVectorDescriptor;
 
@@ -1062,8 +1069,12 @@ mod tests {
             stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":4},\"maxValues\":{\"c3\":4},\"nullCount\":{\"c3\":0}}".into()),
             ..add1.clone()
         };
-        let expected = vec!(add1, add2, add3);
-        for (add, expected) in multi_add_visitor.extracted.into_iter().zip(expected.into_iter()) {
+        let expected = vec![add1, add2, add3];
+        for (add, expected) in multi_add_visitor
+            .extracted
+            .into_iter()
+            .zip(expected.into_iter())
+        {
             assert_eq!(add.unwrap(), expected);
         }
     }

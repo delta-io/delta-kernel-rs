@@ -1,5 +1,4 @@
 /// Code to parse and handle actions from the delta log
-
 pub(crate) mod action_definitions;
 pub(crate) mod schemas;
 pub(crate) mod types;

@@ -173,8 +173,7 @@ impl Scan {
                 })
                 .transpose()?;
 
-            let mut dv_mask =
-                dv_treemap.map(|mask| super::actions::action_definitions::treemap_to_bools(mask));
+            let mut dv_mask = dv_treemap.map(super::actions::action_definitions::treemap_to_bools);
 
             for read_result in read_results {
                 let len = if let Ok(ref res) = read_result {

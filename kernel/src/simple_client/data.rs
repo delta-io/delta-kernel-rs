@@ -97,7 +97,7 @@ impl MapItem for MapArray {
         let start_offset = offsets[row_index] as usize;
         let count = offsets[row_index + 1] as usize - start_offset;
         let keys = self.keys().as_string::<i32>();
-        for (idx,  map_key) in keys.iter().enumerate().skip(start_offset).take(count) {
+        for (idx, map_key) in keys.iter().enumerate().skip(start_offset).take(count) {
             if let Some(map_key) = map_key {
                 if key == map_key {
                     // found the item

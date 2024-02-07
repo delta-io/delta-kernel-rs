@@ -1,4 +1,7 @@
-use std::{any::{Any, TypeId}, collections::HashMap};
+use std::{
+    any::{Any, TypeId},
+    collections::HashMap,
+};
 
 macro_rules! gen_casts {
     (($fnname: ident, $enum_ty: ident, $typ: ty)) => {
