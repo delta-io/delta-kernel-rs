@@ -18,7 +18,8 @@ use crate::error::{DeltaResult, Error};
 use crate::expressions::{scalars::Scalar, Expression};
 use crate::expressions::{BinaryOperator, UnaryOperator, VariadicOperator};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
-use crate::{ExpressionEvaluator, ExpressionHandler};
+use crate::simple_client::data::SimpleData;
+use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
 
 // TODO leverage scalars / Datum
 
@@ -161,7 +162,12 @@ pub struct DefaultExpressionEvaluator {
 }
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
-    fn evaluate(&self, batch: &RecordBatch) -> DeltaResult<RecordBatch> {
+    fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+        let batch = batch
+            .as_any()
+            .downcast_ref::<SimpleData>()
+            .ok_or(Error::EngineDataType("SimpleData".into()))?
+            .record_batch();
         let _result = evaluate_expression(&self.expression, batch)?;
         // TODO handled in #83
         todo!()

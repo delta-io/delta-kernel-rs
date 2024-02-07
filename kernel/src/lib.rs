@@ -39,7 +39,6 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
 use bytes::Bytes;
 use url::Url;
 
@@ -100,7 +99,7 @@ pub trait ExpressionEvaluator {
     ///
     /// Contains one value for each row of the input.
     /// The data type of the output is same as the type output of the expression this evaluator is using.
-    fn evaluate(&self, batch: &RecordBatch) -> DeltaResult<RecordBatch>;
+    fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>>;
 }
 
 /// Provides expression evaluation capability to Delta Kernel.
