@@ -665,7 +665,8 @@ pub(crate) struct Remove {
 }
 
 impl Remove {
-    pub(crate) fn try_new_from_data(
+    // _try_new_from_data for now, to avoid warning, probably will need at some point
+    pub(crate) fn _try_new_from_data(
         engine_client: &dyn EngineClient,
         data: &dyn EngineData,
     ) -> DeltaResult<Remove> {

@@ -57,9 +57,7 @@ impl SimpleClient {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         SimpleClient {
-            data_extractor: Arc::new(SimpleDataExtractor {
-                expected_tag: data::SimpleDataTypeTag,
-            }),
+            data_extractor: Arc::new(SimpleDataExtractor::new()),
             fs_client: Arc::new(fs_client::SimpleFilesystemClient {}),
             json_handler: Arc::new(json::SimpleJsonHandler {}),
             parquet_handler: Arc::new(parquet::SimpleParquetHandler {}),

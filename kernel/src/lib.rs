@@ -60,7 +60,10 @@ pub use error::{DeltaResult, Error};
 pub use expressions::Expression;
 pub use table::Table;
 
-// TODO: Feature flag
+#[cfg(feature = "arrow-conversion")]
+pub mod arrow_conversion;
+
+#[cfg(feature = "simple-client")]
 pub mod simple_client;
 
 #[cfg(feature = "default-client")]
