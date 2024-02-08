@@ -105,6 +105,7 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
 
+    use bytes::{BytesMut, BufMut};
     use url::Url;
 
     use super::SimpleFilesystemClient;
@@ -145,6 +146,29 @@ mod tests {
             file_count += 1;
         }
         assert_eq!(file_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_files() -> Result<(), Box<dyn std::error::Error>> {
+        let client = SimpleFilesystemClient;
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("0001.json");
+        let mut f = File::create(path.clone())?;
+        writeln!(f, "null")?;
+        let url = Url::from_file_path(path).unwrap();
+        let file_slice = (url.clone(), None);
+        let read = client.read_files(vec![file_slice])?;
+        let mut file_count = 0;
+        let mut buf = BytesMut::with_capacity(16);
+        buf.put(&b"null\n"[..]);
+        let a = buf.split();
+        for result in read {
+            let result = result?;
+            assert_eq!(result, a);
+            file_count += 1;
+        }
+        assert_eq!(file_count, 1);
         Ok(())
     }
 }
