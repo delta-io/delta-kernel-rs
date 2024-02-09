@@ -83,18 +83,13 @@ fn read_from_json<R: BufRead>(
     std::iter::from_fn(move || next().transpose()).collect::<Result<Vec<_>, _>>()
 }
 
-fn insert_nulls(
-    batches: &mut Vec<RecordBatch>,
-    null_count: usize,
-    schema: ArrowSchemaRef,
-) -> Result<(), ArrowError> {
+fn get_nulls(null_count: usize, schema: ArrowSchemaRef) -> Result<Vec<RecordBatch>, ArrowError> {
     let columns = schema
         .fields
         .iter()
         .map(|field| new_null_array(field.data_type(), null_count))
         .collect();
-    batches.push(RecordBatch::try_new(schema, columns)?);
-    Ok(())
+    Ok(vec![RecordBatch::try_new(schema, columns)?])
 }
 
 #[inline]
@@ -118,47 +113,41 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
                 ))
             })?;
         let output_schema: ArrowSchemaRef = Arc::new(output_schema.as_ref().try_into()?);
+        if json_strings.is_empty() {
+            return Ok(RecordBatch::new_empty(output_schema));
+        }
+
         let mut decoder = ReaderBuilder::new(output_schema.clone())
             .with_batch_size(self.batch_size)
             .build_decoder()?;
         let mut batches = Vec::new();
 
-        let mut null_count = 0;
-        let mut value_count = 0;
-        let mut value_start = 0;
+        let mut run_is_null = json_strings.is_null(0);
+        let mut mark = 0;
 
-        for it in 0..json_strings.len() {
-            if json_strings.is_null(it) {
-                if value_count > 0 {
-                    let slice = json_strings.slice(value_start, value_count);
-                    let batch = read_from_json(get_reader(slice.value_data()), &mut decoder)?;
-                    batches.extend(batch);
-                    value_count = 0;
-                }
-                null_count += 1;
-                continue;
+        let result_schema = output_schema.clone();
+        let mut emit_run = move |run_len: usize| {
+            if run_is_null {
+                get_nulls(run_len, output_schema.clone())
+            } else {
+                let slice = json_strings.slice(mark, run_len);
+                let batch = read_from_json(get_reader(slice.value_data()), &mut decoder).unwrap();
+                Ok(batch)
             }
-            if value_count == 0 {
-                value_start = it;
+        };
+
+        for it in 1..json_strings.len() {
+            let value_is_null = json_strings.is_null(it);
+            if run_is_null != value_is_null {
+                // polarity change! emit the previous run
+                batches.extend(emit_run(it - mark)?);
+                run_is_null = value_is_null;
+                mark = it;
             }
-            if null_count > 0 {
-                insert_nulls(&mut batches, null_count, output_schema.clone())?;
-                null_count = 0;
-            }
-            value_count += 1;
         }
+        batches.extend(emit_run(json_strings.len() - mark)?);
 
-        if null_count > 0 {
-            insert_nulls(&mut batches, null_count, output_schema.clone())?;
-        }
-
-        if value_count > 0 {
-            let slice = json_strings.slice(value_start, value_count);
-            let batch = read_from_json(get_reader(slice.value_data()), &mut decoder)?;
-            batches.extend(batch);
-        }
-
-        Ok(concat_batches(&output_schema, &batches)?)
+        Ok(concat_batches(&result_schema, &batches)?)
     }
 
     fn read_json_files(
