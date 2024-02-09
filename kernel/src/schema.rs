@@ -126,6 +126,9 @@ impl StructField {
 pub struct StructType {
     pub type_name: String,
     /// The type of element stored in this array
+    // We use indexmap to preserve the order of fields as they are defined in the schema
+    // while also allowing for fast lookup by name. The atlerative to do a liner search
+    // for each field by name would be potentially quite expensive for large schemas.
     pub fields: IndexMap<String, StructField>,
 }
 

@@ -437,11 +437,7 @@ mod tests {
         let expected = Arc::new(BooleanArray::from(vec![false, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
-        let expression = Box::new(
-            column_a
-                .clone()
-                .and(Expression::literal(Scalar::Boolean(true))),
-        );
+        let expression = Box::new(column_a.clone().and(Expression::literal(true)));
         let results =
             evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN))
                 .unwrap();
