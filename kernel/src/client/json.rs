@@ -1,13 +1,13 @@
 //! Default Json handler implementation
 
-use std::io::{BufRead, BufReader, Cursor};
+use std::io::BufReader;
 use std::ops::Range;
 use std::sync::Arc;
 use std::task::{ready, Poll};
 
 use arrow_array::{new_null_array, Array, ArrayRef, RecordBatch, StringArray};
-use arrow_json::{reader::Decoder, ReaderBuilder};
-use arrow_schema::{ArrowError, SchemaRef as ArrowSchemaRef};
+use arrow_json::ReaderBuilder;
+use arrow_schema::SchemaRef as ArrowSchemaRef;
 use arrow_select::concat::concat_batches;
 use bytes::{Buf, Bytes};
 use futures::{StreamExt, TryStreamExt};
@@ -58,43 +58,27 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
     }
 }
 
-fn read_from_json<R: BufRead>(
-    mut reader: R,
-    decoder: &mut Decoder,
-) -> Result<Vec<RecordBatch>, ArrowError> {
-    let mut next = move || {
-        loop {
-            // Decoder is agnostic that buf doesn't contain whole records
-            let buf = reader.fill_buf()?;
-            if buf.is_empty() {
-                break; // Input exhausted
-            }
-            let read = buf.len();
-            let decoded = decoder.decode(buf)?;
-
-            // Consume the number of bytes read
-            reader.consume(decoded);
-            if decoded != read {
-                break; // Read batch size
-            }
-        }
-        decoder.flush()
-    };
-    std::iter::from_fn(move || next().transpose()).collect::<Result<Vec<_>, _>>()
-}
-
-fn get_nulls(null_count: usize, schema: ArrowSchemaRef) -> Result<Vec<RecordBatch>, ArrowError> {
-    let columns = schema
-        .fields
-        .iter()
-        .map(|field| new_null_array(field.data_type(), null_count))
-        .collect();
-    Ok(vec![RecordBatch::try_new(schema, columns)?])
-}
-
-#[inline]
-fn get_reader(data: &[u8]) -> BufReader<Cursor<&[u8]>> {
-    BufReader::new(Cursor::new(data))
+fn hack_parse(
+    stats_schema: &ArrowSchemaRef,
+    json_string: Option<&str>,
+) -> DeltaResult<RecordBatch> {
+    match json_string {
+        Some(s) => Ok(ReaderBuilder::new(stats_schema.clone())
+            .build(BufReader::new(s.as_bytes()))?
+            .collect::<Vec<_>>()
+            .into_iter()
+            .next()
+            .transpose()?
+            .ok_or(Error::missing_data("Expected data"))?),
+        None => Ok(RecordBatch::try_new(
+            stats_schema.clone(),
+            stats_schema
+                .fields
+                .iter()
+                .map(|field| new_null_array(field.data_type(), 1))
+                .collect(),
+        )?),
+    }
 }
 
 impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
@@ -117,37 +101,14 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             return Ok(RecordBatch::new_empty(output_schema));
         }
 
-        let mut decoder = ReaderBuilder::new(output_schema.clone())
-            .with_batch_size(self.batch_size)
-            .build_decoder()?;
-        let mut batches = Vec::new();
-
-        let mut run_is_null = json_strings.is_null(0);
-        let mut mark = 0;
-
-        let result_schema = output_schema.clone();
-        let mut emit_run = move |run_len: usize| {
-            if run_is_null {
-                get_nulls(run_len, output_schema.clone())
-            } else {
-                let slice = json_strings.slice(mark, run_len);
-                let batch = read_from_json(get_reader(slice.value_data()), &mut decoder).unwrap();
-                Ok(batch)
-            }
-        };
-
-        for it in 1..json_strings.len() {
-            let value_is_null = json_strings.is_null(it);
-            if run_is_null != value_is_null {
-                // polarity change! emit the previous run
-                batches.extend(emit_run(it - mark)?);
-                run_is_null = value_is_null;
-                mark = it;
-            }
-        }
-        batches.extend(emit_run(json_strings.len() - mark)?);
-
-        Ok(concat_batches(&result_schema, &batches)?)
+        Ok(concat_batches(
+            &output_schema,
+            json_strings
+                .iter()
+                .map(|json_string| hack_parse(&output_schema, json_string))
+                .collect::<Result<Vec<_>, _>>()?
+                .iter(),
+        )?)
     }
 
     fn read_json_files(
