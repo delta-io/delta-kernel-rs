@@ -91,6 +91,18 @@ impl Display for Scalar {
     }
 }
 
+impl From<i8> for Scalar {
+    fn from(i: i8) -> Self {
+        Self::Byte(i)
+    }
+}
+
+impl From<i16> for Scalar {
+    fn from(i: i16) -> Self {
+        Self::Short(i)
+    }
+}
+
 impl From<i32> for Scalar {
     fn from(i: i32) -> Self {
         Self::Integer(i)

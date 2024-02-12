@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use arrow_array::{BooleanArray, RecordBatch, StructArray};
+use arrow_array::cast::AsArray;
+use arrow_array::{BooleanArray, RecordBatch};
 use arrow_select::concat::concat_batches;
 use arrow_select::filter::filter_record_batch;
 use itertools::Itertools;
@@ -200,12 +201,10 @@ impl Scan {
                     let mut fields =
                         Vec::with_capacity(partition_fields.len() + batch.num_columns());
                     for field in &partition_fields {
-                        let value_expression = match add.partition_values.get(field.name()) {
-                            Some(Some(value)) => {
-                                Expression::Literal(get_partition_value(value, field.data_type())?)
-                            }
-                            _ => Expression::Literal(Scalar::Null(field.data_type().clone())),
-                        };
+                        let value_expression = Expression::Literal(parse_partition_value(
+                            add.partition_values.get(field.name()),
+                            field.data_type(),
+                        )?);
                         fields.push(value_expression);
                     }
                     fields.extend(select_fields.clone());
@@ -218,8 +217,7 @@ impl Scan {
 
                     evaluator
                         .evaluate(&batch)?
-                        .as_any()
-                        .downcast_ref::<StructArray>()
+                        .as_struct_opt()
                         .ok_or(Error::UnexpectedColumnType("Unexpected array type".into()))?
                         .into()
                 };
@@ -240,10 +238,18 @@ impl Scan {
     }
 }
 
-fn get_partition_value(raw: &str, data_type: &DataType) -> DeltaResult<Scalar> {
-    match data_type {
-        DataType::Primitive(primitive) => primitive.parse_scalar(raw),
-        _ => todo!(),
+fn parse_partition_value(
+    raw: Option<&Option<String>>,
+    data_type: &DataType,
+) -> DeltaResult<Scalar> {
+    match raw {
+        None | Some(None) => Ok(Scalar::Null(data_type.clone())),
+        Some(Some(v)) => match data_type {
+            DataType::Primitive(primitive) => primitive.parse_scalar(v),
+            _ => Err(Error::Generic(format!(
+                "Unexpected partition column type: {data_type:?}"
+            ))),
+        },
     }
 }
 
@@ -342,7 +348,11 @@ mod tests {
         ];
 
         for (raw, data_type, expected) in &cases {
-            let value = get_partition_value(raw, &DataType::Primitive(data_type.clone())).unwrap();
+            let value = parse_partition_value(
+                Some(&Some(raw.to_string())),
+                &DataType::Primitive(data_type.clone()),
+            )
+            .unwrap();
             assert_eq!(value, *expected);
         }
     }

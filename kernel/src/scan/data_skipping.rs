@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_array::{Array, BooleanArray, RecordBatch, StructArray};
+use arrow_array::cast::AsArray;
+use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_select::filter::filter_record_batch;
 use tracing::debug;
 
@@ -192,8 +193,7 @@ impl DataSkippingFilter {
 
         let skipping_predicate = self.skipping_evaluator.evaluate(&parsed_stats)?;
         let skipping_predicate = skipping_predicate
-            .as_any()
-            .downcast_ref::<StructArray>()
+            .as_struct_opt()
             .ok_or(Error::UnexpectedColumnType(
                 "Expected type 'StructArray'.".into(),
             ))?

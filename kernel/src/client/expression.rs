@@ -13,6 +13,7 @@ use arrow_array::{
 };
 use arrow_ord::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{ArrowError, Schema as ArrowSchema};
+use itertools::Itertools;
 
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{BinaryOperator, Expression, Scalar, UnaryOperator, VariadicOperator};
@@ -157,15 +158,13 @@ fn evaluate_expression(
         }
         (Struct(fields), Some(DataType::Struct(schema))) => {
             let output_schema: ArrowSchema = schema.as_ref().try_into()?;
-            let mut columns = Vec::with_capacity(fields.len());
-            for (expr, field) in fields.iter().zip(schema.fields()) {
-                columns.push(evaluate_expression(expr, batch, Some(field.data_type()))?);
-            }
-            Ok(Arc::new(StructArray::try_new(
-                output_schema.fields().clone(),
-                columns,
-                None,
-            )?))
+            let columns = fields
+                .iter()
+                .zip(schema.fields())
+                .map(|(expr, field)| evaluate_expression(expr, batch, Some(field.data_type())));
+            let result =
+                StructArray::try_new(output_schema.fields().clone(), columns.try_collect()?, None)?;
+            Ok(Arc::new(result))
         }
         (Struct(_), _) => Err(Error::Generic(
             "Data type is required to evaluate struct expressions".to_string(),
@@ -218,7 +217,7 @@ fn evaluate_expression(
             // NOTE: If we get here, it would be a bug in our code. However it does swallow
             // the error message from the compiler if we add variants to the enum and forget to add them here.
             Err(Error::Generic(format!(
-                "Current variadic expressions are expected to return boolean results, got {:?}",
+                "Variadic {expression:?} is expected to return boolean results, got {:?}",
                 result_type
             )))
         }

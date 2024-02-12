@@ -4,6 +4,7 @@ use arrow_schema::{
     ArrowError, DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
+use itertools::Itertools;
 
 use crate::actions::ActionType;
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
@@ -20,11 +21,7 @@ impl TryFrom<&StructType> for ArrowSchema {
     type Error = ArrowError;
 
     fn try_from(s: &StructType) -> Result<Self, ArrowError> {
-        let fields = s
-            .fields()
-            .map(TryInto::try_into)
-            .collect::<Result<Vec<ArrowField>, ArrowError>>()?;
-
+        let fields: Vec<ArrowField> = s.fields().map(TryInto::try_into).try_collect()?;
         Ok(ArrowSchema::new(fields))
     }
 }
