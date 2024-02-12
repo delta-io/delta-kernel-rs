@@ -323,8 +323,7 @@ impl DataSkippingFilter {
             "number of actions before/after data skipping: {before_count} / {}",
             after.num_rows()
         );
-        let res = Box::new(SimpleData::new(after));
-        Ok(res)
+        Ok(Box::new(SimpleData::new(after)))
     }
 
     fn hack_parse(

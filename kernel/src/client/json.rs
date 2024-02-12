@@ -84,9 +84,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             .build(Cursor::new(data))?
             .collect::<Result<Vec<_>, _>>()?;
 
-        let res: Box<dyn EngineData> =
-            Box::new(SimpleData::new(concat_batches(&schema, &batches)?));
-        Ok(res)
+        Ok(Box::new(SimpleData::new(concat_batches(&schema, &batches)?)))
     }
 
     fn read_json_files(

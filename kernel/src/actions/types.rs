@@ -199,7 +199,7 @@ pub struct Remove {
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
     pub path: String,
 
-    /// The time this logical file was created, as milliseconds since the epoch.
+    /// The time this logical file was removed, as milliseconds since the epoch.
     pub deletion_timestamp: Option<i64>,
 
     /// When `false` the logical file must already be present in the table or the records
