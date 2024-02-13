@@ -30,6 +30,8 @@ pub enum BinaryOperator {
     Equal,
     /// Comparison Not Equal
     NotEqual,
+    /// Distinct
+    Distinct,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,6 +53,10 @@ impl Display for BinaryOperator {
             Self::GreaterThanOrEqual => write!(f, ">="),
             Self::Equal => write!(f, "="),
             Self::NotEqual => write!(f, "!="),
+            // TODO(roeap): AFAIK DISTINCT does not have a commonly used operator symbol
+            // so ideally this would not be used as we use Display for rendering expressions
+            // in our code we take care of this, bot thers might now ...
+            Self::Distinct => write!(f, "DISTINCT"),
         }
     }
 }
@@ -99,12 +105,6 @@ pub enum Expression {
         /// The expressions.
         exprs: Vec<Expression>,
     },
-    Distinct {
-        /// left hand side of the distinct
-        lhs: Box<Expression>,
-        /// right hand side of the distinct
-        rhs: Box<Expression>,
-    },
     // TODO: support more expressions, such as IS IN, LIKE, etc.
 }
 
@@ -124,6 +124,11 @@ impl Display for Expression {
                 "Struct({})",
                 &exprs.iter().map(|e| format!("{e}")).join(", ")
             ),
+            Self::BinaryOperation {
+                op: BinaryOperator::Distinct,
+                left,
+                right,
+            } => write!(f, "DISTINCT({}, {})", left, right),
             Self::BinaryOperation { op, left, right } => write!(f, "{} {} {}", left, op, right),
             Self::UnaryOperation { op, expr } => match op {
                 UnaryOperator::Not => write!(f, "NOT {}", expr),
@@ -145,7 +150,6 @@ impl Display for Expression {
                     )
                 }
             },
-            Self::Distinct { lhs, rhs } => write!(f, "DISTINCT({}, {})", lhs, rhs),
         }
     }
 }
@@ -273,9 +277,10 @@ impl Expression {
 
     /// Create a new expression `DISTINCT(self, other)`
     pub fn distinct(self, other: Self) -> Self {
-        Self::Distinct {
-            lhs: Box::new(self),
-            rhs: Box::new(other),
+        Self::BinaryOperation {
+            op: BinaryOperator::Distinct,
+            left: Box::new(self),
+            right: Box::new(other),
         }
     }
 
@@ -298,10 +303,6 @@ impl Expression {
                 }
                 Self::VariadicOperation { exprs, .. } => {
                     stack.extend(exprs.iter());
-                }
-                Self::Distinct { lhs, rhs } => {
-                    stack.push(lhs);
-                    stack.push(rhs);
                 }
             }
             Some(expr)

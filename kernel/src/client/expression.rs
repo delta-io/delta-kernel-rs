@@ -192,11 +192,12 @@ fn evaluate_expression(
                 GreaterThanOrEqual => |l, r| gt_eq(l, r).map(wrap_comparison_result),
                 Equal => |l, r| eq(l, r).map(wrap_comparison_result),
                 NotEqual => |l, r| neq(l, r).map(wrap_comparison_result),
+                Distinct => |l, r| distinct(l, r).map(wrap_comparison_result),
             };
 
             eval(&left_arr, &right_arr).map_err(Error::generic_err)
         }
-        (VariadicOperation { op, exprs }, Some(&DataType::BOOLEAN)) => {
+        (VariadicOperation { op, exprs }, None | Some(&DataType::BOOLEAN)) => {
             type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
             let (reducer, default): (Operation, _) = match op {
                 VariadicOperator::And => (and, true),
@@ -217,19 +218,9 @@ fn evaluate_expression(
             // NOTE: If we get here, it would be a bug in our code. However it does swallow
             // the error message from the compiler if we add variants to the enum and forget to add them here.
             Err(Error::Generic(format!(
-                "Variadic {expression:?} is expected to return boolean results, got {:?}",
-                result_type
+                "Variadic {expression:?} is expected to return boolean results, got {result_type:?}"
             )))
         }
-        (Distinct { lhs, rhs }, Some(&DataType::BOOLEAN)) => {
-            let lhs_arr = evaluate_expression(lhs.as_ref(), batch, None)?;
-            let rhs_arr = evaluate_expression(rhs.as_ref(), batch, None)?;
-            Ok(distinct(&lhs_arr, &rhs_arr).map(wrap_comparison_result)?)
-        }
-        (Distinct { .. }, _) => Err(Error::Generic(format!(
-            "Distinct will always return boolean result, got {:?}",
-            result_type
-        ))),
     }
 }
 
