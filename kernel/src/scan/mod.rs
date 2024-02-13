@@ -201,11 +201,11 @@ impl Scan {
                     let mut fields =
                         Vec::with_capacity(partition_fields.len() + batch.num_columns());
                     for field in &partition_fields {
-                        let value_expression = Expression::Literal(parse_partition_value(
+                        let value_expression = parse_partition_value(
                             add.partition_values.get(field.name()),
                             field.data_type(),
-                        )?);
-                        fields.push(value_expression);
+                        )?;
+                        fields.push(Expression::Literal(value_expression));
                     }
                     fields.extend(select_fields.clone());
 
