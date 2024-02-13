@@ -153,12 +153,12 @@ impl PrimitiveType {
 
         match self {
             String => Ok(Scalar::String(raw.to_string())),
-            Byte => self.str_parse_scalar(raw, Scalar::Byte),
-            Short => self.str_parse_scalar(raw, Scalar::Short),
-            Integer => self.str_parse_scalar(raw, Scalar::Integer),
-            Long => self.str_parse_scalar(raw, Scalar::Long),
-            Float => self.str_parse_scalar(raw, Scalar::Float),
-            Double => self.str_parse_scalar(raw, Scalar::Double),
+            Byte => self.parse_str_as_scalar(raw, Scalar::Byte),
+            Short => self.parse_str_as_scalar(raw, Scalar::Short),
+            Integer => self.parse_str_as_scalar(raw, Scalar::Integer),
+            Long => self.parse_str_as_scalar(raw, Scalar::Long),
+            Float => self.parse_str_as_scalar(raw, Scalar::Float),
+            Double => self.parse_str_as_scalar(raw, Scalar::Double),
             Boolean => {
                 if raw.eq_ignore_ascii_case("true") {
                     Ok(Scalar::Boolean(true))
@@ -195,7 +195,11 @@ impl PrimitiveType {
         Error::ParseError(raw.to_string(), self.data_type())
     }
 
-    fn str_parse_scalar<T: std::str::FromStr>(
+    /// Parse a string as a scalar value, returning an error if the string is not parseable.
+    ///
+    /// The `f` function is used to convert the parsed value into a `Scalar`.
+    /// The desired type that `FromStr::parse` should parse into is inferred from the parameter type of `f`.
+    fn parse_str_as_scalar<T: std::str::FromStr>(
         &self,
         raw: &str,
         f: impl FnOnce(T) -> Scalar,

@@ -166,14 +166,14 @@ impl Scan {
             .map(|column| {
                 self.schema()
                     .field(column)
-                    .ok_or(Error::Generic("Unexpected partition column".to_string()))
+                    .ok_or(Error::generic("Unexpected partition column"))
             })
             .collect::<DeltaResult<Vec<_>>>()?;
         partition_fields.reverse();
 
         let select_fields = read_schema
             .fields()
-            .map(|f| Expression::Column(f.name().to_string()))
+            .map(|f| Expression::column(f.name()))
             .collect_vec();
 
         self.files(engine_interface)?
@@ -186,7 +186,7 @@ impl Scan {
                 };
                 let batches = parquet_handler
                     .read_parquet_files(&[meta], read_schema.clone(), None)?
-                    .collect::<DeltaResult<Vec<_>>>()?;
+                    .try_collect::<_, Vec<_>, _>()?;
 
                 if batches.is_empty() {
                     return Ok(None);
@@ -218,7 +218,7 @@ impl Scan {
                     evaluator
                         .evaluate(&batch)?
                         .as_struct_opt()
-                        .ok_or(Error::UnexpectedColumnType("Unexpected array type".into()))?
+                        .ok_or(Error::unexpected_column_type("Unexpected array type"))?
                         .into()
                 };
 
@@ -243,13 +243,13 @@ fn parse_partition_value(
     data_type: &DataType,
 ) -> DeltaResult<Scalar> {
     match raw {
-        None | Some(None) => Ok(Scalar::Null(data_type.clone())),
         Some(Some(v)) => match data_type {
             DataType::Primitive(primitive) => primitive.parse_scalar(v),
-            _ => Err(Error::Generic(format!(
+            _ => Err(Error::generic(format!(
                 "Unexpected partition column type: {data_type:?}"
             ))),
         },
+        _ => Ok(Scalar::Null(data_type.clone())),
     }
 }
 

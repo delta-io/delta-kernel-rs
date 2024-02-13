@@ -11,6 +11,7 @@ use arrow_schema::SchemaRef as ArrowSchemaRef;
 use arrow_select::concat::concat_batches;
 use bytes::{Buf, Bytes};
 use futures::{StreamExt, TryStreamExt};
+use itertools::Itertools;
 use object_store::path::Path;
 use object_store::{DynObjectStore, GetResultPayload};
 
@@ -65,8 +66,6 @@ fn hack_parse(
     match json_string {
         Some(s) => Ok(ReaderBuilder::new(stats_schema.clone())
             .build(BufReader::new(s.as_bytes()))?
-            .collect::<Vec<_>>()
-            .into_iter()
             .next()
             .transpose()?
             .ok_or(Error::missing_data("Expected data"))?),
@@ -91,9 +90,8 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| {
-                Error::Generic(format!(
-                    "Expected json_strings to be a StringArray, found {:?}",
-                    json_strings
+                Error::generic(format!(
+                    "Expected json_strings to be a StringArray, found {json_strings:?}"
                 ))
             })?;
         let output_schema: ArrowSchemaRef = Arc::new(output_schema.as_ref().try_into()?);
@@ -106,7 +104,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             json_strings
                 .iter()
                 .map(|json_string| hack_parse(&output_schema, json_string))
-                .collect::<Result<Vec<_>, _>>()?
+                .try_collect::<_, Vec<_>, _>()?
                 .iter(),
         )?)
     }
@@ -124,9 +122,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
         let store = self.store.clone();
         let file_reader = JsonOpener::new(self.batch_size, schema.clone(), store);
-
-        let files = files.to_vec();
-        let stream = FileStream::new(files, schema, file_reader)?;
+        let stream = FileStream::new(files.to_vec(), schema, file_reader)?;
 
         // This channel will become the output iterator
         // The stream will execute in the background, and we allow up to `readahead`

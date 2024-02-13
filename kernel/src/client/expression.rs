@@ -166,8 +166,8 @@ fn evaluate_expression(
                 StructArray::try_new(output_schema.fields().clone(), columns.try_collect()?, None)?;
             Ok(Arc::new(result))
         }
-        (Struct(_), _) => Err(Error::Generic(
-            "Data type is required to evaluate struct expressions".to_string(),
+        (Struct(_), _) => Err(Error::generic(
+            "Data type is required to evaluate struct expressions",
         )),
         (UnaryOperation { op, expr }, _) => {
             let arr = evaluate_expression(expr.as_ref(), batch, None)?;

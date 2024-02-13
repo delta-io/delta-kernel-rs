@@ -194,8 +194,8 @@ impl DataSkippingFilter {
         let skipping_predicate = self.skipping_evaluator.evaluate(&parsed_stats)?;
         let skipping_predicate = skipping_predicate
             .as_struct_opt()
-            .ok_or(Error::UnexpectedColumnType(
-                "Expected type 'StructArray'.".into(),
+            .ok_or(Error::unexpected_column_type(
+                "Expected type 'StructArray'.",
             ))?
             .into();
         let skipping_vector = self.filter_evaluator.evaluate(&skipping_predicate)?;
