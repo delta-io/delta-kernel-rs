@@ -144,24 +144,16 @@ impl Scan {
     pub fn execute(&self, engine_interface: &dyn EngineInterface) -> DeltaResult<Vec<RecordBatch>> {
         let parquet_handler = engine_interface.get_parquet_handler();
 
+        let partition_columns = &self.snapshot.metadata().partition_columns;
         let read_schema = Arc::new(StructType::new(
             self.schema()
                 .fields()
-                .filter(|f| {
-                    !self
-                        .snapshot
-                        .metadata()
-                        .partition_columns
-                        .contains(f.name())
-                })
+                .filter(|f| !partition_columns.contains(f.name()))
                 .cloned()
                 .collect::<Vec<_>>(),
         ));
 
-        let mut partition_fields = self
-            .snapshot
-            .metadata()
-            .partition_columns
+        let mut partition_fields = partition_columns
             .iter()
             .map(|column| {
                 self.schema()
