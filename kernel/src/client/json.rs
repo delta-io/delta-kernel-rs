@@ -11,7 +11,6 @@ use arrow_schema::SchemaRef as ArrowSchemaRef;
 use arrow_select::concat::concat_batches;
 use bytes::{Buf, Bytes};
 use futures::{StreamExt, TryStreamExt};
-use itertools::Itertools;
 use object_store::path::Path;
 use object_store::{DynObjectStore, GetResultPayload};
 
@@ -104,7 +103,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             json_strings
                 .iter()
                 .map(|json_string| hack_parse(&output_schema, json_string))
-                .try_collect::<_, Vec<_>, _>()?
+                .collect::<Result<Vec<_>, _>>()?
                 .iter(),
         )?)
     }

@@ -277,11 +277,7 @@ impl Expression {
 
     /// Create a new expression `DISTINCT(self, other)`
     pub fn distinct(self, other: Self) -> Self {
-        Self::BinaryOperation {
-            op: BinaryOperator::Distinct,
-            left: Box::new(self),
-            right: Box::new(other),
-        }
+        Self::binary(BinaryOperator::Distinct, self, other)
     }
 
     fn walk(&self) -> impl Iterator<Item = &Self> + '_ {

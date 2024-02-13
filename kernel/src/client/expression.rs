@@ -215,8 +215,7 @@ fn evaluate_expression(
                 })
         }
         (VariadicOperation { .. }, _) => {
-            // NOTE: If we get here, it would be a bug in our code. However it does swallow
-            // the error message from the compiler if we add variants to the enum and forget to add them here.
+            // NOTE: Update this error message if we add support for variadic operations on other types
             Err(Error::Generic(format!(
                 "Variadic {expression:?} is expected to return boolean results, got {result_type:?}"
             )))
