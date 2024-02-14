@@ -15,15 +15,14 @@ impl ParquetHandler for SimpleParquetHandler {
         if files.is_empty() {
             return Ok(Box::new(std::iter::empty()));
         }
-        let mut res = vec![];
-        for file in files.iter() {
+        let locations: Vec<_> = files.iter().map(|file| file.location.clone()).collect();
+        Ok(Box::new(locations.into_iter().map(move |location| {
             let d = super::data::SimpleData::try_create_from_parquet(
                 schema.clone(),
-                file.location.clone(),
-            )?;
+                location
+            );
             #[allow(trivial_casts)]
-            res.push(Ok(Box::new(d) as _));
-        }
-        Ok(Box::new(res.into_iter()))
+            d.map(|d| Box::new(d) as _)
+        })))
     }
 }

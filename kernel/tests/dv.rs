@@ -20,12 +20,11 @@ fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let stream = scan.execute(&engine_client)?;
     let mut total_rows = 0;
     for res in stream {
-        if let Ok(ref data) = res.raw_data {
-            let rows = extractor.length(&**data);
-            for i in 0..rows {
-                if res.mask.as_ref().is_none() || res.mask.as_ref().unwrap()[i] {
-                    total_rows += 1;
-                }
+        let data = res.raw_data?;
+        let rows = extractor.length(&*data);
+        for i in 0..rows {
+            if res.mask.as_ref().map_or(true, |mask| mask[i]) {
+                total_rows += 1;
             }
         }
     }
@@ -47,12 +46,11 @@ fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let stream = scan.execute(&engine_client)?;
     let mut total_rows = 0;
     for res in stream {
-        if let Ok(ref data) = res.raw_data {
-            let rows = extractor.length(&**data);
-            for i in 0..rows {
-                if res.mask.as_ref().is_none() || res.mask.as_ref().unwrap()[i] {
-                    total_rows += 1;
-                }
+        let data = res.raw_data?;
+        let rows = extractor.length(&*data);
+        for i in 0..rows {
+            if res.mask.as_ref().map_or(true, |mask| mask[i]) {
+                total_rows += 1;
             }
         }
     }
