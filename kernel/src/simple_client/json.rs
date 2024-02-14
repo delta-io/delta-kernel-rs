@@ -67,12 +67,10 @@ impl JsonHandler for SimpleJsonHandler {
             .collect::<Vec<_>>();
 
         let schema: ArrowSchemaRef = Arc::new(output_schema.as_ref().try_into()?);
-        let batches = ReaderBuilder::new(schema.clone())
+        let batches: Vec<_> = ReaderBuilder::new(schema.clone())
             .build(Cursor::new(data))?
-            .collect::<Result<Vec<_>, _>>()?;
+            .try_collect()?;
 
-        let res: Box<dyn EngineData> =
-            Box::new(SimpleData::new(concat_batches(&schema, &batches)?));
-        Ok(res)
+        Ok(Box::new(SimpleData::new(concat_batches(&schema, &batches)?)) as _)
     }
 }
