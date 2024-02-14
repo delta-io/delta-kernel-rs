@@ -359,7 +359,7 @@ impl DeletionVectorDescriptor {
                 };
                 let dv_path = parent
                     .join(&dv_suffix)
-                    .map_err(|_| Error::DeletionVector(format!("invalid path: {}", dv_suffix)))?;
+                    .map_err(|_| Error::DeletionVector(format!("invalid path: {dv_suffix}")))?;
                 Ok(Some(dv_path))
             }
             "p" => Ok(Some(Url::parse(&self.path_or_inline_dv).map_err(|_| {
