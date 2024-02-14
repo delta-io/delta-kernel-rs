@@ -168,22 +168,17 @@ fn visit_metadata(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResul
         "schema_string must be a str"
     );
 
-    let partition_columns = vals[6].as_ref().ok_or(Error::Extract(
+    let partition_list = extract_required_item!(
+        vals[6],
+        as_list,
         "Metadata",
         "Metadata must have partition_columns",
-    ))?;
-    let partition_columns = if let DataItem::List(lst) = partition_columns {
-        let mut partition_columns = vec![];
-        for i in 0..lst.len(row_index) {
-            partition_columns.push(lst.get(row_index, i));
-        }
-        Ok(partition_columns)
-    } else {
-        Err(Error::Extract(
-            "Metadata",
-            "partition_columns must be a list",
-        ))
-    }?;
+        "partition_list must be a list"
+    );
+    let mut partition_columns = vec![];
+    for i in 0..partition_list.len(row_index) {
+        partition_columns.push(partition_list.get(row_index, i));
+    }
 
     let created_time = extract_required_item!(
         vals[7],
@@ -266,41 +261,33 @@ fn visit_protocol(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResul
         "minWriterVersion must be i32"
     );
 
-    let reader_features = vals[2]
-        .as_ref()
-        .map(|rf_di| {
-            if let DataItem::List(lst) = rf_di {
-                let mut reader_features = vec![];
-                for i in 0..lst.len(row_index) {
-                    reader_features.push(lst.get(row_index, i));
-                }
-                Ok(reader_features)
-            } else {
-                Err(Error::Extract(
-                    "Protocol",
-                    "readerFeatures must be a string list",
-                ))
-            }
-        })
-        .transpose()?;
+    let reader_features_list = extract_opt_item!(
+        vals[2],
+        as_list,
+        "Protocol",
+        "reader_features must be a list"
+    );
+    let reader_features = reader_features_list.map(|rfl| {
+        let mut reader_features = vec![];
+        for i in 0..rfl.len(row_index) {
+            reader_features.push(rfl.get(row_index, i));
+        }
+        reader_features
+    });
 
-    let writer_features = vals[3]
-        .as_ref()
-        .map(|wf_di| {
-            if let DataItem::List(lst) = wf_di {
-                let mut writer_features = vec![];
-                for i in 0..lst.len(row_index) {
-                    writer_features.push(lst.get(row_index, i));
-                }
-                Ok(writer_features)
-            } else {
-                Err(Error::Extract(
-                    "Protocol",
-                    "writerFeatures must be a string list",
-                ))
-            }
-        })
-        .transpose()?;
+    let writer_features_list = extract_opt_item!(
+        vals[3],
+        as_list,
+        "Protocol",
+        "writer_features must be a list"
+    );
+    let writer_features = writer_features_list.map(|rfl| {
+        let mut writer_features = vec![];
+        for i in 0..rfl.len(row_index) {
+            writer_features.push(rfl.get(row_index, i));
+        }
+        writer_features
+    });
 
     Ok(Protocol {
         min_reader_version,
