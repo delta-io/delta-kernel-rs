@@ -16,7 +16,7 @@ use crate::file_handler::FileStream;
 use crate::schema::SchemaRef;
 use crate::simple_client::data::SimpleData;
 use crate::{
-    DeltaResult, EngineData, Error, Expression, FileDataReadResultIterator, FileMeta,
+    DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta,
     ParquetHandler,
 };
 
@@ -148,7 +148,7 @@ mod tests {
     use arrow_array::RecordBatch;
     use object_store::{local::LocalFileSystem, ObjectStore};
 
-    use crate::executor::tokio::TokioBackgroundExecutor;
+    use crate::{executor::tokio::TokioBackgroundExecutor, EngineData};
 
     use itertools::Itertools;
 

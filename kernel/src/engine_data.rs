@@ -54,8 +54,13 @@ impl<'a> DataItem<'a> {
         (as_u32, U32, u32),
         (as_u64, U64, u64),
         (as_str, Str, &str),
+        (as_list, List, &dyn ListItem),
         (as_map, Map, &dyn MapItem)
     );
+
+    pub fn as_string(&self) -> Option<String> {
+        self.as_str().map(|s| s.to_string())
+    }
 }
 
 /// A `DataVisitor` can be called back to visit extracted data. Aside from calling

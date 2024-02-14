@@ -139,39 +139,34 @@ impl Metadata {
 fn visit_metadata(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<Metadata> {
     let id = extract_required_item!(
         vals[0],
-        as_str,
+        as_string,
         "Metadata",
         "Metadata must have an id",
         "id must be str"
-    )
-    .to_string();
+    );
 
-    let name =
-        extract_opt_item!(vals[1], as_str, "Metadata", "name must be str").map(|n| n.to_string());
+    let name = extract_opt_item!(vals[1], as_string, "Metadata", "name must be str");
 
-    let description = extract_opt_item!(vals[1], as_str, "Metadata", "description must be str")
-        .map(|d| d.to_string());
+    let description = extract_opt_item!(vals[1], as_string, "Metadata", "description must be str");
 
     // get format out of primitives
     let format_provider = extract_required_item!(
         vals[3],
-        as_str,
+        as_string,
         "Format",
         "Format must have a provider",
         "format.provider must be a str"
-    )
-    .to_string();
+    );
 
     // options for format is always empty, so skip vals[4]
 
     let schema_string = extract_required_item!(
         vals[5],
-        as_str,
+        as_string,
         "Metadata",
         "schema_string must exist",
         "schema_string must be a str"
-    )
-    .to_string();
+    );
 
     let partition_columns = vals[6].as_ref().ok_or(Error::Extract(
         "Metadata",
@@ -189,8 +184,6 @@ fn visit_metadata(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResul
             "partition_columns must be a list",
         ))
     }?;
-
-    // todo: partition_columns from vals[6]
 
     let created_time = extract_required_item!(
         vals[7],
@@ -506,12 +499,11 @@ impl Add {
 pub(crate) fn visit_add(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<Add> {
     let path = extract_required_item!(
         vals[0],
-        as_str,
+        as_string,
         "Add",
         "Add must have path",
         "path must be str"
-    )
-    .to_string();
+    );
 
     let partition_values = extract_required_item!(
         vals[1],
@@ -554,21 +546,19 @@ pub(crate) fn visit_add(row_index: usize, vals: &[Option<DataItem<'_>>]) -> Delt
         // there is a storageType, so the whole DV must be there
         let storage_type = extract_required_item!(
             vals[7],
-            as_str,
+            as_string,
             "Add",
             "DV must have storageType",
             "storageType must be a string"
-        )
-        .to_string();
+        );
 
         let path_or_inline_dv = extract_required_item!(
             vals[8],
-            as_str,
+            as_string,
             "Add",
             "DV must have pathOrInlineDv",
             "pathOrInlineDv must be a string"
-        )
-        .to_string();
+        );
 
         let offset = extract_opt_item!(vals[9], as_i32, "Add", "offset must be i32");
 
@@ -688,12 +678,11 @@ pub(crate) fn visit_remove(
 ) -> DeltaResult<Remove> {
     let path = extract_required_item!(
         vals[0],
-        as_str,
+        as_string,
         "Remove",
         "Remove must have path",
         "path must be str"
-    )
-    .to_string();
+    );
 
     let deletion_timestamp =
         extract_opt_item!(vals[1], as_i64, "Remove", "deletion_timestamp must be i64");
@@ -723,21 +712,19 @@ pub(crate) fn visit_remove(
         // there is a storageType, so the whole DV must be there
         let storage_type = extract_required_item!(
             vals[8],
-            as_str,
+            as_string,
             "Remove",
             "DV must have storageType",
             "storageType must be a string"
-        )
-        .to_string();
+        );
 
         let path_or_inline_dv = extract_required_item!(
             vals[9],
-            as_str,
+            as_string,
             "Remove",
             "DV must have pathOrInlineDv",
             "pathOrInlineDv must be a string"
-        )
-        .to_string();
+        );
 
         let offset = extract_opt_item!(vals[10], as_i32, "Remove", "offset must be i32");
 
