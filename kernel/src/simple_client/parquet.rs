@@ -1,5 +1,5 @@
 use crate::{
-    schema::SchemaRef, DeltaResult, EngineData, Expression, FileDataReadResultIterator, FileMeta,
+    schema::SchemaRef, DeltaResult, Expression, FileDataReadResultIterator, FileMeta,
     ParquetHandler,
 };
 
@@ -21,6 +21,7 @@ impl ParquetHandler for SimpleParquetHandler {
                 schema.clone(),
                 file.location.clone(),
             )?;
+            #[allow(trivial_casts)]
             res.push(Ok(Box::new(d) as _));
         }
         Ok(Box::new(res.into_iter()))
