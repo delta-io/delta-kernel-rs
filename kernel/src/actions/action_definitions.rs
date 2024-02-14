@@ -404,11 +404,13 @@ impl DeletionVectorDescriptor {
                 cursor
                     .read(&mut buf)
                     .map_err(|err| Error::DeletionVector(err.to_string()))?;
-                // let magic =
-                //     i32::from_le_bytes(buf.try_into().map_err(|_| {
-                //         Error::DeletionVector("filed to read magic bytes".to_string())
-                //     })?);
-                // assert!(magic == 1681511377);
+                let magic =
+                    i32::from_le_bytes(buf.try_into().map_err(|_| {
+                        Error::DeletionVector("filed to read magic bytes".to_string())
+                    })?);
+                if magic != 1681511377 {
+                    return Err(Error::DeletionVector(format!("Invalid magic {magic}")));
+                }
 
                 let mut buf = vec![0; size_in_bytes as usize];
                 cursor
