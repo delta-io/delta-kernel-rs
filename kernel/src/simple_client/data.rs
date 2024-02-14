@@ -161,7 +161,7 @@ impl SimpleData {
         schema: &Schema,
         row: usize,
         had_data: &mut bool,
-        res_arry: &mut Vec<Option<DataItem<'a>>>,
+        res_array: &mut Vec<Option<DataItem<'a>>>,
     ) -> DeltaResult<()> {
         // check each requested column in the row
         for field in schema.fields.iter() {
@@ -172,7 +172,7 @@ impl SimpleData {
                         debug!("Pushing None since column not present for {}", field.name);
                         // TODO(nick): This is probably wrong if there is a nullable struct type. we
                         // just need a helper that can recurse the kernel schema type and push Nones
-                        res_arry.push(None);
+                        res_array.push(None);
                     } else {
                         return Err(Error::Generic(format!(
                             "Didn't find non-nullable column: {}",
@@ -195,7 +195,7 @@ impl SimpleData {
                                     field_struct,
                                     row,
                                     had_data,
-                                    res_arry,
+                                    res_array,
                                 )?;
                             }
                             _ => {
@@ -207,7 +207,7 @@ impl SimpleData {
                     }
                     if col.is_null(row) {
                         debug!("Pushing None for {}", field.name);
-                        res_arry.push(None);
+                        res_array.push(None);
                     } else {
                         *had_data = true;
                         match col.data_type() {
@@ -215,28 +215,28 @@ impl SimpleData {
                             DataType::Boolean => {
                                 let val = col.as_boolean().value(row);
                                 debug!("For {} pushing: {}", field.name, val);
-                                res_arry.push(Some(DataItem::Bool(val)));
+                                res_array.push(Some(DataItem::Bool(val)));
                             }
                             DataType::Int32 => {
                                 let val = col.as_primitive::<Int32Type>().value(row);
                                 debug!("For {} pushing: {}", field.name, val);
-                                res_arry.push(Some(DataItem::I32(val)));
+                                res_array.push(Some(DataItem::I32(val)));
                             }
                             DataType::Int64 => {
                                 let val = col.as_primitive::<Int64Type>().value(row);
                                 debug!("For {} pushing: {}", field.name, val);
-                                res_arry.push(Some(DataItem::I64(val)));
+                                res_array.push(Some(DataItem::I64(val)));
                             }
                             DataType::Utf8 => {
                                 let val = col.as_string::<i32>().value(row);
                                 debug!("For {} pushing: {}", field.name, val);
-                                res_arry.push(Some(DataItem::Str(val)));
+                                res_array.push(Some(DataItem::Str(val)));
                             }
                             DataType::List(_) => {
-                                res_arry.push(Some(DataItem::List(col.as_list::<i32>())));
+                                res_array.push(Some(DataItem::List(col.as_list::<i32>())));
                             }
                             DataType::Map(_, _) => {
-                                res_arry.push(Some(DataItem::Map(col.as_map())));
+                                res_array.push(Some(DataItem::Map(col.as_map())));
                             }
                             typ => {
                                 error!("CAN'T EXTRACT: {}", typ);
@@ -256,11 +256,11 @@ impl SimpleData {
     pub fn extract(&self, schema: SchemaRef, visitor: &mut dyn DataVisitor) -> DeltaResult<()> {
         for row in 0..self.data.num_rows() {
             debug!("Extracting row: {}", row);
-            let mut res_arry: Vec<Option<DataItem<'_>>> = vec![];
+            let mut res_array: Vec<Option<DataItem<'_>>> = vec![];
             let mut had_data = false;
-            SimpleData::extract_row(&self.data, &schema, row, &mut had_data, &mut res_arry)?;
+            SimpleData::extract_row(&self.data, &schema, row, &mut had_data, &mut res_array)?;
             if had_data {
-                visitor.visit(row, &res_arry);
+                visitor.visit(row, &res_array);
             }
         }
         Ok(())
