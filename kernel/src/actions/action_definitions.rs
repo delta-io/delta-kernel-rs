@@ -1007,7 +1007,9 @@ mod tests {
             .unwrap();
         let add_schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
         let mut multi_add_visitor = MultiVisitor::new(visit_add);
-        data_extractor.extract(batch.as_ref(), Arc::new(add_schema), &mut multi_add_visitor).unwrap();
+        data_extractor
+            .extract(batch.as_ref(), Arc::new(add_schema), &mut multi_add_visitor)
+            .unwrap();
         let add1 = Add {
             path: "c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet".into(),
             partition_values: HashMap::from([

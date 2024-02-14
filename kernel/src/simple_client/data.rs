@@ -132,8 +132,8 @@ impl SimpleData {
                 .to_file_path()
                 .map_err(|_| Error::Generic("can only read local files".to_string()))?,
         )?;
-        let mut json = arrow_json::ReaderBuilder::new(Arc::new(arrow_schema))
-            .build(BufReader::new(file))?;
+        let mut json =
+            arrow_json::ReaderBuilder::new(Arc::new(arrow_schema)).build(BufReader::new(file))?;
         let data = json.next().ok_or(Error::Generic(
             "No data found reading json file".to_string(),
         ))?;
@@ -174,7 +174,10 @@ impl SimpleData {
                         // just need a helper that can recurse the kernel schema type and push Nones
                         res_arry.push(None);
                     } else {
-                        return Err(Error::Generic(format!("Didn't find non-nullable column: {}", field.name)));
+                        return Err(Error::Generic(format!(
+                            "Didn't find non-nullable column: {}",
+                            field.name
+                        )));
                     }
                 }
                 Some(col) => {
@@ -195,7 +198,11 @@ impl SimpleData {
                                     res_arry,
                                 )?;
                             }
-                            _ => return Err(Error::Generic("Schema mismatch during extraction".to_string())),
+                            _ => {
+                                return Err(Error::Generic(
+                                    "Schema mismatch during extraction".to_string(),
+                                ))
+                            }
                         }
                     }
                     if col.is_null(row) {
@@ -233,7 +240,10 @@ impl SimpleData {
                             }
                             typ => {
                                 error!("CAN'T EXTRACT: {}", typ);
-                                return Err(Error::Generic(format!("Unimplemented extraction for type: {}", typ)));
+                                return Err(Error::Generic(format!(
+                                    "Unimplemented extraction for type: {}",
+                                    typ
+                                )));
                             }
                         }
                     }

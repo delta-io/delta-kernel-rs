@@ -200,7 +200,12 @@ pub trait ParquetHandler: Send + Sync {
 pub trait DataExtractor {
     /// Extract data as requested by [`schema`] and then call back into `visitor.visit` with a Vec
     /// of that data. Return Ok(()) unless an error was encountered during extraction.
-    fn extract(&self, blob: &dyn EngineData, schema: SchemaRef, visitor: &mut dyn DataVisitor) -> DeltaResult<()>;
+    fn extract(
+        &self,
+        blob: &dyn EngineData,
+        schema: SchemaRef,
+        visitor: &mut dyn DataVisitor,
+    ) -> DeltaResult<()>;
     // Return the number of items (rows?) in blob
     fn length(&self, blob: &dyn EngineData) -> usize;
 }

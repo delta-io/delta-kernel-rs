@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
-use std::{fs, time::SystemTime};
+use std::path::Path;
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use itertools::Itertools;
@@ -33,43 +33,37 @@ impl FileSystemClient for SimpleFilesystemClient {
                 (parent, Some(file_name))
             };
 
-            let all_ents: std::io::Result<Vec<fs::DirEntry>> = std::fs::read_dir(path_to_read)?
-                .sorted_by_key(|ent_res| {
-                    ent_res
-                        .as_ref()
-                        .map(|ent| ent.path())
-                        .unwrap_or_else(|_| PathBuf::new())
-                })
+            let all_ents: Vec<_> = std::fs::read_dir(path_to_read)?
                 .filter(|ent_res| {
                     match (ent_res, min_file_name) {
                         (Ok(ent), Some(min_file_name)) => ent.file_name() >= *min_file_name,
-                        _ => true, // Keep errors and unfiltered entries
+                        _ => true, // Keep unfiltered entries
                     }
                 })
-                .collect();
-            let all_ents = all_ents?; // any errors in reading dir entries will force a return here
-                                      // now all_ents is a sorted list of DirEntries, we can just map over it
-
-            let it = all_ents.into_iter().map(|ent| {
-                ent.metadata().map_err(Error::IOError).and_then(|metadata| {
-                    let last_modified: u64 = metadata
-                        .modified()
-                        .map(
-                            |modified| match modified.duration_since(SystemTime::UNIX_EPOCH) {
-                                Ok(d) => d.as_secs(),
-                                Err(_) => 0,
-                            },
-                        )
-                        .unwrap_or(0);
-                    Url::from_file_path(ent.path())
-                        .map(|location| FileMeta {
-                            location,
-                            last_modified: last_modified as i64,
-                            size: metadata.len() as usize,
-                        })
-                        .map_err(|_| Error::Generic(format!("Invalid path: {:?}", ent.path())))
-                })
-            });
+                .try_collect()?;
+            let it = all_ents
+                .into_iter()
+                .sorted_by_key(|ent| ent.path())
+                .map(|ent| {
+                    ent.metadata().map_err(Error::IOError).and_then(|metadata| {
+                        let last_modified: u64 = metadata
+                            .modified()
+                            .map(
+                                |modified| match modified.duration_since(SystemTime::UNIX_EPOCH) {
+                                    Ok(d) => d.as_secs(),
+                                    Err(_) => 0,
+                                },
+                            )
+                            .unwrap_or(0);
+                        Url::from_file_path(ent.path())
+                            .map(|location| FileMeta {
+                                location,
+                                last_modified: last_modified as i64,
+                                size: metadata.len() as usize,
+                            })
+                            .map_err(|_| Error::Generic(format!("Invalid path: {:?}", ent.path())))
+                    })
+                });
             Ok(Box::new(it))
         } else {
             Err(Error::Generic("Can only read local filesystem".to_string()))
@@ -109,16 +103,23 @@ mod tests {
     fn test_list_from() -> Result<(), Box<dyn std::error::Error>> {
         let client = SimpleFilesystemClient;
         let tmp_dir = tempfile::tempdir().unwrap();
+        let mut expected = vec![];
         for i in 0..3 {
-            let path = tmp_dir.path().join(format!("000{i}.json"));
+            let path = tmp_dir.path().join(format!("{i:020}.json"));
+            expected.push(path.clone());
             let mut f = File::create(path)?;
             writeln!(f, "null")?;
         }
-        let url_path = tmp_dir.path().join("0001.json");
+        let url_path = tmp_dir.path().join(format!("{:020}.json", 1));
         let url = Url::from_file_path(url_path).unwrap();
         let list = client.list_from(&url)?;
         let mut file_count = 0;
-        for _ in list {
+        for (i, file) in list.enumerate() {
+            // i+1 in index because we started at 0001 in the listing
+            assert_eq!(
+                file.unwrap().location.path(),
+                expected[i + 1].to_str().unwrap()
+            );
             file_count += 1;
         }
         assert_eq!(file_count, 2);
@@ -126,19 +127,13 @@ mod tests {
         let url_path = tmp_dir.path().join("");
         let url = Url::from_file_path(url_path).unwrap();
         let list = client.list_from(&url)?;
-        file_count = 0;
-        for _ in list {
-            file_count += 1;
-        }
+        file_count = list.count();
         assert_eq!(file_count, 3);
 
-        let url_path = tmp_dir.path().join("0001");
+        let url_path = tmp_dir.path().join(format!("{:020}", 1));
         let url = Url::from_file_path(url_path).unwrap();
         let list = client.list_from(&url)?;
-        file_count = 0;
-        for _ in list {
-            file_count += 1;
-        }
+        file_count = list.count();
         assert_eq!(file_count, 2);
         Ok(())
     }
@@ -147,7 +142,7 @@ mod tests {
     fn test_read_files() -> Result<(), Box<dyn std::error::Error>> {
         let client = SimpleFilesystemClient;
         let tmp_dir = tempfile::tempdir().unwrap();
-        let path = tmp_dir.path().join("0001.json");
+        let path = tmp_dir.path().join(format!("{:020}.json", 1));
         let mut f = File::create(path.clone())?;
         writeln!(f, "null")?;
         let url = Url::from_file_path(path).unwrap();
