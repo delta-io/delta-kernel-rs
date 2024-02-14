@@ -101,7 +101,7 @@ pub trait TypeTag: 'static {
 /// the `type_tag` method.
 /// ```
 /// use std::any::Any;
-/// use deltakernel::DataExtractor;
+/// use deltakernel::{DataExtractor, DeltaResult};
 /// use deltakernel::engine_data::{DataVisitor, EngineData, TypeTag};
 /// use deltakernel::schema::SchemaRef;
 /// struct MyTypeTag;
@@ -118,9 +118,10 @@ pub trait TypeTag: 'static {
 ///   expected_tag: MyTypeTag,
 /// }
 /// impl DataExtractor for MyDataExtractor {
-///   fn extract(&self, blob: &dyn EngineData, _schema: SchemaRef, visitor: &mut dyn DataVisitor) -> () {
+///   fn extract(&self, blob: &dyn EngineData, _schema: SchemaRef, visitor: &mut dyn DataVisitor) -> DeltaResult<()> {
 ///     assert!(self.expected_tag.eq(blob.type_tag())); // Ensure correct data type
 ///     // extract the data and call back visitor
+///     Ok(())
 ///   }
 ///   fn length(&self, blob: &dyn EngineData) -> usize {
 ///     assert!(self.expected_tag.eq(blob.type_tag())); // Ensure correct data type
@@ -129,9 +130,10 @@ pub trait TypeTag: 'static {
 ///   }
 /// }
 /// ```
-pub trait EngineData : Send {
+pub trait EngineData: Send {
     fn type_tag(&self) -> &dyn TypeTag;
 
+    // TODO(nick) implement this and below when it doesn't cause a compiler error
     fn as_any(&self) -> &dyn Any;
 
     fn into_any(self: Box<Self>) -> Box<dyn Any>;

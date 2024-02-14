@@ -125,7 +125,7 @@ impl Metadata {
         let extractor = engine_client.get_data_extactor();
         let mut visitor = Visitor::new(visit_metadata);
         let schema = StructType::new(vec![crate::actions::schemas::METADATA_FIELD.clone()]);
-        extractor.extract(data, Arc::new(schema), &mut visitor);
+        extractor.extract(data, Arc::new(schema), &mut visitor)?;
         visitor
             .extracted
             .unwrap_or_else(|| Err(Error::Generic("Didn't get expected metadata".to_string())))
@@ -237,7 +237,7 @@ impl Protocol {
         let extractor = engine_client.get_data_extactor();
         let mut visitor = Visitor::new(visit_protocol);
         let schema = StructType::new(vec![crate::actions::schemas::PROTOCOL_FIELD.clone()]);
-        extractor.extract(data, Arc::new(schema), &mut visitor);
+        extractor.extract(data, Arc::new(schema), &mut visitor)?;
         visitor
             .extracted
             .unwrap_or_else(|| Err(Error::Generic("Didn't get expected Protocol".to_string())))
@@ -472,7 +472,7 @@ impl Add {
         let extractor = engine_client.get_data_extactor();
         let mut visitor = Visitor::new(visit_add);
         let schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
-        extractor.extract(data, Arc::new(schema), &mut visitor);
+        extractor.extract(data, Arc::new(schema), &mut visitor)?;
         visitor
             .extracted
             .unwrap_or_else(|| Err(Error::Generic("Didn't get expected Add".to_string())))
@@ -648,7 +648,7 @@ impl Remove {
         let extractor = engine_client.get_data_extactor();
         let mut visitor = Visitor::new(visit_remove);
         let schema = StructType::new(vec![crate::actions::schemas::REMOVE_FIELD.clone()]);
-        extractor.extract(data, Arc::new(schema), &mut visitor);
+        extractor.extract(data, Arc::new(schema), &mut visitor)?;
         visitor
             .extracted
             .unwrap_or_else(|| Err(Error::Generic("Didn't get expected remove".to_string())))
@@ -1007,7 +1007,7 @@ mod tests {
             .unwrap();
         let add_schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
         let mut multi_add_visitor = MultiVisitor::new(visit_add);
-        data_extractor.extract(batch.as_ref(), Arc::new(add_schema), &mut multi_add_visitor);
+        data_extractor.extract(batch.as_ref(), Arc::new(add_schema), &mut multi_add_visitor).unwrap();
         let add1 = Add {
             path: "c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet".into(),
             partition_values: HashMap::from([

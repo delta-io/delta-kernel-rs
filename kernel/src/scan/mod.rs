@@ -86,6 +86,7 @@ pub struct ScanResult {
     /// If an item at mask\[i\] is true, the row at that row index is valid, otherwise if it is
     /// false, the row at that row index is invalid and should be ignored. If this is None, all rows
     /// are valid.
+    // TODO(nick) this should be allocated by the engine
     pub mask: Option<Vec<bool>>,
 }
 

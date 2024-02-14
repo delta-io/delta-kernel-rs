@@ -83,7 +83,9 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         let batches = ReaderBuilder::new(schema.clone())
             .build(Cursor::new(data))?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Box::new(SimpleData::new(concat_batches(&schema, &batches)?)))
+        Ok(Box::new(SimpleData::new(concat_batches(
+            &schema, &batches,
+        )?)))
     }
 
     fn read_json_files(
@@ -112,9 +114,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         }));
         #[allow(trivial_casts)]
         Ok(Box::new(receiver.into_iter().map(|rbr| {
-            rbr.map(|rb| {
-                Box::new(SimpleData::new(rb)) as _
-            })
+            rbr.map(|rb| Box::new(SimpleData::new(rb)) as _)
         })))
     }
 }

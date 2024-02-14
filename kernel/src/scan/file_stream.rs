@@ -50,14 +50,14 @@ impl LogReplayScanner {
         use crate::actions::action_definitions::{visit_add, visit_remove, MultiVisitor};
         let add_schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
         let mut multi_add_visitor = MultiVisitor::new(visit_add);
-        data_extractor.extract(actions, Arc::new(add_schema), &mut multi_add_visitor);
+        data_extractor.extract(actions, Arc::new(add_schema), &mut multi_add_visitor)?;
 
         let mut multi_remove_visitor = MultiVisitor::new(visit_remove);
         let remove_schema = StructType::new(vec![crate::actions::schemas::REMOVE_FIELD.clone()]);
         if is_log_batch {
             // All checkpoint actions are already reconciled and Remove actions in checkpoint files
             // only serve as tombstones for vacuum jobs. So only load them if we're not a checkpoint
-            data_extractor.extract(actions, Arc::new(remove_schema), &mut multi_remove_visitor);
+            data_extractor.extract(actions, Arc::new(remove_schema), &mut multi_remove_visitor)?;
         }
 
         for remove in multi_remove_visitor.extracted.into_iter().flatten() {

@@ -90,7 +90,6 @@ impl ListItem for GenericListArray<i32> {
     }
 }
 
-// TODO: This is likely wrong and needs to only scan the correct row
 impl MapItem for MapArray {
     fn get<'a>(&'a self, row_index: usize, key: &str) -> Option<&'a str> {
         let offsets = self.offsets();
@@ -112,9 +111,8 @@ impl MapItem for MapArray {
     fn materialize(&self, row_index: usize) -> HashMap<String, Option<String>> {
         let mut ret = HashMap::new();
         let map_val = self.value(row_index);
-        let cols = map_val.columns();
-        let keys = cols[0].as_string::<i32>();
-        let values = cols[1].as_string::<i32>();
+        let keys = map_val.column(0).as_string::<i32>();
+        let values = map_val.column(1).as_string::<i32>();
         for (key, value) in keys.iter().zip(values.iter()) {
             if let Some(key) = key {
                 ret.insert(key.into(), value.map(|v| v.into()));
@@ -129,21 +127,32 @@ impl SimpleData {
         let arrow_schema: ArrowSchema = (&*schema).try_into()?;
         debug!("Reading {:#?} with schema: {:#?}", location, arrow_schema);
         // todo: Check scheme of url
-        let file = File::open(location.to_file_path().unwrap()).unwrap(); // todo: fix to_file_path.unwrap()
+        let file = File::open(
+            location
+                .to_file_path()
+                .map_err(|_| Error::Generic("can only read local files".to_string()))?,
+        )?;
         let mut json = arrow_json::ReaderBuilder::new(Arc::new(arrow_schema))
-            .build(BufReader::new(file))
-            .unwrap();
-        let data = json.next().unwrap().unwrap();
-        Ok(SimpleData { data })
+            .build(BufReader::new(file))?;
+        let data = json.next().ok_or(Error::Generic(
+            "No data found reading json file".to_string(),
+        ))?;
+        Ok(SimpleData::new(data?))
     }
 
     // todo: fix all the unwrapping
     pub fn try_create_from_parquet(_schema: SchemaRef, location: Url) -> DeltaResult<Self> {
-        let file = File::open(location.to_file_path().unwrap()).unwrap();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-        let mut reader = builder.build().unwrap();
-        let data = reader.next().unwrap().unwrap();
-        Ok(SimpleData { data })
+        let file = File::open(
+            location
+                .to_file_path()
+                .map_err(|_| Error::Generic("can only read local files".to_string()))?,
+        )?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let mut reader = builder.build()?;
+        let data = reader.next().ok_or(Error::Generic(
+            "No data found reading parquet file".to_string(),
+        ))?;
+        Ok(SimpleData::new(data?))
     }
 
     /// extract a row of data. will recurse into struct types
@@ -153,7 +162,7 @@ impl SimpleData {
         row: usize,
         had_data: &mut bool,
         res_arry: &mut Vec<Option<DataItem<'a>>>,
-    ) {
+    ) -> DeltaResult<()> {
         // check each requested column in the row
         for field in schema.fields.iter() {
             match array.column_by_name(&field.name) {
@@ -165,7 +174,7 @@ impl SimpleData {
                         // just need a helper that can recurse the kernel schema type and push Nones
                         res_arry.push(None);
                     } else {
-                        panic!("Didn't find non-nullable column: {}", field.name);
+                        return Err(Error::Generic(format!("Didn't find non-nullable column: {}", field.name)));
                     }
                 }
                 Some(col) => {
@@ -184,9 +193,9 @@ impl SimpleData {
                                     row,
                                     had_data,
                                     res_arry,
-                                );
+                                )?;
                             }
-                            _ => panic!("schema mismatch"),
+                            _ => return Err(Error::Generic("Schema mismatch during extraction".to_string())),
                         }
                     }
                     if col.is_null(row) {
@@ -224,25 +233,27 @@ impl SimpleData {
                             }
                             typ => {
                                 error!("CAN'T EXTRACT: {}", typ);
-                                unimplemented!()
+                                return Err(Error::Generic(format!("Unimplemented extraction for type: {}", typ)));
                             }
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
 
-    pub fn extract(&self, schema: SchemaRef, visitor: &mut dyn DataVisitor) {
+    pub fn extract(&self, schema: SchemaRef, visitor: &mut dyn DataVisitor) -> DeltaResult<()> {
         for row in 0..self.data.num_rows() {
             debug!("Extracting row: {}", row);
             let mut res_arry: Vec<Option<DataItem<'_>>> = vec![];
             let mut had_data = false;
-            SimpleData::extract_row(&self.data, &schema, row, &mut had_data, &mut res_arry);
+            SimpleData::extract_row(&self.data, &schema, row, &mut had_data, &mut res_arry)?;
             if had_data {
                 visitor.visit(row, &res_arry);
             }
         }
+        Ok(())
     }
 
     pub fn length(&self) -> usize {
@@ -252,7 +263,7 @@ impl SimpleData {
 
 impl From<RecordBatch> for SimpleData {
     fn from(value: RecordBatch) -> Self {
-        SimpleData { data: value }
+        SimpleData::new(value)
     }
 }
 

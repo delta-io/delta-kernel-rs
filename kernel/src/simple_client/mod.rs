@@ -3,7 +3,7 @@
 use crate::engine_data::{DataVisitor, EngineData, TypeTag};
 use crate::schema::SchemaRef;
 use crate::{
-    DataExtractor, EngineClient, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler,
+    DataExtractor, EngineClient, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler, DeltaResult,
 };
 
 use std::sync::Arc;
@@ -27,13 +27,13 @@ impl SimpleDataExtractor {
 }
 
 impl DataExtractor for SimpleDataExtractor {
-    fn extract(&self, blob: &dyn EngineData, schema: SchemaRef, visitor: &mut dyn DataVisitor) {
+    fn extract(&self, blob: &dyn EngineData, schema: SchemaRef, visitor: &mut dyn DataVisitor) -> DeltaResult<()> {
         assert!(self.expected_tag.eq(blob.type_tag()));
         let data: &data::SimpleData = blob
             .as_any()
             .downcast_ref::<data::SimpleData>()
             .expect("extract called on blob that isn't SimpleData");
-        data.extract(schema, visitor);
+        data.extract(schema, visitor)
     }
 
     fn length(&self, blob: &dyn EngineData) -> usize {

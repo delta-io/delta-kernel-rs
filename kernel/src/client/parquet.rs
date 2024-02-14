@@ -15,10 +15,7 @@ use crate::executor::TaskExecutor;
 use crate::file_handler::FileStream;
 use crate::schema::SchemaRef;
 use crate::simple_client::data::SimpleData;
-use crate::{
-    DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta,
-    ParquetHandler,
-};
+use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, ParquetHandler};
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -73,9 +70,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         }));
         #[allow(trivial_casts)]
         Ok(Box::new(receiver.into_iter().map(|rbr| {
-            rbr.map(|rb| {
-                Box::new(SimpleData::new(rb)) as _
-            })
+            rbr.map(|rb| Box::new(SimpleData::new(rb)) as _)
         })))
     }
 }
