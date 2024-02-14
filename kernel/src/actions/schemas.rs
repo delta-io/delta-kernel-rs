@@ -7,7 +7,7 @@ use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
 lazy_static! {
     // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#change-metadata
-    pub static ref METADATA_FIELD: StructField = StructField::new(
+    pub(crate) static ref METADATA_FIELD: StructField = StructField::new(
         "metaData",
         StructType::new(vec![
             StructField::new("id", DataType::STRING, false),
@@ -49,7 +49,7 @@ lazy_static! {
         true,
     );
     // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#protocol-evolution
-    pub static ref PROTOCOL_FIELD: StructField = StructField::new(
+    pub(crate) static ref PROTOCOL_FIELD: StructField = StructField::new(
         "protocol",
         StructType::new(vec![
             StructField::new("minReaderVersion", DataType::INTEGER, false),
@@ -99,7 +99,7 @@ lazy_static! {
         true,
     );
     // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#add-file-and-remove-file
-    pub static ref ADD_FIELD: StructField = StructField::new(
+    pub(crate) static ref ADD_FIELD: StructField = StructField::new(
         "add",
         StructType::new(vec![
             StructField::new("path", DataType::STRING, false),
@@ -117,7 +117,7 @@ lazy_static! {
         true,
     );
     // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#add-file-and-remove-file
-    pub static ref REMOVE_FIELD: StructField = StructField::new(
+    pub(crate) static ref REMOVE_FIELD: StructField = StructField::new(
         "remove",
         StructType::new(vec![
             StructField::new("path", DataType::STRING, false),

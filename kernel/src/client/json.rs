@@ -83,7 +83,6 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         let batches = ReaderBuilder::new(schema.clone())
             .build(Cursor::new(data))?
             .collect::<Result<Vec<_>, _>>()?;
-
         Ok(Box::new(SimpleData::new(concat_batches(&schema, &batches)?)))
     }
 
@@ -111,10 +110,10 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             sender.send(res).ok();
             futures::future::ready(())
         }));
+        #[allow(trivial_casts)]
         Ok(Box::new(receiver.into_iter().map(|rbr| {
             rbr.map(|rb| {
-                let b: Box<dyn EngineData> = Box::new(SimpleData::new(rb));
-                b
+                Box::new(SimpleData::new(rb)) as _
             })
         })))
     }
@@ -273,7 +272,7 @@ mod tests {
         let data: Vec<RecordBatch> = handler
             .read_json_files(files, Arc::new(physical_schema.try_into().unwrap()), None)
             .unwrap()
-            .map(|ed| into_record_batch(ed))
+            .map(into_record_batch)
             .try_collect()
             .unwrap();
 

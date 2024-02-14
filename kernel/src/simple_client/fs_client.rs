@@ -105,7 +105,7 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
 
-    use bytes::{BytesMut, BufMut};
+    use bytes::{BufMut, BytesMut};
     use url::Url;
 
     use super::SimpleFilesystemClient;
