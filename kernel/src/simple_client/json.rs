@@ -8,6 +8,7 @@ use arrow_array::cast::AsArray;
 use arrow_json::ReaderBuilder;
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use arrow_select::concat::concat_batches;
+use itertools::Itertools;
 
 use super::data::SimpleData;
 
@@ -22,16 +23,17 @@ impl JsonHandler for SimpleJsonHandler {
         if files.is_empty() {
             return Ok(Box::new(std::iter::empty()));
         }
-        let res: Vec<dyn EngineData> = files
+        let res: Vec<DeltaResult<Box<dyn EngineData>>> = files
             .iter()
             .map(|file| {
                 let d = super::data::SimpleData::try_create_from_json(
                     schema.clone(),
                     file.location.clone(),
-                )?;
-                Box::new(d) as _;
+                );
+                #[allow(trivial_casts)]
+                d.map(|d| Box::new(d) as _)
             })
-            .try_collect()?;
+            .collect();
         Ok(Box::new(res.into_iter()))
     }
 
@@ -71,6 +73,7 @@ impl JsonHandler for SimpleJsonHandler {
             .build(Cursor::new(data))?
             .try_collect()?;
 
+        #[allow(trivial_casts)]
         Ok(Box::new(SimpleData::new(concat_batches(&schema, &batches)?)) as _)
     }
 }
