@@ -41,15 +41,9 @@ impl FileSystemClient for SimpleFilesystemClient {
                         .unwrap_or_else(|_| PathBuf::new())
                 })
                 .filter(|ent_res| {
-                    match ent_res {
-                        Ok(ent) => {
-                            if let Some(min_file_name) = min_file_name {
-                                ent.file_name() >= *min_file_name
-                            } else {
-                                true
-                            }
-                        }
-                        Err(_) => true, // keep errors so line below will return them
+                    match (ent_res, min_file_name) {
+                        (Ok(ent), Some(min_file_name)) => ent.file_name() >= *min_file_name,
+                        _ => true, // Keep errors and unfiltered entries
                     }
                 })
                 .collect();
