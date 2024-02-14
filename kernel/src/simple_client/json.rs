@@ -56,7 +56,7 @@ impl JsonHandler for SimpleJsonHandler {
                     "Expected column to be String".into(),
                 ))?;
 
-        let data = json_strings
+        let data: Vec<_> = json_strings
             .into_iter()
             .filter_map(|d| {
                 d.map(|dd| {
@@ -66,7 +66,7 @@ impl JsonHandler for SimpleJsonHandler {
                 })
             })
             .flatten()
-            .collect::<Vec<_>>();
+            .collect();
 
         let schema: ArrowSchemaRef = Arc::new(output_schema.as_ref().try_into()?);
         let batches: Vec<_> = ReaderBuilder::new(schema.clone())
