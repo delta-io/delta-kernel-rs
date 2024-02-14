@@ -22,15 +22,16 @@ impl JsonHandler for SimpleJsonHandler {
         if files.is_empty() {
             return Ok(Box::new(std::iter::empty()));
         }
-        let mut res = vec![];
-        for file in files.iter() {
-            let d = super::data::SimpleData::try_create_from_json(
-                schema.clone(),
-                file.location.clone(),
-            )?;
-            let b: Box<dyn EngineData> = Box::new(d);
-            res.push(Ok(b));
-        }
+        let res: Vec<dyn EngineData> = files
+            .iter()
+            .map(|file| {
+                let d = super::data::SimpleData::try_create_from_json(
+                    schema.clone(),
+                    file.location.clone(),
+                )?;
+                Box::new(d) as _;
+            })
+            .try_collect()?;
         Ok(Box::new(res.into_iter()))
     }
 
