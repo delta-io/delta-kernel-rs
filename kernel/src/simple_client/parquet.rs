@@ -21,8 +21,7 @@ impl ParquetHandler for SimpleParquetHandler {
                 schema.clone(),
                 file.location.clone(),
             )?;
-            let b: Box<dyn EngineData> = Box::new(d);
-            res.push(Ok(b));
+            res.push(Ok(Box::new(d) as _));
         }
         Ok(Box::new(res.into_iter()))
     }
