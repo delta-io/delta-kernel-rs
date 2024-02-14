@@ -48,13 +48,13 @@ tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
 [features]
 arrow-conversion = []
 default = ["simple-client"]
-default-client = ["arrow-conversion", "chrono", "futures", "object_store", "parquet/async", "parquet/object_store"]
+default-client = ["arrow-conversion", "chrono", "futures", "object_store", "parquet/async", "parquet/object_store", "tokio"]
 developer-visibility = []
 simple-client = ["arrow-conversion", "parquet"]
 
 [dev-dependencies]
 arrow = { version = "^49.0", features = ["json", "prettyprint"] }
-deltakernel = { path = ".", features = ["tokio", "default-client"] }
+deltakernel = { path = ".", features = ["default-client"] }
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 tempfile = "3"
 test-case = { version = "3.1.0" }
