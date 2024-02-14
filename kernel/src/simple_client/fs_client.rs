@@ -99,18 +99,23 @@ mod tests {
     use super::SimpleFilesystemClient;
     use crate::FileSystemClient;
 
+    /// generate json filenames that follow the spec (numbered padded to 20 chars)
+    fn get_json_filename(index: usize) -> String {
+        format!("{index:020}.json")
+    }
+
     #[test]
     fn test_list_from() -> Result<(), Box<dyn std::error::Error>> {
         let client = SimpleFilesystemClient;
         let tmp_dir = tempfile::tempdir().unwrap();
         let mut expected = vec![];
         for i in 0..3 {
-            let path = tmp_dir.path().join(format!("{i:020}.json"));
+            let path = tmp_dir.path().join(get_json_filename(i));
             expected.push(path.clone());
             let mut f = File::create(path)?;
             writeln!(f, "null")?;
         }
-        let url_path = tmp_dir.path().join(format!("{:020}.json", 1));
+        let url_path = tmp_dir.path().join(get_json_filename(1));
         let url = Url::from_file_path(url_path).unwrap();
         let list = client.list_from(&url)?;
         let mut file_count = 0;
@@ -142,7 +147,7 @@ mod tests {
     fn test_read_files() -> Result<(), Box<dyn std::error::Error>> {
         let client = SimpleFilesystemClient;
         let tmp_dir = tempfile::tempdir().unwrap();
-        let path = tmp_dir.path().join(format!("{:020}.json", 1));
+        let path = tmp_dir.path().join(get_json_filename(1));
         let mut f = File::create(path.clone())?;
         writeln!(f, "null")?;
         let url = Url::from_file_path(path).unwrap();
