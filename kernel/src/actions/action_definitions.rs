@@ -147,7 +147,7 @@ fn visit_metadata(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResul
 
     let name = extract_opt_item!(vals[1], as_string, "Metadata", "name must be str");
 
-    let description = extract_opt_item!(vals[1], as_string, "Metadata", "description must be str");
+    let description = extract_opt_item!(vals[2], as_string, "Metadata", "description must be str");
 
     // get format out of primitives
     let format_provider = extract_required_item!(
