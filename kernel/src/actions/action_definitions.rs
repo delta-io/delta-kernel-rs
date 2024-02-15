@@ -153,7 +153,8 @@ fn visit_metadata(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResul
 
     let created_time: i64 = vals[7].extract_into("metadata.created_time")?;
 
-    let configuration_map_opt: Option<&dyn MapItem> = vals[8].extract_into_opt("metadata.configuration")?;
+    let configuration_map_opt: Option<&dyn MapItem> =
+        vals[8].extract_into_opt("metadata.configuration")?;
     let configuration = match configuration_map_opt {
         Some(map_item) => map_item.materialize(row_index),
         None => HashMap::new(),

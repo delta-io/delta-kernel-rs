@@ -31,7 +31,7 @@ impl SimpleData {
         SimpleData { data }
     }
 
-    /// Utility constructor to get a Box<SimpleData> out of a Box<dyn EngineData>
+    /// Utility constructor to get a `Box<SimpleData>` out of a `Box<dyn EngineData>`
     pub fn try_from_engine_data(engine_data: Box<dyn EngineData>) -> DeltaResult<Box<Self>> {
         engine_data
             .into_any()
