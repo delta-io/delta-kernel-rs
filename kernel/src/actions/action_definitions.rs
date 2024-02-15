@@ -10,7 +10,7 @@ use roaring::RoaringTreemap;
 use url::Url;
 
 use crate::{
-    engine_data::{DataItem, DataVisitor, EngineData},
+    engine_data::{DataItem, DataVisitor, EngineData, ExtractInto, ListItem, MapItem},
     schema::StructType,
     DeltaResult, EngineClient, Error, FileSystemClient,
 };
@@ -137,64 +137,25 @@ impl Metadata {
 }
 
 fn visit_metadata(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<Metadata> {
-    let id = extract_required_item!(
-        vals[0],
-        as_string,
-        "Metadata",
-        "Metadata must have an id",
-        "id must be str"
-    );
-
-    let name = extract_opt_item!(vals[1], as_string, "Metadata", "name must be str");
-
-    let description = extract_opt_item!(vals[2], as_string, "Metadata", "description must be str");
-
+    let id: String = vals[0].extract_into("metadata.id")?;
+    let name: Option<String> = vals[1].extract_into_opt("metadata.name")?;
+    let description: Option<String> = vals[2].extract_into_opt("metadata.description")?;
     // get format out of primitives
-    let format_provider = extract_required_item!(
-        vals[3],
-        as_string,
-        "Format",
-        "Format must have a provider",
-        "format.provider must be a str"
-    );
-
+    let format_provider: String = vals[3].extract_into("metadata.format.provider")?;
     // options for format is always empty, so skip vals[4]
+    let schema_string: String = vals[5].extract_into("metadata.schema_string")?;
 
-    let schema_string = extract_required_item!(
-        vals[5],
-        as_string,
-        "Metadata",
-        "schema_string must exist",
-        "schema_string must be a str"
-    );
-
-    let partition_list = extract_required_item!(
-        vals[6],
-        as_list,
-        "Metadata",
-        "Metadata must have partition_columns",
-        "partition_list must be a list"
-    );
+    let partition_list: &dyn ListItem = vals[6].extract_into("metadata.partition_list")?;
     let mut partition_columns = vec![];
     for i in 0..partition_list.len(row_index) {
         partition_columns.push(partition_list.get(row_index, i));
     }
 
-    let created_time = extract_required_item!(
-        vals[7],
-        as_i64,
-        "Metadata",
-        "Metadata must have a created_time",
-        "created_time must be i64"
-    );
+    let created_time: i64 = vals[7].extract_into("metadata.created_time")?;
 
-    let configuration = match vals[8].as_ref() {
-        Some(map_item) => {
-            let map = map_item
-                .as_map()
-                .ok_or(Error::Extract("Metadata", "configuration must be a map"))?;
-            map.materialize(row_index)
-        }
+    let configuration_map_opt: Option<&dyn MapItem> = vals[8].extract_into_opt("metadata.configuration")?;
+    let configuration = match configuration_map_opt {
+        Some(map_item) => map_item.materialize(row_index),
         None => HashMap::new(),
     };
 

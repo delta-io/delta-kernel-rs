@@ -1,3 +1,5 @@
+use crate::{DeltaResult, Error};
+
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
@@ -62,6 +64,59 @@ impl<'a> DataItem<'a> {
         self.as_str().map(|s| s.to_string())
     }
 }
+
+/// A trait similar to TryInto, that allows extracting a [`DataItem`] into a particular type
+pub trait ExtractInto<T> : Sized {
+    /// Extract a required item into type `T` for the specified `field_name`
+    /// This returns an error if the item is not present
+    fn extract_into(self, field_name: &str) -> DeltaResult<T> {
+        let result = self.extract_into_opt(field_name)?;
+        result.ok_or(Error::Generic(format!("Missing value for required field: {field_name}")))
+    }
+    /// Extract an optional item into type `T` for the specified `field_name`
+    /// Returns `None` if the item is not present, or `Some(T)` if it is
+    fn extract_into_opt(self, field_name: &str) -> DeltaResult<Option<T>>;
+}
+
+macro_rules! impl_extract_into {
+    (($target_type: ty, $enum_variant: ident)) => {
+        impl<'a, 'b> ExtractInto<$target_type> for &'a Option<DataItem<'b>> {
+            fn extract_into_opt(self, field_name: &str) -> DeltaResult<Option<$target_type>> {
+                self.as_ref().map(|item| match item {
+                    &DataItem::$enum_variant(x) => Ok(x),
+                    _ => Err(Error::Generic(format!("Could not extract {field_name} as {}", stringify!($target_type))))
+                }).transpose()
+            }
+        }
+    };
+    (($target_type: ty, $enum_variant: ident), $(($target_type_rest: ty, $enum_variant_rest: ident)),+) => {
+        impl_extract_into!(($target_type, $enum_variant));
+        impl_extract_into!($(($target_type_rest, $enum_variant_rest)),+);
+    }
+}
+
+impl_extract_into!(
+    (bool, Bool),
+    (f32, F32),
+    (f64, F64),
+    (i32, I32),
+    (i64, I64),
+    (u32, U32),
+    (u64, U64),
+    (&'b str, Str),
+    (&'b dyn ListItem, List),
+    (&'b dyn MapItem, Map)
+);
+
+impl<'a, 'b> ExtractInto<String> for &'a Option<DataItem<'b>> {
+    fn extract_into_opt(self, field_name: &str) -> DeltaResult<Option<String>> {
+        self.as_ref().map(|item| match item {
+            &DataItem::Str(x) => Ok(x.to_string()),
+            _ => Err(Error::Generic(format!("Could not extract {field_name} as String")))
+        }).transpose()
+    }
+}
+
 
 /// A `DataVisitor` can be called back to visit extracted data. Aside from calling
 /// [`DataVisitor::visit`] on the visitor passed to [`crate::DataExtractor::extract`], engines do
