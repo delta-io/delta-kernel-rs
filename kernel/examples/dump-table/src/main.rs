@@ -112,7 +112,7 @@ fn main() {
     let scan = ScanBuilder::new(snapshot).build();
 
     let schema = scan.schema();
-    let header_names = schema.fields.iter().map(|field| {
+    let header_names = schema.fields().map(|field| {
         let cell = Cell::new(field.name());
         if cli.ascii {
             cell

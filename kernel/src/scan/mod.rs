@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_select::concat::concat_batches;
 use arrow_select::filter::filter_record_batch;
@@ -7,10 +8,10 @@ use itertools::Itertools;
 
 use self::file_stream::log_replay_iter;
 use crate::actions::ActionType;
-use crate::expressions::Expression;
-use crate::schema::{SchemaRef, StructType};
+use crate::expressions::{Expression, Scalar};
+use crate::schema::{DataType, SchemaRef, StructType};
 use crate::snapshot::Snapshot;
-use crate::{Add, DeltaResult, EngineInterface, FileMeta};
+use crate::{Add, DeltaResult, EngineInterface, Error, FileMeta};
 
 mod data_skipping;
 pub mod file_stream;
@@ -143,6 +144,30 @@ impl Scan {
     pub fn execute(&self, engine_interface: &dyn EngineInterface) -> DeltaResult<Vec<RecordBatch>> {
         let parquet_handler = engine_interface.get_parquet_handler();
 
+        let partition_columns = &self.snapshot.metadata().partition_columns;
+        let read_schema = Arc::new(StructType::new(
+            self.schema()
+                .fields()
+                .filter(|f| !partition_columns.contains(f.name()))
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+
+        let mut partition_fields = partition_columns
+            .iter()
+            .map(|column| {
+                self.schema()
+                    .field(column)
+                    .ok_or(Error::generic("Unexpected partition column"))
+            })
+            .collect::<DeltaResult<Vec<_>>>()?;
+        partition_fields.reverse();
+
+        let select_fields = read_schema
+            .fields()
+            .map(|f| Expression::column(f.name()))
+            .collect_vec();
+
         self.files(engine_interface)?
             .map(|res| {
                 let add = res?;
@@ -152,8 +177,8 @@ impl Scan {
                     location: self.snapshot.table_root.join(&add.path)?,
                 };
                 let batches = parquet_handler
-                    .read_parquet_files(&[meta], self.read_schema.clone(), None)?
-                    .collect::<DeltaResult<Vec<_>>>()?;
+                    .read_parquet_files(&[meta], read_schema.clone(), None)?
+                    .try_collect::<_, Vec<_>, _>()?;
 
                 if batches.is_empty() {
                     return Ok(None);
@@ -161,6 +186,33 @@ impl Scan {
 
                 let schema = batches[0].schema();
                 let batch = concat_batches(&schema, &batches)?;
+
+                let batch = if partition_fields.is_empty() {
+                    batch
+                } else {
+                    let mut fields =
+                        Vec::with_capacity(partition_fields.len() + batch.num_columns());
+                    for field in &partition_fields {
+                        let value_expression = parse_partition_value(
+                            add.partition_values.get(field.name()),
+                            field.data_type(),
+                        )?;
+                        fields.push(Expression::Literal(value_expression));
+                    }
+                    fields.extend(select_fields.clone());
+
+                    let evaluator = engine_interface.get_expression_handler().get_evaluator(
+                        read_schema.clone(),
+                        Expression::Struct(fields),
+                        DataType::Struct(Box::new(self.schema().as_ref().clone())),
+                    );
+
+                    evaluator
+                        .evaluate(&batch)?
+                        .as_struct_opt()
+                        .ok_or(Error::unexpected_column_type("Unexpected array type"))?
+                        .into()
+                };
 
                 if let Some(dv_descriptor) = add.deletion_vector {
                     let fs_client = engine_interface.get_file_system_client();
@@ -178,6 +230,21 @@ impl Scan {
     }
 }
 
+fn parse_partition_value(
+    raw: Option<&Option<String>>,
+    data_type: &DataType,
+) -> DeltaResult<Scalar> {
+    match raw {
+        Some(Some(v)) => match data_type {
+            DataType::Primitive(primitive) => primitive.parse_scalar(v),
+            _ => Err(Error::generic(format!(
+                "Unexpected partition column type: {data_type:?}"
+            ))),
+        },
+        _ => Ok(Scalar::Null(data_type.clone())),
+    }
+}
+
 #[cfg(all(test, feature = "default-client"))]
 mod tests {
     use std::path::PathBuf;
@@ -185,6 +252,7 @@ mod tests {
     use super::*;
     use crate::client::DefaultTableClient;
     use crate::executor::tokio::TokioBackgroundExecutor;
+    use crate::schema::PrimitiveType;
     use crate::Table;
 
     #[test]
@@ -235,5 +303,49 @@ mod tests {
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].num_rows(), 10)
+    }
+
+    #[test]
+    fn test_get_partition_value() {
+        let cases = [
+            (
+                "string",
+                PrimitiveType::String,
+                Scalar::String("string".to_string()),
+            ),
+            ("123", PrimitiveType::Integer, Scalar::Integer(123)),
+            ("1234", PrimitiveType::Long, Scalar::Long(1234)),
+            ("12", PrimitiveType::Short, Scalar::Short(12)),
+            ("1", PrimitiveType::Byte, Scalar::Byte(1)),
+            ("1.1", PrimitiveType::Float, Scalar::Float(1.1)),
+            ("10.10", PrimitiveType::Double, Scalar::Double(10.1)),
+            ("true", PrimitiveType::Boolean, Scalar::Boolean(true)),
+            ("2024-01-01", PrimitiveType::Date, Scalar::Date(19723)),
+            ("1970-01-01", PrimitiveType::Date, Scalar::Date(0)),
+            (
+                "1970-01-01 00:00:00",
+                PrimitiveType::Timestamp,
+                Scalar::Timestamp(0),
+            ),
+            (
+                "1970-01-01 00:00:00.123456",
+                PrimitiveType::Timestamp,
+                Scalar::Timestamp(123456),
+            ),
+            (
+                "1970-01-01 00:00:00.123456789",
+                PrimitiveType::Timestamp,
+                Scalar::Timestamp(123456),
+            ),
+        ];
+
+        for (raw, data_type, expected) in &cases {
+            let value = parse_partition_value(
+                Some(&Some(raw.to_string())),
+                &DataType::Primitive(data_type.clone()),
+            )
+            .unwrap();
+            assert_eq!(value, *expected);
+        }
     }
 }

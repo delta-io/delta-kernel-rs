@@ -39,11 +39,11 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, RecordBatch};
 use bytes::Bytes;
 use url::Url;
 
-use self::schema::SchemaRef;
+use self::schema::{DataType, SchemaRef};
 
 pub mod actions;
 pub mod error;
@@ -103,18 +103,21 @@ pub trait ExpressionEvaluator {
 /// fill up partition column values and any computation on data using Expressions.
 pub trait ExpressionHandler {
     /// Create an [`ExpressionEvaluator`] that can evaluate the given [`Expression`]
-    /// on columnar batches with the given [`Schema`].
+    /// on columnar batches with the given [`Schema`] to produce data of [`DataType`].
     ///
     /// # Parameters
     ///
     /// - `schema`: Schema of the input data.
     /// - `expression`: Expression to evaluate.
+    /// - `output_type`: Expected result data type.
     ///
-    /// [`Schema`]: arrow_schema::Schema
+    /// [`Schema`]: crate::schema::StructType
+    /// [`DataType`]: crate::schema::DataType
     fn get_evaluator(
         &self,
         schema: SchemaRef,
         expression: Expression,
+        output_type: DataType,
     ) -> Arc<dyn ExpressionEvaluator>;
 }
 
@@ -145,7 +148,7 @@ pub trait JsonHandler {
     /// Parse the given json strings and return the fields requested by output schema as columns in a [`RecordBatch`].
     fn parse_json(
         &self,
-        json_strings: StringArray,
+        json_strings: ArrayRef,
         output_schema: SchemaRef,
     ) -> DeltaResult<RecordBatch>;
 

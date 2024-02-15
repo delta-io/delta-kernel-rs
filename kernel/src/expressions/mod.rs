@@ -30,6 +30,8 @@ pub enum BinaryOperator {
     Equal,
     /// Comparison Not Equal
     NotEqual,
+    /// Distinct
+    Distinct,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,8 +43,6 @@ pub enum VariadicOperator {
 impl Display for BinaryOperator {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            // Self::And => write!(f, "AND"),
-            // Self::Or => write!(f, "OR"),
             Self::Plus => write!(f, "+"),
             Self::Minus => write!(f, "-"),
             Self::Multiply => write!(f, "*"),
@@ -53,6 +53,10 @@ impl Display for BinaryOperator {
             Self::GreaterThanOrEqual => write!(f, ">="),
             Self::Equal => write!(f, "="),
             Self::NotEqual => write!(f, "!="),
+            // TODO(roeap): AFAIK DISTINCT does not have a commonly used operator symbol
+            // so ideally this would not be used as we use Display for rendering expressions
+            // in our code we take care of this, bot thers might now ...
+            Self::Distinct => write!(f, "DISTINCT"),
         }
     }
 }
@@ -77,6 +81,8 @@ pub enum Expression {
     Literal(Scalar),
     /// A column reference by name.
     Column(String),
+    ///
+    Struct(Vec<Expression>),
     /// A binary operation.
     BinaryOperation {
         /// The operator.
@@ -113,6 +119,16 @@ impl Display for Expression {
         match self {
             Self::Literal(l) => write!(f, "{}", l),
             Self::Column(name) => write!(f, "Column({})", name),
+            Self::Struct(exprs) => write!(
+                f,
+                "Struct({})",
+                &exprs.iter().map(|e| format!("{e}")).join(", ")
+            ),
+            Self::BinaryOperation {
+                op: BinaryOperator::Distinct,
+                left,
+                right,
+            } => write!(f, "DISTINCT({}, {})", left, right),
             Self::BinaryOperation { op, left, right } => write!(f, "{} {} {}", left, op, right),
             Self::UnaryOperation { op, expr } => match op {
                 UnaryOperator::Not => write!(f, "NOT {}", expr),
@@ -160,6 +176,11 @@ impl Expression {
     /// Create a new expression for a literal value
     pub fn literal(value: impl Into<Scalar>) -> Self {
         Self::Literal(value.into())
+    }
+
+    /// Create a new struct expression
+    pub fn struct_expr(exprs: impl IntoIterator<Item = Self>) -> Self {
+        Self::Struct(exprs.into_iter().collect())
     }
 
     /// Creates a new unary expression OP expr
@@ -254,6 +275,11 @@ impl Expression {
         Self::or_from([self, other])
     }
 
+    /// Create a new expression `DISTINCT(self, other)`
+    pub fn distinct(self, other: Self) -> Self {
+        Self::binary(BinaryOperator::Distinct, self, other)
+    }
+
     fn walk(&self) -> impl Iterator<Item = &Self> + '_ {
         let mut stack = vec![self];
         std::iter::from_fn(move || {
@@ -261,6 +287,9 @@ impl Expression {
             match expr {
                 Self::Literal(_) => {}
                 Self::Column { .. } => {}
+                Self::Struct(exprs) => {
+                    stack.extend(exprs.iter());
+                }
                 Self::BinaryOperation { left, right, .. } => {
                     stack.push(left);
                     stack.push(right);

@@ -4,6 +4,7 @@ use arrow_schema::{
     ArrowError, DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
+use itertools::Itertools;
 
 use crate::actions::ActionType;
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
@@ -20,12 +21,7 @@ impl TryFrom<&StructType> for ArrowSchema {
     type Error = ArrowError;
 
     fn try_from(s: &StructType) -> Result<Self, ArrowError> {
-        let fields = s
-            .fields()
-            .iter()
-            .map(|f| <ArrowField as TryFrom<&StructField>>::try_from(*f))
-            .collect::<Result<Vec<ArrowField>, ArrowError>>()?;
-
+        let fields: Vec<ArrowField> = s.fields().map(TryInto::try_into).try_collect()?;
         Ok(ArrowSchema::new(fields))
     }
 }
@@ -103,23 +99,12 @@ impl TryFrom<&DataType> for ArrowDataType {
                     PrimitiveType::Boolean => Ok(ArrowDataType::Boolean),
                     PrimitiveType::Binary => Ok(ArrowDataType::Binary),
                     PrimitiveType::Decimal(precision, scale) => {
-                        let precision = u8::try_from(*precision).map_err(|_| {
-                            ArrowError::SchemaError(format!(
-                                "Invalid precision for decimal: {}",
-                                precision
-                            ))
-                        })?;
-                        let scale = i8::try_from(*scale).map_err(|_| {
-                            ArrowError::SchemaError(format!("Invalid scale for decimal: {}", scale))
-                        })?;
-
-                        if precision <= 38 {
-                            Ok(ArrowDataType::Decimal128(precision, scale))
-                        } else if precision <= 76 {
-                            Ok(ArrowDataType::Decimal256(precision, scale))
+                        if precision <= &38 {
+                            Ok(ArrowDataType::Decimal128(*precision, *scale))
                         } else {
+                            // NOTE: since we are converting from delta, we should never get here.
                             Err(ArrowError::SchemaError(format!(
-                                "Precision too large to be represented in Arrow: {}",
+                                "Precision too large to be represented as Delta type: {} > 38",
                                 precision
                             )))
                         }
@@ -137,8 +122,7 @@ impl TryFrom<&DataType> for ArrowDataType {
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(
                 s.fields()
-                    .iter()
-                    .map(|f| <ArrowField as TryFrom<&StructField>>::try_from(*f))
+                    .map(TryInto::try_into)
                     .collect::<Result<Vec<ArrowField>, ArrowError>>()?
                     .into(),
             )),
@@ -226,12 +210,7 @@ impl TryFrom<&ArrowDataType> for DataType {
             ArrowDataType::Binary => Ok(DataType::Primitive(PrimitiveType::Binary)),
             ArrowDataType::FixedSizeBinary(_) => Ok(DataType::Primitive(PrimitiveType::Binary)),
             ArrowDataType::LargeBinary => Ok(DataType::Primitive(PrimitiveType::Binary)),
-            ArrowDataType::Decimal128(p, s) => Ok(DataType::Primitive(PrimitiveType::Decimal(
-                *p as i32, *s as i32,
-            ))),
-            ArrowDataType::Decimal256(p, s) => Ok(DataType::Primitive(PrimitiveType::Decimal(
-                *p as i32, *s as i32,
-            ))),
+            ArrowDataType::Decimal128(p, s) => Ok(DataType::decimal(*p, *s)),
             ArrowDataType::Date32 => Ok(DataType::Primitive(PrimitiveType::Date)),
             ArrowDataType::Date64 => Ok(DataType::Primitive(PrimitiveType::Date)),
             ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => {

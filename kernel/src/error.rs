@@ -1,7 +1,10 @@
+use crate::schema::DataType;
+
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[cfg(feature = "default-client")]
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
 
@@ -48,6 +51,9 @@ pub enum Error {
 
     #[error("No table metadata found in delta log.")]
     MissingMetadata,
+
+    #[error("Failed to parse value '{0}' as '{1}'")]
+    ParseError(String, DataType),
 }
 
 // Convenience constructors for Error types that take a String argument
