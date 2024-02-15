@@ -421,7 +421,8 @@ pub(crate) fn visit_add(row_index: usize, vals: &[Option<DataItem<'_>>]) -> Delt
     let deletion_vector = if vals[7].is_some() {
         // there is a storageType, so the whole DV must be there
         let storage_type: String = vals[7].extract_into("add.deletionVector.storageType")?;
-        let path_or_inline_dv: String = vals[8].extract_into("add.deletionVector.pathOrInlineDv")?;
+        let path_or_inline_dv: String =
+            vals[8].extract_into("add.deletionVector.pathOrInlineDv")?;
         let offset: Option<i32> = vals[9].extract_into_opt("add.deletionVector.offset")?;
         let size_in_bytes: i32 = vals[10].extract_into("add.deletionVector.sizeInBytes")?;
         let cardinality: i64 = vals[11].extract_into("add.deletionVector.cardinality")?;
@@ -437,7 +438,8 @@ pub(crate) fn visit_add(row_index: usize, vals: &[Option<DataItem<'_>>]) -> Delt
     };
 
     let base_row_id: Option<i64> = vals[12].extract_into_opt("add.base_row_id")?;
-    let default_row_commit_version: Option<i64> = vals[13].extract_into_opt("add.default_row_commit")?;
+    let default_row_commit_version: Option<i64> =
+        vals[13].extract_into_opt("add.default_row_commit")?;
 
     Ok(Add {
         path,
@@ -520,7 +522,8 @@ pub(crate) fn visit_remove(
     let path: String = vals[0].extract_into("remove.path")?;
     let deletion_timestamp: Option<i64> = vals[1].extract_into_opt("remove.deletionTimestamp")?;
     let data_change: bool = vals[2].extract_into("remove.dataChange")?;
-    let extended_file_metadata: Option<bool> = vals[3].extract_into_opt("remove.extendedFileMetadata")?;
+    let extended_file_metadata: Option<bool> =
+        vals[3].extract_into_opt("remove.extendedFileMetadata")?;
 
     // TODO(nick) handle partition values in vals[4]
 
@@ -531,7 +534,8 @@ pub(crate) fn visit_remove(
     let deletion_vector = if vals[8].is_some() {
         // there is a storageType, so the whole DV must be there
         let storage_type: String = vals[8].extract_into("remove.deletionVector.storageType")?;
-        let path_or_inline_dv: String = vals[9].extract_into("remove.deletionVector.pathOrInlineDv")?;
+        let path_or_inline_dv: String =
+            vals[9].extract_into("remove.deletionVector.pathOrInlineDv")?;
         let offset: Option<i32> = vals[10].extract_into_opt("remove.deletionVector.offset")?;
         let size_in_bytes: i32 = vals[11].extract_into("remove.deletionVector.sizeInBytes")?;
         let cardinality: i64 = vals[12].extract_into("remove.deletionVector.cardinality")?;
@@ -547,7 +551,8 @@ pub(crate) fn visit_remove(
     };
 
     let base_row_id: Option<i64> = vals[13].extract_into_opt("remove.baseRowId")?;
-    let default_row_commit_version: Option<i64> = vals[14].extract_into_opt("remove.defaultRowCommitVersion")?;
+    let default_row_commit_version: Option<i64> =
+        vals[14].extract_into_opt("remove.defaultRowCommitVersion")?;
 
     Ok(Remove {
         path,
