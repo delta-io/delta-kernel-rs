@@ -61,25 +61,6 @@ impl<T> DataVisitor for MultiVisitor<T> {
     }
 }
 
-macro_rules! extract_required_item {
-    ($item: expr, $as_func: ident, $typ: expr, $err_msg_missing: expr, $err_msg_type: expr) => {
-        $item
-            .as_ref()
-            .ok_or(Error::Extract($typ, $err_msg_missing))?
-            .$as_func()
-            .ok_or(Error::Extract($typ, $err_msg_type))?
-    };
-}
-
-macro_rules! extract_opt_item {
-    ($item: expr, $as_func: ident, $typ: expr, $err_msg_type: expr) => {
-        $item
-            .as_ref()
-            .map(|item| item.$as_func().ok_or(Error::Extract($typ, $err_msg_type)))
-            .transpose()?
-    };
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Format {
     /// Name of the encoding for files in this table
@@ -207,28 +188,11 @@ impl Protocol {
 }
 
 fn visit_protocol(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<Protocol> {
-    let min_reader_version = extract_required_item!(
-        vals[0],
-        as_i32,
-        "Protocol",
-        "Protocol must have a minReaderVersion",
-        "minReaderVersion must be i32"
-    );
+    let min_reader_version: i32 = vals[0].extract_into("protocol.min_reader_version")?;
+    let min_writer_version: i32 = vals[1].extract_into("protocol.min_writer_version")?;
 
-    let min_writer_version = extract_required_item!(
-        vals[1],
-        as_i32,
-        "Protocol",
-        "Protocol must have a minWriterVersion",
-        "minWriterVersion must be i32"
-    );
-
-    let reader_features_list = extract_opt_item!(
-        vals[2],
-        as_list,
-        "Protocol",
-        "reader_features must be a list"
-    );
+    let reader_features_list: Option<&dyn ListItem> =
+        vals[2].extract_into_opt("protocol.reader_features")?;
     let reader_features = reader_features_list.map(|rfl| {
         let mut reader_features = vec![];
         for i in 0..rfl.len(row_index) {
@@ -237,16 +201,12 @@ fn visit_protocol(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResul
         reader_features
     });
 
-    let writer_features_list = extract_opt_item!(
-        vals[3],
-        as_list,
-        "Protocol",
-        "writer_features must be a list"
-    );
-    let writer_features = writer_features_list.map(|rfl| {
+    let writer_features_list: Option<&dyn ListItem> =
+        vals[3].extract_into_opt("protocol.writer_features")?;
+    let writer_features = writer_features_list.map(|wfl| {
         let mut writer_features = vec![];
-        for i in 0..rfl.len(row_index) {
-            writer_features.push(rfl.get(row_index, i));
+        for i in 0..wfl.len(row_index) {
+            writer_features.push(wfl.get(row_index, i));
         }
         writer_features
     });
@@ -448,87 +408,23 @@ impl Add {
 }
 
 pub(crate) fn visit_add(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<Add> {
-    let path = extract_required_item!(
-        vals[0],
-        as_string,
-        "Add",
-        "Add must have path",
-        "path must be str"
-    );
+    let path: String = vals[0].extract_into("add.path")?;
+    let partition_values_map: &dyn MapItem = vals[1].extract_into("add.partitionValues")?;
+    let partition_values = partition_values_map.materialize(row_index);
+    let size: i64 = vals[2].extract_into("add.size")?;
+    let modification_time: i64 = vals[3].extract_into("add.modificationTime")?;
+    let data_change: bool = vals[4].extract_into("add.dataChange")?;
+    let stats: Option<&str> = vals[5].extract_into_opt("add.stats")?;
 
-    let partition_values = extract_required_item!(
-        vals[1],
-        as_map,
-        "Add",
-        "Add must have partitionValues",
-        "partitionValues must be a map"
-    )
-    .materialize(row_index);
-
-    let size = extract_required_item!(
-        vals[2],
-        as_i64,
-        "Add",
-        "Add must have size",
-        "size must be i64"
-    );
-
-    let modification_time = extract_required_item!(
-        vals[3],
-        as_i64,
-        "Add",
-        "Add must have modification_time",
-        "modification_time must be i64"
-    );
-
-    let data_change = extract_required_item!(
-        vals[4],
-        as_bool,
-        "Add",
-        "Add must have data_change",
-        "modification_time must be bool"
-    );
-
-    let stats = extract_opt_item!(vals[5], as_str, "Add", "stats must be str");
-
-    // TODO(nick) extract tags at vals[6]
+    // TODO(nick) extract tags if we ever need them at vals[6]
 
     let deletion_vector = if vals[7].is_some() {
         // there is a storageType, so the whole DV must be there
-        let storage_type = extract_required_item!(
-            vals[7],
-            as_string,
-            "Add",
-            "DV must have storageType",
-            "storageType must be a string"
-        );
-
-        let path_or_inline_dv = extract_required_item!(
-            vals[8],
-            as_string,
-            "Add",
-            "DV must have pathOrInlineDv",
-            "pathOrInlineDv must be a string"
-        );
-
-        let offset = extract_opt_item!(vals[9], as_i32, "Add", "offset must be i32");
-
-        let size_in_bytes = extract_required_item!(
-            vals[10],
-            as_i32,
-            "Add",
-            "DV must have sizeInBytes",
-            "sizeInBytes must be i32"
-        );
-
-        let cardinality = extract_required_item!(
-            vals[11],
-            as_i64,
-            "Add",
-            "DV must have cardinality",
-            "cardinality must be i64"
-        );
-
+        let storage_type: String = vals[7].extract_into("add.deletionVector.storageType")?;
+        let path_or_inline_dv: String = vals[8].extract_into("add.deletionVector.pathOrInlineDv")?;
+        let offset: Option<i32> = vals[9].extract_into_opt("add.deletionVector.offset")?;
+        let size_in_bytes: i32 = vals[10].extract_into("add.deletionVector.sizeInBytes")?;
+        let cardinality: i64 = vals[11].extract_into("add.deletionVector.cardinality")?;
         Some(DeletionVectorDescriptor {
             storage_type,
             path_or_inline_dv,
@@ -540,14 +436,8 @@ pub(crate) fn visit_add(row_index: usize, vals: &[Option<DataItem<'_>>]) -> Delt
         None
     };
 
-    let base_row_id = extract_opt_item!(vals[12], as_i64, "Add", "base_row_id must be i64");
-
-    let default_row_commit_version = extract_opt_item!(
-        vals[13],
-        as_i64,
-        "Add",
-        "default_row_commit_version must be i64"
-    );
+    let base_row_id: Option<i64> = vals[12].extract_into_opt("add.base_row_id")?;
+    let default_row_commit_version: Option<i64> = vals[13].extract_into_opt("add.default_row_commit")?;
 
     Ok(Add {
         path,
@@ -627,74 +517,24 @@ pub(crate) fn visit_remove(
     _row_index: usize,
     vals: &[Option<DataItem<'_>>],
 ) -> DeltaResult<Remove> {
-    let path = extract_required_item!(
-        vals[0],
-        as_string,
-        "Remove",
-        "Remove must have path",
-        "path must be str"
-    );
-
-    let deletion_timestamp =
-        extract_opt_item!(vals[1], as_i64, "Remove", "deletion_timestamp must be i64");
-
-    let data_change = extract_required_item!(
-        vals[2],
-        as_bool,
-        "Remove",
-        "Remove must have data_change",
-        "data_change must be a bool"
-    );
-
-    let extended_file_metadata = extract_opt_item!(
-        vals[3],
-        as_bool,
-        "Remove",
-        "extended_file_metadata must be bool"
-    );
+    let path: String = vals[0].extract_into("remove.path")?;
+    let deletion_timestamp: Option<i64> = vals[1].extract_into_opt("remove.deletionTimestamp")?;
+    let data_change: bool = vals[2].extract_into("remove.dataChange")?;
+    let extended_file_metadata: Option<bool> = vals[3].extract_into_opt("remove.extendedFileMetadata")?;
 
     // TODO(nick) handle partition values in vals[4]
 
-    let size = extract_opt_item!(vals[5], as_i64, "Remove", "size must be i64");
+    let size: Option<i64> = vals[5].extract_into_opt("remove.size")?;
 
     // TODO(nick) stats are skipped in vals[6] and tags are skipped in vals[7]
 
     let deletion_vector = if vals[8].is_some() {
         // there is a storageType, so the whole DV must be there
-        let storage_type = extract_required_item!(
-            vals[8],
-            as_string,
-            "Remove",
-            "DV must have storageType",
-            "storageType must be a string"
-        );
-
-        let path_or_inline_dv = extract_required_item!(
-            vals[9],
-            as_string,
-            "Remove",
-            "DV must have pathOrInlineDv",
-            "pathOrInlineDv must be a string"
-        );
-
-        let offset = extract_opt_item!(vals[10], as_i32, "Remove", "offset must be i32");
-
-        let size_in_bytes = extract_required_item!(
-            vals[11],
-            as_i32,
-            "Remove",
-            "DV must have sizeInBytes",
-            "sizeInBytes must be i32"
-        );
-
-        let cardinality = extract_required_item!(
-            vals[12],
-            as_i64,
-            "Remove",
-            "DV must have cardinality",
-            "cardinality must be i64"
-        );
-
+        let storage_type: String = vals[8].extract_into("remove.deletionVector.storageType")?;
+        let path_or_inline_dv: String = vals[9].extract_into("remove.deletionVector.pathOrInlineDv")?;
+        let offset: Option<i32> = vals[10].extract_into_opt("remove.deletionVector.offset")?;
+        let size_in_bytes: i32 = vals[11].extract_into("remove.deletionVector.sizeInBytes")?;
+        let cardinality: i64 = vals[12].extract_into("remove.deletionVector.cardinality")?;
         Some(DeletionVectorDescriptor {
             storage_type,
             path_or_inline_dv,
@@ -706,14 +546,8 @@ pub(crate) fn visit_remove(
         None
     };
 
-    let base_row_id = extract_opt_item!(vals[13], as_i64, "Remove", "base_row_id must be i64");
-
-    let default_row_commit_version = extract_opt_item!(
-        vals[14],
-        as_i64,
-        "Remove",
-        "default_row_commit_version must be i64"
-    );
+    let base_row_id: Option<i64> = vals[13].extract_into_opt("remove.baseRowId")?;
+    let default_row_commit_version: Option<i64> = vals[14].extract_into_opt("remove.defaultRowCommitVersion")?;
 
     Ok(Remove {
         path,
