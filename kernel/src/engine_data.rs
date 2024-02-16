@@ -27,9 +27,6 @@ pub trait DataItemList {
     fn get(&self, row_index: usize, list_index: usize) -> String;
 }
 
-// Note that copy/clone is cheap here as it's just a pointer and an int
-// TODO(nick): Could avoid copy probably with manual impl of ExtractInto<&ListItem>
-#[derive(Clone, Copy)]
 pub struct ListItem<'a> {
     list: &'a dyn DataItemList,
     row: usize,
@@ -55,8 +52,6 @@ pub trait DataItemMap {
     fn materialize(&self, row_index: usize) -> HashMap<String, Option<String>>;
 }
 
-// Note that copy/clone is cheap here as it's just a pointer and an int
-#[derive(Clone, Copy)]
 pub struct MapItem<'a> {
     map: &'a dyn DataItemMap,
     row: usize,
@@ -98,9 +93,7 @@ impl<'a> DataItem<'a> {
         (as_i64, I64, i64),
         (as_u32, U32, u32),
         (as_u64, U64, u64),
-        (as_str, Str, &str),
-        (as_list, List, ListItem<'a>),
-        (as_map, Map, MapItem<'a>)
+        (as_str, Str, &str)
     );
 
     pub fn as_string(&self) -> Option<String> {
@@ -124,7 +117,7 @@ pub trait ExtractInto<T>: Sized {
 }
 macro_rules! impl_extract_into {
     (($target_type: ty, $enum_variant: ident)) => {
-        #[doc = "Attempt to extract a DataItem into a `"]
+        #[doc = "Attempt to extract a DataItem into a(n) `"]
         #[doc = stringify!($target_type)]
         #[doc = "`. This does _not_ perform type  coersion, it just returns "]
         #[doc = concat!("`Ok(Some(", stringify!($target_type), "))`")]
@@ -155,17 +148,35 @@ impl_extract_into!(
     (i64, I64),
     (u32, U32),
     (u64, U64),
-    (&'b str, Str),
-    (ListItem<'b>, List),
-    (MapItem<'b>, Map)
+    (&'b str, Str)
 );
 
+/// Attempt to extract a DataItem into an `&'a ListItem`. This does not perform type coersion, it
+/// just returns `Ok(Some(&'a ListItem<'b>))` if the DataItem is a DataItem::List or returns an error
+/// if it is not. Returns `Ok(None)` if the data item was not present in the source data.
+impl<'a, 'b> ExtractInto<&'a ListItem<'b>> for &'a Option<DataItem<'b>> {
+    fn extract_into_opt(self, field_name: &str) -> DeltaResult<Option<&'a ListItem<'b>>> {
+        self.as_ref()
+            .map(|item| match item {
+                DataItem::List(ref x) => Ok(x),
+                _ => Err(Error::Generic(format!("Could not extract {field_name} as a ListItem")))
+            })
+            .transpose()
+    }
+}
+
+
+/// Attempt to extract a DataItem into an `&'a MapItem`. This does not perform type coersion, it
+/// just returns `Ok(Some(&'a MapItem<'b>))` if the DataItem is a DataItem::Map or returns an error
+/// if it is not. Returns `Ok(None)` if the data item was not present in the source data.
 impl<'a, 'b> ExtractInto<&'a MapItem<'b>> for &'a Option<DataItem<'b>> {
     fn extract_into_opt(self, field_name: &str) -> DeltaResult<Option<&'a MapItem<'b>>> {
-        self.as_ref().map(|item| match item {
-            DataItem::Map(ref x) => Ok(x),
-            _ => panic!()
-        }).transpose()
+        self.as_ref()
+            .map(|item| match item {
+                DataItem::Map(ref x) => Ok(x),
+                _ => Err(Error::Generic(format!("Could not extract {field_name} as a MapItem")))
+            })
+            .transpose()
     }
 }
 

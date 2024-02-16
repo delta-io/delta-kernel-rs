@@ -134,7 +134,7 @@ fn visit_metadata(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResul
     // options for format is always empty, so skip vals[4]
     let schema_string: String = vals[5].extract_into("metadata.schema_string")?;
 
-    let partition_list: ListItem<'_> = vals[6].extract_into("metadata.partition_list")?;
+    let partition_list: &ListItem<'_> = vals[6].extract_into("metadata.partition_list")?;
     let mut partition_columns = vec![];
     for i in 0..partition_list.len() {
         partition_columns.push(partition_list.get(i));
@@ -142,7 +142,7 @@ fn visit_metadata(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResul
 
     let created_time: i64 = vals[7].extract_into("metadata.created_time")?;
 
-    let configuration_map_opt: Option<MapItem<'_>> =
+    let configuration_map_opt: Option<&MapItem<'_>> =
         vals[8].extract_into_opt("metadata.configuration")?;
     let configuration = match configuration_map_opt {
         Some(map_item) => map_item.materialize(),
@@ -417,7 +417,7 @@ impl Add {
 
 pub(crate) fn visit_add(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<Add> {
     let path: String = vals[0].extract_into("add.path")?;
-    let partition_values_map: MapItem<'_> = vals[1].extract_into("add.partitionValues")?;
+    let partition_values_map: &MapItem<'_> = vals[1].extract_into("add.partitionValues")?;
     let partition_values = partition_values_map.materialize();
     let size: i64 = vals[2].extract_into("add.size")?;
     let modification_time: i64 = vals[3].extract_into("add.modificationTime")?;
