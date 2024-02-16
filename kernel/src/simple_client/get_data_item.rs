@@ -1,7 +1,7 @@
 //! This module implements [`GetDataItem`] for the various arrow types we support
 
 use arrow_array::{
-    types::{GenericStringType, Int64Type},
+    types::{GenericStringType, Int32Type, Int64Type},
     Array, ArrayRef, BooleanArray, GenericByteArray, GenericListArray, MapArray, PrimitiveArray,
 };
 
@@ -31,6 +31,16 @@ impl<'a> GetDataItem<'a> for PrimitiveArray<Int64Type> {
     fn get(&'a self, row_index: usize) -> Option<DataItem<'a>> {
         if self.is_valid(row_index) {
             Some(DataItem::I64(self.value(row_index)))
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a> GetDataItem<'a> for PrimitiveArray<Int32Type> {
+    fn get(&'a self, row_index: usize) -> Option<DataItem<'a>> {
+        if self.is_valid(row_index) {
+            Some(DataItem::I32(self.value(row_index)))
         } else {
             None
         }

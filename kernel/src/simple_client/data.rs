@@ -1,15 +1,16 @@
 use crate::engine_data::{
-    DataItem, DataItemList, DataVisitor, EngineData, GetDataItem, ListItem, MapItem, TypeTag, DataItemMap,
+    DataItem, DataItemList, DataItemMap, DataVisitor, EngineData, GetDataItem, ListItem, MapItem,
+    TypeTag,
 };
 use crate::schema::{DataType, PrimitiveType, Schema, SchemaRef};
 use crate::{DeltaResult, Error};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, Int64Type};
-use arrow_array::{Array, GenericListArray, MapArray, RecordBatch, StructArray, NullArray};
-use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
+use arrow_array::{Array, GenericListArray, MapArray, NullArray, RecordBatch, StructArray};
+use arrow_schema::{ArrowError, DataType as ArrowDataType, Schema as ArrowSchema};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use url::Url;
 
 use std::any::Any;
@@ -183,11 +184,14 @@ impl SimpleData {
                             // keep recursing
                             SimpleData::extract_columns_from_array(None, fields, col_array)?;
                         }
-                        _ => col_array.push(&())
+                        _ => col_array.push(&()),
                     }
-                    continue
+                    continue;
                 } else {
-                    return Err(Error::Generic(format!("Found required field {}, but it's null", field.name)));
+                    return Err(Error::Generic(format!(
+                        "Found required field {}, but it's null",
+                        field.name
+                    )));
                 }
             }
             // unwrap here is safe as we checked above
@@ -226,6 +230,13 @@ impl SimpleData {
                 (Some(col), &ArrowDataType::Utf8, &DataType::Primitive(PrimitiveType::String)) => {
                     col_array.push(col.as_string::<i32>());
                 }
+                (
+                    Some(col),
+                    &ArrowDataType::Int32,
+                    &DataType::Primitive(PrimitiveType::Integer),
+                ) => {
+                    col_array.push(col.as_primitive::<Int32Type>());
+                }
                 (Some(col), &ArrowDataType::Int64, &DataType::Primitive(PrimitiveType::Long)) => {
                     col_array.push(col.as_primitive::<Int64Type>());
                 }
@@ -241,11 +252,24 @@ impl SimpleData {
                     col_array.push(col.as_map());
                 }
                 (Some(_), arrow_data_type, data_type) => {
-                    debug!("CATCHALL\n ARROW: {arrow_data_type}\n US: {data_type}");
-                    return Err(Error::Generic(format!(
-                        "Type mismatch on {}: expected {data_type}, got {arrow_data_type}",
-                        field.name
-                    )));
+                    warn!("Can't extract {}. Arrow Type: {arrow_data_type}\n Kernel Type: {data_type}", field.name);
+                    let expected_type: Result<ArrowDataType, ArrowError> = data_type.try_into();
+                    return Err(match expected_type {
+                        Ok(expected_type) => {
+                            if expected_type == *arrow_data_type {
+                                Error::Generic(format!("On {}: Don't know how to extract something of type {data_type}", field.name))
+                            } else {
+                                Error::Generic(format!(
+                                    "Type mismatch on {}: expected {data_type}, got {arrow_data_type}",
+                                    field.name
+                                ))
+                            }
+                        }
+                        Err(e) => Error::Generic(format!(
+                            "On {}: Unsupported data type {data_type}: {e}",
+                            field.name
+                        )),
+                    });
                 }
                 (_, arrow_data_type, _) => {
                     return Err(Error::Generic(format!(
