@@ -1,11 +1,13 @@
-use crate::engine_data::{DataItem, DataVisitor, EngineData, ListItem, MapItem, TypeTag};
-use crate::schema::{Schema, SchemaRef};
+use crate::engine_data::{
+    DataItem, DataItemList, DataVisitor, EngineData, GetDataItem, ListItem, MapItem, TypeTag, DataItemMap,
+};
+use crate::schema::{DataType, PrimitiveType, Schema, SchemaRef};
 use crate::{DeltaResult, Error};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, Int64Type};
-use arrow_array::{Array, GenericListArray, MapArray, RecordBatch, StructArray};
-use arrow_schema::{DataType, Schema as ArrowSchema};
+use arrow_array::{Array, GenericListArray, MapArray, RecordBatch, StructArray, NullArray};
+use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tracing::{debug, error};
 use url::Url;
@@ -78,7 +80,7 @@ impl ProvidesColumnByName for StructArray {
     }
 }
 
-impl ListItem for GenericListArray<i32> {
+impl DataItemList for GenericListArray<i32> {
     fn len(&self, row_index: usize) -> usize {
         self.value(row_index).len()
     }
@@ -90,7 +92,7 @@ impl ListItem for GenericListArray<i32> {
     }
 }
 
-impl MapItem for MapArray {
+impl DataItemMap for MapArray {
     fn get<'a>(&'a self, row_index: usize, key: &str) -> Option<&'a str> {
         let offsets = self.offsets();
         let start_offset = offsets[row_index] as usize;
@@ -155,112 +157,102 @@ impl SimpleData {
         Ok(SimpleData::new(data?))
     }
 
-    /// extract a row of data. will recurse into struct types
-    fn extract_row<'a>(
-        array: &'a dyn ProvidesColumnByName,
+    pub fn extract_columns<'a>(
+        &'a self,
         schema: &Schema,
-        row: usize,
-        had_data: &mut bool,
-        res_array: &mut Vec<Option<DataItem<'a>>>,
+        col_array: &mut Vec<&dyn GetDataItem<'a>>,
     ) -> DeltaResult<()> {
-        // check each requested column in the row
-        for field in schema.fields.iter() {
-            match array.column_by_name(&field.name) {
-                None => {
-                    // check if this is nullable or not
-                    if field.nullable {
-                        debug!("Pushing None since column not present for {}", field.name);
-                        // TODO(nick): This is probably wrong if there is a nullable struct type. we
-                        // just need a helper that can recurse the kernel schema type and push Nones
-                        res_array.push(None);
-                    } else {
-                        return Err(Error::Generic(format!(
-                            "Didn't find non-nullable column: {}",
-                            field.name
-                        )));
-                    }
-                }
-                Some(col) => {
-                    // check first if a struct and just recurse no matter what
-                    if let DataType::Struct(_arrow_fields) = col.data_type() {
-                        match &field.data_type {
-                            crate::schema::DataType::Struct(field_struct) => {
-                                debug!(
-                                    "Recurse into {} with schema {:#?}",
-                                    field.name, field_struct
-                                );
-                                let struct_array = col.as_struct();
-                                SimpleData::extract_row(
-                                    struct_array,
-                                    field_struct,
-                                    row,
-                                    had_data,
-                                    res_array,
-                                )?;
-                            }
-                            _ => {
-                                return Err(Error::Generic(
-                                    "Schema mismatch during extraction".to_string(),
-                                ))
-                            }
-                        }
-                    }
-                    if col.is_null(row) {
-                        debug!("Pushing None for {}", field.name);
-                        res_array.push(None);
-                    } else {
-                        *had_data = true;
-                        match col.data_type() {
-                            DataType::Struct(_) => {} // handled above
-                            DataType::Boolean => {
-                                let val = col.as_boolean().value(row);
-                                debug!("For {} pushing: {}", field.name, val);
-                                res_array.push(Some(DataItem::Bool(val)));
-                            }
-                            DataType::Int32 => {
-                                let val = col.as_primitive::<Int32Type>().value(row);
-                                debug!("For {} pushing: {}", field.name, val);
-                                res_array.push(Some(DataItem::I32(val)));
-                            }
-                            DataType::Int64 => {
-                                let val = col.as_primitive::<Int64Type>().value(row);
-                                debug!("For {} pushing: {}", field.name, val);
-                                res_array.push(Some(DataItem::I64(val)));
-                            }
-                            DataType::Utf8 => {
-                                let val = col.as_string::<i32>().value(row);
-                                debug!("For {} pushing: {}", field.name, val);
-                                res_array.push(Some(DataItem::Str(val)));
-                            }
-                            DataType::List(_) => {
-                                res_array.push(Some(DataItem::List(col.as_list::<i32>())));
-                            }
-                            DataType::Map(_, _) => {
-                                res_array.push(Some(DataItem::Map(col.as_map())));
-                            }
-                            typ => {
-                                error!("CAN'T EXTRACT: {}", typ);
-                                return Err(Error::Generic(format!(
-                                    "Unimplemented extraction for type: {}",
-                                    typ
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        SimpleData::extract_columns_from_array(Some(&self.data), schema, col_array)?;
         Ok(())
     }
 
-    pub fn extract(&self, schema: SchemaRef, visitor: &mut dyn DataVisitor) -> DeltaResult<()> {
-        for row in 0..self.data.num_rows() {
-            debug!("Extracting row: {}", row);
-            let mut res_array: Vec<Option<DataItem<'_>>> = vec![];
-            let mut had_data = false;
-            SimpleData::extract_row(&self.data, &schema, row, &mut had_data, &mut res_array)?;
-            if had_data {
-                visitor.visit(row, &res_array);
+    /// Extracts an exploded schema (all leaf values), in schema order
+    fn extract_columns_from_array<'a>(
+        array: Option<&'a dyn ProvidesColumnByName>,
+        schema: &Schema,
+        col_array: &mut Vec<&dyn GetDataItem<'a>>,
+    ) -> DeltaResult<()> {
+        for field in schema.fields.iter() {
+            //println!("Looking at {:#?}", field);
+            if array.is_none() {
+                // we have recursed into a struct that was all null. if the field is allowed to be
+                // null, push that, otherwise error out.
+                if field.is_nullable() {
+                    match &field.data_type() {
+                        &DataType::Struct(ref fields) => {
+                            // keep recursing
+                            SimpleData::extract_columns_from_array(None, fields, col_array)?;
+                        }
+                        _ => col_array.push(&())
+                    }
+                    continue
+                } else {
+                    return Err(Error::Generic(format!("Found required field {}, but it's null", field.name)));
+                }
+            }
+            // unwrap here is safe as we checked above
+            // TODO(nick): refactor to `match` to make idiomatic
+            let col = array.unwrap().column_by_name(&field.name);
+            let data_type = col.map_or(&ArrowDataType::Null, |c| c.data_type());
+            match (col, data_type, &field.data_type) {
+                (_, &ArrowDataType::Null, &DataType::Struct(ref fields)) => {
+                    // We always explode structs even if null/missing, so recurse on
+                    // on each field.
+                    SimpleData::extract_columns_from_array(None, fields, col_array)?;
+                }
+                // TODO: Is this actually the right place to enforce nullability? We
+                // will anyway have to null-check the value for each row? Tho I guess we
+                // could early-out if we find an all-null or missing column forwhen a
+                // non-nullable field was requested, and could also simplify the checks
+                // in case the underlying column is non-nullable.
+                (_, &ArrowDataType::Null, _) if field.is_nullable() => col_array.push(&()),
+                (_, &ArrowDataType::Null, _) => {
+                    return Err(Error::Generic(
+                        "Got a null column for something required in passed schema".to_string(),
+                    ))
+                }
+                (Some(col), &ArrowDataType::Struct(_), &DataType::Struct(ref fields)) => {
+                    // both structs, so recurse into col
+                    let struct_array = col.as_struct();
+                    SimpleData::extract_columns_from_array(Some(struct_array), fields, col_array)?;
+                }
+                (
+                    Some(col),
+                    &ArrowDataType::Boolean,
+                    &DataType::Primitive(PrimitiveType::Boolean),
+                ) => {
+                    col_array.push(col.as_boolean());
+                }
+                (Some(col), &ArrowDataType::Utf8, &DataType::Primitive(PrimitiveType::String)) => {
+                    col_array.push(col.as_string::<i32>());
+                }
+                (Some(col), &ArrowDataType::Int64, &DataType::Primitive(PrimitiveType::Long)) => {
+                    col_array.push(col.as_primitive::<Int64Type>());
+                }
+                (
+                    Some(col),
+                    &ArrowDataType::List(ref _arrow_field),
+                    &DataType::Array(ref _array_type),
+                ) => {
+                    // TODO(nick): validate the element types match
+                    col_array.push(col.as_list());
+                }
+                (Some(col), &ArrowDataType::Map(_, _), &DataType::Map(_)) => {
+                    col_array.push(col.as_map());
+                }
+                (Some(_), arrow_data_type, data_type) => {
+                    debug!("CATCHALL\n ARROW: {arrow_data_type}\n US: {data_type}");
+                    return Err(Error::Generic(format!(
+                        "Type mismatch on {}: expected {data_type}, got {arrow_data_type}",
+                        field.name
+                    )));
+                }
+                (_, arrow_data_type, _) => {
+                    return Err(Error::Generic(format!(
+                        "Need a column to extract field {} of type {arrow_data_type}, but got none",
+                        field.name
+                    )));
+                }
             }
         }
         Ok(())

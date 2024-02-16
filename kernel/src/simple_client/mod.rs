@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 pub mod data;
 mod fs_client;
+mod get_data_item;
 pub(crate) mod json;
 mod parquet;
 
@@ -39,7 +40,11 @@ impl DataExtractor for SimpleDataExtractor {
             .as_any()
             .downcast_ref::<data::SimpleData>()
             .expect("extract called on blob that isn't SimpleData");
-        data.extract(schema, visitor)
+        //data.extract(schema, visitor)
+        let mut col_array = vec![];
+        data.extract_columns(&schema, &mut col_array)?;
+        visitor.visit(data.length(), &col_array);
+        Ok(())
     }
 
     fn length(&self, blob: &dyn EngineData) -> usize {

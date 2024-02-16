@@ -10,7 +10,7 @@ use roaring::RoaringTreemap;
 use url::Url;
 
 use crate::{
-    engine_data::{DataItem, DataVisitor, EngineData, ExtractInto, ListItem, MapItem},
+    engine_data::{DataItem, DataVisitor, EngineData, ExtractInto, GetDataItem, ListItem, MapItem},
     schema::StructType,
     DeltaResult, EngineClient, Error, FileSystemClient,
 };
@@ -33,8 +33,15 @@ impl<T> Visitor<T> {
 }
 
 impl<T> DataVisitor for Visitor<T> {
-    fn visit(&mut self, row_index: usize, vals: &[Option<DataItem<'_>>]) {
-        self.extracted = Some((self.extract_fn)(row_index, vals));
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetDataItem<'a>]) {
+        for i in 0..row_count {
+            // TODO(nick): How to check if a row is valid
+            if getters[0].get(i).is_some() {
+                // TODO(nick): Have extract_fn take an iter
+                let row: Vec<_> = getters.iter().map(|getter| getter.get(i)).collect();
+                self.extracted = Some((self.extract_fn)(i, &row));
+            }
+        }
     }
 }
 
@@ -56,8 +63,9 @@ impl<T> MultiVisitor<T> {
 }
 
 impl<T> DataVisitor for MultiVisitor<T> {
-    fn visit(&mut self, row_index: usize, vals: &[Option<DataItem<'_>>]) {
-        self.extracted.push((self.extract_fn)(row_index, vals));
+    fn visit(&mut self, row_index: usize, vals: &[&dyn GetDataItem<'_>]) {
+        //self.extracted.push((self.extract_fn)(row_index, vals));
+        panic!("nope");
     }
 }
 
@@ -126,18 +134,18 @@ fn visit_metadata(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResul
     // options for format is always empty, so skip vals[4]
     let schema_string: String = vals[5].extract_into("metadata.schema_string")?;
 
-    let partition_list: &dyn ListItem = vals[6].extract_into("metadata.partition_list")?;
+    let partition_list: ListItem<'_> = vals[6].extract_into("metadata.partition_list")?;
     let mut partition_columns = vec![];
-    for i in 0..partition_list.len(row_index) {
-        partition_columns.push(partition_list.get(row_index, i));
+    for i in 0..partition_list.len() {
+        partition_columns.push(partition_list.get(i));
     }
 
     let created_time: i64 = vals[7].extract_into("metadata.created_time")?;
 
-    let configuration_map_opt: Option<&dyn MapItem> =
+    let configuration_map_opt: Option<MapItem<'_>> =
         vals[8].extract_into_opt("metadata.configuration")?;
     let configuration = match configuration_map_opt {
-        Some(map_item) => map_item.materialize(row_index),
+        Some(map_item) => map_item.materialize(),
         None => HashMap::new(),
     };
 
@@ -191,31 +199,31 @@ fn visit_protocol(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResul
     let min_reader_version: i32 = vals[0].extract_into("protocol.min_reader_version")?;
     let min_writer_version: i32 = vals[1].extract_into("protocol.min_writer_version")?;
 
-    let reader_features_list: Option<&dyn ListItem> =
-        vals[2].extract_into_opt("protocol.reader_features")?;
-    let reader_features = reader_features_list.map(|rfl| {
-        let mut reader_features = vec![];
-        for i in 0..rfl.len(row_index) {
-            reader_features.push(rfl.get(row_index, i));
-        }
-        reader_features
-    });
+    // let reader_features_list: Option<&dyn ListItem> =
+    //     vals[2].extract_into_opt("protocol.reader_features")?;
+    // let reader_features = reader_features_list.map(|rfl| {
+    //     let mut reader_features = vec![];
+    //     for i in 0..rfl.len(row_index) {
+    //         reader_features.push(rfl.get(row_index, i));
+    //     }
+    //     reader_features
+    // });
 
-    let writer_features_list: Option<&dyn ListItem> =
-        vals[3].extract_into_opt("protocol.writer_features")?;
-    let writer_features = writer_features_list.map(|wfl| {
-        let mut writer_features = vec![];
-        for i in 0..wfl.len(row_index) {
-            writer_features.push(wfl.get(row_index, i));
-        }
-        writer_features
-    });
+    // let writer_features_list: Option<&dyn ListItem> =
+    //     vals[3].extract_into_opt("protocol.writer_features")?;
+    // let writer_features = writer_features_list.map(|wfl| {
+    //     let mut writer_features = vec![];
+    //     for i in 0..wfl.len(row_index) {
+    //         writer_features.push(wfl.get(row_index, i));
+    //     }
+    //     writer_features
+    // });
 
     Ok(Protocol {
         min_reader_version,
         min_writer_version,
-        reader_features,
-        writer_features,
+        reader_features: None,
+        writer_features: None,
     })
 }
 
@@ -409,8 +417,8 @@ impl Add {
 
 pub(crate) fn visit_add(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<Add> {
     let path: String = vals[0].extract_into("add.path")?;
-    let partition_values_map: &dyn MapItem = vals[1].extract_into("add.partitionValues")?;
-    let partition_values = partition_values_map.materialize(row_index);
+    let partition_values_map: MapItem<'_> = vals[1].extract_into("add.partitionValues")?;
+    let partition_values = partition_values_map.materialize();
     let size: i64 = vals[2].extract_into("add.size")?;
     let modification_time: i64 = vals[3].extract_into("add.modificationTime")?;
     let data_change: bool = vals[4].extract_into("add.dataChange")?;
