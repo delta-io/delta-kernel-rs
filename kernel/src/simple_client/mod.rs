@@ -42,7 +42,7 @@ impl DataExtractor for SimpleDataExtractor {
             .expect("extract called on blob that isn't SimpleData");
         //data.extract(schema, visitor)
         let mut col_array = vec![];
-        data.extract_columns(&schema, &mut col_array)?;
+        data.extract_columns(&mut col_array, &schema)?;
         visitor.visit(data.length(), &col_array);
         Ok(())
     }

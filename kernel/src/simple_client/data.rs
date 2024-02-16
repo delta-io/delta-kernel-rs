@@ -160,122 +160,103 @@ impl SimpleData {
 
     pub fn extract_columns<'a>(
         &'a self,
+        out_col_array: &mut Vec<&dyn GetDataItem<'a>>,
         schema: &Schema,
-        col_array: &mut Vec<&dyn GetDataItem<'a>>,
     ) -> DeltaResult<()> {
-        SimpleData::extract_columns_from_array(Some(&self.data), schema, col_array)?;
-        Ok(())
+        SimpleData::extract_columns_from_array(out_col_array, schema, Some(&self.data))
     }
 
     /// Extracts an exploded schema (all leaf values), in schema order
     fn extract_columns_from_array<'a>(
-        array: Option<&'a dyn ProvidesColumnByName>,
+        out_col_array: &mut Vec<&dyn GetDataItem<'a>>,
         schema: &Schema,
-        col_array: &mut Vec<&dyn GetDataItem<'a>>,
+        array: Option<&'a dyn ProvidesColumnByName>,
     ) -> DeltaResult<()> {
         for field in schema.fields.iter() {
-            //println!("Looking at {:#?}", field);
-            if array.is_none() {
-                // we have recursed into a struct that was all null. if the field is allowed to be
-                // null, push that, otherwise error out.
-                if field.is_nullable() {
-                    match &field.data_type() {
-                        &DataType::Struct(ref fields) => {
-                            // keep recursing
-                            SimpleData::extract_columns_from_array(None, fields, col_array)?;
+            let col = array
+                .and_then(|a| a.column_by_name(&field.name))
+                .filter(|a| *a.data_type() != ArrowDataType::Null);
+            match col {
+                Some(col) => {
+                    match (col.data_type(), &field.data_type) {
+                        (&ArrowDataType::Struct(_), &DataType::Struct(ref fields)) => {
+                            // both structs, so recurse into col
+                            let struct_array = col.as_struct();
+                            SimpleData::extract_columns_from_array(
+                                out_col_array,
+                                fields,
+                                Some(struct_array),
+                            )?;
                         }
-                        _ => col_array.push(&()),
-                    }
-                    continue;
-                } else {
-                    return Err(Error::Generic(format!(
-                        "Found required field {}, but it's null",
-                        field.name
-                    )));
-                }
-            }
-            // unwrap here is safe as we checked above
-            // TODO(nick): refactor to `match` to make idiomatic
-            let col = array.unwrap().column_by_name(&field.name);
-            let data_type = col.map_or(&ArrowDataType::Null, |c| c.data_type());
-            match (col, data_type, &field.data_type) {
-                (_, &ArrowDataType::Null, &DataType::Struct(ref fields)) => {
-                    // We always explode structs even if null/missing, so recurse on
-                    // on each field.
-                    SimpleData::extract_columns_from_array(None, fields, col_array)?;
-                }
-                // TODO: Is this actually the right place to enforce nullability? We
-                // will anyway have to null-check the value for each row? Tho I guess we
-                // could early-out if we find an all-null or missing column forwhen a
-                // non-nullable field was requested, and could also simplify the checks
-                // in case the underlying column is non-nullable.
-                (_, &ArrowDataType::Null, _) if field.is_nullable() => col_array.push(&()),
-                (_, &ArrowDataType::Null, _) => {
-                    return Err(Error::Generic(
-                        "Got a null column for something required in passed schema".to_string(),
-                    ))
-                }
-                (Some(col), &ArrowDataType::Struct(_), &DataType::Struct(ref fields)) => {
-                    // both structs, so recurse into col
-                    let struct_array = col.as_struct();
-                    SimpleData::extract_columns_from_array(Some(struct_array), fields, col_array)?;
-                }
-                (
-                    Some(col),
-                    &ArrowDataType::Boolean,
-                    &DataType::Primitive(PrimitiveType::Boolean),
-                ) => {
-                    col_array.push(col.as_boolean());
-                }
-                (Some(col), &ArrowDataType::Utf8, &DataType::Primitive(PrimitiveType::String)) => {
-                    col_array.push(col.as_string::<i32>());
-                }
-                (
-                    Some(col),
-                    &ArrowDataType::Int32,
-                    &DataType::Primitive(PrimitiveType::Integer),
-                ) => {
-                    col_array.push(col.as_primitive::<Int32Type>());
-                }
-                (Some(col), &ArrowDataType::Int64, &DataType::Primitive(PrimitiveType::Long)) => {
-                    col_array.push(col.as_primitive::<Int64Type>());
-                }
-                (
-                    Some(col),
-                    &ArrowDataType::List(ref _arrow_field),
-                    &DataType::Array(ref _array_type),
-                ) => {
-                    // TODO(nick): validate the element types match
-                    col_array.push(col.as_list());
-                }
-                (Some(col), &ArrowDataType::Map(_, _), &DataType::Map(_)) => {
-                    col_array.push(col.as_map());
-                }
-                (Some(_), arrow_data_type, data_type) => {
-                    warn!("Can't extract {}. Arrow Type: {arrow_data_type}\n Kernel Type: {data_type}", field.name);
-                    let expected_type: Result<ArrowDataType, ArrowError> = data_type.try_into();
-                    return Err(match expected_type {
-                        Ok(expected_type) => {
-                            if expected_type == *arrow_data_type {
-                                Error::Generic(format!("On {}: Don't know how to extract something of type {data_type}", field.name))
-                            } else {
-                                Error::Generic(format!(
-                                    "Type mismatch on {}: expected {data_type}, got {arrow_data_type}",
+                        (&ArrowDataType::Boolean, &DataType::Primitive(PrimitiveType::Boolean)) => {
+                            out_col_array.push(col.as_boolean());
+                        }
+                        (&ArrowDataType::Utf8, &DataType::Primitive(PrimitiveType::String)) => {
+                            out_col_array.push(col.as_string::<i32>());
+                        }
+                        (&ArrowDataType::Int32, &DataType::Primitive(PrimitiveType::Integer)) => {
+                            out_col_array.push(col.as_primitive::<Int32Type>());
+                        }
+                        (&ArrowDataType::Int64, &DataType::Primitive(PrimitiveType::Long)) => {
+                            out_col_array.push(col.as_primitive::<Int64Type>());
+                        }
+                        (
+                            &ArrowDataType::List(ref _arrow_field),
+                            &DataType::Array(ref _array_type),
+                        ) => {
+                            // TODO(nick): validate the element types match
+                            out_col_array.push(col.as_list());
+                        }
+                        (&ArrowDataType::Map(_, _), &DataType::Map(_)) => {
+                            out_col_array.push(col.as_map());
+                        }
+                        (arrow_data_type, data_type) => {
+                            warn!("Can't extract {}. Arrow Type: {arrow_data_type}\n Kernel Type: {data_type}", field.name);
+                            let expected_type: Result<ArrowDataType, ArrowError> =
+                                data_type.try_into();
+                            return Err(match expected_type {
+                                Ok(expected_type) => {
+                                    if expected_type == *arrow_data_type {
+                                        Error::Generic(format!("On {}: Don't know how to extract something of type {data_type}", field.name))
+                                    } else {
+                                        Error::Generic(format!(
+                                            "Type mismatch on {}: expected {data_type}, got {arrow_data_type}",
+                                            field.name
+                                        ))
+                                    }
+                                }
+                                Err(e) => Error::Generic(format!(
+                                    "On {}: Unsupported data type {data_type}: {e}",
                                     field.name
-                                ))
-                            }
+                                )),
+                            });
                         }
-                        Err(e) => Error::Generic(format!(
-                            "On {}: Unsupported data type {data_type}: {e}",
-                            field.name
-                        )),
-                    });
+                    }
                 }
-                (_, arrow_data_type, _) => {
-                    return Err(Error::Generic(format!(
-                        "Need a column to extract field {} of type {arrow_data_type}, but got none",
-                        field.name
-                    )));
+                None => {
+                    // We have either:
+                    //   a) encountered a column that is all nulls or,
+                    //   b) recursed into a struct that was all null.
+                    // if the field is allowed to be null, push that, otherwise error out.
+                    if field.is_nullable() {
+                        match &field.data_type() {
+                            &DataType::Struct(ref fields) => {
+                                // keep recursing
+                                SimpleData::extract_columns_from_array(
+                                    out_col_array,
+                                    fields,
+                                    None,
+                                )?;
+                            }
+                            _ => out_col_array.push(&()),
+                        }
+                        continue;
+                    } else {
+                        return Err(Error::Generic(format!(
+                            "Found required field {}, but it's null",
+                            field.name
+                        )));
+                    }
                 }
             }
         }

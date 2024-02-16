@@ -159,12 +159,13 @@ impl<'a, 'b> ExtractInto<&'a ListItem<'b>> for &'a Option<DataItem<'b>> {
         self.as_ref()
             .map(|item| match item {
                 DataItem::List(ref x) => Ok(x),
-                _ => Err(Error::Generic(format!("Could not extract {field_name} as a ListItem")))
+                _ => Err(Error::Generic(format!(
+                    "Could not extract {field_name} as a ListItem"
+                ))),
             })
             .transpose()
     }
 }
-
 
 /// Attempt to extract a DataItem into an `&'a MapItem`. This does not perform type coersion, it
 /// just returns `Ok(Some(&'a MapItem<'b>))` if the DataItem is a DataItem::Map or returns an error
@@ -174,7 +175,9 @@ impl<'a, 'b> ExtractInto<&'a MapItem<'b>> for &'a Option<DataItem<'b>> {
         self.as_ref()
             .map(|item| match item {
                 DataItem::Map(ref x) => Ok(x),
-                _ => Err(Error::Generic(format!("Could not extract {field_name} as a MapItem")))
+                _ => Err(Error::Generic(format!(
+                    "Could not extract {field_name} as a MapItem"
+                ))),
             })
             .transpose()
     }
