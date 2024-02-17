@@ -50,8 +50,7 @@ impl<'a> GetDataItem<'a> for PrimitiveArray<Int32Type> {
 impl<'a> GetDataItem<'a> for GenericListArray<i32> {
     fn get(&'a self, row_index: usize) -> Option<DataItem<'a>> {
         if self.is_valid(row_index) {
-            let list_item = ListItem::new(self, row_index);
-            Some(DataItem::List(list_item))
+            Some(DataItem::List(ListItem::new(self, row_index)))
         } else {
             None
         }
@@ -61,8 +60,7 @@ impl<'a> GetDataItem<'a> for GenericListArray<i32> {
 impl<'a> GetDataItem<'a> for MapArray {
     fn get(&'a self, row_index: usize) -> Option<DataItem<'a>> {
         if self.is_valid(row_index) {
-            let map_item = MapItem::new(self, row_index);
-            Some(DataItem::Map(map_item))
+            Some(DataItem::Map(MapItem::new(self, row_index)))
         } else {
             None
         }

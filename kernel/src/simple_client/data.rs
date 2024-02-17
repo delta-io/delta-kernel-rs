@@ -1,5 +1,5 @@
 use crate::engine_data::{DataItemList, DataItemMap, EngineData, GetDataItem, TypeTag};
-use crate::schema::{DataType, PrimitiveType, Schema, SchemaRef};
+use crate::schema::{DataType, PrimitiveType, Schema, SchemaRef, StructField};
 use crate::{DeltaResult, Error};
 
 use arrow_array::cast::AsArray;
@@ -174,94 +174,92 @@ impl SimpleData {
             let col = array
                 .and_then(|a| a.column_by_name(&field.name))
                 .filter(|a| *a.data_type() != ArrowDataType::Null);
+            // Note: if col is None we have either:
+            //   a) encountered a column that is all nulls or,
+            //   b) recursed into a struct that was all null.
+            // So below if the field is allowed to be null, we push that, otherwise we error out.
             match col {
-                Some(col) => {
-                    match (col.data_type(), &field.data_type) {
-                        (&ArrowDataType::Struct(_), DataType::Struct(fields)) => {
-                            // both structs, so recurse into col
-                            let struct_array = col.as_struct();
-                            SimpleData::extract_columns_from_array(
-                                out_col_array,
-                                fields,
-                                Some(struct_array),
-                            )?;
-                        }
-                        (&ArrowDataType::Boolean, &DataType::Primitive(PrimitiveType::Boolean)) => {
-                            debug!("Pushing boolean array for {}", field.name);
-                            out_col_array.push(col.as_boolean());
-                        }
-                        (&ArrowDataType::Utf8, &DataType::Primitive(PrimitiveType::String)) => {
-                            debug!("Pushing string array for {}", field.name);
-                            out_col_array.push(col.as_string::<i32>());
-                        }
-                        (&ArrowDataType::Int32, &DataType::Primitive(PrimitiveType::Integer)) => {
-                            debug!("Pushing int32 array for {}", field.name);
-                            out_col_array.push(col.as_primitive::<Int32Type>());
-                        }
-                        (&ArrowDataType::Int64, &DataType::Primitive(PrimitiveType::Long)) => {
-                            debug!("Pushing int64 array for {}", field.name);
-                            out_col_array.push(col.as_primitive::<Int64Type>());
-                        }
-                        (ArrowDataType::List(_arrow_field), DataType::Array(_array_type)) => {
-                            // TODO(nick): validate the element types match
-                            debug!("Pushing list for {}", field.name);
-                            out_col_array.push(col.as_list());
-                        }
-                        (&ArrowDataType::Map(_, _), &DataType::Map(_)) => {
-                            debug!("Pushing map for {}", field.name);
-                            out_col_array.push(col.as_map());
-                        }
-                        (arrow_data_type, data_type) => {
-                            warn!("Can't extract {}. Arrow Type: {arrow_data_type}\n Kernel Type: {data_type}", field.name);
-                            let expected_type: Result<ArrowDataType, ArrowError> =
-                                data_type.try_into();
-                            return Err(match expected_type {
-                                Ok(expected_type) => {
-                                    if expected_type == *arrow_data_type {
-                                        Error::Generic(format!("On {}: Don't know how to extract something of type {data_type}", field.name))
-                                    } else {
-                                        Error::Generic(format!(
-                                            "Type mismatch on {}: expected {data_type}, got {arrow_data_type}",
-                                            field.name
-                                        ))
-                                    }
-                                }
-                                Err(e) => Error::Generic(format!(
-                                    "On {}: Unsupported data type {data_type}: {e}",
-                                    field.name
-                                )),
-                            });
-                        }
+                Some(col) => Self::extract_column(out_col_array, field, col)?,
+                None if field.is_nullable() => {
+                    if let DataType::Struct(_) = field.data_type() {
+                        Self::extract_columns_from_array(out_col_array, schema, None)?;
+                    } else {
+                        debug!("Pusing a null field for {}", field.name);
+                        out_col_array.push(&());
                     }
                 }
                 None => {
-                    // We have either:
-                    //   a) encountered a column that is all nulls or,
-                    //   b) recursed into a struct that was all null.
-                    // if the field is allowed to be null, push that, otherwise error out.
-                    if field.is_nullable() {
-                        match &field.data_type() {
-                            DataType::Struct(fields) => {
-                                // keep recursing
-                                SimpleData::extract_columns_from_array(
-                                    out_col_array,
-                                    fields,
-                                    None,
-                                )?;
-                            }
-                            _ => {
-                                debug!("Pusing a null field for {}", field.name);
-                                out_col_array.push(&())
-                            }
-                        }
-                        continue;
-                    } else {
-                        return Err(Error::Generic(format!(
-                            "Found required field {}, but it's null",
-                            field.name
-                        )));
-                    }
+                    return Err(Error::Generic(format!(
+                        "Found required field {}, but it's null",
+                        field.name
+                    )));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn extract_column<'a>(
+        out_col_array: &mut Vec<&dyn GetDataItem<'a>>,
+        field: &StructField,
+        col: &'a dyn Array,
+    ) -> DeltaResult<()> {
+        match (col.data_type(), &field.data_type) {
+            (&ArrowDataType::Struct(_), DataType::Struct(fields)) => {
+                // both structs, so recurse into col
+                let struct_array = col.as_struct();
+                SimpleData::extract_columns_from_array(out_col_array, fields, Some(struct_array))?;
+            }
+            (&ArrowDataType::Boolean, &DataType::Primitive(PrimitiveType::Boolean)) => {
+                debug!("Pushing boolean array for {}", field.name);
+                out_col_array.push(col.as_boolean());
+            }
+            (&ArrowDataType::Utf8, &DataType::Primitive(PrimitiveType::String)) => {
+                debug!("Pushing string array for {}", field.name);
+                out_col_array.push(col.as_string::<i32>());
+            }
+            (&ArrowDataType::Int32, &DataType::Primitive(PrimitiveType::Integer)) => {
+                debug!("Pushing int32 array for {}", field.name);
+                out_col_array.push(col.as_primitive::<Int32Type>());
+            }
+            (&ArrowDataType::Int64, &DataType::Primitive(PrimitiveType::Long)) => {
+                debug!("Pushing int64 array for {}", field.name);
+                out_col_array.push(col.as_primitive::<Int64Type>());
+            }
+            (ArrowDataType::List(_arrow_field), DataType::Array(_array_type)) => {
+                // TODO(nick): validate the element types match
+                debug!("Pushing list for {}", field.name);
+                out_col_array.push(col.as_list());
+            }
+            (&ArrowDataType::Map(_, _), &DataType::Map(_)) => {
+                debug!("Pushing map for {}", field.name);
+                out_col_array.push(col.as_map());
+            }
+            (arrow_data_type, data_type) => {
+                warn!(
+                    "Can't extract {}. Arrow Type: {arrow_data_type}\n Kernel Type: {data_type}",
+                    field.name
+                );
+                let expected_type: Result<ArrowDataType, ArrowError> = data_type.try_into();
+                return Err(match expected_type {
+                    Ok(expected_type) => {
+                        if expected_type == *arrow_data_type {
+                            Error::Generic(format!(
+                                "On {}: Don't know how to extract something of type {data_type}",
+                                field.name
+                            ))
+                        } else {
+                            Error::Generic(format!(
+                                "Type mismatch on {}: expected {data_type}, got {arrow_data_type}",
+                                field.name
+                            ))
+                        }
+                    }
+                    Err(e) => Error::Generic(format!(
+                        "On {}: Unsupported data type {data_type}: {e}",
+                        field.name
+                    )),
+                });
             }
         }
         Ok(())
