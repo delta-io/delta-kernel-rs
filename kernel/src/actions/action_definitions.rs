@@ -10,7 +10,7 @@ use roaring::RoaringTreemap;
 use url::Url;
 
 use crate::{
-    engine_data::{DataVisitor, EngineData, ExtractIntoGDI, GetDataItem, ListItem, MapItem},
+    engine_data::{DataVisitor, EngineData, ExtractInto, GetDataItem, ListItem, MapItem},
     schema::StructType,
     DeltaResult, EngineClient, Error, FileSystemClient,
 };

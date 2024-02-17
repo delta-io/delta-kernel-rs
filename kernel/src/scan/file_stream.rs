@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use super::data_skipping::DataSkippingFilter;
 use crate::actions::action_definitions::{Add, AddVisitor, Remove, RemoveVisitor};
-use crate::engine_data::{ExtractIntoGDI, GetDataItem};
+use crate::engine_data::{ExtractInto, GetDataItem};
 use crate::expressions::Expression;
 use crate::schema::{SchemaRef, StructType};
 use crate::{DataExtractor, DataVisitor, DeltaResult, EngineData};

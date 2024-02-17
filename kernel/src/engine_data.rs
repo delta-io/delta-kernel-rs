@@ -101,24 +101,29 @@ impl<'a> DataItem<'a> {
     }
 }
 
+
+pub trait GetDataItem<'a> {
+    fn get(&'a self, row_index: usize) -> Option<DataItem<'a>>;
+}
+
 /// A trait similar to TryInto, that allows extracting a [`DataItem`] into a particular type
 pub trait ExtractInto<T>: Sized {
     /// Extract a required item into type `T` for the specified `field_name`
     /// This returns an error if the item is not present
-    fn extract_into(self, field_name: &str) -> DeltaResult<T> {
-        let result = self.extract_into_opt(field_name)?;
+    fn extract_into(self, row_index: usize, field_name: &str) -> DeltaResult<T> {
+        let result = self.extract_into_opt(row_index, field_name)?;
         result.ok_or(Error::Generic(format!(
             "Missing value for required field: {field_name}"
         )))
     }
     /// Extract an optional item into type `T` for the specified `field_name`
     /// Returns `None` if the item is not present, or `Some(T)` if it is
-    fn extract_into_opt(self, field_name: &str) -> DeltaResult<Option<T>>;
+    fn extract_into_opt(self, row_index: usize, field_name: &str) -> DeltaResult<Option<T>>;
 }
 
 macro_rules! impl_extract_into {
     (($target_type: ty, $enum_variant: ident)) => {
-        #[doc = "Attempt to extract a DataItem into a(n) `"]
+        #[doc = "Attempt to extract a GetDataItem into a(n) `"]
         #[doc = stringify!($target_type)]
         #[doc = "`. This does _not_ perform type  coersion, it just returns "]
         #[doc = concat!("`Ok(Some(", stringify!($target_type), "))`")]
@@ -126,9 +131,10 @@ macro_rules! impl_extract_into {
         #[doc = concat!("`DataItem::", stringify!($enum_variant), "`")]
         #[doc = " or returns an error if it is not. "]
         #[doc = " Returns `Ok(None)` if the data item was not present in the source data."]
-        impl<'a, 'b> ExtractInto<$target_type> for &'a Option<DataItem<'b>> {
-            fn extract_into_opt(self, field_name: &str) -> DeltaResult<Option<$target_type>> {
-                self.as_ref().map(|item| match item {
+        impl<'a> ExtractInto<$target_type> for &'a dyn GetDataItem<'a> {
+            fn extract_into_opt(self, row_index: usize, field_name: &str) -> DeltaResult<Option<$target_type>> {
+                let data_item = self.get(row_index);
+                data_item.as_ref().map(|item| match item {
                     &DataItem::$enum_variant(x) => Ok(x),
                     _ => Err(Error::Generic(format!("Could not extract {field_name} as {}", stringify!($target_type))))
                 }).transpose()
@@ -149,110 +155,13 @@ impl_extract_into!(
     (i64, I64),
     (u32, U32),
     (u64, U64),
-    (&'b str, Str)
-);
-
-/// Attempt to extract a DataItem into an `&'a ListItem`. This does not perform type coersion, it
-/// just returns `Ok(Some(&'a ListItem<'b>))` if the DataItem is a DataItem::List or returns an error
-/// if it is not. Returns `Ok(None)` if the data item was not present in the source data.
-impl<'a, 'b> ExtractInto<&'a ListItem<'b>> for &'a Option<DataItem<'b>> {
-    fn extract_into_opt(self, field_name: &str) -> DeltaResult<Option<&'a ListItem<'b>>> {
-        self.as_ref()
-            .map(|item| match item {
-                DataItem::List(ref x) => Ok(x),
-                _ => Err(Error::Generic(format!(
-                    "Could not extract {field_name} as a ListItem"
-                ))),
-            })
-            .transpose()
-    }
-}
-
-/// Attempt to extract a DataItem into an `&'a MapItem`. This does not perform type coersion, it
-/// just returns `Ok(Some(&'a MapItem<'b>))` if the DataItem is a DataItem::Map or returns an error
-/// if it is not. Returns `Ok(None)` if the data item was not present in the source data.
-impl<'a, 'b> ExtractInto<&'a MapItem<'b>> for &'a Option<DataItem<'b>> {
-    fn extract_into_opt(self, field_name: &str) -> DeltaResult<Option<&'a MapItem<'b>>> {
-        self.as_ref()
-            .map(|item| match item {
-                DataItem::Map(ref x) => Ok(x),
-                _ => Err(Error::Generic(format!(
-                    "Could not extract {field_name} as a MapItem"
-                ))),
-            })
-            .transpose()
-    }
-}
-
-/// The `String` implementation for ExtractInto simply extracts the item as a &str and then
-/// allocates a new string. This is a convenience wrapper only.
-impl<'a, 'b> ExtractInto<String> for &'a Option<DataItem<'b>> {
-    fn extract_into_opt(self, field_name: &str) -> DeltaResult<Option<String>> {
-        let val: Option<&str> = self.extract_into_opt(field_name)?;
-        Ok(val.map(|s| s.to_string()))
-    }
-}
-
-pub trait GetDataItem<'a> {
-    fn get(&'a self, row_index: usize) -> Option<DataItem<'a>>;
-}
-
-/// A trait similar to TryInto, that allows extracting a [`DataItem`] into a particular type
-pub trait ExtractIntoGDI<T>: Sized {
-    /// Extract a required item into type `T` for the specified `field_name`
-    /// This returns an error if the item is not present
-    fn extract_into(self, row_index: usize, field_name: &str) -> DeltaResult<T> {
-        let result = self.extract_into_opt(row_index, field_name)?;
-        result.ok_or(Error::Generic(format!(
-            "Missing value for required field: {field_name}"
-        )))
-    }
-    /// Extract an optional item into type `T` for the specified `field_name`
-    /// Returns `None` if the item is not present, or `Some(T)` if it is
-    fn extract_into_opt(self, row_index: usize, field_name: &str) -> DeltaResult<Option<T>>;
-}
-
-macro_rules! impl_extract_into_gdi {
-    (($target_type: ty, $enum_variant: ident)) => {
-        #[doc = "Attempt to extract a GetDataItem into a(n) `"]
-        #[doc = stringify!($target_type)]
-        #[doc = "`. This does _not_ perform type  coersion, it just returns "]
-        #[doc = concat!("`Ok(Some(", stringify!($target_type), "))`")]
-        #[doc = " if the DataItem is a "]
-        #[doc = concat!("`DataItem::", stringify!($enum_variant), "`")]
-        #[doc = " or returns an error if it is not. "]
-        #[doc = " Returns `Ok(None)` if the data item was not present in the source data."]
-        impl<'a> ExtractIntoGDI<$target_type> for &'a dyn GetDataItem<'a> {
-            fn extract_into_opt(self, row_index: usize, field_name: &str) -> DeltaResult<Option<$target_type>> {
-                let data_item = self.get(row_index);
-                data_item.as_ref().map(|item| match item {
-                    &DataItem::$enum_variant(x) => Ok(x),
-                    _ => Err(Error::Generic(format!("Could not extract {field_name} as {}", stringify!($target_type))))
-                }).transpose()
-            }
-        }
-    };
-    (($target_type: ty, $enum_variant: ident), $(($target_type_rest: ty, $enum_variant_rest: ident)),+) => {
-        impl_extract_into_gdi!(($target_type, $enum_variant));
-        impl_extract_into_gdi!($(($target_type_rest, $enum_variant_rest)),+);
-    }
-}
-
-impl_extract_into_gdi!(
-    (bool, Bool),
-    (f32, F32),
-    (f64, F64),
-    (i32, I32),
-    (i64, I64),
-    (u32, U32),
-    (u64, U64),
     (&'a str, Str)
 );
 
 /// Attempt to extract a DataItem into an `&'a ListItem`. This does not perform type coersion, it
 /// just returns `Ok(Some(&'a ListItem<'b>))` if the DataItem is a DataItem::List or returns an error
 /// if it is not. Returns `Ok(None)` if the data item was not present in the source data.
-impl<'a> ExtractIntoGDI<ListItem<'a>> for &'a dyn GetDataItem<'a> {
+impl<'a> ExtractInto<ListItem<'a>> for &'a dyn GetDataItem<'a> {
     fn extract_into_opt(
         self,
         row_index: usize,
@@ -272,7 +181,7 @@ impl<'a> ExtractIntoGDI<ListItem<'a>> for &'a dyn GetDataItem<'a> {
 /// Attempt to extract a DataItem into an `&'a MapItem`. This does not perform type coersion, it
 /// just returns `Ok(Some(&'a MapItem<'b>))` if the DataItem is a DataItem::Map or returns an error
 /// if it is not. Returns `Ok(None)` if the data item was not present in the source data.
-impl<'a> ExtractIntoGDI<MapItem<'a>> for &'a dyn GetDataItem<'a> {
+impl<'a> ExtractInto<MapItem<'a>> for &'a dyn GetDataItem<'a> {
     fn extract_into_opt(
         self,
         row_index: usize,
@@ -289,7 +198,7 @@ impl<'a> ExtractIntoGDI<MapItem<'a>> for &'a dyn GetDataItem<'a> {
     }
 }
 
-impl<'a> ExtractIntoGDI<String> for &'a dyn GetDataItem<'a> {
+impl<'a> ExtractInto<String> for &'a dyn GetDataItem<'a> {
     fn extract_into_opt(self, row_index: usize, field_name: &str) -> DeltaResult<Option<String>> {
         let val: Option<&str> = self.extract_into_opt(row_index, field_name)?;
         Ok(val.map(|s| s.to_string()))
