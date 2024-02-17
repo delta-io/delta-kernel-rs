@@ -2,7 +2,7 @@
 
 use arrow_array::{
     types::{GenericStringType, Int32Type, Int64Type},
-    Array, ArrayRef, BooleanArray, GenericByteArray, GenericListArray, MapArray, PrimitiveArray,
+    Array, BooleanArray, GenericByteArray, GenericListArray, MapArray, PrimitiveArray,
 };
 
 use crate::engine_data::{DataItem, GetDataItem, ListItem, MapItem};

@@ -10,64 +10,10 @@ use roaring::RoaringTreemap;
 use url::Url;
 
 use crate::{
-    engine_data::{DataItem, DataVisitor, EngineData, ExtractInto, GetDataItem, ListItem, MapItem},
+    engine_data::{DataVisitor, EngineData, ExtractIntoGDI, GetDataItem, ListItem, MapItem},
     schema::StructType,
     DeltaResult, EngineClient, Error, FileSystemClient,
 };
-
-/// Generic struct to allow us to visit a type or hold an error that the type couldn't be parsed
-struct Visitor<T> {
-    extracted: Option<DeltaResult<T>>,
-    extract_fn: fn(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>,
-}
-
-impl<T> Visitor<T> {
-    fn new(
-        extract_fn: fn(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>,
-    ) -> Self {
-        Visitor {
-            extracted: None,
-            extract_fn,
-        }
-    }
-}
-
-impl<T> DataVisitor for Visitor<T> {
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetDataItem<'a>]) {
-        for i in 0..row_count {
-            // TODO(nick): How to check if a row is valid
-            if getters[0].get(i).is_some() {
-                // TODO(nick): Have extract_fn take an iter
-                let row: Vec<_> = getters.iter().map(|getter| getter.get(i)).collect();
-                self.extracted = Some((self.extract_fn)(i, &row));
-            }
-        }
-    }
-}
-
-/// Generic struct to allow us to visit a type repeatedly or hold an error that the type couldn't be parsed
-pub(crate) struct MultiVisitor<T> {
-    pub(crate) extracted: Vec<DeltaResult<T>>,
-    extract_fn: fn(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>,
-}
-
-impl<T> MultiVisitor<T> {
-    pub(crate) fn new(
-        extract_fn: fn(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<T>,
-    ) -> Self {
-        MultiVisitor {
-            extracted: vec![],
-            extract_fn,
-        }
-    }
-}
-
-impl<T> DataVisitor for MultiVisitor<T> {
-    fn visit(&mut self, row_index: usize, vals: &[&dyn GetDataItem<'_>]) {
-        //self.extracted.push((self.extract_fn)(row_index, vals));
-        panic!("nope");
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Format {
@@ -112,12 +58,12 @@ impl Metadata {
         data: &dyn EngineData,
     ) -> DeltaResult<Metadata> {
         let extractor = engine_client.get_data_extactor();
-        let mut visitor = Visitor::new(visit_metadata);
         let schema = StructType::new(vec![crate::actions::schemas::METADATA_FIELD.clone()]);
+        let mut visitor = MetadataVisitor::default();
         extractor.extract(data, Arc::new(schema), &mut visitor)?;
         visitor
-            .extracted
-            .unwrap_or_else(|| Err(Error::Generic("Didn't get expected metadata".to_string())))
+            .metadata
+            .ok_or(Error::Generic("Didn't get expected metadata".to_string()))
     }
 
     pub fn schema(&self) -> DeltaResult<StructType> {
@@ -125,43 +71,73 @@ impl Metadata {
     }
 }
 
-fn visit_metadata(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<Metadata> {
-    let id: String = vals[0].extract_into("metadata.id")?;
-    let name: Option<String> = vals[1].extract_into_opt("metadata.name")?;
-    let description: Option<String> = vals[2].extract_into_opt("metadata.description")?;
-    // get format out of primitives
-    let format_provider: String = vals[3].extract_into("metadata.format.provider")?;
-    // options for format is always empty, so skip vals[4]
-    let schema_string: String = vals[5].extract_into("metadata.schema_string")?;
+#[derive(Default)]
+struct MetadataVisitor {
+    metadata: Option<Metadata>,
+}
 
-    let partition_list: &ListItem<'_> = vals[6].extract_into("metadata.partition_list")?;
-    let mut partition_columns = vec![];
-    for i in 0..partition_list.len() {
-        partition_columns.push(partition_list.get(i));
+impl MetadataVisitor {
+    fn visit_metadata<'a>(
+        row_index: usize,
+        id: String,
+        getters: &[&'a dyn GetDataItem<'a>],
+    ) -> DeltaResult<Metadata> {
+        let name: Option<String> = getters[1].extract_into_opt(row_index, "metadata.name")?;
+        let description: Option<String> =
+            getters[2].extract_into_opt(row_index, "metadata.description")?;
+        // get format out of primitives
+        let format_provider: String =
+            getters[3].extract_into(row_index, "metadata.format.provider")?;
+        // options for format is always empty, so skip getters[4]
+        let schema_string: String = getters[5].extract_into(row_index, "metadata.schema_string")?;
+
+        let partition_list: ListItem<'_> =
+            getters[6].extract_into(row_index, "metadata.partition_list")?;
+        let mut partition_columns = vec![];
+        for i in 0..partition_list.len() {
+            partition_columns.push(partition_list.get(i));
+        }
+
+        let created_time: i64 = getters[7].extract_into(row_index, "metadata.created_time")?;
+
+        let configuration_map_opt: Option<MapItem<'_>> =
+            getters[8].extract_into_opt(row_index, "metadata.configuration")?;
+        let configuration = match configuration_map_opt {
+            Some(map_item) => map_item.materialize(),
+            None => HashMap::new(),
+        };
+
+        Ok(Metadata {
+            id,
+            name,
+            description,
+            format: Format {
+                provider: format_provider,
+                options: HashMap::new(),
+            },
+            schema_string,
+            partition_columns,
+            created_time: Some(created_time),
+            configuration,
+        })
     }
+}
 
-    let created_time: i64 = vals[7].extract_into("metadata.created_time")?;
-
-    let configuration_map_opt: Option<&MapItem<'_>> =
-        vals[8].extract_into_opt("metadata.configuration")?;
-    let configuration = match configuration_map_opt {
-        Some(map_item) => map_item.materialize(),
-        None => HashMap::new(),
-    };
-
-    Ok(Metadata {
-        id,
-        name,
-        description,
-        format: Format {
-            provider: format_provider,
-            options: HashMap::new(),
-        },
-        schema_string,
-        partition_columns,
-        created_time: Some(created_time),
-        configuration,
-    })
+impl DataVisitor for MetadataVisitor {
+    fn visit<'a>(
+        &mut self,
+        row_count: usize,
+        getters: &[&'a dyn GetDataItem<'a>],
+    ) -> DeltaResult<()> {
+        for i in 0..row_count {
+            // Since id column is required, use it to detect presence of a metadata action
+            if let Some(id) = getters[0].extract_into_opt(i, "metadata.id")? {
+                self.metadata = Some(Self::visit_metadata(i, id, getters)?);
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -186,45 +162,72 @@ impl Protocol {
         data: &dyn EngineData,
     ) -> DeltaResult<Protocol> {
         let extractor = engine_client.get_data_extactor();
-        let mut visitor = Visitor::new(visit_protocol);
+        let mut visitor = ProtocolVisitor::default();
         let schema = StructType::new(vec![crate::actions::schemas::PROTOCOL_FIELD.clone()]);
         extractor.extract(data, Arc::new(schema), &mut visitor)?;
         visitor
-            .extracted
-            .unwrap_or_else(|| Err(Error::Generic("Didn't get expected Protocol".to_string())))
+            .protocol
+            .ok_or(Error::Generic("Didn't get expected protocol".to_string()))
     }
 }
 
-fn visit_protocol(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<Protocol> {
-    let min_reader_version: i32 = vals[0].extract_into("protocol.min_reader_version")?;
-    let min_writer_version: i32 = vals[1].extract_into("protocol.min_writer_version")?;
+#[derive(Default)]
+struct ProtocolVisitor {
+    protocol: Option<Protocol>,
+}
 
-    // let reader_features_list: Option<&dyn ListItem> =
-    //     vals[2].extract_into_opt("protocol.reader_features")?;
-    // let reader_features = reader_features_list.map(|rfl| {
-    //     let mut reader_features = vec![];
-    //     for i in 0..rfl.len(row_index) {
-    //         reader_features.push(rfl.get(row_index, i));
-    //     }
-    //     reader_features
-    // });
+impl ProtocolVisitor {
+    fn visit_protocol<'a>(
+        row_index: usize,
+        min_reader_version: i32,
+        getters: &[&'a dyn GetDataItem<'a>],
+    ) -> DeltaResult<Protocol> {
+        let min_writer_version: i32 =
+            getters[1].extract_into(row_index, "protocol.min_writer_version")?;
+        let reader_features_list: Option<ListItem<'_>> =
+            getters[2].extract_into_opt(row_index, "protocol.reader_features")?;
+        let reader_features = reader_features_list.map(|rfl| {
+            let mut reader_features = vec![];
+            for i in 0..rfl.len() {
+                reader_features.push(rfl.get(i));
+            }
+            reader_features
+        });
 
-    // let writer_features_list: Option<&dyn ListItem> =
-    //     vals[3].extract_into_opt("protocol.writer_features")?;
-    // let writer_features = writer_features_list.map(|wfl| {
-    //     let mut writer_features = vec![];
-    //     for i in 0..wfl.len(row_index) {
-    //         writer_features.push(wfl.get(row_index, i));
-    //     }
-    //     writer_features
-    // });
+        let writer_features_list: Option<ListItem<'_>> =
+            getters[3].extract_into_opt(row_index, "protocol.writer_features")?;
+        let writer_features = writer_features_list.map(|wfl| {
+            let mut writer_features = vec![];
+            for i in 0..wfl.len() {
+                writer_features.push(wfl.get(i));
+            }
+            writer_features
+        });
 
-    Ok(Protocol {
-        min_reader_version,
-        min_writer_version,
-        reader_features: None,
-        writer_features: None,
-    })
+        Ok(Protocol {
+            min_reader_version,
+            min_writer_version,
+            reader_features,
+            writer_features,
+        })
+    }
+}
+
+impl DataVisitor for ProtocolVisitor {
+    fn visit<'a>(
+        &mut self,
+        row_count: usize,
+        getters: &[&'a dyn GetDataItem<'a>],
+    ) -> DeltaResult<()> {
+        for i in 0..row_count {
+            // Since minReaderVersion column is required, use it to detect presence of a Protocol action
+            if let Some(mrv) = getters[0].extract_into_opt(i, "protocol.min_reader_version")? {
+                self.protocol = Some(Self::visit_protocol(i, mrv, getters)?);
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,20 +397,22 @@ pub struct Add {
 
     /// First commit version in which an add action with the same path was committed to the table.
     pub default_row_commit_version: Option<i64>,
+
+    /// The name of the clustering implementation
+    pub clustering_provider: Option<String>,
 }
 
 impl Add {
-    pub fn try_new_from_data(
+    /// Since we always want to parse multiple adds from data, we return a Vec<Add>
+    pub fn parse_from_data(
         engine_client: &dyn EngineClient,
         data: &dyn EngineData,
-    ) -> DeltaResult<Add> {
+    ) -> DeltaResult<Vec<Add>> {
         let extractor = engine_client.get_data_extactor();
-        let mut visitor = Visitor::new(visit_add);
+        let mut visitor = AddVisitor::default();
         let schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
         extractor.extract(data, Arc::new(schema), &mut visitor)?;
-        visitor
-            .extracted
-            .unwrap_or_else(|| Err(Error::Generic("Didn't get expected Add".to_string())))
+        Ok(visitor.adds)
     }
 
     pub fn dv_unique_id(&self) -> Option<String> {
@@ -415,52 +420,87 @@ impl Add {
     }
 }
 
-pub(crate) fn visit_add(row_index: usize, vals: &[Option<DataItem<'_>>]) -> DeltaResult<Add> {
-    let path: String = vals[0].extract_into("add.path")?;
-    let partition_values_map: &MapItem<'_> = vals[1].extract_into("add.partitionValues")?;
-    let partition_values = partition_values_map.materialize();
-    let size: i64 = vals[2].extract_into("add.size")?;
-    let modification_time: i64 = vals[3].extract_into("add.modificationTime")?;
-    let data_change: bool = vals[4].extract_into("add.dataChange")?;
-    let stats: Option<&str> = vals[5].extract_into_opt("add.stats")?;
+#[derive(Default)]
+pub(crate) struct AddVisitor {
+    adds: Vec<Add>,
+}
 
-    // TODO(nick) extract tags if we ever need them at vals[6]
+impl AddVisitor {
+    pub(crate) fn visit_add<'a>(
+        row_index: usize,
+        path: String,
+        getters: &[&'a dyn GetDataItem<'a>],
+    ) -> DeltaResult<Add> {
+        let partition_values_map: MapItem<'_> =
+            getters[1].extract_into(row_index, "add.partitionValues")?;
+        let partition_values = partition_values_map.materialize();
+        let size: i64 = getters[2].extract_into(row_index, "add.size")?;
+        let modification_time: i64 = getters[3].extract_into(row_index, "add.modificationTime")?;
+        let data_change: bool = getters[4].extract_into(row_index, "add.dataChange")?;
+        let stats: Option<&str> = getters[5].extract_into_opt(row_index, "add.stats")?;
 
-    let deletion_vector = if vals[7].is_some() {
-        // there is a storageType, so the whole DV must be there
-        let storage_type: String = vals[7].extract_into("add.deletionVector.storageType")?;
-        let path_or_inline_dv: String =
-            vals[8].extract_into("add.deletionVector.pathOrInlineDv")?;
-        let offset: Option<i32> = vals[9].extract_into_opt("add.deletionVector.offset")?;
-        let size_in_bytes: i32 = vals[10].extract_into("add.deletionVector.sizeInBytes")?;
-        let cardinality: i64 = vals[11].extract_into("add.deletionVector.cardinality")?;
-        Some(DeletionVectorDescriptor {
-            storage_type,
-            path_or_inline_dv,
-            offset,
-            size_in_bytes,
-            cardinality,
+        // TODO(nick) extract tags if we ever need them at getters[6]
+
+        let deletion_vector = if let Some(storage_type) =
+            getters[7].extract_into_opt(row_index, "add.deletionVector.storageType")?
+        {
+            // there is a storageType, so the whole DV must be there
+            let path_or_inline_dv: String =
+                getters[8].extract_into(row_index, "add.deletionVector.pathOrInlineDv")?;
+            let offset: Option<i32> =
+                getters[9].extract_into_opt(row_index, "add.deletionVector.offset")?;
+            let size_in_bytes: i32 =
+                getters[10].extract_into(row_index, "add.deletionVector.sizeInBytes")?;
+            let cardinality: i64 =
+                getters[11].extract_into(row_index, "add.deletionVector.cardinality")?;
+            Some(DeletionVectorDescriptor {
+                storage_type,
+                path_or_inline_dv,
+                offset,
+                size_in_bytes,
+                cardinality,
+            })
+        } else {
+            None
+        };
+
+        let base_row_id: Option<i64> =
+            getters[12].extract_into_opt(row_index, "add.base_row_id")?;
+        let default_row_commit_version: Option<i64> =
+            getters[13].extract_into_opt(row_index, "add.default_row_commit")?;
+        let clustering_provider: Option<String> =
+            getters[14].extract_into_opt(row_index, "add.clustering_provider")?;
+
+        Ok(Add {
+            path,
+            partition_values,
+            size,
+            modification_time,
+            data_change,
+            stats: stats.map(|s| s.to_string()),
+            tags: HashMap::new(),
+            deletion_vector,
+            base_row_id,
+            default_row_commit_version,
+            clustering_provider,
         })
-    } else {
-        None
-    };
+    }
+}
 
-    let base_row_id: Option<i64> = vals[12].extract_into_opt("add.base_row_id")?;
-    let default_row_commit_version: Option<i64> =
-        vals[13].extract_into_opt("add.default_row_commit")?;
-
-    Ok(Add {
-        path,
-        partition_values,
-        size,
-        modification_time,
-        data_change,
-        stats: stats.map(|s| s.to_string()),
-        tags: HashMap::new(),
-        deletion_vector,
-        base_row_id,
-        default_row_commit_version,
-    })
+impl DataVisitor for AddVisitor {
+    fn visit<'a>(
+        &mut self,
+        row_count: usize,
+        getters: &[&'a dyn GetDataItem<'a>],
+    ) -> DeltaResult<()> {
+        for i in 0..row_count {
+            // Since path column is required, use it to detect presence of an Add action
+            if let Some(path) = getters[0].extract_into_opt(i, "add.path")? {
+                self.adds.push(Self::visit_add(i, path, getters)?);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -505,75 +545,105 @@ pub(crate) struct Remove {
 
 impl Remove {
     // _try_new_from_data for now, to avoid warning, probably will need at some point
-    pub(crate) fn _try_new_from_data(
-        engine_client: &dyn EngineClient,
-        data: &dyn EngineData,
-    ) -> DeltaResult<Remove> {
-        let extractor = engine_client.get_data_extactor();
-        let mut visitor = Visitor::new(visit_remove);
-        let schema = StructType::new(vec![crate::actions::schemas::REMOVE_FIELD.clone()]);
-        extractor.extract(data, Arc::new(schema), &mut visitor)?;
-        visitor
-            .extracted
-            .unwrap_or_else(|| Err(Error::Generic("Didn't get expected remove".to_string())))
-    }
+    // pub(crate) fn _try_new_from_data(
+    //     engine_client: &dyn EngineClient,
+    //     data: &dyn EngineData,
+    // ) -> DeltaResult<Remove> {
+    //     let extractor = engine_client.get_data_extactor();
+    //     let mut visitor = Visitor::new(visit_remove);
+    //     let schema = StructType::new(vec![crate::actions::schemas::REMOVE_FIELD.clone()]);
+    //     extractor.extract(data, Arc::new(schema), &mut visitor)?;
+    //     visitor
+    //         .extracted
+    //         .unwrap_or_else(|| Err(Error::Generic("Didn't get expected remove".to_string())))
+    // }
 
     pub(crate) fn dv_unique_id(&self) -> Option<String> {
         self.deletion_vector.as_ref().map(|dv| dv.unique_id())
     }
 }
 
-pub(crate) fn visit_remove(
-    _row_index: usize,
-    vals: &[Option<DataItem<'_>>],
-) -> DeltaResult<Remove> {
-    let path: String = vals[0].extract_into("remove.path")?;
-    let deletion_timestamp: Option<i64> = vals[1].extract_into_opt("remove.deletionTimestamp")?;
-    let data_change: bool = vals[2].extract_into("remove.dataChange")?;
-    let extended_file_metadata: Option<bool> =
-        vals[3].extract_into_opt("remove.extendedFileMetadata")?;
+#[derive(Default)]
+pub(crate) struct RemoveVisitor {
+    removes: Vec<Remove>,
+}
 
-    // TODO(nick) handle partition values in vals[4]
+impl RemoveVisitor {
+    pub(crate) fn visit_remove<'a>(
+        row_index: usize,
+        path: String,
+        getters: &[&'a dyn GetDataItem<'a>],
+    ) -> DeltaResult<Remove> {
+        let deletion_timestamp: Option<i64> =
+            getters[1].extract_into_opt(row_index, "remove.deletionTimestamp")?;
+        let data_change: bool = getters[2].extract_into(row_index, "remove.dataChange")?;
+        let extended_file_metadata: Option<bool> =
+            getters[3].extract_into_opt(row_index, "remove.extendedFileMetadata")?;
 
-    let size: Option<i64> = vals[5].extract_into_opt("remove.size")?;
+        // TODO(nick) handle partition values in getters[4]
 
-    // TODO(nick) stats are skipped in vals[6] and tags are skipped in vals[7]
+        let size: Option<i64> = getters[5].extract_into_opt(row_index, "remove.size")?;
 
-    let deletion_vector = if vals[8].is_some() {
-        // there is a storageType, so the whole DV must be there
-        let storage_type: String = vals[8].extract_into("remove.deletionVector.storageType")?;
-        let path_or_inline_dv: String =
-            vals[9].extract_into("remove.deletionVector.pathOrInlineDv")?;
-        let offset: Option<i32> = vals[10].extract_into_opt("remove.deletionVector.offset")?;
-        let size_in_bytes: i32 = vals[11].extract_into("remove.deletionVector.sizeInBytes")?;
-        let cardinality: i64 = vals[12].extract_into("remove.deletionVector.cardinality")?;
-        Some(DeletionVectorDescriptor {
-            storage_type,
-            path_or_inline_dv,
-            offset,
-            size_in_bytes,
-            cardinality,
+        // TODO(nick) stats are skipped in getters[6] and tags are skipped in getters[7]
+
+        let deletion_vector = if let Some(storage_type) =
+            getters[8].extract_into_opt(row_index, "remove.deletionVector.storageType")?
+        {
+            // there is a storageType, so the whole DV must be there
+            let path_or_inline_dv: String =
+                getters[9].extract_into(row_index, "remove.deletionVector.pathOrInlineDv")?;
+            let offset: Option<i32> =
+                getters[10].extract_into_opt(row_index, "remove.deletionVector.offset")?;
+            let size_in_bytes: i32 =
+                getters[11].extract_into(row_index, "remove.deletionVector.sizeInBytes")?;
+            let cardinality: i64 =
+                getters[12].extract_into(row_index, "remove.deletionVector.cardinality")?;
+            Some(DeletionVectorDescriptor {
+                storage_type,
+                path_or_inline_dv,
+                offset,
+                size_in_bytes,
+                cardinality,
+            })
+        } else {
+            None
+        };
+
+        let base_row_id: Option<i64> =
+            getters[13].extract_into_opt(row_index, "remove.baseRowId")?;
+        let default_row_commit_version: Option<i64> =
+            getters[14].extract_into_opt(row_index, "remove.defaultRowCommitVersion")?;
+
+        Ok(Remove {
+            path,
+            data_change,
+            deletion_timestamp,
+            extended_file_metadata,
+            partition_values: None,
+            size,
+            tags: None,
+            deletion_vector,
+            base_row_id,
+            default_row_commit_version,
         })
-    } else {
-        None
-    };
+    }
+}
 
-    let base_row_id: Option<i64> = vals[13].extract_into_opt("remove.baseRowId")?;
-    let default_row_commit_version: Option<i64> =
-        vals[14].extract_into_opt("remove.defaultRowCommitVersion")?;
-
-    Ok(Remove {
-        path,
-        data_change,
-        deletion_timestamp,
-        extended_file_metadata,
-        partition_values: None,
-        size,
-        tags: None,
-        deletion_vector,
-        base_row_id,
-        default_row_commit_version,
-    })
+impl DataVisitor for RemoveVisitor {
+    fn visit<'a>(
+        &mut self,
+        row_count: usize,
+        getters: &[&'a dyn GetDataItem<'a>],
+    ) -> DeltaResult<()> {
+        for i in 0..row_count {
+            // Since path column is required, use it to detect presence of an Remove action
+            if let Some(path) = getters[0].extract_into_opt(i, "remove.path")? {
+                self.removes.push(Self::visit_remove(i, path, getters)?);
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn treemap_to_bools(treemap: RoaringTreemap) -> Vec<bool> {
@@ -817,9 +887,9 @@ mod tests {
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
         let add_schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
-        let mut multi_add_visitor = MultiVisitor::new(visit_add);
+        let mut add_visitor = AddVisitor::default();
         data_extractor
-            .extract(batch.as_ref(), Arc::new(add_schema), &mut multi_add_visitor)
+            .extract(batch.as_ref(), Arc::new(add_schema), &mut add_visitor)
             .unwrap();
         let add1 = Add {
             path: "c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet".into(),
@@ -835,6 +905,7 @@ mod tests {
             deletion_vector: None,
             base_row_id: None,
             default_row_commit_version: None,
+            clustering_provider: None,
         };
         let add2 = Add {
             path: "c1=5/c2=b/part-00007-4e73fa3b-2c88-424a-8051-f8b54328ffdb.c000.snappy.parquet".into(),
@@ -857,12 +928,8 @@ mod tests {
             ..add1.clone()
         };
         let expected = vec![add1, add2, add3];
-        for (add, expected) in multi_add_visitor
-            .extracted
-            .into_iter()
-            .zip(expected.into_iter())
-        {
-            assert_eq!(add.unwrap(), expected);
+        for (add, expected) in add_visitor.adds.into_iter().zip(expected.into_iter()) {
+            assert_eq!(add, expected);
         }
     }
 }

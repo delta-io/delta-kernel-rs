@@ -1,16 +1,13 @@
-use crate::engine_data::{
-    DataItem, DataItemList, DataItemMap, DataVisitor, EngineData, GetDataItem, ListItem, MapItem,
-    TypeTag,
-};
+use crate::engine_data::{DataItemList, DataItemMap, EngineData, GetDataItem, TypeTag};
 use crate::schema::{DataType, PrimitiveType, Schema, SchemaRef};
 use crate::{DeltaResult, Error};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, Int64Type};
-use arrow_array::{Array, GenericListArray, MapArray, NullArray, RecordBatch, StructArray};
+use arrow_array::{Array, GenericListArray, MapArray, RecordBatch, StructArray};
 use arrow_schema::{ArrowError, DataType as ArrowDataType, Schema as ArrowSchema};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 use url::Url;
 
 use std::any::Any;
@@ -163,6 +160,7 @@ impl SimpleData {
         out_col_array: &mut Vec<&dyn GetDataItem<'a>>,
         schema: &Schema,
     ) -> DeltaResult<()> {
+        debug!("Extracting column getters for {:#?}", schema);
         SimpleData::extract_columns_from_array(out_col_array, schema, Some(&self.data))
     }
 
@@ -179,7 +177,7 @@ impl SimpleData {
             match col {
                 Some(col) => {
                     match (col.data_type(), &field.data_type) {
-                        (&ArrowDataType::Struct(_), &DataType::Struct(ref fields)) => {
+                        (&ArrowDataType::Struct(_), DataType::Struct(fields)) => {
                             // both structs, so recurse into col
                             let struct_array = col.as_struct();
                             SimpleData::extract_columns_from_array(
@@ -189,25 +187,28 @@ impl SimpleData {
                             )?;
                         }
                         (&ArrowDataType::Boolean, &DataType::Primitive(PrimitiveType::Boolean)) => {
+                            debug!("Pushing boolean array for {}", field.name);
                             out_col_array.push(col.as_boolean());
                         }
                         (&ArrowDataType::Utf8, &DataType::Primitive(PrimitiveType::String)) => {
+                            debug!("Pushing string array for {}", field.name);
                             out_col_array.push(col.as_string::<i32>());
                         }
                         (&ArrowDataType::Int32, &DataType::Primitive(PrimitiveType::Integer)) => {
+                            debug!("Pushing int32 array for {}", field.name);
                             out_col_array.push(col.as_primitive::<Int32Type>());
                         }
                         (&ArrowDataType::Int64, &DataType::Primitive(PrimitiveType::Long)) => {
+                            debug!("Pushing int64 array for {}", field.name);
                             out_col_array.push(col.as_primitive::<Int64Type>());
                         }
-                        (
-                            &ArrowDataType::List(ref _arrow_field),
-                            &DataType::Array(ref _array_type),
-                        ) => {
+                        (ArrowDataType::List(_arrow_field), DataType::Array(_array_type)) => {
                             // TODO(nick): validate the element types match
+                            debug!("Pushing list for {}", field.name);
                             out_col_array.push(col.as_list());
                         }
                         (&ArrowDataType::Map(_, _), &DataType::Map(_)) => {
+                            debug!("Pushing map for {}", field.name);
                             out_col_array.push(col.as_map());
                         }
                         (arrow_data_type, data_type) => {
@@ -240,7 +241,7 @@ impl SimpleData {
                     // if the field is allowed to be null, push that, otherwise error out.
                     if field.is_nullable() {
                         match &field.data_type() {
-                            &DataType::Struct(ref fields) => {
+                            DataType::Struct(fields) => {
                                 // keep recursing
                                 SimpleData::extract_columns_from_array(
                                     out_col_array,
@@ -248,7 +249,10 @@ impl SimpleData {
                                     None,
                                 )?;
                             }
-                            _ => out_col_array.push(&()),
+                            _ => {
+                                debug!("Pusing a null field for {}", field.name);
+                                out_col_array.push(&())
+                            }
                         }
                         continue;
                     } else {

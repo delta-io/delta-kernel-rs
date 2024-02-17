@@ -43,8 +43,7 @@ impl DataExtractor for SimpleDataExtractor {
         //data.extract(schema, visitor)
         let mut col_array = vec![];
         data.extract_columns(&mut col_array, &schema)?;
-        visitor.visit(data.length(), &col_array);
-        Ok(())
+        visitor.visit(data.length(), &col_array)
     }
 
     fn length(&self, blob: &dyn EngineData) -> usize {

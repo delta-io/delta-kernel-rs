@@ -6,6 +6,8 @@ use deltakernel::scan::ScanBuilder;
 use deltakernel::simple_client::SimpleClient;
 use deltakernel::{EngineClient, Table};
 
+use test_log::test;
+
 #[test]
 fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/"))?;
