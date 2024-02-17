@@ -101,7 +101,6 @@ impl<'a> DataItem<'a> {
     }
 }
 
-
 pub trait GetDataItem<'a> {
     fn get(&'a self, row_index: usize) -> Option<DataItem<'a>>;
 }
