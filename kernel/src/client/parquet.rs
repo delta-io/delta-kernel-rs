@@ -68,7 +68,6 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             sender.send(res).ok();
             futures::future::ready(())
         }));
-        #[allow(trivial_casts)]
         Ok(Box::new(receiver.into_iter().map(|rbr| {
             rbr.map(|rb| Box::new(SimpleData::new(rb)) as _)
         })))

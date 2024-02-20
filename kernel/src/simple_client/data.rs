@@ -178,22 +178,20 @@ impl SimpleData {
             //   a) encountered a column that is all nulls or,
             //   b) recursed into a struct that was all null.
             // So below if the field is allowed to be null, we push that, otherwise we error out.
-            match col {
-                Some(col) => Self::extract_column(out_col_array, field, col)?,
-                None if field.is_nullable() => {
-                    if let DataType::Struct(_) = field.data_type() {
-                        Self::extract_columns_from_array(out_col_array, schema, None)?;
-                    } else {
-                        debug!("Pusing a null field for {}", field.name);
-                        out_col_array.push(&());
-                    }
+            if let Some(col) = col {
+                Self::extract_column(out_col_array, field, col)?;
+            } else if field.is_nullable() {
+                if let DataType::Struct(_) = field.data_type() {
+                    Self::extract_columns_from_array(out_col_array, schema, None)?;
+                } else {
+                    debug!("Pushing a null field for {}", field.name);
+                    out_col_array.push(&());
                 }
-                None => {
-                    return Err(Error::Generic(format!(
-                        "Found required field {}, but it's null",
-                        field.name
-                    )));
-                }
+            } else {
+                return Err(Error::Generic(format!(
+                    "Found required field {}, but it's null",
+                    field.name
+                )));
             }
         }
         Ok(())

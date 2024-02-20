@@ -1,7 +1,6 @@
 //! Default Expression handler.
 //!
 //! Expression handling based on arrow-rs compute kernels.
-#![allow(trivial_casts)]
 use std::sync::Arc;
 
 use arrow_arith::boolean::{and, is_null, not, or};

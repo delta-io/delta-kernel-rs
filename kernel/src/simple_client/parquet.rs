@@ -18,7 +18,6 @@ impl ParquetHandler for SimpleParquetHandler {
         let locations: Vec<_> = files.iter().map(|file| file.location.clone()).collect();
         Ok(Box::new(locations.into_iter().map(move |location| {
             let d = super::data::SimpleData::try_create_from_parquet(schema.clone(), location);
-            #[allow(trivial_casts)]
             d.map(|d| Box::new(d) as _)
         })))
     }

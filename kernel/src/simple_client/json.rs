@@ -30,7 +30,6 @@ impl JsonHandler for SimpleJsonHandler {
                     schema.clone(),
                     file.location.clone(),
                 );
-                #[allow(trivial_casts)]
                 d.map(|d| Box::new(d) as _)
             })
             .collect();
@@ -72,8 +71,6 @@ impl JsonHandler for SimpleJsonHandler {
         let batches: Vec<_> = ReaderBuilder::new(schema.clone())
             .build(Cursor::new(data))?
             .try_collect()?;
-
-        #[allow(trivial_casts)]
         Ok(Box::new(SimpleData::new(concat_batches(&schema, &batches)?)) as _)
     }
 }
