@@ -92,6 +92,10 @@ impl LogSegment {
                     protocol_opt = Some(p)
                 }
             }
+            if metadata_opt.is_some() && protocol_opt.is_some() {
+                // we've found both, we can stop
+                break;
+            }
         }
         Ok(metadata_opt.zip(protocol_opt))
     }
