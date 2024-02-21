@@ -88,9 +88,7 @@ pub trait TypedGetData<'a, T> {
     fn get_opt(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<T>>;
     fn get(&'a self, row_index: usize, field_name: &str) -> DeltaResult<T> {
         let val = self.get_opt(row_index, field_name)?;
-        val.ok_or_else(||Error::MissingData(format!(
-            "Data missing for field {field_name}"
-        )))
+        val.ok_or_else(|| Error::MissingData(format!("Data missing for field {field_name}")))
     }
 }
 
@@ -134,12 +132,15 @@ impl<'a> TypedGetData<'a, Vec<String>> for dyn GetData<'a> + '_ {
 /// Provide an impl to get a map field as a `HashMap<String, Option<String>>`. Note that this will
 /// allocate the map and allocate for each entry
 impl<'a> TypedGetData<'a, HashMap<String, Option<String>>> for dyn GetData<'a> + '_ {
-    fn get_opt(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<HashMap<String, Option<String>>>> {
+    fn get_opt(
+        &'a self,
+        row_index: usize,
+        field_name: &str,
+    ) -> DeltaResult<Option<HashMap<String, Option<String>>>> {
         let map_opt: Option<MapItem<'_>> = self.get_opt(row_index, field_name)?;
         Ok(map_opt.map(|map| map.materialize()))
     }
 }
-
 
 /// A `DataVisitor` can be called back to visit extracted data. Aside from calling
 /// [`DataVisitor::visit`] on the visitor passed to [`crate::DataExtractor::extract`], engines do
@@ -212,8 +213,13 @@ pub trait TypeTag: 'static {
 ///   }
 /// }
 pub trait EngineData: Send {
+    /// Request that the data be visited for the passed schema. The contract of this method is that
+    /// it will call back into the passed [`DataVisitor`]s `visit` method. The call to `visit` must
+    /// include `GetData` items for each leaf of the schema, as well as the number of rows in this
+    /// data.
     fn extract(&self, schema: SchemaRef, visitor: &mut dyn DataVisitor) -> DeltaResult<()>;
-    // Return the number of items (rows?) in blob
+
+    /// Return the number of items (rows) in blob
     fn length(&self) -> usize;
 
     fn type_tag(&self) -> &dyn TypeTag;

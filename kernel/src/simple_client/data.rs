@@ -197,7 +197,6 @@ impl SimpleData {
         SimpleData::extract_columns_from_array(out_col_array, schema, Some(&self.data))
     }
 
-
     fn extract_columns_from_array<'a>(
         out_col_array: &mut Vec<&dyn GetData<'a>>,
         schema: &Schema,
@@ -317,8 +316,8 @@ mod tests {
     use arrow_array::{RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 
-    use crate::DeltaResult;
     use crate::actions::action_definitions::Metadata;
+    use crate::DeltaResult;
     use crate::{
         actions::schemas::log_schema,
         simple_client::{data::SimpleData, SimpleClient},
