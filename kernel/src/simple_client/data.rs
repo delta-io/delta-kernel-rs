@@ -181,11 +181,15 @@ impl SimpleData {
     /// Extracts an exploded view (all leaf values), in schema order of that data contained
     /// within. `out_col_array` is filled with [`GetData`] items that can be used to get at the
     /// actual primitive types.
+    ///
+    /// # Arguments
+    ///
+    /// * `out_col_array` - the vec that leaf values will be pushed onto. it is passed as an arg to
+    /// make the recursion below easier. if we returned a [`Vec`] we would have to `extend` it each
+    /// time we encountered a struct and made the recursive call.
+    /// * `schema` - the schema to extract getters for
     pub fn extract_columns<'a>(
         &'a self,
-        // out_col_array is passed as an arg to make the recursion below easier. if we returned a
-        // [`Vec`] we would have to `extend` it each time we encountered a struct and made the
-        // recursive call.
         out_col_array: &mut Vec<&dyn GetData<'a>>,
         schema: &Schema,
     ) -> DeltaResult<()> {
