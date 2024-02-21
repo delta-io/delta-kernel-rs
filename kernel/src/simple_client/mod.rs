@@ -10,19 +10,6 @@ mod get_data;
 pub(crate) mod json;
 mod parquet;
 
-// #[derive(Debug)]
-// pub(crate) struct SimpleDataExtractor {
-//     expected_tag: data::SimpleDataTypeTag,
-// }
-
-// impl SimpleDataExtractor {
-//     pub(crate) fn new() -> Self {
-//         SimpleDataExtractor {
-//             expected_tag: data::SimpleDataTypeTag,
-//         }
-//     }
-// }
-
 pub struct SimpleClient {
     fs_client: Arc<fs_client::SimpleFilesystemClient>,
     json_handler: Arc<json::SimpleJsonHandler>,
