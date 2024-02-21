@@ -63,15 +63,13 @@ impl<'a> MapItem<'a> {
 }
 
 macro_rules! impl_default_get {
-    (($name: ident, $typ: ty)) => {
-        fn $name(&'a self, _row_index: usize, field_name: &str) -> DeltaResult<Option<$typ>> {
-            debug!("Asked for type {} on {field_name}, but using default error impl.", stringify!($typ));
-            Err(Error::UnexpectedColumnType(format!("{field_name} is not of type {}", stringify!($typ))))
-        }
-    };
-    (($name: ident, $typ: ty), $(($name_rest: ident, $typ_rest: ty)),+) => {
-        impl_default_get!(($name, $typ));
-        impl_default_get!($(($name_rest, $typ_rest)),+);
+    ( $(($name: ident, $typ: ty)), * ) => {
+        $(
+            fn $name(&'a self, _row_index: usize, field_name: &str) -> DeltaResult<Option<$typ>> {
+                debug!("Asked for type {} on {field_name}, but using default error impl.", stringify!($typ));
+                Err(Error::UnexpectedColumnType(format!("{field_name} is not of type {}", stringify!($typ))))
+            }
+        )*
     };
 }
 
@@ -90,23 +88,21 @@ pub trait TypedGetData<'a, T> {
     fn get_opt(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<T>>;
     fn get(&'a self, row_index: usize, field_name: &str) -> DeltaResult<T> {
         let val = self.get_opt(row_index, field_name)?;
-        val.ok_or(Error::Generic(format!(
+        val.ok_or_else(||Error::MissingData(format!(
             "Data missing for field {field_name}"
         )))
     }
 }
 
 macro_rules! impl_typed_get_data {
-    (($name: ident, $typ: ty)) => {
-        impl<'a> TypedGetData<'a, $typ> for dyn GetData<'a> +'_ {
-            fn get_opt(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<$typ>> {
-                self.$name(row_index, field_name)
+    ( $(($name: ident, $typ: ty)), * ) => {
+        $(
+            impl<'a> TypedGetData<'a, $typ> for dyn GetData<'a> +'_ {
+                fn get_opt(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<$typ>> {
+                    self.$name(row_index, field_name)
+                }
             }
-        }
-    };
-    (($name: ident, $typ: ty), $(($name_rest: ident, $typ_rest: ty)),+) => {
-        impl_typed_get_data!(($name, $typ));
-        impl_typed_get_data!($(($name_rest, $typ_rest)),+);
+        )*
     };
 }
 

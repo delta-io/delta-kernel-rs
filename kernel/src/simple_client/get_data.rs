@@ -75,14 +75,12 @@ impl<'a> GetData<'a> for MapArray {
 }
 
 macro_rules! impl_null_get {
-    (($name: ident, $typ: ty)) => {
-        fn $name(&'a self, _row_index: usize, _field_name: &str) -> DeltaResult<Option<$typ>> {
-            Ok(None)
-        }
-    };
-    (($name: ident, $typ: ty), $(($name_rest: ident, $typ_rest: ty)),+) => {
-        impl_null_get!(($name, $typ));
-        impl_null_get!($(($name_rest, $typ_rest)),+);
+    ( $(($name: ident, $typ: ty)), * ) => {
+        $(
+            fn $name(&'a self, _row_index: usize, _field_name: &str) -> DeltaResult<Option<$typ>> {
+                Ok(None)
+            }
+        )*
     };
 }
 
