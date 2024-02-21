@@ -88,10 +88,7 @@ impl MetadataVisitor {
         let schema_string: String = getters[5].get(row_index, "metadata.schema_string")?;
 
         let partition_list: ListItem<'_> = getters[6].get(row_index, "metadata.partition_list")?;
-        let mut partition_columns = vec![];
-        for i in 0..partition_list.len() {
-            partition_columns.push(partition_list.get(i));
-        }
+        let partition_columns = partition_list.materialize();
 
         let created_time: i64 = getters[7].get(row_index, "metadata.created_time")?;
 
@@ -174,23 +171,11 @@ impl ProtocolVisitor {
         let min_writer_version: i32 = getters[1].get(row_index, "protocol.min_writer_version")?;
         let reader_features_list: Option<ListItem<'_>> =
             getters[2].get_opt(row_index, "protocol.reader_features")?;
-        let reader_features = reader_features_list.map(|rfl| {
-            let mut reader_features = vec![];
-            for i in 0..rfl.len() {
-                reader_features.push(rfl.get(i));
-            }
-            reader_features
-        });
+        let reader_features = reader_features_list.map(|rfl| rfl.materialize());
 
         let writer_features_list: Option<ListItem<'_>> =
             getters[3].get_opt(row_index, "protocol.writer_features")?;
-        let writer_features = writer_features_list.map(|wfl| {
-            let mut writer_features = vec![];
-            for i in 0..wfl.len() {
-                writer_features.push(wfl.get(i));
-            }
-            writer_features
-        });
+        let writer_features = writer_features_list.map(|wfl| wfl.materialize());
 
         Ok(Protocol {
             min_reader_version,

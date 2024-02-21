@@ -1,4 +1,4 @@
-use crate::engine_data::{DataItemList, DataItemMap, EngineData, GetData, TypeTag};
+use crate::engine_data::{EngineList, EngineMap, EngineData, GetData, TypeTag};
 use crate::schema::{DataType, PrimitiveType, Schema, SchemaRef, StructField};
 use crate::{DeltaResult, Error, DataVisitor};
 
@@ -97,7 +97,7 @@ impl ProvidesColumnByName for StructArray {
     }
 }
 
-impl DataItemList for GenericListArray<i32> {
+impl EngineList for GenericListArray<i32> {
     fn len(&self, row_index: usize) -> usize {
         self.value(row_index).len()
     }
@@ -107,9 +107,17 @@ impl DataItemList for GenericListArray<i32> {
         let sarry = arry.as_string::<i32>();
         sarry.value(index).to_string()
     }
+
+    fn materialize(&self, row_index: usize) -> Vec<String> {
+        let mut result = vec![];
+        for i in 0..EngineList::len(self, row_index) {
+            result.push(self.get(row_index, i));
+        }
+        result
+    }
 }
 
-impl DataItemMap for MapArray {
+impl EngineMap for MapArray {
     fn get<'a>(&'a self, row_index: usize, key: &str) -> Option<&'a str> {
         let offsets = self.offsets();
         let start_offset = offsets[row_index] as usize;

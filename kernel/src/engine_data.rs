@@ -7,19 +7,20 @@ use std::{
     collections::HashMap,
 };
 
-// a list that can go inside a DataItem
-pub trait DataItemList {
+// a trait that an engine exposes to give access to a list
+pub trait EngineList {
     fn len(&self, row_index: usize) -> usize;
     fn get(&self, row_index: usize, list_index: usize) -> String;
+    fn materialize(&self, row_index: usize) -> Vec<String>;
 }
 
 pub struct ListItem<'a> {
-    list: &'a dyn DataItemList,
+    list: &'a dyn EngineList,
     row: usize,
 }
 
 impl<'a> ListItem<'a> {
-    pub fn new(list: &'a dyn DataItemList, row: usize) -> ListItem<'a> {
+    pub fn new(list: &'a dyn EngineList, row: usize) -> ListItem<'a> {
         ListItem { list, row }
     }
 
@@ -30,21 +31,25 @@ impl<'a> ListItem<'a> {
     pub fn get(&self, list_index: usize) -> String {
         self.list.get(self.row, list_index)
     }
+
+    pub fn materialize(&self) -> Vec<String> {
+        self.list.materialize(self.row)
+    }
 }
 
-// a map that can go inside a DataItem
-pub trait DataItemMap {
+// a trait that an engine exposes to give access to a map
+pub trait EngineMap {
     fn get<'a>(&'a self, row_index: usize, key: &str) -> Option<&'a str>;
     fn materialize(&self, row_index: usize) -> HashMap<String, Option<String>>;
 }
 
 pub struct MapItem<'a> {
-    map: &'a dyn DataItemMap,
+    map: &'a dyn EngineMap,
     row: usize,
 }
 
 impl<'a> MapItem<'a> {
-    pub fn new(map: &'a dyn DataItemMap, row: usize) -> MapItem<'a> {
+    pub fn new(map: &'a dyn EngineMap, row: usize) -> MapItem<'a> {
         MapItem { map, row }
     }
 
