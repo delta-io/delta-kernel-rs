@@ -11,6 +11,7 @@ use arrow_schema::SchemaRef as ArrowSchemaRef;
 use arrow_select::concat::concat_batches;
 use bytes::{Buf, Bytes};
 use futures::{StreamExt, TryStreamExt};
+use itertools::Itertools;
 use object_store::path::Path;
 use object_store::{DynObjectStore, GetResultPayload};
 
@@ -80,9 +81,9 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             .collect::<Vec<_>>();
 
         let schema: ArrowSchemaRef = Arc::new(output_schema.as_ref().try_into()?);
-        let batches = ReaderBuilder::new(schema.clone())
+        let batches: Vec<_> = ReaderBuilder::new(schema.clone())
             .build(Cursor::new(data))?
-            .collect::<Result<Vec<_>, _>>()?;
+            .try_collect()?;
         Ok(Box::new(SimpleData::new(concat_batches(
             &schema, &batches,
         )?)))
