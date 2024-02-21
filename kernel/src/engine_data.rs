@@ -195,7 +195,7 @@ pub trait TypeTag: 'static {
 pub trait EngineData: Send {
     fn type_tag(&self) -> &dyn TypeTag;
 
-    // TODO(nick) implement this and below when it doesn't cause a compiler error
+    // TODO(nick) implement this and below here in the trait when it doesn't cause a compiler error
     fn as_any(&self) -> &dyn Any;
 
     fn into_any(self: Box<Self>) -> Box<dyn Any>;

@@ -62,6 +62,11 @@ impl EngineData for SimpleData {
     }
 }
 
+/// This is a trait that allows us to query something by column name and get out an Arrow
+/// `Array`. Both `RecordBatch` and `StructArray` can do this. By having our `extract_*` functions
+/// just take anything that implements this trait we can use the same function to drill into
+/// either. This is useful because when we're recursing into data we start with a RecordBatch, but
+/// if we encounter a Struct column, it will be a `StructArray`.
 trait ProvidesColumnByName {
     fn column_by_name(&self, name: &str) -> Option<&Arc<dyn Array>>;
 }
