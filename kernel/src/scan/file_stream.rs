@@ -26,6 +26,8 @@ struct AddRemoveVisitor {
     removes: Vec<Remove>,
 }
 
+const ADD_FIELD_COUNT: usize = 15;
+
 impl DataVisitor for AddRemoveVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         println!("at top: {}", getters.len());
@@ -33,13 +35,13 @@ impl DataVisitor for AddRemoveVisitor {
             // Add will have a path at index 0 if it is valid
             if let Some(path) = getters[0].get_opt(i, "add.path")? {
                 self.adds
-                    .push(AddVisitor::visit_add(i, path, &getters[..15])?);
+                    .push(AddVisitor::visit_add(i, path, &getters[..ADD_FIELD_COUNT])?);
             }
             // Remove will have a path at index 15 if it is valid
             // TODO(nick): Should count the fields in Add to ensure we don't get this wrong if more
             // are added
-            else if let Some(path) = getters[15].get_opt(i, "remove.path")? {
-                let remove_getters = &getters[15..];
+            else if let Some(path) = getters[ADD_FIELD_COUNT].get_opt(i, "remove.path")? {
+                let remove_getters = &getters[ADD_FIELD_COUNT..];
                 self.removes
                     .push(RemoveVisitor::visit_remove(i, path, remove_getters)?);
             }
