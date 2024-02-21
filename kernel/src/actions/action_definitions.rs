@@ -10,7 +10,7 @@ use roaring::RoaringTreemap;
 use url::Url;
 
 use crate::{
-    engine_data::{DataVisitor, EngineData, ExtractInto, GetDataItem, ListItem, MapItem},
+    engine_data::{DataVisitor, EngineData, GetData, ListItem, MapItem, TypedGetData},
     schema::StructType,
     DeltaResult, EngineClient, Error, FileSystemClient,
 };
@@ -19,7 +19,7 @@ use crate::{
 pub struct Format {
     /// Name of the encoding for files in this table
     pub provider: String,
-    /// A map containing configuration options for the format
+    /// A map containingconfiguration options for the format
     pub options: HashMap<String, String>,
 }
 
@@ -80,28 +80,25 @@ impl MetadataVisitor {
     fn visit_metadata<'a>(
         row_index: usize,
         id: String,
-        getters: &[&'a dyn GetDataItem<'a>],
+        getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Metadata> {
-        let name: Option<String> = getters[1].extract_into_opt(row_index, "metadata.name")?;
-        let description: Option<String> =
-            getters[2].extract_into_opt(row_index, "metadata.description")?;
+        let name: Option<String> = getters[1].get_opt(row_index, "metadata.name")?;
+        let description: Option<String> = getters[2].get_opt(row_index, "metadata.description")?;
         // get format out of primitives
-        let format_provider: String =
-            getters[3].extract_into(row_index, "metadata.format.provider")?;
+        let format_provider: String = getters[3].get(row_index, "metadata.format.provider")?;
         // options for format is always empty, so skip getters[4]
-        let schema_string: String = getters[5].extract_into(row_index, "metadata.schema_string")?;
+        let schema_string: String = getters[5].get(row_index, "metadata.schema_string")?;
 
-        let partition_list: ListItem<'_> =
-            getters[6].extract_into(row_index, "metadata.partition_list")?;
+        let partition_list: ListItem<'_> = getters[6].get(row_index, "metadata.partition_list")?;
         let mut partition_columns = vec![];
         for i in 0..partition_list.len() {
             partition_columns.push(partition_list.get(i));
         }
 
-        let created_time: i64 = getters[7].extract_into(row_index, "metadata.created_time")?;
+        let created_time: i64 = getters[7].get(row_index, "metadata.created_time")?;
 
         let configuration_map_opt: Option<MapItem<'_>> =
-            getters[8].extract_into_opt(row_index, "metadata.configuration")?;
+            getters[8].get_opt(row_index, "metadata.configuration")?;
         let configuration = match configuration_map_opt {
             Some(map_item) => map_item.materialize(),
             None => HashMap::new(),
@@ -124,14 +121,10 @@ impl MetadataVisitor {
 }
 
 impl DataVisitor for MetadataVisitor {
-    fn visit<'a>(
-        &mut self,
-        row_count: usize,
-        getters: &[&'a dyn GetDataItem<'a>],
-    ) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
             // Since id column is required, use it to detect presence of a metadata action
-            if let Some(id) = getters[0].extract_into_opt(i, "metadata.id")? {
+            if let Some(id) = getters[0].get_opt(i, "metadata.id")? {
                 self.metadata = Some(Self::visit_metadata(i, id, getters)?);
                 break;
             }
@@ -180,12 +173,11 @@ impl ProtocolVisitor {
     fn visit_protocol<'a>(
         row_index: usize,
         min_reader_version: i32,
-        getters: &[&'a dyn GetDataItem<'a>],
+        getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Protocol> {
-        let min_writer_version: i32 =
-            getters[1].extract_into(row_index, "protocol.min_writer_version")?;
+        let min_writer_version: i32 = getters[1].get(row_index, "protocol.min_writer_version")?;
         let reader_features_list: Option<ListItem<'_>> =
-            getters[2].extract_into_opt(row_index, "protocol.reader_features")?;
+            getters[2].get_opt(row_index, "protocol.reader_features")?;
         let reader_features = reader_features_list.map(|rfl| {
             let mut reader_features = vec![];
             for i in 0..rfl.len() {
@@ -195,7 +187,7 @@ impl ProtocolVisitor {
         });
 
         let writer_features_list: Option<ListItem<'_>> =
-            getters[3].extract_into_opt(row_index, "protocol.writer_features")?;
+            getters[3].get_opt(row_index, "protocol.writer_features")?;
         let writer_features = writer_features_list.map(|wfl| {
             let mut writer_features = vec![];
             for i in 0..wfl.len() {
@@ -214,14 +206,10 @@ impl ProtocolVisitor {
 }
 
 impl DataVisitor for ProtocolVisitor {
-    fn visit<'a>(
-        &mut self,
-        row_count: usize,
-        getters: &[&'a dyn GetDataItem<'a>],
-    ) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
             // Since minReaderVersion column is required, use it to detect presence of a Protocol action
-            if let Some(mrv) = getters[0].extract_into_opt(i, "protocol.min_reader_version")? {
+            if let Some(mrv) = getters[0].get_opt(i, "protocol.min_reader_version")? {
                 self.protocol = Some(Self::visit_protocol(i, mrv, getters)?);
                 break;
             }
@@ -429,30 +417,27 @@ impl AddVisitor {
     pub(crate) fn visit_add<'a>(
         row_index: usize,
         path: String,
-        getters: &[&'a dyn GetDataItem<'a>],
+        getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Add> {
-        let partition_values_map: MapItem<'_> =
-            getters[1].extract_into(row_index, "add.partitionValues")?;
+        let partition_values_map: MapItem<'_> = getters[1].get(row_index, "add.partitionValues")?;
         let partition_values = partition_values_map.materialize();
-        let size: i64 = getters[2].extract_into(row_index, "add.size")?;
-        let modification_time: i64 = getters[3].extract_into(row_index, "add.modificationTime")?;
-        let data_change: bool = getters[4].extract_into(row_index, "add.dataChange")?;
-        let stats: Option<&str> = getters[5].extract_into_opt(row_index, "add.stats")?;
+        let size: i64 = getters[2].get(row_index, "add.size")?;
+        let modification_time: i64 = getters[3].get(row_index, "add.modificationTime")?;
+        let data_change: bool = getters[4].get(row_index, "add.dataChange")?;
+        let stats: Option<&str> = getters[5].get_opt(row_index, "add.stats")?;
 
         // TODO(nick) extract tags if we ever need them at getters[6]
 
         let deletion_vector = if let Some(storage_type) =
-            getters[7].extract_into_opt(row_index, "add.deletionVector.storageType")?
+            getters[7].get_opt(row_index, "add.deletionVector.storageType")?
         {
             // there is a storageType, so the whole DV must be there
             let path_or_inline_dv: String =
-                getters[8].extract_into(row_index, "add.deletionVector.pathOrInlineDv")?;
-            let offset: Option<i32> =
-                getters[9].extract_into_opt(row_index, "add.deletionVector.offset")?;
+                getters[8].get(row_index, "add.deletionVector.pathOrInlineDv")?;
+            let offset: Option<i32> = getters[9].get_opt(row_index, "add.deletionVector.offset")?;
             let size_in_bytes: i32 =
-                getters[10].extract_into(row_index, "add.deletionVector.sizeInBytes")?;
-            let cardinality: i64 =
-                getters[11].extract_into(row_index, "add.deletionVector.cardinality")?;
+                getters[10].get(row_index, "add.deletionVector.sizeInBytes")?;
+            let cardinality: i64 = getters[11].get(row_index, "add.deletionVector.cardinality")?;
             Some(DeletionVectorDescriptor {
                 storage_type,
                 path_or_inline_dv,
@@ -464,12 +449,11 @@ impl AddVisitor {
             None
         };
 
-        let base_row_id: Option<i64> =
-            getters[12].extract_into_opt(row_index, "add.base_row_id")?;
+        let base_row_id: Option<i64> = getters[12].get_opt(row_index, "add.base_row_id")?;
         let default_row_commit_version: Option<i64> =
-            getters[13].extract_into_opt(row_index, "add.default_row_commit")?;
+            getters[13].get_opt(row_index, "add.default_row_commit")?;
         let clustering_provider: Option<String> =
-            getters[14].extract_into_opt(row_index, "add.clustering_provider")?;
+            getters[14].get_opt(row_index, "add.clustering_provider")?;
 
         Ok(Add {
             path,
@@ -488,14 +472,10 @@ impl AddVisitor {
 }
 
 impl DataVisitor for AddVisitor {
-    fn visit<'a>(
-        &mut self,
-        row_count: usize,
-        getters: &[&'a dyn GetDataItem<'a>],
-    ) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of an Add action
-            if let Some(path) = getters[0].extract_into_opt(i, "add.path")? {
+            if let Some(path) = getters[0].get_opt(i, "add.path")? {
                 self.adds.push(Self::visit_add(i, path, getters)?);
             }
         }
@@ -572,32 +552,32 @@ impl RemoveVisitor {
     pub(crate) fn visit_remove<'a>(
         row_index: usize,
         path: String,
-        getters: &[&'a dyn GetDataItem<'a>],
+        getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Remove> {
         let deletion_timestamp: Option<i64> =
-            getters[1].extract_into_opt(row_index, "remove.deletionTimestamp")?;
-        let data_change: bool = getters[2].extract_into(row_index, "remove.dataChange")?;
+            getters[1].get_opt(row_index, "remove.deletionTimestamp")?;
+        let data_change: bool = getters[2].get(row_index, "remove.dataChange")?;
         let extended_file_metadata: Option<bool> =
-            getters[3].extract_into_opt(row_index, "remove.extendedFileMetadata")?;
+            getters[3].get_opt(row_index, "remove.extendedFileMetadata")?;
 
         // TODO(nick) handle partition values in getters[4]
 
-        let size: Option<i64> = getters[5].extract_into_opt(row_index, "remove.size")?;
+        let size: Option<i64> = getters[5].get_opt(row_index, "remove.size")?;
 
         // TODO(nick) stats are skipped in getters[6] and tags are skipped in getters[7]
 
         let deletion_vector = if let Some(storage_type) =
-            getters[8].extract_into_opt(row_index, "remove.deletionVector.storageType")?
+            getters[8].get_opt(row_index, "remove.deletionVector.storageType")?
         {
             // there is a storageType, so the whole DV must be there
             let path_or_inline_dv: String =
-                getters[9].extract_into(row_index, "remove.deletionVector.pathOrInlineDv")?;
+                getters[9].get(row_index, "remove.deletionVector.pathOrInlineDv")?;
             let offset: Option<i32> =
-                getters[10].extract_into_opt(row_index, "remove.deletionVector.offset")?;
+                getters[10].get_opt(row_index, "remove.deletionVector.offset")?;
             let size_in_bytes: i32 =
-                getters[11].extract_into(row_index, "remove.deletionVector.sizeInBytes")?;
+                getters[11].get(row_index, "remove.deletionVector.sizeInBytes")?;
             let cardinality: i64 =
-                getters[12].extract_into(row_index, "remove.deletionVector.cardinality")?;
+                getters[12].get(row_index, "remove.deletionVector.cardinality")?;
             Some(DeletionVectorDescriptor {
                 storage_type,
                 path_or_inline_dv,
@@ -609,10 +589,9 @@ impl RemoveVisitor {
             None
         };
 
-        let base_row_id: Option<i64> =
-            getters[13].extract_into_opt(row_index, "remove.baseRowId")?;
+        let base_row_id: Option<i64> = getters[13].get_opt(row_index, "remove.baseRowId")?;
         let default_row_commit_version: Option<i64> =
-            getters[14].extract_into_opt(row_index, "remove.defaultRowCommitVersion")?;
+            getters[14].get_opt(row_index, "remove.defaultRowCommitVersion")?;
 
         Ok(Remove {
             path,
@@ -630,14 +609,10 @@ impl RemoveVisitor {
 }
 
 impl DataVisitor for RemoveVisitor {
-    fn visit<'a>(
-        &mut self,
-        row_count: usize,
-        getters: &[&'a dyn GetDataItem<'a>],
-    ) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of an Remove action
-            if let Some(path) = getters[0].extract_into_opt(i, "remove.path")? {
+            if let Some(path) = getters[0].get_opt(i, "remove.path")? {
                 self.removes.push(Self::visit_remove(i, path, getters)?);
                 break;
             }

@@ -439,7 +439,7 @@ mod tests {
         assert!(cp.is_none())
     }
 
-    #[test]
+    #[test_log::test]
     fn test_read_table_with_checkpoint() {
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/with_checkpoint_no_last_checkpoint/",

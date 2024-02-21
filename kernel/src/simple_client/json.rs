@@ -9,6 +9,7 @@ use arrow_json::ReaderBuilder;
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use arrow_select::concat::concat_batches;
 use itertools::Itertools;
+use tracing::debug;
 
 use super::data::SimpleData;
 
@@ -20,10 +21,11 @@ impl JsonHandler for SimpleJsonHandler {
         schema: SchemaRef,
         _predicate: Option<Expression>,
     ) -> DeltaResult<FileDataReadResultIterator> {
+        debug!("Reading json files: {:#?}", files);
         if files.is_empty() {
             return Ok(Box::new(std::iter::empty()));
         }
-        let res: Vec<DeltaResult<Box<dyn EngineData>>> = files
+        let res: Vec<_> = files
             .iter()
             .map(|file| {
                 let d = super::data::SimpleData::try_create_from_json(

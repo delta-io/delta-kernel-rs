@@ -1,4 +1,4 @@
-use crate::engine_data::{DataItemList, DataItemMap, EngineData, GetDataItem, TypeTag};
+use crate::engine_data::{DataItemList, DataItemMap, EngineData, GetData, TypeTag};
 use crate::schema::{DataType, PrimitiveType, Schema, SchemaRef, StructField};
 use crate::{DeltaResult, Error};
 
@@ -157,7 +157,7 @@ impl SimpleData {
 
     pub fn extract_columns<'a>(
         &'a self,
-        out_col_array: &mut Vec<&dyn GetDataItem<'a>>,
+        out_col_array: &mut Vec<&dyn GetData<'a>>,
         schema: &Schema,
     ) -> DeltaResult<()> {
         debug!("Extracting column getters for {:#?}", schema);
@@ -166,7 +166,7 @@ impl SimpleData {
 
     /// Extracts an exploded schema (all leaf values), in schema order
     fn extract_columns_from_array<'a>(
-        out_col_array: &mut Vec<&dyn GetDataItem<'a>>,
+        out_col_array: &mut Vec<&dyn GetData<'a>>,
         schema: &Schema,
         array: Option<&'a dyn ProvidesColumnByName>,
     ) -> DeltaResult<()> {
@@ -198,7 +198,7 @@ impl SimpleData {
     }
 
     fn extract_column<'a>(
-        out_col_array: &mut Vec<&dyn GetDataItem<'a>>,
+        out_col_array: &mut Vec<&dyn GetData<'a>>,
         field: &StructField,
         col: &'a dyn Array,
     ) -> DeltaResult<()> {

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use super::data_skipping::DataSkippingFilter;
 use crate::actions::action_definitions::{Add, AddVisitor, Remove, RemoveVisitor};
-use crate::engine_data::{ExtractInto, GetDataItem};
+use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::Expression;
 use crate::schema::{SchemaRef, StructType};
 use crate::{DataExtractor, DataVisitor, DeltaResult, EngineData};
@@ -27,21 +27,18 @@ struct AddRemoveVisitor {
 }
 
 impl DataVisitor for AddRemoveVisitor {
-    fn visit<'a>(
-        &mut self,
-        row_count: usize,
-        getters: &[&'a dyn GetDataItem<'a>],
-    ) -> DeltaResult<()> {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         println!("at top: {}", getters.len());
         for i in 0..row_count {
             // Add will have a path at index 0 if it is valid
-            if let Some(path) = getters[0].extract_into_opt(i, "add.path")? {
-                self.adds.push(AddVisitor::visit_add(i, path, getters)?);
+            if let Some(path) = getters[0].get_opt(i, "add.path")? {
+                self.adds
+                    .push(AddVisitor::visit_add(i, path, &getters[..15])?);
             }
             // Remove will have a path at index 15 if it is valid
             // TODO(nick): Should count the fields in Add to ensure we don't get this wrong if more
             // are added
-            if let Some(path) = getters[15].extract_into_opt(i, "remove.path")? {
+            else if let Some(path) = getters[15].get_opt(i, "remove.path")? {
                 let remove_getters = &getters[15..];
                 self.removes
                     .push(RemoveVisitor::visit_remove(i, path, remove_getters)?);
@@ -89,15 +86,15 @@ impl LogReplayScanner {
             // only serve as tombstones for vacuum jobs. So no need to load them here.
             vec![crate::actions::schemas::ADD_FIELD.clone()]
         });
-        let mut add_remove_visitor = AddRemoveVisitor::default();
-        data_extractor.extract(actions, Arc::new(schema_to_use), &mut add_remove_visitor)?;
+        let mut visitor = AddRemoveVisitor::default();
+        data_extractor.extract(actions, Arc::new(schema_to_use), &mut visitor)?;
 
-        for remove in add_remove_visitor.removes.into_iter() {
+        for remove in visitor.removes.into_iter() {
             self.seen
                 .insert((remove.path.clone(), remove.dv_unique_id()));
         }
 
-        add_remove_visitor
+        visitor
             .adds
             .into_iter()
             .filter_map(|add| {

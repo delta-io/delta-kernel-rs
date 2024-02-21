@@ -1,25 +1,11 @@
 use crate::{DeltaResult, Error};
 
+use tracing::debug;
+
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
 };
-
-macro_rules! gen_casts {
-    (($fnname: ident, $enum_ty: ident, $typ: ty)) => {
-        pub fn $fnname(&self) -> Option<$typ> {
-            if let DataItem::$enum_ty(x) = self {
-                Some(*x)
-            } else {
-                None
-            }
-        }
-    };
-    (($fnname: ident, $enum_ty: ident, $typ: ty), $(($fnname_rest: ident, $enum_ty_rest: ident, $typ_rest: ty)),+) => {
-        gen_casts!(($fnname, $enum_ty, $typ));
-        gen_casts!($(($fnname_rest, $enum_ty_rest, $typ_rest)),+);
-    };
-}
 
 // a list that can go inside a DataItem
 pub trait DataItemList {
@@ -71,136 +57,67 @@ impl<'a> MapItem<'a> {
     }
 }
 
-pub enum DataItem<'a> {
-    Bool(bool),
-    F32(f32),
-    F64(f64),
-    I32(i32),
-    I64(i64),
-    U32(u32),
-    U64(u64),
-    Str(&'a str),
-    List(ListItem<'a>),
-    Map(MapItem<'a>),
+macro_rules! impl_default_get {
+    (($name: ident, $typ: ty)) => {
+        fn $name(&'a self, _row_index: usize, field_name: &str) -> DeltaResult<Option<$typ>> {
+            debug!("Asked for type {} on {field_name}, but using default error impl.", stringify!($typ));
+            Err(Error::Generic(format!("Type mismatch for field {field_name}")))
+        }
+    };
+    (($name: ident, $typ: ty), $(($name_rest: ident, $typ_rest: ty)),+) => {
+        impl_default_get!(($name, $typ));
+        impl_default_get!($(($name_rest, $typ_rest)),+);
+    };
 }
 
-impl<'a> DataItem<'a> {
-    gen_casts!(
-        (as_bool, Bool, bool),
-        (as_f32, F32, f32),
-        (as_f64, F64, f64),
-        (as_i32, I32, i32),
-        (as_i64, I64, i64),
-        (as_u32, U32, u32),
-        (as_u64, U64, u64),
-        (as_str, Str, &str)
+pub trait GetData<'a> {
+    impl_default_get!(
+        (get_bool, bool),
+        (get_int, i32),
+        (get_long, i64),
+        (get_str, &'a str),
+        (get_list, ListItem<'a>),
+        (get_map, MapItem<'a>)
     );
-
-    pub fn as_string(&self) -> Option<String> {
-        self.as_str().map(|s| s.to_string())
-    }
 }
 
-pub trait GetDataItem<'a> {
-    fn get(&'a self, row_index: usize) -> Option<DataItem<'a>>;
-}
-
-/// A trait similar to TryInto, that allows extracting a [`DataItem`] into a particular type
-pub trait ExtractInto<T>: Sized {
-    /// Extract a required item into type `T` for the specified `field_name`
-    /// This returns an error if the item is not present
-    fn extract_into(self, row_index: usize, field_name: &str) -> DeltaResult<T> {
-        let result = self.extract_into_opt(row_index, field_name)?;
-        result.ok_or(Error::Generic(format!(
-            "Missing value for required field: {field_name}"
+pub trait TypedGetData<'a, T> {
+    fn get_opt(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<T>>;
+    fn get(&'a self, row_index: usize, field_name: &str) -> DeltaResult<T> {
+        let val = self.get_opt(row_index, field_name)?;
+        val.ok_or(Error::Generic(format!(
+            "Data missing for field {field_name}"
         )))
     }
-    /// Extract an optional item into type `T` for the specified `field_name`
-    /// Returns `None` if the item is not present, or `Some(T)` if it is
-    fn extract_into_opt(self, row_index: usize, field_name: &str) -> DeltaResult<Option<T>>;
 }
 
-macro_rules! impl_extract_into {
-    (($target_type: ty, $enum_variant: ident)) => {
-        #[doc = "Attempt to extract a GetDataItem into a(n) `"]
-        #[doc = stringify!($target_type)]
-        #[doc = "`. This does _not_ perform type  coersion, it just returns "]
-        #[doc = concat!("`Ok(Some(", stringify!($target_type), "))`")]
-        #[doc = " if the DataItem is a "]
-        #[doc = concat!("`DataItem::", stringify!($enum_variant), "`")]
-        #[doc = " or returns an error if it is not. "]
-        #[doc = " Returns `Ok(None)` if the data item was not present in the source data."]
-        impl<'a> ExtractInto<$target_type> for &'a dyn GetDataItem<'a> {
-            fn extract_into_opt(self, row_index: usize, field_name: &str) -> DeltaResult<Option<$target_type>> {
-                let data_item = self.get(row_index);
-                data_item.as_ref().map(|item| match item {
-                    &DataItem::$enum_variant(x) => Ok(x),
-                    _ => Err(Error::Generic(format!("Could not extract {field_name} as {}", stringify!($target_type))))
-                }).transpose()
+macro_rules! impl_typed_get_data {
+    (($name: ident, $typ: ty)) => {
+        impl<'a> TypedGetData<'a, $typ> for dyn GetData<'a> +'_ {
+            fn get_opt(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<$typ>> {
+                self.$name(row_index, field_name)
             }
         }
     };
-    (($target_type: ty, $enum_variant: ident), $(($target_type_rest: ty, $enum_variant_rest: ident)),+) => {
-        impl_extract_into!(($target_type, $enum_variant));
-        impl_extract_into!($(($target_type_rest, $enum_variant_rest)),+);
-    }
+    (($name: ident, $typ: ty), $(($name_rest: ident, $typ_rest: ty)),+) => {
+        impl_typed_get_data!(($name, $typ));
+        impl_typed_get_data!($(($name_rest, $typ_rest)),+);
+    };
 }
 
-impl_extract_into!(
-    (bool, Bool),
-    (f32, F32),
-    (f64, F64),
-    (i32, I32),
-    (i64, I64),
-    (u32, U32),
-    (u64, U64),
-    (&'a str, Str)
+impl_typed_get_data!(
+    (get_bool, bool),
+    (get_int, i32),
+    (get_long, i64),
+    (get_str, &'a str),
+    (get_list, ListItem<'a>),
+    (get_map, MapItem<'a>)
 );
 
-/// Attempt to extract a DataItem into an `&'a ListItem`. This does not perform type coersion, it
-/// just returns `Ok(Some(&'a ListItem<'b>))` if the DataItem is a DataItem::List or returns an error
-/// if it is not. Returns `Ok(None)` if the data item was not present in the source data.
-impl<'a> ExtractInto<ListItem<'a>> for &'a dyn GetDataItem<'a> {
-    fn extract_into_opt(
-        self,
-        row_index: usize,
-        field_name: &str,
-    ) -> DeltaResult<Option<ListItem<'a>>> {
-        self.get(row_index)
-            .map(|item| match item {
-                DataItem::List(x) => Ok(x),
-                _ => Err(Error::Generic(format!(
-                    "Could not extract {field_name} as a ListItem"
-                ))),
-            })
-            .transpose()
-    }
-}
-
-/// Attempt to extract a DataItem into an `&'a MapItem`. This does not perform type coersion, it
-/// just returns `Ok(Some(&'a MapItem<'b>))` if the DataItem is a DataItem::Map or returns an error
-/// if it is not. Returns `Ok(None)` if the data item was not present in the source data.
-impl<'a> ExtractInto<MapItem<'a>> for &'a dyn GetDataItem<'a> {
-    fn extract_into_opt(
-        self,
-        row_index: usize,
-        field_name: &str,
-    ) -> DeltaResult<Option<MapItem<'a>>> {
-        self.get(row_index)
-            .map(|item| match item {
-                DataItem::Map(x) => Ok(x),
-                _ => Err(Error::Generic(format!(
-                    "Could not extract {field_name} as a MapItem"
-                ))),
-            })
-            .transpose()
-    }
-}
-
-impl<'a> ExtractInto<String> for &'a dyn GetDataItem<'a> {
-    fn extract_into_opt(self, row_index: usize, field_name: &str) -> DeltaResult<Option<String>> {
-        let val: Option<&str> = self.extract_into_opt(row_index, field_name)?;
-        Ok(val.map(|s| s.to_string()))
+impl<'a> TypedGetData<'a, String> for dyn GetData<'a> + '_ {
+    fn get_opt(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<String>> {
+        self.get_str(row_index, field_name)
+            .map(|s| s.map(|s| s.to_string()))
     }
 }
 
@@ -215,11 +132,7 @@ pub trait DataVisitor {
 
     /// The visitor is passed a slice of `GetDataItem` values, and a row count.
     // TODO(nick) better comment
-    fn visit<'a>(
-        &mut self,
-        row_count: usize,
-        getters: &[&'a dyn GetDataItem<'a>],
-    ) -> DeltaResult<()>;
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()>;
 }
 
 /// A TypeTag identifies the class that an Engine is using to represent data read by its

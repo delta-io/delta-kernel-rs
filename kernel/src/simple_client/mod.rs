@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 pub mod data;
 mod fs_client;
-mod get_data_item;
+mod get_data;
 pub(crate) mod json;
 mod parquet;
 

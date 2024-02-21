@@ -1,3 +1,5 @@
+use tracing::debug;
+
 use crate::{
     schema::SchemaRef, DeltaResult, Expression, FileDataReadResultIterator, FileMeta,
     ParquetHandler,
@@ -12,6 +14,7 @@ impl ParquetHandler for SimpleParquetHandler {
         schema: SchemaRef,
         _predicate: Option<Expression>,
     ) -> DeltaResult<FileDataReadResultIterator> {
+        debug!("Reading parquet files: {:#?}", files);
         if files.is_empty() {
             return Ok(Box::new(std::iter::empty()));
         }
