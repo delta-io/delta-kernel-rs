@@ -379,7 +379,7 @@ impl AddVisitor {
         let size: i64 = getters[2].get(row_index, "add.size")?;
         let modification_time: i64 = getters[3].get(row_index, "add.modificationTime")?;
         let data_change: bool = getters[4].get(row_index, "add.dataChange")?;
-        let stats: Option<&str> = getters[5].get_opt(row_index, "add.stats")?;
+        let stats: Option<String> = getters[5].get_opt(row_index, "add.stats")?;
 
         // TODO(nick) extract tags if we ever need them at getters[6]
 
@@ -416,7 +416,7 @@ impl AddVisitor {
             size,
             modification_time,
             data_change,
-            stats: stats.map(|s| s.to_string()),
+            stats,
             tags: HashMap::new(),
             deletion_vector,
             base_row_id,
