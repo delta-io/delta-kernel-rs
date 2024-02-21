@@ -85,9 +85,7 @@ impl<E: TaskExecutor> DefaultTableClient<E> {
             expression: Arc::new(DefaultExpressionHandler {}),
         }
     }
-}
 
-impl<E: TaskExecutor> DefaultTableClient<E> {
     pub fn get_object_store_for_url(&self, _url: &Url) -> Option<Arc<DynObjectStore>> {
         Some(self.store.clone())
     }

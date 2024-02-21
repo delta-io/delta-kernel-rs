@@ -4,18 +4,31 @@
 #include <ostream>
 #include <new>
 
-// ======================================================================================
-// Missing forward declarations from deltakernel crate, added manually via cbindgen.toml
-// ======================================================================================
-struct Snapshot;
-struct TokioBackgroundExecutor;
-template<typename E> struct DefaultTableClient;
-// ======================================================================================
+enum class KernelError {
+  UnknownError,
+  FFIError,
+  ArrowError,
+  GenericError,
+  ParquetError,
+  ObjectStoreError,
+  FileNotFoundError,
+  MissingColumnError,
+  UnexpectedColumnTypeError,
+  MissingDataError,
+  MissingVersionError,
+  DeletionVectorError,
+  InvalidUrlError,
+  MalformedJsonError,
+  MissingMetadataError,
+};
 
+struct ExternTableClientHandle;
 
 struct KernelExpressionVisitorState;
 
 struct KernelScanFileIterator;
+
+struct SnapshotHandle;
 
 /// Model iterators. This allows an engine to specify iteration however it likes, and we simply wrap
 /// the engine functions. The engine retains ownership of the iterator.
@@ -27,7 +40,35 @@ struct EngineIterator {
   const void *(*get_next)(void *data);
 };
 
-using KernelDefaultTableClient = DefaultTableClient<TokioBackgroundExecutor>;
+/// An error that can be returned to the engine. Engines can define additional struct fields on
+/// their side, by e.g. embedding this struct as the first member of a larger struct.
+struct EngineError {
+  KernelError etype;
+};
+
+template<typename T>
+struct ExternResult {
+  enum class Tag {
+    Ok,
+    Err,
+  };
+
+  struct Ok_Body {
+    T _0;
+  };
+
+  struct Err_Body {
+    EngineError *_0;
+  };
+
+  Tag tag;
+  union {
+    Ok_Body ok;
+    Err_Body err;
+  };
+};
+
+using AllocateErrorFn = EngineError*(*)(KernelError etype, const char *msg_ptr, uintptr_t msg_len);
 
 struct EngineSchemaVisitor {
   void *data;
@@ -51,15 +92,42 @@ extern "C" {
 /// test function to print for items. this assumes each item is an `int`
 void iterate(EngineIterator *it);
 
-const KernelDefaultTableClient *get_default_client(const char *path);
+/// # Safety
+///
+/// Caller is responsible to pass a valid path pointer.
+ExternResult<const ExternTableClientHandle*> get_default_client(const char *path,
+                                                                AllocateErrorFn allocate_error);
+
+/// # Safety
+///
+/// Caller is responsible to pass a valid handle.
+void drop_table_client(const ExternTableClientHandle *table_client);
 
 /// Get the latest snapshot from the specified table
-const Snapshot *snapshot(const char *path, const KernelDefaultTableClient *table_client);
+///
+/// # Safety
+///
+/// Caller is responsible to pass valid handles and path pointer.
+ExternResult<const SnapshotHandle*> snapshot(const char *path,
+                                             const ExternTableClientHandle *table_client,
+                                             AllocateErrorFn allocate_error);
+
+/// # Safety
+///
+/// Caller is responsible to pass a valid handle.
+void drop_snapshot(const SnapshotHandle *snapshot);
 
 /// Get the version of the specified snapshot
-uint64_t version(const Snapshot *snapshot);
+///
+/// # Safety
+///
+/// Caller is responsible to pass a valid handle.
+uint64_t version(const SnapshotHandle *snapshot);
 
-uintptr_t visit_schema(const Snapshot *snapshot, EngineSchemaVisitor *visitor);
+/// # Safety
+///
+/// Caller is responsible to pass a valid handle.
+uintptr_t visit_schema(const SnapshotHandle *snapshot, EngineSchemaVisitor *visitor);
 
 uintptr_t visit_expression_and(KernelExpressionVisitorState *state, EngineIterator *children);
 
@@ -79,14 +147,12 @@ uintptr_t visit_expression_literal_string(KernelExpressionVisitorState *state, c
 
 uintptr_t visit_expression_literal_long(KernelExpressionVisitorState *state, int64_t value);
 
-/// Get a FileList for all the files that need to be read from the table. NB: This _consumes_ the
-/// snapshot, it is no longer valid after making this call (TODO: We should probably fix this?)
-///
+/// Get a FileList for all the files that need to be read from the table.
 /// # Safety
 ///
 /// Caller is responsible to pass a valid snapshot pointer.
-KernelScanFileIterator *kernel_scan_files_init(const Snapshot *snapshot,
-                                               const KernelDefaultTableClient *table_client,
+KernelScanFileIterator *kernel_scan_files_init(const SnapshotHandle *snapshot,
+                                               const ExternTableClientHandle *table_client,
                                                EnginePredicate *predicate);
 
 void kernel_scan_files_next(KernelScanFileIterator *files,
@@ -95,6 +161,10 @@ void kernel_scan_files_next(KernelScanFileIterator *files,
                                                    const char *ptr,
                                                    uintptr_t len));
 
+/// # Safety
+///
+/// Caller is responsible to (at most once) pass a valid pointer returned by a call to
+/// [kernel_scan_files_init].
 void kernel_scan_files_free(KernelScanFileIterator *files);
 
 } // extern "C"

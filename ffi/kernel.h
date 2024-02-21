@@ -3,18 +3,31 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-// ======================================================================================
-// Missing forward declarations from deltakernel crate, added manually via cbindgen.toml
-// ======================================================================================
-struct Snapshot;
-struct TokioBackgroundExecutor;
-template<typename E> struct DefaultTableClient;
-// ======================================================================================
+typedef enum KernelError {
+  UnknownError,
+  FFIError,
+  ArrowError,
+  GenericError,
+  ParquetError,
+  ObjectStoreError,
+  FileNotFoundError,
+  MissingColumnError,
+  UnexpectedColumnTypeError,
+  MissingDataError,
+  MissingVersionError,
+  DeletionVectorError,
+  InvalidUrlError,
+  MalformedJsonError,
+  MissingMetadataError,
+} KernelError;
 
+typedef struct ExternTableClientHandle ExternTableClientHandle;
 
 typedef struct KernelExpressionVisitorState KernelExpressionVisitorState;
 
 typedef struct KernelScanFileIterator KernelScanFileIterator;
+
+typedef struct SnapshotHandle SnapshotHandle;
 
 /**
  * Model iterators. This allows an engine to specify iteration however it likes, and we simply wrap
@@ -30,7 +43,51 @@ typedef struct EngineIterator {
   const void *(*get_next)(void *data);
 } EngineIterator;
 
-typedef DefaultTableClient<TokioBackgroundExecutor> KernelDefaultTableClient;
+/**
+ * An error that can be returned to the engine. Engines can define additional struct fields on
+ * their side, by e.g. embedding this struct as the first member of a larger struct.
+ */
+typedef struct EngineError {
+  enum KernelError etype;
+} EngineError;
+
+typedef enum ExternResult______ExternTableClientHandle_Tag {
+  Ok______ExternTableClientHandle,
+  Err______ExternTableClientHandle,
+} ExternResult______ExternTableClientHandle_Tag;
+
+typedef struct ExternResult______ExternTableClientHandle {
+  ExternResult______ExternTableClientHandle_Tag tag;
+  union {
+    struct {
+      const struct ExternTableClientHandle *ok;
+    };
+    struct {
+      struct EngineError *err;
+    };
+  };
+} ExternResult______ExternTableClientHandle;
+
+typedef struct EngineError *(*AllocateErrorFn)(enum KernelError etype,
+                                               const char *msg_ptr,
+                                               uintptr_t msg_len);
+
+typedef enum ExternResult______SnapshotHandle_Tag {
+  Ok______SnapshotHandle,
+  Err______SnapshotHandle,
+} ExternResult______SnapshotHandle_Tag;
+
+typedef struct ExternResult______SnapshotHandle {
+  ExternResult______SnapshotHandle_Tag tag;
+  union {
+    struct {
+      const struct SnapshotHandle *ok;
+    };
+    struct {
+      struct EngineError *err;
+    };
+  };
+} ExternResult______SnapshotHandle;
 
 typedef struct EngineSchemaVisitor {
   void *data;
@@ -54,19 +111,54 @@ typedef struct EnginePredicate {
  */
 void iterate(struct EngineIterator *it);
 
-const KernelDefaultTableClient *get_default_client(const char *path);
+/**
+ * # Safety
+ *
+ * Caller is responsible to pass a valid path pointer.
+ */
+struct ExternResult______ExternTableClientHandle get_default_client(const char *path,
+                                                                    AllocateErrorFn allocate_error);
+
+/**
+ * # Safety
+ *
+ * Caller is responsible to pass a valid handle.
+ */
+void drop_table_client(const struct ExternTableClientHandle *table_client);
 
 /**
  * Get the latest snapshot from the specified table
+ *
+ * # Safety
+ *
+ * Caller is responsible to pass valid handles and path pointer.
  */
-const Snapshot *snapshot(const char *path, const KernelDefaultTableClient *table_client);
+struct ExternResult______SnapshotHandle snapshot(const char *path,
+                                                 const struct ExternTableClientHandle *table_client,
+                                                 AllocateErrorFn allocate_error);
+
+/**
+ * # Safety
+ *
+ * Caller is responsible to pass a valid handle.
+ */
+void drop_snapshot(const struct SnapshotHandle *snapshot);
 
 /**
  * Get the version of the specified snapshot
+ *
+ * # Safety
+ *
+ * Caller is responsible to pass a valid handle.
  */
-uint64_t version(const Snapshot *snapshot);
+uint64_t version(const struct SnapshotHandle *snapshot);
 
-uintptr_t visit_schema(const Snapshot *snapshot, struct EngineSchemaVisitor *visitor);
+/**
+ * # Safety
+ *
+ * Caller is responsible to pass a valid handle.
+ */
+uintptr_t visit_schema(const struct SnapshotHandle *snapshot, struct EngineSchemaVisitor *visitor);
 
 uintptr_t visit_expression_and(struct KernelExpressionVisitorState *state,
                                struct EngineIterator *children);
@@ -89,15 +181,13 @@ uintptr_t visit_expression_literal_string(struct KernelExpressionVisitorState *s
 uintptr_t visit_expression_literal_long(struct KernelExpressionVisitorState *state, int64_t value);
 
 /**
- * Get a FileList for all the files that need to be read from the table. NB: This _consumes_ the
- * snapshot, it is no longer valid after making this call (TODO: We should probably fix this?)
- *
+ * Get a FileList for all the files that need to be read from the table.
  * # Safety
  *
  * Caller is responsible to pass a valid snapshot pointer.
  */
-struct KernelScanFileIterator *kernel_scan_files_init(const Snapshot *snapshot,
-                                                      const KernelDefaultTableClient *table_client,
+struct KernelScanFileIterator *kernel_scan_files_init(const struct SnapshotHandle *snapshot,
+                                                      const struct ExternTableClientHandle *table_client,
                                                       struct EnginePredicate *predicate);
 
 void kernel_scan_files_next(struct KernelScanFileIterator *files,
@@ -106,4 +196,10 @@ void kernel_scan_files_next(struct KernelScanFileIterator *files,
                                                    const char *ptr,
                                                    uintptr_t len));
 
+/**
+ * # Safety
+ *
+ * Caller is responsible to (at most once) pass a valid pointer returned by a call to
+ * [kernel_scan_files_init].
+ */
 void kernel_scan_files_free(struct KernelScanFileIterator *files);

@@ -2,7 +2,9 @@
 ///
 /// Exposes that an engine needs to call from C/C++ to interface with kernel
 use std::collections::HashMap;
+use std::default::Default;
 use std::ffi::{CStr, CString};
+use std::fmt::{Display, Formatter};
 use std::os::raw::{c_char, c_void};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -12,6 +14,10 @@ use deltakernel::expressions::{BinaryOperator, Expression, Scalar};
 use deltakernel::scan::ScanBuilder;
 use deltakernel::schema::{DataType, PrimitiveType, StructField, StructType};
 use deltakernel::snapshot::Snapshot;
+use deltakernel::{DeltaResult, Error, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler, TableClient};
+
+mod handle;
+use handle::{ArcHandle, SizedArcHandle, Uncreate};
 
 /// Model iterators. This allows an engine to specify iteration however it likes, and we simply wrap
 /// the engine functions. The engine retains ownership of the iterator.
@@ -50,69 +56,239 @@ impl Iterator for EngineIterator {
     }
 }
 
-// TODO: We REALLY don't want to expose the real type of default client. Doing so forces every kernel
-// API call to take either a default client or a generic client, because those are incompatible types.
-use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
-type KernelDefaultTableClient = deltakernel::DefaultTableClient<TokioBackgroundExecutor>;
+#[repr(C)]
+pub enum KernelError {
+    UnknownError, // catch-all for unrecognized kernel Error types
+    FFIError, // errors encountered in the code layer that supports FFI
+    ArrowError,
+    GenericError,
+    ParquetError,
+    ObjectStoreError,
+    FileNotFoundError,
+    MissingColumnError,
+    UnexpectedColumnTypeError,
+    MissingDataError,
+    MissingVersionError,
+    DeletionVectorError,
+    InvalidUrlError,
+    MalformedJsonError,
+    MissingMetadataError,
+}
+
+impl Display for KernelError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KernelError::UnknownError => write!(f, "UnknownError"),
+            KernelError::FFIError => write!(f, "FFIError"),
+            KernelError::ArrowError => write!(f, "ArrowError"),
+            KernelError::GenericError => write!(f, "GenericError"),
+            KernelError::ParquetError => write!(f, "ParquetError"),
+            KernelError::ObjectStoreError => write!(f, "ObjectStoreError"),
+            KernelError::FileNotFoundError => write!(f, "FileNotFoundError"),
+            KernelError::MissingColumnError => write!(f, "MissingColumnError"),
+            KernelError::UnexpectedColumnTypeError => write!(f, "UnexpectedColumnTypeError"),
+            KernelError::MissingDataError => write!(f, "MissingDataError"),
+            KernelError::MissingVersionError => write!(f, "MissingVersionError"),
+            KernelError::DeletionVectorError => write!(f, "DeletionVectorError"),
+            KernelError::InvalidUrlError => write!(f, "InvalidUrlError"),
+            KernelError::MalformedJsonError => write!(f, "MalformedJsonError"),
+            KernelError::MissingMetadataError => write!(f, "MissingMetadataError"),
+        }
+    }
+}
+
+impl From<Error> for KernelError {
+    fn from(e: Error) -> Self {
+        match e {
+            // NOTE: By definition, no kernel Error maps to FFIError
+            Error::Arrow(_) => KernelError::ArrowError,
+            Error::Generic(_) => KernelError::GenericError,
+            Error::GenericError { .. } => KernelError::GenericError,
+            Error::Parquet(_) => KernelError::ParquetError,
+            Error::ObjectStore(_) => KernelError::ObjectStoreError,
+            Error::FileNotFound(_) => KernelError::FileNotFoundError,
+            Error::MissingColumn(_) => KernelError::MissingColumnError,
+            Error::UnexpectedColumnType(_) => KernelError::UnexpectedColumnTypeError,
+            Error::MissingData(_) => KernelError::MissingDataError,
+            Error::MissingVersion => KernelError::MissingVersionError,
+            Error::DeletionVector(_) => KernelError::DeletionVectorError,
+            Error::InvalidUrl(_) => KernelError::InvalidUrlError,
+            Error::MalformedJson(_) => KernelError::MalformedJsonError,
+            Error::MissingMetadata => KernelError::MissingMetadataError,
+        }
+    }
+}
+
+/// An error that can be returned to the engine. Engines can define additional struct fields on
+/// their side, by e.g. embedding this struct as the first member of a larger struct.
+#[repr(C)]
+pub struct EngineError {
+    etype: KernelError,
+}
+
+#[repr(C)]
+pub enum ExternResult<T> {
+    Ok(T),
+    Err(*mut EngineError),
+}
+
+type AllocateErrorFn = extern "C" fn(
+    etype: KernelError,
+    msg_ptr: *const c_char,
+    msg_len: usize,
+) -> *mut EngineError;
+
+// NOTE: We can't "just" impl From<DeltaResult<T>> because we require an error allocator.
+impl<T> ExternResult<T> {
+    pub fn is_ok(&self) -> bool {
+        match self {
+            Self::Ok(_) => true,
+            Self::Err(_) => false,
+        }
+    }
+    pub fn is_err(&self) -> bool {
+        !self.is_ok()
+    }
+}
+
+
+trait IntoExternResult<T> {
+    fn into_extern_result(
+        self,
+        allocate_error: AllocateErrorFn,
+    ) -> ExternResult<T>;
+}
+
+impl<T> IntoExternResult<T> for DeltaResult<T> {
+    fn into_extern_result(
+        self,
+        allocate_error: AllocateErrorFn,
+    ) -> ExternResult<T> {
+        match self {
+            Ok(ok) => ExternResult::Ok(ok),
+            Err(err) => {
+                let msg = format!("{}", err);
+                let err = allocate_error(err.into(), msg.as_ptr().cast(), msg.len());
+                ExternResult::Err(err)
+            }
+        }
+    }
+}
+
+// An extended version of TableClient which defines additional FFI-specific methods.
+pub trait ExternTableClient {
+    /// The underlying table client instance to use
+    fn table_client(&self) -> Arc<dyn TableClient>;
+
+    /// Allocates a new error in engine memory and returns the resulting pointer. The engine is
+    /// expected to copy the passed-in message, which is only guaranteed to remain valid until the
+    /// call returns. Kernel will always immediately return the result of this method to the engine.
+    fn allocate_error(&self, error: Error) -> *mut EngineError;
+}
+
+pub struct ExternTableClientHandle {
+    _uncreate: Uncreate,
+}
+
+impl ArcHandle for ExternTableClientHandle {
+    type Target = dyn ExternTableClient;
+}
+
+struct ExternTableClientVtable {
+    // Actual table client instance to use
+    client: Arc<dyn TableClient>,
+    allocate_error: AllocateErrorFn,
+}
+
+impl ExternTableClient for ExternTableClientVtable {
+    fn table_client(&self) -> Arc<dyn TableClient> {
+        self.client.clone()
+    }
+    fn allocate_error(&self, error: Error) -> *mut EngineError {
+        let msg = format!("{}", error);
+        (self.allocate_error)(error.into(), msg.as_ptr().cast(), msg.len())
+    }
+}
 
 /// # Safety
 ///
 /// Caller is responsible to pass a valid path pointer.
-unsafe fn unwrap_and_parse_path_as_url(path: *const c_char) -> Option<Url> {
+unsafe fn unwrap_and_parse_path_as_url(path: *const c_char) -> DeltaResult<Url> {
     let path = unsafe { CStr::from_ptr(path) };
-    let path = path.to_str().unwrap();
-    let path = std::fs::canonicalize(PathBuf::from(path));
-    let Ok(path) = path else {
-        println!("Couldn't open table: {}", path.err().unwrap());
-        return None;
-    };
-    let Ok(url) = Url::from_directory_path(path) else {
-        println!("Invalid url");
-        return None;
-    };
-    Some(url)
+    let path = path.to_str().map_err(Error::generic)?;
+    let path = std::fs::canonicalize(PathBuf::from(path)).map_err(Error::generic)?;
+    Url::from_directory_path(path).map_err(|_| Error::generic("Invalid url"))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn get_default_client(
     path: *const c_char,
-) -> *const KernelDefaultTableClient {
-    let path = unsafe { unwrap_and_parse_path_as_url(path) };
-    let Some(url) = path else {
-        return std::ptr::null_mut();
-    };
-    let table_client = KernelDefaultTableClient::try_new(
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<*const ExternTableClientHandle> {
+    get_default_client_impl(path, allocate_error).into_extern_result(allocate_error)
+}
+
+unsafe fn get_default_client_impl(
+    path: *const c_char,
+    allocate_error: AllocateErrorFn,
+) -> DeltaResult<*const ExternTableClientHandle> {
+    let url = unsafe { unwrap_and_parse_path_as_url(path) }?;
+    use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
+    let table_client = deltakernel::DefaultTableClient::<TokioBackgroundExecutor>::try_new(
         &url,
         HashMap::<String, String>::new(),
         Arc::new(TokioBackgroundExecutor::new()),
     );
-    let Ok(table_client) = table_client else {
-        println!(
-            "Error creating table client: {}",
-            table_client.err().unwrap()
-        );
-        return std::ptr::null_mut();
-    };
-    Arc::into_raw(Arc::new(table_client))
+    let client = Arc::new(table_client.map_err(Error::generic)?);
+    let client: Arc<dyn ExternTableClient> = Arc::new(ExternTableClientVtable {
+        client,
+        allocate_error,
+    });
+    Ok(ArcHandle::into_handle(client))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn drop_table_client(table_client: *const ExternTableClientHandle) {
+    ArcHandle::drop_handle(table_client);
+}
+
+pub struct SnapshotHandle {
+    _uncreate: Uncreate,
+}
+
+impl SizedArcHandle for SnapshotHandle {
+    type Target = Snapshot;
 }
 
 /// Get the latest snapshot from the specified table
 #[no_mangle]
 pub unsafe extern "C" fn snapshot(
     path: *const c_char,
-    table_client: &KernelDefaultTableClient,
-) -> *const Snapshot {
-    let path = unsafe { unwrap_and_parse_path_as_url(path) };
-    let Some(url) = path else {
-        return std::ptr::null_mut();
-    };
-    let snapshot = Snapshot::try_new(url, table_client, None).unwrap();
-    Arc::into_raw(snapshot)
+    table_client: *const ExternTableClientHandle,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<*const SnapshotHandle> {
+    snapshot_impl(path, table_client).into_extern_result(allocate_error)
+}
+
+unsafe fn snapshot_impl(
+    path: *const c_char,
+    table_client: *const ExternTableClientHandle,
+) -> DeltaResult<*const SnapshotHandle> {
+    let url = unsafe { unwrap_and_parse_path_as_url(path) }?;
+    let table_client = unsafe { ArcHandle::clone_as_arc(table_client) };
+    let snapshot = Snapshot::try_new(url, table_client.table_client().as_ref(), None)?;
+    Ok(ArcHandle::into_handle(snapshot))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn drop_snapshot(snapshot: *const SnapshotHandle) {
+    ArcHandle::drop_handle(snapshot);
 }
 
 /// Get the version of the specified snapshot
 #[no_mangle]
-pub extern "C" fn version(snapshot: &Snapshot) -> u64 {
+pub unsafe extern "C" fn version(snapshot: *const SnapshotHandle) -> u64 {
+    let snapshot = unsafe { ArcHandle::clone_as_arc(snapshot) };
     snapshot.version()
 }
 
@@ -139,7 +315,8 @@ pub struct EngineSchemaVisitor {
 }
 
 #[no_mangle]
-pub extern "C" fn visit_schema(snapshot: &Snapshot, visitor: &mut EngineSchemaVisitor) -> usize {
+pub extern "C" fn visit_schema(snapshot: *const SnapshotHandle, visitor: &mut EngineSchemaVisitor) -> usize {
+    let snapshot = unsafe { ArcHandle::clone_as_arc(snapshot) };
     // Visit all the fields of a struct and return the list of children
     fn visit_struct_fields(visitor: &EngineSchemaVisitor, s: &StructType) -> usize {
         let child_list_id = (visitor.make_field_list)(visitor.data, s.fields.len());
@@ -380,7 +557,7 @@ pub struct KernelScanFileIterator {
     _snapshot: Arc<Snapshot>,
 
     // The iterator also has an internal borrowed reference to the table client it came from.
-    _table_client: Arc<KernelDefaultTableClient>,
+    _table_client: Arc<dyn TableClient>,
 }
 
 impl Drop for KernelScanFileIterator {
@@ -389,20 +566,18 @@ impl Drop for KernelScanFileIterator {
     }
 }
 
-/// Get a FileList for all the files that need to be read from the table. NB: This _consumes_ the
-/// snapshot, it is no longer valid after making this call (TODO: We should probably fix this?)
-///
+/// Get a FileList for all the files that need to be read from the table.
 /// # Safety
 ///
 /// Caller is responsible to pass a valid snapshot pointer.
 #[no_mangle]
 pub extern "C" fn kernel_scan_files_init(
-    snapshot: *const Snapshot,
-    table_client: *const KernelDefaultTableClient,
+    snapshot: *const SnapshotHandle,
+    table_client: *const ExternTableClientHandle,
     predicate: Option<&mut EnginePredicate>,
 ) -> *mut KernelScanFileIterator {
-    let snapshot: Arc<Snapshot> = unsafe { Arc::from_raw(snapshot) };
-    let table_client = unsafe { Arc::from_raw(table_client) };
+    let snapshot = unsafe { ArcHandle::clone_as_arc(snapshot) };
+    let table_client = unsafe { ArcHandle::clone_as_arc(table_client) };
     let mut scan_builder = ScanBuilder::new(snapshot.clone());
     if let Some(predicate) = predicate {
         // TODO: There is a lot of redundancy between the various visit_expression_XXX methods here,
@@ -418,12 +593,13 @@ pub extern "C" fn kernel_scan_files_init(
             scan_builder = scan_builder.with_predicate(predicate);
         }
     }
-    let scan_adds = scan_builder.build().files(table_client.as_ref()).unwrap();
+    let real_table_client = table_client.table_client();
+    let scan_adds = scan_builder.build().files(real_table_client.as_ref()).unwrap();
     let files = scan_adds.map(|add| add.unwrap().path);
     let files = KernelScanFileIterator {
         files: Box::new(Mutex::new(files)),
         _snapshot: snapshot,
-        _table_client: table_client,
+        _table_client: real_table_client,
     };
     Box::into_raw(Box::new(files))
 }
