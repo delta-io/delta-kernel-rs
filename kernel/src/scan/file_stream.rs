@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::data_skipping::DataSkippingFilter;
-use crate::actions::action_definitions::{Add, AddVisitor, Remove, RemoveVisitor};
+use crate::actions::{visitors::AddVisitor, visitors::RemoveVisitor, Add, Remove};
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::Expression;
 use crate::schema::{SchemaRef, StructType};

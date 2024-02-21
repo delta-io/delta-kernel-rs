@@ -53,7 +53,6 @@ pub mod schema;
 pub mod snapshot;
 pub mod table;
 
-pub use actions::{types::*, ActionType};
 pub use engine_data::{DataVisitor, EngineData};
 pub use error::{DeltaResult, Error};
 pub use expressions::Expression;

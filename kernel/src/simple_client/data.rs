@@ -316,7 +316,7 @@ mod tests {
     use arrow_array::{RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 
-    use crate::actions::action_definitions::Metadata;
+    use crate::actions::Metadata;
     use crate::DeltaResult;
     use crate::{
         actions::schemas::log_schema,

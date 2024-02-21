@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use self::file_stream::log_replay_iter;
-use crate::actions::action_definitions::Add;
+use crate::actions::Add;
 use crate::expressions::Expression;
 use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::Snapshot;
@@ -172,7 +172,7 @@ impl Scan {
                 })
                 .transpose()?;
 
-            let mut dv_mask = dv_treemap.map(super::actions::action_definitions::treemap_to_bools);
+            let mut dv_mask = dv_treemap.map(super::actions::deletion_vector::treemap_to_bools);
 
             for read_result in read_results {
                 let len = if let Ok(ref res) = read_result {

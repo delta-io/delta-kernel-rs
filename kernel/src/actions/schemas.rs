@@ -2,7 +2,6 @@
 
 use lazy_static::lazy_static;
 
-use super::ActionType;
 use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
 lazy_static! {
@@ -247,24 +246,6 @@ fn deletion_vector_field() -> StructField {
         ]))),
         true,
     )
-}
-
-impl ActionType {
-    /// Returns the type of the corresponding field in the delta log schema
-    pub fn schema_field(&self) -> &StructField {
-        match self {
-            Self::Metadata => &METADATA_FIELD,
-            Self::Protocol => &PROTOCOL_FIELD,
-            Self::CommitInfo => &COMMIT_INFO_FIELD,
-            Self::Add => &ADD_FIELD,
-            Self::Remove => &REMOVE_FIELD,
-            Self::Cdc => &CDC_FIELD,
-            Self::Txn => &TXN_FIELD,
-            Self::DomainMetadata => &DOMAIN_METADATA_FIELD,
-            Self::CheckpointMetadata => &CHECKPOINT_METADATA_FIELD,
-            Self::Sidecar => &SIDECAR_FIELD,
-        }
-    }
 }
 
 #[cfg(test)]
