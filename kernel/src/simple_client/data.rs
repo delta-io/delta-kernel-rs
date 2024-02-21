@@ -238,26 +238,7 @@ impl SimpleData {
                     "Can't extract {}. Arrow Type: {arrow_data_type}\n Kernel Type: {data_type}",
                     field.name
                 );
-                let expected_type: Result<ArrowDataType, ArrowError> = data_type.try_into();
-                return Err(match expected_type {
-                    Ok(expected_type) => {
-                        if expected_type == *arrow_data_type {
-                            Error::Generic(format!(
-                                "On {}: Don't know how to extract something of type {data_type}",
-                                field.name
-                            ))
-                        } else {
-                            Error::Generic(format!(
-                                "Type mismatch on {}: expected {data_type}, got {arrow_data_type}",
-                                field.name
-                            ))
-                        }
-                    }
-                    Err(e) => Error::Generic(format!(
-                        "On {}: Unsupported data type {data_type}: {e}",
-                        field.name
-                    )),
-                });
+                return Err(get_error_for_types(data_type, arrow_data_type, &field.name));
             }
         }
         Ok(())
@@ -265,6 +246,30 @@ impl SimpleData {
 
     pub fn length(&self) -> usize {
         self.data.num_rows()
+    }
+}
+
+fn get_error_for_types(
+    data_type: &DataType,
+    arrow_data_type: &ArrowDataType,
+    field_name: &str,
+) -> Error {
+    let expected_type: Result<ArrowDataType, ArrowError> = data_type.try_into();
+    match expected_type {
+        Ok(expected_type) => {
+            if expected_type == *arrow_data_type {
+                Error::Generic(format!(
+                    "On {field_name}: Don't know how to extract something of type {data_type}",
+                ))
+            } else {
+                Error::Generic(format!(
+                    "Type mismatch on {field_name}: expected {data_type}, got {arrow_data_type}",
+                ))
+            }
+        }
+        Err(e) => Error::Generic(format!(
+            "On {field_name}: Unsupported data type {data_type}: {e}",
+        )),
     }
 }
 
