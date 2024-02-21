@@ -27,6 +27,8 @@ pub enum Error {
     #[error("Arrow error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
 
+    // We don't use [#from] object_store::Error here as our From impl transforms
+    // object_store::Error::NotFound into Self::FileNotFound
     #[cfg(feature = "object_store")]
     #[error("Error interacting with object store: {0}")]
     ObjectStore(object_store::Error),
