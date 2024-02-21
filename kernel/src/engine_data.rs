@@ -66,7 +66,7 @@ macro_rules! impl_default_get {
     (($name: ident, $typ: ty)) => {
         fn $name(&'a self, _row_index: usize, field_name: &str) -> DeltaResult<Option<$typ>> {
             debug!("Asked for type {} on {field_name}, but using default error impl.", stringify!($typ));
-            Err(Error::Generic(format!("Type mismatch for field {field_name}")))
+            Err(Error::UnexpectedColumnType(format!("{field_name} is not of type {}", stringify!($typ))))
         }
     };
     (($name: ident, $typ: ty), $(($name_rest: ident, $typ_rest: ty)),+) => {

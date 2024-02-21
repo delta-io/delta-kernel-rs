@@ -21,7 +21,7 @@ pub enum Error {
     },
 
     #[error("IO error: {0}")]
-    IOError(std::io::Error),
+    IOError(#[from] std::io::Error),
 
     #[cfg(feature = "parquet")]
     #[error("Arrow error: {0}")]
@@ -57,12 +57,6 @@ pub enum Error {
 
     #[error("No table metadata found in delta log.")]
     MissingMetadata,
-}
-
-impl From<std::io::Error> for Error {
-    fn from(io_err: std::io::Error) -> Error {
-        Error::IOError(io_err)
-    }
 }
 
 #[cfg(feature = "object_store")]

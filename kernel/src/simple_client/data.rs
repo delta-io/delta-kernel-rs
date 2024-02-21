@@ -217,7 +217,7 @@ impl SimpleData {
                     out_col_array.push(&());
                 }
             } else {
-                return Err(Error::Generic(format!(
+                return Err(Error::MissingData(format!(
                     "Found required field {}, but it's null",
                     field.name
                 )));
@@ -283,16 +283,16 @@ fn get_error_for_types(
     match expected_type {
         Ok(expected_type) => {
             if expected_type == *arrow_data_type {
-                Error::Generic(format!(
+                Error::UnexpectedColumnType(format!(
                     "On {field_name}: Don't know how to extract something of type {data_type}",
                 ))
             } else {
-                Error::Generic(format!(
+                Error::UnexpectedColumnType(format!(
                     "Type mismatch on {field_name}: expected {data_type}, got {arrow_data_type}",
                 ))
             }
         }
-        Err(e) => Error::Generic(format!(
+        Err(e) => Error::UnexpectedColumnType(format!(
             "On {field_name}: Unsupported data type {data_type}: {e}",
         )),
     }
