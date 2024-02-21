@@ -122,6 +122,25 @@ impl<'a> TypedGetData<'a, String> for dyn GetData<'a> + '_ {
     }
 }
 
+/// Provide an impl to get a list field as a `Vec<String>`. Note that this will allocate the vector
+/// and allocate for each string entry.
+impl<'a> TypedGetData<'a, Vec<String>> for dyn GetData<'a> + '_ {
+    fn get_opt(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<Vec<String>>> {
+        let list_opt: Option<ListItem<'_>> = self.get_opt(row_index, field_name)?;
+        Ok(list_opt.map(|list| list.materialize()))
+    }
+}
+
+/// Provide an impl to get a map field as a `HashMap<String, Option<String>>`. Note that this will
+/// allocate the map and allocate for each entry
+impl<'a> TypedGetData<'a, HashMap<String, Option<String>>> for dyn GetData<'a> + '_ {
+    fn get_opt(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<HashMap<String, Option<String>>>> {
+        let map_opt: Option<MapItem<'_>> = self.get_opt(row_index, field_name)?;
+        Ok(map_opt.map(|map| map.materialize()))
+    }
+}
+
+
 /// A `DataVisitor` can be called back to visit extracted data. Aside from calling
 /// [`DataVisitor::visit`] on the visitor passed to [`crate::DataExtractor::extract`], engines do
 /// not need to worry about this trait.

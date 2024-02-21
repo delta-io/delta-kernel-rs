@@ -10,7 +10,7 @@ use roaring::RoaringTreemap;
 use url::Url;
 
 use crate::{
-    engine_data::{DataVisitor, EngineData, GetData, ListItem, MapItem, TypedGetData},
+    engine_data::{DataVisitor, EngineData, GetData, TypedGetData},
     schema::StructType,
     DeltaResult, Error, FileSystemClient,
 };
@@ -84,18 +84,10 @@ impl MetadataVisitor {
         let format_provider: String = getters[3].get(row_index, "metadata.format.provider")?;
         // options for format is always empty, so skip getters[4]
         let schema_string: String = getters[5].get(row_index, "metadata.schema_string")?;
-
-        let partition_list: ListItem<'_> = getters[6].get(row_index, "metadata.partition_list")?;
-        let partition_columns = partition_list.materialize();
-
+        let partition_columns: Vec<_> = getters[6].get(row_index, "metadata.partition_list")?;
         let created_time: i64 = getters[7].get(row_index, "metadata.created_time")?;
-
-        let configuration_map_opt: Option<MapItem<'_>> =
-            getters[8].get_opt(row_index, "metadata.configuration")?;
-        let configuration = match configuration_map_opt {
-            Some(map_item) => map_item.materialize(),
-            None => HashMap::new(),
-        };
+        let configuration_map_opt: Option<HashMap<_, _>> = getters[8].get_opt(row_index, "metadata.configuration")?;
+        let configuration = configuration_map_opt.unwrap_or_else(|| HashMap::new());
 
         Ok(Metadata {
             id,
@@ -165,13 +157,8 @@ impl ProtocolVisitor {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Protocol> {
         let min_writer_version: i32 = getters[1].get(row_index, "protocol.min_writer_version")?;
-        let reader_features_list: Option<ListItem<'_>> =
-            getters[2].get_opt(row_index, "protocol.reader_features")?;
-        let reader_features = reader_features_list.map(|rfl| rfl.materialize());
-
-        let writer_features_list: Option<ListItem<'_>> =
-            getters[3].get_opt(row_index, "protocol.writer_features")?;
-        let writer_features = writer_features_list.map(|wfl| wfl.materialize());
+        let reader_features: Option<Vec<_>> = getters[2].get_opt(row_index, "protocol.reader_features")?;
+        let writer_features: Option<Vec<_>> = getters[3].get_opt(row_index, "protocol.writer_features")?;
 
         Ok(Protocol {
             min_reader_version,
@@ -392,8 +379,7 @@ impl AddVisitor {
         path: String,
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Add> {
-        let partition_values_map: MapItem<'_> = getters[1].get(row_index, "add.partitionValues")?;
-        let partition_values = partition_values_map.materialize();
+        let partition_values: HashMap<_,_> = getters[1].get(row_index, "add.partitionValues")?;
         let size: i64 = getters[2].get(row_index, "add.size")?;
         let modification_time: i64 = getters[3].get(row_index, "add.modificationTime")?;
         let data_change: bool = getters[4].get(row_index, "add.dataChange")?;
