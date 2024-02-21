@@ -57,6 +57,12 @@ pub enum Error {
 
     #[error("No table metadata found in delta log.")]
     MissingMetadata,
+
+    #[error("No protocol found in delta log.")]
+    MissingProtocol,
+
+    #[error("No table metadata or protocol found in delta log.")]
+    MissingMetadataAndProtocol,
 }
 
 #[cfg(feature = "object_store")]

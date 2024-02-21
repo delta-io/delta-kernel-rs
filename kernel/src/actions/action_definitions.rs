@@ -53,13 +53,11 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Metadata> {
+    pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
         let schema = StructType::new(vec![crate::actions::schemas::METADATA_FIELD.clone()]);
         let mut visitor = MetadataVisitor::default();
         data.extract(Arc::new(schema), &mut visitor)?;
-        visitor
-            .metadata
-            .ok_or(Error::Generic("Didn't get expected metadata".to_string()))
+        Ok(visitor.metadata)
     }
 
     pub fn schema(&self) -> DeltaResult<StructType> {
@@ -135,13 +133,11 @@ pub struct Protocol {
 }
 
 impl Protocol {
-    pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Protocol> {
+    pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
         let mut visitor = ProtocolVisitor::default();
         let schema = StructType::new(vec![crate::actions::schemas::PROTOCOL_FIELD.clone()]);
         data.extract(Arc::new(schema), &mut visitor)?;
-        visitor
-            .protocol
-            .ok_or(Error::Generic("Didn't get expected protocol".to_string()))
+        Ok(visitor.protocol)
     }
 }
 
@@ -755,22 +751,23 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_protocol() {
+    fn test_parse_protocol() -> DeltaResult<()> {
         let data = action_batch();
-        let parsed = Protocol::try_new_from_data(data.as_ref()).unwrap();
+        let parsed = Protocol::try_new_from_data(data.as_ref())?.unwrap();
         let expected = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
             reader_features: Some(vec!["deletionVectors".into()]),
             writer_features: Some(vec!["deletionVectors".into()]),
         };
-        assert_eq!(parsed, expected)
+        assert_eq!(parsed, expected);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_metadata() {
+    fn test_parse_metadata() -> DeltaResult<()> {
         let data = action_batch();
-        let parsed = Metadata::try_new_from_data(data.as_ref()).unwrap();
+        let parsed = Metadata::try_new_from_data(data.as_ref())?.unwrap();
 
         let configuration = HashMap::from_iter([
             (
@@ -795,7 +792,8 @@ mod tests {
             created_time: Some(1677811175819),
             configuration,
         };
-        assert_eq!(parsed, expected)
+        assert_eq!(parsed, expected);
+        Ok(())
     }
 
     #[test]

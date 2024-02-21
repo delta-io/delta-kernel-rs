@@ -77,25 +77,22 @@ impl LogSegment {
         for batch in data_batches {
             let (batch, _) = batch?;
             if metadata_opt.is_none() {
-                if let Ok(md) =
-                    crate::actions::action_definitions::Metadata::try_new_from_data(batch.as_ref())
-                {
-                    metadata_opt = Some(md)
-                }
+                metadata_opt =crate::actions::action_definitions::Metadata::try_new_from_data(batch.as_ref())?;
             }
             if protocol_opt.is_none() {
-                if let Ok(p) =
-                    crate::actions::action_definitions::Protocol::try_new_from_data(batch.as_ref())
-                {
-                    protocol_opt = Some(p)
-                }
+                protocol_opt = crate::actions::action_definitions::Protocol::try_new_from_data(batch.as_ref())?;
             }
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 // we've found both, we can stop
                 break;
             }
         }
-        Ok(metadata_opt.zip(protocol_opt))
+        match (metadata_opt, protocol_opt) {
+            (Some(m), Some(p)) => Ok(Some((m, p))),
+            (None, Some(_)) => Err(Error::MissingMetadata),
+            (Some(_), None) => Err(Error::MissingProtocol),
+            _ => Err(Error::MissingMetadataAndProtocol)
+        }
     }
 }
 
