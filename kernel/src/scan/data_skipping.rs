@@ -270,6 +270,7 @@ impl DataSkippingFilter {
     }
 
     pub(crate) fn apply(&self, actions: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+        // TODO(nick) to use JsonHandler and ExpressionHandler here
         let actions = actions
             .as_any()
             .downcast_ref::<SimpleData>()
