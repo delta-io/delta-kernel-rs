@@ -83,7 +83,7 @@ impl MetadataVisitor {
         // options for format is always empty, so skip getters[4]
         let schema_string: String = getters[5].get(row_index, "metadata.schema_string")?;
         let partition_columns: Vec<_> = getters[6].get(row_index, "metadata.partition_list")?;
-        let created_time: i64 = getters[7].get(row_index, "metadata.created_time")?;
+        let created_time: Option<i64> = getters[7].get_opt(row_index, "metadata.created_time")?;
         let configuration_map_opt: Option<HashMap<_, _>> = getters[8].get_opt(row_index, "metadata.configuration")?;
         let configuration = configuration_map_opt.unwrap_or_else(|| HashMap::new());
 
@@ -97,7 +97,7 @@ impl MetadataVisitor {
             },
             schema_string,
             partition_columns,
-            created_time: Some(created_time),
+            created_time,
             configuration,
         })
     }
