@@ -1,9 +1,6 @@
 //! This module implements a simple, single threaded, EngineClient
 
-use crate::{
-    EngineClient, ExpressionHandler, FileSystemClient, JsonHandler,
-    ParquetHandler,
-};
+use crate::{EngineClient, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler};
 
 use std::sync::Arc;
 

@@ -53,9 +53,7 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    pub fn try_new_from_data(
-        data: &dyn EngineData,
-    ) -> DeltaResult<Metadata> {
+    pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Metadata> {
         let schema = StructType::new(vec![crate::actions::schemas::METADATA_FIELD.clone()]);
         let mut visitor = MetadataVisitor::default();
         data.extract(Arc::new(schema), &mut visitor)?;
@@ -145,9 +143,7 @@ pub struct Protocol {
 }
 
 impl Protocol {
-    pub fn try_new_from_data(
-        data: &dyn EngineData,
-    ) -> DeltaResult<Protocol> {
+    pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Protocol> {
         let mut visitor = ProtocolVisitor::default();
         let schema = StructType::new(vec![crate::actions::schemas::PROTOCOL_FIELD.clone()]);
         data.extract(Arc::new(schema), &mut visitor)?;
@@ -373,9 +369,7 @@ pub struct Add {
 
 impl Add {
     /// Since we always want to parse multiple adds from data, we return a Vec<Add>
-    pub fn parse_from_data(
-        data: &dyn EngineData,
-    ) -> DeltaResult<Vec<Add>> {
+    pub fn parse_from_data(data: &dyn EngineData) -> DeltaResult<Vec<Add>> {
         let mut visitor = AddVisitor::default();
         let schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
         data.extract(Arc::new(schema), &mut visitor)?;
@@ -837,7 +831,9 @@ mod tests {
             .unwrap();
         let add_schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
         let mut add_visitor = AddVisitor::default();
-        batch.extract(Arc::new(add_schema), &mut add_visitor).unwrap();
+        batch
+            .extract(Arc::new(add_schema), &mut add_visitor)
+            .unwrap();
         let add1 = Add {
             path: "c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet".into(),
             partition_values: HashMap::from([

@@ -1,6 +1,6 @@
-use crate::engine_data::{EngineList, EngineMap, EngineData, GetData, TypeTag};
+use crate::engine_data::{EngineData, EngineList, EngineMap, GetData, TypeTag};
 use crate::schema::{DataType, PrimitiveType, Schema, SchemaRef, StructField};
-use crate::{DeltaResult, Error, DataVisitor};
+use crate::{DataVisitor, DeltaResult, Error};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, Int64Type};
@@ -49,11 +49,7 @@ impl SimpleData {
 }
 
 impl EngineData for SimpleData {
-    fn extract(
-        &self,
-        schema: SchemaRef,
-        visitor: &mut dyn DataVisitor,
-    ) -> DeltaResult<()> {
+    fn extract(&self, schema: SchemaRef, visitor: &mut dyn DataVisitor) -> DeltaResult<()> {
         let mut col_array = vec![];
         self.extract_columns(&mut col_array, &schema)?;
         visitor.visit(self.length(), &col_array)

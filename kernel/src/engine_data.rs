@@ -1,4 +1,4 @@
-use crate::{DeltaResult, Error, schema::SchemaRef};
+use crate::{schema::SchemaRef, DeltaResult, Error};
 
 use tracing::debug;
 
@@ -197,11 +197,7 @@ pub trait TypeTag: 'static {
 ///   }
 /// }
 pub trait EngineData: Send {
-    fn extract(
-        &self,
-        schema: SchemaRef,
-        visitor: &mut dyn DataVisitor,
-    ) -> DeltaResult<()>;
+    fn extract(&self, schema: SchemaRef, visitor: &mut dyn DataVisitor) -> DeltaResult<()>;
     // Return the number of items (rows?) in blob
     fn length(&self) -> usize;
 
