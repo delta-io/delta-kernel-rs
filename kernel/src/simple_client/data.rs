@@ -1,6 +1,6 @@
 use crate::engine_data::{DataItemList, DataItemMap, EngineData, GetData, TypeTag};
 use crate::schema::{DataType, PrimitiveType, Schema, SchemaRef, StructField};
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, Error, DataVisitor};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, Int64Type};
@@ -49,6 +49,20 @@ impl SimpleData {
 }
 
 impl EngineData for SimpleData {
+    fn extract(
+        &self,
+        schema: SchemaRef,
+        visitor: &mut dyn DataVisitor,
+    ) -> DeltaResult<()> {
+        let mut col_array = vec![];
+        self.extract_columns(&mut col_array, &schema)?;
+        visitor.visit(self.length(), &col_array)
+    }
+
+    fn length(&self) -> usize {
+        self.data.num_rows()
+    }
+
     fn type_tag(&self) -> &dyn TypeTag {
         &SimpleDataTypeTag
     }
@@ -248,10 +262,6 @@ impl SimpleData {
         }
         Ok(())
     }
-
-    pub fn length(&self) -> usize {
-        self.data.num_rows()
-    }
 }
 
 fn get_error_for_types(
@@ -320,7 +330,7 @@ mod tests {
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
-        let metadata = Metadata::try_new_from_data(&client, parsed.as_ref());
+        let metadata = Metadata::try_new_from_data(parsed.as_ref());
         assert!(metadata.is_ok());
         let metadata = metadata.unwrap();
         assert_eq!(metadata.id, "aff5cb91-8cd9-4195-aef9-446908507302");

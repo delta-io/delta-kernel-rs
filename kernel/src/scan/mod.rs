@@ -139,7 +139,6 @@ impl Scan {
 
         Ok(log_replay_iter(
             log_iter,
-            engine_client.get_data_extactor(),
             &self.read_schema,
             &self.predicate,
         ))
@@ -153,7 +152,6 @@ impl Scan {
     /// more details.
     pub fn execute(&self, engine_client: &dyn EngineClient) -> DeltaResult<Vec<ScanResult>> {
         let parquet_handler = engine_client.get_parquet_handler();
-        let data_extractor = engine_client.get_data_extactor();
         let mut results: Vec<ScanResult> = vec![];
         let files = self.files(engine_client)?;
         for add_result in files {
@@ -178,7 +176,7 @@ impl Scan {
 
             for read_result in read_results {
                 let len = if let Ok(ref res) = read_result {
-                    data_extractor.length(&**res)
+                    res.length()
                 } else {
                     0
                 };
@@ -234,7 +232,6 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let engine_client = SimpleClient::new();
-        let data_extractor = engine_client.get_data_extactor();
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine_client, None).unwrap();
@@ -242,7 +239,7 @@ mod tests {
         let files = scan.execute(&engine_client).unwrap();
 
         assert_eq!(files.len(), 1);
-        let num_rows = data_extractor.length(&**files[0].raw_data.as_ref().unwrap());
+        let num_rows = files[0].raw_data.as_ref().unwrap().length();
         assert_eq!(num_rows, 10)
     }
 }

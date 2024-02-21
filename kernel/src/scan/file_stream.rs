@@ -6,7 +6,7 @@ use crate::actions::action_definitions::{Add, AddVisitor, Remove, RemoveVisitor}
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::Expression;
 use crate::schema::{SchemaRef, StructType};
-use crate::{DataExtractor, DataVisitor, DeltaResult, EngineData};
+use crate::{DataVisitor, DeltaResult, EngineData};
 
 use either::Either;
 use tracing::debug;
@@ -63,7 +63,6 @@ impl LogReplayScanner {
     fn process_batch(
         &mut self,
         actions: &dyn EngineData,
-        data_extractor: &Arc<dyn DataExtractor>,
         is_log_batch: bool,
     ) -> DeltaResult<Vec<Add>> {
         let filtered_actions = self
@@ -87,7 +86,7 @@ impl LogReplayScanner {
             vec![crate::actions::schemas::ADD_FIELD.clone()]
         });
         let mut visitor = AddRemoveVisitor::default();
-        data_extractor.extract(actions, Arc::new(schema_to_use), &mut visitor)?;
+        actions.extract(Arc::new(schema_to_use), &mut visitor)?;
 
         for remove in visitor.removes.into_iter() {
             self.seen
@@ -123,7 +122,6 @@ impl LogReplayScanner {
 /// The boolean flag indicates whether the record batch is a log or checkpoint batch.
 pub fn log_replay_iter(
     action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
-    data_extractor: Arc<dyn DataExtractor>,
     table_schema: &SchemaRef,
     predicate: &Option<Expression>,
 ) -> impl Iterator<Item = DeltaResult<Add>> {
@@ -131,7 +129,7 @@ pub fn log_replay_iter(
 
     action_iter.flat_map(move |actions| match actions {
         Ok((batch, is_log_batch)) => {
-            match log_scanner.process_batch(batch.as_ref(), &data_extractor, is_log_batch) {
+            match log_scanner.process_batch(batch.as_ref(), is_log_batch) {
                 Ok(adds) => Either::Left(adds.into_iter().map(Ok)),
                 Err(err) => Either::Right(std::iter::once(Err(err))),
             }

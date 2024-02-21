@@ -194,21 +194,6 @@ pub trait ParquetHandler: Send + Sync {
     ) -> DeltaResult<FileDataReadResultIterator>;
 }
 
-/// A data extractor can take whatever the engine defines as its [`EngineData`] type and can call
-/// back into kernel with rows extracted from that data.
-pub trait DataExtractor {
-    /// Extract data as requested by [`schema`] and then call back into `visitor.visit` with a Vec
-    /// of that data. Return Ok(()) unless an error was encountered during extraction.
-    fn extract(
-        &self,
-        blob: &dyn EngineData,
-        schema: SchemaRef,
-        visitor: &mut dyn DataVisitor,
-    ) -> DeltaResult<()>;
-    // Return the number of items (rows?) in blob
-    fn length(&self, blob: &dyn EngineData) -> usize;
-}
-
 /// Interface encapsulating all clients needed by the Delta Kernel in order to read the Delta table.
 ///
 /// Connectors are expected to pass an implementation of this interface when reading a Delta table.
@@ -224,7 +209,4 @@ pub trait EngineClient {
 
     /// Get the connector provided [`ParquetHandler`].
     fn get_parquet_handler(&self) -> Arc<dyn ParquetHandler>;
-
-    /// Get the connector provided [`DataExtractor`].
-    fn get_data_extactor(&self) -> Arc<dyn DataExtractor>;
 }

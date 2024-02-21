@@ -12,7 +12,7 @@ use url::Url;
 use crate::{
     engine_data::{DataVisitor, EngineData, GetData, ListItem, MapItem, TypedGetData},
     schema::StructType,
-    DeltaResult, EngineClient, Error, FileSystemClient,
+    DeltaResult, Error, FileSystemClient,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,13 +54,11 @@ pub struct Metadata {
 
 impl Metadata {
     pub fn try_new_from_data(
-        engine_client: &dyn EngineClient,
         data: &dyn EngineData,
     ) -> DeltaResult<Metadata> {
-        let extractor = engine_client.get_data_extactor();
         let schema = StructType::new(vec![crate::actions::schemas::METADATA_FIELD.clone()]);
         let mut visitor = MetadataVisitor::default();
-        extractor.extract(data, Arc::new(schema), &mut visitor)?;
+        data.extract(Arc::new(schema), &mut visitor)?;
         visitor
             .metadata
             .ok_or(Error::Generic("Didn't get expected metadata".to_string()))
@@ -151,13 +149,11 @@ pub struct Protocol {
 
 impl Protocol {
     pub fn try_new_from_data(
-        engine_client: &dyn EngineClient,
         data: &dyn EngineData,
     ) -> DeltaResult<Protocol> {
-        let extractor = engine_client.get_data_extactor();
         let mut visitor = ProtocolVisitor::default();
         let schema = StructType::new(vec![crate::actions::schemas::PROTOCOL_FIELD.clone()]);
-        extractor.extract(data, Arc::new(schema), &mut visitor)?;
+        data.extract(Arc::new(schema), &mut visitor)?;
         visitor
             .protocol
             .ok_or(Error::Generic("Didn't get expected protocol".to_string()))
@@ -393,13 +389,11 @@ pub struct Add {
 impl Add {
     /// Since we always want to parse multiple adds from data, we return a Vec<Add>
     pub fn parse_from_data(
-        engine_client: &dyn EngineClient,
         data: &dyn EngineData,
     ) -> DeltaResult<Vec<Add>> {
-        let extractor = engine_client.get_data_extactor();
         let mut visitor = AddVisitor::default();
         let schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
-        extractor.extract(data, Arc::new(schema), &mut visitor)?;
+        data.extract(Arc::new(schema), &mut visitor)?;
         Ok(visitor.adds)
     }
 
@@ -526,13 +520,11 @@ pub(crate) struct Remove {
 impl Remove {
     // _try_new_from_data for now, to avoid warning, probably will need at some point
     // pub(crate) fn _try_new_from_data(
-    //     engine_client: &dyn EngineClient,
     //     data: &dyn EngineData,
     // ) -> DeltaResult<Remove> {
-    //     let extractor = engine_client.get_data_extactor();
     //     let mut visitor = Visitor::new(visit_remove);
     //     let schema = StructType::new(vec![crate::actions::schemas::REMOVE_FIELD.clone()]);
-    //     extractor.extract(data, Arc::new(schema), &mut visitor)?;
+    //     data.extract(Arc::new(schema), &mut visitor)?;
     //     visitor
     //         .extracted
     //         .unwrap_or_else(|| Err(Error::Generic("Didn't get expected remove".to_string())))
@@ -799,9 +791,8 @@ mod tests {
 
     #[test]
     fn test_parse_protocol() {
-        let client = SimpleClient::new();
         let data = action_batch();
-        let parsed = Protocol::try_new_from_data(&client, data.as_ref()).unwrap();
+        let parsed = Protocol::try_new_from_data(data.as_ref()).unwrap();
         let expected = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
@@ -813,9 +804,8 @@ mod tests {
 
     #[test]
     fn test_parse_metadata() {
-        let client = SimpleClient::new();
         let data = action_batch();
-        let parsed = Metadata::try_new_from_data(&client, data.as_ref()).unwrap();
+        let parsed = Metadata::try_new_from_data(data.as_ref()).unwrap();
 
         let configuration = HashMap::from_iter([
             (
@@ -847,7 +837,6 @@ mod tests {
     fn test_parse_add_partitioned() {
         let client = SimpleClient::new();
         let json_handler = client.get_json_handler();
-        let data_extractor = client.get_data_extactor();
         let json_strings: StringArray = vec![
             r#"{"commitInfo":{"timestamp":1670892998177,"operation":"WRITE","operationParameters":{"mode":"Append","partitionBy":"[\"c1\",\"c2\"]"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"3","numOutputRows":"3","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
@@ -863,9 +852,7 @@ mod tests {
             .unwrap();
         let add_schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
         let mut add_visitor = AddVisitor::default();
-        data_extractor
-            .extract(batch.as_ref(), Arc::new(add_schema), &mut add_visitor)
-            .unwrap();
+        batch.extract(Arc::new(add_schema), &mut add_visitor).unwrap();
         let add1 = Add {
             path: "c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet".into(),
             partition_values: HashMap::from([

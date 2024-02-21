@@ -1,4 +1,4 @@
-use crate::{DeltaResult, Error};
+use crate::{DeltaResult, Error, schema::SchemaRef};
 
 use tracing::debug;
 
@@ -161,9 +161,9 @@ pub trait TypeTag: 'static {
 /// Any type that an engine wants to return as "data" needs to implement this trait. This should be
 /// as easy as defining a tag to represent it that implements [`TypeTag`], and then returning it for
 /// the `type_tag` method.
-/// ```
+/// TODO(Nick): Make this code again
 /// use std::any::Any;
-/// use deltakernel::{DataExtractor, DeltaResult};
+/// use deltakernel::DeltaResult;
 /// use deltakernel::engine_data::{DataVisitor, EngineData, TypeTag};
 /// use deltakernel::schema::SchemaRef;
 /// struct MyTypeTag;
@@ -191,8 +191,15 @@ pub trait TypeTag: 'static {
 ///     len
 ///   }
 /// }
-/// ```
 pub trait EngineData: Send {
+    fn extract(
+        &self,
+        schema: SchemaRef,
+        visitor: &mut dyn DataVisitor,
+    ) -> DeltaResult<()>;
+    // Return the number of items (rows?) in blob
+    fn length(&self) -> usize;
+
     fn type_tag(&self) -> &dyn TypeTag;
 
     // TODO(nick) implement this and below here in the trait when it doesn't cause a compiler error

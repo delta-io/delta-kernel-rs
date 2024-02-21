@@ -78,7 +78,6 @@ impl LogSegment {
             let (batch, _) = batch?;
             if metadata_opt.is_none() {
                 if let Ok(md) = crate::actions::action_definitions::Metadata::try_new_from_data(
-                    engine_client,
                     batch.as_ref(),
                 ) {
                     metadata_opt = Some(md)
@@ -86,7 +85,6 @@ impl LogSegment {
             }
             if protocol_opt.is_none() {
                 if let Ok(p) = crate::actions::action_definitions::Protocol::try_new_from_data(
-                    engine_client,
                     batch.as_ref(),
                 ) {
                     protocol_opt = Some(p)
