@@ -1,9 +1,10 @@
-use std::{
-    cmp::Ordering,
-    fmt::{Display, Formatter},
-};
+use std::cmp::Ordering;
+use std::fmt::{Display, Formatter};
+
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 
 use crate::schema::{DataType, PrimitiveType};
+use crate::Error;
 
 /// A single value, which can be null. Used for representing literal values
 /// in [Expressions][crate::expressions::Expression].
@@ -11,10 +12,17 @@ use crate::schema::{DataType, PrimitiveType};
 pub enum Scalar {
     Integer(i32),
     Long(i64),
+    Short(i16),
+    Byte(i8),
     Float(f32),
+    Double(f64),
+    /// utf-8 encoded string.
     String(String),
+    /// true or false value
     Boolean(bool),
+    /// Microsecond precision timestamp, adjusted to UTC.
     Timestamp(i64),
+    /// Date stored as a signed 32bit int days since UNIX epoch 1970-01-01
     Date(i32),
     Binary(Vec<u8>),
     Decimal(i128, u8, i8),
@@ -26,15 +34,16 @@ impl Scalar {
         match self {
             Self::Integer(_) => DataType::Primitive(PrimitiveType::Integer),
             Self::Long(_) => DataType::Primitive(PrimitiveType::Long),
+            Self::Short(_) => DataType::Primitive(PrimitiveType::Short),
+            Self::Byte(_) => DataType::Primitive(PrimitiveType::Byte),
             Self::Float(_) => DataType::Primitive(PrimitiveType::Float),
+            Self::Double(_) => DataType::Primitive(PrimitiveType::Double),
             Self::String(_) => DataType::Primitive(PrimitiveType::String),
             Self::Boolean(_) => DataType::Primitive(PrimitiveType::Boolean),
             Self::Timestamp(_) => DataType::Primitive(PrimitiveType::Timestamp),
             Self::Date(_) => DataType::Primitive(PrimitiveType::Date),
             Self::Binary(_) => DataType::Primitive(PrimitiveType::Binary),
-            Self::Decimal(_, precision, scale) => {
-                DataType::decimal(*precision as usize, *scale as usize)
-            }
+            Self::Decimal(_, precision, scale) => DataType::decimal(*precision, *scale),
             Self::Null(data_type) => data_type.clone(),
         }
     }
@@ -45,7 +54,10 @@ impl Display for Scalar {
         match self {
             Self::Integer(i) => write!(f, "{}", i),
             Self::Long(i) => write!(f, "{}", i),
+            Self::Short(i) => write!(f, "{}", i),
+            Self::Byte(i) => write!(f, "{}", i),
             Self::Float(fl) => write!(f, "{}", fl),
+            Self::Double(fl) => write!(f, "{}", fl),
             Self::String(s) => write!(f, "'{}'", s),
             Self::Boolean(b) => write!(f, "{}", b),
             Self::Timestamp(ts) => write!(f, "{}", ts),
@@ -76,6 +88,18 @@ impl Display for Scalar {
             },
             Self::Null(_) => write!(f, "null"),
         }
+    }
+}
+
+impl From<i8> for Scalar {
+    fn from(i: i8) -> Self {
+        Self::Byte(i)
+    }
+}
+
+impl From<i16> for Scalar {
+    fn from(i: i16) -> Self {
+        Self::Short(i)
     }
 }
 
@@ -110,6 +134,82 @@ impl From<String> for Scalar {
 }
 
 // TODO: add more From impls
+
+impl PrimitiveType {
+    fn data_type(&self) -> DataType {
+        DataType::Primitive(self.clone())
+    }
+
+    pub fn parse_scalar(&self, raw: &str) -> Result<Scalar, Error> {
+        use PrimitiveType::*;
+
+        lazy_static::lazy_static! {
+            static ref UNIX_EPOCH: DateTime<Utc> = DateTime::from_timestamp(0, 0).unwrap();
+        }
+
+        if raw.is_empty() {
+            return Ok(Scalar::Null(self.data_type()));
+        }
+
+        match self {
+            String => Ok(Scalar::String(raw.to_string())),
+            Byte => self.parse_str_as_scalar(raw, Scalar::Byte),
+            Short => self.parse_str_as_scalar(raw, Scalar::Short),
+            Integer => self.parse_str_as_scalar(raw, Scalar::Integer),
+            Long => self.parse_str_as_scalar(raw, Scalar::Long),
+            Float => self.parse_str_as_scalar(raw, Scalar::Float),
+            Double => self.parse_str_as_scalar(raw, Scalar::Double),
+            Boolean => {
+                if raw.eq_ignore_ascii_case("true") {
+                    Ok(Scalar::Boolean(true))
+                } else if raw.eq_ignore_ascii_case("false") {
+                    Ok(Scalar::Boolean(false))
+                } else {
+                    Err(self.parse_error(raw))
+                }
+            }
+            Date => {
+                let date = NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+                    .map_err(|_| self.parse_error(raw))?
+                    .and_hms_opt(0, 0, 0)
+                    .ok_or(self.parse_error(raw))?;
+                let date = Utc.from_utc_datetime(&date);
+                let days = date.signed_duration_since(*UNIX_EPOCH).num_days() as i32;
+                Ok(Scalar::Date(days))
+            }
+            Timestamp => {
+                let timestamp = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
+                    .map_err(|_| self.parse_error(raw))?;
+                let timestamp = Utc.from_utc_datetime(&timestamp);
+                let micros = timestamp
+                    .signed_duration_since(*UNIX_EPOCH)
+                    .num_microseconds()
+                    .ok_or(self.parse_error(raw))?;
+                Ok(Scalar::Timestamp(micros))
+            }
+            _ => todo!(),
+        }
+    }
+
+    fn parse_error(&self, raw: &str) -> Error {
+        Error::ParseError(raw.to_string(), self.data_type())
+    }
+
+    /// Parse a string as a scalar value, returning an error if the string is not parseable.
+    ///
+    /// The `f` function is used to convert the parsed value into a `Scalar`.
+    /// The desired type that `FromStr::parse` should parse into is inferred from the parameter type of `f`.
+    fn parse_str_as_scalar<T: std::str::FromStr>(
+        &self,
+        raw: &str,
+        f: impl FnOnce(T) -> Scalar,
+    ) -> Result<Scalar, Error> {
+        match raw.parse() {
+            Ok(val) => Ok(f(val)),
+            Err(..) => Err(self.parse_error(raw)),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

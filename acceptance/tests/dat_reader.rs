@@ -18,7 +18,7 @@ fn reader_test(path: &Path) -> datatest_stable::Result<()> {
         .block_on(async {
             let case = read_dat_case(root_dir).unwrap();
             let table_root = case.table_root().unwrap();
-            let engine_client = Arc::new(
+            let engine_interface = Arc::new(
                 DefaultTableClient::try_new(
                     &table_root,
                     std::iter::empty::<(&str, &str)>(),
@@ -27,7 +27,9 @@ fn reader_test(path: &Path) -> datatest_stable::Result<()> {
                 .unwrap(),
             );
 
-            case.assert_metadata(engine_client.clone()).await.unwrap();
+            case.assert_metadata(engine_interface.clone())
+                .await
+                .unwrap();
         });
     Ok(())
 }

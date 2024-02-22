@@ -1,9 +1,9 @@
-//! # EngineClient interfaces
+//! # Engineinterface interfaces
 //!
-//! The EngineClient interfaces allow connectors to bring their own implementation of functionality
+//! The Engineinterface interfaces allow connectors to bring their own implementation of functionality
 //! such as reading parquet files, listing files in a file system, parsing a JSON string etc.
 //!
-//! The [`EngineClient`] trait exposes methods to get sub-clients which expose the core
+//! The [`Engineinterface`] trait exposes methods to get sub-clients which expose the core
 //! functionalities customizable by connectors.
 //!
 //! ## Expression handling
@@ -41,7 +41,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use url::Url;
 
-use self::schema::SchemaRef;
+use self::schema::{DataType, SchemaRef};
 
 pub mod actions;
 pub mod engine_data;
@@ -109,18 +109,21 @@ pub trait ExpressionEvaluator {
 /// fill up partition column values and any computation on data using Expressions.
 pub trait ExpressionHandler {
     /// Create an [`ExpressionEvaluator`] that can evaluate the given [`Expression`]
-    /// on columnar batches with the given [`Schema`].
+    /// on columnar batches with the given [`Schema`] to produce data of [`DataType`].
     ///
     /// # Parameters
     ///
     /// - `schema`: Schema of the input data.
     /// - `expression`: Expression to evaluate.
+    /// - `output_type`: Expected result data type.
     ///
-    /// [`Schema`]: arrow_schema::Schema
+    /// [`Schema`]: crate::schema::StructType
+    /// [`DataType`]: crate::schema::DataType
     fn get_evaluator(
         &self,
         schema: SchemaRef,
         expression: Expression,
+        output_type: DataType,
     ) -> Arc<dyn ExpressionEvaluator>;
 }
 
@@ -154,7 +157,7 @@ pub trait JsonHandler {
         &self,
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
-    ) -> DeltaResult<Box<dyn EngineData>>;
+    ) -> DeltaResult<RecordBatch>;
 
     /// Read and parse the JSON format file at given locations and return
     /// the data as EngineData with the columns requested by physical schema.
@@ -196,7 +199,7 @@ pub trait ParquetHandler: Send + Sync {
 /// Interface encapsulating all clients needed by the Delta Kernel in order to read the Delta table.
 ///
 /// Connectors are expected to pass an implementation of this interface when reading a Delta table.
-pub trait EngineClient {
+pub trait EngineInterface {
     /// Get the connector provided [`ExpressionHandler`].
     fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler>;
 

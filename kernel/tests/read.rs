@@ -1,8 +1,10 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int32Array, StringArray};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use arrow_select::concat::concat_batches;
 use deltakernel::client::DefaultTableClient;
 use deltakernel::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::expressions::{BinaryOperator, Expression};
@@ -95,7 +97,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine_client = DefaultTableClient::new(
+    let engine_interface = DefaultTableClient::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
@@ -104,11 +106,14 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let table = Table::new(location);
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.snapshot(&engine_client, None)?;
+    let snapshot = table.snapshot(&engine_interface, None)?;
     let scan = ScanBuilder::new(snapshot).build();
 
     let mut files = 0;
-    let stream = scan.execute(&engine_client)?.into_iter().zip(expected_data);
+    let stream = scan
+        .execute(&engine_interface)?
+        .into_iter()
+        .zip(expected_data);
 
     for (data, expected) in stream {
         let raw_data = data.raw_data?;
@@ -146,7 +151,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine_client = DefaultTableClient::new(
+    let engine_interface = DefaultTableClient::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
@@ -155,11 +160,14 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let table = Table::new(location);
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.snapshot(&engine_client, None).unwrap();
+    let snapshot = table.snapshot(&engine_interface, None).unwrap();
     let scan = ScanBuilder::new(snapshot).build();
 
     let mut files = 0;
-    let stream = scan.execute(&engine_client)?.into_iter().zip(expected_data);
+    let stream = scan
+        .execute(&engine_interface)?
+        .into_iter()
+        .zip(expected_data);
 
     for (data, expected) in stream {
         let raw_data = data.raw_data?;
@@ -201,7 +209,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine_client = DefaultTableClient::new(
+    let engine_interface = DefaultTableClient::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
@@ -210,10 +218,13 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let table = Table::new(location);
     let expected_data = vec![batch];
 
-    let snapshot = table.snapshot(&engine_client, None)?;
+    let snapshot = table.snapshot(&engine_interface, None)?;
     let scan = ScanBuilder::new(snapshot).build();
 
-    let stream = scan.execute(&engine_client)?.into_iter().zip(expected_data);
+    let stream = scan
+        .execute(&engine_interface)?
+        .into_iter()
+        .zip(expected_data);
 
     let mut files = 0;
     for (data, expected) in stream {
@@ -276,21 +287,23 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine_client = DefaultTableClient::new(
+    let engine_interface = DefaultTableClient::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
     );
 
     let table = Table::new(location);
-    let snapshot = table.snapshot(&engine_client, None)?;
+    let snapshot = table.snapshot(&engine_interface, None)?;
 
     // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
     // we validate the boundary values where we expect the set of matched files to change.
     //
     // NOTE: For cases that match both batch1 and batch2, we list batch2 first because log replay
     // returns most recently added files first.
-    use BinaryOperator::{Equal, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual};
+    use BinaryOperator::{
+        Equal, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual, NotEqual,
+    };
     let test_cases: Vec<(_, i64, _)> = vec![
         (Equal, 0, vec![]),
         (Equal, 1, vec![&batch1]),
@@ -315,6 +328,13 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         (GreaterThanOrEqual, 4, vec![&batch2]),
         (GreaterThanOrEqual, 7, vec![&batch2]),
         (GreaterThanOrEqual, 8, vec![]),
+        (NotEqual, 0, vec![&batch2, &batch1]),
+        (NotEqual, 1, vec![&batch2]),
+        (NotEqual, 3, vec![&batch2]),
+        (NotEqual, 4, vec![&batch2, &batch1]),
+        (NotEqual, 5, vec![&batch1]),
+        (NotEqual, 7, vec![&batch1]),
+        (NotEqual, 8, vec![&batch2, &batch1]),
     ];
     for (op, value, expected_batches) in test_cases {
         let predicate = Expression::BinaryOperation {
@@ -329,7 +349,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         let expected_files = expected_batches.len();
         let mut files_scanned = 0;
         let stream = scan
-            .execute(&engine_client)?
+            .execute(&engine_interface)?
             .into_iter()
             .zip(expected_batches);
 
@@ -340,5 +360,76 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         }
         assert_eq!(expected_files, files_scanned);
     }
+    Ok(())
+}
+
+macro_rules! assert_batches_sorted_eq {
+    ($EXPECTED_LINES: expr, $CHUNKS: expr) => {
+        let mut expected_lines: Vec<String> = $EXPECTED_LINES.iter().map(|&s| s.into()).collect();
+
+        // sort except for header + footer
+        let num_lines = expected_lines.len();
+        if num_lines > 3 {
+            expected_lines.as_mut_slice()[2..num_lines - 1].sort_unstable()
+        }
+
+        let formatted = arrow::util::pretty::pretty_format_batches($CHUNKS)
+            .unwrap()
+            .to_string();
+        // fix for windows: \r\n -->
+
+        let mut actual_lines: Vec<&str> = formatted.trim().lines().collect();
+
+        // sort except for header + footer
+        let num_lines = actual_lines.len();
+        if num_lines > 3 {
+            actual_lines.as_mut_slice()[2..num_lines - 1].sort_unstable()
+        }
+
+        assert_eq!(
+            expected_lines, actual_lines,
+            "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
+            expected_lines, actual_lines
+        );
+    };
+}
+
+fn read_table_data(path: &str, expected: Vec<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::fs::canonicalize(PathBuf::from(path))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let table_client = DefaultTableClient::try_new(
+        &url,
+        std::iter::empty::<(&str, &str)>(),
+        Arc::new(TokioBackgroundExecutor::new()),
+    )?;
+
+    let table = Table::new(url);
+    let snapshot = table.snapshot(&table_client, None)?;
+    let scan = ScanBuilder::new(snapshot).build();
+
+    let batches = scan.execute(&table_client)?;
+    let schema = batches[0].schema();
+    let batch = concat_batches(&schema, &batches)?;
+
+    assert_batches_sorted_eq!(&expected, &[batch]);
+    Ok(())
+}
+
+#[test]
+fn data() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+--------+--------+---------+",
+        "| letter | number | a_float |",
+        "+--------+--------+---------+",
+        "|        | 6      | 6.6     |",
+        "| a      | 1      | 1.1     |",
+        "| a      | 4      | 4.4     |",
+        "| b      | 2      | 2.2     |",
+        "| c      | 3      | 3.3     |",
+        "| e      | 5      | 5.5     |",
+        "+--------+--------+---------+",
+    ];
+    read_table_data("./tests/data/basic_partitioned", expected)?;
+
     Ok(())
 }

@@ -5,7 +5,7 @@ use crate::actions::Add;
 use crate::expressions::Expression;
 use crate::schema::{SchemaRef, StructType};
 use crate::snapshot::Snapshot;
-use crate::{DeltaResult, EngineClient, EngineData, FileMeta};
+use crate::{DeltaResult, EngineInterface, EngineData, FileMeta};
 
 mod data_skipping;
 pub mod file_stream;
@@ -124,7 +124,7 @@ impl Scan {
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible)
     pub fn files(
         &self,
-        engine_client: &dyn EngineClient,
+        engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
         let action_schema = Arc::new(StructType::new(vec![
             crate::actions::schemas::ADD_FIELD.clone(),
@@ -132,7 +132,7 @@ impl Scan {
         ]));
 
         let log_iter = self.snapshot.log_segment.replay(
-            engine_client,
+            engine_interface,
             action_schema,
             self.predicate.clone(),
         )?;
@@ -146,14 +146,39 @@ impl Scan {
 
     /// This is the main method to 'materialize' the scan. It returns a [`Result`] of
     /// `Vec<`[`ScanResult`]`>`. This calls [`Scan::files`] to get a set of `Add` actions for the scan,
-    /// and then uses the `engine_client`'s [`crate::ParquetHandler`] to read the actual table
+    /// and then uses the `engine_interface`'s [`crate::ParquetHandler`] to read the actual table
     /// data. Each [`ScanResult`] encapsulates the raw data and an optional boolean vector built
     /// from the deletion vector if it was present. See the documentation for [`ScanResult`] for
     /// more details.
-    pub fn execute(&self, engine_client: &dyn EngineClient) -> DeltaResult<Vec<ScanResult>> {
-        let parquet_handler = engine_client.get_parquet_handler();
+    pub fn execute(&self, engine_interface: &dyn EngineInterface) -> DeltaResult<Vec<ScanResult>> {
+        let parquet_handler = engine_interface.get_parquet_handler();
+
+        let partition_columns = &self.snapshot.metadata().partition_columns;
+        let read_schema = Arc::new(StructType::new(
+            self.schema()
+                .fields()
+                .filter(|f| !partition_columns.contains(f.name()))
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+
+        let mut partition_fields = partition_columns
+            .iter()
+            .map(|column| {
+                self.schema()
+                    .field(column)
+                    .ok_or(Error::generic("Unexpected partition column"))
+            })
+            .collect::<DeltaResult<Vec<_>>>()?;
+        partition_fields.reverse();
+
+        let select_fields = read_schema
+            .fields()
+            .map(|f| Expression::column(f.name()))
+            .collect_vec();
+
         let mut results: Vec<ScanResult> = vec![];
-        let files = self.files(engine_client)?;
+        let files = self.files(engine_interface)?;
         for add_result in files {
             let add = add_result?;
             let meta = FileMeta {
@@ -161,13 +186,46 @@ impl Scan {
                 size: add.size as usize,
                 location: self.snapshot.table_root.join(&add.path)?,
             };
+            // TODO(nick) check if we need robert's try_collect change here
             let read_results =
                 parquet_handler.read_parquet_files(&[meta], self.read_schema.clone(), None)?;
+
+            // start broken code
+
+            // let batch = if partition_fields.is_empty() {
+            //     batch
+            // } else {
+            //     let mut fields =
+            //         Vec::with_capacity(partition_fields.len() + batch.num_columns());
+            //     for field in &partition_fields {
+            //         let value_expression = parse_partition_value(
+            //             add.partition_values.get(field.name()),
+            //             field.data_type(),
+            //         )?;
+            //         fields.push(Expression::Literal(value_expression));
+            //     }
+            //     fields.extend(select_fields.clone());
+
+            //     let evaluator = engine_interface.get_expression_handler().get_evaluator(
+            //         read_schema.clone(),
+            //         Expression::Struct(fields),
+            //         DataType::Struct(Box::new(self.schema().as_ref().clone())),
+            //     );
+
+            //     evaluator
+            //         .evaluate(&batch)?
+            //         .as_struct_opt()
+            //         .ok_or(Error::unexpected_column_type("Unexpected array type"))?
+            //         .into()
+            // };
+
+            // end broken code
+
             let dv_treemap = add
                 .deletion_vector
                 .as_ref()
                 .map(|dv_descriptor| {
-                    let fs_client = engine_client.get_file_system_client();
+                    let fs_client = engine_interface.get_file_system_client();
                     dv_descriptor.read(fs_client, self.snapshot.table_root.clone())
                 })
                 .transpose()?;
@@ -197,6 +255,21 @@ impl Scan {
     }
 }
 
+fn parse_partition_value(
+    raw: Option<&Option<String>>,
+    data_type: &DataType,
+) -> DeltaResult<Scalar> {
+    match raw {
+        Some(Some(v)) => match data_type {
+            DataType::Primitive(primitive) => primitive.parse_scalar(v),
+            _ => Err(Error::generic(format!(
+                "Unexpected partition column type: {data_type:?}"
+            ))),
+        },
+        _ => Ok(Scalar::Null(data_type.clone())),
+    }
+}
+
 #[cfg(all(test, feature = "default-client"))]
 mod tests {
     use itertools::Itertools;
@@ -211,12 +284,12 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine_client = SimpleClient::new();
+        let engine_interface = SimpleClient::new();
 
         let table = Table::new(url);
-        let snapshot = table.snapshot(&engine_client, None).unwrap();
+        let snapshot = table.snapshot(&engine_interface, None).unwrap();
         let scan = ScanBuilder::new(snapshot).build();
-        let files: Vec<Add> = scan.files(&engine_client).unwrap().try_collect().unwrap();
+        let files: Vec<Add> = scan.files(&engine_interface).unwrap().try_collect().unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(
@@ -231,12 +304,12 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine_client = SimpleClient::new();
+        let engine_interface = SimpleClient::new();
 
         let table = Table::new(url);
-        let snapshot = table.snapshot(&engine_client, None).unwrap();
+        let snapshot = table.snapshot(&engine_interface, None).unwrap();
         let scan = ScanBuilder::new(snapshot).build();
-        let files = scan.execute(&engine_client).unwrap();
+        let files = scan.execute(&engine_interface).unwrap();
 
         assert_eq!(files.len(), 1);
         let num_rows = files[0].raw_data.as_ref().unwrap().length();

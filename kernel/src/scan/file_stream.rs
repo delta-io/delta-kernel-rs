@@ -5,11 +5,8 @@ use super::data_skipping::DataSkippingFilter;
 use crate::actions::{visitors::AddVisitor, visitors::RemoveVisitor, Add, Remove};
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::Expression;
-use crate::schema::{SchemaRef, StructType};
-use crate::{DataVisitor, DeltaResult, EngineData};
-
-use either::Either;
-use tracing::debug;
+use crate::schema::SchemaRef;
+use crate::{DataVisitor, DeltaResult, EngineData, EngineInterface};
 
 struct LogReplayScanner {
     filter: Option<DataSkippingFilter>,
@@ -51,10 +48,14 @@ impl DataVisitor for AddRemoveVisitor {
 }
 
 impl LogReplayScanner {
-    /// Create a new [`LogReplayStream`] instance
-    fn new(table_schema: &SchemaRef, predicate: &Option<Expression>) -> Self {
+    /// Create a new [`LogReplayScanner`] instance
+    fn new(
+        table_client: &dyn EngineInterface,
+        table_schema: &SchemaRef,
+        predicate: &Option<Expression>,
+    ) -> Self {
         Self {
-            filter: DataSkippingFilter::new(table_schema, predicate),
+            filter: DataSkippingFilter::new(table_client, table_schema, predicate),
             seen: Default::default(),
         }
     }
@@ -123,11 +124,12 @@ impl LogReplayScanner {
 /// Given an iterator of (record batch, bool) tuples and a predicate, returns an iterator of `Adds`.
 /// The boolean flag indicates whether the record batch is a log or checkpoint batch.
 pub fn log_replay_iter(
+    engine_client: &dyn EngineInterface,
     action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
     table_schema: &SchemaRef,
     predicate: &Option<Expression>,
 ) -> impl Iterator<Item = DeltaResult<Add>> {
-    let mut log_scanner = LogReplayScanner::new(table_schema, predicate);
+    let mut log_scanner = LogReplayScanner::new(engine_client, table_schema, predicate);
 
     action_iter.flat_map(move |actions| match actions {
         Ok((batch, is_log_batch)) => {

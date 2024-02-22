@@ -1,11 +1,11 @@
-use self::scalars::Scalar;
-use itertools::Itertools;
-use std::{
-    collections::HashSet,
-    fmt::{Display, Formatter},
-};
+use std::collections::HashSet;
+use std::fmt::{Display, Formatter};
 
-pub mod scalars;
+use itertools::Itertools;
+
+pub use self::scalars::Scalar;
+
+mod scalars;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 /// A binary operator.
@@ -30,6 +30,8 @@ pub enum BinaryOperator {
     Equal,
     /// Comparison Not Equal
     NotEqual,
+    /// Distinct
+    Distinct,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,8 +43,6 @@ pub enum VariadicOperator {
 impl Display for BinaryOperator {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            // Self::And => write!(f, "AND"),
-            // Self::Or => write!(f, "OR"),
             Self::Plus => write!(f, "+"),
             Self::Minus => write!(f, "-"),
             Self::Multiply => write!(f, "*"),
@@ -53,6 +53,10 @@ impl Display for BinaryOperator {
             Self::GreaterThanOrEqual => write!(f, ">="),
             Self::Equal => write!(f, "="),
             Self::NotEqual => write!(f, "!="),
+            // TODO(roeap): AFAIK DISTINCT does not have a commonly used operator symbol
+            // so ideally this would not be used as we use Display for rendering expressions
+            // in our code we take care of this, bot thers might now ...
+            Self::Distinct => write!(f, "DISTINCT"),
         }
     }
 }
@@ -77,6 +81,8 @@ pub enum Expression {
     Literal(Scalar),
     /// A column reference by name.
     Column(String),
+    ///
+    Struct(Vec<Expression>),
     /// A binary operation.
     BinaryOperation {
         /// The operator.
@@ -102,11 +108,27 @@ pub enum Expression {
     // TODO: support more expressions, such as IS IN, LIKE, etc.
 }
 
+impl<T: Into<Scalar>> From<T> for Expression {
+    fn from(value: T) -> Self {
+        Self::literal(value)
+    }
+}
+
 impl Display for Expression {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Literal(l) => write!(f, "{}", l),
             Self::Column(name) => write!(f, "Column({})", name),
+            Self::Struct(exprs) => write!(
+                f,
+                "Struct({})",
+                &exprs.iter().map(|e| format!("{e}")).join(", ")
+            ),
+            Self::BinaryOperation {
+                op: BinaryOperator::Distinct,
+                left,
+                right,
+            } => write!(f, "DISTINCT({}, {})", left, right),
             Self::BinaryOperation { op, left, right } => write!(f, "{} {} {}", left, op, right),
             Self::UnaryOperation { op, expr } => match op {
                 UnaryOperator::Not => write!(f, "NOT {}", expr),
@@ -147,8 +169,8 @@ impl Expression {
     }
 
     /// Create an new expression for a column reference
-    pub fn column(name: impl Into<String>) -> Self {
-        Self::Column(name.into())
+    pub fn column(name: impl ToString) -> Self {
+        Self::Column(name.to_string())
     }
 
     /// Create a new expression for a literal value
@@ -156,71 +178,106 @@ impl Expression {
         Self::Literal(value.into())
     }
 
-    fn binary_op_impl(self, other: Self, op: BinaryOperator) -> Self {
-        Self::BinaryOperation {
+    /// Create a new struct expression
+    pub fn struct_expr(exprs: impl IntoIterator<Item = Self>) -> Self {
+        Self::Struct(exprs.into_iter().collect())
+    }
+
+    /// Creates a new unary expression OP expr
+    pub fn unary(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
+        Self::UnaryOperation {
             op,
-            left: Box::new(self),
-            right: Box::new(other),
+            expr: Box::new(expr.into()),
         }
     }
 
-    fn variadic_op_impl(self, other: impl IntoIterator<Item = Self>, op: VariadicOperator) -> Self {
-        let mut exprs = other.into_iter().collect::<Vec<_>>();
-        if exprs.is_empty() {
-            return self;
+    /// Creates a new binary expression lhs OP rhs
+    pub fn binary(
+        op: BinaryOperator,
+        lhs: impl Into<Expression>,
+        rhs: impl Into<Expression>,
+    ) -> Self {
+        Self::BinaryOperation {
+            op,
+            left: Box::new(lhs.into()),
+            right: Box::new(rhs.into()),
         }
-        exprs.insert(0, self);
+    }
+
+    /// Creates a new variadic expression OP(exprs...)
+    pub fn variadic(op: VariadicOperator, exprs: impl IntoIterator<Item = Self>) -> Self {
+        let exprs = exprs.into_iter().collect::<Vec<_>>();
         Self::VariadicOperation { op, exprs }
+    }
+
+    /// Creates a new expression AND(exprs...)
+    pub fn and_from(exprs: impl IntoIterator<Item = Self>) -> Self {
+        Self::variadic(VariadicOperator::And, exprs)
+    }
+
+    /// Creates a new expression OR(exprs...)
+    pub fn or_from(exprs: impl IntoIterator<Item = Self>) -> Self {
+        Self::variadic(VariadicOperator::Or, exprs)
+    }
+
+    /// Create a new expression `self IS NULL`
+    pub fn is_null(self) -> Self {
+        Self::unary(UnaryOperator::IsNull, self)
     }
 
     /// Create a new expression `self == other`
     pub fn eq(self, other: Self) -> Self {
-        self.binary_op_impl(other, BinaryOperator::Equal)
+        Self::binary(BinaryOperator::Equal, self, other)
     }
 
     /// Create a new expression `self != other`
     pub fn ne(self, other: Self) -> Self {
-        self.binary_op_impl(other, BinaryOperator::NotEqual)
+        Self::binary(BinaryOperator::NotEqual, self, other)
+    }
+
+    /// Create a new expression `self <= other`
+    pub fn le(self, other: Self) -> Self {
+        Self::binary(BinaryOperator::LessThanOrEqual, self, other)
     }
 
     /// Create a new expression `self < other`
     pub fn lt(self, other: Self) -> Self {
-        self.binary_op_impl(other, BinaryOperator::LessThan)
+        Self::binary(BinaryOperator::LessThan, self, other)
+    }
+
+    /// Create a new expression `self >= other`
+    pub fn ge(self, other: Self) -> Self {
+        Self::binary(BinaryOperator::GreaterThanOrEqual, self, other)
     }
 
     /// Create a new expression `self > other`
     pub fn gt(self, other: Self) -> Self {
-        self.binary_op_impl(other, BinaryOperator::GreaterThan)
+        Self::binary(BinaryOperator::GreaterThan, self, other)
     }
 
     /// Create a new expression `self >= other`
     pub fn gt_eq(self, other: Self) -> Self {
-        self.binary_op_impl(other, BinaryOperator::GreaterThanOrEqual)
+        Self::binary(BinaryOperator::GreaterThanOrEqual, self, other)
     }
 
     /// Create a new expression `self <= other`
     pub fn lt_eq(self, other: Self) -> Self {
-        self.binary_op_impl(other, BinaryOperator::LessThanOrEqual)
+        Self::binary(BinaryOperator::LessThanOrEqual, self, other)
     }
 
     /// Create a new expression `self AND other`
     pub fn and(self, other: Self) -> Self {
-        self.and_many([other])
-    }
-
-    /// Create a new expression `self AND others`
-    pub fn and_many(self, other: impl IntoIterator<Item = Self>) -> Self {
-        self.variadic_op_impl(other, VariadicOperator::And)
-    }
-
-    /// Create a new expression `self AND other`
-    pub fn or(self, other: Self) -> Self {
-        self.or_many([other])
+        Self::and_from([self, other])
     }
 
     /// Create a new expression `self OR other`
-    pub fn or_many(self, other: impl IntoIterator<Item = Self>) -> Self {
-        self.variadic_op_impl(other, VariadicOperator::Or)
+    pub fn or(self, other: Self) -> Self {
+        Self::or_from([self, other])
+    }
+
+    /// Create a new expression `DISTINCT(self, other)`
+    pub fn distinct(self, other: Self) -> Self {
+        Self::binary(BinaryOperator::Distinct, self, other)
     }
 
     fn walk(&self) -> impl Iterator<Item = &Self> + '_ {
@@ -230,6 +287,9 @@ impl Expression {
             match expr {
                 Self::Literal(_) => {}
                 Self::Column { .. } => {}
+                Self::Struct(exprs) => {
+                    stack.extend(exprs.iter());
+                }
                 Self::BinaryOperation { left, right, .. } => {
                     stack.push(left);
                     stack.push(right);
@@ -237,14 +297,20 @@ impl Expression {
                 Self::UnaryOperation { expr, .. } => {
                     stack.push(expr);
                 }
-                Self::VariadicOperation { op, exprs } => match op {
-                    VariadicOperator::And | VariadicOperator::Or => {
-                        stack.extend(exprs.iter());
-                    }
-                },
+                Self::VariadicOperation { exprs, .. } => {
+                    stack.extend(exprs.iter());
+                }
             }
             Some(expr)
         })
+    }
+}
+
+impl std::ops::Not for Expression {
+    type Output = Self;
+
+    fn not(self) -> Self {
+        Self::unary(UnaryOperator::Not, self)
     }
 }
 
@@ -252,31 +318,31 @@ impl std::ops::Add<Expression> for Expression {
     type Output = Self;
 
     fn add(self, rhs: Expression) -> Self::Output {
-        self.binary_op_impl(rhs, BinaryOperator::Plus)
+        Self::binary(BinaryOperator::Plus, self, rhs)
     }
 }
 
 impl std::ops::Sub<Expression> for Expression {
     type Output = Self;
 
-    fn sub(self, rhs: Expression) -> Self::Output {
-        self.binary_op_impl(rhs, BinaryOperator::Minus)
+    fn sub(self, rhs: Expression) -> Self {
+        Self::binary(BinaryOperator::Minus, self, rhs)
     }
 }
 
 impl std::ops::Mul<Expression> for Expression {
     type Output = Self;
 
-    fn mul(self, rhs: Expression) -> Self::Output {
-        self.binary_op_impl(rhs, BinaryOperator::Multiply)
+    fn mul(self, rhs: Expression) -> Self {
+        Self::binary(BinaryOperator::Multiply, self, rhs)
     }
 }
 
 impl std::ops::Div<Expression> for Expression {
     type Output = Self;
 
-    fn div(self, rhs: Expression) -> Self::Output {
-        self.binary_op_impl(rhs, BinaryOperator::Divide)
+    fn div(self, rhs: Expression) -> Self {
+        Self::binary(BinaryOperator::Divide, self, rhs)
     }
 }
 
@@ -306,7 +372,8 @@ mod tests {
                 "AND(Column(x) >= 2, Column(x) <= 10)",
             ),
             (
-                col_ref.clone().gt_eq(Expr::literal(2)).and_many([
+                Expr::and_from([
+                    col_ref.clone().gt_eq(Expr::literal(2)),
                     col_ref.clone().lt_eq(Expr::literal(10)),
                     col_ref.clone().lt_eq(Expr::literal(100)),
                 ]),

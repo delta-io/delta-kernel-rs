@@ -12,7 +12,7 @@ use url::Url;
 use crate::actions::{Metadata, Protocol};
 use crate::path::LogPath;
 use crate::schema::{Schema, SchemaRef, StructType};
-use crate::{DeltaResult, EngineClient, Error, FileMeta, FileSystemClient, Version};
+use crate::{DeltaResult, EngineInterface, Error, FileMeta, FileSystemClient, Version};
 use crate::{EngineData, Expression};
 
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
@@ -43,16 +43,16 @@ impl LogSegment {
     #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
     fn replay(
         &self,
-        engine_client: &dyn EngineClient,
+        engine_interface: &dyn EngineInterface,
         read_schema: SchemaRef,
         predicate: Option<Expression>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>> {
-        let json_client = engine_client.get_json_handler();
+        let json_client = engine_interface.get_json_handler();
         let commit_stream = json_client
             .read_json_files(&self.commit_files, read_schema.clone(), predicate.clone())?
             .map_ok(|batch| (batch, true));
 
-        let parquet_client = engine_client.get_parquet_handler();
+        let parquet_client = engine_interface.get_parquet_handler();
         let checkpoint_stream = parquet_client
             .read_parquet_files(&self.checkpoint_files, read_schema, predicate)?
             .map_ok(|batch| (batch, false));
@@ -64,14 +64,14 @@ impl LogSegment {
 
     fn read_metadata(
         &self,
-        engine_client: &dyn EngineClient,
+        engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<Option<(Metadata, Protocol)>> {
         //let metadata_schema = crate::actions::schemas::METADATA_SCHEMA.clone();
         let schema = StructType::new(vec![
             crate::actions::schemas::METADATA_FIELD.clone(),
             crate::actions::schemas::PROTOCOL_FIELD.clone(),
         ]);
-        let data_batches = self.replay(engine_client, Arc::new(schema), None)?;
+        let data_batches = self.replay(engine_interface, Arc::new(schema), None)?;
         let mut metadata_opt: Option<Metadata> = None;
         let mut protocol_opt: Option<Protocol> = None;
         for batch in data_batches {
@@ -126,14 +126,14 @@ impl Snapshot {
     /// # Parameters
     ///
     /// - `location`: url pointing at the table root (where `_delta_log` folder is located)
-    /// - `engine_client`: Implementation of [`EngineClient`] apis.
+    /// - `engine_interface`: Implementation of [`EngineInterface`] apis.
     /// - `version`: target version of the [`Snapshot`]
     pub fn try_new(
         table_root: Url,
-        engine_client: &dyn EngineClient,
+        engine_interface: &dyn EngineInterface,
         version: Option<Version>,
     ) -> DeltaResult<Arc<Self>> {
-        let fs_client = engine_client.get_file_system_client();
+        let fs_client = engine_interface.get_file_system_client();
         let log_url = LogPath(&table_root).child("_delta_log/").unwrap();
 
         // List relevant files from log
@@ -180,7 +180,7 @@ impl Snapshot {
             table_root,
             log_segment,
             version_eff,
-            engine_client,
+            engine_interface,
         )?))
     }
 
@@ -189,10 +189,10 @@ impl Snapshot {
         location: Url,
         log_segment: LogSegment,
         version: Version,
-        engine_client: &dyn EngineClient,
+        engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<Self> {
         let (metadata, protocol) = log_segment
-            .read_metadata(engine_client)?
+            .read_metadata(engine_interface)?
             .ok_or(Error::MissingMetadata)?;
         let schema = metadata.schema()?;
         Ok(Self {
@@ -445,8 +445,8 @@ mod tests {
         ))
         .unwrap();
         let location = url::Url::from_directory_path(path).unwrap();
-        let engine_client = SimpleClient::new();
-        let snapshot = Snapshot::try_new(location, &engine_client, None).unwrap();
+        let engine_interface = SimpleClient::new();
+        let snapshot = Snapshot::try_new(location, &engine_interface, None).unwrap();
 
         assert_eq!(snapshot.log_segment.checkpoint_files.len(), 1);
         assert_eq!(
