@@ -28,6 +28,10 @@ impl<'a> ListItem<'a> {
         self.list.len(self.row)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn get(&self, list_index: usize) -> String {
         self.list.get(self.row, list_index)
     }
