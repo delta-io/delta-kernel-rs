@@ -98,6 +98,9 @@ impl Error {
     pub fn deletion_vector(msg: impl ToString) -> Self {
         Self::DeletionVector(msg.to_string())
     }
+    pub fn engine_data_type(msg: impl ToString) -> Self {
+        Self::EngineDataType(msg.to_string())
+    }
 }
 
 #[cfg(feature = "object_store")]

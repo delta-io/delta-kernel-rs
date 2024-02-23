@@ -194,7 +194,7 @@ impl Remove {
     //     data.extract(Arc::new(schema), &mut visitor)?;
     //     visitor
     //         .extracted
-    //         .unwrap_or_else(|| Err(Error::Generic("Didn't get expected remove".to_string())))
+    //         .unwrap_or_else(|| Err(Error::generic("Didn't get expected remove")))
     // }
 
     pub(crate) fn dv_unique_id(&self) -> Option<String> {

@@ -291,7 +291,7 @@ mod tests {
                 ed_res.and_then(|ed| {
                     ed.into_any()
                         .downcast::<SimpleData>()
-                        .map_err(|_| Error::EngineDataType("SimpleData".into()))
+                        .map_err(|_| Error::engine_data_type("SimpleData"))
                         .map(|sd| sd.into_record_batch())
                 })
             })

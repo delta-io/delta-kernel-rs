@@ -66,7 +66,7 @@ impl FileSystemClient for SimpleFilesystemClient {
                 });
             Ok(Box::new(it))
         } else {
-            Err(Error::Generic("Can only read local filesystem".to_string()))
+            Err(Error::generic("Can only read local filesystem"))
         }
     }
 
@@ -79,9 +79,9 @@ impl FileSystemClient for SimpleFilesystemClient {
             if url.scheme() == "file" {
                 let bytes_vec_res = std::fs::read(url.path());
                 let bytes: std::io::Result<Bytes> = bytes_vec_res.map(|bytes_vec| bytes_vec.into());
-                bytes.map_err(|_| Error::FileNotFound(url.path().to_string()))
+                bytes.map_err(|_| Error::file_not_found(url.path()))
             } else {
-                Err(Error::Generic("Can only read local filesystem".to_string()))
+                Err(Error::generic("Can only read local filesystem"))
             }
         });
         Ok(Box::new(iter))

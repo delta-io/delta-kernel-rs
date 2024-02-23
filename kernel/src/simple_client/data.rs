@@ -153,13 +153,13 @@ impl SimpleData {
         let file = File::open(
             location
                 .to_file_path()
-                .map_err(|_| Error::Generic("can only read local files".to_string()))?,
+                .map_err(|_| Error::generic("can only read local files"))?,
         )?;
         let mut json =
             arrow_json::ReaderBuilder::new(Arc::new(arrow_schema)).build(BufReader::new(file))?;
-        let data = json.next().ok_or(Error::Generic(
-            "No data found reading json file".to_string(),
-        ))?;
+        let data = json
+            .next()
+            .ok_or(Error::generic("No data found reading json file"))?;
         Ok(SimpleData::new(data?))
     }
 
@@ -168,13 +168,13 @@ impl SimpleData {
         let file = File::open(
             location
                 .to_file_path()
-                .map_err(|_| Error::Generic("can only read local files".to_string()))?,
+                .map_err(|_| Error::generic("can only read local files"))?,
         )?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
         let mut reader = builder.build()?;
-        let data = reader.next().ok_or(Error::Generic(
-            "No data found reading parquet file".to_string(),
-        ))?;
+        let data = reader
+            .next()
+            .ok_or(Error::generic("No data found reading parquet file"))?;
         Ok(SimpleData::new(data?))
     }
 

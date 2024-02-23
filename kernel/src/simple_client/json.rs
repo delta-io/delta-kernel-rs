@@ -47,14 +47,14 @@ impl JsonHandler for SimpleJsonHandler {
         // implementation at some point
         let json_strings = SimpleData::try_from_engine_data(json_strings)?.into_record_batch();
         if json_strings.num_columns() != 1 {
-            return Err(Error::MissingColumn("Expected single column".into()));
+            return Err(Error::missing_column("Expected single column"));
         }
         let json_strings =
             json_strings
                 .column(0)
                 .as_string_opt::<i32>()
-                .ok_or(Error::UnexpectedColumnType(
-                    "Expected column to be String".into(),
+                .ok_or(Error::unexpected_column_type(
+                    "Expected column to be String",
                 ))?;
 
         let data: Vec<_> = json_strings

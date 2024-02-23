@@ -54,10 +54,10 @@ impl DeletionVectorDescriptor {
             "u" => {
                 let prefix_len = self.path_or_inline_dv.len() as i32 - 20;
                 if prefix_len < 0 {
-                    return Err(Error::DeletionVector("Invalid length".to_string()));
+                    return Err(Error::deletion_vector("Invalid length"));
                 }
                 let decoded = z85::decode(&self.path_or_inline_dv[(prefix_len as usize)..])
-                    .map_err(|_| Error::DeletionVector("Failed to decode DV uuid".to_string()))?;
+                    .map_err(|_| Error::deletion_vector("Failed to decode DV uuid"))?;
                 let uuid = uuid::Uuid::from_slice(&decoded)
                     .map_err(|err| Error::DeletionVector(err.to_string()))?;
                 let dv_suffix = if prefix_len > 0 {
@@ -91,7 +91,7 @@ impl DeletionVectorDescriptor {
         match self.absolute_path(&parent)? {
             None => {
                 let bytes = z85::decode(&self.path_or_inline_dv)
-                    .map_err(|_| Error::DeletionVector("Failed to decode DV".to_string()))?;
+                    .map_err(|_| Error::deletion_vector("Failed to decode DV"))?;
                 RoaringTreemap::deserialize_from(&bytes[12..])
                     .map_err(|err| Error::DeletionVector(err.to_string()))
             }
@@ -102,7 +102,7 @@ impl DeletionVectorDescriptor {
                 let dv_data = fs_client
                     .read_files(vec![(path, None)])?
                     .next()
-                    .ok_or(Error::MissingData("No deletion Vector data".to_string()))??;
+                    .ok_or(Error::missing_data("No deletion vector data"))??;
 
                 let mut cursor = Cursor::new(dv_data);
                 if let Some(offset) = offset {
@@ -115,10 +115,10 @@ impl DeletionVectorDescriptor {
                 cursor
                     .read(&mut buf)
                     .map_err(|err| Error::DeletionVector(err.to_string()))?;
-                let magic =
-                    i32::from_le_bytes(buf.try_into().map_err(|_| {
-                        Error::DeletionVector("filed to read magic bytes".to_string())
-                    })?);
+                let magic = i32::from_le_bytes(
+                    buf.try_into()
+                        .map_err(|_| Error::deletion_vector("failed to read magic bytes"))?,
+                );
                 if magic != 1681511377 {
                     return Err(Error::DeletionVector(format!("Invalid magic {magic}")));
                 }

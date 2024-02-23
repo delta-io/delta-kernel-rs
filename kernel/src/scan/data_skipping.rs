@@ -208,7 +208,7 @@ impl DataSkippingFilter {
         let skipping_vector = skipping_vector
             .as_any()
             .downcast_ref::<SimpleData>()
-            .ok_or(Error::EngineDataType("SimpleData".into()))?
+            .ok_or(Error::engine_data_type("SimpleData"))?
             .record_batch()
             .column(0);
         let skipping_vector = skipping_vector
@@ -222,7 +222,7 @@ impl DataSkippingFilter {
         let actions = actions
             .as_any()
             .downcast_ref::<SimpleData>()
-            .ok_or(Error::EngineDataType("SimpleData".into()))?
+            .ok_or(Error::engine_data_type("SimpleData"))?
             .record_batch();
         let after = filter_record_batch(actions, skipping_vector)?;
         debug!(
