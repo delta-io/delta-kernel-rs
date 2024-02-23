@@ -1,11 +1,14 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use either::Either;
+use tracing::debug;
+
 use super::data_skipping::DataSkippingFilter;
 use crate::actions::{visitors::AddVisitor, visitors::RemoveVisitor, Add, Remove};
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::Expression;
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, StructType};
 use crate::{DataVisitor, DeltaResult, EngineData, EngineInterface};
 
 struct LogReplayScanner {

@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use self::file_stream::log_replay_iter;
 use crate::actions::Add;
-use crate::expressions::Expression;
-use crate::schema::{SchemaRef, StructType};
+use crate::expressions::{Expression, Scalar};
+use crate::schema::{SchemaRef, StructType, DataType};
 use crate::snapshot::Snapshot;
-use crate::{DeltaResult, EngineInterface, EngineData, FileMeta};
+use crate::{DeltaResult, EngineInterface, EngineData, FileMeta, Error};
 
 mod data_skipping;
 pub mod file_stream;
@@ -138,6 +138,7 @@ impl Scan {
         )?;
 
         Ok(log_replay_iter(
+            engine_interface,
             log_iter,
             &self.read_schema,
             &self.predicate,
@@ -172,10 +173,10 @@ impl Scan {
             .collect::<DeltaResult<Vec<_>>>()?;
         partition_fields.reverse();
 
-        let select_fields = read_schema
-            .fields()
-            .map(|f| Expression::column(f.name()))
-            .collect_vec();
+        // let select_fields = read_schema
+        //     .fields()
+        //     .map(|f| Expression::column(f.name()))
+        //     .collect_vec();
 
         let mut results: Vec<ScanResult> = vec![];
         let files = self.files(engine_interface)?;

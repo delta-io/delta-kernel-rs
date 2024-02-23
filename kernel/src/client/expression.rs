@@ -11,7 +11,7 @@ use arrow_array::{
     StructArray, TimestampMicrosecondArray,
 };
 use arrow_ord::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq};
-use arrow_schema::{ArrowError, Schema as ArrowSchema};
+use arrow_schema::{ArrowError, Schema as ArrowSchema, DataType as ArrowDataType, Field as ArrowField};
 use itertools::Itertools;
 
 use crate::error::{DeltaResult, Error};
@@ -249,7 +249,7 @@ pub struct DefaultExpressionEvaluator {
 }
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
-    fn evaluate(&self, batch: &RecordBatch) -> DeltaResult<ArrayRef> {
+    fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         let batch = batch
             .as_any()
             .downcast_ref::<SimpleData>()
@@ -264,7 +264,15 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
         //         batch.schema()
         //     )));
         // };
-        evaluate_expression(&self.expression, batch, Some(&self.output_type))
+        let array_ref = evaluate_expression(&self.expression, batch, Some(&self.output_type))?;
+        let arrow_type: ArrowDataType = ArrowDataType::try_from(&self.output_type)?;
+        let schema: ArrowSchema = if let DataType::Struct(ref st) = self.output_type {
+            st.as_ref().try_into()?
+        } else {
+            ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)])
+        };
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![array_ref])?;
+        Ok(Box::new(SimpleData::new(batch)))
     }
 }
 

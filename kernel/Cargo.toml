@@ -46,7 +46,7 @@ parquet = { version = "^49.0", optional = true }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
 
 [features]
-arrow-conversion = []
+arrow-conversion = ["arrow-schema"]
 default = ["simple-client"]
 default-client = [
   "arrow-conversion",
@@ -62,7 +62,11 @@ default-client = [
 ]
 
 developer-visibility = []
-simple-client = ["arrow-conversion", "parquet"]
+simple-client = [
+  "arrow-conversion",
+  "arrow-json",
+  "parquet"
+]
 
 [dev-dependencies]
 arrow = { version = "^49.0", features = ["json", "prettyprint"] }

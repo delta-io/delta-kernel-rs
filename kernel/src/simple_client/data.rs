@@ -202,7 +202,7 @@ impl SimpleData {
         schema: &Schema,
         array: Option<&'a dyn ProvidesColumnByName>,
     ) -> DeltaResult<()> {
-        for field in schema.fields.iter() {
+        for field in schema.fields() {
             let col = array
                 .and_then(|a| a.column_by_name(&field.name))
                 .filter(|a| *a.data_type() != ArrowDataType::Null);
@@ -321,7 +321,7 @@ mod tests {
     use crate::{
         actions::schemas::log_schema,
         simple_client::{data::SimpleData, SimpleClient},
-        EngineClient, EngineData,
+        EngineInterface, EngineData,
     };
 
     fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {

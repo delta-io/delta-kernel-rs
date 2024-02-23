@@ -265,7 +265,7 @@ mod tests {
         actions::schemas::log_schema,
         schema::StructType,
         simple_client::{data::SimpleData, json::SimpleJsonHandler, SimpleClient},
-        EngineClient, EngineData, JsonHandler,
+        EngineInterface, EngineData, JsonHandler,
     };
 
     fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {

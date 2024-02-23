@@ -1,6 +1,6 @@
-//! This module implements a simple, single threaded, EngineClient
+//! This module implements a simple, single threaded, EngineInterface
 
-use crate::{EngineClient, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler};
+use crate::{EngineInterface, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler};
 
 use std::sync::Arc;
 
@@ -27,7 +27,7 @@ impl SimpleClient {
     }
 }
 
-impl EngineClient for SimpleClient {
+impl EngineInterface for SimpleClient {
     fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler> {
         unimplemented!();
     }

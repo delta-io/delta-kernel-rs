@@ -157,7 +157,7 @@ pub trait JsonHandler {
         &self,
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
-    ) -> DeltaResult<RecordBatch>;
+    ) -> DeltaResult<Box<dyn EngineData>>;
 
     /// Read and parse the JSON format file at given locations and return
     /// the data as EngineData with the columns requested by physical schema.
