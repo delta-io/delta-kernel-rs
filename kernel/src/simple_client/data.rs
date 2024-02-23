@@ -36,7 +36,7 @@ impl SimpleData {
         engine_data
             .into_any()
             .downcast::<SimpleData>()
-            .map_err(|_| Error::EngineDataType("SimpleData".into()))
+            .map_err(|_| Error::engine_data_type("SimpleData"))
     }
 
     pub fn into_record_batch(self) -> RecordBatch {
