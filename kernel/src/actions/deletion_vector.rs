@@ -1,9 +1,7 @@
 //! Code relating to parsing and using deletion vectors
 
-use std::{
-    io::{Cursor, Read},
-    sync::Arc,
-};
+use std::io::{Cursor, Read};
+use std::sync::Arc;
 
 use roaring::RoaringTreemap;
 use url::Url;
