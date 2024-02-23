@@ -270,6 +270,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::schema::PrimitiveType;
     use crate::simple_client::SimpleClient;
     use crate::Table;
 
@@ -312,5 +313,49 @@ mod tests {
         assert_eq!(files.len(), 1);
         let num_rows = files[0].raw_data.as_ref().unwrap().length();
         assert_eq!(num_rows, 10)
+    }
+
+    #[test]
+    fn test_get_partition_value() {
+        let cases = [
+            (
+                "string",
+                PrimitiveType::String,
+                Scalar::String("string".to_string()),
+            ),
+            ("123", PrimitiveType::Integer, Scalar::Integer(123)),
+            ("1234", PrimitiveType::Long, Scalar::Long(1234)),
+            ("12", PrimitiveType::Short, Scalar::Short(12)),
+            ("1", PrimitiveType::Byte, Scalar::Byte(1)),
+            ("1.1", PrimitiveType::Float, Scalar::Float(1.1)),
+            ("10.10", PrimitiveType::Double, Scalar::Double(10.1)),
+            ("true", PrimitiveType::Boolean, Scalar::Boolean(true)),
+            ("2024-01-01", PrimitiveType::Date, Scalar::Date(19723)),
+            ("1970-01-01", PrimitiveType::Date, Scalar::Date(0)),
+            (
+                "1970-01-01 00:00:00",
+                PrimitiveType::Timestamp,
+                Scalar::Timestamp(0),
+            ),
+            (
+                "1970-01-01 00:00:00.123456",
+                PrimitiveType::Timestamp,
+                Scalar::Timestamp(123456),
+            ),
+            (
+                "1970-01-01 00:00:00.123456789",
+                PrimitiveType::Timestamp,
+                Scalar::Timestamp(123456),
+            ),
+        ];
+
+        for (raw, data_type, expected) in &cases {
+            let value = parse_partition_value(
+                Some(&Some(raw.to_string())),
+                &DataType::Primitive(data_type.clone()),
+            )
+            .unwrap();
+            assert_eq!(value, *expected);
+        }
     }
 }
