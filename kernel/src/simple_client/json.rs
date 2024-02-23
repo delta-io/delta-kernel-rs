@@ -4,7 +4,7 @@ use crate::{
     schema::SchemaRef, DeltaResult, EngineData, Error, Expression, FileDataReadResultIterator,
     FileMeta, JsonHandler,
 };
-use arrow_array::cast::AsArray;
+use arrow_array::{cast::AsArray, RecordBatch};
 use arrow_json::ReaderBuilder;
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use arrow_select::concat::concat_batches;
@@ -45,7 +45,7 @@ impl JsonHandler for SimpleJsonHandler {
     ) -> DeltaResult<Box<dyn EngineData>> {
         // TODO: This is taken from the default client as it's the same. We should share an
         // implementation at some point
-        let json_strings = SimpleData::try_from_engine_data(json_strings)?.into_record_batch();
+        let json_strings: RecordBatch = SimpleData::try_from_engine_data(json_strings)?.into();
         if json_strings.num_columns() != 1 {
             return Err(Error::missing_column("Expected single column"));
         }

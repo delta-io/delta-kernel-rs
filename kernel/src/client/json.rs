@@ -89,7 +89,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let json_strings = SimpleData::try_from_engine_data(json_strings)?.into_record_batch();
+        let json_strings: RecordBatch = SimpleData::try_from_engine_data(json_strings)?.into();
         // TODO(nick): this is pretty terrible
         let struct_array: StructArray = json_strings.into();
         let json_strings = struct_array
@@ -292,7 +292,7 @@ mod tests {
                     ed.into_any()
                         .downcast::<SimpleData>()
                         .map_err(|_| Error::engine_data_type("SimpleData"))
-                        .map(|sd| sd.into_record_batch())
+                        .map(|sd| sd.into())
                 })
             })
             .try_collect()

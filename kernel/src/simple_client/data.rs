@@ -20,13 +20,13 @@ use std::sync::Arc;
 pub struct SimpleDataTypeTag;
 impl TypeTag for SimpleDataTypeTag {}
 
-/// SimpleData holds a RecordBatch
+/// SimpleData holds a RecordBatch, implements `EngineData` so the kernel can extract from it.
 pub struct SimpleData {
     data: RecordBatch,
 }
 
 impl SimpleData {
-    /// Create a new SimpleData from a RecordBatch
+    /// Create a new `SimpleData` from a `RecordBatch`
     pub fn new(data: RecordBatch) -> Self {
         SimpleData { data }
     }
@@ -39,10 +39,7 @@ impl SimpleData {
             .map_err(|_| Error::engine_data_type("SimpleData"))
     }
 
-    pub fn into_record_batch(self) -> RecordBatch {
-        self.data
-    }
-
+    /// Get a reference to the `RecordBatch` this `SimpleData` is wrapping
     pub fn record_batch(&self) -> &RecordBatch {
         &self.data
     }
@@ -69,6 +66,24 @@ impl EngineData for SimpleData {
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
         self
+    }
+}
+
+impl From<RecordBatch> for SimpleData {
+    fn from(value: RecordBatch) -> Self {
+        SimpleData::new(value)
+    }
+}
+
+impl From<SimpleData> for RecordBatch {
+    fn from(value: SimpleData) -> Self {
+        value.data
+    }
+}
+
+impl From<Box<SimpleData>> for RecordBatch {
+    fn from(value: Box<SimpleData>) -> Self {
+        value.data
     }
 }
 
@@ -163,7 +178,6 @@ impl SimpleData {
         Ok(SimpleData::new(data?))
     }
 
-    // todo: fix all the unwrapping
     pub fn try_create_from_parquet(_schema: SchemaRef, location: Url) -> DeltaResult<Self> {
         let file = File::open(
             location
@@ -300,14 +314,6 @@ fn get_error_for_types(
         )),
     }
 }
-
-impl From<RecordBatch> for SimpleData {
-    fn from(value: RecordBatch) -> Self {
-        SimpleData::new(value)
-    }
-}
-
-// test disabled because creating a record batch is tricky :)
 
 #[cfg(test)]
 mod tests {

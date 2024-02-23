@@ -150,7 +150,7 @@ mod tests {
     ) -> DeltaResult<RecordBatch> {
         engine_data
             .and_then(SimpleData::try_from_engine_data)
-            .map(|sd| sd.into_record_batch())
+            .map(|sd| sd.into())
     }
 
     #[tokio::test]
