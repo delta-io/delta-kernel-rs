@@ -1,8 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_array::cast::AsArray;
-use arrow_array::{Array, BooleanArray, RecordBatch};
+use arrow_array::{Array, BooleanArray};
 use arrow_select::filter::filter_record_batch;
 use tracing::debug;
 
@@ -10,7 +9,7 @@ use crate::error::{DeltaResult, Error};
 use crate::expressions::{BinaryOperator, Expression as Expr, VariadicOperator};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::simple_client::data::SimpleData;
-use crate::{EngineInterface, ExpressionEvaluator, JsonHandler, EngineData};
+use crate::{EngineData, EngineInterface, ExpressionEvaluator, JsonHandler};
 
 /// Returns <op2> (if any) such that B <op2> A is equivalent to A <op> B.
 fn commute(op: &BinaryOperator) -> Option<BinaryOperator> {
@@ -141,7 +140,6 @@ impl DataSkippingFilter {
             return None;
         }
 
-
         let stats_schema = Arc::new(StructType::new(vec![
             StructField::new("minValues", StructType::new(data_fields.clone()), true),
             StructField::new("maxValues", StructType::new(data_fields), true),
@@ -197,30 +195,41 @@ impl DataSkippingFilter {
         let skipping_predicate = skipping_predicate
             .as_any()
             .downcast_ref::<SimpleData>()
-            .ok_or(Error::EngineDataType("SimpleData".into()))?
-            .record_batch();
-        Ok(Box::new(SimpleData::new(skipping_predicate.clone()))) // TODO(nick) BROKEN
-        // let skipping_predicate = skipping_predicate.columns()
+            .unwrap();
+        // TODO(nick): Ensure this is okay
+        // let skipping_predicate = skipping_predicate
         //     .as_struct_opt()
         //     .ok_or(Error::unexpected_column_type(
         //         "Expected type 'StructArray'.",
         //     ))?
         //     .into();
-        // let skipping_vector = self.filter_evaluator.evaluate(&skipping_predicate)?;
-        // let skipping_vector = skipping_vector
-        //     .as_any()
-        //     .downcast_ref::<BooleanArray>()
-        //     .ok_or(Error::unexpected_column_type(
-        //         "Expected type 'BooleanArray'.",
-        //     ))?;
 
-        // let before_count = actions.num_rows();
-        // let after = filter_record_batch(actions, skipping_vector)?;
-        // debug!(
-        //     "number of actions before/after data skipping: {before_count} / {}",
-        //     after.num_rows()
-        // );
-        // Ok(Box::new(SimpleData::new(after)))
+        let skipping_vector = self.filter_evaluator.evaluate(skipping_predicate)?;
+        let skipping_vector = skipping_vector
+            .as_any()
+            .downcast_ref::<SimpleData>()
+            .ok_or(Error::EngineDataType("SimpleData".into()))?
+            .record_batch()
+            .column(0);
+        let skipping_vector = skipping_vector
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or(Error::unexpected_column_type(
+                "Expected type 'BooleanArray'.",
+            ))?;
+
+        let before_count = actions.length();
+        let actions = actions
+            .as_any()
+            .downcast_ref::<SimpleData>()
+            .ok_or(Error::EngineDataType("SimpleData".into()))?
+            .record_batch();
+        let after = filter_record_batch(actions, skipping_vector)?;
+        debug!(
+            "number of actions before/after data skipping: {before_count} / {}",
+            after.num_rows()
+        );
+        Ok(Box::new(SimpleData::new(after)))
     }
 }
 

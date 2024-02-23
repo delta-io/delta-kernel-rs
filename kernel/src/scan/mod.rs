@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
+use itertools::Itertools;
+
 use self::file_stream::log_replay_iter;
 use crate::actions::Add;
 use crate::expressions::{Expression, Scalar};
-use crate::schema::{SchemaRef, StructType, DataType};
+use crate::schema::{DataType, SchemaRef, StructType};
 use crate::snapshot::Snapshot;
-use crate::{DeltaResult, EngineInterface, EngineData, FileMeta, Error};
+use crate::{DeltaResult, EngineData, EngineInterface, Error, FileMeta};
 
 mod data_skipping;
 pub mod file_stream;
@@ -173,10 +175,10 @@ impl Scan {
             .collect::<DeltaResult<Vec<_>>>()?;
         partition_fields.reverse();
 
-        // let select_fields = read_schema
-        //     .fields()
-        //     .map(|f| Expression::column(f.name()))
-        //     .collect_vec();
+        let select_fields = read_schema
+            .fields()
+            .map(|f| Expression::column(f.name()))
+            .collect_vec();
 
         let mut results: Vec<ScanResult> = vec![];
         let files = self.files(engine_interface)?;
@@ -190,37 +192,6 @@ impl Scan {
             // TODO(nick) check if we need robert's try_collect change here
             let read_results =
                 parquet_handler.read_parquet_files(&[meta], self.read_schema.clone(), None)?;
-
-            // start broken code
-
-            // let batch = if partition_fields.is_empty() {
-            //     batch
-            // } else {
-            //     let mut fields =
-            //         Vec::with_capacity(partition_fields.len() + batch.num_columns());
-            //     for field in &partition_fields {
-            //         let value_expression = parse_partition_value(
-            //             add.partition_values.get(field.name()),
-            //             field.data_type(),
-            //         )?;
-            //         fields.push(Expression::Literal(value_expression));
-            //     }
-            //     fields.extend(select_fields.clone());
-
-            //     let evaluator = engine_interface.get_expression_handler().get_evaluator(
-            //         read_schema.clone(),
-            //         Expression::Struct(fields),
-            //         DataType::Struct(Box::new(self.schema().as_ref().clone())),
-            //     );
-
-            //     evaluator
-            //         .evaluate(&batch)?
-            //         .as_struct_opt()
-            //         .ok_or(Error::unexpected_column_type("Unexpected array type"))?
-            //         .into()
-            // };
-
-            // end broken code
 
             let dv_treemap = add
                 .deletion_vector
@@ -238,6 +209,28 @@ impl Scan {
                     res.length()
                 } else {
                     0
+                };
+
+                let read_result = if partition_fields.is_empty() {
+                    read_result
+                } else {
+                    let mut fields = Vec::with_capacity(partition_fields.len() + len);
+                    for field in &partition_fields {
+                        let value_expression = parse_partition_value(
+                            add.partition_values.get(field.name()),
+                            field.data_type(),
+                        )?;
+                        fields.push(Expression::Literal(value_expression));
+                    }
+                    fields.extend(select_fields.clone());
+
+                    let evaluator = engine_interface.get_expression_handler().get_evaluator(
+                        read_schema.clone(),
+                        Expression::Struct(fields),
+                        DataType::Struct(Box::new(self.schema().as_ref().clone())),
+                    );
+
+                    evaluator.evaluate(read_result?.as_ref())
                 };
 
                 // need to split the dv_mask. what's left in dv_mask covers this result, and rest
@@ -290,7 +283,11 @@ mod tests {
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine_interface, None).unwrap();
         let scan = ScanBuilder::new(snapshot).build();
-        let files: Vec<Add> = scan.files(&engine_interface).unwrap().try_collect().unwrap();
+        let files: Vec<Add> = scan
+            .files(&engine_interface)
+            .unwrap()
+            .try_collect()
+            .unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(

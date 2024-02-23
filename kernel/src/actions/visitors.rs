@@ -265,9 +265,10 @@ mod tests {
         actions::schemas::log_schema,
         schema::StructType,
         simple_client::{data::SimpleData, json::SimpleJsonHandler, SimpleClient},
-        EngineInterface, EngineData, JsonHandler,
+        EngineData, EngineInterface, JsonHandler,
     };
 
+    // TODO(nick): Merge all copies of this into one "test utils" thing
     fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
         let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
         let schema = Arc::new(ArrowSchema::new(vec![string_field]));

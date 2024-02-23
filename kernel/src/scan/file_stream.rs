@@ -30,7 +30,6 @@ const ADD_FIELD_COUNT: usize = 15;
 
 impl DataVisitor for AddRemoveVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        println!("at top: {}", getters.len());
         for i in 0..row_count {
             // Add will have a path at index 0 if it is valid
             if let Some(path) = getters[0].get_opt(i, "add.path")? {

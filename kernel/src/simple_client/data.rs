@@ -321,7 +321,7 @@ mod tests {
     use crate::{
         actions::schemas::log_schema,
         simple_client::{data::SimpleData, SimpleClient},
-        EngineInterface, EngineData,
+        EngineData, EngineInterface,
     };
 
     fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {

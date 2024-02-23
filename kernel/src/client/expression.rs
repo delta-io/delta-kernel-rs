@@ -5,13 +5,16 @@ use std::sync::Arc;
 
 use arrow_arith::boolean::{and, is_null, not, or};
 use arrow_arith::numeric::{add, div, mul, sub};
+use arrow_array::cast::AsArray;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum, Decimal128Array, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
     StructArray, TimestampMicrosecondArray,
 };
 use arrow_ord::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq};
-use arrow_schema::{ArrowError, Schema as ArrowSchema, DataType as ArrowDataType, Field as ArrowField};
+use arrow_schema::{
+    ArrowError, DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+};
 use itertools::Itertools;
 
 use crate::error::{DeltaResult, Error};
@@ -266,12 +269,15 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
         // };
         let array_ref = evaluate_expression(&self.expression, batch, Some(&self.output_type))?;
         let arrow_type: ArrowDataType = ArrowDataType::try_from(&self.output_type)?;
-        let schema: ArrowSchema = if let DataType::Struct(ref st) = self.output_type {
-            st.as_ref().try_into()?
+        let batch: RecordBatch = if let DataType::Struct(_) = self.output_type {
+            array_ref
+                .as_struct_opt()
+                .ok_or(Error::unexpected_column_type("Expected a struct array"))?
+                .into()
         } else {
-            ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)])
+            let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
+            RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
         };
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![array_ref])?;
         Ok(Box::new(SimpleData::new(batch)))
     }
 }

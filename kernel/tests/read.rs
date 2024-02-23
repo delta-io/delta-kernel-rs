@@ -407,12 +407,21 @@ fn read_table_data(path: &str, expected: Vec<&str>) -> Result<(), Box<dyn std::e
     let snapshot = table.snapshot(&table_client, None)?;
     let scan = ScanBuilder::new(snapshot).build();
 
-    let batches = scan.execute(&table_client)?;
-    // TODO(nick)
-    // let schema = batches[0].schema();
-    // let batch = concat_batches(&schema, &batches)?;
+    let scan_results = scan.execute(&table_client)?;
+    let batches: Vec<RecordBatch> = scan_results
+        .into_iter()
+        .map(|sr| {
+            let data = sr.raw_data.unwrap();
+            data.into_any()
+                .downcast::<SimpleData>()
+                .unwrap()
+                .into_record_batch()
+        })
+        .collect();
+    let schema = batches[0].schema();
+    let batch = concat_batches(&schema, &batches)?;
 
-    // assert_batches_sorted_eq!(&expected, &[batch]);
+    assert_batches_sorted_eq!(&expected, &[batch]);
     Ok(())
 }
 
