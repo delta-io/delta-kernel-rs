@@ -3,7 +3,7 @@
 //! The Engineinterface interfaces allow connectors to bring their own implementation of functionality
 //! such as reading parquet files, listing files in a file system, parsing a JSON string etc.
 //!
-//! The [`Engineinterface`] trait exposes methods to get sub-clients which expose the core
+//! The [`EngineInterface`] trait exposes methods to get sub-clients which expose the core
 //! functionalities customizable by connectors.
 //!
 //! ## Expression handling

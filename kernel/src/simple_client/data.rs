@@ -1,4 +1,4 @@
-use crate::engine_data::{EngineData, EngineList, EngineMap, GetData, TypeTag};
+use crate::engine_data::{EngineData, EngineList, EngineMap, GetData};
 use crate::schema::{DataType, PrimitiveType, Schema, SchemaRef, StructField};
 use crate::{DataVisitor, DeltaResult, Error};
 
@@ -15,10 +15,6 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
-
-#[derive(Debug)]
-pub struct SimpleDataTypeTag;
-impl TypeTag for SimpleDataTypeTag {}
 
 /// SimpleData holds a RecordBatch, implements `EngineData` so the kernel can extract from it.
 pub struct SimpleData {
@@ -54,10 +50,6 @@ impl EngineData for SimpleData {
 
     fn length(&self) -> usize {
         self.data.num_rows()
-    }
-
-    fn type_tag(&self) -> &dyn TypeTag {
-        &SimpleDataTypeTag
     }
 
     fn as_any(&self) -> &dyn Any {

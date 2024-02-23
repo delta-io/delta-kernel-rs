@@ -131,7 +131,7 @@ pub struct Add {
 }
 
 impl Add {
-    /// Since we always want to parse multiple adds from data, we return a Vec<Add>
+    /// Since we always want to parse multiple adds from data, we return a `Vec<Add>`
     pub fn parse_from_data(data: &dyn EngineData) -> DeltaResult<Vec<Add>> {
         let mut visitor = AddVisitor::default();
         let schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);

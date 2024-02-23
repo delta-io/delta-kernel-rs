@@ -1,19 +1,24 @@
+//! Traits that engines need to implement in order to pass data between themselves and kernel.
+
 use crate::{schema::SchemaRef, DeltaResult, Error};
 
 use tracing::debug;
 
-use std::{
-    any::{Any, TypeId},
-    collections::HashMap,
-};
+use std::any::Any;
+use std::collections::HashMap;
 
-// a trait that an engine exposes to give access to a list
+/// a trait that an engine exposes to give access to a list
 pub trait EngineList {
+    /// Return the length of the list at the specified row_index in the raw data
     fn len(&self, row_index: usize) -> usize;
+    /// Get the item at `list_index` from the list at `row_index` in the raw data, and return it as a [`String`]
     fn get(&self, row_index: usize, list_index: usize) -> String;
+    /// Materialize the entire list at row_index in the raw data into a `Vec<String>`
     fn materialize(&self, row_index: usize) -> Vec<String>;
 }
 
+/// A list item is useful if the Engine needs to know what row of raw data it needs to access to
+/// implement the [`EngineList`] trait. It simply wraps such a list, and the row.
 pub struct ListItem<'a> {
     list: &'a dyn EngineList,
     row: usize,
@@ -41,12 +46,16 @@ impl<'a> ListItem<'a> {
     }
 }
 
-// a trait that an engine exposes to give access to a map
+/// a trait that an engine exposes to give access to a map
 pub trait EngineMap {
+    /// Get the item with the specified key from the map at `row_index` in the raw data, and return it as an `Option<&'a str>`
     fn get<'a>(&'a self, row_index: usize, key: &str) -> Option<&'a str>;
+    /// Materialize the entire map at `row_index` in the raw data into a `HashMap`
     fn materialize(&self, row_index: usize) -> HashMap<String, Option<String>>;
 }
 
+/// A map item is useful if the Engine needs to know what row of raw data it needs to access to
+/// implement the [`EngineMap`] trait. It simply wraps such a map, and the row.
 pub struct MapItem<'a> {
     map: &'a dyn EngineMap,
     row: usize,
@@ -77,6 +86,11 @@ macro_rules! impl_default_get {
     };
 }
 
+/// When calling back into a [`DataVisitor`], the engine needs to provide a slice of items that
+/// implement this trait. This allows type_safe extraction from the raw data by the kernel. By
+/// default all these methods will return an `Error` that an incorrect type has been asked
+/// for. Therefore, for each "data container" an Engine has, it is only nessecary to implement the
+/// `get_x` method for the type it holds.
 pub trait GetData<'a> {
     impl_default_get!(
         (get_bool, bool),
@@ -88,7 +102,9 @@ pub trait GetData<'a> {
     );
 }
 
-pub trait TypedGetData<'a, T> {
+// This is a convenience wrapper over `GetData` to allow code like:
+// `let name: Option<String> = getters[1].get_opt(row_index, "metadata.name")?;`
+pub(crate) trait TypedGetData<'a, T> {
     fn get_opt(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<T>>;
     fn get(&'a self, row_index: usize, field_name: &str) -> DeltaResult<T> {
         let val = self.get_opt(row_index, field_name)?;
@@ -147,7 +163,7 @@ impl<'a> TypedGetData<'a, HashMap<String, Option<String>>> for dyn GetData<'a> +
 }
 
 /// A `DataVisitor` can be called back to visit extracted data. Aside from calling
-/// [`DataVisitor::visit`] on the visitor passed to [`crate::DataExtractor::extract`], engines do
+/// [`DataVisitor::visit`] on the visitor passed to [`EngineData::extract`], engines do
 /// not need to worry about this trait.
 pub trait DataVisitor {
     // // Receive some data from a call to `extract`. The data in [vals] should not be assumed to live
@@ -160,62 +176,36 @@ pub trait DataVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()>;
 }
 
-/// A TypeTag identifies the class that an Engine is using to represent data read by its
-/// json/parquet readers. We don't parameterize our client by this to avoid having to specify the
-/// generic type _everywhere_, and to make the ffi story easier. TypeTags nevertheless allow us some
-/// amount of runtime type-safety as an engine can check that it got called with a data type it
-/// understands.
-pub trait TypeTag: 'static {
-    // Can't use `:Eq / :PartialEq` as that's generic, and we want to return this trait as an object
-    // below. We require the 'static bound so we can be sure the TypeId will live long enough to
-    // return. In practice this just means that the type must be fully defined and not a generated type.
-
-    /// Return a [`std::any::TypeId`] for this tag.
-    fn tag_id(&self) -> TypeId {
-        TypeId::of::<Self>()
-    }
-
-    /// Check if this tag is equivalent to another tag
-    fn eq(&self, other: &dyn TypeTag) -> bool {
-        let my_id = self.tag_id();
-        let other_id = other.tag_id();
-        my_id == other_id
-    }
-}
-
-/// Any type that an engine wants to return as "data" needs to implement this trait. This should be
-/// as easy as defining a tag to represent it that implements [`TypeTag`], and then returning it for
-/// the `type_tag` method.
-/// TODO(Nick): Make this code again
-/// use std::any::Any;
-/// use deltakernel::DeltaResult;
-/// use deltakernel::engine_data::{DataVisitor, EngineData, TypeTag};
-/// use deltakernel::schema::SchemaRef;
-/// struct MyTypeTag;
-/// impl TypeTag for MyTypeTag {}
+/// Any type that an engine wants to return as "data" needs to implement this trait. The bulk of the
+/// work is in the [`EngineData::extract`] method. See the docs for that method for more details.
+/// ```rust
+/// # use std::any::Any;
+/// # use deltakernel::DeltaResult;
+/// # use deltakernel::engine_data::{DataVisitor, EngineData, GetData};
+/// # use deltakernel::schema::SchemaRef;
 /// struct MyDataType; // Whatever the engine wants here
+/// impl MyDataType {
+///   fn do_extraction<'a>(&self) -> Vec<&'a dyn GetData<'a>> {
+///      /// Actually do the extraction into getters
+///      todo!()
+///   }
+/// }
+///
 /// impl EngineData for MyDataType {
-///    fn type_tag(&self) -> &dyn TypeTag {
-///        &MyTypeTag
-///    }
-///    fn as_any(&self) -> &(dyn Any + 'static) { self }
-///    fn into_any(self: Box<Self>) -> Box<dyn Any> { self }
-/// }
-/// struct MyDataExtractor {
-///   expected_tag: MyTypeTag,
-/// }
-/// impl DataExtractor for MyDataExtractor {
-///   fn extract(&self, blob: &dyn EngineData, _schema: SchemaRef, visitor: &mut dyn DataVisitor) -> DeltaResult<()> {
-///     assert!(self.expected_tag.eq(blob.type_tag())); // Ensure correct data type
-///     // extract the data and call back visitor
+///   fn as_any(&self) -> &dyn Any { self }
+///   fn into_any(self: Box<Self>) -> Box<dyn Any> { self }
+///   fn extract(&self, schema: SchemaRef, visitor: &mut dyn DataVisitor) -> DeltaResult<()> {
+///     let getters = self.do_extraction(); // do the extraction
+///     let row_count = self.length();
+///     visitor.visit(row_count, &getters); // call the visitor back with the getters
 ///     Ok(())
 ///   }
-///   fn length(&self, blob: &dyn EngineData) -> usize {
-///     assert!(self.expected_tag.eq(blob.type_tag())); // Ensure correct data type
+///   fn length(&self) -> usize {
 ///     let len = 0; // actually get the len here
 ///     len
 ///   }
 /// }
+/// ```
 pub trait EngineData: Send {
     /// Request that the data be visited for the passed schema. The contract of this method is that
     /// it will call back into the passed [`DataVisitor`]s `visit` method. The call to `visit` must
@@ -225,8 +215,6 @@ pub trait EngineData: Send {
 
     /// Return the number of items (rows) in blob
     fn length(&self) -> usize;
-
-    fn type_tag(&self) -> &dyn TypeTag;
 
     // TODO(nick) implement this and below here in the trait when it doesn't cause a compiler error
     fn as_any(&self) -> &dyn Any;
