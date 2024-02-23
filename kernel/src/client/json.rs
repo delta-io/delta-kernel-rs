@@ -97,9 +97,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| {
-                Error::generic(format!(
-                    "Expected json_strings to be a StringArray, found something else"
-                ))
+                Error::generic("Expected json_strings to be a StringArray, found something else")
             })?;
         let output_schema: ArrowSchemaRef = Arc::new(output_schema.as_ref().try_into()?);
         if json_strings.is_empty() {

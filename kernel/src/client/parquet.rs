@@ -149,7 +149,7 @@ mod tests {
         engine_data: DeltaResult<Box<dyn EngineData>>,
     ) -> DeltaResult<RecordBatch> {
         engine_data
-            .and_then(|ed| SimpleData::try_from_engine_data(ed))
+            .and_then(SimpleData::try_from_engine_data)
             .map(|sd| sd.into_record_batch())
     }
 
