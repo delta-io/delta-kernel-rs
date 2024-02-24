@@ -4,7 +4,7 @@ mod uncreate {
     /// A struct that cannot be instantiated by any rust code because this modeule exposes no public
     /// constructor for it.
     pub struct Uncreate {
-        _private: usize
+        _private: usize,
     }
 }
 
@@ -115,9 +115,9 @@ pub type Uncreate = uncreate::Uncreate;
 /// * The `Target` type is `Sync`
 ///
 /// * The handle is (correctly) `Send`
-pub trait ArcHandle : Sized {
+pub trait ArcHandle: Sized {
     /// The target type this handle represents.
-    type Target : ?Sized;
+    type Target: ?Sized;
 
     /// Converts the target Arc into a (leaked) "handle" that can cross the FFI boundary. The Arc
     /// refcount does not change. The handle remains valid until passed to [Self::drop_handle].
@@ -159,8 +159,8 @@ pub trait ArcHandle : Sized {
 
 /// A special kind of [ArcHandle] which is optimized for [Sized] types. Handles for sized types are
 /// more efficient if they implement this trait instead of [ArcHandle].
-pub trait SizedArcHandle : Sized {
-    type Target : Sized;
+pub trait SizedArcHandle: Sized {
+    type Target: Sized;
 }
 
 // A blanket implementation of `ArcHandle` for all types satisfying `SizedArcHandle`.
@@ -182,7 +182,10 @@ pub trait SizedArcHandle : Sized {
 // 55 | impl ArcHandle for FooHandle {
 //    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ conflicting implementation for `FooHandle`
 // ```
-impl<H, T> ArcHandle for H where H: SizedArcHandle<Target = T> {
+impl<H, T> ArcHandle for H
+where
+    H: SizedArcHandle<Target = T>,
+{
     type Target = T;
 
     fn into_handle(target: Arc<Self::Target>) -> *const Self {

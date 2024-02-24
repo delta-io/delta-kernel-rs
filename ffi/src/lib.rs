@@ -14,7 +14,7 @@ use deltakernel::expressions::{BinaryOperator, Expression, Scalar};
 use deltakernel::scan::ScanBuilder;
 use deltakernel::schema::{DataType, PrimitiveType, StructField, StructType};
 use deltakernel::snapshot::Snapshot;
-use deltakernel::{DeltaResult, Error, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler, TableClient};
+use deltakernel::{DeltaResult, Error, TableClient};
 
 mod handle;
 use handle::{ArcHandle, SizedArcHandle, Uncreate};
@@ -59,7 +59,7 @@ impl Iterator for EngineIterator {
 #[repr(C)]
 pub enum KernelError {
     UnknownError, // catch-all for unrecognized kernel Error types
-    FFIError, // errors encountered in the code layer that supports FFI
+    FFIError,     // errors encountered in the code layer that supports FFI
     ArrowError,
     GenericError,
     ParquetError,
@@ -132,11 +132,8 @@ pub enum ExternResult<T> {
     Err(*mut EngineError),
 }
 
-type AllocateErrorFn = extern "C" fn(
-    etype: KernelError,
-    msg_ptr: *const c_char,
-    msg_len: usize,
-) -> *mut EngineError;
+type AllocateErrorFn =
+    extern "C" fn(etype: KernelError, msg_ptr: *const c_char, msg_len: usize) -> *mut EngineError;
 
 // NOTE: We can't "just" impl From<DeltaResult<T>> because we require an error allocator.
 impl<T> ExternResult<T> {
@@ -151,19 +148,12 @@ impl<T> ExternResult<T> {
     }
 }
 
-
 trait IntoExternResult<T> {
-    fn into_extern_result(
-        self,
-        allocate_error: AllocateErrorFn,
-    ) -> ExternResult<T>;
+    fn into_extern_result(self, allocate_error: AllocateErrorFn) -> ExternResult<T>;
 }
 
 impl<T> IntoExternResult<T> for DeltaResult<T> {
-    fn into_extern_result(
-        self,
-        allocate_error: AllocateErrorFn,
-    ) -> ExternResult<T> {
+    fn into_extern_result(self, allocate_error: AllocateErrorFn) -> ExternResult<T> {
         match self {
             Ok(ok) => ExternResult::Ok(ok),
             Err(err) => {
@@ -200,6 +190,18 @@ struct ExternTableClientVtable {
     allocate_error: AllocateErrorFn,
 }
 
+/// # Safety
+///
+/// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
+/// responsible to handle any races that could result.
+unsafe impl Send for ExternTableClientVtable {}
+
+/// # Safety
+///
+/// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
+/// responsible to handle any races that could result.
+unsafe impl Sync for ExternTableClientVtable {}
+
 impl ExternTableClient for ExternTableClientVtable {
     fn table_client(&self) -> Arc<dyn TableClient> {
         self.client.clone()
@@ -220,6 +222,9 @@ unsafe fn unwrap_and_parse_path_as_url(path: *const c_char) -> DeltaResult<Url> 
     Url::from_directory_path(path).map_err(|_| Error::generic("Invalid url"))
 }
 
+/// # Safety
+///
+/// Caller is responsible to pass a valid path pointer.
 #[no_mangle]
 pub unsafe extern "C" fn get_default_client(
     path: *const c_char,
@@ -247,6 +252,9 @@ unsafe fn get_default_client_impl(
     Ok(ArcHandle::into_handle(client))
 }
 
+/// # Safety
+///
+/// Caller is responsible to pass a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn drop_table_client(table_client: *const ExternTableClientHandle) {
     ArcHandle::drop_handle(table_client);
@@ -261,6 +269,10 @@ impl SizedArcHandle for SnapshotHandle {
 }
 
 /// Get the latest snapshot from the specified table
+///
+/// # Safety
+///
+/// Caller is responsible to pass valid handles and path pointer.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot(
     path: *const c_char,
@@ -280,12 +292,19 @@ unsafe fn snapshot_impl(
     Ok(ArcHandle::into_handle(snapshot))
 }
 
+/// # Safety
+///
+/// Caller is responsible to pass a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn drop_snapshot(snapshot: *const SnapshotHandle) {
     ArcHandle::drop_handle(snapshot);
 }
 
 /// Get the version of the specified snapshot
+///
+/// # Safety
+///
+/// Caller is responsible to pass a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn version(snapshot: *const SnapshotHandle) -> u64 {
     let snapshot = unsafe { ArcHandle::clone_as_arc(snapshot) };
@@ -314,8 +333,14 @@ pub struct EngineSchemaVisitor {
     visit_long: extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: *const c_char) -> (),
 }
 
+/// # Safety
+///
+/// Caller is responsible to pass a valid handle.
 #[no_mangle]
-pub extern "C" fn visit_schema(snapshot: *const SnapshotHandle, visitor: &mut EngineSchemaVisitor) -> usize {
+pub unsafe extern "C" fn visit_schema(
+    snapshot: *const SnapshotHandle,
+    visitor: &mut EngineSchemaVisitor,
+) -> usize {
     let snapshot = unsafe { ArcHandle::clone_as_arc(snapshot) };
     // Visit all the fields of a struct and return the list of children
     fn visit_struct_fields(visitor: &EngineSchemaVisitor, s: &StructType) -> usize {
@@ -571,7 +596,7 @@ impl Drop for KernelScanFileIterator {
 ///
 /// Caller is responsible to pass a valid snapshot pointer.
 #[no_mangle]
-pub extern "C" fn kernel_scan_files_init(
+pub unsafe extern "C" fn kernel_scan_files_init(
     snapshot: *const SnapshotHandle,
     table_client: *const ExternTableClientHandle,
     predicate: Option<&mut EnginePredicate>,
@@ -594,7 +619,10 @@ pub extern "C" fn kernel_scan_files_init(
         }
     }
     let real_table_client = table_client.table_client();
-    let scan_adds = scan_builder.build().files(real_table_client.as_ref()).unwrap();
+    let scan_adds = scan_builder
+        .build()
+        .files(real_table_client.as_ref())
+        .unwrap();
     let files = scan_adds.map(|add| add.unwrap().path);
     let files = KernelScanFileIterator {
         files: Box::new(Mutex::new(files)),
@@ -617,7 +645,11 @@ pub extern "C" fn kernel_scan_files_next(
     }
 }
 
+/// # Safety
+///
+/// Caller is responsible to (at most once) pass a valid pointer returned by a call to
+/// [kernel_scan_files_init].
 #[no_mangle]
-pub extern "C" fn kernel_scan_files_free(files: *mut KernelScanFileIterator) {
+pub unsafe extern "C" fn kernel_scan_files_free(files: *mut KernelScanFileIterator) {
     let _ = unsafe { Box::from_raw(files) };
 }
