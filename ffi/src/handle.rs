@@ -1,5 +1,22 @@
 use std::sync::Arc;
 
+/// Helper trait that simplifies passing an instance of a Sized type across the FFI boundary as a
+/// leaked thin pointer. Does not include any reference-counting capability, so engine is
+/// responsible to do whatever reference counting the engine may need. Engine is also responsible
+/// not to drop an in-use handle, so kernel code can safely dereference the pointer.
+pub trait BoxHandle: Sized {
+    fn into_handle(self) -> *mut Self {
+        Box::into_raw(Box::new(self))
+    }
+    /// # Safety
+    ///
+    /// The `handle` was returned by a call to `into_handle`, has not already been passed to
+    /// `drop_handle`, and has no other live references.
+    unsafe fn drop_handle(handle: *mut Self) {
+        let _ = unsafe { Box::from_raw(handle) };
+    }
+}
+
 mod uncreate {
     /// A struct that cannot be instantiated by any rust code because this modeule exposes no public
     /// constructor for it.
@@ -151,6 +168,7 @@ pub trait ArcHandle: Sized {
     /// * Obtained by calling [into_handle]
     /// * Never cast to any other type nor dereferenced
     /// * Not previously passed to [drop_handle]
+    /// * Has no other live references
     unsafe fn drop_handle(handle: *const Self) {
         let ptr = handle as *mut Arc<Self::Target>;
         let _ = unsafe { Box::from_raw(ptr) };

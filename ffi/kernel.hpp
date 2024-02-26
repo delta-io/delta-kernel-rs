@@ -68,18 +68,41 @@ struct ExternResult {
   };
 };
 
-using AllocateErrorFn = EngineError*(*)(KernelError etype, const char *msg_ptr, uintptr_t msg_len);
+/// A non-owned slice of a UTF8 string, intended for arg-passing between kernel and engine. The
+/// slice is only valid until the function it was passed into returns, and should not be copied.
+///
+/// # Safety
+///
+/// Intentionally not Copy, Clone, Send, nor Sync.
+///
+/// Whoever instantiates the struct must ensure it does not outlive the data it points to. The
+/// compiler cannot help us here, because raw pointers don't have lifetimes. To reduce the risk of
+/// accidental misuse, it is recommended to only instantiate this struct as a function arg, by
+/// converting a `&str` value `Into<KernelStringSlice>`, so the borrowed reference protects the
+/// function call (callee must not retain any references to the slice after the call returns):
+///
+/// ```
+/// fn wants_slice(slice: KernelStringSlice) { ... }
+/// let msg = String::from(...);
+/// wants_slice(msg.as_ref().into());
+/// ```
+struct KernelStringSlice {
+  const char *ptr;
+  uintptr_t len;
+};
+
+using AllocateErrorFn = EngineError*(*)(KernelError etype, KernelStringSlice msg);
 
 struct EngineSchemaVisitor {
   void *data;
   uintptr_t (*make_field_list)(void *data, uintptr_t reserve);
   void (*visit_struct)(void *data,
                        uintptr_t sibling_list_id,
-                       const char *name,
+                       KernelStringSlice name,
                        uintptr_t child_list_id);
-  void (*visit_string)(void *data, uintptr_t sibling_list_id, const char *name);
-  void (*visit_integer)(void *data, uintptr_t sibling_list_id, const char *name);
-  void (*visit_long)(void *data, uintptr_t sibling_list_id, const char *name);
+  void (*visit_string)(void *data, uintptr_t sibling_list_id, KernelStringSlice name);
+  void (*visit_integer)(void *data, uintptr_t sibling_list_id, KernelStringSlice name);
+  void (*visit_long)(void *data, uintptr_t sibling_list_id, KernelStringSlice name);
 };
 
 struct EnginePredicate {
@@ -95,7 +118,7 @@ void iterate(EngineIterator *it);
 /// # Safety
 ///
 /// Caller is responsible to pass a valid path pointer.
-ExternResult<const ExternTableClientHandle*> get_default_client(const char *path,
+ExternResult<const ExternTableClientHandle*> get_default_client(KernelStringSlice path,
                                                                 AllocateErrorFn allocate_error);
 
 /// # Safety
@@ -108,9 +131,8 @@ void drop_table_client(const ExternTableClientHandle *table_client);
 /// # Safety
 ///
 /// Caller is responsible to pass valid handles and path pointer.
-ExternResult<const SnapshotHandle*> snapshot(const char *path,
-                                             const ExternTableClientHandle *table_client,
-                                             AllocateErrorFn allocate_error);
+ExternResult<const SnapshotHandle*> snapshot(KernelStringSlice path,
+                                             const ExternTableClientHandle *table_client);
 
 /// # Safety
 ///
@@ -141,9 +163,14 @@ uintptr_t visit_expression_ge(KernelExpressionVisitorState *state, uintptr_t a, 
 
 uintptr_t visit_expression_eq(KernelExpressionVisitorState *state, uintptr_t a, uintptr_t b);
 
-uintptr_t visit_expression_column(KernelExpressionVisitorState *state, const char *name);
+/// # Safety
+/// The string slice must be valid
+uintptr_t visit_expression_column(KernelExpressionVisitorState *state, KernelStringSlice name);
 
-uintptr_t visit_expression_literal_string(KernelExpressionVisitorState *state, const char *value);
+/// # Safety
+/// The string slice must be valid
+uintptr_t visit_expression_literal_string(KernelExpressionVisitorState *state,
+                                          KernelStringSlice value);
 
 uintptr_t visit_expression_literal_long(KernelExpressionVisitorState *state, int64_t value);
 
@@ -151,15 +178,18 @@ uintptr_t visit_expression_literal_long(KernelExpressionVisitorState *state, int
 /// # Safety
 ///
 /// Caller is responsible to pass a valid snapshot pointer.
-KernelScanFileIterator *kernel_scan_files_init(const SnapshotHandle *snapshot,
-                                               const ExternTableClientHandle *table_client,
-                                               EnginePredicate *predicate);
+ExternResult<KernelScanFileIterator*> kernel_scan_files_init(const SnapshotHandle *snapshot,
+                                                             const ExternTableClientHandle *table_client,
+                                                             EnginePredicate *predicate);
 
-void kernel_scan_files_next(KernelScanFileIterator *files,
-                            void *engine_context,
-                            void (*engine_visitor)(void *engine_context,
-                                                   const char *ptr,
-                                                   uintptr_t len));
+/// # Safety
+///
+/// The iterator must be valid (returned by [kernel_scan_files_init]) and not yet freed by
+/// [kernel_scan_files_free]. The visitor function pointer must be non-null.
+ExternResult<bool> kernel_scan_files_next(KernelScanFileIterator *files,
+                                          void *engine_context,
+                                          void (*engine_visitor)(void *engine_context,
+                                                                 KernelStringSlice file_name));
 
 /// # Safety
 ///
