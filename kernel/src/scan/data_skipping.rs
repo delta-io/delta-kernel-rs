@@ -185,6 +185,8 @@ impl DataSkippingFilter {
         })
     }
 
+    // TODO(nick): This should not be expressed in terms of SimpleData, but should use only the
+    // expression API
     pub(crate) fn apply(&self, actions: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         let stats = self.select_stats_evaluator.evaluate(actions)?;
         let parsed_stats = self
@@ -192,19 +194,8 @@ impl DataSkippingFilter {
             .parse_json(stats, self.stats_schema.clone())?;
 
         let skipping_predicate = self.skipping_evaluator.evaluate(&*parsed_stats)?;
-        let skipping_predicate = skipping_predicate
-            .as_any()
-            .downcast_ref::<SimpleData>()
-            .unwrap();
-        // TODO(nick): Ensure this is okay
-        // let skipping_predicate = skipping_predicate
-        //     .as_struct_opt()
-        //     .ok_or(Error::unexpected_column_type(
-        //         "Expected type 'StructArray'.",
-        //     ))?
-        //     .into();
 
-        let skipping_vector = self.filter_evaluator.evaluate(skipping_predicate)?;
+        let skipping_vector = self.filter_evaluator.evaluate(skipping_predicate.as_ref())?;
         let skipping_vector = skipping_vector
             .as_any()
             .downcast_ref::<SimpleData>()

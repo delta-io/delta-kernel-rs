@@ -23,8 +23,7 @@
 //! Delta Kernel requires the capability to read json and parquet files, which is exposed via the
 //! [`JsonHandler`] and [`ParquetHandler`] respectively. When reading files, connectors are asked to
 //! provide the context information it requires to execute the actual read. This is done by invoking
-//! methods on the [`FileSystemClient`] trait. All specific file handlers must also provide the
-//! contextualization APis.
+//! methods on the [`FileSystemClient`] trait.
 //!
 
 #![warn(
