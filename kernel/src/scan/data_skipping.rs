@@ -195,7 +195,9 @@ impl DataSkippingFilter {
 
         let skipping_predicate = self.skipping_evaluator.evaluate(&*parsed_stats)?;
 
-        let skipping_vector = self.filter_evaluator.evaluate(skipping_predicate.as_ref())?;
+        let skipping_vector = self
+            .filter_evaluator
+            .evaluate(skipping_predicate.as_ref())?;
         let skipping_vector = skipping_vector
             .as_any()
             .downcast_ref::<SimpleData>()
