@@ -1,3 +1,14 @@
+//! A set of traits and types to help safely and ergonically pass rust objects across the FFI
+//! boundary as thin pointer "handles". A handle is an opaque type that aids type safety by uniquely
+//! identifying some Rust type that may not even be representable (such as traits). There are three
+//! kinds of handles:
+//!
+//! * [BoxHandle] represents the content of a `Box<T>`, where `T` is a sized type.
+//! * [ArcHandle] represents the content of an `Arc<T>`, where `T` may not be sized.
+//! * [SizedArcHandle] specializes [ArcHandle] to handle sized types efficiently.
+//!
+//! Box handles are useful for passing owned sized data across the FFI boundary, while Arc handles
+//! are more suitable for shared and/or unsized data.
 use std::sync::Arc;
 
 /// Helper trait that simplifies passing an instance of a Sized type across the FFI boundary as a
@@ -17,23 +28,23 @@ pub trait BoxHandle: Sized {
     }
 }
 
-mod uncreate {
-    /// A struct that cannot be instantiated by any rust code because this modeule exposes no public
-    /// constructor for it.
-    pub struct Uncreate {
+mod unconstructable {
+    /// A struct that cannot be instantiated by any rust code because this module exposes no public
+    /// constructor for it. Intentionally _NOT_ a zero-sized type, to avoid weirdness in C/C++ land.
+    pub struct Unconstructable {
         _private: usize,
     }
 }
 
 // Make it easy to use (the module was only used to enforce member privacy).
-pub type Uncreate = uncreate::Uncreate;
+pub type Unconstructable = unconstructable::Unconstructable;
 
 /// Helper trait that allows passing `Arc<Target>` across the FFI boundary as a thin-pointer handle
 /// type. The pointer remains valid until freed by a call to [ArcHandle::drop_handle]. The handle is
 /// strongly typed, in the sense that each handle type maps to a single `Target` type.
 ///
 /// Typically, the handle (`Self`) is an opaque struct (_not_ `repr(C)`) with an FFI-friendly name
-/// name, containing an [Uncreate] member that prevents rust code from legally instantiating it.
+/// name, containing an [Unconstructable] member so rust code cannot legally instantiate it.
 ///
 /// # Examples
 ///
@@ -44,7 +55,7 @@ pub type Uncreate = uncreate::Uncreate;
 ///
 /// // The handle that will represent `MyStruct` externally
 /// struct MyTraitHandle {
-///     _uncreate: Uncreate,
+///     _unconstructable: Unconstructable,
 /// }
 ///
 /// // Connect the two
@@ -69,7 +80,7 @@ pub type Uncreate = uncreate::Uncreate;
 ///
 /// // The handle that will represent `MyStruct` externally
 /// struct MyStructHandle {
-///     _uncreate: Uncreate,
+///     _unconstructable: Unconstructable,
 /// }
 ///
 /// // Connect the two
@@ -184,8 +195,8 @@ pub trait SizedArcHandle: Sized {
 // A blanket implementation of `ArcHandle` for all types satisfying `SizedArcHandle`.
 //
 // Unlike the default (unsized) implementation, which must wrap the Arc in a Box in order to obtain
-// a thin pointer, the sized implementation can directly return a pointer to the Arc's
-// underlying. This blanket implementation applies automatically to all types that implement
+// a thin pointer, the sized implementation can directly return a pointer to the Arc's underlying
+// type. This blanket implementation applies automatically to all types that implement
 // SizedArcHandle, so a type that implements SizedArcHandle cannot directly implement ArcHandle
 // (which is a Good Thing, because it preserves the important type safety invariant that every
 // handle has exactly one `Target` type):

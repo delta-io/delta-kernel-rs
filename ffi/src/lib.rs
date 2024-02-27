@@ -17,7 +17,7 @@ use deltakernel::Add;
 use deltakernel::{DeltaResult, Error, TableClient};
 
 mod handle;
-use handle::{ArcHandle, BoxHandle, SizedArcHandle, Uncreate};
+use handle::{ArcHandle, BoxHandle, SizedArcHandle, Unconstructable};
 
 /// Model iterators. This allows an engine to specify iteration however it likes, and we simply wrap
 /// the engine functions. The engine retains ownership of the iterator.
@@ -92,20 +92,23 @@ impl Into<KernelStringSlice> for &str {
     }
 }
 
-trait FromStringSlice {
-    unsafe fn from_slice(slice: KernelStringSlice) -> Self;
+trait TryFromStringSlice: Sized {
+    unsafe fn try_from_slice(slice: KernelStringSlice) -> DeltaResult<Self>;
 }
 
-impl FromStringSlice for String {
+impl TryFromStringSlice for String {
     /// Converts a slice back to a string
     ///
     /// # Safety
     ///
     /// The slice must be a valid (non-null) pointer, and must point to the indicated number of
     /// valid utf8 bytes.
-    unsafe fn from_slice(slice: KernelStringSlice) -> String {
-        let slice = std::slice::from_raw_parts(slice.ptr.cast(), slice.len);
-        std::str::from_utf8_unchecked(slice).to_string()
+    unsafe fn try_from_slice(slice: KernelStringSlice) -> DeltaResult<String> {
+        let slice = unsafe { std::slice::from_raw_parts(slice.ptr.cast(), slice.len) };
+        match std::str::from_utf8(slice) {
+            Ok(s) => Ok(s.to_string()),
+            Err(e) => Err(Error::generic_err(e)),
+        }
     }
 }
 
@@ -172,8 +175,12 @@ impl From<Error> for KernelError {
     }
 }
 
-/// An error that can be returned to the engine. Engines can define additional struct fields on
-/// their side, by e.g. embedding this struct as the first member of a larger struct.
+/// An error that can be returned to the engine. Engines that wish to associate additional
+/// information can define and use any type that is [pointer
+/// interconvertible](https://en.cppreference.com/w/cpp/language/static_cast#pointer-interconvertible)
+/// with this one -- e.g. by subclassing this struct or by embedding this struct as the first member
+/// of a [standard layout](https://en.cppreference.com/w/cpp/language/data_members#Standard-layout)
+/// class.
 #[repr(C)]
 pub struct EngineError {
     etype: KernelError,
@@ -281,7 +288,7 @@ pub trait ExternTableClient {
 }
 
 pub struct ExternTableClientHandle {
-    _uncreate: Uncreate,
+    _unconstructable: Unconstructable,
 }
 
 impl ArcHandle for ExternTableClientHandle {
@@ -319,8 +326,8 @@ impl ExternTableClient for ExternTableClientVtable {
 ///
 /// Caller is responsible to pass a valid path pointer.
 unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<Url> {
-    let path = unsafe { String::from_slice(path) };
-    let path = std::fs::canonicalize(PathBuf::from(path)).map_err(Error::generic)?;
+    let path = unsafe { String::try_from_slice(path) };
+    let path = std::fs::canonicalize(PathBuf::from(path?)).map_err(Error::generic)?;
     Url::from_directory_path(path).map_err(|_| Error::generic("Invalid url"))
 }
 
@@ -363,7 +370,7 @@ pub unsafe extern "C" fn drop_table_client(table_client: *const ExternTableClien
 }
 
 pub struct SnapshotHandle {
-    _uncreate: Uncreate,
+    _unconstructable: Unconstructable,
 }
 
 impl SizedArcHandle for SnapshotHandle {
@@ -646,8 +653,16 @@ pub extern "C" fn visit_expression_eq(
 pub unsafe extern "C" fn visit_expression_column(
     state: &mut KernelExpressionVisitorState,
     name: KernelStringSlice,
-) -> usize {
-    wrap_expression(state, Expression::Column(String::from_slice(name)))
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    visit_expression_column_impl(state, name).into_extern_result(allocate_error)
+}
+unsafe fn visit_expression_column_impl(
+    state: &mut KernelExpressionVisitorState,
+    name: KernelStringSlice,
+) -> DeltaResult<usize> {
+    let name = unsafe { String::try_from_slice(name) };
+    Ok(wrap_expression(state, Expression::Column(name?)))
 }
 
 /// # Safety
@@ -656,11 +671,19 @@ pub unsafe extern "C" fn visit_expression_column(
 pub unsafe extern "C" fn visit_expression_literal_string(
     state: &mut KernelExpressionVisitorState,
     value: KernelStringSlice,
-) -> usize {
-    wrap_expression(
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    visit_expression_literal_string_impl(state, value).into_extern_result(allocate_error)
+}
+unsafe fn visit_expression_literal_string_impl(
+    state: &mut KernelExpressionVisitorState,
+    value: KernelStringSlice,
+) -> DeltaResult<usize> {
+    let value = unsafe { String::try_from_slice(value) };
+    Ok(wrap_expression(
         state,
-        Expression::Literal(Scalar::from(String::from_slice(value))),
-    )
+        Expression::Literal(Scalar::from(value?)),
+    ))
 }
 
 #[no_mangle]

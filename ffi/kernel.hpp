@@ -165,12 +165,15 @@ uintptr_t visit_expression_eq(KernelExpressionVisitorState *state, uintptr_t a, 
 
 /// # Safety
 /// The string slice must be valid
-uintptr_t visit_expression_column(KernelExpressionVisitorState *state, KernelStringSlice name);
+ExternResult<uintptr_t> visit_expression_column(KernelExpressionVisitorState *state,
+                                                KernelStringSlice name,
+                                                AllocateErrorFn allocate_error);
 
 /// # Safety
 /// The string slice must be valid
-uintptr_t visit_expression_literal_string(KernelExpressionVisitorState *state,
-                                          KernelStringSlice value);
+ExternResult<uintptr_t> visit_expression_literal_string(KernelExpressionVisitorState *state,
+                                                        KernelStringSlice value,
+                                                        AllocateErrorFn allocate_error);
 
 uintptr_t visit_expression_literal_long(KernelExpressionVisitorState *state, int64_t value);
 

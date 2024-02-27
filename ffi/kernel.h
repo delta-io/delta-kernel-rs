@@ -124,6 +124,23 @@ typedef struct EngineSchemaVisitor {
   void (*visit_long)(void *data, uintptr_t sibling_list_id, struct KernelStringSlice name);
 } EngineSchemaVisitor;
 
+typedef enum ExternResult_usize_Tag {
+  Ok_usize,
+  Err_usize,
+} ExternResult_usize_Tag;
+
+typedef struct ExternResult_usize {
+  ExternResult_usize_Tag tag;
+  union {
+    struct {
+      uintptr_t ok;
+    };
+    struct {
+      struct EngineError *err;
+    };
+  };
+} ExternResult_usize;
+
 typedef enum ExternResult_____KernelScanFileIterator_Tag {
   Ok_____KernelScanFileIterator,
   Err_____KernelScanFileIterator,
@@ -233,15 +250,17 @@ uintptr_t visit_expression_eq(struct KernelExpressionVisitorState *state, uintpt
  * # Safety
  * The string slice must be valid
  */
-uintptr_t visit_expression_column(struct KernelExpressionVisitorState *state,
-                                  struct KernelStringSlice name);
+struct ExternResult_usize visit_expression_column(struct KernelExpressionVisitorState *state,
+                                                  struct KernelStringSlice name,
+                                                  AllocateErrorFn allocate_error);
 
 /**
  * # Safety
  * The string slice must be valid
  */
-uintptr_t visit_expression_literal_string(struct KernelExpressionVisitorState *state,
-                                          struct KernelStringSlice value);
+struct ExternResult_usize visit_expression_literal_string(struct KernelExpressionVisitorState *state,
+                                                          struct KernelStringSlice value,
+                                                          AllocateErrorFn allocate_error);
 
 uintptr_t visit_expression_literal_long(struct KernelExpressionVisitorState *state, int64_t value);
 
