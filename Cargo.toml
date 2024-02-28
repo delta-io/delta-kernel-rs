@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "acceptance",
+    "derive-macros",
     "ffi",
     "kernel",
     "kernel/examples/*",
