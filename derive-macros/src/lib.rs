@@ -84,14 +84,12 @@ fn get_schema_name(name: &Ident) -> Ident {
             if c == '_' {
                 next_caps = true;
                 None
+            } else if next_caps {
+                next_caps = false;
+                // This assumes we're using ascii, should be okay
+                Some(c.to_ascii_uppercase())
             } else {
-                if next_caps {
-                    next_caps = false;
-                    // This assumes we're using ascii, should be okay
-                    Some(c.to_ascii_uppercase())
-                } else {
-                    Some(c)
-                }
+                Some(c)
             }
         })
         .collect();
