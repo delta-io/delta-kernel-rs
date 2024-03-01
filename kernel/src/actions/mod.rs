@@ -7,17 +7,9 @@ use derive_macros::Schema;
 use std::{collections::HashMap, sync::Arc};
 use visitors::{AddVisitor, MetadataVisitor, ProtocolVisitor};
 
-use crate::{
-    schema::{StructField, StructType},
-    DeltaResult, EngineData,
-};
+use crate::{schema::StructType, DeltaResult, EngineData};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-
-/// A trait that says you can ask for the [`Schema`] of the implementor
-trait GetSchema {
-    fn get_schema() -> StructField;
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
 pub struct Format {
@@ -37,6 +29,7 @@ impl Default for Format {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Schema)]
+#[schema(name = metaData)]
 pub struct Metadata {
     /// Unique identifier for this table
     pub id: String,
