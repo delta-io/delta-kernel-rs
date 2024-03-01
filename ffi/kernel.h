@@ -44,8 +44,12 @@ typedef struct EngineIterator {
 } EngineIterator;
 
 /**
- * An error that can be returned to the engine. Engines can define additional struct fields on
- * their side, by e.g. embedding this struct as the first member of a larger struct.
+ * An error that can be returned to the engine. Engines that wish to associate additional
+ * information can define and use any type that is [pointer
+ * interconvertible](https://en.cppreference.com/w/cpp/language/static_cast#pointer-interconvertible)
+ * with this one -- e.g. by subclassing this struct or by embedding this struct as the first member
+ * of a [standard layout](https://en.cppreference.com/w/cpp/language/data_members#Standard-layout)
+ * class.
  */
 typedef struct EngineError {
   enum KernelError etype;
