@@ -81,8 +81,8 @@ fn get_schema_name(name: &Ident) -> Ident {
         } else {
             if next_caps {
                 next_caps = false;
-                // This assumes we're basically using ascii, should be okay
-                Some(c.to_uppercase().next().unwrap())
+                // This assumes we're using ascii, should be okay
+                Some(c.to_ascii_uppercase())
             } else {
                 Some(c)
             }
