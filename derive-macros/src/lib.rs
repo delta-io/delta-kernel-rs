@@ -14,25 +14,14 @@ fn get_schema_name_from_attr<'a>(attrs: impl Iterator<Item = &'a Attribute>) -> 
                 if attr_name.ident == "schema" {
                     // We have some schema(...) attribute, see if we've specified a different name
                     let tokens: Vec<TokenTree> = list.tokens.clone().into_iter().collect();
-                    if tokens.len() == 3 {
+                    match tokens[..] {
                         // we only support `name = name` style
-                        if let TokenTree::Ident(ref ident) = tokens[0] {
+                        [TokenTree::Ident(ref ident), TokenTree::Punct(ref punct), TokenTree::Ident(ref ident)] => {
                             assert!(ident == "name");
-                        } else {
-                            panic!("schema(...) only supports schema(name = name)");
-                        }
-                        // ensure a normal = sign in the specification
-                        if let TokenTree::Punct(ref punct) = tokens[1] {
                             assert!(punct.as_char() == '=');
-                            assert!(punct.spacing() == Spacing::Alone);
-                        } else {
-                            panic!("schema(...) only supports schema(name = name)");
-                        }
-                        if let TokenTree::Ident(ref ident) = tokens[2] {
                             return Some(ident.clone());
-                        } else {
-                            panic!("schema(...) only supports schema(name = name)");
                         }
+                        _ => panic!("schema(...) only supports schema(name = name)"),
                     }
                 } else {
                     panic!("Schema only accepts `schema` as an extra attribute")
