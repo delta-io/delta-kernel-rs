@@ -17,7 +17,8 @@ fn get_schema_name_from_attr<'a>(attrs: impl Iterator<Item = &'a Attribute>) -> 
                     let tokens: Vec<TokenTree> = list.tokens.clone().into_iter().collect();
                     match tokens[..] {
                         // we only support `name = name` style
-                        [TokenTree::Ident(ref name_ident), TokenTree::Punct(ref punct), TokenTree::Ident(ref schema_ident)] => {
+                        [TokenTree::Ident(ref name_ident), TokenTree::Punct(ref punct), TokenTree::Ident(ref schema_ident)] =>
+                        {
                             assert!(name_ident == "name", "{}", SCHEMA_ERR_STR);
                             assert!(punct.as_char() == '=', "{}", SCHEMA_ERR_STR);
                             assert!(punct.spacing() == Spacing::Alone, "{}", SCHEMA_ERR_STR);
@@ -38,11 +39,13 @@ fn get_schema_name_from_attr<'a>(attrs: impl Iterator<Item = &'a Attribute>) -> 
 pub fn derive_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let struct_ident = input.ident;
-    let schema_name =
-        get_schema_name_from_attr(input.attrs.iter()).unwrap_or_else(|| {
-            // default to the struct name, but lowercased
-            Ident::new(&struct_ident.to_string().to_lowercase(), struct_ident.span())
-        });
+    let schema_name = get_schema_name_from_attr(input.attrs.iter()).unwrap_or_else(|| {
+        // default to the struct name, but lowercased
+        Ident::new(
+            &struct_ident.to_string().to_lowercase(),
+            struct_ident.span(),
+        )
+    });
 
     let schema_fields = gen_schema_fields(&input.data);
     let output = quote! {
@@ -71,25 +74,27 @@ pub fn derive_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream 
     proc_macro::TokenStream::from(output)
 }
 
-
 // turn our struct name into the schema name, goes from snake_case to camelCase
 fn get_schema_name(name: &Ident) -> Ident {
     let snake_name = name.to_string();
     let mut next_caps = false;
-    let ret: String = snake_name.chars().filter_map(|c| {
-        if c == '_' {
-            next_caps = true;
-            None
-        } else {
-            if next_caps {
-                next_caps = false;
-                // This assumes we're using ascii, should be okay
-                Some(c.to_ascii_uppercase())
+    let ret: String = snake_name
+        .chars()
+        .filter_map(|c| {
+            if c == '_' {
+                next_caps = true;
+                None
             } else {
-                Some(c)
+                if next_caps {
+                    next_caps = false;
+                    // This assumes we're using ascii, should be okay
+                    Some(c.to_ascii_uppercase())
+                } else {
+                    Some(c)
+                }
             }
-        }
-    }).collect();
+        })
+        .collect();
     Ident::new(&ret, name.span())
 }
 

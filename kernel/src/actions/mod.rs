@@ -207,7 +207,10 @@ impl Remove {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{actions::schemas::GetSchema, schema::{StructField, DataType, ArrayType, MapType}};
+    use crate::{
+        actions::schemas::GetSchema,
+        schema::{ArrayType, DataType, MapType, StructField},
+    };
 
     #[test]
     fn test_metadata_schema() {
@@ -225,11 +228,7 @@ mod tests {
                         StructField::new("provider", DataType::STRING, false),
                         StructField::new(
                             "options",
-                            MapType::new(
-                                DataType::STRING,
-                                DataType::STRING,
-                                false,
-                            ),
+                            MapType::new(DataType::STRING, DataType::STRING, false),
                             false,
                         ),
                     ]),
@@ -244,11 +243,7 @@ mod tests {
                 StructField::new("createdTime", DataType::LONG, true),
                 StructField::new(
                     "configuration",
-                    MapType::new(
-                        DataType::STRING,
-                        DataType::STRING,
-                        true,
-                    ),
+                    MapType::new(DataType::STRING, DataType::STRING, true),
                     false,
                 ),
             ]),
