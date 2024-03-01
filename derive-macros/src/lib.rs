@@ -5,8 +5,9 @@ use syn::{
     parse_macro_input, Attribute, Data, DataStruct, DeriveInput, Fields, Meta, PathArguments, Type,
 };
 
+static SCHEMA_ERR_STR: &str = "schema(...) only supports schema(name = name)";
+
 // Return the ident to use as the schema name if it's been specified in the attributes of the struct
-// TODO: can we simplify this?
 fn get_schema_name_from_attr<'a>(attrs: impl Iterator<Item = &'a Attribute>) -> Option<Ident> {
     for attr in attrs {
         if let Meta::List(list) = &attr.meta {
@@ -16,12 +17,13 @@ fn get_schema_name_from_attr<'a>(attrs: impl Iterator<Item = &'a Attribute>) -> 
                     let tokens: Vec<TokenTree> = list.tokens.clone().into_iter().collect();
                     match tokens[..] {
                         // we only support `name = name` style
-                        [TokenTree::Ident(ref ident), TokenTree::Punct(ref punct), TokenTree::Ident(ref ident)] => {
-                            assert!(ident == "name");
-                            assert!(punct.as_char() == '=');
-                            return Some(ident.clone());
+                        [TokenTree::Ident(ref name_ident), TokenTree::Punct(ref punct), TokenTree::Ident(ref schema_ident)] => {
+                            assert!(name_ident == "name", "{}", SCHEMA_ERR_STR);
+                            assert!(punct.as_char() == '=', "{}", SCHEMA_ERR_STR);
+                            assert!(punct.spacing() == Spacing::Alone, "{}", SCHEMA_ERR_STR);
+                            return Some(schema_ident.clone());
                         }
-                        _ => panic!("schema(...) only supports schema(name = name)"),
+                        _ => panic!("{}", SCHEMA_ERR_STR),
                     }
                 } else {
                     panic!("Schema only accepts `schema` as an extra attribute")
