@@ -203,3 +203,57 @@ impl Remove {
         self.deletion_vector.as_ref().map(|dv| dv.unique_id())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{actions::schemas::GetSchema, schema::{StructField, DataType, ArrayType, MapType}};
+
+    #[test]
+    fn test_metadata_schema() {
+        let schema = Metadata::get_schema();
+
+        let expected = StructField::new(
+            "metaData",
+            StructType::new(vec![
+                StructField::new("id", DataType::STRING, false),
+                StructField::new("name", DataType::STRING, true),
+                StructField::new("description", DataType::STRING, true),
+                StructField::new(
+                    "format",
+                    StructType::new(vec![
+                        StructField::new("provider", DataType::STRING, false),
+                        StructField::new(
+                            "options",
+                            MapType::new(
+                                DataType::STRING,
+                                DataType::STRING,
+                                false,
+                            ),
+                            false,
+                        ),
+                    ]),
+                    false,
+                ),
+                StructField::new("schemaString", DataType::STRING, false),
+                StructField::new(
+                    "partitionColumns",
+                    ArrayType::new(DataType::STRING, false),
+                    false,
+                ),
+                StructField::new("createdTime", DataType::LONG, true),
+                StructField::new(
+                    "configuration",
+                    MapType::new(
+                        DataType::STRING,
+                        DataType::STRING,
+                        true,
+                    ),
+                    false,
+                ),
+            ]),
+            false,
+        );
+        assert_eq!(schema, expected);
+    }
+}
