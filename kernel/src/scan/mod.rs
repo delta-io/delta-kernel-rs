@@ -1,17 +1,13 @@
 use std::sync::Arc;
 
-use arrow_array::cast::AsArray;
-use arrow_array::{BooleanArray, RecordBatch};
-use arrow_select::concat::concat_batches;
-use arrow_select::filter::filter_record_batch;
 use itertools::Itertools;
 
 use self::file_stream::log_replay_iter;
-use crate::actions::ActionType;
+use crate::actions::Add;
 use crate::expressions::{Expression, Scalar};
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::snapshot::Snapshot;
-use crate::{Add, DeltaResult, EngineInterface, Error, FileMeta};
+use crate::{DeltaResult, EngineData, EngineInterface, Error, FileMeta};
 
 mod data_skipping;
 pub mod file_stream;
@@ -81,6 +77,23 @@ impl ScanBuilder {
     }
 }
 
+/// A vector of this type is returned from calling [`Scan::execute`]. Each [`ScanResult`] contains
+/// the raw [`EngineData`] as read by the engines [`crate::ParquetHandler`], and a boolean
+/// mask. Rows can be dropped from a scan due to deletion vectors, so we communicate back both
+/// EngineData and information regarding whether a row should be included or not See the docs below
+/// for [`ScanResult::mask`] for details on the mask.
+pub struct ScanResult {
+    /// Raw engine data as read from the disk for a particular file included in the query
+    pub raw_data: DeltaResult<Box<dyn EngineData>>,
+    /// If an item at mask\[i\] is true, the row at that row index is valid, otherwise if it is
+    /// false, the row at that row index is invalid and should be ignored. If this is None, all rows
+    /// are valid.
+    // TODO(nick) this should be allocated by the engine
+    pub mask: Option<Vec<bool>>,
+}
+
+/// The result of building a scan over a table. This can be used to get the actual data from
+/// scanning the table.
 pub struct Scan {
     snapshot: Arc<Snapshot>,
     read_schema: SchemaRef,
@@ -99,9 +112,6 @@ impl std::fmt::Debug for Scan {
 impl Scan {
     /// Get a shred reference to the [`Schema`] of the scan.
     ///
-    /// This is the schema of the columns that will be returned by the scan,
-    /// and not the schema of the entire table.
-    ///
     /// [`Schema`]: crate::schema::Schema
     pub fn schema(&self) -> &SchemaRef {
         &self.read_schema
@@ -112,24 +122,20 @@ impl Scan {
         &self.predicate
     }
 
-    /// This is the main method to 'materialize' the scan. It returns a `ScanFileBatchIterator`
-    /// which yields record batches of scan files and their associated metadata. Rows of the scan
-    /// files batches correspond to data reads, and the DeltaReader is used to materialize the scan
-    /// files into actual table data.
+    /// Get an iterator of Add actions that should be included in scan for a query. This handles
+    /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible)
     pub fn files(
         &self,
         engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
-        lazy_static::lazy_static! {
-            static ref ACTION_SCHEMA: SchemaRef = Arc::new(StructType::new(vec![
-                ActionType::Add.schema_field().clone(),
-                ActionType::Remove.schema_field().clone(),
-            ]));
-        }
+        let action_schema = Arc::new(StructType::new(vec![
+            crate::actions::schemas::ADD_FIELD.clone(),
+            crate::actions::schemas::REMOVE_FIELD.clone(),
+        ]));
 
         let log_iter = self.snapshot.log_segment.replay(
             engine_interface,
-            ACTION_SCHEMA.clone(),
+            action_schema,
             self.predicate.clone(),
         )?;
 
@@ -141,7 +147,13 @@ impl Scan {
         ))
     }
 
-    pub fn execute(&self, engine_interface: &dyn EngineInterface) -> DeltaResult<Vec<RecordBatch>> {
+    /// This is the main method to 'materialize' the scan. It returns a [`Result`] of
+    /// `Vec<`[`ScanResult`]`>`. This calls [`Scan::files`] to get a set of `Add` actions for the scan,
+    /// and then uses the `engine_interface`'s [`crate::ParquetHandler`] to read the actual table
+    /// data. Each [`ScanResult`] encapsulates the raw data and an optional boolean vector built
+    /// from the deletion vector if it was present. See the documentation for [`ScanResult`] for
+    /// more details.
+    pub fn execute(&self, engine_interface: &dyn EngineInterface) -> DeltaResult<Vec<ScanResult>> {
         let parquet_handler = engine_interface.get_parquet_handler();
 
         let partition_columns = &self.snapshot.metadata().partition_columns;
@@ -168,30 +180,41 @@ impl Scan {
             .map(|f| Expression::column(f.name()))
             .collect_vec();
 
-        self.files(engine_interface)?
-            .map(|res| {
-                let add = res?;
-                let meta = FileMeta {
-                    last_modified: add.modification_time,
-                    size: add.size as usize,
-                    location: self.snapshot.table_root.join(&add.path)?,
-                };
-                let batches = parquet_handler
-                    .read_parquet_files(&[meta], read_schema.clone(), None)?
-                    .try_collect::<_, Vec<_>, _>()?;
+        let mut results: Vec<ScanResult> = vec![];
+        let files = self.files(engine_interface)?;
+        for add_result in files {
+            let add = add_result?;
+            let meta = FileMeta {
+                last_modified: add.modification_time,
+                size: add.size as usize,
+                location: self.snapshot.table_root.join(&add.path)?,
+            };
+            // TODO(nick) check if we need robert's try_collect change here
+            let read_results =
+                parquet_handler.read_parquet_files(&[meta], self.read_schema.clone(), None)?;
 
-                if batches.is_empty() {
-                    return Ok(None);
-                }
+            let dv_treemap = add
+                .deletion_vector
+                .as_ref()
+                .map(|dv_descriptor| {
+                    let fs_client = engine_interface.get_file_system_client();
+                    dv_descriptor.read(fs_client, self.snapshot.table_root.clone())
+                })
+                .transpose()?;
 
-                let schema = batches[0].schema();
-                let batch = concat_batches(&schema, &batches)?;
+            let mut dv_mask = dv_treemap.map(super::actions::deletion_vector::treemap_to_bools);
 
-                let batch = if partition_fields.is_empty() {
-                    batch
+            for read_result in read_results {
+                let len = if let Ok(ref res) = read_result {
+                    res.length()
                 } else {
-                    let mut fields =
-                        Vec::with_capacity(partition_fields.len() + batch.num_columns());
+                    0
+                };
+
+                let read_result = if partition_fields.is_empty() {
+                    read_result
+                } else {
+                    let mut fields = Vec::with_capacity(partition_fields.len() + len);
                     for field in &partition_fields {
                         let value_expression = parse_partition_value(
                             add.partition_values.get(field.name()),
@@ -207,26 +230,22 @@ impl Scan {
                         DataType::Struct(Box::new(self.schema().as_ref().clone())),
                     );
 
-                    evaluator
-                        .evaluate(&batch)?
-                        .as_struct_opt()
-                        .ok_or(Error::unexpected_column_type("Unexpected array type"))?
-                        .into()
+                    evaluator.evaluate(read_result?.as_ref())
                 };
 
-                if let Some(dv_descriptor) = add.deletion_vector {
-                    let fs_client = engine_interface.get_file_system_client();
-                    let dv = dv_descriptor.read(fs_client, self.snapshot.table_root.clone())?;
-                    let mask: BooleanArray = (0..batch.num_rows())
-                        .map(|i| Some(!dv.contains(i.try_into().expect("fit into u32"))))
-                        .collect();
-                    Ok(Some(filter_record_batch(&batch, &mask)?))
-                } else {
-                    Ok(Some(batch))
-                }
-            })
-            .filter_map_ok(|batch| batch)
-            .collect()
+                // need to split the dv_mask. what's left in dv_mask covers this result, and rest
+                // will cover the following results
+                let rest = dv_mask.as_mut().map(|mask| mask.split_off(len));
+
+                let scan_result = ScanResult {
+                    raw_data: read_result,
+                    mask: dv_mask,
+                };
+                dv_mask = rest;
+                results.push(scan_result);
+            }
+        }
+        Ok(results)
     }
 }
 
@@ -247,12 +266,12 @@ fn parse_partition_value(
 
 #[cfg(all(test, feature = "default-client"))]
 mod tests {
+    use itertools::Itertools;
     use std::path::PathBuf;
 
     use super::*;
-    use crate::client::DefaultTableClient;
-    use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::schema::PrimitiveType;
+    use crate::simple_client::SimpleClient;
     use crate::Table;
 
     #[test]
@@ -260,12 +279,7 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine_interface = DefaultTableClient::try_new(
-            &url,
-            std::iter::empty::<(&str, &str)>(),
-            Arc::new(TokioBackgroundExecutor::new()),
-        )
-        .unwrap();
+        let engine_interface = SimpleClient::new();
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine_interface, None).unwrap();
@@ -289,12 +303,7 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine_interface = DefaultTableClient::try_new(
-            &url,
-            std::iter::empty::<(&str, &str)>(),
-            Arc::new(TokioBackgroundExecutor::new()),
-        )
-        .unwrap();
+        let engine_interface = SimpleClient::new();
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine_interface, None).unwrap();
@@ -302,7 +311,8 @@ mod tests {
         let files = scan.execute(&engine_interface).unwrap();
 
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].num_rows(), 10)
+        let num_rows = files[0].raw_data.as_ref().unwrap().length();
+        assert_eq!(num_rows, 10)
     }
 
     #[test]

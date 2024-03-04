@@ -14,6 +14,7 @@ use super::file_handler::{FileOpenFuture, FileOpener};
 use crate::executor::TaskExecutor;
 use crate::file_handler::FileStream;
 use crate::schema::SchemaRef;
+use crate::simple_client::data::SimpleData;
 use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, ParquetHandler};
 
 #[derive(Debug)]
@@ -67,8 +68,9 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             sender.send(res).ok();
             futures::future::ready(())
         }));
-
-        Ok(Box::new(receiver.into_iter()))
+        Ok(Box::new(receiver.into_iter().map(|rbr| {
+            rbr.map(|rb| Box::new(SimpleData::new(rb)) as _)
+        })))
     }
 }
 
@@ -137,11 +139,19 @@ mod tests {
     use arrow_array::RecordBatch;
     use object_store::{local::LocalFileSystem, ObjectStore};
 
-    use crate::executor::tokio::TokioBackgroundExecutor;
+    use crate::{executor::tokio::TokioBackgroundExecutor, EngineData};
 
     use itertools::Itertools;
 
     use super::*;
+
+    fn into_record_batch(
+        engine_data: DeltaResult<Box<dyn EngineData>>,
+    ) -> DeltaResult<RecordBatch> {
+        engine_data
+            .and_then(SimpleData::try_from_engine_data)
+            .map(|sd| sd.into())
+    }
 
     #[tokio::test]
     async fn test_read_parquet_files() {
@@ -171,6 +181,7 @@ mod tests {
         let data: Vec<RecordBatch> = handler
             .read_parquet_files(files, Arc::new(physical_schema.try_into().unwrap()), None)
             .unwrap()
+            .map(into_record_batch)
             .try_collect()
             .unwrap();
 

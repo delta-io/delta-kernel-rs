@@ -1,24 +1,27 @@
 //! Default Expression handler.
 //!
 //! Expression handling based on arrow-rs compute kernels.
-#![allow(trivial_casts)]
 use std::sync::Arc;
 
 use arrow_arith::boolean::{and, is_null, not, or};
 use arrow_arith::numeric::{add, div, mul, sub};
+use arrow_array::cast::AsArray;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum, Decimal128Array, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
     StructArray, TimestampMicrosecondArray,
 };
 use arrow_ord::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq};
-use arrow_schema::{ArrowError, Schema as ArrowSchema};
+use arrow_schema::{
+    ArrowError, DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+};
 use itertools::Itertools;
 
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{BinaryOperator, Expression, Scalar, UnaryOperator, VariadicOperator};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
-use crate::{ExpressionEvaluator, ExpressionHandler};
+use crate::simple_client::data::SimpleData;
+use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
 
 // TODO leverage scalars / Datum
 
@@ -249,7 +252,12 @@ pub struct DefaultExpressionEvaluator {
 }
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
-    fn evaluate(&self, batch: &RecordBatch) -> DeltaResult<ArrayRef> {
+    fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+        let batch = batch
+            .as_any()
+            .downcast_ref::<SimpleData>()
+            .ok_or(Error::engine_data_type("SimpleData"))?
+            .record_batch();
         let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into()?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {
@@ -259,7 +267,18 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
         //         batch.schema()
         //     )));
         // };
-        evaluate_expression(&self.expression, batch, Some(&self.output_type))
+        let array_ref = evaluate_expression(&self.expression, batch, Some(&self.output_type))?;
+        let arrow_type: ArrowDataType = ArrowDataType::try_from(&self.output_type)?;
+        let batch: RecordBatch = if let DataType::Struct(_) = self.output_type {
+            array_ref
+                .as_struct_opt()
+                .ok_or(Error::unexpected_column_type("Expected a struct array"))?
+                .into()
+        } else {
+            let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
+            RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
+        };
+        Ok(Box::new(SimpleData::new(batch)))
     }
 }
 

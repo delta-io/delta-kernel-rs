@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::task::{ready, Poll};
 
-use arrow_array::{new_null_array, Array, ArrayRef, RecordBatch, StringArray};
+use arrow_array::{new_null_array, Array, RecordBatch, StringArray, StructArray};
 use arrow_json::ReaderBuilder;
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use arrow_select::concat::concat_batches;
@@ -18,7 +18,10 @@ use object_store::{DynObjectStore, GetResultPayload};
 use super::executor::TaskExecutor;
 use super::file_handler::{FileOpenFuture, FileOpener, FileStream};
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, JsonHandler};
+use crate::simple_client::data::SimpleData;
+use crate::{
+    DeltaResult, EngineData, Error, Expression, FileDataReadResultIterator, FileMeta, JsonHandler,
+};
 
 #[derive(Debug)]
 pub struct DefaultJsonHandler<E: TaskExecutor> {
@@ -83,26 +86,33 @@ fn hack_parse(
 impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     fn parse_json(
         &self,
-        json_strings: ArrayRef,
+        json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
-    ) -> DeltaResult<RecordBatch> {
-        let json_strings = json_strings
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let json_strings: RecordBatch = SimpleData::try_from_engine_data(json_strings)?.into();
+        // TODO(nick): this is pretty terrible
+        let struct_array: StructArray = json_strings.into();
+        let json_strings = struct_array
+            .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| {
-                Error::generic(format!(
-                    "Expected json_strings to be a StringArray, found {json_strings:?}"
-                ))
+                Error::generic("Expected json_strings to be a StringArray, found something else")
             })?;
         let output_schema: ArrowSchemaRef = Arc::new(output_schema.as_ref().try_into()?);
         if json_strings.is_empty() {
-            return Ok(RecordBatch::new_empty(output_schema));
+            return Ok(Box::new(SimpleData::new(RecordBatch::new_empty(
+                output_schema,
+            ))));
         }
         let output: Vec<_> = json_strings
             .iter()
             .map(|json_string| hack_parse(&output_schema, json_string))
             .try_collect()?;
-        Ok(concat_batches(&output_schema, output.iter())?)
+        Ok(Box::new(SimpleData::new(concat_batches(
+            &output_schema,
+            output.iter(),
+        )?)))
     }
 
     fn read_json_files(
@@ -130,7 +140,9 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             futures::future::ready(())
         }));
 
-        Ok(Box::new(receiver.into_iter()))
+        Ok(Box::new(receiver.into_iter().map(|rbr| {
+            rbr.map(|rb| Box::new(SimpleData::new(rb)) as _)
+        })))
     }
 }
 
@@ -217,29 +229,38 @@ impl FileOpener for JsonOpener {
 mod tests {
     use std::path::PathBuf;
 
-    use arrow_array::ArrayRef;
-    use arrow_schema::Schema as ArrowSchema;
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use itertools::Itertools;
     use object_store::{local::LocalFileSystem, ObjectStore};
 
     use super::*;
     use crate::{actions::schemas::log_schema, executor::tokio::TokioBackgroundExecutor};
 
+    fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
+        let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
+        let schema = Arc::new(ArrowSchema::new(vec![string_field]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
+            .expect("Can't convert to record batch");
+        Box::new(SimpleData::new(batch))
+    }
+
     #[test]
     fn test_parse_json() {
         let store = Arc::new(LocalFileSystem::new());
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
-        let json_strings: ArrayRef = Arc::new(StringArray::from(vec![
+        let json_strings = StringArray::from(vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
             r#"{"commitInfo":{"timestamp":1677811178585,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isolationLevel":"WriteSerializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"10","numOutputBytes":"635"},"engineInfo":"Databricks-Runtime/<unknown>","txnId":"a6a94671-55ef-450e-9546-b8465b9147de"}}"#,
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
-        ]));
+        ]);
         let output_schema = Arc::new(log_schema().clone());
 
-        let batch = handler.parse_json(json_strings, output_schema).unwrap();
-        assert_eq!(batch.num_rows(), 4);
+        let batch = handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        assert_eq!(batch.length(), 4);
     }
 
     #[tokio::test]
@@ -265,6 +286,15 @@ mod tests {
         let data: Vec<RecordBatch> = handler
             .read_json_files(files, Arc::new(physical_schema.try_into().unwrap()), None)
             .unwrap()
+            .map(|ed_res| {
+                // TODO(nick) make this easier
+                ed_res.and_then(|ed| {
+                    ed.into_any()
+                        .downcast::<SimpleData>()
+                        .map_err(|_| Error::engine_data_type("SimpleData"))
+                        .map(|sd| sd.into())
+                })
+            })
             .try_collect()
             .unwrap();
 

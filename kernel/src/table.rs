@@ -45,25 +45,17 @@ impl Table {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::path::PathBuf;
 
     use super::*;
-    use crate::client::DefaultTableClient;
-    use crate::executor::tokio::TokioBackgroundExecutor;
+    use crate::simple_client::SimpleClient;
 
     #[test]
     fn test_table() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine_interface = DefaultTableClient::try_new(
-            &url,
-            HashMap::<String, String>::new(),
-            Arc::new(TokioBackgroundExecutor::new()),
-        )
-        .unwrap();
-
+        let engine_interface = SimpleClient::new();
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine_interface, None).unwrap();
         assert_eq!(snapshot.version(), 1)

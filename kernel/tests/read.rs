@@ -9,7 +9,8 @@ use deltakernel::client::DefaultTableClient;
 use deltakernel::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::expressions::{BinaryOperator, Expression};
 use deltakernel::scan::ScanBuilder;
-use deltakernel::Table;
+use deltakernel::simple_client::data::SimpleData;
+use deltakernel::{EngineData, Table};
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -68,6 +69,12 @@ async fn add_commit(
     Ok(())
 }
 
+fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
+    SimpleData::try_from_engine_data(engine_data)
+        .unwrap()
+        .into()
+}
+
 #[tokio::test]
 async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
@@ -109,8 +116,9 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         .zip(expected_data);
 
     for (data, expected) in stream {
+        let raw_data = data.raw_data?;
         files += 1;
-        assert_eq!(data, expected);
+        assert_eq!(into_record_batch(raw_data), expected);
     }
     assert_eq!(2, files, "Expected to have scanned two files");
     Ok(())
@@ -162,8 +170,9 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         .zip(expected_data);
 
     for (data, expected) in stream {
+        let raw_data = data.raw_data?;
         files += 1;
-        assert_eq!(data, expected);
+        assert_eq!(into_record_batch(raw_data), expected);
     }
     assert_eq!(2, files, "Expected to have scanned two files");
 
@@ -219,8 +228,9 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut files = 0;
     for (data, expected) in stream {
+        let raw_data = data.raw_data?;
         files += 1;
-        assert_eq!(data, expected);
+        assert_eq!(into_record_batch(raw_data), expected);
     }
     assert_eq!(1, files, "Expected to have scanned one file");
     Ok(())
@@ -344,8 +354,9 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
             .zip(expected_batches);
 
         for (batch, expected) in stream {
+            let raw_data = batch.raw_data?;
             files_scanned += 1;
-            assert_eq!(&batch, expected);
+            assert_eq!(into_record_batch(raw_data), expected.clone());
         }
         assert_eq!(expected_files, files_scanned);
     }
@@ -396,7 +407,14 @@ fn read_table_data(path: &str, expected: Vec<&str>) -> Result<(), Box<dyn std::e
     let snapshot = table.snapshot(&table_client, None)?;
     let scan = ScanBuilder::new(snapshot).build();
 
-    let batches = scan.execute(&table_client)?;
+    let scan_results = scan.execute(&table_client)?;
+    let batches: Vec<RecordBatch> = scan_results
+        .into_iter()
+        .map(|sr| {
+            let data = sr.raw_data.unwrap();
+            data.into_any().downcast::<SimpleData>().unwrap().into()
+        })
+        .collect();
     let schema = batches[0].schema();
     let batch = concat_batches(&schema, &batches)?;
 

@@ -1,14 +1,15 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use arrow_array::RecordBatch;
 use either::Either;
 use tracing::debug;
 
 use super::data_skipping::DataSkippingFilter;
-use crate::actions::{parse_actions, Action, ActionType, Add};
+use crate::actions::{visitors::AddVisitor, visitors::RemoveVisitor, Add, Remove};
+use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::Expression;
-use crate::schema::SchemaRef;
-use crate::{DeltaResult, EngineInterface};
+use crate::schema::{SchemaRef, StructType};
+use crate::{DataVisitor, DeltaResult, EngineData, EngineInterface};
 
 struct LogReplayScanner {
     filter: Option<DataSkippingFilter>,
@@ -17,6 +18,35 @@ struct LogReplayScanner {
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
     seen: HashSet<(String, Option<String>)>,
+}
+
+#[derive(Default)]
+struct AddRemoveVisitor {
+    adds: Vec<Add>,
+    removes: Vec<Remove>,
+}
+
+const ADD_FIELD_COUNT: usize = 15;
+
+impl DataVisitor for AddRemoveVisitor {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for i in 0..row_count {
+            // Add will have a path at index 0 if it is valid
+            if let Some(path) = getters[0].get_opt(i, "add.path")? {
+                self.adds
+                    .push(AddVisitor::visit_add(i, path, &getters[..ADD_FIELD_COUNT])?);
+            }
+            // Remove will have a path at index 15 if it is valid
+            // TODO(nick): Should count the fields in Add to ensure we don't get this wrong if more
+            // are added
+            else if let Some(path) = getters[ADD_FIELD_COUNT].get_opt(i, "remove.path")? {
+                let remove_getters = &getters[ADD_FIELD_COUNT..];
+                self.removes
+                    .push(RemoveVisitor::visit_remove(i, path, remove_getters)?);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl LogReplayScanner {
@@ -37,38 +67,46 @@ impl LogReplayScanner {
     /// actions in the log.
     fn process_batch(
         &mut self,
-        actions: &RecordBatch,
+        actions: &dyn EngineData,
         is_log_batch: bool,
     ) -> DeltaResult<Vec<Add>> {
-        let filtered_actions = match &self.filter {
-            Some(filter) => Some(filter.apply(actions)?),
-            None => None,
-        };
-        let actions = if let Some(filtered) = &filtered_actions {
-            filtered
-        } else {
-            actions
+        let filtered_actions = self
+            .filter
+            .as_ref()
+            .map(|filter| filter.apply(actions))
+            .transpose()?;
+        let actions = match filtered_actions {
+            Some(ref filtered_actions) => filtered_actions.as_ref(),
+            None => actions,
         };
 
-        let schema_to_use = if is_log_batch {
-            vec![ActionType::Add, ActionType::Remove]
+        let schema_to_use = StructType::new(if is_log_batch {
+            vec![
+                crate::actions::schemas::ADD_FIELD.clone(),
+                crate::actions::schemas::REMOVE_FIELD.clone(),
+            ]
         } else {
             // All checkpoint actions are already reconciled and Remove actions in checkpoint files
             // only serve as tombstones for vacuum jobs. So no need to load them here.
-            vec![ActionType::Add]
-        };
+            vec![crate::actions::schemas::ADD_FIELD.clone()]
+        });
+        let mut visitor = AddRemoveVisitor::default();
+        actions.extract(Arc::new(schema_to_use), &mut visitor)?;
 
-        let adds: Vec<Add> = parse_actions(actions, &schema_to_use)?
-            .filter_map(|action| match action {
-                Action::Add(add)
-                    // Note: each (add.path + add.dv_unique_id()) pair has a
-                    // unique Add + Remove pair in the log. For example:
-                    // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
-                    if !self
-                        .seen
-                        .contains(&(add.path.clone(), add.dv_unique_id())) =>
-                {
-                    debug!("Found file: {}", &add.path);
+        for remove in visitor.removes.into_iter() {
+            self.seen
+                .insert((remove.path.clone(), remove.dv_unique_id()));
+        }
+
+        visitor
+            .adds
+            .into_iter()
+            .filter_map(|add| {
+                // Note: each (add.path + add.dv_unique_id()) pair has a
+                // unique Add + Remove pair in the log. For example:
+                // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
+                if !self.seen.contains(&(add.path.clone(), add.dv_unique_id())) {
+                    debug!("Found file: {}, is log {}", &add.path, is_log_batch);
                     if is_log_batch {
                         // Remember file actions from this batch so we can ignore duplicates
                         // as we process batches from older commit and/or checkpoint files. We
@@ -76,37 +114,32 @@ impl LogReplayScanner {
                         // oldest actions and can never replace anything.
                         self.seen.insert((add.path.clone(), add.dv_unique_id()));
                     }
-                    Some(add)
-                }
-                Action::Remove(remove) => {
-                    // Remove actions always come from log batches, so no need to check here.
-                    self.seen
-                        .insert((remove.path.clone(), remove.dv_unique_id()));
+                    Some(Ok(add))
+                } else {
                     None
                 }
-                _ => None,
             })
-            .collect();
-
-        Ok(adds)
+            .collect()
     }
 }
 
-/// Given an iterator of (record batch, bool) tuples and a predicate, returns an iterator of [Add]s.
+/// Given an iterator of (record batch, bool) tuples and a predicate, returns an iterator of `Adds`.
 /// The boolean flag indicates whether the record batch is a log or checkpoint batch.
 pub fn log_replay_iter(
-    table_client: &dyn EngineInterface,
-    action_iter: impl Iterator<Item = DeltaResult<(RecordBatch, bool)>>,
+    engine_client: &dyn EngineInterface,
+    action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
     table_schema: &SchemaRef,
     predicate: &Option<Expression>,
 ) -> impl Iterator<Item = DeltaResult<Add>> {
-    let mut log_scanner = LogReplayScanner::new(table_client, table_schema, predicate);
+    let mut log_scanner = LogReplayScanner::new(engine_client, table_schema, predicate);
 
     action_iter.flat_map(move |actions| match actions {
-        Ok((batch, is_log_batch)) => match log_scanner.process_batch(&batch, is_log_batch) {
-            Ok(adds) => Either::Left(adds.into_iter().map(Ok)),
-            Err(err) => Either::Right(std::iter::once(Err(err))),
-        },
+        Ok((batch, is_log_batch)) => {
+            match log_scanner.process_batch(batch.as_ref(), is_log_batch) {
+                Ok(adds) => Either::Left(adds.into_iter().map(Ok)),
+                Err(err) => Either::Right(std::iter::once(Err(err))),
+            }
+        }
         Err(err) => Either::Right(std::iter::once(Err(err))),
     })
 }
