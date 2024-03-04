@@ -171,7 +171,7 @@ mod tests {
 
     use super::DeletionVectorDescriptor;
 
-    fn dv_relateive() -> DeletionVectorDescriptor {
+    fn dv_relative() -> DeletionVectorDescriptor {
         DeletionVectorDescriptor {
             storage_type: "u".to_string(),
             path_or_inline_dv: "ab^-aqEH.-t@S}K{vb[*k^".to_string(),
@@ -216,7 +216,7 @@ mod tests {
     fn test_deletion_vector_absolute_path() {
         let parent = Url::parse("s3://mytable/").unwrap();
 
-        let relative = dv_relateive();
+        let relative = dv_relative();
         let expected =
             Url::parse("s3://mytable/ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin")
                 .unwrap();
