@@ -66,7 +66,6 @@ impl LogSegment {
         &self,
         engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<Option<(Metadata, Protocol)>> {
-        //let metadata_schema = crate::actions::schemas::METADATA_SCHEMA.clone();
         let schema = StructType::new(vec![
             crate::actions::schemas::METADATA_FIELD.clone(),
             crate::actions::schemas::PROTOCOL_FIELD.clone(),
