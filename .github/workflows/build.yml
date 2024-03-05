@@ -7,7 +7,13 @@ env:
 
 jobs:
   format:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - macOS-latest
+          - ubuntu-latest
+          - windows-latest
     steps:
       - uses: actions/checkout@v3
       - name: Install minimal stable with clippy and rustfmt
@@ -20,7 +26,13 @@ jobs:
       - name: format
         run: cargo fmt -- --check
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - macOS-latest
+          - ubuntu-latest
+          - windows-latest
     steps:
       - uses: actions/checkout@v3
       - name: Install minimal stable with clippy and rustfmt
@@ -35,7 +47,13 @@ jobs:
       - name: lint without default features
         run: cargo clippy --no-default-features -- -D warnings
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - macOS-latest
+          - ubuntu-latest
+          - windows-latest
     steps:
       - uses: actions/checkout@v3
       - name: Install minimal stable with clippy and rustfmt
