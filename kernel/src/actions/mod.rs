@@ -9,7 +9,7 @@ use visitors::{AddVisitor, MetadataVisitor, ProtocolVisitor};
 
 use crate::{schema::StructType, DeltaResult, EngineData};
 
-use self::deletion_vector::DeletionVectorDescriptor;
+use self::{deletion_vector::DeletionVectorDescriptor, schemas::GetSchema};
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
 pub struct Format {
@@ -51,8 +51,8 @@ pub struct Metadata {
 
 impl Metadata {
     pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
-        let schema = StructType::new(vec![crate::actions::schemas::METADATA_FIELD.clone()]);
         let mut visitor = MetadataVisitor::default();
+        let schema = StructType::new(vec![Metadata::get_schema().clone()]);
         data.extract(Arc::new(schema), &mut visitor)?;
         Ok(visitor.metadata)
     }
@@ -249,6 +249,6 @@ mod tests {
             ]),
             false,
         );
-        assert_eq!(schema, expected);
+        assert_eq!(schema, &expected);
     }
 }

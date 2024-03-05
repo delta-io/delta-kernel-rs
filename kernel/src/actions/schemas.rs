@@ -8,7 +8,7 @@ use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
 /// A trait that says you can ask for the [`Schema`] of the implementor
 pub(crate) trait GetSchema {
-    fn get_schema() -> StructField;
+    fn get_schema() -> &'static StructField;
 }
 
 /// A trait that allows getting a `StructField` based on the provided name and nullability

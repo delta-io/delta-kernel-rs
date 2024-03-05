@@ -50,9 +50,12 @@ pub fn derive_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream 
     let schema_fields = gen_schema_fields(&input.data);
     let output = quote! {
         impl crate::actions::schemas::GetSchema for #struct_ident {
-            fn get_schema() -> crate::schema::StructField {
+            fn get_schema() -> &'static crate::schema::StructField {
                 use crate::actions::schemas::GetField;
-                Self::get_field(stringify!(#schema_name))
+                static SCHEMA_LOCK: std::sync::OnceLock<crate::schema::StructField> = std::sync::OnceLock::new();
+                SCHEMA_LOCK.get_or_init(|| {
+                    Self::get_field(stringify!(#schema_name))
+                })
             }
         }
 
