@@ -4,11 +4,11 @@ use std::collections::HashMap;
 
 use lazy_static::lazy_static;
 
-use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
+use crate::schema::{ArrayType, DataType, MapType, SchemaRef, StructField, StructType};
 
 /// A trait that says you can ask for the [`Schema`] of the implementor
 pub(crate) trait GetSchema {
-    fn get_schema() -> &'static StructField;
+    fn get_schema() -> SchemaRef;
 }
 
 /// A trait that allows getting a `StructField` based on the provided name and nullability

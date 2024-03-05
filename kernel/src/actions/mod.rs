@@ -52,8 +52,7 @@ pub struct Metadata {
 impl Metadata {
     pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
         let mut visitor = MetadataVisitor::default();
-        let schema = StructType::new(vec![Metadata::get_schema().clone()]);
-        data.extract(Arc::new(schema), &mut visitor)?;
+        data.extract(Metadata::get_schema(), &mut visitor)?;
         Ok(visitor.metadata)
     }
 
@@ -216,7 +215,7 @@ mod tests {
     fn test_metadata_schema() {
         let schema = Metadata::get_schema();
 
-        let expected = StructField::new(
+        let expected = Arc::new(StructType::new(vec![StructField::new(
             "metaData",
             StructType::new(vec![
                 StructField::new("id", DataType::STRING, false),
@@ -248,7 +247,7 @@ mod tests {
                 ),
             ]),
             false,
-        );
-        assert_eq!(schema, &expected);
+        )]));
+        assert_eq!(schema, expected);
     }
 }

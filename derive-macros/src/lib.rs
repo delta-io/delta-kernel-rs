@@ -50,12 +50,14 @@ pub fn derive_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream 
     let schema_fields = gen_schema_fields(&input.data);
     let output = quote! {
         impl crate::actions::schemas::GetSchema for #struct_ident {
-            fn get_schema() -> &'static crate::schema::StructField {
+            fn get_schema() -> crate::schema::SchemaRef {
                 use crate::actions::schemas::GetField;
-                static SCHEMA_LOCK: std::sync::OnceLock<crate::schema::StructField> = std::sync::OnceLock::new();
+                static SCHEMA_LOCK: std::sync::OnceLock<crate::schema::SchemaRef> = std::sync::OnceLock::new();
                 SCHEMA_LOCK.get_or_init(|| {
-                    Self::get_field(stringify!(#schema_name))
-                })
+                    std::sync::Arc::new(crate::schema::StructType::new(vec![
+                        Self::get_field(stringify!(#schema_name))
+                    ]))
+                }).clone() // cheap clone, it's an Arc
             }
         }
 
