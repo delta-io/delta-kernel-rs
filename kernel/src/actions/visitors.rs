@@ -196,20 +196,20 @@ impl RemoveVisitor {
 
         let size: Option<i64> = getters[5].get_opt(row_index, "remove.size")?;
 
-        // TODO(nick) stats are skipped in getters[6] and tags are skipped in getters[7]
+        // TODO(nick) tags are skipped in getters[6]
 
         let deletion_vector = if let Some(storage_type) =
-            getters[8].get_opt(row_index, "remove.deletionVector.storageType")?
+            getters[7].get_opt(row_index, "remove.deletionVector.storageType")?
         {
             // there is a storageType, so the whole DV must be there
             let path_or_inline_dv: String =
-                getters[9].get(row_index, "remove.deletionVector.pathOrInlineDv")?;
+                getters[8].get(row_index, "remove.deletionVector.pathOrInlineDv")?;
             let offset: Option<i32> =
-                getters[10].get_opt(row_index, "remove.deletionVector.offset")?;
+                getters[9].get_opt(row_index, "remove.deletionVector.offset")?;
             let size_in_bytes: i32 =
-                getters[11].get(row_index, "remove.deletionVector.sizeInBytes")?;
+                getters[10].get(row_index, "remove.deletionVector.sizeInBytes")?;
             let cardinality: i64 =
-                getters[12].get(row_index, "remove.deletionVector.cardinality")?;
+                getters[11].get(row_index, "remove.deletionVector.cardinality")?;
             Some(DeletionVectorDescriptor {
                 storage_type,
                 path_or_inline_dv,
@@ -221,9 +221,9 @@ impl RemoveVisitor {
             None
         };
 
-        let base_row_id: Option<i64> = getters[13].get_opt(row_index, "remove.baseRowId")?;
+        let base_row_id: Option<i64> = getters[12].get_opt(row_index, "remove.baseRowId")?;
         let default_row_commit_version: Option<i64> =
-            getters[14].get_opt(row_index, "remove.defaultRowCommitVersion")?;
+            getters[13].get_opt(row_index, "remove.defaultRowCommitVersion")?;
 
         Ok(Remove {
             path,

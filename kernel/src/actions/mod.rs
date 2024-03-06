@@ -152,12 +152,12 @@ pub(crate) struct Remove {
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
     pub(crate) path: String,
 
+    /// The time this logical file was created, as milliseconds since the epoch.
+    pub(crate) deletion_timestamp: Option<i64>,
+
     /// When `false` the logical file must already be present in the table or the records
     /// in the added file must be contained in one or more remove actions in the same version.
     pub(crate) data_change: bool,
-
-    /// The time this logical file was created, as milliseconds since the epoch.
-    pub(crate) deletion_timestamp: Option<i64>,
 
     /// When true the fields `partition_values`, `size`, and `tags` are present
     pub(crate) extended_file_metadata: Option<bool>,
@@ -248,6 +248,60 @@ mod tests {
             ]),
             false,
         )]));
+        assert_eq!(schema, expected);
+    }
+
+    fn tags_field() -> StructField {
+        StructField::new(
+            "tags",
+            MapType::new(DataType::STRING, DataType::STRING, true),
+            true,
+        )
+    }
+
+    fn partition_values_field() -> StructField {
+        StructField::new(
+            "partitionValues",
+            MapType::new(DataType::STRING, DataType::STRING, true),
+            true,
+        )
+    }
+
+    fn deletion_vector_field() -> StructField {
+        StructField::new(
+            "deletionVector",
+            DataType::Struct(Box::new(StructType::new(vec![
+                StructField::new("storageType", DataType::STRING, false),
+                StructField::new("pathOrInlineDv", DataType::STRING, false),
+                StructField::new("offset", DataType::INTEGER, true),
+                StructField::new("sizeInBytes", DataType::INTEGER, false),
+                StructField::new("cardinality", DataType::LONG, false),
+            ]))),
+            true,
+        )
+    }
+
+    #[test]
+    fn test_remove_schema() {
+        let schema = Remove::get_schema();
+        let expected = Arc::new(StructType::new(vec![
+            StructField::new(
+                "remove",
+                StructType::new(vec![
+                    StructField::new("path", DataType::STRING, false),
+                    StructField::new("deletionTimestamp", DataType::LONG, true),
+                    StructField::new("dataChange", DataType::BOOLEAN, false),
+                    StructField::new("extendedFileMetadata", DataType::BOOLEAN, true),
+                    partition_values_field(),
+                    StructField::new("size", DataType::LONG, true),
+                    tags_field(),
+                    deletion_vector_field(),
+                    StructField::new("baseRowId", DataType::LONG, true),
+                    StructField::new("defaultRowCommitVersion", DataType::LONG, true),
+                ]),
+                false,
+            )
+        ]));
         assert_eq!(schema, expected);
     }
 }

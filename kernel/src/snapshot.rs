@@ -9,6 +9,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::actions::schemas::GetField;
 use crate::actions::{Metadata, Protocol};
 use crate::path::LogPath;
 use crate::schema::{Schema, SchemaRef, StructType};
@@ -67,8 +68,8 @@ impl LogSegment {
         engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<Option<(Metadata, Protocol)>> {
         let schema = StructType::new(vec![
-            crate::actions::schemas::METADATA_FIELD.clone(),
-            crate::actions::schemas::PROTOCOL_FIELD.clone(),
+            Option::<Metadata>::get_field("metaData"),
+            Option::<Protocol>::get_field("protocol"),
         ]);
         let data_batches = self.replay(engine_interface, Arc::new(schema), None)?;
         let mut metadata_opt: Option<Metadata> = None;

@@ -5,6 +5,7 @@ use either::Either;
 use tracing::debug;
 
 use super::data_skipping::DataSkippingFilter;
+use crate::actions::schemas::{GetSchema, GetField};
 use crate::actions::{visitors::AddVisitor, visitors::RemoveVisitor, Add, Remove};
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::Expression;
@@ -80,18 +81,20 @@ impl LogReplayScanner {
             None => actions,
         };
 
-        let schema_to_use = StructType::new(if is_log_batch {
-            vec![
-                crate::actions::schemas::ADD_FIELD.clone(),
-                crate::actions::schemas::REMOVE_FIELD.clone(),
-            ]
+        let schema_to_use = if is_log_batch {
+            Arc::new(StructType::new(
+                vec![
+                    Option::<Add>::get_field("add"),
+                    Option::<Remove>::get_field("remove"),
+                ]
+            ))
         } else {
             // All checkpoint actions are already reconciled and Remove actions in checkpoint files
             // only serve as tombstones for vacuum jobs. So no need to load them here.
-            vec![crate::actions::schemas::ADD_FIELD.clone()]
-        });
+            Add::get_schema()
+        };
         let mut visitor = AddRemoveVisitor::default();
-        actions.extract(Arc::new(schema_to_use), &mut visitor)?;
+        actions.extract(schema_to_use, &mut visitor)?;
 
         for remove in visitor.removes.into_iter() {
             self.seen
