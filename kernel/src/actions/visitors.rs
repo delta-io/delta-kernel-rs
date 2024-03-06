@@ -262,7 +262,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        actions::schemas::{log_schema, GetSchema},
+        actions::get_log_schema,
+        actions::schemas::GetSchema,
         simple_client::{data::SimpleData, json::SimpleJsonHandler, SimpleClient},
         EngineData, EngineInterface, JsonHandler,
     };
@@ -285,7 +286,7 @@ mod tests {
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
         ]
         .into();
-        let output_schema = Arc::new(log_schema().clone());
+        let output_schema = Arc::new(get_log_schema().clone());
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
@@ -351,7 +352,7 @@ mod tests {
             r#"{"add":{"path":"c1=6/c2=a/part-00011-10619b10-b691-4fd0-acc4-2a9608499d7c.c000.snappy.parquet","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":4},\"maxValues\":{\"c3\":4},\"nullCount\":{\"c3\":0}}"}}"#,
         ]
         .into();
-        let output_schema = Arc::new(log_schema().clone());
+        let output_schema = Arc::new(get_log_schema().clone());
         let batch = json_handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();

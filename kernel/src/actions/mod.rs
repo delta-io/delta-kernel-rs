@@ -189,6 +189,30 @@ impl Remove {
     }
 }
 
+use crate::actions::schemas::GetField;
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref LOG_SCHEMA: StructType = StructType::new(
+        vec![
+            Option::<Add>::get_field("add"),
+            Option::<Remove>::get_field("remove"),
+            Option::<Metadata>::get_field("metaData"),
+            Option::<Protocol>::get_field("protocol"),
+            // We don't support the following actions yet
+            //Option<Cdc>::get_field("cdc"),
+            //Option<CommitInfo>::get_field("commitInfo"),
+            //Option<DomainMetadata>::get_field("domainMetadata"),
+            //Option<Transaction>::get_field("txn"),
+        ]
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn get_log_schema() -> &'static StructType {
+    &LOG_SCHEMA
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

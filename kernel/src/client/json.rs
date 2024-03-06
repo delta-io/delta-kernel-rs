@@ -234,7 +234,7 @@ mod tests {
     use object_store::{local::LocalFileSystem, ObjectStore};
 
     use super::*;
-    use crate::{actions::schemas::log_schema, executor::tokio::TokioBackgroundExecutor};
+    use crate::{actions::get_log_schema, executor::tokio::TokioBackgroundExecutor};
 
     fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
         let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
@@ -255,7 +255,7 @@ mod tests {
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
         ]);
-        let output_schema = Arc::new(log_schema().clone());
+        let output_schema = Arc::new(get_log_schema().clone());
 
         let batch = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
@@ -282,7 +282,7 @@ mod tests {
         }];
 
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
-        let physical_schema = Arc::new(ArrowSchema::try_from(log_schema()).unwrap());
+        let physical_schema = Arc::new(ArrowSchema::try_from(get_log_schema()).unwrap());
         let data: Vec<RecordBatch> = handler
             .read_json_files(files, Arc::new(physical_schema.try_into().unwrap()), None)
             .unwrap()
