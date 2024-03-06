@@ -154,7 +154,7 @@ impl AddVisitor {
             modification_time,
             data_change,
             stats,
-            tags: HashMap::new(),
+            tags: None,
             deletion_vector,
             base_row_id,
             default_row_commit_version,
@@ -262,8 +262,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        actions::schemas::log_schema,
-        schema::StructType,
+        actions::schemas::{log_schema, GetSchema},
         simple_client::{data::SimpleData, json::SimpleJsonHandler, SimpleClient},
         EngineData, EngineInterface, JsonHandler,
     };
@@ -356,11 +355,9 @@ mod tests {
         let batch = json_handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
-        let add_schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
+        let add_schema = Add::get_schema();
         let mut add_visitor = AddVisitor::default();
-        batch
-            .extract(Arc::new(add_schema), &mut add_visitor)
-            .unwrap();
+        batch.extract(add_schema, &mut add_visitor).unwrap();
         let add1 = Add {
             path: "c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet".into(),
             partition_values: HashMap::from([
@@ -371,7 +368,7 @@ mod tests {
             modification_time: 1670892998135,
             data_change: true,
             stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":5},\"maxValues\":{\"c3\":5},\"nullCount\":{\"c3\":0}}".into()),
-            tags: HashMap::new(),
+            tags: None,
             deletion_vector: None,
             base_row_id: None,
             default_row_commit_version: None,

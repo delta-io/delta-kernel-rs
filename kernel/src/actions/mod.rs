@@ -113,7 +113,7 @@ pub struct Add {
     pub stats: Option<String>,
 
     /// Map containing metadata about this logical file.
-    pub tags: HashMap<String, Option<String>>,
+    pub tags: Option<HashMap<String, Option<String>>>,
 
     /// Information about deletion vector (DV) associated with this add action
     pub deletion_vector: Option<DeletionVectorDescriptor>,
@@ -184,18 +184,6 @@ pub(crate) struct Remove {
 }
 
 impl Remove {
-    // _try_new_from_data for now, to avoid warning, probably will need at some point
-    // pub(crate) fn _try_new_from_data(
-    //     data: &dyn EngineData,
-    // ) -> DeltaResult<Remove> {
-    //     let mut visitor = Visitor::new(visit_remove);
-    //     let schema = StructType::new(vec![crate::actions::schemas::REMOVE_FIELD.clone()]);
-    //     data.extract(Arc::new(schema), &mut visitor)?;
-    //     visitor
-    //         .extracted
-    //         .unwrap_or_else(|| Err(Error::generic("Didn't get expected remove")))
-    // }
-
     pub(crate) fn dv_unique_id(&self) -> Option<String> {
         self.deletion_vector.as_ref().map(|dv| dv.unique_id())
     }
@@ -284,24 +272,22 @@ mod tests {
     #[test]
     fn test_remove_schema() {
         let schema = Remove::get_schema();
-        let expected = Arc::new(StructType::new(vec![
-            StructField::new(
-                "remove",
-                StructType::new(vec![
-                    StructField::new("path", DataType::STRING, false),
-                    StructField::new("deletionTimestamp", DataType::LONG, true),
-                    StructField::new("dataChange", DataType::BOOLEAN, false),
-                    StructField::new("extendedFileMetadata", DataType::BOOLEAN, true),
-                    partition_values_field(),
-                    StructField::new("size", DataType::LONG, true),
-                    tags_field(),
-                    deletion_vector_field(),
-                    StructField::new("baseRowId", DataType::LONG, true),
-                    StructField::new("defaultRowCommitVersion", DataType::LONG, true),
-                ]),
-                false,
-            )
-        ]));
+        let expected = Arc::new(StructType::new(vec![StructField::new(
+            "remove",
+            StructType::new(vec![
+                StructField::new("path", DataType::STRING, false),
+                StructField::new("deletionTimestamp", DataType::LONG, true),
+                StructField::new("dataChange", DataType::BOOLEAN, false),
+                StructField::new("extendedFileMetadata", DataType::BOOLEAN, true),
+                partition_values_field(),
+                StructField::new("size", DataType::LONG, true),
+                tags_field(),
+                deletion_vector_field(),
+                StructField::new("baseRowId", DataType::LONG, true),
+                StructField::new("defaultRowCommitVersion", DataType::LONG, true),
+            ]),
+            false,
+        )]));
         assert_eq!(schema, expected);
     }
 }
