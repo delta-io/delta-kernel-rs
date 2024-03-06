@@ -4,7 +4,7 @@ pub(crate) mod schemas;
 pub(crate) mod visitors;
 
 use derive_macros::Schema;
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 use visitors::{AddVisitor, MetadataVisitor, ProtocolVisitor};
 
 use crate::{schema::StructType, DeltaResult, EngineData};
@@ -80,8 +80,7 @@ pub struct Protocol {
 impl Protocol {
     pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
         let mut visitor = ProtocolVisitor::default();
-        let schema = StructType::new(vec![crate::actions::schemas::PROTOCOL_FIELD.clone()]);
-        data.extract(Arc::new(schema), &mut visitor)?;
+        data.extract(Protocol::get_schema(), &mut visitor)?;
         Ok(visitor.protocol)
     }
 }
@@ -135,8 +134,7 @@ impl Add {
     /// Since we always want to parse multiple adds from data, we return a `Vec<Add>`
     pub fn parse_from_data(data: &dyn EngineData) -> DeltaResult<Vec<Add>> {
         let mut visitor = AddVisitor::default();
-        let schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
-        data.extract(Arc::new(schema), &mut visitor)?;
+        data.extract(Add::get_schema(), &mut visitor)?;
         Ok(visitor.adds)
     }
 
@@ -205,6 +203,8 @@ impl Remove {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::{
         actions::schemas::GetSchema,
