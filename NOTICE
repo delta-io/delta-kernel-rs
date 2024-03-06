@@ -13,15 +13,6 @@ https://github.com/tokio-rs/bytes
 Licence: MIT
 Copyright (c) 2018 Carl Lerche
 
-cargo-about
-https://github.com/EmbarkStudios/cargo-about
-License: MIT or Apache-2.0
-Copyright 2020-2023, Embark Studios
-
-cbindgen
-https://github.com/mozilla/cbindgen
-Licence: MPL-2.0
-
 chrono
 https://github.com/chronotope/chrono
 Licence: MIT OR Apache-2.0
