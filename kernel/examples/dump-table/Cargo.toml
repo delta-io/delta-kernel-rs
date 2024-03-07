@@ -5,13 +5,14 @@ edition = "2021"
 publish = false
 
 [dependencies]
-arrow-array = { version = "^49.0" }
-arrow-schema = { version = "^49.0" }
+arrow = { version = "^49.0" }
+clap = { version = "^4.4", features = ["derive"] }
+comfy-table = "7.1.0"
 deltakernel = { path = "../../../kernel", features = [
-  "default",
+  "default-client",
   "tokio",
   "developer-visibility",
 ] }
-clap = { version = "^4.4", features = ["derive"] }
+env_logger = "0.11.3"
 url = "2"
-comfy-table = "7.1.0"
+

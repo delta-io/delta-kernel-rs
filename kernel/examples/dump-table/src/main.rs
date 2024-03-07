@@ -1,14 +1,16 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use arrow::array::{ArrayRef, AsArray};
+use arrow::compute::filter_record_batch;
+use arrow::datatypes::DataType;
+use arrow::record_batch::RecordBatch;
 use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::client::DefaultTableClient;
 use deltakernel::scan::ScanBuilder;
+use deltakernel::simple_client::data::SimpleData;
 use deltakernel::Table;
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use arrow_array::{cast::AsArray, ArrayRef};
-use arrow_schema::{DataType, TimeUnit};
 use clap::Parser;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, Color, Table as ComfyTable};
@@ -42,7 +44,7 @@ macro_rules! format_primitive {
 }
 
 fn extract_value(column: &ArrayRef, row_id: usize) -> String {
-    use arrow_array::types::*;
+    use arrow::datatypes::*;
     use DataType::*;
     match column.data_type() {
         Binary => format!("{:?}", column.as_binary::<i32>().value(row_id)),
@@ -76,16 +78,10 @@ fn extract_value(column: &ArrayRef, row_id: usize) -> String {
 }
 
 fn main() {
+    env_logger::init();
     let cli = Cli::parse();
-    let path = std::fs::canonicalize(PathBuf::from(cli.path));
-    let Ok(path) = path else {
-        println!("Couldn't open table: {}", path.err().unwrap());
-        return;
-    };
-    let Ok(url) = url::Url::from_directory_path(path) else {
-        println!("Invalid url");
-        return;
-    };
+    let url = url::Url::parse(&cli.path).unwrap();
+    println!("Reading {url}");
     let engine_interface = DefaultTableClient::try_new(
         &url,
         HashMap::<String, String>::new(),
@@ -127,13 +123,19 @@ fn main() {
     }
     table.set_header(header_names);
 
-    for batch in scan.execute(&engine_interface).unwrap() {
+    for res in scan.execute(&engine_interface).unwrap().into_iter() {
+        let data = res.raw_data.unwrap();
+        let record_batch: RecordBatch = data.into_any().downcast::<SimpleData>().unwrap().into();
+        let batch = if let Some(mask) = res.mask {
+            filter_record_batch(&record_batch, &mask.into()).unwrap()
+        } else {
+            record_batch
+        };
         for row in 0..batch.num_rows() {
             let table_row =
                 (0..batch.num_columns()).map(|col| extract_value(batch.column(col), row));
             table.add_row(table_row);
         }
     }
-
     println!("{table}");
 }
