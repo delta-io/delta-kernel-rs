@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::actions::visitors::SelectionVectorVisitor;
-use crate::error::{DeltaResult, Error};
+use crate::error::DeltaResult;
 use crate::expressions::{BinaryOperator, Expression as Expr, VariadicOperator};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{EngineData, EngineInterface, ExpressionEvaluator, JsonHandler};
