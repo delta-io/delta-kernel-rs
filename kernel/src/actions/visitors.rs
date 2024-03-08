@@ -63,6 +63,31 @@ impl DataVisitor for MetadataVisitor {
 }
 
 #[derive(Default)]
+pub(crate) struct SelectionVectorVisitor {
+    pub(crate) selection_vector: Vec<bool>,
+}
+
+impl SelectionVectorVisitor {
+    fn visit_bool<'a>(
+        row_index: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<bool> {
+        // FIXME(zach): output col name
+        // FIXME(zach): unwrap garbo
+        Ok(getters[0].get_bool(row_index, "output").unwrap().unwrap())
+    }
+}
+
+impl DataVisitor for SelectionVectorVisitor {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for i in 0..row_count {
+            self.selection_vector.push(Self::visit_bool(i, getters)?);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
 pub(crate) struct ProtocolVisitor {
     pub(crate) protocol: Option<Protocol>,
 }

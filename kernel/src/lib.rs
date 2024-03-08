@@ -95,7 +95,7 @@ pub struct FileMeta {
 /// Connectors can implement this interface to optimize the evaluation using the
 /// connector specific capabilities.
 pub trait ExpressionEvaluator {
-    /// Evaluate the expression on given ColumnarBatch data.
+    /// Evaluate the expression on a given EngineData.
     ///
     /// Contains one value for each row of the input.
     /// The data type of the output is same as the type output of the expression this evaluator is using.
