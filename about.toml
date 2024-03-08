@@ -1,0 +1,9 @@
+accepted = [
+    "Apache-2.0",
+    "MIT",
+]
+
+ignore-transitive-dependencies = true
+
+[cbindgen]
+accepted = ["MPL-2.0"]
