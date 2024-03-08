@@ -94,8 +94,9 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
         self.task_executor.spawn(
             futures::stream::iter(files)
                 .map(move |(url, range)| {
-                    let file_path= url.to_file_path().expect("Not a valid file path");
-                    let path = Path::from_absolute_path(file_path).expect("Not able to be made into Path");
+                    let file_path = url.to_file_path().expect("Not a valid file path");
+                    let path =
+                        Path::from_absolute_path(file_path).expect("Not able to be made into Path");
                     let store = store.clone();
                     async move {
                         if let Some(rng) = range {
