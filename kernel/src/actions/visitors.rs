@@ -68,10 +68,7 @@ pub(crate) struct SelectionVectorVisitor {
 }
 
 impl SelectionVectorVisitor {
-    fn visit_bool<'a>(
-        row_index: usize,
-        getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<bool> {
+    fn visit_bool<'a>(row_index: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<bool> {
         // FIXME(zach): output col name
         // FIXME(zach): unwrap garbo
         Ok(getters[0].get_bool(row_index, "output").unwrap().unwrap())
