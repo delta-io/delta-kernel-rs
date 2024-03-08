@@ -289,7 +289,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     let location = Url::parse("memory:///").unwrap();
     let engine_interface = DefaultTableClient::new(
         storage.clone(),
-        Path::from("/"),
+        Path::from(""),
         Arc::new(TokioBackgroundExecutor::new()),
     );
 
