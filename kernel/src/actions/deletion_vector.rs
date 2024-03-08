@@ -157,7 +157,7 @@ enum Endian {
     Little,
 }
 
-/// small helper to read a little endian u32 from a cursor
+/// small helper to read a big or little endian u32 from a cursor
 fn read_u32(cursor: &mut Cursor<Bytes>, endian: Endian) -> DeltaResult<u32> {
     let mut buf = [0; 4];
     cursor
