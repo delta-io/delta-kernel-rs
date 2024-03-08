@@ -9,7 +9,7 @@ use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::client::DefaultTableClient;
 use deltakernel::scan::ScanBuilder;
 use deltakernel::simple_client::data::SimpleData;
-use deltakernel::Table;
+use deltakernel::{DeltaResult, Table};
 
 use clap::Parser;
 use comfy_table::presets::UTF8_FULL;
@@ -77,33 +77,19 @@ fn extract_value(column: &ArrayRef, row_id: usize) -> String {
     }
 }
 
-fn main() {
+fn main() -> DeltaResult<()> {
     env_logger::init();
     let cli = Cli::parse();
-    let url = url::Url::parse(&cli.path).unwrap();
+    let url = url::Url::parse(&cli.path)?;
     println!("Reading {url}");
     let engine_interface = DefaultTableClient::try_new(
         &url,
         HashMap::<String, String>::new(),
         Arc::new(TokioBackgroundExecutor::new()),
-    );
-    let Ok(engine_interface) = engine_interface else {
-        println!(
-            "Failed to construct table client: {}",
-            engine_interface.err().unwrap()
-        );
-        return;
-    };
+    )?;
 
     let table = Table::new(url);
-    let snapshot = table.snapshot(&engine_interface, None);
-    let Ok(snapshot) = snapshot else {
-        println!(
-            "Failed to construct latest snapshot: {}",
-            snapshot.err().unwrap()
-        );
-        return;
-    };
+    let snapshot = table.snapshot(&engine_interface, None)?;
 
     let scan = ScanBuilder::new(snapshot).build();
 
@@ -123,11 +109,15 @@ fn main() {
     }
     table.set_header(header_names);
 
-    for res in scan.execute(&engine_interface).unwrap().into_iter() {
-        let data = res.raw_data.unwrap();
-        let record_batch: RecordBatch = data.into_any().downcast::<SimpleData>().unwrap().into();
+    for res in scan.execute(&engine_interface)?.into_iter() {
+        let data = res.raw_data?;
+        let record_batch: RecordBatch = data
+            .into_any()
+            .downcast::<SimpleData>()
+            .map_err(|_| deltakernel::Error::EngineDataType("SimpleData".to_string()))?
+            .into();
         let batch = if let Some(mask) = res.mask {
-            filter_record_batch(&record_batch, &mask.into()).unwrap()
+            filter_record_batch(&record_batch, &mask.into())?
         } else {
             record_batch
         };
@@ -138,4 +128,5 @@ fn main() {
         }
     }
     println!("{table}");
+    Ok(())
 }
