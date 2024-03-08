@@ -94,7 +94,8 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
         self.task_executor.spawn(
             futures::stream::iter(files)
                 .map(move |(url, range)| {
-                    let path = Path::from(url.path());
+                    let file_path= url.to_file_path().expect("Not a valid file path");
+                    let path = Path::from_absolute_path(file_path).expect("Not able to be made into Path");
                     let store = store.clone();
                     async move {
                         if let Some(rng) = range {
@@ -160,7 +161,7 @@ mod tests {
 
         url.set_path(&format!("{}/c", url.path()));
         slices.push((url, Some(Range { start: 4, end: 9 })));
-
+        dbg!(&slices);
         let data: Vec<Bytes> = client.read_files(slices).unwrap().try_collect().unwrap();
 
         assert_eq!(data.len(), 3);
