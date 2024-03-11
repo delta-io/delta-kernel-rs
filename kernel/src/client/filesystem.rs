@@ -94,10 +94,14 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
         self.task_executor.spawn(
             futures::stream::iter(files)
                 .map(move |(url, range)| {
-                    let file_path = url.to_file_path().expect("Not a valid file path");
-                    dbg!(&file_path);
-                    let path =
-                        Path::from_absolute_path(file_path).expect("Not able to be made into Path");
+                    // Wasn't checking the scheme before calling to_file_path causing the url path to
+                    // be eaten in a strange way. Now just revert to the old way if not a file scheme
+                    let path = if url.scheme() == "file" {
+                        let file_path = url.to_file_path().expect("Not a valid file path");
+                        Path::from_absolute_path(file_path).expect("Not able to be made into Path")
+                    } else {
+                        Path::from(url.path())
+                    };
                     let store = store.clone();
                     async move {
                         if let Some(rng) = range {
