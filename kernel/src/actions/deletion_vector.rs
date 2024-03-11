@@ -142,7 +142,12 @@ impl DeletionVectorDescriptor {
                 // get the Bytes back out and limit it to dv_size
                 let position = cursor.position();
                 let mut bytes = cursor.into_inner();
-                bytes.truncate((position + dv_size as u64) as usize);
+                let truncate_pos = position + dv_size as u64;
+                assert!(
+                    truncate_pos <= usize::MAX as u64,
+                    "Can't truncate as truncate_pos is > usize::MAX"
+                );
+                bytes.truncate(truncate_pos as usize);
                 let mut cursor = Cursor::new(bytes);
                 cursor.set_position(position);
                 RoaringTreemap::deserialize_from(cursor)
