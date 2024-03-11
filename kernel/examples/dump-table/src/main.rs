@@ -40,7 +40,7 @@ fn main() -> DeltaResult<()> {
 
     let scan = ScanBuilder::new(snapshot).build();
 
-    let mut batches = vec!();
+    let mut batches = vec![];
     for res in scan.execute(&engine_interface)?.into_iter() {
         let data = res.raw_data?;
         let record_batch: RecordBatch = data
