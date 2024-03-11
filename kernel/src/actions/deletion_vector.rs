@@ -3,6 +3,7 @@
 use std::io::{Cursor, Read};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use roaring::RoaringTreemap;
 use url::Url;
 
@@ -52,18 +53,21 @@ impl DeletionVectorDescriptor {
     pub fn absolute_path(&self, parent: &Url) -> DeltaResult<Option<Url>> {
         match self.storage_type.as_str() {
             "u" => {
-                let prefix_len = self.path_or_inline_dv.len() as i32 - 20;
-                if prefix_len < 0 {
-                    return Err(Error::deletion_vector("Invalid length"));
+                let path_len = self.path_or_inline_dv.len();
+                if path_len < 20 {
+                    return Err(Error::deletion_vector(
+                        "Invalid length {path_len}, must be >20",
+                    ));
                 }
-                let decoded = z85::decode(&self.path_or_inline_dv[(prefix_len as usize)..])
+                let prefix_len = path_len - 20;
+                let decoded = z85::decode(&self.path_or_inline_dv[prefix_len..])
                     .map_err(|_| Error::deletion_vector("Failed to decode DV uuid"))?;
                 let uuid = uuid::Uuid::from_slice(&decoded)
                     .map_err(|err| Error::DeletionVector(err.to_string()))?;
                 let dv_suffix = if prefix_len > 0 {
                     format!(
                         "{}/deletion_vector_{uuid}.bin",
-                        &self.path_or_inline_dv[..(prefix_len as usize)]
+                        &self.path_or_inline_dv[..prefix_len]
                     )
                 } else {
                     format!("deletion_vector_{uuid}.bin")
@@ -83,6 +87,12 @@ impl DeletionVectorDescriptor {
         }
     }
 
+    /// Read a dv in stored form into a [`RoaringTreemap`]
+    // A few notes:
+    //  - dvs write integers in BOTH big and little endian format. The magic and dv itself are
+    //  little, while the version, size, and checksum are big
+    //  - dvs can potentially indicate the size in the delta log, and _also_ in the file. If both
+    //  are present, we assert they are the same
     pub fn read(
         &self,
         fs_client: Arc<dyn FileSystemClient>,
@@ -105,36 +115,67 @@ impl DeletionVectorDescriptor {
                     .ok_or(Error::missing_data("No deletion vector data"))??;
 
                 let mut cursor = Cursor::new(dv_data);
+                let mut version_buf = [0; 1];
+                cursor
+                    .read(&mut version_buf)
+                    .map_err(|err| Error::DeletionVector(err.to_string()))?;
+                let version = u8::from_be_bytes(version_buf);
+                if version != 1 {
+                    return Err(Error::DeletionVector(format!("Invalid version: {version}")));
+                }
+
                 if let Some(offset) = offset {
-                    // TODO should we read the datasize from the DV file?
-                    // offset plus datasize bytes
-                    cursor.set_position((offset + 4) as u64);
+                    cursor.set_position(offset as u64);
                 }
+                let dv_size = read_u32(&mut cursor, Endian::Big)?;
+                if dv_size != size_in_bytes as u32 {
+                    return Err(Error::DeletionVector(format!(
+                        "DV size mismatch. Log indicates {size_in_bytes}, file says: {dv_size}"
+                    )));
+                }
+                let magic = read_u32(&mut cursor, Endian::Little)?;
 
-                let mut buf = vec![0; 4];
-                cursor
-                    .read(&mut buf)
-                    .map_err(|err| Error::DeletionVector(err.to_string()))?;
-                let magic = i32::from_le_bytes(
-                    buf.try_into()
-                        .map_err(|_| Error::deletion_vector("failed to read magic bytes"))?,
-                );
                 if magic != 1681511377 {
-                    return Err(Error::DeletionVector(format!("Invalid magic {magic}")));
+                    return Err(Error::DeletionVector(format!("Invalid magic: {magic}")));
                 }
 
-                let mut buf = vec![0; size_in_bytes as usize];
-                cursor
-                    .read(&mut buf)
-                    .map_err(|err| Error::DeletionVector(err.to_string()))?;
-
-                RoaringTreemap::deserialize_from(Cursor::new(buf))
+                // get the Bytes back out and limit it to dv_size
+                let position = cursor.position();
+                let mut bytes = cursor.into_inner();
+                let truncate_pos = position + dv_size as u64;
+                assert!(
+                    truncate_pos <= usize::MAX as u64,
+                    "Can't truncate as truncate_pos is > usize::MAX"
+                );
+                bytes.truncate(truncate_pos as usize);
+                let mut cursor = Cursor::new(bytes);
+                cursor.set_position(position);
+                RoaringTreemap::deserialize_from(cursor)
                     .map_err(|err| Error::DeletionVector(err.to_string()))
             }
         }
     }
 }
 
+enum Endian {
+    Big,
+    Little,
+}
+
+/// small helper to read a big or little endian u32 from a cursor
+fn read_u32(cursor: &mut Cursor<Bytes>, endian: Endian) -> DeltaResult<u32> {
+    let mut buf = [0; 4];
+    cursor
+        .read(&mut buf)
+        .map_err(|err| Error::DeletionVector(err.to_string()))?;
+    match endian {
+        Endian::Big => Ok(u32::from_be_bytes(buf)),
+        Endian::Little => Ok(u32::from_le_bytes(buf)),
+    }
+}
+
+/// helper function to convert a treemap into a boolean vector where, for index i, if the bit is
+/// set, the vector will be false, and otherwise at index i the vector will be true
 pub(crate) fn treemap_to_bools(treemap: RoaringTreemap) -> Vec<bool> {
     fn combine(high_bits: u32, low_bits: u32) -> usize {
         ((u64::from(high_bits) << 32) | u64::from(low_bits)) as usize
