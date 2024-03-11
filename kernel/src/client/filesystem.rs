@@ -96,7 +96,7 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
                 .map(move |(url, range)| {
                     // Wasn't checking the scheme before calling to_file_path causing the url path to
                     // be eaten in a strange way. Now, if not a file scheme, just blindly convert to a path.
-                    // https://docs.rs/url/latest/url/struct.Url.html#method.to_file_path has more 
+                    // https://docs.rs/url/latest/url/struct.Url.html#method.to_file_path has more
                     // details about why this check is necessary
                     let path = if url.scheme() == "file" {
                         let file_path = url.to_file_path().expect("Not a valid file path");
