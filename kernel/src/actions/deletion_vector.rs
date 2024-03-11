@@ -91,7 +91,7 @@ impl DeletionVectorDescriptor {
     // A few notes:
     //  - dvs write integers in BOTH big and little endian format. The magic and dv itself are
     //  little, while the version, size, and checksum are big
-    //  - dvs can potentially indicate the size in the delta log, and _also_ in the file, if both
+    //  - dvs can potentially indicate the size in the delta log, and _also_ in the file. If both
     //  are present, we assert they are the same
     pub fn read(
         &self,
