@@ -8,13 +8,7 @@ env:
 
 jobs:
   format:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os:
-          - macOS-latest
-          - ubuntu-latest
-          - windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
       - name: Install minimal stable with clippy and rustfmt
