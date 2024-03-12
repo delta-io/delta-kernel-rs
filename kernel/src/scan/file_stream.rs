@@ -44,8 +44,13 @@ impl DataVisitor for AddRemoveVisitor {
             // Add will have a path at index 0 if it is valid
             if let Some(path) = getters[0].get_opt(i, "add.path")? {
                 // Keep the file unless the selection vector is present and is false for this row
-                if !self.selection_vector.as_ref().is_some_and(|selection| !selection[i]) {
-                    self.adds.push(AddVisitor::visit_add(i, path, &getters[..ADD_FIELD_COUNT])?)
+                if !self
+                    .selection_vector
+                    .as_ref()
+                    .is_some_and(|selection| !selection[i])
+                {
+                    self.adds
+                        .push(AddVisitor::visit_add(i, path, &getters[..ADD_FIELD_COUNT])?)
                 }
             }
             // Remove will have a path at index 15 if it is valid
@@ -105,8 +110,8 @@ impl LogReplayScanner {
         actions.extract(Arc::new(schema_to_use), &mut visitor)?;
 
         for remove in visitor.removes.into_iter() {
-            self.seen
-                .insert((remove.path.clone(), remove.dv_unique_id()));
+            let dv_id = remove.dv_unique_id();
+            self.seen.insert((remove.path, dv_id));
         }
 
         visitor
