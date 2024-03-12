@@ -43,12 +43,9 @@ impl DataVisitor for AddRemoveVisitor {
         for i in 0..row_count {
             // Add will have a path at index 0 if it is valid
             if let Some(path) = getters[0].get_opt(i, "add.path")? {
-                match self.selection_vector.as_ref().map(|selection| selection[i]) {
-                    Some(true) | None => {
-                        self.adds
-                            .push(AddVisitor::visit_add(i, path, &getters[..ADD_FIELD_COUNT])?)
-                    }
-                    Some(false) => (), // did not pass skipping
+                // Keep the file unless the selection vector is present and is false for this row
+                if !self.selection_vector.as_ref().is_some_and(|selection| !selection[i]) {
+                    self.adds.push(AddVisitor::visit_add(i, path, &getters[..ADD_FIELD_COUNT])?)
                 }
             }
             // Remove will have a path at index 15 if it is valid
