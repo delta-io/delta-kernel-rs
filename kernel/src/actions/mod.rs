@@ -13,26 +13,26 @@ use crate::{schema::StructType, DeltaResult, EngineData};
 
 use std::collections::HashMap;
 
-lazy_static! {
-    static ref LOG_SCHEMA: StructType = StructType::new(
-        vec![
-            Option::<Add>::get_field("add"),
-            Option::<Remove>::get_field("remove"),
-            Option::<Metadata>::get_field("metaData"),
-            Option::<Protocol>::get_field("protocol"),
-            // We don't support the following actions yet
-            //Option<Cdc>::get_field("cdc"),
-            //Option<CommitInfo>::get_field("commitInfo"),
-            //Option<DomainMetadata>::get_field("domainMetadata"),
-            //Option<Transaction>::get_field("txn"),
-        ]
-    );
-}
-
 pub(crate) static ADD_NAME: &str = "add";
 pub(crate) static REMOVE_NAME: &str = "remove";
 pub(crate) static METADATA_NAME: &str = "metaData";
 pub(crate) static PROTOCOL_NAME: &str = "protocol";
+
+lazy_static! {
+    static ref LOG_SCHEMA: StructType = StructType::new(
+        vec![
+            Option::<Add>::get_field(ADD_NAME),
+            Option::<Remove>::get_field(REMOVE_NAME),
+            Option::<Metadata>::get_field(METADATA_NAME),
+            Option::<Protocol>::get_field(PROTOCOL_NAME),
+            // We don't support the following actions yet
+            //Option<Cdc>::get_field(CDC_NAME),
+            //Option<CommitInfo>::get_field(COMMIT_INFO_NAME),
+            //Option<DomainMetadata>::get_field(DOMAIN_METADATA_NAME),
+            //Option<Transaction>::get_field(TRANSACTION_NAME),
+        ]
+    );
+}
 
 pub(crate) fn get_log_schema() -> &'static StructType {
     &LOG_SCHEMA
