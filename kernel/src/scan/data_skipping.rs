@@ -153,7 +153,7 @@ impl DataSkippingFilter {
         //    were missing/null.
         //
         // 3. The selection evaluator does DISTINCT(col(predicate), 'false') to produce true (= keep) when
-        //    the predicate is false and false (= skip) when the predicate is true/null.
+        //    the predicate is true/null and false (= skip) when the predicate is false.
         let select_stats_evaluator = table_client.get_expression_handler().get_evaluator(
             stats_schema.clone(),
             STATS_EXPR.clone(),
