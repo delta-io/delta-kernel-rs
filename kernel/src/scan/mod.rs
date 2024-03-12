@@ -3,8 +3,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 
 use self::file_stream::log_replay_iter;
-use crate::actions::schemas::GetField;
-use crate::actions::{Add, Remove};
+use crate::actions::{get_log_schema, Add, ADD_NAME, REMOVE_NAME};
 use crate::expressions::{Expression, Scalar};
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::snapshot::Snapshot;
@@ -129,10 +128,7 @@ impl Scan {
         &self,
         engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
-        let action_schema = Arc::new(StructType::new(vec![
-            Option::<Add>::get_field("add"),
-            Option::<Remove>::get_field("remove"),
-        ]));
+        let action_schema = get_log_schema().project_as_schema(&[ADD_NAME, REMOVE_NAME])?;
 
         let log_iter = self.snapshot.log_segment.replay(
             engine_interface,

@@ -214,13 +214,16 @@ impl SimpleData {
                 .filter(|a| *a.data_type() != ArrowDataType::Null);
             // Note: if col is None we have either:
             //   a) encountered a column that is all nulls or,
-            //   b) recursed into a struct that was all null.
-            // So below if the field is allowed to be null, we push that, otherwise we error out.
+            //   b) recursed into a optional struct that was null. In this case, array.is_none() is
+            //      true and we don't need to check field nullability, because we assume all fields
+            //      of a nullable struct can be null
+            // So below if the field is allowed to be null, OR array.is_none() we push that,
+            // otherwise we error out.
             if let Some(col) = col {
                 Self::extract_column(out_col_array, field, col)?;
-            } else if field.is_nullable() {
-                if let DataType::Struct(_) = field.data_type() {
-                    Self::extract_columns_from_array(out_col_array, schema, None)?;
+            } else if array.is_none() || field.is_nullable() {
+                if let DataType::Struct(inner_struct) = field.data_type() {
+                    Self::extract_columns_from_array(out_col_array, inner_struct.as_ref(), None)?;
                 } else {
                     debug!("Pushing a null field for {}", field.name);
                     out_col_array.push(&());
@@ -314,7 +317,7 @@ mod tests {
     use arrow_array::{RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 
-    use crate::actions::Metadata;
+    use crate::actions::{Metadata, Protocol};
     use crate::DeltaResult;
     use crate::{
         actions::get_log_schema,
@@ -346,6 +349,23 @@ mod tests {
         assert_eq!(metadata.id, "aff5cb91-8cd9-4195-aef9-446908507302");
         assert_eq!(metadata.created_time, Some(1670892997849));
         assert_eq!(metadata.partition_columns, vec!("c1", "c2"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_nullable_struct() -> DeltaResult<()> {
+        let client = SimpleClient::new();
+        let handler = client.get_json_handler();
+        let json_strings: StringArray = vec![
+            r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
+        ]
+        .into();
+        let output_schema = get_log_schema().project_as_schema(&["metaData"])?;
+        let parsed = handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        let protocol = Protocol::try_new_from_data(parsed.as_ref())?;
+        assert!(protocol.is_none());
         Ok(())
     }
 }

@@ -262,8 +262,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        actions::get_log_schema,
-        actions::schemas::GetSchema,
+        actions::{get_log_schema, ADD_NAME},
         simple_client::{data::SimpleData, json::SimpleJsonHandler, SimpleClient},
         EngineData, EngineInterface, JsonHandler,
     };
@@ -356,7 +355,9 @@ mod tests {
         let batch = json_handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
-        let add_schema = Add::get_schema();
+        let add_schema = get_log_schema()
+            .project_as_schema(&[ADD_NAME])
+            .expect("Can't get add schema");
         let mut add_visitor = AddVisitor::default();
         batch.extract(add_schema, &mut add_visitor).unwrap();
         let add1 = Add {

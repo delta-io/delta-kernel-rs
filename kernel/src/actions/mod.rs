@@ -4,12 +4,39 @@ pub(crate) mod schemas;
 pub(crate) mod visitors;
 
 use derive_macros::Schema;
-use std::collections::HashMap;
+use lazy_static::lazy_static;
 use visitors::{AddVisitor, MetadataVisitor, ProtocolVisitor};
 
+use self::deletion_vector::DeletionVectorDescriptor;
+use crate::actions::schemas::GetField;
 use crate::{schema::StructType, DeltaResult, EngineData};
 
-use self::{deletion_vector::DeletionVectorDescriptor, schemas::GetSchema};
+use std::collections::HashMap;
+
+lazy_static! {
+    static ref LOG_SCHEMA: StructType = StructType::new(
+        vec![
+            Option::<Add>::get_field("add"),
+            Option::<Remove>::get_field("remove"),
+            Option::<Metadata>::get_field("metaData"),
+            Option::<Protocol>::get_field("protocol"),
+            // We don't support the following actions yet
+            //Option<Cdc>::get_field("cdc"),
+            //Option<CommitInfo>::get_field("commitInfo"),
+            //Option<DomainMetadata>::get_field("domainMetadata"),
+            //Option<Transaction>::get_field("txn"),
+        ]
+    );
+}
+
+pub(crate) static ADD_NAME: &str = "add";
+pub(crate) static REMOVE_NAME: &str = "remove";
+pub(crate) static METADATA_NAME: &str = "metaData";
+pub(crate) static PROTOCOL_NAME: &str = "protocol";
+
+pub(crate) fn get_log_schema() -> &'static StructType {
+    &LOG_SCHEMA
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
 pub struct Format {
@@ -52,7 +79,10 @@ pub struct Metadata {
 impl Metadata {
     pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
         let mut visitor = MetadataVisitor::default();
-        data.extract(Metadata::get_schema(), &mut visitor)?;
+        data.extract(
+            get_log_schema().project_as_schema(&[METADATA_NAME])?,
+            &mut visitor,
+        )?;
         Ok(visitor.metadata)
     }
 
@@ -80,7 +110,10 @@ pub struct Protocol {
 impl Protocol {
     pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
         let mut visitor = ProtocolVisitor::default();
-        data.extract(Protocol::get_schema(), &mut visitor)?;
+        data.extract(
+            get_log_schema().project_as_schema(&[PROTOCOL_NAME])?,
+            &mut visitor,
+        )?;
         Ok(visitor.protocol)
     }
 }
@@ -134,7 +167,10 @@ impl Add {
     /// Since we always want to parse multiple adds from data, we return a `Vec<Add>`
     pub fn parse_from_data(data: &dyn EngineData) -> DeltaResult<Vec<Add>> {
         let mut visitor = AddVisitor::default();
-        data.extract(Add::get_schema(), &mut visitor)?;
+        data.extract(
+            get_log_schema().project_as_schema(&[ADD_NAME])?,
+            &mut visitor,
+        )?;
         Ok(visitor.adds)
     }
 
@@ -189,43 +225,18 @@ impl Remove {
     }
 }
 
-use crate::actions::schemas::GetField;
-use lazy_static::lazy_static;
-
-lazy_static! {
-    static ref LOG_SCHEMA: StructType = StructType::new(
-        vec![
-            Option::<Add>::get_field("add"),
-            Option::<Remove>::get_field("remove"),
-            Option::<Metadata>::get_field("metaData"),
-            Option::<Protocol>::get_field("protocol"),
-            // We don't support the following actions yet
-            //Option<Cdc>::get_field("cdc"),
-            //Option<CommitInfo>::get_field("commitInfo"),
-            //Option<DomainMetadata>::get_field("domainMetadata"),
-            //Option<Transaction>::get_field("txn"),
-        ]
-    );
-}
-
-#[cfg(test)]
-pub(crate) fn get_log_schema() -> &'static StructType {
-    &LOG_SCHEMA
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::{
-        actions::schemas::GetSchema,
-        schema::{ArrayType, DataType, MapType, StructField},
-    };
+    use crate::schema::{ArrayType, DataType, MapType, StructField};
 
     #[test]
     fn test_metadata_schema() {
-        let schema = Metadata::get_schema();
+        let schema = get_log_schema()
+            .project_as_schema(&["metaData"])
+            .expect("Couldn't get metaData field");
 
         let expected = Arc::new(StructType::new(vec![StructField::new(
             "metaData",
@@ -258,7 +269,7 @@ mod tests {
                     false,
                 ),
             ]),
-            false,
+            true,
         )]));
         assert_eq!(schema, expected);
     }
@@ -295,7 +306,9 @@ mod tests {
 
     #[test]
     fn test_remove_schema() {
-        let schema = Remove::get_schema();
+        let schema = get_log_schema()
+            .project_as_schema(&["remove"])
+            .expect("Couldn't get remove field");
         let expected = Arc::new(StructType::new(vec![StructField::new(
             "remove",
             StructType::new(vec![
@@ -310,7 +323,7 @@ mod tests {
                 StructField::new("baseRowId", DataType::LONG, true),
                 StructField::new("defaultRowCommitVersion", DataType::LONG, true),
             ]),
-            false,
+            true,
         )]));
         assert_eq!(schema, expected);
     }

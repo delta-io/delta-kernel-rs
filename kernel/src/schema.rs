@@ -3,7 +3,10 @@ use std::sync::Arc;
 use std::{collections::HashMap, fmt::Display};
 
 use indexmap::IndexMap;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+
+use crate::{DeltaResult, Error};
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
@@ -138,6 +141,38 @@ impl StructType {
             type_name: "struct".into(),
             fields: fields.into_iter().map(|f| (f.name.clone(), f)).collect(),
         }
+    }
+
+    /// Get a [`StructType`] containing [`StructField`]s of the given names, preserving the original
+    /// order of fields. Returns an Err if a specified field doesn't exist
+    pub fn project(&self, names: &[impl AsRef<str>]) -> DeltaResult<StructType> {
+        let mut indexes: Vec<usize> = names
+            .iter()
+            .map(|name| {
+                self.fields
+                    .get_index_of(name.as_ref())
+                    .ok_or_else(|| Error::missing_column(name.as_ref()))
+            })
+            .try_collect()?;
+        indexes.sort(); // keep schema order
+        let fields: Vec<StructField> = indexes
+            .iter()
+            .map(|index| {
+                self.fields
+                    .get_index(*index)
+                    .expect("get_index_of returned non-existant index")
+                    .1
+                    .clone()
+            })
+            .collect();
+        Ok(Self::new(fields))
+    }
+
+    /// Get a [`SchemaRef`] containing [`StructField`]s of the given names, preserving the original
+    /// order of fields. Returns an Err if a specified field doesn't exist
+    pub fn project_as_schema(&self, names: &[impl AsRef<str>]) -> DeltaResult<SchemaRef> {
+        let struct_type = self.project(names)?;
+        Ok(Arc::new(struct_type))
     }
 
     pub fn field(&self, name: impl AsRef<str>) -> Option<&StructField> {

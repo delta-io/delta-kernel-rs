@@ -1,66 +1,15 @@
-use proc_macro2::{Ident, Spacing, TokenStream, TokenTree};
+use proc_macro2::{Ident, TokenStream};
 use quote::{quote, quote_spanned};
 use syn::spanned::Spanned;
-use syn::{
-    parse_macro_input, Attribute, Data, DataStruct, DeriveInput, Fields, Meta, PathArguments, Type,
-};
-
-static SCHEMA_ERR_STR: &str = "schema(...) only supports schema(name = name)";
-
-// Return the ident to use as the schema name if it's been specified in the attributes of the struct
-fn get_schema_name_from_attr<'a>(attrs: impl Iterator<Item = &'a Attribute>) -> Option<Ident> {
-    for attr in attrs {
-        if let Meta::List(list) = &attr.meta {
-            if let Some(attr_name) = list.path.segments.iter().last() {
-                if attr_name.ident == "schema" {
-                    // We have some schema(...) attribute, see if we've specified a different name
-                    let tokens: Vec<TokenTree> = list.tokens.clone().into_iter().collect();
-                    match tokens[..] {
-                        // we only support `name = name` style
-                        [TokenTree::Ident(ref name_ident), TokenTree::Punct(ref punct), TokenTree::Ident(ref schema_ident)] =>
-                        {
-                            assert!(name_ident == "name", "{}", SCHEMA_ERR_STR);
-                            assert!(punct.as_char() == '=', "{}", SCHEMA_ERR_STR);
-                            assert!(punct.spacing() == Spacing::Alone, "{}", SCHEMA_ERR_STR);
-                            return Some(schema_ident.clone());
-                        }
-                        _ => panic!("{}", SCHEMA_ERR_STR),
-                    }
-                } else {
-                    panic!("Schema only accepts `schema` as an extra attribute")
-                }
-            }
-        }
-    }
-    None
-}
+use syn::{parse_macro_input, Data, DataStruct, DeriveInput, Fields, PathArguments, Type};
 
 #[proc_macro_derive(Schema, attributes(schema))]
 pub fn derive_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let struct_ident = input.ident;
-    let schema_name = get_schema_name_from_attr(input.attrs.iter()).unwrap_or_else(|| {
-        // default to the struct name, but lowercased
-        Ident::new(
-            &struct_ident.to_string().to_lowercase(),
-            struct_ident.span(),
-        )
-    });
 
     let schema_fields = gen_schema_fields(&input.data);
     let output = quote! {
-        impl crate::actions::schemas::GetSchema for #struct_ident {
-            fn get_schema() -> crate::schema::SchemaRef {
-                use crate::actions::schemas::GetField;
-                static SCHEMA_LOCK: std::sync::OnceLock<crate::schema::SchemaRef> = std::sync::OnceLock::new();
-                SCHEMA_LOCK.get_or_init(|| {
-                    std::sync::Arc::new(crate::schema::StructType::new(vec![
-                        Self::get_field(stringify!(#schema_name))
-                    ]))
-                }).clone() // cheap clone, it's an Arc
-            }
-        }
-
         impl crate::actions::schemas::GetField for #struct_ident {
             fn get_field(name: impl Into<String>) -> crate::schema::StructField {
                 use crate::actions::schemas::GetField;

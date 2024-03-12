@@ -1,15 +1,14 @@
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use either::Either;
 use tracing::debug;
 
 use super::data_skipping::DataSkippingFilter;
-use crate::actions::schemas::{GetField, GetSchema};
+use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME};
 use crate::actions::{visitors::AddVisitor, visitors::RemoveVisitor, Add, Remove};
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::Expression;
-use crate::schema::{SchemaRef, StructType};
+use crate::schema::SchemaRef;
 use crate::{DataVisitor, DeltaResult, EngineData, EngineInterface};
 
 struct LogReplayScanner {
@@ -82,14 +81,11 @@ impl LogReplayScanner {
         };
 
         let schema_to_use = if is_log_batch {
-            Arc::new(StructType::new(vec![
-                Option::<Add>::get_field("add"),
-                Option::<Remove>::get_field("remove"),
-            ]))
+            get_log_schema().project_as_schema(&[ADD_NAME, REMOVE_NAME])?
         } else {
             // All checkpoint actions are already reconciled and Remove actions in checkpoint files
             // only serve as tombstones for vacuum jobs. So no need to load them here.
-            Add::get_schema()
+            get_log_schema().project_as_schema(&[ADD_NAME])?
         };
         let mut visitor = AddRemoveVisitor::default();
         actions.extract(schema_to_use, &mut visitor)?;

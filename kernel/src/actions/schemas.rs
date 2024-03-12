@@ -2,12 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::schema::{ArrayType, DataType, MapType, SchemaRef, StructField};
-
-/// A trait that says you can ask for the [`Schema`] of the implementor
-pub(crate) trait GetSchema {
-    fn get_schema() -> SchemaRef;
-}
+use crate::schema::{ArrayType, DataType, MapType, StructField};
 
 /// A trait that allows getting a `StructField` based on the provided name and nullability
 pub(crate) trait GetField {
