@@ -18,8 +18,7 @@ pub fn derive_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream 
                     crate::schema::StructType::new(vec![
                         #schema_fields
                     ]),
-                    // TODO: Ensure correct. By default not nullable, only can be made nullable by
-                    // being wrapped in an Option
+                    // By default not nullable. To make something nullable wrap it in an Option
                     false,
                 )
             }
