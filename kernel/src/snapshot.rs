@@ -9,10 +9,9 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::actions::schemas::GetField;
-use crate::actions::{Metadata, Protocol};
+use crate::actions::{get_log_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
 use crate::path::LogPath;
-use crate::schema::{Schema, SchemaRef, StructType};
+use crate::schema::{Schema, SchemaRef};
 use crate::{DeltaResult, EngineInterface, Error, FileMeta, FileSystemClient, Version};
 use crate::{EngineData, Expression};
 
@@ -67,11 +66,8 @@ impl LogSegment {
         &self,
         engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<Option<(Metadata, Protocol)>> {
-        let schema = StructType::new(vec![
-            Option::<Metadata>::get_field("metaData"),
-            Option::<Protocol>::get_field("protocol"),
-        ]);
-        let data_batches = self.replay(engine_interface, Arc::new(schema), None)?;
+        let schema = get_log_schema().project_as_schema(&[METADATA_NAME, PROTOCOL_NAME])?;
+        let data_batches = self.replay(engine_interface, schema, None)?;
         let mut metadata_opt: Option<Metadata> = None;
         let mut protocol_opt: Option<Protocol> = None;
         for batch in data_batches {
