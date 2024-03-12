@@ -78,7 +78,7 @@ impl SelectionVectorVisitor {
 impl DataVisitor for SelectionVectorVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
-            self.selection_vector.push(Self::visit_bool(i, getters)?);
+            self.selection_vector.push(getters[0].get(i, "selectionvector.output")?)
         }
         Ok(())
     }
