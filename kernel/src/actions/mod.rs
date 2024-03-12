@@ -56,7 +56,6 @@ impl Default for Format {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Schema)]
-#[schema(name = metaData)]
 pub struct Metadata {
     /// Unique identifier for this table
     pub id: String,
