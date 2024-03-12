@@ -65,8 +65,10 @@ default-client = [
 
 developer-visibility = []
 simple-client = [
+  "arrow-array",
   "arrow-conversion",
   "arrow-json",
+  "arrow-select",
   "parquet"
 ]
 
