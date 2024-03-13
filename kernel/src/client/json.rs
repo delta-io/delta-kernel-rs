@@ -133,20 +133,15 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         // This channel will become the output iterator
         // The stream will execute in the background, and we allow up to `readahead`
         // batches to be buffered in the channel.
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(self.readahead);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(self.readahead);
 
         self.task_executor.spawn(stream.for_each(move |res| {
-            let sender = sender.clone();
-            async move {
-                // we don't need to check result, it's okay if the receiver hung up because they may
-                // not need anymore of the read data
-                let _ = sender.send(res).await;
-            }
+            sender.send(res).ok();
+            futures::future::ready(())
         }));
 
-        Ok(Box::new(std::iter::from_fn(move || {
-            let rbo = receiver.blocking_recv();
-            rbo.map(|rbr| rbr.map(|rb| Box::new(SimpleData::new(rb)) as _))
+        Ok(Box::new(receiver.into_iter().map(|rbr| {
+            rbr.map(|rb| Box::new(SimpleData::new(rb)) as _)
         })))
     }
 }
