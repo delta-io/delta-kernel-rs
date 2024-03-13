@@ -67,9 +67,9 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         self.task_executor.spawn(async move {
             while let Some(res) = stream.next().await {
                 let sender = sender.clone();
-                let send_res = tokio::task::spawn_blocking(move || sender.send(res)).await;
-                match send_res {
-                    Ok(res) => match res {
+                let join_res = tokio::task::spawn_blocking(move || sender.send(res)).await;
+                match join_res {
+                    Ok(send_res) => match send_res {
                         Ok(()) => continue,
                         Err(_) => break,
                     },
