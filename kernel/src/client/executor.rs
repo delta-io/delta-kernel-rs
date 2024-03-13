@@ -140,7 +140,7 @@ pub mod tokio {
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
         {
-            Box::pin(tokio::task::spawn_blocking(task).map_err(|e| crate::Error::join_failure(e)))
+            Box::pin(tokio::task::spawn_blocking(task).map_err(crate::Error::join_failure))
         }
     }
 
@@ -203,7 +203,7 @@ pub mod tokio {
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
         {
-            Box::pin(tokio::task::spawn_blocking(task).map_err(|e| crate::Error::join_failure(e)))
+            Box::pin(tokio::task::spawn_blocking(task).map_err(crate::Error::join_failure))
         }
     }
 
