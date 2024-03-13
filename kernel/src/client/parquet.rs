@@ -64,10 +64,13 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         // stream to get ahead of the consumer.
         let (sender, receiver) = std::sync::mpsc::sync_channel(self.readahead);
 
+        let executor_for_block = self.task_executor.clone();
         self.task_executor.spawn(async move {
             while let Some(res) = stream.next().await {
                 let sender = sender.clone();
-                let join_res = tokio::task::spawn_blocking(move || sender.send(res)).await;
+                let join_res = executor_for_block
+                    .spawn_blocking(move || sender.send(res))
+                    .await;
                 match join_res {
                     Ok(send_res) => match send_res {
                         Ok(()) => continue,
