@@ -24,25 +24,48 @@ struct LogReplayScanner {
 struct AddRemoveVisitor {
     adds: Vec<Add>,
     removes: Vec<Remove>,
+    selection_vector: Option<Vec<bool>>,
+    // whether or not we are visiting commit json (=true) or checkpoint (=false)
+    is_log_batch: bool,
 }
 
 const ADD_FIELD_COUNT: usize = 15;
+
+impl AddRemoveVisitor {
+    fn new(selection_vector: Option<Vec<bool>>, is_log_batch: bool) -> Self {
+        AddRemoveVisitor {
+            selection_vector,
+            is_log_batch,
+            ..Default::default()
+        }
+    }
+}
 
 impl DataVisitor for AddRemoveVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
             // Add will have a path at index 0 if it is valid
             if let Some(path) = getters[0].get_opt(i, "add.path")? {
-                self.adds
-                    .push(AddVisitor::visit_add(i, path, &getters[..ADD_FIELD_COUNT])?);
+                // Keep the file unless the selection vector is present and is false for this row
+                if !self
+                    .selection_vector
+                    .as_ref()
+                    .is_some_and(|selection| !selection[i])
+                {
+                    self.adds
+                        .push(AddVisitor::visit_add(i, path, &getters[..ADD_FIELD_COUNT])?)
+                }
             }
             // Remove will have a path at index 15 if it is valid
             // TODO(nick): Should count the fields in Add to ensure we don't get this wrong if more
             // are added
-            else if let Some(path) = getters[ADD_FIELD_COUNT].get_opt(i, "remove.path")? {
-                let remove_getters = &getters[ADD_FIELD_COUNT..];
-                self.removes
-                    .push(RemoveVisitor::visit_remove(i, path, remove_getters)?);
+            // TODO(zach): add a check for selection vector that we never skip a remove
+            else if self.is_log_batch {
+                if let Some(path) = getters[ADD_FIELD_COUNT].get_opt(i, "remove.path")? {
+                    let remove_getters = &getters[ADD_FIELD_COUNT..];
+                    self.removes
+                        .push(RemoveVisitor::visit_remove(i, path, remove_getters)?);
+                }
             }
         }
         Ok(())
@@ -70,15 +93,13 @@ impl LogReplayScanner {
         actions: &dyn EngineData,
         is_log_batch: bool,
     ) -> DeltaResult<Vec<Add>> {
-        let filtered_actions = self
+        // apply data skipping to get back a selection vector for actions that passed skipping
+        // note: None implies all files passed data skipping.
+        let selection_vector = self
             .filter
             .as_ref()
             .map(|filter| filter.apply(actions))
             .transpose()?;
-        let actions = match filtered_actions {
-            Some(ref filtered_actions) => filtered_actions.as_ref(),
-            None => actions,
-        };
 
         let schema_to_use = StructType::new(if is_log_batch {
             vec![
@@ -90,12 +111,12 @@ impl LogReplayScanner {
             // only serve as tombstones for vacuum jobs. So no need to load them here.
             vec![crate::actions::schemas::ADD_FIELD.clone()]
         });
-        let mut visitor = AddRemoveVisitor::default();
+        let mut visitor = AddRemoveVisitor::new(selection_vector, is_log_batch);
         actions.extract(Arc::new(schema_to_use), &mut visitor)?;
 
         for remove in visitor.removes.into_iter() {
-            self.seen
-                .insert((remove.path.clone(), remove.dv_unique_id()));
+            let dv_id = remove.dv_unique_id();
+            self.seen.insert((remove.path, dv_id));
         }
 
         visitor

@@ -44,17 +44,20 @@ impl LogSegment {
     fn replay(
         &self,
         engine_interface: &dyn EngineInterface,
-        read_schema: SchemaRef,
+        commit_read_schema: SchemaRef,
+        checkpoint_read_schema: SchemaRef,
         predicate: Option<Expression>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>> {
         let json_client = engine_interface.get_json_handler();
+        // TODO change predicate to: predicate AND add.path not null and remove.path not null
         let commit_stream = json_client
-            .read_json_files(&self.commit_files, read_schema.clone(), predicate.clone())?
+            .read_json_files(&self.commit_files, commit_read_schema, predicate.clone())?
             .map_ok(|batch| (batch, true));
 
         let parquet_client = engine_interface.get_parquet_handler();
+        // TODO change predicate to: predicate AND add.path not null
         let checkpoint_stream = parquet_client
-            .read_parquet_files(&self.checkpoint_files, read_schema, predicate)?
+            .read_parquet_files(&self.checkpoint_files, checkpoint_read_schema, predicate)?
             .map_ok(|batch| (batch, false));
 
         let batches = commit_stream.chain(checkpoint_stream);
@@ -66,11 +69,13 @@ impl LogSegment {
         &self,
         engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<Option<(Metadata, Protocol)>> {
-        let schema = StructType::new(vec![
+        let schema = Arc::new(StructType::new(vec![
             crate::actions::schemas::METADATA_FIELD.clone(),
             crate::actions::schemas::PROTOCOL_FIELD.clone(),
-        ]);
-        let data_batches = self.replay(engine_interface, Arc::new(schema), None)?;
+        ]));
+        // read the same protocol and metadata schema for both commits and checkpoints
+        // TODO add metadata.table_id is not null and protocol.something_required is not null
+        let data_batches = self.replay(engine_interface, schema.clone(), schema, None)?;
         let mut metadata_opt: Option<Metadata> = None;
         let mut protocol_opt: Option<Protocol> = None;
         for batch in data_batches {
