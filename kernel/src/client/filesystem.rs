@@ -169,7 +169,7 @@ mod tests {
 
         url.set_path(&format!("{}/c", url.path()));
         slices.push((url, Some(Range { start: 4, end: 9 })));
-        dbg!(&slices);
+        dbg!("Slices are: {}", &slices);
         let data: Vec<Bytes> = client.read_files(slices).unwrap().try_collect().unwrap();
 
         assert_eq!(data.len(), 3);
