@@ -128,14 +128,18 @@ impl Scan {
         &self,
         engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
-        let action_schema = Arc::new(StructType::new(vec![
+        let commit_read_schema = Arc::new(StructType::new(vec![
             crate::actions::schemas::ADD_FIELD.clone(),
             crate::actions::schemas::REMOVE_FIELD.clone(),
+        ]));
+        let checkpoint_read_schema = Arc::new(StructType::new(vec![
+            crate::actions::schemas::ADD_FIELD.clone(),
         ]));
 
         let log_iter = self.snapshot.log_segment.replay(
             engine_interface,
-            action_schema,
+            commit_read_schema,
+            checkpoint_read_schema,
             self.predicate.clone(),
         )?;
 
@@ -357,5 +361,38 @@ mod tests {
             .unwrap();
             assert_eq!(value, *expected);
         }
+    }
+
+    #[test_log::test]
+    fn test_scan_with_checkpoint() -> DeltaResult<()> {
+        let path = std::fs::canonicalize(PathBuf::from(
+            "./tests/data/with_checkpoint_no_last_checkpoint/",
+        ))?;
+
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine_interface = SimpleClient::new();
+
+        let table = Table::new(url);
+        let snapshot = table.snapshot(&engine_interface, None)?;
+        let scan = ScanBuilder::new(snapshot).build();
+        let files: Vec<DeltaResult<Add>> = scan.files(&engine_interface)?.collect();
+
+        // test case:
+        //
+        // commit0:     P and M, no add/remove
+        // commit1:     add file-ad1
+        // commit2:     remove file-ad1, add file-a19
+        // checkpoint2: remove file-ad1, add file-a19
+        // commit3:     remove file-a19, add file-70b
+        //
+        // thus replay should produce only file-70b
+        assert_eq!(
+            files
+                .into_iter()
+                .map(|file| file.unwrap().path)
+                .collect::<Vec<_>>(),
+            vec!["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"]
+        );
+        Ok(())
     }
 }

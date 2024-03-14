@@ -25,14 +25,17 @@ struct AddRemoveVisitor {
     adds: Vec<Add>,
     removes: Vec<Remove>,
     selection_vector: Option<Vec<bool>>,
+    // whether or not we are visiting commit json (=true) or checkpoint (=false)
+    is_log_batch: bool,
 }
 
 const ADD_FIELD_COUNT: usize = 15;
 
 impl AddRemoveVisitor {
-    fn new(selection_vector: Option<Vec<bool>>) -> Self {
+    fn new(selection_vector: Option<Vec<bool>>, is_log_batch: bool) -> Self {
         AddRemoveVisitor {
             selection_vector,
+            is_log_batch,
             ..Default::default()
         }
     }
@@ -57,10 +60,12 @@ impl DataVisitor for AddRemoveVisitor {
             // TODO(nick): Should count the fields in Add to ensure we don't get this wrong if more
             // are added
             // TODO(zach): add a check for selection vector that we never skip a remove
-            else if let Some(path) = getters[ADD_FIELD_COUNT].get_opt(i, "remove.path")? {
-                let remove_getters = &getters[ADD_FIELD_COUNT..];
-                self.removes
-                    .push(RemoveVisitor::visit_remove(i, path, remove_getters)?);
+            else if self.is_log_batch {
+                if let Some(path) = getters[ADD_FIELD_COUNT].get_opt(i, "remove.path")? {
+                    let remove_getters = &getters[ADD_FIELD_COUNT..];
+                    self.removes
+                        .push(RemoveVisitor::visit_remove(i, path, remove_getters)?);
+                }
             }
         }
         Ok(())
@@ -106,7 +111,7 @@ impl LogReplayScanner {
             // only serve as tombstones for vacuum jobs. So no need to load them here.
             vec![crate::actions::schemas::ADD_FIELD.clone()]
         });
-        let mut visitor = AddRemoveVisitor::new(selection_vector);
+        let mut visitor = AddRemoveVisitor::new(selection_vector, is_log_batch);
         actions.extract(Arc::new(schema_to_use), &mut visitor)?;
 
         for remove in visitor.removes.into_iter() {
