@@ -30,7 +30,7 @@ pub trait TaskExecutor: Send + Sync + 'static {
     where
         F: Future<Output = ()> + Send + 'static;
 
-    fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'static, DeltaResult<R>>
+    fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, DeltaResult<R>>
     where
         T: FnOnce() -> R + Send + 'static,
         R: Send + 'static;
@@ -135,7 +135,7 @@ pub mod tokio {
             self.send_future(Box::pin(task));
         }
 
-        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'static, DeltaResult<R>>
+        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, DeltaResult<R>>
         where
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
@@ -198,7 +198,7 @@ pub mod tokio {
             self.handle.spawn(task);
         }
 
-        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'static, DeltaResult<R>>
+        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, DeltaResult<R>>
         where
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
