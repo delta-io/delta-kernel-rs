@@ -71,6 +71,9 @@ pub enum Error {
 
     #[error("Failed to parse value '{0}' as '{1}'")]
     ParseError(String, DataType),
+
+    #[error("Join failure: {0}")]
+    JoinFailure(String),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -100,6 +103,9 @@ impl Error {
     }
     pub fn engine_data_type(msg: impl ToString) -> Self {
         Self::EngineDataType(msg.to_string())
+    }
+    pub fn join_failure(msg: impl ToString) -> Self {
+        Self::JoinFailure(msg.to_string())
     }
 }
 
