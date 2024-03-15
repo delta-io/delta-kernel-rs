@@ -20,7 +20,10 @@ impl ParquetHandler for SyncParquetHandler {
         }
         let locations: Vec<_> = files.iter().map(|file| file.location.clone()).collect();
         Ok(Box::new(locations.into_iter().map(move |location| {
-            let d = super::data::SimpleData::try_create_from_parquet(schema.clone(), location);
+            let d = crate::client::arrow_data::SimpleData::try_create_from_parquet(
+                schema.clone(),
+                location,
+            );
             d.map(|d| Box::new(d) as _)
         })))
     }

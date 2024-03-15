@@ -274,8 +274,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::schema::PrimitiveType;
     use crate::client::sync::SyncInterface;
+    use crate::schema::PrimitiveType;
     use crate::Table;
 
     #[test]

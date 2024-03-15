@@ -374,10 +374,10 @@ mod tests {
     use object_store::local::LocalFileSystem;
     use object_store::path::Path;
 
+    use crate::client::sync::SyncInterface;
     use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::filesystem::ObjectStoreFileSystemClient;
     use crate::schema::StructType;
-    use crate::client::sync::SyncInterface;
 
     #[test]
     fn test_snapshot_read_metadata() {

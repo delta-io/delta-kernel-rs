@@ -17,10 +17,10 @@ use arrow_schema::{
 };
 use itertools::Itertools;
 
+use crate::client::arrow_data::SimpleData;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{BinaryOperator, Expression, Scalar, UnaryOperator, VariadicOperator};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
-use crate::client::sync::data::SimpleData;
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
 
 // TODO leverage scalars / Datum

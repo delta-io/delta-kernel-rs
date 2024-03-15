@@ -11,7 +11,7 @@ use arrow_select::concat::concat_batches;
 use itertools::Itertools;
 use tracing::debug;
 
-use super::data::SimpleData;
+use crate::client::arrow_data::SimpleData;
 
 pub(crate) struct SyncJsonHandler {}
 impl JsonHandler for SyncJsonHandler {
@@ -28,10 +28,7 @@ impl JsonHandler for SyncJsonHandler {
         let res: Vec<_> = files
             .iter()
             .map(|file| {
-                let d = super::data::SimpleData::try_create_from_json(
-                    schema.clone(),
-                    file.location.clone(),
-                );
+                let d = SimpleData::try_create_from_json(schema.clone(), file.location.clone());
                 d.map(|d| Box::new(d) as _)
             })
             .collect();

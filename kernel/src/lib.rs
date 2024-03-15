@@ -62,6 +62,7 @@ pub mod arrow_conversion;
 
 #[cfg(any(feature = "default-client", feature = "sync-client"))]
 pub mod client;
+
 #[cfg(feature = "default-client")]
 pub use client::default::*;
 

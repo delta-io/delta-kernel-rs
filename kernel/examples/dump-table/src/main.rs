@@ -4,10 +4,10 @@ use std::sync::Arc;
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
+use deltakernel::client::arrow_data::SimpleData;
 use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::client::DefaultTableClient;
 use deltakernel::scan::ScanBuilder;
-use deltakernel::client::sync::data::SimpleData;
 use deltakernel::{DeltaResult, Table};
 
 use clap::Parser;

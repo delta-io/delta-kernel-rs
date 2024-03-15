@@ -278,8 +278,9 @@ mod tests {
     use super::*;
     use crate::{
         actions::schemas::log_schema,
+        client::arrow_data::SimpleData,
+        client::sync::{json::SyncJsonHandler, SyncInterface},
         schema::StructType,
-        client::sync::{data::SimpleData, json::SyncJsonHandler, SyncInterface},
         EngineData, EngineInterface, JsonHandler,
     };
 

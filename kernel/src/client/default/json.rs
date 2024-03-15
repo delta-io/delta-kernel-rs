@@ -17,8 +17,8 @@ use object_store::{DynObjectStore, GetResultPayload};
 
 use super::executor::TaskExecutor;
 use super::file_handler::{FileOpenFuture, FileOpener, FileStream};
+use crate::client::arrow_data::SimpleData;
 use crate::schema::SchemaRef;
-use crate::client::sync::data::SimpleData;
 use crate::{
     DeltaResult, EngineData, Error, Expression, FileDataReadResultIterator, FileMeta, JsonHandler,
 };

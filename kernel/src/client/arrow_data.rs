@@ -321,10 +321,10 @@ mod tests {
     use crate::actions::Metadata;
     use crate::DeltaResult;
     use crate::{
-        actions::schemas::log_schema,
-        client::sync::{data::SimpleData, SyncInterface},
-        EngineData, EngineInterface,
+        actions::schemas::log_schema, client::sync::SyncInterface, EngineData, EngineInterface,
     };
+
+    use super::SimpleData;
 
     fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
         let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
