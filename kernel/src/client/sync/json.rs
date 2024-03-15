@@ -28,7 +28,8 @@ impl JsonHandler for SyncJsonHandler {
         let res: Vec<_> = files
             .iter()
             .map(|file| {
-                let d = ArrowEngineData::try_create_from_json(schema.clone(), file.location.clone());
+                let d =
+                    ArrowEngineData::try_create_from_json(schema.clone(), file.location.clone());
                 d.map(|d| Box::new(d) as _)
             })
             .collect();

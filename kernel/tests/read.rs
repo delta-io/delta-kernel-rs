@@ -412,7 +412,10 @@ fn read_table_data(path: &str, expected: Vec<&str>) -> Result<(), Box<dyn std::e
         .into_iter()
         .map(|sr| {
             let data = sr.raw_data.unwrap();
-            data.into_any().downcast::<ArrowEngineData>().unwrap().into()
+            data.into_any()
+                .downcast::<ArrowEngineData>()
+                .unwrap()
+                .into()
         })
         .collect();
     let schema = batches[0].schema();

@@ -248,7 +248,11 @@ impl ArrowEngineData {
             (&ArrowDataType::Struct(_), DataType::Struct(fields)) => {
                 // both structs, so recurse into col
                 let struct_array = col.as_struct();
-                ArrowEngineData::extract_columns_from_array(out_col_array, fields, Some(struct_array))?;
+                ArrowEngineData::extract_columns_from_array(
+                    out_col_array,
+                    fields,
+                    Some(struct_array),
+                )?;
             }
             (&ArrowDataType::Boolean, &DataType::Primitive(PrimitiveType::Boolean)) => {
                 debug!("Pushing boolean array for {}", field.name);
