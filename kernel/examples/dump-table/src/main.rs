@@ -6,7 +6,7 @@ use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
 use deltakernel::client::arrow_data::ArrowEngineData;
 use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
-use deltakernel::client::DefaultTableClient;
+use deltakernel::client::DefaultEngineInterface;
 use deltakernel::scan::ScanBuilder;
 use deltakernel::{DeltaResult, Table};
 
@@ -29,7 +29,7 @@ fn main() -> DeltaResult<()> {
     let url = url::Url::parse(&cli.path)?;
 
     println!("Reading {url}");
-    let engine_interface = DefaultTableClient::try_new(
+    let engine_interface = DefaultEngineInterface::try_new(
         &url,
         HashMap::<String, String>::new(),
         Arc::new(TokioBackgroundExecutor::new()),

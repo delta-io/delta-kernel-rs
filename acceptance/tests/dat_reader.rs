@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use acceptance::read_dat_case;
-use deltakernel::client::DefaultTableClient;
+use deltakernel::client::DefaultEngineInterface;
 use deltakernel::executor::tokio::TokioBackgroundExecutor;
 
 fn reader_test(path: &Path) -> datatest_stable::Result<()> {
@@ -19,7 +19,7 @@ fn reader_test(path: &Path) -> datatest_stable::Result<()> {
             let case = read_dat_case(root_dir).unwrap();
             let table_root = case.table_root().unwrap();
             let engine_interface = Arc::new(
-                DefaultTableClient::try_new(
+                DefaultEngineInterface::try_new(
                     &table_root,
                     std::iter::empty::<(&str, &str)>(),
                     Arc::new(TokioBackgroundExecutor::new()),

@@ -28,7 +28,7 @@ pub mod json;
 pub mod parquet;
 
 #[derive(Debug)]
-pub struct DefaultTableClient<E: TaskExecutor> {
+pub struct DefaultEngineInterface<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
     file_system: Arc<ObjectStoreFileSystemClient<E>>,
     json: Arc<DefaultJsonHandler<E>>,
@@ -36,7 +36,7 @@ pub struct DefaultTableClient<E: TaskExecutor> {
     expression: Arc<DefaultExpressionHandler>,
 }
 
-impl<E: TaskExecutor> DefaultTableClient<E> {
+impl<E: TaskExecutor> DefaultEngineInterface<E> {
     /// Create a new [`DefaultTableClient`] instance
     ///
     /// The `path` parameter is used to determine the type of storage used.
@@ -84,13 +84,13 @@ impl<E: TaskExecutor> DefaultTableClient<E> {
     }
 }
 
-impl<E: TaskExecutor> DefaultTableClient<E> {
+impl<E: TaskExecutor> DefaultEngineInterface<E> {
     pub fn get_object_store_for_url(&self, _url: &Url) -> Option<Arc<DynObjectStore>> {
         Some(self.store.clone())
     }
 }
 
-impl<E: TaskExecutor> EngineInterface for DefaultTableClient<E> {
+impl<E: TaskExecutor> EngineInterface for DefaultEngineInterface<E> {
     fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler> {
         self.expression.clone()
     }

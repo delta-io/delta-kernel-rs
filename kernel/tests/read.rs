@@ -6,7 +6,7 @@ use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use arrow_select::concat::concat_batches;
 use deltakernel::client::arrow_data::ArrowEngineData;
-use deltakernel::client::DefaultTableClient;
+use deltakernel::client::DefaultEngineInterface;
 use deltakernel::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::expressions::{BinaryOperator, Expression};
 use deltakernel::scan::ScanBuilder;
@@ -97,7 +97,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine_interface = DefaultTableClient::new(
+    let engine_interface = DefaultEngineInterface::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
@@ -151,7 +151,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine_interface = DefaultTableClient::new(
+    let engine_interface = DefaultEngineInterface::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
@@ -209,7 +209,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine_interface = DefaultTableClient::new(
+    let engine_interface = DefaultEngineInterface::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
@@ -287,7 +287,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine_interface = DefaultTableClient::new(
+    let engine_interface = DefaultEngineInterface::new(
         storage.clone(),
         Path::from(""),
         Arc::new(TokioBackgroundExecutor::new()),
@@ -397,7 +397,7 @@ macro_rules! assert_batches_sorted_eq {
 fn read_table_data(path: &str, expected: Vec<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from(path))?;
     let url = url::Url::from_directory_path(path).unwrap();
-    let table_client = DefaultTableClient::try_new(
+    let table_client = DefaultEngineInterface::try_new(
         &url,
         std::iter::empty::<(&str, &str)>(),
         Arc::new(TokioBackgroundExecutor::new()),
