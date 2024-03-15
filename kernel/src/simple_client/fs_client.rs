@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::time::SystemTime;
 
 use bytes::Bytes;
@@ -17,16 +16,22 @@ impl FileSystemClient for SimpleFilesystemClient {
         url_path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
         if url_path.scheme() == "file" {
-            let path = Path::new(url_path.path());
+            let path = url_path.to_file_path().map_err(|_| {
+                Error::Generic(format!("Invalid path for list_from: {:?}", url_path))
+            })?;
+
             let (path_to_read, min_file_name) = if path.is_dir() {
                 // passed path is an existing dir, don't strip anything and don't filter the results
                 (path, None)
             } else {
                 // path doesn't exist, or is not a dir, assume the final part is a filename. strip
                 // that and use it as the min_file_name to return
-                let parent = path.parent().ok_or_else(|| {
-                    Error::Generic(format!("Invalid path for list_from: {:?}", path))
-                })?;
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| {
+                        Error::Generic(format!("Invalid path for list_from: {:?}", path))
+                    })?
+                    .to_path_buf();
                 let file_name = path.file_name().ok_or_else(|| {
                     Error::Generic(format!("Invalid path for list_from: {:?}", path))
                 })?;
@@ -77,12 +82,14 @@ impl FileSystemClient for SimpleFilesystemClient {
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
         let iter = files.into_iter().map(|(url, _range_opt)| {
             if url.scheme() == "file" {
-                let bytes_vec_res = std::fs::read(url.path());
-                let bytes: std::io::Result<Bytes> = bytes_vec_res.map(|bytes_vec| bytes_vec.into());
-                bytes.map_err(|_| Error::file_not_found(url.path()))
-            } else {
-                Err(Error::generic("Can only read local filesystem"))
+                if let Ok(file_path) = url.to_file_path() {
+                    let bytes_vec_res = std::fs::read(file_path);
+                    let bytes: std::io::Result<Bytes> =
+                        bytes_vec_res.map(|bytes_vec| bytes_vec.into());
+                    return bytes.map_err(|_| Error::file_not_found(url.path()));
+                }
             }
+            Err(Error::generic("Can only read local filesystem"))
         });
         Ok(Box::new(iter))
     }
@@ -122,7 +129,7 @@ mod tests {
         for (i, file) in list.enumerate() {
             // i+1 in index because we started at 0001 in the listing
             assert_eq!(
-                file.unwrap().location.path(),
+                file?.location.to_file_path().unwrap().to_str().unwrap(),
                 expected[i + 1].to_str().unwrap()
             );
             file_count += 1;
