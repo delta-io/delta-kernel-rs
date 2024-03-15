@@ -11,7 +11,7 @@ use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 
 use super::file_handler::{FileOpenFuture, FileOpener};
-use crate::client::arrow_data::SimpleData;
+use crate::client::arrow_data::ArrowEngineData;
 use crate::executor::TaskExecutor;
 use crate::file_handler::FileStream;
 use crate::schema::SchemaRef;
@@ -84,7 +84,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         });
 
         Ok(Box::new(receiver.into_iter().map(|rbr| {
-            rbr.map(|rb| Box::new(SimpleData::new(rb)) as _)
+            rbr.map(|rb| Box::new(ArrowEngineData::new(rb)) as _)
         })))
     }
 }
@@ -164,7 +164,7 @@ mod tests {
         engine_data: DeltaResult<Box<dyn EngineData>>,
     ) -> DeltaResult<RecordBatch> {
         engine_data
-            .and_then(SimpleData::try_from_engine_data)
+            .and_then(ArrowEngineData::try_from_engine_data)
             .map(|sd| sd.into())
     }
 

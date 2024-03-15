@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
-use deltakernel::client::arrow_data::SimpleData;
+use deltakernel::client::arrow_data::ArrowEngineData;
 use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::client::DefaultTableClient;
 use deltakernel::scan::ScanBuilder;
@@ -45,7 +45,7 @@ fn main() -> DeltaResult<()> {
         let data = res.raw_data?;
         let record_batch: RecordBatch = data
             .into_any()
-            .downcast::<SimpleData>()
+            .downcast::<ArrowEngineData>()
             .map_err(|_| deltakernel::Error::EngineDataType("SimpleData".to_string()))?
             .into();
         let batch = if let Some(mask) = res.mask {

@@ -5,7 +5,7 @@ use arrow::array::{ArrayRef, Int32Array, StringArray};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use arrow_select::concat::concat_batches;
-use deltakernel::client::arrow_data::SimpleData;
+use deltakernel::client::arrow_data::ArrowEngineData;
 use deltakernel::client::DefaultTableClient;
 use deltakernel::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::expressions::{BinaryOperator, Expression};
@@ -70,7 +70,7 @@ async fn add_commit(
 }
 
 fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
-    SimpleData::try_from_engine_data(engine_data)
+    ArrowEngineData::try_from_engine_data(engine_data)
         .unwrap()
         .into()
 }
@@ -412,7 +412,7 @@ fn read_table_data(path: &str, expected: Vec<&str>) -> Result<(), Box<dyn std::e
         .into_iter()
         .map(|sr| {
             let data = sr.raw_data.unwrap();
-            data.into_any().downcast::<SimpleData>().unwrap().into()
+            data.into_any().downcast::<ArrowEngineData>().unwrap().into()
         })
         .collect();
     let schema = batches[0].schema();

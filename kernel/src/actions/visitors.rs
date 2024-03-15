@@ -278,7 +278,7 @@ mod tests {
     use super::*;
     use crate::{
         actions::schemas::log_schema,
-        client::arrow_data::SimpleData,
+        client::arrow_data::ArrowEngineData,
         client::sync::{json::SyncJsonHandler, SyncInterface},
         schema::StructType,
         EngineData, EngineInterface, JsonHandler,
@@ -290,10 +290,10 @@ mod tests {
         let schema = Arc::new(ArrowSchema::new(vec![string_field]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
             .expect("Can't convert to record batch");
-        Box::new(SimpleData::new(batch))
+        Box::new(ArrowEngineData::new(batch))
     }
 
-    fn action_batch() -> Box<SimpleData> {
+    fn action_batch() -> Box<ArrowEngineData> {
         let handler = SyncJsonHandler {};
         let json_strings: StringArray = vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
@@ -306,7 +306,7 @@ mod tests {
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
-        SimpleData::try_from_engine_data(parsed).unwrap()
+        ArrowEngineData::try_from_engine_data(parsed).unwrap()
     }
 
     #[test]

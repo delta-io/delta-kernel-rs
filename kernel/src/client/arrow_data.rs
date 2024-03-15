@@ -17,21 +17,21 @@ use std::io::BufReader;
 use std::sync::Arc;
 
 /// SimpleData holds a RecordBatch, implements `EngineData` so the kernel can extract from it.
-pub struct SimpleData {
+pub struct ArrowEngineData {
     data: RecordBatch,
 }
 
-impl SimpleData {
+impl ArrowEngineData {
     /// Create a new `SimpleData` from a `RecordBatch`
     pub fn new(data: RecordBatch) -> Self {
-        SimpleData { data }
+        ArrowEngineData { data }
     }
 
     /// Utility constructor to get a `Box<SimpleData>` out of a `Box<dyn EngineData>`
     pub fn try_from_engine_data(engine_data: Box<dyn EngineData>) -> DeltaResult<Box<Self>> {
         engine_data
             .into_any()
-            .downcast::<SimpleData>()
+            .downcast::<ArrowEngineData>()
             .map_err(|_| Error::engine_data_type("SimpleData"))
     }
 
@@ -41,7 +41,7 @@ impl SimpleData {
     }
 }
 
-impl EngineData for SimpleData {
+impl EngineData for ArrowEngineData {
     fn extract(&self, schema: SchemaRef, visitor: &mut dyn DataVisitor) -> DeltaResult<()> {
         let mut col_array = vec![];
         self.extract_columns(&mut col_array, &schema)?;
@@ -61,20 +61,20 @@ impl EngineData for SimpleData {
     }
 }
 
-impl From<RecordBatch> for SimpleData {
+impl From<RecordBatch> for ArrowEngineData {
     fn from(value: RecordBatch) -> Self {
-        SimpleData::new(value)
+        ArrowEngineData::new(value)
     }
 }
 
-impl From<SimpleData> for RecordBatch {
-    fn from(value: SimpleData) -> Self {
+impl From<ArrowEngineData> for RecordBatch {
+    fn from(value: ArrowEngineData) -> Self {
         value.data
     }
 }
 
-impl From<Box<SimpleData>> for RecordBatch {
-    fn from(value: Box<SimpleData>) -> Self {
+impl From<Box<ArrowEngineData>> for RecordBatch {
+    fn from(value: Box<ArrowEngineData>) -> Self {
         value.data
     }
 }
@@ -152,7 +152,7 @@ impl EngineMap for MapArray {
     }
 }
 
-impl SimpleData {
+impl ArrowEngineData {
     pub fn try_create_from_json(schema: SchemaRef, location: Url) -> DeltaResult<Self> {
         let arrow_schema: ArrowSchema = (&*schema).try_into()?;
         debug!("Reading {:#?} with schema: {:#?}", location, arrow_schema);
@@ -167,7 +167,7 @@ impl SimpleData {
         let data = json
             .next()
             .ok_or(Error::generic("No data found reading json file"))?;
-        Ok(SimpleData::new(data?))
+        Ok(ArrowEngineData::new(data?))
     }
 
     // TODO needs to apply the schema to the parquet read
@@ -182,7 +182,7 @@ impl SimpleData {
         let data = reader
             .next()
             .ok_or(Error::generic("No data found reading parquet file"))?;
-        Ok(SimpleData::new(data?))
+        Ok(ArrowEngineData::new(data?))
     }
 
     /// Extracts an exploded view (all leaf values), in schema order of that data contained
@@ -201,7 +201,7 @@ impl SimpleData {
         schema: &Schema,
     ) -> DeltaResult<()> {
         debug!("Extracting column getters for {:#?}", schema);
-        SimpleData::extract_columns_from_array(out_col_array, schema, Some(&self.data))
+        ArrowEngineData::extract_columns_from_array(out_col_array, schema, Some(&self.data))
     }
 
     fn extract_columns_from_array<'a>(
@@ -248,7 +248,7 @@ impl SimpleData {
             (&ArrowDataType::Struct(_), DataType::Struct(fields)) => {
                 // both structs, so recurse into col
                 let struct_array = col.as_struct();
-                SimpleData::extract_columns_from_array(out_col_array, fields, Some(struct_array))?;
+                ArrowEngineData::extract_columns_from_array(out_col_array, fields, Some(struct_array))?;
             }
             (&ArrowDataType::Boolean, &DataType::Primitive(PrimitiveType::Boolean)) => {
                 debug!("Pushing boolean array for {}", field.name);
@@ -324,14 +324,14 @@ mod tests {
         actions::schemas::log_schema, client::sync::SyncInterface, EngineData, EngineInterface,
     };
 
-    use super::SimpleData;
+    use super::ArrowEngineData;
 
     fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
         let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
         let schema = Arc::new(ArrowSchema::new(vec![string_field]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
             .expect("Can't convert to record batch");
-        Box::new(SimpleData::new(batch))
+        Box::new(ArrowEngineData::new(batch))
     }
 
     #[test]
