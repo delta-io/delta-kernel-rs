@@ -63,6 +63,21 @@ impl DataVisitor for MetadataVisitor {
 }
 
 #[derive(Default)]
+pub(crate) struct SelectionVectorVisitor {
+    pub(crate) selection_vector: Vec<bool>,
+}
+
+impl DataVisitor for SelectionVectorVisitor {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for i in 0..row_count {
+            self.selection_vector
+                .push(getters[0].get(i, "selectionvector.output")?)
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
 pub(crate) struct ProtocolVisitor {
     pub(crate) protocol: Option<Protocol>,
 }

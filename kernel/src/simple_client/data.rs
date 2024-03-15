@@ -170,6 +170,7 @@ impl SimpleData {
         Ok(SimpleData::new(data?))
     }
 
+    // TODO needs to apply the schema to the parquet read
     pub fn try_create_from_parquet(_schema: SchemaRef, location: Url) -> DeltaResult<Self> {
         let file = File::open(
             location
@@ -214,13 +215,16 @@ impl SimpleData {
                 .filter(|a| *a.data_type() != ArrowDataType::Null);
             // Note: if col is None we have either:
             //   a) encountered a column that is all nulls or,
-            //   b) recursed into a struct that was all null.
-            // So below if the field is allowed to be null, we push that, otherwise we error out.
+            //   b) recursed into a optional struct that was null. In this case, array.is_none() is
+            //      true and we don't need to check field nullability, because we assume all fields
+            //      of a nullable struct can be null
+            // So below if the field is allowed to be null, OR array.is_none() we push that,
+            // otherwise we error out.
             if let Some(col) = col {
                 Self::extract_column(out_col_array, field, col)?;
-            } else if field.is_nullable() {
-                if let DataType::Struct(_) = field.data_type() {
-                    Self::extract_columns_from_array(out_col_array, schema, None)?;
+            } else if array.is_none() || field.is_nullable() {
+                if let DataType::Struct(inner_struct) = field.data_type() {
+                    Self::extract_columns_from_array(out_col_array, inner_struct.as_ref(), None)?;
                 } else {
                     debug!("Pushing a null field for {}", field.name);
                     out_col_array.push(&());
