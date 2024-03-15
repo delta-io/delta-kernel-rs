@@ -279,7 +279,7 @@ mod tests {
     use crate::{
         actions::schemas::log_schema,
         schema::StructType,
-        simple_client::{data::SimpleData, json::SimpleJsonHandler, SimpleClient},
+        client::sync::{data::SimpleData, json::SimpleJsonHandler, SimpleClient},
         EngineData, EngineInterface, JsonHandler,
     };
 

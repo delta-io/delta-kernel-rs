@@ -322,7 +322,7 @@ mod tests {
     use crate::DeltaResult;
     use crate::{
         actions::schemas::log_schema,
-        simple_client::{data::SimpleData, SimpleClient},
+        client::sync::{data::SimpleData, SimpleClient},
         EngineData, EngineInterface,
     };
 

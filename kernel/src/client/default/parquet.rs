@@ -14,7 +14,7 @@ use super::file_handler::{FileOpenFuture, FileOpener};
 use crate::executor::TaskExecutor;
 use crate::file_handler::FileStream;
 use crate::schema::SchemaRef;
-use crate::simple_client::data::SimpleData;
+use crate::client::sync::data::SimpleData;
 use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, ParquetHandler};
 
 #[derive(Debug)]

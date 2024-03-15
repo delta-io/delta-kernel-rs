@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use deltakernel::scan::ScanBuilder;
-use deltakernel::simple_client::SimpleClient;
+use deltakernel::client::sync::SimpleClient;
 use deltakernel::Table;
 
 use test_log::test;

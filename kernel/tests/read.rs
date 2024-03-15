@@ -9,7 +9,7 @@ use deltakernel::client::DefaultTableClient;
 use deltakernel::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::expressions::{BinaryOperator, Expression};
 use deltakernel::scan::ScanBuilder;
-use deltakernel::simple_client::data::SimpleData;
+use deltakernel::client::sync::data::SimpleData;
 use deltakernel::{EngineData, Table};
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use parquet::arrow::arrow_writer::ArrowWriter;

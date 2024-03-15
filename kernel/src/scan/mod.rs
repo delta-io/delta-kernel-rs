@@ -275,7 +275,7 @@ mod tests {
 
     use super::*;
     use crate::schema::PrimitiveType;
-    use crate::simple_client::SimpleClient;
+    use crate::client::sync::SimpleClient;
     use crate::Table;
 
     #[test]

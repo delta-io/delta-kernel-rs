@@ -377,7 +377,7 @@ mod tests {
     use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::filesystem::ObjectStoreFileSystemClient;
     use crate::schema::StructType;
-    use crate::simple_client::SimpleClient;
+    use crate::client::sync::SimpleClient;
 
     #[test]
     fn test_snapshot_read_metadata() {
