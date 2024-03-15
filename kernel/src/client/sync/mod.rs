@@ -12,24 +12,24 @@ mod parquet;
 
 /// This is a simple implemention of [`EngineInterface`]. It only supports reading data from the
 /// local filesystem, and internally represents data using `Arrow`.
-pub struct SimpleClient {
-    fs_client: Arc<fs_client::SimpleFilesystemClient>,
-    json_handler: Arc<json::SimpleJsonHandler>,
-    parquet_handler: Arc<parquet::SimpleParquetHandler>,
+pub struct SyncInterface {
+    fs_client: Arc<fs_client::SyncFilesystemClient>,
+    json_handler: Arc<json::SyncJsonHandler>,
+    parquet_handler: Arc<parquet::SyncParquetHandler>,
 }
 
-impl SimpleClient {
+impl SyncInterface {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        SimpleClient {
-            fs_client: Arc::new(fs_client::SimpleFilesystemClient {}),
-            json_handler: Arc::new(json::SimpleJsonHandler {}),
-            parquet_handler: Arc::new(parquet::SimpleParquetHandler {}),
+        SyncInterface {
+            fs_client: Arc::new(fs_client::SyncFilesystemClient {}),
+            json_handler: Arc::new(json::SyncJsonHandler {}),
+            parquet_handler: Arc::new(parquet::SyncParquetHandler {}),
         }
     }
 }
 
-impl EngineInterface for SimpleClient {
+impl EngineInterface for SyncInterface {
     fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler> {
         unimplemented!();
     }

@@ -279,7 +279,7 @@ mod tests {
     use crate::{
         actions::schemas::log_schema,
         schema::StructType,
-        client::sync::{data::SimpleData, json::SimpleJsonHandler, SimpleClient},
+        client::sync::{data::SimpleData, json::SyncJsonHandler, SyncInterface},
         EngineData, EngineInterface, JsonHandler,
     };
 
@@ -293,7 +293,7 @@ mod tests {
     }
 
     fn action_batch() -> Box<SimpleData> {
-        let handler = SimpleJsonHandler {};
+        let handler = SyncJsonHandler {};
         let json_strings: StringArray = vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
             r#"{"commitInfo":{"timestamp":1677811178585,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isolationLevel":"WriteSerializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"10","numOutputBytes":"635"},"engineInfo":"Databricks-Runtime/<unknown>","txnId":"a6a94671-55ef-450e-9546-b8465b9147de"}}"#,
@@ -356,7 +356,7 @@ mod tests {
 
     #[test]
     fn test_parse_add_partitioned() {
-        let client = SimpleClient::new();
+        let client = SyncInterface::new();
         let json_handler = client.get_json_handler();
         let json_strings: StringArray = vec![
             r#"{"commitInfo":{"timestamp":1670892998177,"operation":"WRITE","operationParameters":{"mode":"Append","partitionBy":"[\"c1\",\"c2\"]"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"3","numOutputRows":"3","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,

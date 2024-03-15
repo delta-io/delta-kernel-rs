@@ -377,7 +377,7 @@ mod tests {
     use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::filesystem::ObjectStoreFileSystemClient;
     use crate::schema::StructType;
-    use crate::client::sync::SimpleClient;
+    use crate::client::sync::SyncInterface;
 
     #[test]
     fn test_snapshot_read_metadata() {
@@ -385,7 +385,7 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
-        let client = SimpleClient::new();
+        let client = SyncInterface::new();
         let snapshot = Snapshot::try_new(url, &client, Some(1)).unwrap();
 
         let expected = Protocol {
@@ -407,7 +407,7 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
-        let client = SimpleClient::new();
+        let client = SyncInterface::new();
         let snapshot = Snapshot::try_new(url, &client, None).unwrap();
 
         let expected = Protocol {
@@ -449,7 +449,7 @@ mod tests {
         ))
         .unwrap();
         let location = url::Url::from_directory_path(path).unwrap();
-        let engine_interface = SimpleClient::new();
+        let engine_interface = SyncInterface::new();
         let snapshot = Snapshot::try_new(location, &engine_interface, None).unwrap();
 
         assert_eq!(snapshot.log_segment.checkpoint_files.len(), 1);

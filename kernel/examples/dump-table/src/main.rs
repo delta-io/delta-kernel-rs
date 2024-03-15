@@ -7,7 +7,7 @@ use arrow::util::pretty::print_batches;
 use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::client::DefaultTableClient;
 use deltakernel::scan::ScanBuilder;
-use deltakernel::simple_client::data::SimpleData;
+use deltakernel::client::sync::data::SimpleData;
 use deltakernel::{DeltaResult, Table};
 
 use clap::Parser;

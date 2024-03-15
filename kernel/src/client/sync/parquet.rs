@@ -5,9 +5,9 @@ use crate::{
     ParquetHandler,
 };
 
-pub(crate) struct SimpleParquetHandler {}
+pub(crate) struct SyncParquetHandler {}
 
-impl ParquetHandler for SimpleParquetHandler {
+impl ParquetHandler for SyncParquetHandler {
     fn read_parquet_files(
         &self,
         files: &[FileMeta],

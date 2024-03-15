@@ -13,8 +13,8 @@ use tracing::debug;
 
 use super::data::SimpleData;
 
-pub(crate) struct SimpleJsonHandler {}
-impl JsonHandler for SimpleJsonHandler {
+pub(crate) struct SyncJsonHandler {}
+impl JsonHandler for SyncJsonHandler {
     fn read_json_files(
         &self,
         files: &[FileMeta],

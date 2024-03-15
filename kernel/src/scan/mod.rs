@@ -275,7 +275,7 @@ mod tests {
 
     use super::*;
     use crate::schema::PrimitiveType;
-    use crate::client::sync::SimpleClient;
+    use crate::client::sync::SyncInterface;
     use crate::Table;
 
     #[test]
@@ -283,7 +283,7 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine_interface = SimpleClient::new();
+        let engine_interface = SyncInterface::new();
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine_interface, None).unwrap();
@@ -307,7 +307,7 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine_interface = SimpleClient::new();
+        let engine_interface = SyncInterface::new();
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine_interface, None).unwrap();
@@ -370,7 +370,7 @@ mod tests {
         ))?;
 
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine_interface = SimpleClient::new();
+        let engine_interface = SyncInterface::new();
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine_interface, None)?;
