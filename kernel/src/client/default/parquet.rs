@@ -12,8 +12,8 @@ use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream
 
 use super::file_handler::{FileOpenFuture, FileOpener};
 use crate::client::arrow_data::ArrowEngineData;
-use crate::executor::TaskExecutor;
-use crate::file_handler::FileStream;
+use crate::client::default::executor::TaskExecutor;
+use crate::client::default::file_handler::FileStream;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, ParquetHandler};
 
@@ -154,7 +154,7 @@ mod tests {
     use arrow_array::RecordBatch;
     use object_store::{local::LocalFileSystem, ObjectStore};
 
-    use crate::{executor::tokio::TokioBackgroundExecutor, EngineData};
+    use crate::{client::default::executor::tokio::TokioBackgroundExecutor, EngineData};
 
     use itertools::Itertools;
 

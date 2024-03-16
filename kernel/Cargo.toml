@@ -74,7 +74,7 @@ sync-client = [
 
 [dev-dependencies]
 arrow = { version = "^49.0", features = ["json", "prettyprint"] }
-deltakernel = { path = ".", features = ["default-client"] }
+deltakernel = { path = ".", features = ["default-client", "sync-client"] }
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 tempfile = "3"
 test-case = { version = "3.1.0" }

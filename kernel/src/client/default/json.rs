@@ -248,7 +248,9 @@ mod tests {
     use object_store::{local::LocalFileSystem, ObjectStore};
 
     use super::*;
-    use crate::{actions::schemas::log_schema, executor::tokio::TokioBackgroundExecutor};
+    use crate::{
+        actions::schemas::log_schema, client::default::executor::tokio::TokioBackgroundExecutor,
+    };
 
     fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
         let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
