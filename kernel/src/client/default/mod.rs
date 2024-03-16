@@ -1,6 +1,6 @@
 //! # Default Engineinterface
 //!
-//! The default implementation of [`Engineinterface`] is [`DefaultTableClient`].
+//! The default implementation of [`Engineinterface`] is [`DefaultEngineInterface`].
 //!
 //! The underlying implementations use asynchronous IO. Async tasks are run on
 //! a separate thread pool, provided by the [`TaskExecutor`] trait. Read more in
@@ -37,7 +37,7 @@ pub struct DefaultEngineInterface<E: TaskExecutor> {
 }
 
 impl<E: TaskExecutor> DefaultEngineInterface<E> {
-    /// Create a new [`DefaultTableClient`] instance
+    /// Create a new [`DefaultEngineInterface`] instance
     ///
     /// The `path` parameter is used to determine the type of storage used.
     ///
