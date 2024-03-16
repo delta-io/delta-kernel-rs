@@ -7,7 +7,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_select::concat::concat_batches;
 use deltakernel::client::arrow_data::ArrowEngineData;
 use deltakernel::client::default::executor::tokio::TokioBackgroundExecutor;
-use deltakernel::client::DefaultEngineInterface;
+use deltakernel::client::default::DefaultEngineInterface;
 use deltakernel::expressions::{BinaryOperator, Expression};
 use deltakernel::scan::ScanBuilder;
 use deltakernel::{EngineData, Table};

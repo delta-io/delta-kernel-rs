@@ -5,8 +5,8 @@ use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
 use deltakernel::client::arrow_data::ArrowEngineData;
-use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
-use deltakernel::client::DefaultEngineInterface;
+use deltakernel::client::default::executor::tokio::TokioBackgroundExecutor;
+use deltakernel::client::default::DefaultEngineInterface;
 use deltakernel::scan::ScanBuilder;
 use deltakernel::{DeltaResult, Table};
 
