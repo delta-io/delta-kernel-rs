@@ -13,7 +13,8 @@ use tracing::debug;
 
 use crate::client::arrow_data::ArrowEngineData;
 
-pub(crate) struct SyncJsonHandler {}
+pub(crate) struct SyncJsonHandler;
+
 impl JsonHandler for SyncJsonHandler {
     fn read_json_files(
         &self,
