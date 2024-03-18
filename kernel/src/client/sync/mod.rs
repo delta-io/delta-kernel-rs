@@ -1,7 +1,7 @@
 //! A simple, single threaded, EngineInterface that can only read from the local filesystem
 
-use crate::{EngineInterface, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler};
 use super::arrow_expression::ArrowExpressionHandler;
+use crate::{EngineInterface, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler};
 
 use std::sync::Arc;
 
