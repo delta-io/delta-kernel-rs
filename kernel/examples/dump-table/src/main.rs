@@ -22,7 +22,7 @@ struct Cli {
     /// Path to the table to inspect
     path: String,
 
-    /// Which client to use
+    /// Which EngineInterface to use
     #[arg(short, long, value_enum, default_value_t = Interface::Default)]
     interface: Interface,
 }
