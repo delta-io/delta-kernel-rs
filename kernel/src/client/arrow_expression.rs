@@ -1,5 +1,3 @@
-//! Default Expression handler.
-//!
 //! Expression handling based on arrow-rs compute kernels.
 use std::sync::Arc;
 
@@ -227,9 +225,9 @@ fn evaluate_expression(
 }
 
 #[derive(Debug)]
-pub struct DefaultExpressionHandler {}
+pub struct ArrowExpressionHandler;
 
-impl ExpressionHandler for DefaultExpressionHandler {
+impl ExpressionHandler for ArrowExpressionHandler {
     fn get_evaluator(
         &self,
         schema: SchemaRef,

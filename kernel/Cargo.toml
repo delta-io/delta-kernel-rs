@@ -47,13 +47,13 @@ tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
 
 [features]
 arrow-conversion = ["arrow-schema"]
+arrow-expression = ["arrow-arith", "arrow-array", "arrow-ord", "arrow-schema"]
 default = ["sync-client"]
 default-client = [
-  "arrow-array",
   "arrow-conversion",
-  "arrow-arith",
+  "arrow-expression",
+  "arrow-array",
   "arrow-json",
-  "arrow-ord",
   "arrow-schema",
   "arrow-select",
   "futures",
@@ -65,8 +65,9 @@ default-client = [
 
 developer-visibility = []
 sync-client = [
-  "arrow-array",
   "arrow-conversion",
+  "arrow-expression",
+  "arrow-array",
   "arrow-json",
   "arrow-select",
   "parquet"

@@ -12,16 +12,15 @@ use object_store::{parse_url_opts, path::Path, DynObjectStore};
 use url::Url;
 
 use self::executor::TaskExecutor;
-use self::expression::DefaultExpressionHandler;
 use self::filesystem::ObjectStoreFileSystemClient;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
+use super::arrow_expression::ArrowExpressionHandler;
 use crate::{
     DeltaResult, EngineInterface, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler,
 };
 
 pub mod executor;
-pub mod expression;
 pub mod file_handler;
 pub mod filesystem;
 pub mod json;
@@ -33,7 +32,7 @@ pub struct DefaultEngineInterface<E: TaskExecutor> {
     file_system: Arc<ObjectStoreFileSystemClient<E>>,
     json: Arc<DefaultJsonHandler<E>>,
     parquet: Arc<DefaultParquetHandler<E>>,
-    expression: Arc<DefaultExpressionHandler>,
+    expression: Arc<ArrowExpressionHandler>,
 }
 
 impl<E: TaskExecutor> DefaultEngineInterface<E> {
@@ -62,7 +61,7 @@ impl<E: TaskExecutor> DefaultEngineInterface<E> {
             )),
             parquet: Arc::new(DefaultParquetHandler::new(store.clone(), task_executor)),
             store,
-            expression: Arc::new(DefaultExpressionHandler {}),
+            expression: Arc::new(ArrowExpressionHandler {}),
         })
     }
 
@@ -79,7 +78,7 @@ impl<E: TaskExecutor> DefaultEngineInterface<E> {
             )),
             parquet: Arc::new(DefaultParquetHandler::new(store.clone(), task_executor)),
             store,
-            expression: Arc::new(DefaultExpressionHandler {}),
+            expression: Arc::new(ArrowExpressionHandler {}),
         }
     }
 }

@@ -325,7 +325,8 @@ mod tests {
     use crate::actions::Metadata;
     use crate::DeltaResult;
     use crate::{
-        actions::schemas::log_schema, client::sync::SyncEngineInterface, EngineData, EngineInterface,
+        actions::schemas::log_schema, client::sync::SyncEngineInterface, EngineData,
+        EngineInterface,
     };
 
     use super::ArrowEngineData;
