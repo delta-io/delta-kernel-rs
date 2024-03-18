@@ -46,7 +46,7 @@ fn main() -> DeltaResult<()> {
         let record_batch: RecordBatch = data
             .into_any()
             .downcast::<ArrowEngineData>()
-            .map_err(|_| deltakernel::Error::EngineDataType("SimpleData".to_string()))?
+            .map_err(|_| deltakernel::Error::EngineDataType("ArrowEngineData".to_string()))?
             .into();
         let batch = if let Some(mask) = res.mask {
             filter_record_batch(&record_batch, &mask.into())?

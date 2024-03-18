@@ -307,7 +307,7 @@ mod tests {
                 ed_res.and_then(|ed| {
                     ed.into_any()
                         .downcast::<ArrowEngineData>()
-                        .map_err(|_| Error::engine_data_type("SimpleData"))
+                        .map_err(|_| Error::engine_data_type("ArrowEngineData"))
                         .map(|sd| sd.into())
                 })
             })

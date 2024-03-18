@@ -16,26 +16,26 @@ use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
 
-/// SimpleData holds a RecordBatch, implements `EngineData` so the kernel can extract from it.
+/// ArrowEngineData holds an Arrow RecordBatch, implements `EngineData` so the kernel can extract from it.
 pub struct ArrowEngineData {
     data: RecordBatch,
 }
 
 impl ArrowEngineData {
-    /// Create a new `SimpleData` from a `RecordBatch`
+    /// Create a new `ArrowEngineData` from a `RecordBatch`
     pub fn new(data: RecordBatch) -> Self {
         ArrowEngineData { data }
     }
 
-    /// Utility constructor to get a `Box<SimpleData>` out of a `Box<dyn EngineData>`
+    /// Utility constructor to get a `Box<ArrowEngineData>` out of a `Box<dyn EngineData>`
     pub fn try_from_engine_data(engine_data: Box<dyn EngineData>) -> DeltaResult<Box<Self>> {
         engine_data
             .into_any()
             .downcast::<ArrowEngineData>()
-            .map_err(|_| Error::engine_data_type("SimpleData"))
+            .map_err(|_| Error::engine_data_type("ArrowEngineData"))
     }
 
-    /// Get a reference to the `RecordBatch` this `SimpleData` is wrapping
+    /// Get a reference to the `RecordBatch` this `ArrowEngineData` is wrapping
     pub fn record_batch(&self) -> &RecordBatch {
         &self.data
     }

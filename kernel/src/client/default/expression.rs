@@ -256,7 +256,7 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
         let batch = batch
             .as_any()
             .downcast_ref::<ArrowEngineData>()
-            .ok_or(Error::engine_data_type("SimpleData"))?
+            .ok_or(Error::engine_data_type("ArrowEngineData"))?
             .record_batch();
         let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into()?;
         // TODO: make sure we have matching schemas for validation
