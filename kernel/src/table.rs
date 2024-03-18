@@ -48,14 +48,14 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::client::sync::SyncInterface;
+    use crate::client::sync::SyncEngineInterface;
 
     #[test]
     fn test_table() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine_interface = SyncInterface::new();
+        let engine_interface = SyncEngineInterface::new();
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine_interface, None).unwrap();
         assert_eq!(snapshot.version(), 1)

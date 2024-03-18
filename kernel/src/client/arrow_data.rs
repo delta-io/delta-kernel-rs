@@ -325,7 +325,7 @@ mod tests {
     use crate::actions::Metadata;
     use crate::DeltaResult;
     use crate::{
-        actions::schemas::log_schema, client::sync::SyncInterface, EngineData, EngineInterface,
+        actions::schemas::log_schema, client::sync::SyncEngineInterface, EngineData, EngineInterface,
     };
 
     use super::ArrowEngineData;
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn test_md_extract() -> DeltaResult<()> {
-        let client = SyncInterface::new();
+        let client = SyncEngineInterface::new();
         let handler = client.get_json_handler();
         let json_strings: StringArray = vec![
             r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
