@@ -329,5 +329,7 @@ mod tests {
         expect_fail_parse("iowjef");
         expect_fail_parse("123Ef");
         expect_fail_parse("1d2E3");
+        expect_fail_parse("1.2.3");
+        expect_fail_parse("1.2E1.3");
     }
 }
