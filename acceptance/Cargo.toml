@@ -11,7 +11,7 @@ readme.workspace = true
 version.workspace = true
 
 [dependencies]
-deltakernel = { path = "../kernel", features = ["developer-visibility"] }
+deltakernel = { path = "../kernel", features = ["default-client", "developer-visibility"] }
 futures = "0.3"
 object_store = "^0.8.0"
 serde = { version = "1", features = ["derive"] }
