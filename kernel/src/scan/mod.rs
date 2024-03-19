@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use itertools::Itertools;
 use tracing::debug;
 
 use self::file_stream::log_replay_iter;
@@ -214,12 +215,11 @@ impl Scan {
                     read_result
                 } else {
                     debug!("Adding back in partition columns");
-                    let mut fields_with_index = Vec::with_capacity(partition_fields.len() + len);
                     let final_schema = self.schema();
+                    let mut fields = vec![None; final_schema.fields.len()];
                     for select_field in read_schema.fields() {
                         let field_position = final_schema.field_index(&select_field.name).unwrap();
-                        fields_with_index
-                            .push((field_position, Expression::column(select_field.name())));
+                        fields[field_position] = Some(Expression::column(select_field.name()));
                     }
                     for field in &partition_fields {
                         let value_expression = parse_partition_value(
@@ -227,12 +227,13 @@ impl Scan {
                             field.data_type(),
                         )?;
                         let field_position = final_schema.field_index(&field.name).unwrap();
-                        fields_with_index
-                            .push((field_position, Expression::Literal(value_expression)));
+                        fields[field_position] = Some(Expression::Literal(value_expression));
                     }
-                    fields_with_index.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                    debug!("Final fields to evaluate for partition columns: {fields_with_index:?}");
-                    let fields = fields_with_index.into_iter().map(|pair| pair.1).collect();
+                    debug!("Final fields to evaluate for partition columns: {fields:?}");
+                    let fields = fields
+                        .into_iter()
+                        .map(|opt| opt.ok_or_else(|| Error::generic("Invalid columns in select")))
+                        .try_collect()?;
                     let evaluator = engine_interface.get_expression_handler().get_evaluator(
                         read_schema.clone(),
                         Expression::Struct(fields),
@@ -275,7 +276,6 @@ fn parse_partition_value(
 
 #[cfg(all(test, feature = "default-client"))]
 mod tests {
-    use itertools::Itertools;
     use std::path::PathBuf;
 
     use super::*;
