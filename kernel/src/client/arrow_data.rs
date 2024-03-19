@@ -322,11 +322,10 @@ mod tests {
     use arrow_array::{RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 
-    use crate::actions::Metadata;
-    use crate::DeltaResult;
     use crate::{
-        actions::schemas::log_schema, client::sync::SyncEngineInterface, EngineData,
-        EngineInterface,
+        actions::{schemas::log_schema, Metadata},
+        client::sync::SyncEngineInterface,
+        DeltaResult, EngineData, EngineInterface,
     };
 
     use super::ArrowEngineData;
