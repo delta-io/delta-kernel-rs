@@ -218,7 +218,9 @@ impl Scan {
                     let final_schema = self.schema();
                     let mut fields = vec![None; final_schema.fields.len()];
                     for select_field in read_schema.fields() {
-                        let field_position = final_schema.field_index(&select_field.name).unwrap();
+                        let field_position = final_schema
+                            .field_index(&select_field.name)
+                            .ok_or_else(|| Error::missing_column(&select_field.name))?;
                         fields[field_position] = Some(Expression::column(select_field.name()));
                     }
                     for field in &partition_fields {
@@ -226,7 +228,9 @@ impl Scan {
                             add.partition_values.get(field.name()),
                             field.data_type(),
                         )?;
-                        let field_position = final_schema.field_index(&field.name).unwrap();
+                        let field_position = final_schema
+                            .field_index(&field.name)
+                            .ok_or_else(|| Error::missing_column(&field.name))?;
                         fields[field_position] = Some(Expression::Literal(value_expression));
                     }
                     debug!("Final fields to evaluate for partition columns: {fields:?}");
