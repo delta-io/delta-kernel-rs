@@ -293,7 +293,7 @@ mod tests {
                 assert_eq!(prec, expect_prec);
                 assert_eq!(scale, expect_scale);
             }
-            _ => assert!(false, "Didn't parse as decimal"),
+            _ => panic!("Didn't parse as decimal"),
         };
         Ok(())
     }
