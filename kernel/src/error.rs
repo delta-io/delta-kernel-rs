@@ -1,3 +1,5 @@
+use std::string::FromUtf8Error;
+
 use crate::schema::DataType;
 
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
@@ -74,6 +76,9 @@ pub enum Error {
 
     #[error("Join failure: {0}")]
     JoinFailure(String),
+
+    #[error("Could not convert to string to utf-8: {0}")]
+    Utf8Error(#[from] FromUtf8Error),
 }
 
 // Convenience constructors for Error types that take a String argument

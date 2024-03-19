@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use itertools::Itertools;
+use tracing::debug;
 
 use self::file_stream::log_replay_iter;
 use crate::actions::Add;
@@ -179,11 +179,6 @@ impl Scan {
             .collect::<DeltaResult<Vec<_>>>()?;
         partition_fields.reverse();
 
-        let select_fields = read_schema
-            .fields()
-            .map(|f| Expression::column(f.name()))
-            .collect_vec();
-
         let mut results: Vec<ScanResult> = vec![];
         let files = self.files(engine_interface)?;
         for add_result in files {
@@ -218,20 +213,30 @@ impl Scan {
                 let read_result = if partition_fields.is_empty() {
                     read_result
                 } else {
-                    let mut fields = Vec::with_capacity(partition_fields.len() + len);
+                    debug!("Adding back in partition columns");
+                    let mut fields_with_index = Vec::with_capacity(partition_fields.len() + len);
+                    let final_schema = self.schema();
+                    for select_field in read_schema.fields() {
+                        let field_position = final_schema.field_index(&select_field.name).unwrap();
+                        fields_with_index
+                            .push((field_position, Expression::column(select_field.name())));
+                    }
                     for field in &partition_fields {
                         let value_expression = parse_partition_value(
                             add.partition_values.get(field.name()),
                             field.data_type(),
                         )?;
-                        fields.push(Expression::Literal(value_expression));
+                        let field_position = final_schema.field_index(&field.name).unwrap();
+                        fields_with_index
+                            .push((field_position, Expression::Literal(value_expression)));
                     }
-                    fields.extend(select_fields.clone());
-
+                    fields_with_index.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    debug!("Final fields to evaluate for partition columns: {fields_with_index:?}");
+                    let fields = fields_with_index.into_iter().map(|pair| pair.1).collect();
                     let evaluator = engine_interface.get_expression_handler().get_evaluator(
                         read_schema.clone(),
                         Expression::Struct(fields),
-                        DataType::Struct(Box::new(self.schema().as_ref().clone())),
+                        DataType::Struct(Box::new(final_schema.as_ref().clone())),
                     );
 
                     evaluator.evaluate(read_result?.as_ref())

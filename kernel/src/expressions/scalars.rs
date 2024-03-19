@@ -153,6 +153,7 @@ impl PrimitiveType {
 
         match self {
             String => Ok(Scalar::String(raw.to_string())),
+            Binary => Ok(Scalar::Binary(raw.to_string().into_bytes())),
             Byte => self.parse_str_as_scalar(raw, Scalar::Byte),
             Short => self.parse_str_as_scalar(raw, Scalar::Short),
             Integer => self.parse_str_as_scalar(raw, Scalar::Integer),
@@ -187,7 +188,7 @@ impl PrimitiveType {
                     .ok_or(self.parse_error(raw))?;
                 Ok(Scalar::Timestamp(micros))
             }
-            _ => todo!(),
+            s => todo!("{s}: {raw}"),
         }
     }
 
