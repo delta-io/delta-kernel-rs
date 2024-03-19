@@ -1,10 +1,10 @@
 //! A simple, single threaded, EngineInterface that can only read from the local filesystem
 
+use super::arrow_expression::ArrowExpressionHandler;
 use crate::{EngineInterface, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler};
 
 use std::sync::Arc;
 
-pub mod data;
 mod fs_client;
 mod get_data;
 pub(crate) mod json;
@@ -12,26 +12,28 @@ mod parquet;
 
 /// This is a simple implemention of [`EngineInterface`]. It only supports reading data from the
 /// local filesystem, and internally represents data using `Arrow`.
-pub struct SimpleClient {
-    fs_client: Arc<fs_client::SimpleFilesystemClient>,
-    json_handler: Arc<json::SimpleJsonHandler>,
-    parquet_handler: Arc<parquet::SimpleParquetHandler>,
+pub struct SyncEngineInterface {
+    fs_client: Arc<fs_client::SyncFilesystemClient>,
+    json_handler: Arc<json::SyncJsonHandler>,
+    parquet_handler: Arc<parquet::SyncParquetHandler>,
+    expression_handler: Arc<ArrowExpressionHandler>,
 }
 
-impl SimpleClient {
+impl SyncEngineInterface {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        SimpleClient {
-            fs_client: Arc::new(fs_client::SimpleFilesystemClient {}),
-            json_handler: Arc::new(json::SimpleJsonHandler {}),
-            parquet_handler: Arc::new(parquet::SimpleParquetHandler {}),
+        SyncEngineInterface {
+            fs_client: Arc::new(fs_client::SyncFilesystemClient {}),
+            json_handler: Arc::new(json::SyncJsonHandler {}),
+            parquet_handler: Arc::new(parquet::SyncParquetHandler {}),
+            expression_handler: Arc::new(ArrowExpressionHandler {}),
         }
     }
 }
 
-impl EngineInterface for SimpleClient {
+impl EngineInterface for SyncEngineInterface {
     fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler> {
-        unimplemented!();
+        self.expression_handler.clone()
     }
 
     fn get_file_system_client(&self) -> Arc<dyn FileSystemClient> {

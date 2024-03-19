@@ -1,5 +1,3 @@
-//! Default Expression handler.
-//!
 //! Expression handling based on arrow-rs compute kernels.
 use std::sync::Arc;
 
@@ -17,10 +15,10 @@ use arrow_schema::{
 };
 use itertools::Itertools;
 
+use crate::client::arrow_data::ArrowEngineData;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{BinaryOperator, Expression, Scalar, UnaryOperator, VariadicOperator};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
-use crate::simple_client::data::SimpleData;
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
 
 // TODO leverage scalars / Datum
@@ -227,9 +225,9 @@ fn evaluate_expression(
 }
 
 #[derive(Debug)]
-pub struct DefaultExpressionHandler {}
+pub struct ArrowExpressionHandler;
 
-impl ExpressionHandler for DefaultExpressionHandler {
+impl ExpressionHandler for ArrowExpressionHandler {
     fn get_evaluator(
         &self,
         schema: SchemaRef,
@@ -255,8 +253,8 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         let batch = batch
             .as_any()
-            .downcast_ref::<SimpleData>()
-            .ok_or(Error::engine_data_type("SimpleData"))?
+            .downcast_ref::<ArrowEngineData>()
+            .ok_or(Error::engine_data_type("ArrowEngineData"))?
             .record_batch();
         let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into()?;
         // TODO: make sure we have matching schemas for validation
@@ -278,7 +276,7 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
             let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
             RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
         };
-        Ok(Box::new(SimpleData::new(batch)))
+        Ok(Box::new(ArrowEngineData::new(batch)))
     }
 }
 

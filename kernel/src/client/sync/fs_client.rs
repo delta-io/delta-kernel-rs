@@ -6,9 +6,9 @@ use url::Url;
 
 use crate::{DeltaResult, Error, FileMeta, FileSlice, FileSystemClient};
 
-pub(crate) struct SimpleFilesystemClient;
+pub(crate) struct SyncFilesystemClient;
 
-impl FileSystemClient for SimpleFilesystemClient {
+impl FileSystemClient for SyncFilesystemClient {
     /// List the paths in the same directory that are lexicographically greater or equal to
     /// (UTF-8 sorting) the given `path`. The result is sorted by the file name.
     fn list_from(
@@ -103,7 +103,7 @@ mod tests {
     use bytes::{BufMut, BytesMut};
     use url::Url;
 
-    use super::SimpleFilesystemClient;
+    use super::SyncFilesystemClient;
     use crate::FileSystemClient;
 
     /// generate json filenames that follow the spec (numbered padded to 20 chars)
@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn test_list_from() -> Result<(), Box<dyn std::error::Error>> {
-        let client = SimpleFilesystemClient;
+        let client = SyncFilesystemClient;
         let tmp_dir = tempfile::tempdir().unwrap();
         let mut expected = vec![];
         for i in 0..3 {
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_read_files() -> Result<(), Box<dyn std::error::Error>> {
-        let client = SimpleFilesystemClient;
+        let client = SyncFilesystemClient;
         let tmp_dir = tempfile::tempdir().unwrap();
         let path = tmp_dir.path().join(get_json_filename(1));
         let mut f = File::create(path.clone())?;

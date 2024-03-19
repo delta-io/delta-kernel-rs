@@ -17,8 +17,8 @@ use object_store::{DynObjectStore, GetResultPayload};
 
 use super::executor::TaskExecutor;
 use super::file_handler::{FileOpenFuture, FileOpener, FileStream};
+use crate::client::arrow_data::ArrowEngineData;
 use crate::schema::SchemaRef;
-use crate::simple_client::data::SimpleData;
 use crate::{
     DeltaResult, EngineData, Error, Expression, FileDataReadResultIterator, FileMeta, JsonHandler,
 };
@@ -89,7 +89,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let json_strings: RecordBatch = SimpleData::try_from_engine_data(json_strings)?.into();
+        let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
         // TODO(nick): this is pretty terrible
         let struct_array: StructArray = json_strings.into();
         let json_strings = struct_array
@@ -101,7 +101,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             })?;
         let output_schema: ArrowSchemaRef = Arc::new(output_schema.as_ref().try_into()?);
         if json_strings.is_empty() {
-            return Ok(Box::new(SimpleData::new(RecordBatch::new_empty(
+            return Ok(Box::new(ArrowEngineData::new(RecordBatch::new_empty(
                 output_schema,
             ))));
         }
@@ -109,7 +109,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             .iter()
             .map(|json_string| hack_parse(&output_schema, json_string))
             .try_collect()?;
-        Ok(Box::new(SimpleData::new(concat_batches(
+        Ok(Box::new(ArrowEngineData::new(concat_batches(
             &output_schema,
             output.iter(),
         )?)))
@@ -155,7 +155,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         });
 
         Ok(Box::new(receiver.into_iter().map(|rbr| {
-            rbr.map(|rb| Box::new(SimpleData::new(rb)) as _)
+            rbr.map(|rb| Box::new(ArrowEngineData::new(rb)) as _)
         })))
     }
 }
@@ -248,14 +248,16 @@ mod tests {
     use object_store::{local::LocalFileSystem, ObjectStore};
 
     use super::*;
-    use crate::{actions::schemas::log_schema, executor::tokio::TokioBackgroundExecutor};
+    use crate::{
+        actions::schemas::log_schema, client::default::executor::tokio::TokioBackgroundExecutor,
+    };
 
     fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
         let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
         let schema = Arc::new(ArrowSchema::new(vec![string_field]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
             .expect("Can't convert to record batch");
-        Box::new(SimpleData::new(batch))
+        Box::new(ArrowEngineData::new(batch))
     }
 
     #[test]
@@ -304,8 +306,8 @@ mod tests {
                 // TODO(nick) make this easier
                 ed_res.and_then(|ed| {
                     ed.into_any()
-                        .downcast::<SimpleData>()
-                        .map_err(|_| Error::engine_data_type("SimpleData"))
+                        .downcast::<ArrowEngineData>()
+                        .map_err(|_| Error::engine_data_type("ArrowEngineData"))
                         .map(|sd| sd.into())
                 })
             })

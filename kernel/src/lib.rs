@@ -57,16 +57,12 @@ pub use error::{DeltaResult, Error};
 pub use expressions::Expression;
 pub use table::Table;
 
-#[cfg(feature = "arrow-conversion")]
-pub mod arrow_conversion;
-
-#[cfg(feature = "simple-client")]
-pub mod simple_client;
-
-#[cfg(feature = "default-client")]
+#[cfg(any(
+    feature = "default-client",
+    feature = "sync-client",
+    feature = "arrow-conversion"
+))]
 pub mod client;
-#[cfg(feature = "default-client")]
-pub use client::*;
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;

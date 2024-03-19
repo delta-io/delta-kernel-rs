@@ -5,9 +5,9 @@ use crate::{
     ParquetHandler,
 };
 
-pub(crate) struct SimpleParquetHandler {}
+pub(crate) struct SyncParquetHandler;
 
-impl ParquetHandler for SimpleParquetHandler {
+impl ParquetHandler for SyncParquetHandler {
     fn read_parquet_files(
         &self,
         files: &[FileMeta],
@@ -20,7 +20,10 @@ impl ParquetHandler for SimpleParquetHandler {
         }
         let locations: Vec<_> = files.iter().map(|file| file.location.clone()).collect();
         Ok(Box::new(locations.into_iter().map(move |location| {
-            let d = super::data::SimpleData::try_create_from_parquet(schema.clone(), location);
+            let d = crate::client::arrow_data::ArrowEngineData::try_create_from_parquet(
+                schema.clone(),
+                location,
+            );
             d.map(|d| Box::new(d) as _)
         })))
     }

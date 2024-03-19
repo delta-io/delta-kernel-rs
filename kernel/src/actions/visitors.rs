@@ -278,8 +278,9 @@ mod tests {
     use super::*;
     use crate::{
         actions::schemas::log_schema,
+        client::arrow_data::ArrowEngineData,
+        client::sync::{json::SyncJsonHandler, SyncEngineInterface},
         schema::StructType,
-        simple_client::{data::SimpleData, json::SimpleJsonHandler, SimpleClient},
         EngineData, EngineInterface, JsonHandler,
     };
 
@@ -289,11 +290,11 @@ mod tests {
         let schema = Arc::new(ArrowSchema::new(vec![string_field]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
             .expect("Can't convert to record batch");
-        Box::new(SimpleData::new(batch))
+        Box::new(ArrowEngineData::new(batch))
     }
 
-    fn action_batch() -> Box<SimpleData> {
-        let handler = SimpleJsonHandler {};
+    fn action_batch() -> Box<ArrowEngineData> {
+        let handler = SyncJsonHandler {};
         let json_strings: StringArray = vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
             r#"{"commitInfo":{"timestamp":1677811178585,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isolationLevel":"WriteSerializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"10","numOutputBytes":"635"},"engineInfo":"Databricks-Runtime/<unknown>","txnId":"a6a94671-55ef-450e-9546-b8465b9147de"}}"#,
@@ -305,7 +306,7 @@ mod tests {
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
-        SimpleData::try_from_engine_data(parsed).unwrap()
+        ArrowEngineData::try_from_engine_data(parsed).unwrap()
     }
 
     #[test]
@@ -356,7 +357,7 @@ mod tests {
 
     #[test]
     fn test_parse_add_partitioned() {
-        let client = SimpleClient::new();
+        let client = SyncEngineInterface::new();
         let json_handler = client.get_json_handler();
         let json_strings: StringArray = vec![
             r#"{"commitInfo":{"timestamp":1670892998177,"operation":"WRITE","operationParameters":{"mode":"Append","partitionBy":"[\"c1\",\"c2\"]"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"3","numOutputRows":"3","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,

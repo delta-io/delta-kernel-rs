@@ -11,10 +11,11 @@ use arrow_select::concat::concat_batches;
 use itertools::Itertools;
 use tracing::debug;
 
-use super::data::SimpleData;
+use crate::client::arrow_data::ArrowEngineData;
 
-pub(crate) struct SimpleJsonHandler {}
-impl JsonHandler for SimpleJsonHandler {
+pub(crate) struct SyncJsonHandler;
+
+impl JsonHandler for SyncJsonHandler {
     fn read_json_files(
         &self,
         files: &[FileMeta],
@@ -28,10 +29,8 @@ impl JsonHandler for SimpleJsonHandler {
         let res: Vec<_> = files
             .iter()
             .map(|file| {
-                let d = super::data::SimpleData::try_create_from_json(
-                    schema.clone(),
-                    file.location.clone(),
-                );
+                let d =
+                    ArrowEngineData::try_create_from_json(schema.clone(), file.location.clone());
                 d.map(|d| Box::new(d) as _)
             })
             .collect();
@@ -45,7 +44,7 @@ impl JsonHandler for SimpleJsonHandler {
     ) -> DeltaResult<Box<dyn EngineData>> {
         // TODO: This is taken from the default client as it's the same. We should share an
         // implementation at some point
-        let json_strings: RecordBatch = SimpleData::try_from_engine_data(json_strings)?.into();
+        let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
         if json_strings.num_columns() != 1 {
             return Err(Error::missing_column("Expected single column"));
         }
@@ -73,6 +72,6 @@ impl JsonHandler for SimpleJsonHandler {
         let batches: Vec<_> = ReaderBuilder::new(schema.clone())
             .build(Cursor::new(data))?
             .try_collect()?;
-        Ok(Box::new(SimpleData::new(concat_batches(&schema, &batches)?)) as _)
+        Ok(Box::new(ArrowEngineData::new(concat_batches(&schema, &batches)?)) as _)
     }
 }

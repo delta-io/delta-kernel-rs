@@ -4,7 +4,7 @@ pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[cfg(any(feature = "default-client", feature = "simple-client"))]
+    #[cfg(any(feature = "default-client", feature = "sync-client"))]
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
 
