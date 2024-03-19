@@ -1,4 +1,4 @@
-use std::string::FromUtf8Error;
+use std::{num::ParseIntError, string::FromUtf8Error};
 
 use crate::schema::DataType;
 
@@ -79,6 +79,9 @@ pub enum Error {
 
     #[error("Could not convert to string to utf-8: {0}")]
     Utf8Error(#[from] FromUtf8Error),
+
+    #[error("Could not parse int: {0}")]
+    ParseIntError(#[from] ParseIntError),
 }
 
 // Convenience constructors for Error types that take a String argument
