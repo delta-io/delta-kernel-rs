@@ -212,12 +212,12 @@ impl PrimitiveType {
     }
 
     fn parse_decimal(&self, raw: &str, precision: u8, expected_scale: i8) -> Result<Scalar, Error> {
-        let (base, exp) = match raw.find(['e', 'E']) {
+        let (base, exp): (&str, i128) = match raw.find(['e', 'E']) {
             None => (raw, 0), // no 'e' or 'E', so there's no exponent
             Some(pos) => {
                 let (base, exp) = raw.split_at(pos);
                 // exp now has '[e/E][exponent]', strip the 'e/E' and parse it
-                (base, exp[1..].parse::<i128>()?)
+                (base, exp[1..].parse()?)
             }
         };
         if base.is_empty() {
@@ -240,9 +240,9 @@ impl PrimitiveType {
             }
         };
 
-        let scale = frac_digits
-            .checked_sub(exp)
-            .ok_or_else(|| self.parse_error(raw))?;
+        // we can assume this won't underflow since `frac_digits` is at minimum 0, and exp is at
+        // most i128::MAX, and 0-i128::MAX doesn't underflow
+        let scale = frac_digits - exp;
         let scale: i8 = scale.try_into().map_err(|_| self.parse_error(raw))?;
         if scale != expected_scale {
             return Err(self.parse_error(raw));
@@ -299,6 +299,7 @@ mod tests {
         assert_decimal("0.00", 0, 3, 2)?;
         assert_decimal("123", 123, 3, 0)?;
         assert_decimal("-123", -123, 3, 0)?;
+        assert_decimal("-123.", -123, 3, 0)?;
         assert_decimal("1.23E3", 123, 3, -1)?;
         assert_decimal("123000", 123000, 6, 0)?;
         assert_decimal("12.3E+7", 123, 9, -6)?;
@@ -313,18 +314,27 @@ mod tests {
         Ok(())
     }
 
-    fn expect_fail_parse(raw: &str) {
-        let s = PrimitiveType::Decimal(0, 0);
+    fn expect_fail_parse(raw: &str, prec: u8, scale: i8) {
+        let s = PrimitiveType::Decimal(prec, scale);
         let res = s.parse_scalar(raw);
         assert!(res.is_err(), "Fail on {raw}");
     }
 
     #[test]
     fn test_parse_decimal_expect_fail() {
-        expect_fail_parse("iowjef");
-        expect_fail_parse("123Ef");
-        expect_fail_parse("1d2E3");
-        expect_fail_parse("1.2.3");
-        expect_fail_parse("1.2E1.3");
+        expect_fail_parse("iowjef", 0, 0);
+        expect_fail_parse("123Ef", 0, 0);
+        expect_fail_parse("1d2E3", 0, 0);
+        expect_fail_parse("a", 0, 0);
+        expect_fail_parse("2.a", 1, 1);
+        expect_fail_parse("E45", 0, 0);
+        expect_fail_parse("1.2.3", 0, 0);
+        expect_fail_parse("1.2E1.3", 0, 0);
+        expect_fail_parse("123.45", 5, 1);
+        expect_fail_parse(".45", 5, 1);
+        // overflow i8 for `scale`
+        expect_fail_parse("0.999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999", 0, 0);
+        // scale will be too small to fit in i8
+        expect_fail_parse("0.E170141183460469231731687303715884105727", 0, 0);
     }
 }
