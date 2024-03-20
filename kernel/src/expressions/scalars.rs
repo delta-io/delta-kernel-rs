@@ -224,17 +224,15 @@ impl PrimitiveType {
             return Err(self.parse_error(raw));
         }
 
-        let base_end = base.len() - 1; // position of last char in base
-
         // now split on any '.' and parse
         let (int_part, frac_part, frac_digits) = match base.find('.') {
             None => {
                 // no, '.', just base base as int_part
                 (base, None, 0)
             }
-            Some(pos) if pos == base_end => {
+            Some(pos) if pos == base.len() - 1 => {
                 // '.' is at the end, just strip it
-                (&base[..base_end], None, 0)
+                (&base[..pos], None, 0)
             }
             Some(pos) => {
                 let (int_part, frac_part) = (&base[..pos], &base[pos + 1..]);
@@ -250,9 +248,9 @@ impl PrimitiveType {
             return Err(self.parse_error(raw));
         }
 
-        let int = match frac_part {
-            None => int_part.parse::<i128>()?,
-            Some(frac_part) => format!("{}{}", int_part, frac_part).parse::<i128>()?,
+        let int: i128 = match frac_part {
+            None => int_part.parse()?,
+            Some(frac_part) => format!("{}{}", int_part, frac_part).parse()?,
         };
         Ok(Scalar::Decimal(int, precision, scale))
     }
