@@ -81,7 +81,7 @@ pub enum Error {
     #[error("Join failure: {0}")]
     JoinFailure(String),
 
-    #[error("Could not convert to string to utf-8: {0}")]
+    #[error("Could not convert to string from utf-8: {0}")]
     Utf8Error(#[from] FromUtf8Error),
 
     #[error("Could not parse int: {0}")]
