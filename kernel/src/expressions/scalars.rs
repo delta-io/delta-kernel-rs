@@ -245,10 +245,7 @@ impl PrimitiveType {
         let scale = frac_digits
             .checked_sub(exp)
             .ok_or_else(|| self.parse_error(raw))?;
-        if scale > i8::MAX as i128 {
-            return Err(self.parse_error(raw));
-        }
-        let scale = scale as i8;
+        let scale: i8 = scale.try_into().map_err(|_| self.parse_error(raw));
         if scale != expected_scale {
             return Err(self.parse_error(raw));
         }
