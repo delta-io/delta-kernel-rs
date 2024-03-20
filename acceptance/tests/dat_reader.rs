@@ -30,6 +30,7 @@ fn reader_test(path: &Path) -> datatest_stable::Result<()> {
             case.assert_metadata(engine_interface.clone())
                 .await
                 .unwrap();
+            acceptance::data::assert_scan_data(engine_interface.clone(), &case).await.unwrap();
         });
     Ok(())
 }
