@@ -162,23 +162,23 @@ impl Scan {
         let parquet_handler = engine_interface.get_parquet_handler();
 
         let partition_columns = &self.snapshot.metadata().partition_columns;
-        let read_schema = Arc::new(StructType::new(
-            self.schema()
-                .fields()
-                .filter(|f| !partition_columns.contains(f.name()))
-                .cloned()
-                .collect::<Vec<_>>(),
-        ));
-
-        let mut partition_fields = partition_columns
-            .iter()
-            .map(|column| {
-                self.schema()
-                    .field(column)
-                    .ok_or(Error::generic("Unexpected partition column"))
-            })
-            .collect::<DeltaResult<Vec<_>>>()?;
-        partition_fields.reverse();
+        for partition_column in partition_columns.iter() {
+            if !self.schema().contains(partition_column) {
+                return Err(Error::Generic(format!(
+                    "Unexpected partition column {partition_column}"
+                )));
+            }
+        }
+        let mut partition_fields = vec![];
+        let mut read_fields = vec![];
+        for field in self.schema().fields() {
+            if partition_columns.contains(field.name()) {
+                partition_fields.push(field);
+            } else {
+                read_fields.push(field.clone());
+            }
+        }
+        let read_schema = Arc::new(StructType::new(read_fields));
 
         let mut results: Vec<ScanResult> = vec![];
         let files = self.files(engine_interface)?;
