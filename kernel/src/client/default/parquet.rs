@@ -115,7 +115,7 @@ impl ParquetOpener {
 
 impl FileOpener for ParquetOpener {
     fn open(&self, file_meta: FileMeta, _range: Option<Range<i64>>) -> DeltaResult<FileOpenFuture> {
-        let path = Path::from_url_path(file_meta.location.path()).unwrap();
+        let path = Path::from_url_path(file_meta.location.path())?;
         let store = self.store.clone();
 
         let batch_size = self.batch_size;

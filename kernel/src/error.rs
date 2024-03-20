@@ -38,6 +38,10 @@ pub enum Error {
     #[error("Error interacting with object store: {0}")]
     ObjectStore(object_store::Error),
 
+    #[cfg(feature = "object_store")]
+    #[error("Object store path error: {0}")]
+    ObjectStorePath(#[from] object_store::path::Error),
+
     #[error("File not found: {0}")]
     FileNotFound(String),
 
