@@ -167,7 +167,7 @@ impl Scan {
     /// more details.
     pub fn execute(&self, engine_interface: &dyn EngineInterface) -> DeltaResult<Vec<ScanResult>> {
         let partition_columns = &self.snapshot.metadata().partition_columns;
-        let mut read_fields = vec![];
+        let mut read_fields = Vec::with_capacity(self.schema().fields.len());
         let mut have_partition_cols = false;
         // Loop over all selected fields and note if they are columns that will be read from the
         // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
@@ -245,19 +245,19 @@ impl Scan {
                     0
                 };
 
-                let read_result = if have_partition_cols {
-                    let evaluator = engine_interface.get_expression_handler().get_evaluator(
-                        read_schema.clone(),
-                        read_expression
-                            .as_ref()
-                            .unwrap() // safe, we know have_partition_cols is true so it's Some
-                            .clone(),
-                        output_schema.clone(),
-                    );
-                    evaluator.evaluate(read_result?.as_ref())
-                } else {
-                    // if we don't have partition columns, the result is just what we read
-                    read_result
+                let read_result = match read_expression {
+                    Some(ref read_expression) => engine_interface
+                        .get_expression_handler()
+                        .get_evaluator(
+                            read_schema.clone(),
+                            read_expression.clone(),
+                            output_schema.clone(),
+                        )
+                        .evaluate(read_result?.as_ref()),
+                    None => {
+                        // if we don't have partition columns, the result is just what we read
+                        read_result
+                    }
                 };
 
                 // need to split the dv_mask. what's left in dv_mask covers this result, and rest
