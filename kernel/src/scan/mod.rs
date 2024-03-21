@@ -6,7 +6,7 @@ use tracing::debug;
 use self::file_stream::log_replay_iter;
 use crate::actions::Add;
 use crate::expressions::{Expression, Scalar};
-use crate::schema::{DataType, SchemaRef, StructType};
+use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::{DeltaResult, EngineData, EngineInterface, Error, FileMeta};
 
@@ -93,6 +93,13 @@ pub struct ScanResult {
     pub mask: Option<Vec<bool>>,
 }
 
+/// Scan uses this to set up what kinds of columns it is scanning. A reference to the field is
+/// stored so we can get the name and data_type out when building the read expression
+enum ColumnType<'a> {
+    Selected(&'a StructField),
+    Partition(&'a StructField),
+}
+
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
 pub struct Scan {
@@ -159,26 +166,31 @@ impl Scan {
     /// from the deletion vector if it was present. See the documentation for [`ScanResult`] for
     /// more details.
     pub fn execute(&self, engine_interface: &dyn EngineInterface) -> DeltaResult<Vec<ScanResult>> {
-        let parquet_handler = engine_interface.get_parquet_handler();
-
+        // Place read schema fields directly in their final location; leave None placeholders
+        // for partition value fields, to be fixed up later.
         let partition_columns = &self.snapshot.metadata().partition_columns;
-        for partition_column in partition_columns.iter() {
-            if !self.schema().contains(partition_column) {
-                return Err(Error::Generic(format!(
-                    "Unexpected partition column {partition_column}"
-                )));
-            }
-        }
-        let mut partition_fields = vec![];
         let mut read_fields = vec![];
-        for field in self.schema().fields() {
-            if partition_columns.contains(field.name()) {
-                partition_fields.push(field);
-            } else {
-                read_fields.push(field.clone());
-            }
-        }
+        let mut have_partition_cols = false;
+        let all_fields: Vec<_> = self
+            .schema()
+            .fields()
+            .map(|field| {
+                if partition_columns.contains(field.name()) {
+                    // Store the raw field, we will turn it into an expression in the inner loop
+                    // since the expression could be different for each add file
+                    have_partition_cols = true;
+                    ColumnType::Partition(field)
+                } else {
+                    // Add to read schema, store field so we can build a `Column` expression later
+                    // if needed (i.e. if we have partition columns)
+                    read_fields.push(field.clone());
+                    ColumnType::Selected(field)
+                }
+            })
+            .collect();
         let read_schema = Arc::new(StructType::new(read_fields));
+        let output_schema = DataType::Struct(Box::new(self.schema().as_ref().clone()));
+        let parquet_handler = engine_interface.get_parquet_handler();
 
         let mut results: Vec<ScanResult> = vec![];
         let files = self.files(engine_interface)?;
@@ -189,9 +201,30 @@ impl Scan {
                 size: add.size as usize,
                 location: self.snapshot.table_root.join(&add.path)?,
             };
-            // TODO(nick) check if we need robert's try_collect change here
+
             let read_results =
                 parquet_handler.read_parquet_files(&[meta], self.read_schema.clone(), None)?;
+
+            let read_expression = if have_partition_cols {
+                // Loop over all fields and create the correct expressions for them
+                let all_fields: Vec<Expression> = all_fields
+                    .iter()
+                    .map(|field| match field {
+                        ColumnType::Partition(field) => {
+                            let value_expression = parse_partition_value(
+                                add.partition_values.get(field.name()),
+                                field.data_type(),
+                            )?;
+                            Ok::<Expression, Error>(Expression::Literal(value_expression))
+                        }
+                        ColumnType::Selected(field) => Ok(Expression::column(field.name())),
+                    })
+                    .try_collect()?;
+                Some(Expression::Struct(all_fields))
+            } else {
+                None
+            };
+            debug!("Final expression for read: {read_expression:?}");
 
             let dv_treemap = add
                 .deletion_vector
@@ -211,40 +244,19 @@ impl Scan {
                     0
                 };
 
-                let read_result = if partition_fields.is_empty() {
-                    read_result
-                } else {
-                    debug!("Adding back in partition columns");
-                    let final_schema = self.schema();
-                    let mut fields = vec![None; final_schema.fields.len()];
-                    for select_field in read_schema.fields() {
-                        let field_position = final_schema
-                            .field_index(&select_field.name)
-                            .ok_or_else(|| Error::missing_column(&select_field.name))?;
-                        fields[field_position] = Some(Expression::column(select_field.name()));
-                    }
-                    for field in &partition_fields {
-                        let value_expression = parse_partition_value(
-                            add.partition_values.get(field.name()),
-                            field.data_type(),
-                        )?;
-                        let field_position = final_schema
-                            .field_index(&field.name)
-                            .ok_or_else(|| Error::missing_column(&field.name))?;
-                        fields[field_position] = Some(Expression::Literal(value_expression));
-                    }
-                    debug!("Final fields to evaluate for partition columns: {fields:?}");
-                    let fields = fields
-                        .into_iter()
-                        .map(|opt| opt.ok_or_else(|| Error::generic("Invalid columns in select")))
-                        .try_collect()?;
+                let read_result = if have_partition_cols {
                     let evaluator = engine_interface.get_expression_handler().get_evaluator(
                         read_schema.clone(),
-                        Expression::Struct(fields),
-                        DataType::Struct(Box::new(final_schema.as_ref().clone())),
+                        read_expression
+                            .as_ref()
+                            .unwrap() // safe, we know have_partition_cols is true so it's Some
+                            .clone(),
+                        output_schema.clone(),
                     );
-
                     evaluator.evaluate(read_result?.as_ref())
+                } else {
+                    // if we don't have partition columns, the result is just what we read
+                    read_result
                 };
 
                 // need to split the dv_mask. what's left in dv_mask covers this result, and rest
