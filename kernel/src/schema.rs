@@ -140,20 +140,12 @@ impl StructType {
         }
     }
 
-    pub fn contains(&self, name: impl AsRef<str>) -> bool {
-        self.fields.contains_key(name.as_ref())
-    }
-
     pub fn field(&self, name: impl AsRef<str>) -> Option<&StructField> {
         self.fields.get(name.as_ref())
     }
 
     pub fn fields(&self) -> impl Iterator<Item = &StructField> {
         self.fields.values()
-    }
-
-    pub fn field_index(&self, name: impl AsRef<str>) -> Option<usize> {
-        self.fields.get_index_of(name.as_ref())
     }
 }
 
