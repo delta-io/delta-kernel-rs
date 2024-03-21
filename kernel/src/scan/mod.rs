@@ -166,11 +166,12 @@ impl Scan {
     /// from the deletion vector if it was present. See the documentation for [`ScanResult`] for
     /// more details.
     pub fn execute(&self, engine_interface: &dyn EngineInterface) -> DeltaResult<Vec<ScanResult>> {
-        // Place read schema fields directly in their final location; leave None placeholders
-        // for partition value fields, to be fixed up later.
         let partition_columns = &self.snapshot.metadata().partition_columns;
         let mut read_fields = vec![];
         let mut have_partition_cols = false;
+        // Loop over all selected fields and note if they are columns that will be read from the
+        // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
+        // be filled in by evaluating an expression ([`ColumnType::Partition`])
         let all_fields: Vec<_> = self
             .schema()
             .fields()
