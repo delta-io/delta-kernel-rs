@@ -332,6 +332,14 @@ mod tests {
         expect_fail_parse("1.2E1.3", 0, 0);
         expect_fail_parse("123.45", 5, 1);
         expect_fail_parse(".45", 5, 1);
+        expect_fail_parse("+", 0, 0);
+        expect_fail_parse("-", 0, 0);
+        expect_fail_parse("0.-0", 2, 1);
+        expect_fail_parse("--1.0", 1, 1);
+        expect_fail_parse("+-1.0", 1, 1);
+        expect_fail_parse("-+1.0", 1, 1);
+        expect_fail_parse("++1.0", 1, 1);
+        expect_fail_parse("1.0E1+", 1, 1);
         // overflow i8 for `scale`
         expect_fail_parse("0.999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999", 0, 0);
         // scale will be too small to fit in i8
