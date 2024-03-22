@@ -172,7 +172,6 @@ impl ArrowEngineData {
         Ok(ArrowEngineData::new(data?))
     }
 
-    // TODO needs to apply the schema to the parquet read
     pub fn try_create_from_parquet(schema: SchemaRef, location: Url) -> DeltaResult<Self> {
         let file = File::open(
             location
@@ -187,7 +186,7 @@ impl ArrowEngineData {
             .fields
             .iter()
             .map(|field| {
-                // todo: handle nested
+                // todo: handle nested (then use `leaves` not `roots` below
                 parquet_schema.index_of(field.name())
             })
             .try_collect()?;
@@ -195,7 +194,7 @@ impl ArrowEngineData {
         let mask = if parquet_schema.fields.size() == requested_schema.fields.size() {
             ProjectionMask::all()
         } else {
-            ProjectionMask::leaves(builder.parquet_schema(), indicies.clone())
+            ProjectionMask::roots(builder.parquet_schema(), indicies.clone())
         };
 
         let builder = builder.with_projection(mask);
