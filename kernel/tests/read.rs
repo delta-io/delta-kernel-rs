@@ -10,6 +10,7 @@ use deltakernel::client::default::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::client::default::DefaultEngineInterface;
 use deltakernel::expressions::{BinaryOperator, Expression};
 use deltakernel::scan::ScanBuilder;
+use deltakernel::schema::{StructField, Schema};
 use deltakernel::{EngineData, Table};
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use parquet::arrow::arrow_writer::ArrowWriter;
@@ -394,7 +395,7 @@ macro_rules! assert_batches_sorted_eq {
     };
 }
 
-fn read_table_data(path: &str, expected: Vec<&str>) -> Result<(), Box<dyn std::error::Error>> {
+fn read_table_data(path: &str, select_cols: Option<&[&str]>, expected: Vec<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from(path))?;
     let url = url::Url::from_directory_path(path).unwrap();
     let table_client = DefaultEngineInterface::try_new(
@@ -405,7 +406,19 @@ fn read_table_data(path: &str, expected: Vec<&str>) -> Result<(), Box<dyn std::e
 
     let table = Table::new(url);
     let snapshot = table.snapshot(&table_client, None)?;
-    let scan = ScanBuilder::new(snapshot).build();
+    let mut scan_builder = ScanBuilder::new(snapshot.clone());
+
+    if let Some(select_cols) = select_cols {
+        let table_schema = snapshot.schema();
+        let selected_fields: Vec<StructField> =
+            select_cols.iter()
+            .map(|col| {
+                table_schema.field(col).map(|f| f.clone()).unwrap()
+            }).collect();
+        let read_schema = Arc::new(Schema::new(selected_fields));
+        scan_builder = scan_builder.with_schema(read_schema);
+    }
+    let scan = scan_builder.build();
 
     let scan_results = scan.execute(&table_client)?;
     let batches: Vec<RecordBatch> = scan_results
@@ -439,7 +452,45 @@ fn data() -> Result<(), Box<dyn std::error::Error>> {
         "| e      | 5      | 5.5     |",
         "+--------+--------+---------+",
     ];
-    read_table_data("./tests/data/basic_partitioned", expected)?;
+    read_table_data("./tests/data/basic_partitioned", None, expected)?;
+
+    Ok(())
+}
+
+#[test]
+fn column_ordering() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+---------+--------+--------+",
+        "| a_float | letter | number |",
+        "+---------+--------+--------+",
+        "| 6.6     |        | 6      |",
+        "| 4.4     | a      | 4      |",
+        "| 5.5     | e      | 5      |",
+        "| 1.1     | a      | 1      |",
+        "| 2.2     | b      | 2      |",
+        "| 3.3     | c      | 3      |",
+        "+---------+--------+--------+",
+    ];
+    read_table_data("./tests/data/basic_partitioned", Some(&["a_float", "letter", "number"]), expected)?;
+
+    Ok(())
+}
+
+#[test]
+fn column_ordering_and_projection() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+---------+--------+",
+        "| a_float | number |",
+        "+---------+--------+",
+        "| 6.6     | 6      |",
+        "| 4.4     | 4      |",
+        "| 5.5     | 5      |",
+        "| 1.1     | 1      |",
+        "| 2.2     | 2      |",
+        "| 3.3     | 3      |",
+        "+---------+--------+",
+    ];
+    read_table_data("./tests/data/basic_partitioned", Some(&["a_float", "number"]), expected)?;
 
     Ok(())
 }
