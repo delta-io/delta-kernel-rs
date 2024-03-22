@@ -65,7 +65,7 @@ fn main() -> DeltaResult<()> {
             let selected_fields: Vec<StructField> =
                 cols.iter()
                     .map(|col| {
-                        table_schema.field(col).map(|f| f.clone()).ok_or(
+                        table_schema.field(col).cloned().ok_or(
                             deltakernel::Error::Generic(format!("Table has no such column: {col}")),
                         )
                     })

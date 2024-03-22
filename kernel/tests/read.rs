@@ -416,7 +416,7 @@ fn read_table_data(
         let table_schema = snapshot.schema();
         let selected_fields: Vec<StructField> = select_cols
             .iter()
-            .map(|col| table_schema.field(col).map(|f| f.clone()).unwrap())
+            .map(|col| table_schema.field(col).cloned().unwrap())
             .collect();
         let read_schema = Arc::new(Schema::new(selected_fields));
         scan_builder = scan_builder.with_schema(read_schema);

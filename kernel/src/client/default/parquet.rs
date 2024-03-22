@@ -130,13 +130,13 @@ impl FileOpener for ParquetOpener {
             let mut reader = ParquetObjectReader::new(store, meta);
             let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
             let parquet_schema = metadata.schema();
-            let indicies = get_requested_indicies(&table_schema, &parquet_schema)?;
+            let indicies = get_requested_indicies(&table_schema, parquet_schema)?;
             let options = ArrowReaderOptions::new(); //.with_page_index(enable_page_index);
             let mut builder =
                 ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await?;
             if let Some(mask) = generate_mask(
                 &table_schema,
-                &parquet_schema,
+                parquet_schema,
                 builder.parquet_schema(),
                 &indicies,
             ) {
