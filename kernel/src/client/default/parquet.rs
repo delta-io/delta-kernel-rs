@@ -7,11 +7,12 @@ use arrow_schema::SchemaRef as ArrowSchemaRef;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::DynObjectStore;
-use parquet::arrow::arrow_reader::ArrowReaderOptions;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 
 use super::file_handler::{FileOpenFuture, FileOpener};
 use crate::client::arrow_data::ArrowEngineData;
+use crate::client::arrow_utils::{generate_mask, get_requested_indicies, reorder_record_batch};
 use crate::client::default::executor::TaskExecutor;
 use crate::client::default::file_handler::FileStream;
 use crate::schema::SchemaRef;
@@ -120,26 +121,42 @@ impl FileOpener for ParquetOpener {
 
         let batch_size = self.batch_size;
         // let projection = self.projection.clone();
-        let _table_schema = self.table_schema.clone();
+        let table_schema = self.table_schema.clone();
         let limit = self.limit;
 
         Ok(Box::pin(async move {
             // TODO avoid IO by converting passed file meta to ObjectMeta
             let meta = store.head(&path).await?;
-            let reader = ParquetObjectReader::new(store, meta);
+            let mut reader = ParquetObjectReader::new(store, meta);
+            let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
+            let parquet_schema = metadata.schema();
+            let indicies = get_requested_indicies(&table_schema, &parquet_schema)?;
             let options = ArrowReaderOptions::new(); //.with_page_index(enable_page_index);
             let mut builder =
                 ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await?;
+            let mask = generate_mask(
+                &table_schema,
+                &parquet_schema,
+                builder.parquet_schema(),
+                &indicies,
+            );
 
-            // let mask = ProjectionMask::roots(builder.parquet_schema(), projection.iter().cloned());
             if let Some(limit) = limit {
                 builder = builder.with_limit(limit)
             }
 
             let stream = builder
-                // .with_projection(mask)
+                .with_projection(mask)
                 .with_batch_size(batch_size)
                 .build()?;
+
+            let stream = stream.map(move |rbr| {
+                // re-order each batch if needed
+                rbr.and_then(|rb| {
+                    reorder_record_batch(table_schema.clone(), rb, &indicies)
+                        .map_err(|e| parquet::errors::ParquetError::General(format!("{e}")))
+                })
+            });
 
             let adapted = stream.map_err(Error::generic_err);
             Ok(adapted.boxed())

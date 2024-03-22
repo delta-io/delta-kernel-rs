@@ -1,3 +1,4 @@
+use super::arrow_utils::{generate_mask, get_requested_indicies, reorder_record_batch};
 use crate::engine_data::{EngineData, EngineList, EngineMap, GetData};
 use crate::schema::{DataType, PrimitiveType, Schema, SchemaRef, StructField};
 use crate::{DataVisitor, DeltaResult, Error};
@@ -6,9 +7,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::{Array, GenericListArray, MapArray, RecordBatch, StructArray};
 use arrow_schema::{ArrowError, DataType as ArrowDataType, Schema as ArrowSchema};
-use itertools::Itertools;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
-use parquet::arrow::ProjectionMask;
 use tracing::{debug, warn};
 use url::Url;
 
@@ -178,45 +177,28 @@ impl ArrowEngineData {
                 .to_file_path()
                 .map_err(|_| Error::generic("can only read local files"))?,
         )?;
-        let metadata = ArrowReaderMetadata::load(&file, Default::default()).unwrap();
+        let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
         let parquet_schema = metadata.schema();
         let requested_schema: ArrowSchema = (&*schema).try_into()?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-        let indicies: Vec<usize> = requested_schema
-            .fields
-            .iter()
-            .map(|field| {
-                // todo: handle nested (then use `leaves` not `roots` below
-                parquet_schema.index_of(field.name())
-            })
-            .try_collect()?;
-
-        let mask = if parquet_schema.fields.size() == requested_schema.fields.size() {
-            ProjectionMask::all()
-        } else {
-            ProjectionMask::roots(builder.parquet_schema(), indicies.clone())
-        };
+        let indicies: Vec<usize> = get_requested_indicies(&requested_schema, parquet_schema)?;
+        let mask = generate_mask(
+            &requested_schema,
+            parquet_schema,
+            builder.parquet_schema(),
+            &indicies,
+        );
 
         let builder = builder.with_projection(mask);
         let mut reader = builder.build()?;
         let data = reader
             .next()
             .ok_or(Error::generic("No data found reading parquet file"))?;
-        if is_sorted(&indicies) {
-            Ok(ArrowEngineData::new(data?))
-        } else {
-            // requested an order different from the parquet, reorder
-            let data = data?;
-            let mut cols = Vec::with_capacity(data.num_columns());
-            for field in requested_schema.fields.iter() {
-                let col = data.column_by_name(field.name()).ok_or(Error::generic(
-                    "request_schema had a field that didn't exist in final result. This is a bug",
-                ))?;
-                cols.push(col.clone());
-            }
-            let reordered = RecordBatch::try_new(requested_schema.into(), cols)?;
-            Ok(ArrowEngineData::new(reordered))
-        }
+        Ok(ArrowEngineData::new(reorder_record_batch(
+            requested_schema.into(),
+            data?,
+            &indicies,
+        )?))
     }
 
     /// Extracts an exploded view (all leaf values), in schema order of that data contained
@@ -347,10 +329,6 @@ fn get_error_for_types(
             "On {field_name}: Unsupported data type {data_type}: {e}",
         )),
     }
-}
-
-fn is_sorted(indicies: &[usize]) -> bool {
-    indicies.windows(2).all(|is| is[0] <= is[1])
 }
 
 #[cfg(test)]
