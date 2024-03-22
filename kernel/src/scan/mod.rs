@@ -190,7 +190,23 @@ impl Scan {
             })
             .collect();
         let read_schema = Arc::new(StructType::new(read_fields));
+        debug!("Executing scan with read schema {read_schema:#?}");
         let output_schema = DataType::Struct(Box::new(self.schema().as_ref().clone()));
+
+        // // start col_mapping hack
+        // let mut p = 0;
+        // let fields = self
+        //     .schema()
+        //     .fields()
+        //     .map(|field| {
+        //         let f =
+        //             StructField::new(format!("f{}", p), field.data_type().clone(), field.nullable);
+        //         p += 1;
+        //         f
+        //     })
+        //     .collect();
+        // // end hack
+        //let output_schema = DataType::Struct(Box::new(StructType::new(fields)));
         let parquet_handler = engine_interface.get_parquet_handler();
 
         let mut results: Vec<ScanResult> = vec![];
@@ -204,7 +220,7 @@ impl Scan {
             };
 
             let read_results =
-                parquet_handler.read_parquet_files(&[meta], self.read_schema.clone(), None)?;
+                parquet_handler.read_parquet_files(&[meta], read_schema.clone(), None)?;
 
             let read_expression = if have_partition_cols {
                 // Loop over all fields and create the correct expressions for them

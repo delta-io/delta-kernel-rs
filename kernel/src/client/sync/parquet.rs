@@ -14,7 +14,7 @@ impl ParquetHandler for SyncParquetHandler {
         schema: SchemaRef,
         _predicate: Option<Expression>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        debug!("Reading parquet files: {:#?}", files);
+        debug!("Reading parquet files: {files:#?} with schema {schema:#?}");
         if files.is_empty() {
             return Ok(Box::new(std::iter::empty()));
         }

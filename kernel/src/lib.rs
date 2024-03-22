@@ -175,13 +175,14 @@ pub trait JsonHandler {
 /// Connectors can leverage this interface to provide their own custom
 /// implementation of Parquet data file functionalities to Delta Kernel.
 pub trait ParquetHandler: Send + Sync {
-    /// Read and parse the JSON format file at given locations and return
-    /// the data as EngineData with the columns requested by physical schema.
+    /// Read and parse the Parquet file at given locations and return the data as EngineData with
+    /// the columns requested by physical schema . The ParquetHandler _must_ return exactly the
+    /// columns specified in `physical_schema`, and they _must_ be in schema order.
     ///
     /// # Parameters
     ///
     /// - `files` - File metadata for files to be read.
-    /// - `physical_schema` - Select list of columns to read from the JSON file.
+    /// - `physical_schema` - Select list and order of columns to read from the Parquet file.
     /// - `predicate` - Optional push-down predicate hint (engine is free to ignore it).
     fn read_parquet_files(
         &self,

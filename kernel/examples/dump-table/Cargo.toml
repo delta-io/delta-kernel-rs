@@ -13,5 +13,6 @@ deltakernel = { path = "../../../kernel", features = [
   "developer-visibility",
 ] }
 env_logger = "0.11.3"
+itertools = "0.12.1"
 url = "2"
 

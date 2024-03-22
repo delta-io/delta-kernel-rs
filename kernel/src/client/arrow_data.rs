@@ -6,7 +6,9 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::{Array, GenericListArray, MapArray, RecordBatch, StructArray};
 use arrow_schema::{ArrowError, DataType as ArrowDataType, Schema as ArrowSchema};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use itertools::Itertools;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::ProjectionMask;
 use tracing::{debug, warn};
 use url::Url;
 
@@ -171,18 +173,51 @@ impl ArrowEngineData {
     }
 
     // TODO needs to apply the schema to the parquet read
-    pub fn try_create_from_parquet(_schema: SchemaRef, location: Url) -> DeltaResult<Self> {
+    pub fn try_create_from_parquet(schema: SchemaRef, location: Url) -> DeltaResult<Self> {
         let file = File::open(
             location
                 .to_file_path()
                 .map_err(|_| Error::generic("can only read local files"))?,
         )?;
+        let metadata = ArrowReaderMetadata::load(&file, Default::default()).unwrap();
+        let parquet_schema = metadata.schema();
+        let requested_schema: ArrowSchema = (&*schema).try_into()?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let indicies: Vec<usize> = requested_schema
+            .fields
+            .iter()
+            .map(|field| {
+                // todo: handle nested
+                parquet_schema.index_of(field.name())
+            })
+            .try_collect()?;
+
+        let mask = if parquet_schema.fields.size() == requested_schema.fields.size() {
+            ProjectionMask::all()
+        } else {
+            ProjectionMask::leaves(builder.parquet_schema(), indicies.clone())
+        };
+
+        let builder = builder.with_projection(mask);
         let mut reader = builder.build()?;
         let data = reader
             .next()
             .ok_or(Error::generic("No data found reading parquet file"))?;
-        Ok(ArrowEngineData::new(data?))
+        if is_sorted(&indicies) {
+            Ok(ArrowEngineData::new(data?))
+        } else {
+            // requested an order different from the parquet, reorder
+            let data = data?;
+            let mut cols = Vec::with_capacity(data.num_columns());
+            for field in requested_schema.fields.iter() {
+                let col = data.column_by_name(field.name()).ok_or(Error::generic(
+                    "request_schema had a field that didn't exist in final result. This is a bug",
+                ))?;
+                cols.push(col.clone());
+            }
+            let reordered = RecordBatch::try_new(requested_schema.into(), cols)?;
+            Ok(ArrowEngineData::new(reordered))
+        }
     }
 
     /// Extracts an exploded view (all leaf values), in schema order of that data contained
@@ -313,6 +348,10 @@ fn get_error_for_types(
             "On {field_name}: Unsupported data type {data_type}: {e}",
         )),
     }
+}
+
+fn is_sorted(indicies: &[usize]) -> bool {
+    indicies.windows(2).all(|is| is[0] <= is[1])
 }
 
 #[cfg(test)]
