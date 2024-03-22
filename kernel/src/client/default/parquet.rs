@@ -134,21 +134,20 @@ impl FileOpener for ParquetOpener {
             let options = ArrowReaderOptions::new(); //.with_page_index(enable_page_index);
             let mut builder =
                 ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await?;
-            let mask = generate_mask(
+            if let Some(mask) = generate_mask(
                 &table_schema,
                 &parquet_schema,
                 builder.parquet_schema(),
                 &indicies,
-            );
+            ) {
+                builder = builder.with_projection(mask)
+            }
 
             if let Some(limit) = limit {
                 builder = builder.with_limit(limit)
             }
 
-            let stream = builder
-                .with_projection(mask)
-                .with_batch_size(batch_size)
-                .build()?;
+            let stream = builder.with_batch_size(batch_size).build()?;
 
             let stream = stream.map(move |rbr| {
                 // re-order each batch if needed
