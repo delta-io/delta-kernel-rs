@@ -153,7 +153,9 @@ impl PrimitiveType {
 
         match self {
             String => Ok(Scalar::String(raw.to_string())),
+            Binary => Ok(Scalar::Binary(raw.to_string().into_bytes())),
             Byte => self.parse_str_as_scalar(raw, Scalar::Byte),
+            Decimal(precision, scale) => self.parse_decimal(raw, *precision, *scale),
             Short => self.parse_str_as_scalar(raw, Scalar::Short),
             Integer => self.parse_str_as_scalar(raw, Scalar::Integer),
             Long => self.parse_str_as_scalar(raw, Scalar::Long),
@@ -187,7 +189,6 @@ impl PrimitiveType {
                     .ok_or(self.parse_error(raw))?;
                 Ok(Scalar::Timestamp(micros))
             }
-            _ => todo!(),
         }
     }
 
@@ -209,6 +210,50 @@ impl PrimitiveType {
             Err(..) => Err(self.parse_error(raw)),
         }
     }
+
+    fn parse_decimal(&self, raw: &str, precision: u8, expected_scale: i8) -> Result<Scalar, Error> {
+        let (base, exp): (&str, i128) = match raw.find(['e', 'E']) {
+            None => (raw, 0), // no 'e' or 'E', so there's no exponent
+            Some(pos) => {
+                let (base, exp) = raw.split_at(pos);
+                // exp now has '[e/E][exponent]', strip the 'e/E' and parse it
+                (base, exp[1..].parse()?)
+            }
+        };
+        if base.is_empty() {
+            return Err(self.parse_error(raw));
+        }
+
+        // now split on any '.' and parse
+        let (int_part, frac_part, frac_digits) = match base.find('.') {
+            None => {
+                // no, '.', just base base as int_part
+                (base, None, 0)
+            }
+            Some(pos) if pos == base.len() - 1 => {
+                // '.' is at the end, just strip it
+                (&base[..pos], None, 0)
+            }
+            Some(pos) => {
+                let (int_part, frac_part) = (&base[..pos], &base[pos + 1..]);
+                (int_part, Some(frac_part), frac_part.len() as i128)
+            }
+        };
+
+        // we can assume this won't underflow since `frac_digits` is at minimum 0, and exp is at
+        // most i128::MAX, and 0-i128::MAX doesn't underflow
+        let scale = frac_digits - exp;
+        let scale: i8 = scale.try_into().map_err(|_| self.parse_error(raw))?;
+        if scale != expected_scale {
+            return Err(self.parse_error(raw));
+        }
+
+        let int: i128 = match frac_part {
+            None => int_part.parse()?,
+            Some(frac_part) => format!("{}{}", int_part, frac_part).parse()?,
+        };
+        Ok(Scalar::Decimal(int, precision, scale))
+    }
 }
 
 #[cfg(test)]
@@ -228,5 +273,76 @@ mod tests {
 
         let s = Scalar::Decimal(123, 9, -3);
         assert_eq!(s.to_string(), "123000");
+    }
+
+    fn assert_decimal(
+        raw: &str,
+        expect_int: i128,
+        expect_prec: u8,
+        expect_scale: i8,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let s = PrimitiveType::Decimal(expect_prec, expect_scale);
+        match s.parse_scalar(raw)? {
+            Scalar::Decimal(int, prec, scale) => {
+                assert_eq!(int, expect_int);
+                assert_eq!(prec, expect_prec);
+                assert_eq!(scale, expect_scale);
+            }
+            _ => panic!("Didn't parse as decimal"),
+        };
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_decimal() -> Result<(), Box<dyn std::error::Error>> {
+        assert_decimal("0", 0, 0, 0)?;
+        assert_decimal("0.00", 0, 3, 2)?;
+        assert_decimal("123", 123, 3, 0)?;
+        assert_decimal("-123", -123, 3, 0)?;
+        assert_decimal("-123.", -123, 3, 0)?;
+        assert_decimal("1.23E3", 123, 3, -1)?;
+        assert_decimal("123000", 123000, 6, 0)?;
+        assert_decimal("12.3E+7", 123, 9, -6)?;
+        assert_decimal("12.0", 120, 3, 1)?;
+        assert_decimal("12.3", 123, 3, 1)?;
+        assert_decimal("0.00123", 123, 5, 5)?;
+        assert_decimal("-1.23E-12", -123, 3, 14)?;
+        assert_decimal("1234.5E-4", 12345, 5, 5)?;
+        assert_decimal("0E+7", 0, 0, -7)?;
+        assert_decimal("-0", 0, 0, 0)?;
+        assert_decimal("12.000000000000000000", 12000000000000000000, 38, 18)?;
+        Ok(())
+    }
+
+    fn expect_fail_parse(raw: &str, prec: u8, scale: i8) {
+        let s = PrimitiveType::Decimal(prec, scale);
+        let res = s.parse_scalar(raw);
+        assert!(res.is_err(), "Fail on {raw}");
+    }
+
+    #[test]
+    fn test_parse_decimal_expect_fail() {
+        expect_fail_parse("iowjef", 0, 0);
+        expect_fail_parse("123Ef", 0, 0);
+        expect_fail_parse("1d2E3", 0, 0);
+        expect_fail_parse("a", 0, 0);
+        expect_fail_parse("2.a", 1, 1);
+        expect_fail_parse("E45", 0, 0);
+        expect_fail_parse("1.2.3", 0, 0);
+        expect_fail_parse("1.2E1.3", 0, 0);
+        expect_fail_parse("123.45", 5, 1);
+        expect_fail_parse(".45", 5, 1);
+        expect_fail_parse("+", 0, 0);
+        expect_fail_parse("-", 0, 0);
+        expect_fail_parse("0.-0", 2, 1);
+        expect_fail_parse("--1.0", 1, 1);
+        expect_fail_parse("+-1.0", 1, 1);
+        expect_fail_parse("-+1.0", 1, 1);
+        expect_fail_parse("++1.0", 1, 1);
+        expect_fail_parse("1.0E1+", 1, 1);
+        // overflow i8 for `scale`
+        expect_fail_parse("0.999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999", 0, 0);
+        // scale will be too small to fit in i8
+        expect_fail_parse("0.E170141183460469231731687303715884105727", 0, 0);
     }
 }

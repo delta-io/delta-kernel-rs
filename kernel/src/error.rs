@@ -1,3 +1,5 @@
+use std::{num::ParseIntError, string::FromUtf8Error};
+
 use crate::schema::DataType;
 
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
@@ -35,6 +37,10 @@ pub enum Error {
     #[cfg(feature = "object_store")]
     #[error("Error interacting with object store: {0}")]
     ObjectStore(object_store::Error),
+
+    #[cfg(feature = "object_store")]
+    #[error("Object store path error: {0}")]
+    ObjectStorePath(#[from] object_store::path::Error),
 
     #[error("File not found: {0}")]
     FileNotFound(String),
@@ -74,6 +80,12 @@ pub enum Error {
 
     #[error("Join failure: {0}")]
     JoinFailure(String),
+
+    #[error("Could not convert to string from utf-8: {0}")]
+    Utf8Error(#[from] FromUtf8Error),
+
+    #[error("Could not parse int: {0}")]
+    ParseIntError(#[from] ParseIntError),
 }
 
 // Convenience constructors for Error types that take a String argument

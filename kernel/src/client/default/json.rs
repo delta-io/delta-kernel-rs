@@ -192,7 +192,7 @@ impl FileOpener for JsonOpener {
         let batch_size = self.batch_size;
 
         Ok(Box::pin(async move {
-            let path = Path::from(file_meta.location.path());
+            let path = Path::from_url_path(file_meta.location.path())?;
             match store.get(&path).await?.payload {
                 GetResultPayload::File(file, _) => {
                     let reader = ReaderBuilder::new(schema)
