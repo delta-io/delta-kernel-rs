@@ -8,9 +8,13 @@ enum class KernelError {
   UnknownError,
   FFIError,
   ArrowError,
+  EngineDataTypeError,
+  ExtractError,
   GenericError,
+  IOErrorError,
   ParquetError,
   ObjectStoreError,
+  ObjectStorePathError,
   FileNotFoundError,
   MissingColumnError,
   UnexpectedColumnTypeError,
@@ -20,9 +24,15 @@ enum class KernelError {
   InvalidUrlError,
   MalformedJsonError,
   MissingMetadataError,
+  MissingProtocolError,
+  MissingMetadataAndProtocolError,
+  ParseError,
+  JoinFailureError,
+  Utf8Error,
+  ParseIntError,
 };
 
-struct ExternTableClientHandle;
+struct ExternEngineInterfaceHandle;
 
 struct KernelExpressionVisitorState;
 
@@ -122,13 +132,13 @@ void iterate(EngineIterator *it);
 /// # Safety
 ///
 /// Caller is responsible to pass a valid path pointer.
-ExternResult<const ExternTableClientHandle*> get_default_client(KernelStringSlice path,
-                                                                AllocateErrorFn allocate_error);
+ExternResult<const ExternEngineInterfaceHandle*> get_default_client(KernelStringSlice path,
+                                                                    AllocateErrorFn allocate_error);
 
 /// # Safety
 ///
 /// Caller is responsible to pass a valid handle.
-void drop_table_client(const ExternTableClientHandle *table_client);
+void drop_table_client(const ExternEngineInterfaceHandle *table_client);
 
 /// Get the latest snapshot from the specified table
 ///
@@ -136,7 +146,7 @@ void drop_table_client(const ExternTableClientHandle *table_client);
 ///
 /// Caller is responsible to pass valid handles and path pointer.
 ExternResult<const SnapshotHandle*> snapshot(KernelStringSlice path,
-                                             const ExternTableClientHandle *table_client);
+                                             const ExternEngineInterfaceHandle *table_client);
 
 /// # Safety
 ///
@@ -186,7 +196,7 @@ uintptr_t visit_expression_literal_long(KernelExpressionVisitorState *state, int
 ///
 /// Caller is responsible to pass a valid snapshot pointer.
 ExternResult<KernelScanFileIterator*> kernel_scan_files_init(const SnapshotHandle *snapshot,
-                                                             const ExternTableClientHandle *table_client,
+                                                             const ExternEngineInterfaceHandle *table_client,
                                                              EnginePredicate *predicate);
 
 /// # Safety

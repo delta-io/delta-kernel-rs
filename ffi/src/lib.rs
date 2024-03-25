@@ -3,18 +3,17 @@
 /// Exposes that an engine needs to call from C/C++ to interface with kernel
 use std::collections::HashMap;
 use std::default::Default;
-use std::fmt::{Display, Formatter};
 use std::os::raw::{c_char, c_void};
 use std::path::PathBuf;
 use std::sync::Arc;
 use url::Url;
 
+use deltakernel::actions::Add;
 use deltakernel::expressions::{BinaryOperator, Expression, Scalar};
 use deltakernel::scan::ScanBuilder;
 use deltakernel::schema::{DataType, PrimitiveType, StructField, StructType};
 use deltakernel::snapshot::Snapshot;
-use deltakernel::Add;
-use deltakernel::{DeltaResult, Error, TableClient};
+use deltakernel::{DeltaResult, EngineInterface, Error};
 
 mod handle;
 use handle::{ArcHandle, BoxHandle, SizedArcHandle, Unconstructable};
@@ -113,13 +112,18 @@ impl TryFromStringSlice for String {
 }
 
 #[repr(C)]
+#[derive(Debug)]
 pub enum KernelError {
     UnknownError, // catch-all for unrecognized kernel Error types
     FFIError,     // errors encountered in the code layer that supports FFI
     ArrowError,
+    EngineDataTypeError,
+    ExtractError,
     GenericError,
+    IOErrorError,
     ParquetError,
     ObjectStoreError,
+    ObjectStorePathError,
     FileNotFoundError,
     MissingColumnError,
     UnexpectedColumnTypeError,
@@ -129,28 +133,12 @@ pub enum KernelError {
     InvalidUrlError,
     MalformedJsonError,
     MissingMetadataError,
-}
-
-impl Display for KernelError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            KernelError::UnknownError => write!(f, "UnknownError"),
-            KernelError::FFIError => write!(f, "FFIError"),
-            KernelError::ArrowError => write!(f, "ArrowError"),
-            KernelError::GenericError => write!(f, "GenericError"),
-            KernelError::ParquetError => write!(f, "ParquetError"),
-            KernelError::ObjectStoreError => write!(f, "ObjectStoreError"),
-            KernelError::FileNotFoundError => write!(f, "FileNotFoundError"),
-            KernelError::MissingColumnError => write!(f, "MissingColumnError"),
-            KernelError::UnexpectedColumnTypeError => write!(f, "UnexpectedColumnTypeError"),
-            KernelError::MissingDataError => write!(f, "MissingDataError"),
-            KernelError::MissingVersionError => write!(f, "MissingVersionError"),
-            KernelError::DeletionVectorError => write!(f, "DeletionVectorError"),
-            KernelError::InvalidUrlError => write!(f, "InvalidUrlError"),
-            KernelError::MalformedJsonError => write!(f, "MalformedJsonError"),
-            KernelError::MissingMetadataError => write!(f, "MissingMetadataError"),
-        }
-    }
+    MissingProtocolError,
+    MissingMetadataAndProtocolError,
+    ParseError,
+    JoinFailureError,
+    Utf8Error,
+    ParseIntError,
 }
 
 impl From<Error> for KernelError {
@@ -158,10 +146,14 @@ impl From<Error> for KernelError {
         match e {
             // NOTE: By definition, no kernel Error maps to FFIError
             Error::Arrow(_) => KernelError::ArrowError,
+            Error::EngineDataType(_) => KernelError::EngineDataTypeError,
+            Error::Extract(..) => KernelError::ExtractError,
             Error::Generic(_) => KernelError::GenericError,
             Error::GenericError { .. } => KernelError::GenericError,
+            Error::IOError(_) => KernelError::IOErrorError,
             Error::Parquet(_) => KernelError::ParquetError,
             Error::ObjectStore(_) => KernelError::ObjectStoreError,
+            Error::ObjectStorePath(_) => KernelError::ObjectStorePathError,
             Error::FileNotFound(_) => KernelError::FileNotFoundError,
             Error::MissingColumn(_) => KernelError::MissingColumnError,
             Error::UnexpectedColumnType(_) => KernelError::UnexpectedColumnTypeError,
@@ -171,6 +163,12 @@ impl From<Error> for KernelError {
             Error::InvalidUrl(_) => KernelError::InvalidUrlError,
             Error::MalformedJson(_) => KernelError::MalformedJsonError,
             Error::MissingMetadata => KernelError::MissingMetadataError,
+            Error::MissingProtocol => KernelError::MissingProtocolError,
+            Error::MissingMetadataAndProtocol => KernelError::MissingMetadataAndProtocolError,
+            Error::ParseError(..) => KernelError::ParseError,
+            Error::JoinFailure(_) => KernelError::JoinFailureError,
+            Error::Utf8Error(_) => KernelError::Utf8Error,
+            Error::ParseIntError(_) => KernelError::ParseIntError,
         }
     }
 }
@@ -244,7 +242,7 @@ impl AllocateError for AllocateErrorFn {
         self(etype, msg)
     }
 }
-impl AllocateError for *const ExternTableClientHandle {
+impl AllocateError for *const ExternEngineInterfaceHandle {
     /// # Safety
     ///
     /// In addition to the usual requirements, the table client handle must be valid.
@@ -281,23 +279,23 @@ impl<T> IntoExternResult<T> for DeltaResult<T> {
     }
 }
 
-// A wrapper for TableClient which defines additional FFI-specific methods.
-pub trait ExternTableClient {
-    fn table_client(&self) -> Arc<dyn TableClient>;
+// A wrapper for EngineInterface which defines additional FFI-specific methods.
+pub trait ExternEngineInterface {
+    fn table_client(&self) -> Arc<dyn EngineInterface>;
     fn error_allocator(&self) -> &dyn AllocateError;
 }
 
-pub struct ExternTableClientHandle {
+pub struct ExternEngineInterfaceHandle {
     _unconstructable: Unconstructable,
 }
 
-impl ArcHandle for ExternTableClientHandle {
-    type Target = dyn ExternTableClient;
+impl ArcHandle for ExternEngineInterfaceHandle {
+    type Target = dyn ExternEngineInterface;
 }
 
-struct ExternTableClientVtable {
+struct ExternEngineInterfaceVtable {
     // Actual table client instance to use
-    client: Arc<dyn TableClient>,
+    client: Arc<dyn EngineInterface>,
     allocate_error: AllocateErrorFn,
 }
 
@@ -305,16 +303,16 @@ struct ExternTableClientVtable {
 ///
 /// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
 /// responsible to handle any races that could result.
-unsafe impl Send for ExternTableClientVtable {}
+unsafe impl Send for ExternEngineInterfaceVtable {}
 
 /// # Safety
 ///
 /// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
 /// responsible to handle any races that could result.
-unsafe impl Sync for ExternTableClientVtable {}
+unsafe impl Sync for ExternEngineInterfaceVtable {}
 
-impl ExternTableClient for ExternTableClientVtable {
-    fn table_client(&self) -> Arc<dyn TableClient> {
+impl ExternEngineInterface for ExternEngineInterfaceVtable {
+    fn table_client(&self) -> Arc<dyn EngineInterface> {
         self.client.clone()
     }
     fn error_allocator(&self) -> &dyn AllocateError {
@@ -338,23 +336,24 @@ unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<U
 pub unsafe extern "C" fn get_default_client(
     path: KernelStringSlice,
     allocate_error: AllocateErrorFn,
-) -> ExternResult<*const ExternTableClientHandle> {
+) -> ExternResult<*const ExternEngineInterfaceHandle> {
     get_default_client_impl(path, allocate_error).into_extern_result(allocate_error)
 }
 
 unsafe fn get_default_client_impl(
     path: KernelStringSlice,
     allocate_error: AllocateErrorFn,
-) -> DeltaResult<*const ExternTableClientHandle> {
+) -> DeltaResult<*const ExternEngineInterfaceHandle> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) }?;
-    use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
-    let table_client = deltakernel::DefaultTableClient::<TokioBackgroundExecutor>::try_new(
+    use deltakernel::client::default::executor::tokio::TokioBackgroundExecutor;
+    use deltakernel::client::default::DefaultEngineInterface;
+    let table_client = DefaultEngineInterface::<TokioBackgroundExecutor>::try_new(
         &url,
         HashMap::<String, String>::new(),
         Arc::new(TokioBackgroundExecutor::new()),
     );
     let client = Arc::new(table_client.map_err(Error::generic)?);
-    let client: Arc<dyn ExternTableClient> = Arc::new(ExternTableClientVtable {
+    let client: Arc<dyn ExternEngineInterface> = Arc::new(ExternEngineInterfaceVtable {
         client,
         allocate_error,
     });
@@ -365,7 +364,7 @@ unsafe fn get_default_client_impl(
 ///
 /// Caller is responsible to pass a valid handle.
 #[no_mangle]
-pub unsafe extern "C" fn drop_table_client(table_client: *const ExternTableClientHandle) {
+pub unsafe extern "C" fn drop_table_client(table_client: *const ExternEngineInterfaceHandle) {
     ArcHandle::drop_handle(table_client);
 }
 
@@ -385,14 +384,14 @@ impl SizedArcHandle for SnapshotHandle {
 #[no_mangle]
 pub unsafe extern "C" fn snapshot(
     path: KernelStringSlice,
-    table_client: *const ExternTableClientHandle,
+    table_client: *const ExternEngineInterfaceHandle,
 ) -> ExternResult<*const SnapshotHandle> {
     snapshot_impl(path, table_client).into_extern_result(table_client)
 }
 
 unsafe fn snapshot_impl(
     path: KernelStringSlice,
-    extern_table_client: *const ExternTableClientHandle,
+    extern_table_client: *const ExternEngineInterfaceHandle,
 ) -> DeltaResult<*const SnapshotHandle> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) }?;
     let extern_table_client = unsafe { ArcHandle::clone_as_arc(extern_table_client) };
@@ -454,7 +453,7 @@ pub unsafe extern "C" fn visit_schema(
     // Visit all the fields of a struct and return the list of children
     fn visit_struct_fields(visitor: &EngineSchemaVisitor, s: &StructType) -> usize {
         let child_list_id = (visitor.make_field_list)(visitor.data, s.fields.len());
-        for field in s.fields.iter() {
+        for field in s.fields() {
             visit_field(visitor, child_list_id, field);
         }
         child_list_id
@@ -702,7 +701,7 @@ pub struct KernelScanFileIterator {
     files: Box<dyn Iterator<Item = DeltaResult<Add>>>,
 
     // Also keep a reference to the external client for its error allocator.
-    table_client: Arc<dyn ExternTableClient>,
+    table_client: Arc<dyn ExternEngineInterface>,
 }
 
 impl BoxHandle for KernelScanFileIterator {}
@@ -720,7 +719,7 @@ impl Drop for KernelScanFileIterator {
 #[no_mangle]
 pub unsafe extern "C" fn kernel_scan_files_init(
     snapshot: *const SnapshotHandle,
-    table_client: *const ExternTableClientHandle,
+    table_client: *const ExternEngineInterfaceHandle,
     predicate: Option<&mut EnginePredicate>,
 ) -> ExternResult<*mut KernelScanFileIterator> {
     kernel_scan_files_init_impl(snapshot, table_client, predicate).into_extern_result(table_client)
@@ -728,7 +727,7 @@ pub unsafe extern "C" fn kernel_scan_files_init(
 
 fn kernel_scan_files_init_impl(
     snapshot: *const SnapshotHandle,
-    extern_table_client: *const ExternTableClientHandle,
+    extern_table_client: *const ExternEngineInterfaceHandle,
     predicate: Option<&mut EnginePredicate>,
 ) -> DeltaResult<*mut KernelScanFileIterator> {
     let snapshot = unsafe { ArcHandle::clone_as_arc(snapshot) };

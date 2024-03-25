@@ -7,9 +7,13 @@ typedef enum KernelError {
   UnknownError,
   FFIError,
   ArrowError,
+  EngineDataTypeError,
+  ExtractError,
   GenericError,
+  IOErrorError,
   ParquetError,
   ObjectStoreError,
+  ObjectStorePathError,
   FileNotFoundError,
   MissingColumnError,
   UnexpectedColumnTypeError,
@@ -19,9 +23,15 @@ typedef enum KernelError {
   InvalidUrlError,
   MalformedJsonError,
   MissingMetadataError,
+  MissingProtocolError,
+  MissingMetadataAndProtocolError,
+  ParseError,
+  JoinFailureError,
+  Utf8Error,
+  ParseIntError,
 } KernelError;
 
-typedef struct ExternTableClientHandle ExternTableClientHandle;
+typedef struct ExternEngineInterfaceHandle ExternEngineInterfaceHandle;
 
 typedef struct KernelExpressionVisitorState KernelExpressionVisitorState;
 
@@ -55,22 +65,22 @@ typedef struct EngineError {
   enum KernelError etype;
 } EngineError;
 
-typedef enum ExternResult______ExternTableClientHandle_Tag {
-  Ok______ExternTableClientHandle,
-  Err______ExternTableClientHandle,
-} ExternResult______ExternTableClientHandle_Tag;
+typedef enum ExternResult______ExternEngineInterfaceHandle_Tag {
+  Ok______ExternEngineInterfaceHandle,
+  Err______ExternEngineInterfaceHandle,
+} ExternResult______ExternEngineInterfaceHandle_Tag;
 
-typedef struct ExternResult______ExternTableClientHandle {
-  ExternResult______ExternTableClientHandle_Tag tag;
+typedef struct ExternResult______ExternEngineInterfaceHandle {
+  ExternResult______ExternEngineInterfaceHandle_Tag tag;
   union {
     struct {
-      const struct ExternTableClientHandle *ok;
+      const struct ExternEngineInterfaceHandle *ok;
     };
     struct {
       struct EngineError *err;
     };
   };
-} ExternResult______ExternTableClientHandle;
+} ExternResult______ExternEngineInterfaceHandle;
 
 /**
  * A non-owned slice of a UTF8 string, intended for arg-passing between kernel and engine. The
@@ -194,15 +204,15 @@ void iterate(struct EngineIterator *it);
  *
  * Caller is responsible to pass a valid path pointer.
  */
-struct ExternResult______ExternTableClientHandle get_default_client(struct KernelStringSlice path,
-                                                                    AllocateErrorFn allocate_error);
+struct ExternResult______ExternEngineInterfaceHandle get_default_client(struct KernelStringSlice path,
+                                                                        AllocateErrorFn allocate_error);
 
 /**
  * # Safety
  *
  * Caller is responsible to pass a valid handle.
  */
-void drop_table_client(const struct ExternTableClientHandle *table_client);
+void drop_table_client(const struct ExternEngineInterfaceHandle *table_client);
 
 /**
  * Get the latest snapshot from the specified table
@@ -212,7 +222,7 @@ void drop_table_client(const struct ExternTableClientHandle *table_client);
  * Caller is responsible to pass valid handles and path pointer.
  */
 struct ExternResult______SnapshotHandle snapshot(struct KernelStringSlice path,
-                                                 const struct ExternTableClientHandle *table_client);
+                                                 const struct ExternEngineInterfaceHandle *table_client);
 
 /**
  * # Safety
@@ -275,7 +285,7 @@ uintptr_t visit_expression_literal_long(struct KernelExpressionVisitorState *sta
  * Caller is responsible to pass a valid snapshot pointer.
  */
 struct ExternResult_____KernelScanFileIterator kernel_scan_files_init(const struct SnapshotHandle *snapshot,
-                                                                      const struct ExternTableClientHandle *table_client,
+                                                                      const struct ExternEngineInterfaceHandle *table_client,
                                                                       struct EnginePredicate *predicate);
 
 /**
