@@ -51,6 +51,15 @@ impl ScanBuilder {
         self
     }
 
+    /// Optionally provide a [`Schema`] for columns to select from the [`Snapshot`]. See
+    /// [`with_schema`] for details. If schema_opt is `None` this is a no-op.
+    pub fn with_schema_opt(self, schema_opt: Option<SchemaRef>) -> Self {
+        match schema_opt {
+            Some(schema) => self.with_schema(schema),
+            None => self,
+        }
+    }
+
     /// Predicates specified in this crate's [`Expression`] type.
     ///
     /// Can be used to filter the rows in a scan. For example, using the predicate

@@ -10,7 +10,7 @@ use itertools::Itertools;
 use parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 
 /// Get the indicies in `parquet_schema` of the specified columns in `requested_schema`
-pub(crate) fn get_requested_indicies(
+pub(crate) fn get_requested_indices(
     requested_schema: &ArrowSchema,
     parquet_schema: &ArrowSchemaRef,
 ) -> DeltaResult<Vec<usize>> {

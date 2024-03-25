@@ -10,7 +10,7 @@ use deltakernel::client::default::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::client::default::DefaultEngineInterface;
 use deltakernel::expressions::{BinaryOperator, Expression};
 use deltakernel::scan::ScanBuilder;
-use deltakernel::schema::{Schema, StructField};
+use deltakernel::schema::Schema;
 use deltakernel::{EngineData, Table};
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use parquet::arrow::arrow_writer::ArrowWriter;
@@ -410,18 +410,18 @@ fn read_table_data(
 
     let table = Table::new(url);
     let snapshot = table.snapshot(&table_client, None)?;
-    let mut scan_builder = ScanBuilder::new(snapshot.clone());
 
-    if let Some(select_cols) = select_cols {
+    let read_schema = select_cols.map(|select_cols| {
         let table_schema = snapshot.schema();
-        let selected_fields: Vec<StructField> = select_cols
+        let selected_fields = select_cols
             .iter()
             .map(|col| table_schema.field(col).cloned().unwrap())
             .collect();
-        let read_schema = Arc::new(Schema::new(selected_fields));
-        scan_builder = scan_builder.with_schema(read_schema);
-    }
-    let scan = scan_builder.build();
+        Arc::new(Schema::new(selected_fields))
+    });
+    let scan = ScanBuilder::new(snapshot.clone())
+        .with_schema_opt(read_schema)
+        .build();
 
     let scan_results = scan.execute(&table_client)?;
     let batches: Vec<RecordBatch> = scan_results

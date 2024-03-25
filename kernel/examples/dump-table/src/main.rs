@@ -9,7 +9,7 @@ use deltakernel::client::default::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::client::default::DefaultEngineInterface;
 use deltakernel::client::sync::SyncEngineInterface;
 use deltakernel::scan::ScanBuilder;
-use deltakernel::schema::{Schema, StructField};
+use deltakernel::schema::Schema;
 use deltakernel::{DeltaResult, EngineInterface, Table};
 
 use clap::{Parser, ValueEnum};
@@ -58,11 +58,12 @@ fn main() -> DeltaResult<()> {
     let table = Table::new(url);
     let snapshot = table.snapshot(engine_interface.as_ref(), None)?;
 
-    let scan = match cli.columns {
-        Some(cols) => {
+    let read_schema_opt = cli
+        .columns
+        .map(|cols| {
             use itertools::Itertools;
             let table_schema = snapshot.schema();
-            let selected_fields: Vec<StructField> = cols
+            let selected_fields = cols
                 .iter()
                 .map(|col| {
                     table_schema
@@ -72,13 +73,13 @@ fn main() -> DeltaResult<()> {
                             "Table has no such column: {col}"
                         )))
                 })
-                .try_collect()?;
-            let read_schema = Arc::new(Schema::new(selected_fields));
-            let builder = ScanBuilder::new(snapshot).with_schema(read_schema);
-            builder.build()
-        }
-        None => ScanBuilder::new(snapshot).build(),
-    };
+                .try_collect();
+            selected_fields.map(|selected_fields| Arc::new(Schema::new(selected_fields)))
+        })
+        .transpose()?;
+    let scan = ScanBuilder::new(snapshot)
+        .with_schema_opt(read_schema_opt)
+        .build();
 
     let mut batches = vec![];
     for res in scan.execute(engine_interface.as_ref())?.into_iter() {

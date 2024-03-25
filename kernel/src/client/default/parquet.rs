@@ -12,7 +12,7 @@ use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream
 
 use super::file_handler::{FileOpenFuture, FileOpener};
 use crate::client::arrow_data::ArrowEngineData;
-use crate::client::arrow_utils::{generate_mask, get_requested_indicies, reorder_record_batch};
+use crate::client::arrow_utils::{generate_mask, get_requested_indices, reorder_record_batch};
 use crate::client::default::executor::TaskExecutor;
 use crate::client::default::file_handler::FileStream;
 use crate::schema::SchemaRef;
@@ -130,7 +130,7 @@ impl FileOpener for ParquetOpener {
             let mut reader = ParquetObjectReader::new(store, meta);
             let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
             let parquet_schema = metadata.schema();
-            let indicies = get_requested_indicies(&table_schema, parquet_schema)?;
+            let indicies = get_requested_indices(&table_schema, parquet_schema)?;
             let options = ArrowReaderOptions::new(); //.with_page_index(enable_page_index);
             let mut builder =
                 ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await?;

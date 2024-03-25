@@ -1,4 +1,4 @@
-use super::arrow_utils::{generate_mask, get_requested_indicies, reorder_record_batch};
+use super::arrow_utils::{generate_mask, get_requested_indices, reorder_record_batch};
 use crate::engine_data::{EngineData, EngineList, EngineMap, GetData};
 use crate::schema::{DataType, PrimitiveType, Schema, SchemaRef, StructField};
 use crate::{DataVisitor, DeltaResult, Error};
@@ -181,7 +181,7 @@ impl ArrowEngineData {
         let parquet_schema = metadata.schema();
         let requested_schema: ArrowSchema = (&*schema).try_into()?;
         let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-        let indicies = get_requested_indicies(&requested_schema, parquet_schema)?;
+        let indicies = get_requested_indices(&requested_schema, parquet_schema)?;
         if let Some(mask) = generate_mask(
             &requested_schema,
             parquet_schema,
