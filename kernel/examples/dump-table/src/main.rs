@@ -62,14 +62,17 @@ fn main() -> DeltaResult<()> {
         Some(cols) => {
             use itertools::Itertools;
             let table_schema = snapshot.schema();
-            let selected_fields: Vec<StructField> =
-                cols.iter()
-                    .map(|col| {
-                        table_schema.field(col).cloned().ok_or(
-                            deltakernel::Error::Generic(format!("Table has no such column: {col}")),
-                        )
-                    })
-                    .try_collect()?;
+            let selected_fields: Vec<StructField> = cols
+                .iter()
+                .map(|col| {
+                    table_schema
+                        .field(col)
+                        .cloned()
+                        .ok_or(deltakernel::Error::Generic(format!(
+                            "Table has no such column: {col}"
+                        )))
+                })
+                .try_collect()?;
             let read_schema = Arc::new(Schema::new(selected_fields));
             let builder = ScanBuilder::new(snapshot).with_schema(read_schema);
             builder.build()
