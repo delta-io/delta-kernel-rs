@@ -2,8 +2,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use acceptance::read_dat_case;
-use deltakernel::client::DefaultTableClient;
-use deltakernel::executor::tokio::TokioBackgroundExecutor;
+use deltakernel::client::default::executor::tokio::TokioBackgroundExecutor;
+use deltakernel::client::default::DefaultEngineInterface;
 
 fn reader_test(path: &Path) -> datatest_stable::Result<()> {
     let root_dir = format!(
@@ -18,8 +18,8 @@ fn reader_test(path: &Path) -> datatest_stable::Result<()> {
         .block_on(async {
             let case = read_dat_case(root_dir).unwrap();
             let table_root = case.table_root().unwrap();
-            let table_client = Arc::new(
-                DefaultTableClient::try_new(
+            let engine_interface = Arc::new(
+                DefaultEngineInterface::try_new(
                     &table_root,
                     std::iter::empty::<(&str, &str)>(),
                     Arc::new(TokioBackgroundExecutor::new()),
@@ -27,7 +27,9 @@ fn reader_test(path: &Path) -> datatest_stable::Result<()> {
                 .unwrap(),
             );
 
-            case.assert_metadata(table_client.clone()).await.unwrap();
+            case.assert_metadata(engine_interface.clone())
+                .await
+                .unwrap();
         });
     Ok(())
 }

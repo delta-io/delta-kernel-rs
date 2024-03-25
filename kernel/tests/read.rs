@@ -1,13 +1,16 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int32Array, StringArray};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
-use deltakernel::client::DefaultTableClient;
-use deltakernel::executor::tokio::TokioBackgroundExecutor;
+use arrow_select::concat::concat_batches;
+use deltakernel::client::arrow_data::ArrowEngineData;
+use deltakernel::client::default::executor::tokio::TokioBackgroundExecutor;
+use deltakernel::client::default::DefaultEngineInterface;
 use deltakernel::expressions::{BinaryOperator, Expression};
 use deltakernel::scan::ScanBuilder;
-use deltakernel::Table;
+use deltakernel::{EngineData, Table};
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -66,6 +69,12 @@ async fn add_commit(
     Ok(())
 }
 
+fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
+    ArrowEngineData::try_from_engine_data(engine_data)
+        .unwrap()
+        .into()
+}
+
 #[tokio::test]
 async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
@@ -88,7 +97,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let table_client = DefaultTableClient::new(
+    let engine_interface = DefaultEngineInterface::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
@@ -97,15 +106,19 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let table = Table::new(location);
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.snapshot(&table_client, None)?;
+    let snapshot = table.snapshot(&engine_interface, None)?;
     let scan = ScanBuilder::new(snapshot).build();
 
     let mut files = 0;
-    let stream = scan.execute(&table_client)?.into_iter().zip(expected_data);
+    let stream = scan
+        .execute(&engine_interface)?
+        .into_iter()
+        .zip(expected_data);
 
     for (data, expected) in stream {
+        let raw_data = data.raw_data?;
         files += 1;
-        assert_eq!(data, expected);
+        assert_eq!(into_record_batch(raw_data), expected);
     }
     assert_eq!(2, files, "Expected to have scanned two files");
     Ok(())
@@ -138,7 +151,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let table_client = DefaultTableClient::new(
+    let engine_interface = DefaultEngineInterface::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
@@ -147,15 +160,19 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let table = Table::new(location);
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.snapshot(&table_client, None).unwrap();
+    let snapshot = table.snapshot(&engine_interface, None).unwrap();
     let scan = ScanBuilder::new(snapshot).build();
 
     let mut files = 0;
-    let stream = scan.execute(&table_client)?.into_iter().zip(expected_data);
+    let stream = scan
+        .execute(&engine_interface)?
+        .into_iter()
+        .zip(expected_data);
 
     for (data, expected) in stream {
+        let raw_data = data.raw_data?;
         files += 1;
-        assert_eq!(data, expected);
+        assert_eq!(into_record_batch(raw_data), expected);
     }
     assert_eq!(2, files, "Expected to have scanned two files");
 
@@ -192,7 +209,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let table_client = DefaultTableClient::new(
+    let engine_interface = DefaultEngineInterface::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
@@ -201,15 +218,19 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let table = Table::new(location);
     let expected_data = vec![batch];
 
-    let snapshot = table.snapshot(&table_client, None)?;
+    let snapshot = table.snapshot(&engine_interface, None)?;
     let scan = ScanBuilder::new(snapshot).build();
 
-    let stream = scan.execute(&table_client)?.into_iter().zip(expected_data);
+    let stream = scan
+        .execute(&engine_interface)?
+        .into_iter()
+        .zip(expected_data);
 
     let mut files = 0;
     for (data, expected) in stream {
+        let raw_data = data.raw_data?;
         files += 1;
-        assert_eq!(data, expected);
+        assert_eq!(into_record_batch(raw_data), expected);
     }
     assert_eq!(1, files, "Expected to have scanned one file");
     Ok(())
@@ -266,14 +287,14 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let table_client = DefaultTableClient::new(
+    let engine_interface = DefaultEngineInterface::new(
         storage.clone(),
-        Path::from("/"),
+        Path::from(""),
         Arc::new(TokioBackgroundExecutor::new()),
     );
 
     let table = Table::new(location);
-    let snapshot = table.snapshot(&table_client, None)?;
+    let snapshot = table.snapshot(&engine_interface, None)?;
 
     // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
     // we validate the boundary values where we expect the set of matched files to change.
@@ -328,15 +349,97 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         let expected_files = expected_batches.len();
         let mut files_scanned = 0;
         let stream = scan
-            .execute(&table_client)?
+            .execute(&engine_interface)?
             .into_iter()
             .zip(expected_batches);
 
         for (batch, expected) in stream {
+            let raw_data = batch.raw_data?;
             files_scanned += 1;
-            assert_eq!(&batch, expected);
+            assert_eq!(into_record_batch(raw_data), expected.clone());
         }
         assert_eq!(expected_files, files_scanned);
     }
+    Ok(())
+}
+
+macro_rules! assert_batches_sorted_eq {
+    ($EXPECTED_LINES: expr, $CHUNKS: expr) => {
+        let mut expected_lines: Vec<String> = $EXPECTED_LINES.iter().map(|&s| s.into()).collect();
+
+        // sort except for header + footer
+        let num_lines = expected_lines.len();
+        if num_lines > 3 {
+            expected_lines.as_mut_slice()[2..num_lines - 1].sort_unstable()
+        }
+
+        let formatted = arrow::util::pretty::pretty_format_batches($CHUNKS)
+            .unwrap()
+            .to_string();
+        // fix for windows: \r\n -->
+
+        let mut actual_lines: Vec<&str> = formatted.trim().lines().collect();
+
+        // sort except for header + footer
+        let num_lines = actual_lines.len();
+        if num_lines > 3 {
+            actual_lines.as_mut_slice()[2..num_lines - 1].sort_unstable()
+        }
+
+        assert_eq!(
+            expected_lines, actual_lines,
+            "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
+            expected_lines, actual_lines
+        );
+    };
+}
+
+fn read_table_data(path: &str, expected: Vec<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::fs::canonicalize(PathBuf::from(path))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let table_client = DefaultEngineInterface::try_new(
+        &url,
+        std::iter::empty::<(&str, &str)>(),
+        Arc::new(TokioBackgroundExecutor::new()),
+    )?;
+
+    let table = Table::new(url);
+    let snapshot = table.snapshot(&table_client, None)?;
+    let scan = ScanBuilder::new(snapshot).build();
+
+    let scan_results = scan.execute(&table_client)?;
+    let batches: Vec<RecordBatch> = scan_results
+        .into_iter()
+        .map(|sr| {
+            let data = sr.raw_data.unwrap();
+            data.into_any()
+                .downcast::<ArrowEngineData>()
+                .unwrap()
+                .into()
+        })
+        .collect();
+    let schema = batches[0].schema();
+    let batch = concat_batches(&schema, &batches)?;
+
+    assert_batches_sorted_eq!(&expected, &[batch]);
+    Ok(())
+}
+
+#[test]
+fn data() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+--------+--------+---------+",
+        "| letter | number | a_float |",
+        "+--------+--------+---------+",
+        "|        | 6      | 6.6     |",
+        "| a      | 1      | 1.1     |",
+        "| a      | 4      | 4.4     |",
+        "| b      | 2      | 2.2     |",
+        "| c      | 3      | 3.3     |",
+        "| e      | 5      | 5.5     |",
+        "+--------+--------+---------+",
+    ];
+    read_table_data("./tests/data/basic_partitioned", expected)?;
+
     Ok(())
 }

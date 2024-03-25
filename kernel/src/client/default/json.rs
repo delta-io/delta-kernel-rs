@@ -1,29 +1,38 @@
 //! Default Json handler implementation
 
-use std::io::{BufReader, Cursor};
+use std::io::BufReader;
 use std::ops::Range;
 use std::sync::Arc;
 use std::task::{ready, Poll};
 
-use arrow_array::{RecordBatch, StringArray};
+use arrow_array::{new_null_array, Array, RecordBatch, StringArray, StructArray};
 use arrow_json::ReaderBuilder;
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use arrow_select::concat::concat_batches;
 use bytes::{Buf, Bytes};
 use futures::{StreamExt, TryStreamExt};
+use itertools::Itertools;
 use object_store::path::Path;
 use object_store::{DynObjectStore, GetResultPayload};
 
 use super::executor::TaskExecutor;
 use super::file_handler::{FileOpenFuture, FileOpener, FileStream};
+use crate::client::arrow_data::ArrowEngineData;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, JsonHandler};
+use crate::{
+    DeltaResult, EngineData, Error, Expression, FileDataReadResultIterator, FileMeta, JsonHandler,
+};
 
 #[derive(Debug)]
 pub struct DefaultJsonHandler<E: TaskExecutor> {
+    /// The object store to read files from
     store: Arc<DynObjectStore>,
+    /// The executor to run async tasks on
     task_executor: Arc<E>,
+    /// The maximun number of batches to read ahead
     readahead: usize,
+    /// The number of rows to read per batch
+    batch_size: usize,
 }
 
 impl<E: TaskExecutor> DefaultJsonHandler<E> {
@@ -32,6 +41,7 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
             store,
             task_executor,
             readahead: 10,
+            batch_size: 1024,
         }
     }
 
@@ -42,34 +52,67 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
         self.readahead = readahead;
         self
     }
+
+    /// Set the number of rows to read per batch during [Self::parse_json()].
+    ///
+    /// Defaults to 1024.
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size;
+        self
+    }
+}
+
+fn hack_parse(
+    stats_schema: &ArrowSchemaRef,
+    json_string: Option<&str>,
+) -> DeltaResult<RecordBatch> {
+    match json_string {
+        Some(s) => Ok(ReaderBuilder::new(stats_schema.clone())
+            .build(BufReader::new(s.as_bytes()))?
+            .next()
+            .transpose()?
+            .ok_or(Error::missing_data("Expected data"))?),
+        None => Ok(RecordBatch::try_new(
+            stats_schema.clone(),
+            stats_schema
+                .fields
+                .iter()
+                .map(|field| new_null_array(field.data_type(), 1))
+                .collect(),
+        )?),
+    }
 }
 
 impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     fn parse_json(
         &self,
-        json_strings: StringArray,
+        json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
-    ) -> DeltaResult<RecordBatch> {
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
+        // TODO(nick): this is pretty terrible
+        let struct_array: StructArray = json_strings.into();
+        let json_strings = struct_array
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                Error::generic("Expected json_strings to be a StringArray, found something else")
+            })?;
         let output_schema: ArrowSchemaRef = Arc::new(output_schema.as_ref().try_into()?);
-        // TODO concatenating to a single string is probably not needed if we use the
-        // lower level RawDecoder APIs
-        let data = json_strings
-            .into_iter()
-            .filter_map(|d| {
-                d.map(|dd| {
-                    let mut data = dd.as_bytes().to_vec();
-                    data.extend("\n".as_bytes());
-                    data
-                })
-            })
-            .flatten()
-            .collect::<Vec<_>>();
-
-        let batches = ReaderBuilder::new(output_schema.clone())
-            .build(Cursor::new(data))?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(concat_batches(&output_schema, &batches)?)
+        if json_strings.is_empty() {
+            return Ok(Box::new(ArrowEngineData::new(RecordBatch::new_empty(
+                output_schema,
+            ))));
+        }
+        let output: Vec<_> = json_strings
+            .iter()
+            .map(|json_string| hack_parse(&output_schema, json_string))
+            .try_collect()?;
+        Ok(Box::new(ArrowEngineData::new(concat_batches(
+            &output_schema,
+            output.iter(),
+        )?)))
     }
 
     fn read_json_files(
@@ -84,20 +127,36 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
 
         let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
         let store = self.store.clone();
-        let file_reader = JsonOpener::new(1024, schema.clone(), store);
-        let stream = FileStream::new(files.to_vec(), schema, file_reader)?;
+        let file_reader = JsonOpener::new(self.batch_size, schema.clone(), store);
+        let mut stream = FileStream::new(files.to_vec(), schema, file_reader)?;
 
         // This channel will become the output iterator
         // The stream will execute in the background, and we allow up to `readahead`
         // batches to be buffered in the channel.
         let (sender, receiver) = std::sync::mpsc::sync_channel(self.readahead);
 
-        self.task_executor.spawn(stream.for_each(move |res| {
-            sender.send(res).ok();
-            futures::future::ready(())
-        }));
+        let executor_for_block = self.task_executor.clone();
+        self.task_executor.spawn(async move {
+            while let Some(res) = stream.next().await {
+                let sender = sender.clone();
+                let join_res = executor_for_block
+                    .spawn_blocking(move || sender.send(res))
+                    .await;
+                match join_res {
+                    Ok(send_res) => match send_res {
+                        Ok(()) => continue,
+                        Err(_) => break,
+                    },
+                    Err(je) => {
+                        panic!("Couldn't join spawned task, runtime is likely in bad state: {je}")
+                    }
+                }
+            }
+        });
 
-        Ok(Box::new(receiver.into_iter()))
+        Ok(Box::new(receiver.into_iter().map(|rbr| {
+            rbr.map(|rb| Box::new(ArrowEngineData::new(rb)) as _)
+        })))
     }
 }
 
@@ -133,7 +192,7 @@ impl FileOpener for JsonOpener {
         let batch_size = self.batch_size;
 
         Ok(Box::pin(async move {
-            let path = Path::from(file_meta.location.path());
+            let path = Path::from_url_path(file_meta.location.path())?;
             match store.get(&path).await?.payload {
                 GetResultPayload::File(file, _) => {
                     let reader = ReaderBuilder::new(schema)
@@ -184,29 +243,40 @@ impl FileOpener for JsonOpener {
 mod tests {
     use std::path::PathBuf;
 
-    use arrow_schema::Schema as ArrowSchema;
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use itertools::Itertools;
     use object_store::{local::LocalFileSystem, ObjectStore};
 
     use super::*;
-    use crate::{actions::schemas::log_schema, executor::tokio::TokioBackgroundExecutor};
+    use crate::{
+        actions::schemas::log_schema, client::default::executor::tokio::TokioBackgroundExecutor,
+    };
+
+    fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
+        let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
+        let schema = Arc::new(ArrowSchema::new(vec![string_field]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
+            .expect("Can't convert to record batch");
+        Box::new(ArrowEngineData::new(batch))
+    }
 
     #[test]
     fn test_parse_json() {
         let store = Arc::new(LocalFileSystem::new());
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
-        let json_strings: StringArray = vec![
+        let json_strings = StringArray::from(vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
             r#"{"commitInfo":{"timestamp":1677811178585,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isolationLevel":"WriteSerializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"10","numOutputBytes":"635"},"engineInfo":"Databricks-Runtime/<unknown>","txnId":"a6a94671-55ef-450e-9546-b8465b9147de"}}"#,
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
-        ]
-        .into();
+        ]);
         let output_schema = Arc::new(log_schema().clone());
 
-        let batch = handler.parse_json(json_strings, output_schema).unwrap();
-        assert_eq!(batch.num_rows(), 4);
+        let batch = handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        assert_eq!(batch.length(), 4);
     }
 
     #[tokio::test]
@@ -223,7 +293,7 @@ mod tests {
 
         let files = &[FileMeta {
             location: url.clone(),
-            last_modified: meta.last_modified.timestamp(),
+            last_modified: meta.last_modified.timestamp_millis(),
             size: meta.size,
         }];
 
@@ -232,6 +302,15 @@ mod tests {
         let data: Vec<RecordBatch> = handler
             .read_json_files(files, Arc::new(physical_schema.try_into().unwrap()), None)
             .unwrap()
+            .map(|ed_res| {
+                // TODO(nick) make this easier
+                ed_res.and_then(|ed| {
+                    ed.into_any()
+                        .downcast::<ArrowEngineData>()
+                        .map_err(|_| Error::engine_data_type("ArrowEngineData"))
+                        .map(|sd| sd.into())
+                })
+            })
             .try_collect()
             .unwrap();
 

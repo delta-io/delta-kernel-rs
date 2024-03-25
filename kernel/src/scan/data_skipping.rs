@@ -1,20 +1,13 @@
 use std::collections::HashSet;
-use std::io::BufReader;
 use std::sync::Arc;
 
-use arrow_arith::boolean::is_null;
-use arrow_array::{new_null_array, Array, BooleanArray, RecordBatch, StringArray, StructArray};
-use arrow_json::ReaderBuilder;
-use arrow_schema::Schema as ArrowSchema;
-use arrow_select::concat::concat_batches;
-use arrow_select::filter::filter_record_batch;
-use arrow_select::nullif::nullif;
 use tracing::debug;
 
-use crate::error::{DeltaResult, Error};
+use crate::actions::visitors::SelectionVectorVisitor;
+use crate::error::DeltaResult;
 use crate::expressions::{BinaryOperator, Expression as Expr, VariadicOperator};
-use crate::schema::{SchemaRef, StructField, StructType};
-use crate::{ExpressionEvaluator, TableClient};
+use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::{EngineData, EngineInterface, ExpressionEvaluator, JsonHandler};
 
 /// Returns <op2> (if any) such that B <op2> A is equivalent to A <op> B.
 fn commute(op: &BinaryOperator) -> Option<BinaryOperator> {
@@ -100,7 +93,10 @@ fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
 
 pub(crate) struct DataSkippingFilter {
     stats_schema: SchemaRef,
-    evaluator: Arc<dyn ExpressionEvaluator>,
+    select_stats_evaluator: Arc<dyn ExpressionEvaluator>,
+    skipping_evaluator: Arc<dyn ExpressionEvaluator>,
+    filter_evaluator: Arc<dyn ExpressionEvaluator>,
+    json_handler: Arc<dyn JsonHandler>,
 }
 
 impl DataSkippingFilter {
@@ -110,10 +106,18 @@ impl DataSkippingFilter {
     /// NOTE: None is equivalent to a trivial filter that always returns TRUE (= keeps all files),
     /// but using an Option lets the engine easily avoid the overhead of applying trivial filters.
     pub(crate) fn new(
-        table_client: &dyn TableClient,
+        table_client: &dyn EngineInterface,
         table_schema: &SchemaRef,
         predicate: &Option<Expr>,
     ) -> Option<Self> {
+        lazy_static::lazy_static!(
+            static ref PREDICATE_SCHEMA: DataType = StructType::new(vec![
+                StructField::new("predicate", DataType::BOOLEAN, true),
+            ]).into();
+            static ref STATS_EXPR: Expr = Expr::column("add.stats");
+            static ref FILTER_EXPR: Expr = Expr::column("predicate").distinct(Expr::literal(false));
+        );
+
         let predicate = match predicate {
             Some(predicate) => predicate,
             None => return None,
@@ -125,8 +129,7 @@ impl DataSkippingFilter {
         // Build the stats read schema by extracting the column names referenced by the predicate,
         // extracting the corresponding field from the table schema, and inserting that field.
         let data_fields: Vec<_> = table_schema
-            .fields
-            .iter()
+            .fields()
             .filter(|field| field_names.contains(&field.name.as_str()))
             .cloned()
             .collect();
@@ -140,100 +143,73 @@ impl DataSkippingFilter {
             StructField::new("maxValues", StructType::new(data_fields), true),
         ]));
 
-        let skipping_predicate = as_data_skipping_predicate(predicate)?;
-        let evaluator = table_client
-            .get_expression_handler()
-            .get_evaluator(stats_schema.clone(), skipping_predicate);
+        // Skipping happens in several steps:
+        //
+        // 1. The stats selector fetches add.stats from the metadata
+        //
+        // 2. The predicate (skipping evaluator) produces false for any file whose stats prove we
+        //    can safely skip it. A value of true means the stats say we must keep the file, and
+        //    null means we could not determine whether the file is safe to skip, because its stats
+        //    were missing/null.
+        //
+        // 3. The selection evaluator does DISTINCT(col(predicate), 'false') to produce true (= keep) when
+        //    the predicate is true/null and false (= skip) when the predicate is false.
+        let select_stats_evaluator = table_client.get_expression_handler().get_evaluator(
+            stats_schema.clone(),
+            STATS_EXPR.clone(),
+            DataType::STRING,
+        );
+
+        let skipping_evaluator = table_client.get_expression_handler().get_evaluator(
+            stats_schema.clone(),
+            Expr::struct_expr([as_data_skipping_predicate(predicate)?]),
+            PREDICATE_SCHEMA.clone(),
+        );
+
+        let filter_evaluator = table_client.get_expression_handler().get_evaluator(
+            stats_schema.clone(),
+            FILTER_EXPR.clone(),
+            DataType::BOOLEAN,
+        );
 
         Some(Self {
             stats_schema,
-            evaluator,
+            select_stats_evaluator,
+            skipping_evaluator,
+            filter_evaluator,
+            json_handler: table_client.get_json_handler(),
         })
     }
 
-    pub(crate) fn apply(&self, actions: &RecordBatch) -> DeltaResult<RecordBatch> {
-        let adds = actions
-            .column_by_name("add")
-            .ok_or(Error::missing_column("Column 'add' not found."))?
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .ok_or(Error::unexpected_column_type(
-                "Expected type 'StructArray'.",
-            ))?;
-        let stats = adds
-            .column_by_name("stats")
-            .ok_or(Error::missing_column("Column 'stats' not found."))?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or(Error::unexpected_column_type(
-                "Expected type 'StringArray'.",
-            ))?;
+    /// Apply the DataSkippingFilter to an EngineData batch of actions. Returns a selection vector
+    /// which can be applied to the actions to find those that passed data skipping.
+    pub(crate) fn apply(&self, actions: &dyn EngineData) -> DeltaResult<Vec<bool>> {
+        // retrieve and parse stats from actions data
+        let stats = self.select_stats_evaluator.evaluate(actions)?;
+        let parsed_stats = self
+            .json_handler
+            .parse_json(stats, self.stats_schema.clone())?;
 
-        let stats_schema = Arc::new(self.stats_schema.as_ref().try_into()?);
+        // evaluate the predicate on the parsed stats, then convert to selection vector
+        let skipping_predicate = self.skipping_evaluator.evaluate(&*parsed_stats)?;
+        let selection_vector = self
+            .filter_evaluator
+            .evaluate(skipping_predicate.as_ref())?;
 
-        let parsed_stats = concat_batches(
-            &stats_schema,
-            stats
-                .iter()
-                .map(|json_string| Self::hack_parse(&stats_schema, json_string))
-                .collect::<Result<Vec<_>, _>>()?
-                .iter(),
-        )?;
+        // visit the engine's selection vector to produce a Vec<bool>
+        let mut visitor = SelectionVectorVisitor::default();
+        let schema = StructType::new(vec![StructField::new("output", DataType::BOOLEAN, false)]);
+        selection_vector
+            .as_ref()
+            .extract(Arc::new(schema), &mut visitor)?;
+        Ok(visitor.selection_vector)
 
-        // Skipping happens in several steps:
-        //
-        // 1. The predicate produces false for any file whose stats prove we can safely skip it. A
-        //    value of true means the stats say we must keep the file, and null means we could not
-        //    determine whether the file is safe to skip, because its stats were missing/null.
-        //
-        // 2. The nullif(skip, skip) converts true (= keep) to null, producing a result
-        //    that contains only false (= skip) and null (= keep) values.
-        //
-        // 3. The is_null converts null to true, producing a result that contains only true (=
-        //    keep) and false (= skip) values.
-        //
-        // 4. The filter discards every file whose selection vector entry is false.
-        let skipping_vector = self.evaluator.evaluate(&parsed_stats)?;
-        let skipping_vector = skipping_vector
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or(Error::unexpected_column_type(
-                "Expected type 'BooleanArray'.",
-            ))?;
-
-        // let skipping_vector = self.predicate.invoke(&parsed_stats)?;
-        let skipping_vector = &is_null(&nullif(skipping_vector, skipping_vector)?)?;
-
-        let before_count = actions.num_rows();
-        let after = filter_record_batch(actions, skipping_vector)?;
-        debug!(
-            "number of actions before/after data skipping: {before_count} / {}",
-            after.num_rows()
-        );
-        Ok(after)
-    }
-
-    fn hack_parse(
-        stats_schema: &Arc<ArrowSchema>,
-        json_string: Option<&str>,
-    ) -> DeltaResult<RecordBatch> {
-        match json_string {
-            Some(s) => Ok(ReaderBuilder::new(stats_schema.clone())
-                .build(BufReader::new(s.as_bytes()))?
-                .collect::<Vec<_>>()
-                .into_iter()
-                .next()
-                .transpose()?
-                .ok_or(Error::missing_data("Expected data"))?),
-            None => Ok(RecordBatch::try_new(
-                stats_schema.clone(),
-                stats_schema
-                    .fields
-                    .iter()
-                    .map(|field| new_null_array(field.data_type(), 1))
-                    .collect(),
-            )?),
-        }
+        // TODO(zach): add some debug info about data skipping that occurred
+        // let before_count = actions.length();
+        // debug!(
+        //     "number of actions before/after data skipping: {before_count} / {}",
+        //     filtered_actions.num_rows()
+        // );
     }
 }
 

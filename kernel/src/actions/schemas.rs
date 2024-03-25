@@ -2,12 +2,11 @@
 
 use lazy_static::lazy_static;
 
-use super::ActionType;
 use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
 lazy_static! {
     // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#change-metadata
-    static ref METADATA_FIELD: StructField = StructField::new(
+    pub(crate) static ref METADATA_FIELD: StructField = StructField::new(
         "metaData",
         StructType::new(vec![
             StructField::new("id", DataType::STRING, false),
@@ -18,7 +17,7 @@ lazy_static! {
                 StructType::new(vec![
                     StructField::new("provider", DataType::STRING, false),
                     StructField::new(
-                        "configuration",
+                        "options",
                         MapType::new(
                             DataType::STRING,
                             DataType::STRING,
@@ -49,7 +48,7 @@ lazy_static! {
         true,
     );
     // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#protocol-evolution
-    static ref PROTOCOL_FIELD: StructField = StructField::new(
+    pub(crate) static ref PROTOCOL_FIELD: StructField = StructField::new(
         "protocol",
         StructType::new(vec![
             StructField::new("minReaderVersion", DataType::INTEGER, false),
@@ -99,7 +98,7 @@ lazy_static! {
         true,
     );
     // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#add-file-and-remove-file
-    static ref ADD_FIELD: StructField = StructField::new(
+    pub(crate) static ref ADD_FIELD: StructField = StructField::new(
         "add",
         StructType::new(vec![
             StructField::new("path", DataType::STRING, false),
@@ -117,7 +116,7 @@ lazy_static! {
         true,
     );
     // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#add-file-and-remove-file
-    static ref REMOVE_FIELD: StructField = StructField::new(
+    pub(crate) static ref REMOVE_FIELD: StructField = StructField::new(
         "remove",
         StructType::new(vec![
             StructField::new("path", DataType::STRING, false),
@@ -247,24 +246,6 @@ fn deletion_vector_field() -> StructField {
         ]))),
         true,
     )
-}
-
-impl ActionType {
-    /// Returns the type of the corresponding field in the delta log schema
-    pub fn schema_field(&self) -> &StructField {
-        match self {
-            Self::Metadata => &METADATA_FIELD,
-            Self::Protocol => &PROTOCOL_FIELD,
-            Self::CommitInfo => &COMMIT_INFO_FIELD,
-            Self::Add => &ADD_FIELD,
-            Self::Remove => &REMOVE_FIELD,
-            Self::Cdc => &CDC_FIELD,
-            Self::Txn => &TXN_FIELD,
-            Self::DomainMetadata => &DOMAIN_METADATA_FIELD,
-            Self::CheckpointMetadata => &CHECKPOINT_METADATA_FIELD,
-            Self::Sidecar => &SIDECAR_FIELD,
-        }
-    }
 }
 
 #[cfg(test)]

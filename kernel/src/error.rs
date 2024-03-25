@@ -1,9 +1,20 @@
+use std::{num::ParseIntError, string::FromUtf8Error};
+
+use crate::schema::DataType;
+
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[cfg(any(feature = "default-client", feature = "sync-client"))]
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
+
+    #[error("Invalid engine data type. Could not convert to {0}")]
+    EngineDataType(String),
+
+    #[error("Error extracting type {0}: {1}")]
+    Extract(&'static str, &'static str),
 
     #[error("Generic delta kernel error: {0}")]
     Generic(String),
@@ -14,13 +25,22 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
+    #[error("IO error: {0}")]
+    IOError(#[from] std::io::Error),
+
     #[cfg(feature = "parquet")]
     #[error("Arrow error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
 
+    // We don't use [#from] object_store::Error here as our From impl transforms
+    // object_store::Error::NotFound into Self::FileNotFound
     #[cfg(feature = "object_store")]
     #[error("Error interacting with object store: {0}")]
     ObjectStore(object_store::Error),
+
+    #[cfg(feature = "object_store")]
+    #[error("Object store path error: {0}")]
+    ObjectStorePath(#[from] object_store::path::Error),
 
     #[error("File not found: {0}")]
     FileNotFound(String),
@@ -48,6 +68,24 @@ pub enum Error {
 
     #[error("No table metadata found in delta log.")]
     MissingMetadata,
+
+    #[error("No protocol found in delta log.")]
+    MissingProtocol,
+
+    #[error("No table metadata or protocol found in delta log.")]
+    MissingMetadataAndProtocol,
+
+    #[error("Failed to parse value '{0}' as '{1}'")]
+    ParseError(String, DataType),
+
+    #[error("Join failure: {0}")]
+    JoinFailure(String),
+
+    #[error("Could not convert to string from utf-8: {0}")]
+    Utf8Error(#[from] FromUtf8Error),
+
+    #[error("Could not parse int: {0}")]
+    ParseIntError(#[from] ParseIntError),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -74,6 +112,12 @@ impl Error {
     }
     pub fn deletion_vector(msg: impl ToString) -> Self {
         Self::DeletionVector(msg.to_string())
+    }
+    pub fn engine_data_type(msg: impl ToString) -> Self {
+        Self::EngineDataType(msg.to_string())
+    }
+    pub fn join_failure(msg: impl ToString) -> Self {
+        Self::JoinFailure(msg.to_string())
     }
 }
 

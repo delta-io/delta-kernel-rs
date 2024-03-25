@@ -11,8 +11,9 @@ use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 
 use super::file_handler::{FileOpenFuture, FileOpener};
-use crate::executor::TaskExecutor;
-use crate::file_handler::FileStream;
+use crate::client::arrow_data::ArrowEngineData;
+use crate::client::default::executor::TaskExecutor;
+use crate::client::default::file_handler::FileStream;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, ParquetHandler};
 
@@ -55,7 +56,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
         let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
         let file_reader = ParquetOpener::new(1024, schema.clone(), self.store.clone());
-        let stream = FileStream::new(files.to_vec(), schema, file_reader)?;
+        let mut stream = FileStream::new(files.to_vec(), schema, file_reader)?;
 
         // This channel will become the output iterator.
         // The stream will execute in the background and send results to this channel.
@@ -63,12 +64,28 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         // stream to get ahead of the consumer.
         let (sender, receiver) = std::sync::mpsc::sync_channel(self.readahead);
 
-        self.task_executor.spawn(stream.for_each(move |res| {
-            sender.send(res).ok();
-            futures::future::ready(())
-        }));
+        let executor_for_block = self.task_executor.clone();
+        self.task_executor.spawn(async move {
+            while let Some(res) = stream.next().await {
+                let sender = sender.clone();
+                let join_res = executor_for_block
+                    .spawn_blocking(move || sender.send(res))
+                    .await;
+                match join_res {
+                    Ok(send_res) => match send_res {
+                        Ok(()) => continue,
+                        Err(_) => break,
+                    },
+                    Err(je) => {
+                        panic!("Couldn't join spawned task, runtime is likely in bad state: {je}")
+                    }
+                }
+            }
+        });
 
-        Ok(Box::new(receiver.into_iter()))
+        Ok(Box::new(receiver.into_iter().map(|rbr| {
+            rbr.map(|rb| Box::new(ArrowEngineData::new(rb)) as _)
+        })))
     }
 }
 
@@ -98,7 +115,7 @@ impl ParquetOpener {
 
 impl FileOpener for ParquetOpener {
     fn open(&self, file_meta: FileMeta, _range: Option<Range<i64>>) -> DeltaResult<FileOpenFuture> {
-        let path = Path::from(file_meta.location.path());
+        let path = Path::from_url_path(file_meta.location.path())?;
         let store = self.store.clone();
 
         let batch_size = self.batch_size;
@@ -137,11 +154,19 @@ mod tests {
     use arrow_array::RecordBatch;
     use object_store::{local::LocalFileSystem, ObjectStore};
 
-    use crate::executor::tokio::TokioBackgroundExecutor;
+    use crate::{client::default::executor::tokio::TokioBackgroundExecutor, EngineData};
 
     use itertools::Itertools;
 
     use super::*;
+
+    fn into_record_batch(
+        engine_data: DeltaResult<Box<dyn EngineData>>,
+    ) -> DeltaResult<RecordBatch> {
+        engine_data
+            .and_then(ArrowEngineData::try_from_engine_data)
+            .map(|sd| sd.into())
+    }
 
     #[tokio::test]
     async fn test_read_parquet_files() {
@@ -171,6 +196,7 @@ mod tests {
         let data: Vec<RecordBatch> = handler
             .read_parquet_files(files, Arc::new(physical_schema.try_into().unwrap()), None)
             .unwrap()
+            .map(into_record_batch)
             .try_collect()
             .unwrap();
 

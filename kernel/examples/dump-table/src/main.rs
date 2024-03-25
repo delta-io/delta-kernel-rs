@@ -1,17 +1,17 @@
-use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
-use deltakernel::client::DefaultTableClient;
-use deltakernel::scan::ScanBuilder;
-use deltakernel::Table;
-
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, ArrayRef};
-use arrow_schema::{DataType, TimeUnit};
-use clap::Parser;
-use comfy_table::presets::UTF8_FULL;
-use comfy_table::{Cell, Color, Table as ComfyTable};
+use arrow::compute::filter_record_batch;
+use arrow::record_batch::RecordBatch;
+use arrow::util::pretty::print_batches;
+use deltakernel::client::arrow_data::ArrowEngineData;
+use deltakernel::client::default::executor::tokio::TokioBackgroundExecutor;
+use deltakernel::client::default::DefaultEngineInterface;
+use deltakernel::client::sync::SyncEngineInterface;
+use deltakernel::scan::ScanBuilder;
+use deltakernel::{DeltaResult, EngineInterface, Table};
+
+use clap::{Parser, ValueEnum};
 
 /// An example program that dumps out the data of a delta table. Struct and Map types are not
 /// supported.
@@ -20,120 +20,56 @@ use comfy_table::{Cell, Color, Table as ComfyTable};
 #[command(propagate_version = true)]
 struct Cli {
     /// Path to the table to inspect
-    #[arg(short, long)]
     path: String,
 
-    /// Dump the table in plain ascii with no color/utf-8 styling
-    #[arg(short, long)]
-    ascii: bool,
+    /// Which EngineInterface to use
+    #[arg(short, long, value_enum, default_value_t = Interface::Default)]
+    interface: Interface,
 }
 
-macro_rules! format_primitive {
-    ($column:expr, $typ:tt, $row_id:expr) => {
-        format!("{}", $column.as_primitive::<$typ>().value($row_id))
-    };
-    ($column:expr, $typ:tt, $row_id:expr, $suffix:expr) => {
-        format!(
-            "{}{}",
-            $column.as_primitive::<$typ>().value($row_id),
-            $suffix
-        )
-    };
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum Interface {
+    /// Use the default, async engine interface
+    Default,
+    /// Use the sync engine interface (local files only)
+    Sync,
 }
 
-fn extract_value(column: &ArrayRef, row_id: usize) -> String {
-    use arrow_array::types::*;
-    use DataType::*;
-    match column.data_type() {
-        Binary => format!("{:?}", column.as_binary::<i32>().value(row_id)),
-        Boolean => format!("{}", column.as_boolean().value(row_id)),
-        Date32 => format_primitive!(column, Date32Type, row_id),
-        Date64 => format_primitive!(column, Date64Type, row_id),
-        Decimal128(..) => format_primitive!(column, Decimal128Type, row_id),
-        Float32 => format_primitive!(column, Float32Type, row_id),
-        Float64 => format_primitive!(column, Float64Type, row_id),
-        Int8 => format_primitive!(column, Int8Type, row_id),
-        Int16 => format_primitive!(column, Int16Type, row_id),
-        Int32 => format_primitive!(column, Int32Type, row_id),
-        Int64 => format_primitive!(column, Int64Type, row_id),
-        Timestamp(unit, _) => match unit {
-            TimeUnit::Second => format_primitive!(column, TimestampSecondType, row_id, "s"),
-            TimeUnit::Millisecond => {
-                format_primitive!(column, TimestampMillisecondType, row_id, "ms")
-            }
-            TimeUnit::Microsecond => {
-                format_primitive!(column, TimestampMicrosecondType, row_id, "us")
-            }
-            TimeUnit::Nanosecond => {
-                format_primitive!(column, TimestampNanosecondType, row_id, "ns")
-            }
-        },
-        Utf8 => column.as_string::<i32>().value(row_id).to_string(),
-        _ => {
-            todo!("Don't support {}", column.data_type())
-        }
-    }
-}
-
-fn main() {
+fn main() -> DeltaResult<()> {
+    env_logger::init();
     let cli = Cli::parse();
-    let path = std::fs::canonicalize(PathBuf::from(cli.path));
-    let Ok(path) = path else {
-        println!("Couldn't open table: {}", path.err().unwrap());
-        return;
-    };
-    let Ok(url) = url::Url::from_directory_path(path) else {
-        println!("Invalid url");
-        return;
-    };
-    let table_client = DefaultTableClient::try_new(
-        &url,
-        HashMap::<String, String>::new(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    );
-    let Ok(table_client) = table_client else {
-        println!(
-            "Failed to construct table client: {}",
-            table_client.err().unwrap()
-        );
-        return;
+    let url = url::Url::parse(&cli.path)?;
+
+    println!("Reading {url}");
+    let engine_interface: Box<dyn EngineInterface> = match cli.interface {
+        Interface::Default => Box::new(DefaultEngineInterface::try_new(
+            &url,
+            HashMap::<String, String>::new(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        )?),
+        Interface::Sync => Box::new(SyncEngineInterface::new()),
     };
 
     let table = Table::new(url);
-    let snapshot = table.snapshot(&table_client, None);
-    let Ok(snapshot) = snapshot else {
-        println!(
-            "Failed to construct latest snapshot: {}",
-            snapshot.err().unwrap()
-        );
-        return;
-    };
+    let snapshot = table.snapshot(engine_interface.as_ref(), None)?;
 
     let scan = ScanBuilder::new(snapshot).build();
 
-    let schema = scan.schema();
-    let header_names = schema.fields.iter().map(|field| {
-        let cell = Cell::new(field.name());
-        if cli.ascii {
-            cell
+    let mut batches = vec![];
+    for res in scan.execute(engine_interface.as_ref())?.into_iter() {
+        let data = res.raw_data?;
+        let record_batch: RecordBatch = data
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .map_err(|_| deltakernel::Error::EngineDataType("ArrowEngineData".to_string()))?
+            .into();
+        let batch = if let Some(mask) = res.mask {
+            filter_record_batch(&record_batch, &mask.into())?
         } else {
-            cell.fg(Color::Green)
-        }
-    });
-
-    let mut table = ComfyTable::new();
-    if !cli.ascii {
-        table.load_preset(UTF8_FULL);
+            record_batch
+        };
+        batches.push(batch);
     }
-    table.set_header(header_names);
-
-    for batch in scan.execute(&table_client).unwrap() {
-        for row in 0..batch.num_rows() {
-            let table_row =
-                (0..batch.num_columns()).map(|col| extract_value(batch.column(col), row));
-            table.add_row(table_row);
-        }
-    }
-
-    println!("{table}");
+    print_batches(&batches)?;
+    Ok(())
 }

@@ -2,12 +2,13 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 use std::{collections::HashMap, fmt::Display};
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 #[serde(untagged)]
 pub enum MetadataValue {
     Number(i32),
@@ -59,7 +60,7 @@ impl AsRef<str> for ColumnMetadataKey {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 pub struct StructField {
     /// Name of this (possibly nested) column
     pub name: String,
@@ -121,28 +122,73 @@ impl StructField {
 
 /// A struct is used to represent both the top-level schema of the table
 /// as well as struct columns that contain nested columns.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Eq)]
 pub struct StructType {
-    #[serde(rename = "type")]
     pub type_name: String,
     /// The type of element stored in this array
-    pub fields: Vec<StructField>,
+    // We use indexmap to preserve the order of fields as they are defined in the schema
+    // while also allowing for fast lookup by name. The atlerative to do a liner search
+    // for each field by name would be potentially quite expensive for large schemas.
+    pub fields: IndexMap<String, StructField>,
 }
 
 impl StructType {
     pub fn new(fields: Vec<StructField>) -> Self {
         Self {
             type_name: "struct".into(),
-            fields,
+            fields: fields.into_iter().map(|f| (f.name.clone(), f)).collect(),
         }
     }
 
-    pub fn fields(&self) -> Vec<&StructField> {
-        self.fields.iter().collect()
+    pub fn field(&self, name: impl AsRef<str>) -> Option<&StructField> {
+        self.fields.get(name.as_ref())
+    }
+
+    pub fn fields(&self) -> impl Iterator<Item = &StructField> {
+        self.fields.values()
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StructTypeSerDeHelper {
+    #[serde(rename = "type")]
+    type_name: String,
+    fields: Vec<StructField>,
+}
+
+impl Serialize for StructType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        StructTypeSerDeHelper {
+            type_name: self.type_name.clone(),
+            fields: self.fields.values().cloned().collect(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for StructType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        Self: Sized,
+    {
+        let helper = StructTypeSerDeHelper::deserialize(deserializer)?;
+        Ok(Self {
+            type_name: helper.type_name,
+            fields: helper
+                .fields
+                .into_iter()
+                .map(|f| (f.name.clone(), f))
+                .collect(),
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ArrayType {
     #[serde(rename = "type")]
@@ -173,7 +219,7 @@ impl ArrayType {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MapType {
     #[serde(rename = "type")]
@@ -217,7 +263,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum PrimitiveType {
     /// UTF-8 encoded string of characters
@@ -246,18 +292,18 @@ pub enum PrimitiveType {
         deserialize_with = "deserialize_decimal",
         untagged
     )]
-    Decimal(i32, i32),
+    Decimal(u8, i8),
 }
 
 fn serialize_decimal<S: serde::Serializer>(
-    precision: &i32,
-    scale: &i32,
+    precision: &u8,
+    scale: &i8,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(&format!("decimal({},{})", precision, scale))
 }
 
-fn deserialize_decimal<'de, D>(deserializer: D) -> Result<(i32, i32), D::Error>
+fn deserialize_decimal<'de, D>(deserializer: D) -> Result<(u8, i8), D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -272,13 +318,13 @@ where
     let mut parts = str_value[8..str_value.len() - 1].split(',');
     let precision = parts
         .next()
-        .and_then(|part| part.trim().parse::<i32>().ok())
+        .and_then(|part| part.trim().parse::<u8>().ok())
         .ok_or_else(|| {
             serde::de::Error::custom(format!("Invalid precision in decimal: {}", str_value))
         })?;
     let scale = parts
         .next()
-        .and_then(|part| part.trim().parse::<i32>().ok())
+        .and_then(|part| part.trim().parse::<i8>().ok())
         .ok_or_else(|| {
             serde::de::Error::custom(format!("Invalid scale in decimal: {}", str_value))
         })?;
@@ -307,7 +353,7 @@ impl Display for PrimitiveType {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 #[serde(untagged, rename_all = "camelCase")]
 pub enum DataType {
     /// UTF-8 encoded string of characters
@@ -353,8 +399,8 @@ impl DataType {
     pub const DATE: Self = DataType::Primitive(PrimitiveType::Date);
     pub const TIMESTAMP: Self = DataType::Primitive(PrimitiveType::Timestamp);
 
-    pub fn decimal(precision: usize, scale: usize) -> Self {
-        DataType::Primitive(PrimitiveType::Decimal(precision as i32, scale as i32))
+    pub fn decimal(precision: u8, scale: i8) -> Self {
+        DataType::Primitive(PrimitiveType::Decimal(precision, scale))
     }
 }
 
@@ -365,7 +411,7 @@ impl Display for DataType {
             DataType::Array(a) => write!(f, "array<{}>", a.element_type),
             DataType::Struct(s) => {
                 write!(f, "struct<")?;
-                for (i, field) in s.fields.iter().enumerate() {
+                for (i, field) in s.fields().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }

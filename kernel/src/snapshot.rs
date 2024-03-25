@@ -5,16 +5,15 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::actions::{parse_action, Action, ActionType, Metadata, Protocol};
+use crate::actions::{Metadata, Protocol};
 use crate::path::LogPath;
 use crate::schema::{Schema, SchemaRef, StructType};
-use crate::Expression;
-use crate::{DeltaResult, Error, FileMeta, FileSystemClient, TableClient, Version};
+use crate::{DeltaResult, EngineInterface, Error, FileMeta, FileSystemClient, Version};
+use crate::{EngineData, Expression};
 
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 
@@ -44,18 +43,21 @@ impl LogSegment {
     #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
     fn replay(
         &self,
-        table_client: &dyn TableClient,
-        read_schema: SchemaRef,
+        engine_interface: &dyn EngineInterface,
+        commit_read_schema: SchemaRef,
+        checkpoint_read_schema: SchemaRef,
         predicate: Option<Expression>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(RecordBatch, bool)>>> {
-        let json_client = table_client.get_json_handler();
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>> {
+        let json_client = engine_interface.get_json_handler();
+        // TODO change predicate to: predicate AND add.path not null and remove.path not null
         let commit_stream = json_client
-            .read_json_files(&self.commit_files, read_schema.clone(), predicate.clone())?
+            .read_json_files(&self.commit_files, commit_read_schema, predicate.clone())?
             .map_ok(|batch| (batch, true));
 
-        let parquet_client = table_client.get_parquet_handler();
+        let parquet_client = engine_interface.get_parquet_handler();
+        // TODO change predicate to: predicate AND add.path not null
         let checkpoint_stream = parquet_client
-            .read_parquet_files(&self.checkpoint_files, read_schema.clone(), predicate)?
+            .read_parquet_files(&self.checkpoint_files, checkpoint_read_schema, predicate)?
             .map_ok(|batch| (batch, false));
 
         let batches = commit_stream.chain(checkpoint_stream);
@@ -65,47 +67,36 @@ impl LogSegment {
 
     fn read_metadata(
         &self,
-        table_client: &dyn TableClient,
+        engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<Option<(Metadata, Protocol)>> {
-        lazy_static::lazy_static! {
-            static ref ACTION_SCHEMA: SchemaRef = Arc::new(StructType::new(vec![
-                ActionType::Metadata.schema_field().clone(),
-                ActionType::Protocol.schema_field().clone(),
-            ]));
-        }
-
+        let schema = Arc::new(StructType::new(vec![
+            crate::actions::schemas::METADATA_FIELD.clone(),
+            crate::actions::schemas::PROTOCOL_FIELD.clone(),
+        ]));
+        // read the same protocol and metadata schema for both commits and checkpoints
+        // TODO add metadata.table_id is not null and protocol.something_required is not null
+        let data_batches = self.replay(engine_interface, schema.clone(), schema, None)?;
         let mut metadata_opt: Option<Metadata> = None;
         let mut protocol_opt: Option<Protocol> = None;
-
-        // TODO should we request the checkpoint iterator only if we don't find the metadata in the commit files?
-        // since the engine might pre-fetch data o.a.? On the other hand, if the engine is smart about it, it should not be
-        // too much extra work to request the checkpoint iterator as well.
-        let batches = self.replay(table_client, ACTION_SCHEMA.clone(), None)?;
-        for batch in batches {
+        for batch in data_batches {
             let (batch, _) = batch?;
-
             if metadata_opt.is_none() {
-                if let Ok(mut action) = parse_action(&batch, &ActionType::Metadata) {
-                    if let Some(Action::Metadata(meta)) = action.next() {
-                        metadata_opt = Some(meta)
-                    }
-                }
+                metadata_opt = crate::actions::Metadata::try_new_from_data(batch.as_ref())?;
             }
-
             if protocol_opt.is_none() {
-                if let Ok(mut action) = parse_action(&batch, &ActionType::Protocol) {
-                    if let Some(Action::Protocol(proto)) = action.next() {
-                        protocol_opt = Some(proto)
-                    }
-                }
+                protocol_opt = crate::actions::Protocol::try_new_from_data(batch.as_ref())?;
             }
-
             if metadata_opt.is_some() && protocol_opt.is_some() {
-                // found both, we can stop iterating
+                // we've found both, we can stop
                 break;
             }
         }
-        Ok(metadata_opt.zip(protocol_opt))
+        match (metadata_opt, protocol_opt) {
+            (Some(m), Some(p)) => Ok(Some((m, p))),
+            (None, Some(_)) => Err(Error::MissingMetadata),
+            (Some(_), None) => Err(Error::MissingProtocol),
+            _ => Err(Error::MissingMetadataAndProtocol),
+        }
     }
 }
 
@@ -139,14 +130,14 @@ impl Snapshot {
     /// # Parameters
     ///
     /// - `location`: url pointing at the table root (where `_delta_log` folder is located)
-    /// - `table_client`: Implementation of [`TableClient`] apis.
+    /// - `engine_interface`: Implementation of [`EngineInterface`] apis.
     /// - `version`: target version of the [`Snapshot`]
     pub fn try_new(
         table_root: Url,
-        table_client: &dyn TableClient,
+        engine_interface: &dyn EngineInterface,
         version: Option<Version>,
     ) -> DeltaResult<Arc<Self>> {
-        let fs_client = table_client.get_file_system_client();
+        let fs_client = engine_interface.get_file_system_client();
         let log_url = LogPath(&table_root).child("_delta_log/").unwrap();
 
         // List relevant files from log
@@ -193,7 +184,7 @@ impl Snapshot {
             table_root,
             log_segment,
             version_eff,
-            table_client,
+            engine_interface,
         )?))
     }
 
@@ -202,12 +193,11 @@ impl Snapshot {
         location: Url,
         log_segment: LogSegment,
         version: Version,
-        table_client: &dyn TableClient,
+        engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<Self> {
         let (metadata, protocol) = log_segment
-            .read_metadata(table_client)?
+            .read_metadata(engine_interface)?
             .ok_or(Error::MissingMetadata)?;
-
         let schema = metadata.schema()?;
         Ok(Self {
             table_root: location,
@@ -379,25 +369,15 @@ fn list_log_files(
 mod tests {
     use super::*;
 
-    use std::collections::HashMap;
     use std::path::PathBuf;
 
     use object_store::local::LocalFileSystem;
     use object_store::path::Path;
 
-    use crate::client::DefaultTableClient;
-    use crate::executor::tokio::TokioBackgroundExecutor;
-    use crate::filesystem::ObjectStoreFileSystemClient;
+    use crate::client::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::client::default::filesystem::ObjectStoreFileSystemClient;
+    use crate::client::sync::SyncEngineInterface;
     use crate::schema::StructType;
-
-    fn default_table_client(url: &Url) -> DefaultTableClient<TokioBackgroundExecutor> {
-        DefaultTableClient::try_new(
-            url,
-            HashMap::<String, String>::new(),
-            Arc::new(TokioBackgroundExecutor::new()),
-        )
-        .unwrap()
-    }
 
     #[test]
     fn test_snapshot_read_metadata() {
@@ -405,7 +385,7 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
-        let client = default_table_client(&url);
+        let client = SyncEngineInterface::new();
         let snapshot = Snapshot::try_new(url, &client, Some(1)).unwrap();
 
         let expected = Protocol {
@@ -427,7 +407,7 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
-        let client = default_table_client(&url);
+        let client = SyncEngineInterface::new();
         let snapshot = Snapshot::try_new(url, &client, None).unwrap();
 
         let expected = Protocol {
@@ -462,15 +442,15 @@ mod tests {
         assert!(cp.is_none())
     }
 
-    #[test]
+    #[test_log::test]
     fn test_read_table_with_checkpoint() {
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/with_checkpoint_no_last_checkpoint/",
         ))
         .unwrap();
         let location = url::Url::from_directory_path(path).unwrap();
-        let table_client = default_table_client(&location);
-        let snapshot = Snapshot::try_new(location, &table_client, None).unwrap();
+        let engine_interface = SyncEngineInterface::new();
+        let snapshot = Snapshot::try_new(location, &engine_interface, None).unwrap();
 
         assert_eq!(snapshot.log_segment.checkpoint_files.len(), 1);
         assert_eq!(

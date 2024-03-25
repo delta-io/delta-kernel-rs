@@ -1,14 +1,15 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use arrow_array::RecordBatch;
 use either::Either;
 use tracing::debug;
 
 use super::data_skipping::DataSkippingFilter;
-use crate::actions::{parse_actions, Action, ActionType, Add};
+use crate::actions::{visitors::AddVisitor, visitors::RemoveVisitor, Add, Remove};
+use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::Expression;
-use crate::schema::SchemaRef;
-use crate::{DeltaResult, TableClient};
+use crate::schema::{SchemaRef, StructType};
+use crate::{DataVisitor, DeltaResult, EngineData, EngineInterface};
 
 struct LogReplayScanner {
     filter: Option<DataSkippingFilter>,
@@ -19,10 +20,62 @@ struct LogReplayScanner {
     seen: HashSet<(String, Option<String>)>,
 }
 
+#[derive(Default)]
+struct AddRemoveVisitor {
+    adds: Vec<Add>,
+    removes: Vec<Remove>,
+    selection_vector: Option<Vec<bool>>,
+    // whether or not we are visiting commit json (=true) or checkpoint (=false)
+    is_log_batch: bool,
+}
+
+const ADD_FIELD_COUNT: usize = 15;
+
+impl AddRemoveVisitor {
+    fn new(selection_vector: Option<Vec<bool>>, is_log_batch: bool) -> Self {
+        AddRemoveVisitor {
+            selection_vector,
+            is_log_batch,
+            ..Default::default()
+        }
+    }
+}
+
+impl DataVisitor for AddRemoveVisitor {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for i in 0..row_count {
+            // Add will have a path at index 0 if it is valid
+            if let Some(path) = getters[0].get_opt(i, "add.path")? {
+                // Keep the file unless the selection vector is present and is false for this row
+                if !self
+                    .selection_vector
+                    .as_ref()
+                    .is_some_and(|selection| !selection[i])
+                {
+                    self.adds
+                        .push(AddVisitor::visit_add(i, path, &getters[..ADD_FIELD_COUNT])?)
+                }
+            }
+            // Remove will have a path at index 15 if it is valid
+            // TODO(nick): Should count the fields in Add to ensure we don't get this wrong if more
+            // are added
+            // TODO(zach): add a check for selection vector that we never skip a remove
+            else if self.is_log_batch {
+                if let Some(path) = getters[ADD_FIELD_COUNT].get_opt(i, "remove.path")? {
+                    let remove_getters = &getters[ADD_FIELD_COUNT..];
+                    self.removes
+                        .push(RemoveVisitor::visit_remove(i, path, remove_getters)?);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl LogReplayScanner {
     /// Create a new [`LogReplayScanner`] instance
     fn new(
-        table_client: &dyn TableClient,
+        table_client: &dyn EngineInterface,
         table_schema: &SchemaRef,
         predicate: &Option<Expression>,
     ) -> Self {
@@ -37,38 +90,44 @@ impl LogReplayScanner {
     /// actions in the log.
     fn process_batch(
         &mut self,
-        actions: &RecordBatch,
+        actions: &dyn EngineData,
         is_log_batch: bool,
     ) -> DeltaResult<Vec<Add>> {
-        let filtered_actions = match &self.filter {
-            Some(filter) => Some(filter.apply(actions)?),
-            None => None,
-        };
-        let actions = if let Some(filtered) = &filtered_actions {
-            filtered
-        } else {
-            actions
-        };
+        // apply data skipping to get back a selection vector for actions that passed skipping
+        // note: None implies all files passed data skipping.
+        let selection_vector = self
+            .filter
+            .as_ref()
+            .map(|filter| filter.apply(actions))
+            .transpose()?;
 
-        let schema_to_use = if is_log_batch {
-            vec![ActionType::Add, ActionType::Remove]
+        let schema_to_use = StructType::new(if is_log_batch {
+            vec![
+                crate::actions::schemas::ADD_FIELD.clone(),
+                crate::actions::schemas::REMOVE_FIELD.clone(),
+            ]
         } else {
             // All checkpoint actions are already reconciled and Remove actions in checkpoint files
             // only serve as tombstones for vacuum jobs. So no need to load them here.
-            vec![ActionType::Add]
-        };
+            vec![crate::actions::schemas::ADD_FIELD.clone()]
+        });
+        let mut visitor = AddRemoveVisitor::new(selection_vector, is_log_batch);
+        actions.extract(Arc::new(schema_to_use), &mut visitor)?;
 
-        let adds: Vec<Add> = parse_actions(actions, &schema_to_use)?
-            .filter_map(|action| match action {
-                Action::Add(add)
-                    // Note: each (add.path + add.dv_unique_id()) pair has a
-                    // unique Add + Remove pair in the log. For example:
-                    // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
-                    if !self
-                        .seen
-                        .contains(&(add.path.clone(), add.dv_unique_id())) =>
-                {
-                    debug!("Found file: {}", &add.path);
+        for remove in visitor.removes.into_iter() {
+            let dv_id = remove.dv_unique_id();
+            self.seen.insert((remove.path, dv_id));
+        }
+
+        visitor
+            .adds
+            .into_iter()
+            .filter_map(|add| {
+                // Note: each (add.path + add.dv_unique_id()) pair has a
+                // unique Add + Remove pair in the log. For example:
+                // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
+                if !self.seen.contains(&(add.path.clone(), add.dv_unique_id())) {
+                    debug!("Found file: {}, is log {}", &add.path, is_log_batch);
                     if is_log_batch {
                         // Remember file actions from this batch so we can ignore duplicates
                         // as we process batches from older commit and/or checkpoint files. We
@@ -76,37 +135,32 @@ impl LogReplayScanner {
                         // oldest actions and can never replace anything.
                         self.seen.insert((add.path.clone(), add.dv_unique_id()));
                     }
-                    Some(add)
-                }
-                Action::Remove(remove) => {
-                    // Remove actions always come from log batches, so no need to check here.
-                    self.seen
-                        .insert((remove.path.clone(), remove.dv_unique_id()));
+                    Some(Ok(add))
+                } else {
                     None
                 }
-                _ => None,
             })
-            .collect();
-
-        Ok(adds)
+            .collect()
     }
 }
 
-/// Given an iterator of (record batch, bool) tuples and a predicate, returns an iterator of [Add]s.
+/// Given an iterator of (record batch, bool) tuples and a predicate, returns an iterator of `Adds`.
 /// The boolean flag indicates whether the record batch is a log or checkpoint batch.
 pub fn log_replay_iter(
-    table_client: &dyn TableClient,
-    action_iter: impl Iterator<Item = DeltaResult<(RecordBatch, bool)>>,
+    engine_client: &dyn EngineInterface,
+    action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
     table_schema: &SchemaRef,
     predicate: &Option<Expression>,
 ) -> impl Iterator<Item = DeltaResult<Add>> {
-    let mut log_scanner = LogReplayScanner::new(table_client, table_schema, predicate);
+    let mut log_scanner = LogReplayScanner::new(engine_client, table_schema, predicate);
 
     action_iter.flat_map(move |actions| match actions {
-        Ok((batch, is_log_batch)) => match log_scanner.process_batch(&batch, is_log_batch) {
-            Ok(adds) => Either::Left(adds.into_iter().map(Ok)),
-            Err(err) => Either::Right(std::iter::once(Err(err))),
-        },
+        Ok((batch, is_log_batch)) => {
+            match log_scanner.process_batch(batch.as_ref(), is_log_batch) {
+                Ok(adds) => Either::Left(adds.into_iter().map(Ok)),
+                Err(err) => Either::Right(std::iter::once(Err(err))),
+            }
+        }
         Err(err) => Either::Right(std::iter::once(Err(err))),
     })
 }
