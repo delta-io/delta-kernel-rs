@@ -181,7 +181,7 @@ impl ArrowEngineData {
         let parquet_schema = metadata.schema();
         let requested_schema: ArrowSchema = (&*schema).try_into()?;
         let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-        let indicies: Vec<usize> = get_requested_indicies(&requested_schema, parquet_schema)?;
+        let indicies = get_requested_indicies(&requested_schema, parquet_schema)?;
         if let Some(mask) = generate_mask(
             &requested_schema,
             parquet_schema,
