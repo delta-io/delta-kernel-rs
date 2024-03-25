@@ -13,7 +13,6 @@ use crate::{DeltaResult, EngineData, EngineInterface, Error, FileMeta};
 mod data_skipping;
 pub mod file_stream;
 
-// TODO projection: something like fn select(self, columns: &[&str])
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
     snapshot: Arc<Snapshot>,
