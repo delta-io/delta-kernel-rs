@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::{DeltaResult, Error};
+use crate::DeltaResult;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
@@ -27,7 +27,7 @@ pub(crate) fn get_requested_indices(
 
 /// Create a mask that will only select the specified indicies from the parquet. Currently we only
 /// handle "root" level columns, and hence use `ProjectionMask::roots`, but will support leaf
-/// selection in the future
+/// selection in the future. See issues #86 and #96 as well.
 pub(crate) fn generate_mask(
     requested_schema: &ArrowSchema,
     parquet_schema: &ArrowSchemaRef,
@@ -61,18 +61,12 @@ pub(crate) fn reorder_record_batch(
         Ok(input_data)
     } else {
         // requested an order different from the parquet, reorder
-        let reordered_columns = requested_schema
-            .fields
+        let reordered_columns = indicies
             .iter()
-            .map(|field| {
-                input_data
-                    .column_by_name(field.name())
-                    .cloned() // cheap clones of `Arc`s
-                    .ok_or(Error::generic(
-                        "request_schema had a field that didn't exist in final result. This is a bug",
-                    ))
+            .map(|index| {
+                input_data.column(*index).clone() // cheap clones of `Arc`s
             })
-            .try_collect()?;
+            .collect();
         Ok(RecordBatch::try_new(requested_schema, reordered_columns)?)
     }
 }
