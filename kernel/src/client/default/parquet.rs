@@ -4,7 +4,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef as ArrowSchemaRef;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use object_store::path::Path;
 use object_store::DynObjectStore;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
@@ -151,14 +151,10 @@ impl FileOpener for ParquetOpener {
 
             let stream = stream.map(move |rbr| {
                 // re-order each batch if needed
-                rbr.and_then(|rb| {
-                    reorder_record_batch(table_schema.clone(), rb, &indicies)
-                        .map_err(|e| parquet::errors::ParquetError::General(format!("{e}")))
-                })
+                rbr.map_err(Error::Parquet)
+                    .and_then(|rb| reorder_record_batch(table_schema.clone(), rb, &indicies))
             });
-
-            let adapted = stream.map_err(Error::generic_err);
-            Ok(adapted.boxed())
+            Ok(stream.boxed())
         }))
     }
 }
