@@ -166,8 +166,11 @@ fn evaluate_expression(
             let mut fields = output_schema.all_fields();
             fields.pop();
             let fields: Vec<arrow_schema::Field> = fields.into_iter().cloned().collect();
-            let result =
-                StructArray::try_new(arrow_schema::Fields::from(fields), columns.try_collect()?, None)?;
+            let result = StructArray::try_new(
+                arrow_schema::Fields::from(fields),
+                columns.try_collect()?,
+                None,
+            )?;
             Ok(Arc::new(result))
         }
         (Struct(_), _) => Err(Error::generic(

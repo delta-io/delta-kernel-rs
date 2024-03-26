@@ -44,9 +44,7 @@ enum Interface {
 fn main() -> ExitCode {
     env_logger::init();
     match try_main() {
-        Ok(()) => {
-            ExitCode::SUCCESS
-        }
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             println!("{e:#?}");
             ExitCode::FAILURE

@@ -1,4 +1,8 @@
-use std::{num::ParseIntError, string::FromUtf8Error, backtrace::{Backtrace, BacktraceStatus}};
+use std::{
+    backtrace::{Backtrace, BacktraceStatus},
+    num::ParseIntError,
+    string::FromUtf8Error,
+};
 
 use crate::schema::DataType;
 
@@ -135,18 +139,17 @@ impl Error {
                 source: Box::new(self),
                 backtrace: Box::new(backtrace),
             },
-            _ => self
+            _ => self,
         }
     }
 }
 
-#[cfg(feature = "object_store")]
+#[cfg(any(feature = "default-client", feature = "sync-client"))]
 impl From<arrow_schema::ArrowError> for Error {
     fn from(value: arrow_schema::ArrowError) -> Self {
         Self::Arrow(value).with_backtrace()
     }
 }
-
 
 #[cfg(feature = "object_store")]
 impl From<object_store::Error> for Error {
