@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use arrow::compute::filter_record_batch;
@@ -40,8 +41,20 @@ enum Interface {
     Sync,
 }
 
-fn main() -> DeltaResult<()> {
+fn main() -> ExitCode {
     env_logger::init();
+    match try_main() {
+        Ok(()) => {
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            println!("{e:#?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
     let url = url::Url::parse(&cli.path)?;
 

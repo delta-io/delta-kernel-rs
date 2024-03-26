@@ -1,4 +1,4 @@
-use std::{num::ParseIntError, string::FromUtf8Error};
+use std::{num::ParseIntError, string::FromUtf8Error, backtrace::{Backtrace, BacktraceStatus}};
 
 use crate::schema::DataType;
 
@@ -6,9 +6,15 @@ pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error("{source}\n{backtrace}")]
+    Backtraced {
+        source: Box<Self>,
+        backtrace: Box<Backtrace>,
+    },
+
     #[cfg(any(feature = "default-client", feature = "sync-client"))]
-    #[error("Arrow error: {0}")]
-    Arrow(#[from] arrow_schema::ArrowError),
+    #[error(transparent)]
+    Arrow(arrow_schema::ArrowError),
 
     #[error("Invalid engine data type. Could not convert to {0}")]
     EngineDataType(String),
@@ -119,7 +125,28 @@ impl Error {
     pub fn join_failure(msg: impl ToString) -> Self {
         Self::JoinFailure(msg.to_string())
     }
+
+    // Capture a backtrace when the error is constructed.
+    #[must_use]
+    pub fn with_backtrace(self) -> Self {
+        let backtrace = Backtrace::capture();
+        match backtrace.status() {
+            BacktraceStatus::Captured => Self::Backtraced {
+                source: Box::new(self),
+                backtrace: Box::new(backtrace),
+            },
+            _ => self
+        }
+    }
 }
+
+#[cfg(feature = "object_store")]
+impl From<arrow_schema::ArrowError> for Error {
+    fn from(value: arrow_schema::ArrowError) -> Self {
+        Self::Arrow(value).with_backtrace()
+    }
+}
+
 
 #[cfg(feature = "object_store")]
 impl From<object_store::Error> for Error {
