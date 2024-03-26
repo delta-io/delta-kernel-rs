@@ -9,6 +9,7 @@ use deltakernel::client::default::executor::tokio::TokioBackgroundExecutor;
 use deltakernel::client::default::DefaultEngineInterface;
 use deltakernel::client::sync::SyncEngineInterface;
 use deltakernel::scan::ScanBuilder;
+use deltakernel::schema::Schema;
 use deltakernel::{DeltaResult, EngineInterface, Table};
 
 use clap::{Parser, ValueEnum};
@@ -25,6 +26,10 @@ struct Cli {
     /// Which EngineInterface to use
     #[arg(short, long, value_enum, default_value_t = Interface::Default)]
     interface: Interface,
+
+    /// Comma separated list of columns to select
+    #[arg(long, value_delimiter=',', num_args(0..))]
+    columns: Option<Vec<String>>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -53,7 +58,28 @@ fn main() -> DeltaResult<()> {
     let table = Table::new(url);
     let snapshot = table.snapshot(engine_interface.as_ref(), None)?;
 
-    let scan = ScanBuilder::new(snapshot).build();
+    let read_schema_opt = cli
+        .columns
+        .map(|cols| {
+            use itertools::Itertools;
+            let table_schema = snapshot.schema();
+            let selected_fields = cols
+                .iter()
+                .map(|col| {
+                    table_schema
+                        .field(col)
+                        .cloned()
+                        .ok_or(deltakernel::Error::Generic(format!(
+                            "Table has no such column: {col}"
+                        )))
+                })
+                .try_collect();
+            selected_fields.map(|selected_fields| Arc::new(Schema::new(selected_fields)))
+        })
+        .transpose()?;
+    let scan = ScanBuilder::new(snapshot)
+        .with_schema_opt(read_schema_opt)
+        .build();
 
     let mut batches = vec![];
     for res in scan.execute(engine_interface.as_ref())?.into_iter() {

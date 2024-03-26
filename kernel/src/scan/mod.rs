@@ -13,7 +13,6 @@ use crate::{DeltaResult, EngineData, EngineInterface, Error, FileMeta};
 mod data_skipping;
 pub mod file_stream;
 
-// TODO projection: something like fn select(self, columns: &[&str])
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
     snapshot: Arc<Snapshot>,
@@ -50,6 +49,15 @@ impl ScanBuilder {
     pub fn with_schema(mut self, schema: SchemaRef) -> Self {
         self.schema = Some(schema);
         self
+    }
+
+    /// Optionally provide a [`Schema`] for columns to select from the [`Snapshot`]. See
+    /// [`with_schema`] for details. If schema_opt is `None` this is a no-op.
+    pub fn with_schema_opt(self, schema_opt: Option<SchemaRef>) -> Self {
+        match schema_opt {
+            Some(schema) => self.with_schema(schema),
+            None => self,
+        }
     }
 
     /// Predicates specified in this crate's [`Expression`] type.
@@ -190,6 +198,7 @@ impl Scan {
             })
             .collect();
         let read_schema = Arc::new(StructType::new(read_fields));
+        debug!("Executing scan with read schema {read_schema:#?}");
         let output_schema = DataType::Struct(Box::new(self.schema().as_ref().clone()));
         let parquet_handler = engine_interface.get_parquet_handler();
 
@@ -204,7 +213,7 @@ impl Scan {
             };
 
             let read_results =
-                parquet_handler.read_parquet_files(&[meta], self.read_schema.clone(), None)?;
+                parquet_handler.read_parquet_files(&[meta], read_schema.clone(), None)?;
 
             let read_expression = if have_partition_cols {
                 // Loop over all fields and create the correct expressions for them

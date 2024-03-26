@@ -1,3 +1,4 @@
+use super::arrow_utils::{generate_mask, get_requested_indices, reorder_record_batch};
 use crate::engine_data::{EngineData, EngineList, EngineMap, GetData};
 use crate::schema::{DataType, PrimitiveType, Schema, SchemaRef, StructField};
 use crate::{DataVisitor, DeltaResult, Error};
@@ -6,7 +7,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::{Array, GenericListArray, MapArray, RecordBatch, StructArray};
 use arrow_schema::{ArrowError, DataType as ArrowDataType, Schema as ArrowSchema};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use tracing::{debug, warn};
 use url::Url;
 
@@ -170,19 +171,34 @@ impl ArrowEngineData {
         Ok(ArrowEngineData::new(data?))
     }
 
-    // TODO needs to apply the schema to the parquet read
-    pub fn try_create_from_parquet(_schema: SchemaRef, location: Url) -> DeltaResult<Self> {
+    pub fn try_create_from_parquet(schema: SchemaRef, location: Url) -> DeltaResult<Self> {
         let file = File::open(
             location
                 .to_file_path()
                 .map_err(|_| Error::generic("can only read local files"))?,
         )?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
+        let parquet_schema = metadata.schema();
+        let requested_schema: ArrowSchema = (&*schema).try_into()?;
+        let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let indicies = get_requested_indices(&requested_schema, parquet_schema)?;
+        if let Some(mask) = generate_mask(
+            &requested_schema,
+            parquet_schema,
+            builder.parquet_schema(),
+            &indicies,
+        ) {
+            builder = builder.with_projection(mask);
+        }
         let mut reader = builder.build()?;
         let data = reader
             .next()
             .ok_or(Error::generic("No data found reading parquet file"))?;
-        Ok(ArrowEngineData::new(data?))
+        Ok(ArrowEngineData::new(reorder_record_batch(
+            requested_schema.into(),
+            data?,
+            &indicies,
+        )?))
     }
 
     /// Extracts an exploded view (all leaf values), in schema order of that data contained
