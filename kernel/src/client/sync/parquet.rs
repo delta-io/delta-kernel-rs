@@ -5,14 +5,10 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReader
 use tracing::debug;
 use url::Url;
 
-use crate::{
-    client::{
-        arrow_data::ArrowEngineData,
-        arrow_utils::{generate_mask, get_requested_indices, reorder_record_batch},
-    },
-    schema::SchemaRef,
-    DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, ParquetHandler,
-};
+use crate::client::arrow_data::ArrowEngineData;
+use crate::client::arrow_utils::{generate_mask, get_requested_indices, reorder_record_batch};
+use crate::schema::SchemaRef;
+use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, ParquetHandler};
 
 pub(crate) struct SyncParquetHandler;
 
@@ -38,7 +34,7 @@ fn try_create_from_parquet(schema: SchemaRef, location: Url) -> DeltaResult<Arro
     let mut reader = builder.build()?;
     let data = reader
         .next()
-        .ok_or(Error::generic("No data found reading parquet file"))?;
+        .ok_or_else(|| Error::generic("No data found reading parquet file"))?;
     Ok(ArrowEngineData::new(reorder_record_batch(
         requested_schema.into(),
         data?,
@@ -59,8 +55,7 @@ impl ParquetHandler for SyncParquetHandler {
         }
         let locations: Vec<_> = files.iter().map(|file| file.location.clone()).collect();
         Ok(Box::new(locations.into_iter().map(move |location| {
-            let d = try_create_from_parquet(schema.clone(), location);
-            d.map(|d| Box::new(d) as _)
+            try_create_from_parquet(schema.clone(), location).map(|d| Box::new(d) as _)
         })))
     }
 }

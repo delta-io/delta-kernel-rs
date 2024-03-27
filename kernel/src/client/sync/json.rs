@@ -50,8 +50,8 @@ impl JsonHandler for SyncJsonHandler {
         let res: Vec<_> = files
             .iter()
             .map(|file| {
-                let d = try_create_from_json(schema.clone(), file.location.clone());
-                d.map(|d| Box::new(d) as _)
+                try_create_from_json(schema.clone(), file.location.clone())
+                    .map(|d| Box::new(d) as _)
             })
             .collect();
         Ok(Box::new(res.into_iter()))
