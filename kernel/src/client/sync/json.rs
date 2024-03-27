@@ -23,7 +23,6 @@ pub(crate) struct SyncJsonHandler;
 fn try_create_from_json(schema: SchemaRef, location: Url) -> DeltaResult<ArrowEngineData> {
     let arrow_schema: ArrowSchema = (&*schema).try_into()?;
     debug!("Reading {:#?} with schema: {:#?}", location, arrow_schema);
-    // todo: Check scheme of url
     let file = File::open(
         location
             .to_file_path()
