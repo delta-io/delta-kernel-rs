@@ -1,20 +1,15 @@
-use super::arrow_utils::{generate_mask, get_requested_indices, reorder_record_batch};
 use crate::engine_data::{EngineData, EngineList, EngineMap, GetData};
 use crate::schema::{DataType, PrimitiveType, Schema, SchemaRef, StructField};
 use crate::{DataVisitor, DeltaResult, Error};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, Int64Type};
-use arrow_array::{Array, GenericListArray, MapArray, RecordBatch, StructArray};
-use arrow_schema::{ArrowError, DataType as ArrowDataType, Schema as ArrowSchema};
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
+use arrow_array::{Array, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray};
+use arrow_schema::{ArrowError, DataType as ArrowDataType};
 use tracing::{debug, warn};
-use url::Url;
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufReader;
 use std::sync::Arc;
 
 /// ArrowEngineData holds an Arrow RecordBatch, implements `EngineData` so the kernel can extract from it.
@@ -101,7 +96,10 @@ impl ProvidesColumnByName for StructArray {
     }
 }
 
-impl EngineList for GenericListArray<i32> {
+impl<OffsetSize> EngineList for GenericListArray<OffsetSize>
+where
+    OffsetSize: OffsetSizeTrait,
+{
     fn len(&self, row_index: usize) -> usize {
         self.value(row_index).len()
     }
@@ -154,53 +152,6 @@ impl EngineMap for MapArray {
 }
 
 impl ArrowEngineData {
-    pub fn try_create_from_json(schema: SchemaRef, location: Url) -> DeltaResult<Self> {
-        let arrow_schema: ArrowSchema = (&*schema).try_into()?;
-        debug!("Reading {:#?} with schema: {:#?}", location, arrow_schema);
-        // todo: Check scheme of url
-        let file = File::open(
-            location
-                .to_file_path()
-                .map_err(|_| Error::generic("can only read local files"))?,
-        )?;
-        let mut json =
-            arrow_json::ReaderBuilder::new(Arc::new(arrow_schema)).build(BufReader::new(file))?;
-        let data = json
-            .next()
-            .ok_or(Error::generic("No data found reading json file"))?;
-        Ok(ArrowEngineData::new(data?))
-    }
-
-    pub fn try_create_from_parquet(schema: SchemaRef, location: Url) -> DeltaResult<Self> {
-        let file = File::open(
-            location
-                .to_file_path()
-                .map_err(|_| Error::generic("can only read local files"))?,
-        )?;
-        let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
-        let parquet_schema = metadata.schema();
-        let requested_schema: ArrowSchema = (&*schema).try_into()?;
-        let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-        let indicies = get_requested_indices(&requested_schema, parquet_schema)?;
-        if let Some(mask) = generate_mask(
-            &requested_schema,
-            parquet_schema,
-            builder.parquet_schema(),
-            &indicies,
-        ) {
-            builder = builder.with_projection(mask);
-        }
-        let mut reader = builder.build()?;
-        let data = reader
-            .next()
-            .ok_or(Error::generic("No data found reading parquet file"))?;
-        Ok(ArrowEngineData::new(reorder_record_batch(
-            requested_schema.into(),
-            data?,
-            &indicies,
-        )?))
-    }
-
     /// Extracts an exploded view (all leaf values), in schema order of that data contained
     /// within. `out_col_array` is filled with [`GetData`] items that can be used to get at the
     /// actual primitive types.
@@ -276,7 +227,7 @@ impl ArrowEngineData {
             }
             (&ArrowDataType::Utf8, &DataType::Primitive(PrimitiveType::String)) => {
                 debug!("Pushing string array for {}", field.name);
-                out_col_array.push(col.as_string::<i32>());
+                out_col_array.push(col.as_string());
             }
             (&ArrowDataType::Int32, &DataType::Primitive(PrimitiveType::Integer)) => {
                 debug!("Pushing int32 array for {}", field.name);
@@ -286,14 +237,62 @@ impl ArrowEngineData {
                 debug!("Pushing int64 array for {}", field.name);
                 out_col_array.push(col.as_primitive::<Int64Type>());
             }
-            (ArrowDataType::List(_arrow_field), DataType::Array(_array_type)) => {
-                // TODO(nick): validate the element types match
-                debug!("Pushing list for {}", field.name);
-                out_col_array.push(col.as_list());
+            (ArrowDataType::List(arrow_field), DataType::Array(_array_type)) => {
+                match arrow_field.data_type() {
+                    ArrowDataType::Utf8 => {
+                        debug!("Pushing list for {}", field.name);
+                        let list: &GenericListArray<i32> = col.as_list();
+                        out_col_array.push(list);
+                    }
+                    _ => {
+                        return Err(Error::UnexpectedColumnType(format!(
+                            "On {}: Only support lists that contain strings",
+                            field.name()
+                        )))
+                    }
+                }
             }
-            (&ArrowDataType::Map(_, _), &DataType::Map(_)) => {
-                debug!("Pushing map for {}", field.name);
-                out_col_array.push(col.as_map());
+            (ArrowDataType::LargeList(arrow_field), DataType::Array(_array_type)) => {
+                match arrow_field.data_type() {
+                    ArrowDataType::Utf8 => {
+                        debug!("Pushing large list for {}", field.name);
+                        let list: &GenericListArray<i64> = col.as_list();
+                        out_col_array.push(list);
+                    }
+                    _ => {
+                        return Err(Error::UnexpectedColumnType(format!(
+                            "On {}: Only support lists that contain strings",
+                            field.name()
+                        )))
+                    }
+                }
+            }
+            (&ArrowDataType::Map(ref map_field, _sorted_keys), &DataType::Map(_)) => {
+                if let ArrowDataType::Struct(fields) = map_field.data_type() {
+                    let mut fcount = 0;
+                    for field in fields {
+                        if field.data_type() != &ArrowDataType::Utf8 {
+                            return Err(Error::UnexpectedColumnType(format!(
+                                "On {}: Only support maps of String->String",
+                                field.name()
+                            )));
+                        }
+                        fcount += 1;
+                    }
+                    if fcount != 2 {
+                        return Err(Error::UnexpectedColumnType(format!(
+                            "On {}: Expect map field struct to have two fields",
+                            field.name()
+                        )));
+                    }
+                    debug!("Pushing map for {}", field.name);
+                    out_col_array.push(col.as_map());
+                } else {
+                    return Err(Error::UnexpectedColumnType(format!(
+                        "On {}: Expect arrow maps to have struct field in DataType",
+                        field.name()
+                    )));
+                }
             }
             (arrow_data_type, data_type) => {
                 warn!(

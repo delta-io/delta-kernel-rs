@@ -10,6 +10,9 @@ pub mod arrow_expression;
 pub mod arrow_data;
 
 #[cfg(any(feature = "default-client", feature = "sync-client"))]
+pub mod arrow_get_data;
+
+#[cfg(any(feature = "default-client", feature = "sync-client"))]
 pub mod arrow_utils;
 
 #[cfg(feature = "default-client")]
