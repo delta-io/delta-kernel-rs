@@ -317,6 +317,8 @@ pub enum PrimitiveType {
     Date,
     /// Microsecond precision timestamp, adjusted to UTC.
     Timestamp,
+    #[serde(rename = "timestamp_ntz")]
+    TimestampNtz,
     // TODO: timestamp without timezone
     #[serde(
         serialize_with = "serialize_decimal",
@@ -377,6 +379,7 @@ impl Display for PrimitiveType {
             PrimitiveType::Binary => write!(f, "binary"),
             PrimitiveType::Date => write!(f, "date"),
             PrimitiveType::Timestamp => write!(f, "timestamp"),
+            PrimitiveType::TimestampNtz => write!(f, "timestamp_ntz"),
             PrimitiveType::Decimal(precision, scale) => {
                 write!(f, "decimal({}, {})", precision, scale)
             }
