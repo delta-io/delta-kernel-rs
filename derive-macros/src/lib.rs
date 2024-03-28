@@ -3,7 +3,13 @@ use quote::{quote, quote_spanned};
 use syn::spanned::Spanned;
 use syn::{parse_macro_input, Data, DataStruct, DeriveInput, Fields, PathArguments, Type};
 
-#[proc_macro_derive(Schema, attributes(schema))]
+/// Derive a `deltakernel::schemas::GetField` implementation for the annotated struct. The actual
+/// field names in the schema (and therefore of the struct members) are all mandated by Delta spec,
+/// and so the user of this macro is responsible for ensuring that e.g. `Metadata::schema_string is
+/// the snake_case-ified version of `schemaString` from Delta's Change Metadata action (this macro
+/// allows the use of standard rust snake_case, and will convert to the correct delta schema
+/// camelCase version).
+#[proc_macro_derive(Schema)]
 pub fn derive_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let struct_ident = input.ident;
