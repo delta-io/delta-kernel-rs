@@ -60,18 +60,29 @@ pub fn sort_record_batch(batch: RecordBatch) -> RecordBatch {
     RecordBatch::try_new(batch.schema(), columns).unwrap()
 }
 
+static SKIPPED_TESTS: &[&str; 3] = &[
+    // Kernel does not support column mapping yet
+    "column_mapping",
+    // We don't support iceberg yet
+    "iceberg_compat_v1",
+    // For multi_partitioned_2: The golden table stores the timestamp as an INT96 (which is
+    // nanosecond precision), while the spec says we should read partition columns as
+    // microseconds. This means the read and golden data don't line up. When this is released in
+    // `dat` upstream, we can stop skipping this test
+    "multi_partitioned_2",
+];
+
 pub async fn assert_scan_data(
     engine_interface: Arc<dyn EngineInterface>,
     test_case: &TestCaseInfo,
 ) -> TestResult<()> {
     let root_dir = test_case.root_dir();
-    // if root_dir.ends_with("multi_partitioned_2") {
-    //     // Skip this test. The golden table stores the timestamp as an INT96 (which is nanosecond
-    //     // precision), while the spec says we should read partition columns as microseconds. This
-    //     // means the read and golden data don't line up. When this is fixed in `dat` upstream, we
-    //     // can remove this early return
-    //     return Ok(());
-    // }
+    for skipped in SKIPPED_TESTS {
+        if root_dir.ends_with(skipped) {
+            return Ok(());
+        }
+    }
+
     let engine_interface = engine_interface.as_ref();
     let table_root = test_case.table_root()?;
     let table = Table::new(table_root);
