@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use arrow::{
     compute::{concat_batches, filter_record_batch, lexsort_to_indices, take, SortColumn},
@@ -12,7 +12,7 @@ use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream
 
 use crate::{TestCaseInfo, TestResult};
 
-pub async fn read_golden(path: &PathBuf, _version: Option<&str>) -> Option<RecordBatch> {
+pub async fn read_golden(path: &Path, _version: Option<&str>) -> Option<RecordBatch> {
     let expected_root = path.join("expected").join("latest").join("table_content");
     let store = Arc::new(LocalFileSystem::new_with_prefix(&expected_root).unwrap());
     let files = store.list(None).try_collect::<Vec<_>>().await.unwrap();
@@ -55,7 +55,7 @@ pub fn sort_record_batch(batch: RecordBatch) -> RecordBatch {
     let columns = batch
         .columns()
         .iter()
-        .map(|c| take(&*c, &indices, None).unwrap())
+        .map(|c| take(c, &indices, None).unwrap())
         .collect();
     RecordBatch::try_new(batch.schema(), columns).unwrap()
 }
