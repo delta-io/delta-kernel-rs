@@ -69,20 +69,15 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
         let name = get_schema_name(name);
         match field.ty {
             Type::Path(ref type_path) => {
-                if let Some(fin) = type_path.path.segments.iter().last() {
-                    let type_ident = &fin.ident;
-                    if let PathArguments::AngleBracketed(angle_args) = &fin.arguments {
-                        quote_spanned! {field.span()=>
-                                        #type_ident::#angle_args::get_field(stringify!(#name))
-                        }
-                    } else {
-                        quote_spanned! {field.span()=>
-                                        #type_ident::get_field(stringify!(#name))
-                        }
+                let type_path_quoted: Vec<TokenStream> = type_path.path.segments.iter().map(|segment| {
+                    let segment_ident = &segment.ident;
+                    match &segment.arguments {
+                        PathArguments::None => quote! { #segment_ident },
+                        PathArguments::AngleBracketed(angle_args) => quote! { #segment_ident::#angle_args },
+                        _ => panic!("Can only handle <> type path args"),
                     }
-                } else {
-                    panic!("Couldn't get type");
-                }
+                }).collect();
+                quote_spanned! { field.span() => #(#type_path_quoted),* ::get_field(stringify!(#name))}
             }
             _ => {
                 panic!("Can't handle type: {:?}", field.ty);
