@@ -1,4 +1,8 @@
-use std::{io::Cursor, sync::Arc};
+use std::{
+    fs::File,
+    io::{BufReader, Cursor},
+    sync::Arc,
+};
 
 use crate::{
     schema::SchemaRef, DeltaResult, EngineData, Error, Expression, FileDataReadResultIterator,
@@ -6,15 +10,33 @@ use crate::{
 };
 use arrow_array::{cast::AsArray, RecordBatch};
 use arrow_json::ReaderBuilder;
-use arrow_schema::SchemaRef as ArrowSchemaRef;
+use arrow_schema::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use arrow_select::concat::concat_batches;
 use itertools::Itertools;
 use tracing::debug;
+use url::Url;
 
-use super::data::SimpleData;
+use crate::client::arrow_data::ArrowEngineData;
 
-pub(crate) struct SimpleJsonHandler {}
-impl JsonHandler for SimpleJsonHandler {
+pub(crate) struct SyncJsonHandler;
+
+fn try_create_from_json(schema: SchemaRef, location: Url) -> DeltaResult<ArrowEngineData> {
+    let arrow_schema: ArrowSchema = (&*schema).try_into()?;
+    debug!("Reading {:#?} with schema: {:#?}", location, arrow_schema);
+    let file = File::open(
+        location
+            .to_file_path()
+            .map_err(|_| Error::generic("can only read local files"))?,
+    )?;
+    let mut json =
+        arrow_json::ReaderBuilder::new(Arc::new(arrow_schema)).build(BufReader::new(file))?;
+    let data = json
+        .next()
+        .ok_or(Error::generic("No data found reading json file"))?;
+    Ok(ArrowEngineData::new(data?))
+}
+
+impl JsonHandler for SyncJsonHandler {
     fn read_json_files(
         &self,
         files: &[FileMeta],
@@ -28,11 +50,8 @@ impl JsonHandler for SimpleJsonHandler {
         let res: Vec<_> = files
             .iter()
             .map(|file| {
-                let d = super::data::SimpleData::try_create_from_json(
-                    schema.clone(),
-                    file.location.clone(),
-                );
-                d.map(|d| Box::new(d) as _)
+                try_create_from_json(schema.clone(), file.location.clone())
+                    .map(|d| Box::new(d) as _)
             })
             .collect();
         Ok(Box::new(res.into_iter()))
@@ -45,7 +64,7 @@ impl JsonHandler for SimpleJsonHandler {
     ) -> DeltaResult<Box<dyn EngineData>> {
         // TODO: This is taken from the default client as it's the same. We should share an
         // implementation at some point
-        let json_strings: RecordBatch = SimpleData::try_from_engine_data(json_strings)?.into();
+        let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
         if json_strings.num_columns() != 1 {
             return Err(Error::missing_column("Expected single column"));
         }
@@ -73,6 +92,6 @@ impl JsonHandler for SimpleJsonHandler {
         let batches: Vec<_> = ReaderBuilder::new(schema.clone())
             .build(Cursor::new(data))?
             .try_collect()?;
-        Ok(Box::new(SimpleData::new(concat_batches(&schema, &batches)?)) as _)
+        Ok(Box::new(ArrowEngineData::new(concat_batches(&schema, &batches)?)) as _)
     }
 }

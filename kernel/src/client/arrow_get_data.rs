@@ -1,6 +1,7 @@
 use arrow_array::{
     types::{GenericStringType, Int32Type, Int64Type},
-    Array, BooleanArray, GenericByteArray, GenericListArray, MapArray, PrimitiveArray,
+    Array, BooleanArray, GenericByteArray, GenericListArray, MapArray, OffsetSizeTrait,
+    PrimitiveArray,
 };
 
 use crate::{
@@ -50,7 +51,10 @@ impl<'a> GetData<'a> for GenericByteArray<GenericStringType<i32>> {
     }
 }
 
-impl<'a> GetData<'a> for GenericListArray<i32> {
+impl<'a, OffsetSize> GetData<'a> for GenericListArray<OffsetSize>
+where
+    OffsetSize: OffsetSizeTrait,
+{
     fn get_list(
         &'a self,
         row_index: usize,

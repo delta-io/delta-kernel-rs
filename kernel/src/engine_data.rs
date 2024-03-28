@@ -89,7 +89,7 @@ macro_rules! impl_default_get {
 /// When calling back into a [`DataVisitor`], the engine needs to provide a slice of items that
 /// implement this trait. This allows type_safe extraction from the raw data by the kernel. By
 /// default all these methods will return an `Error` that an incorrect type has been asked
-/// for. Therefore, for each "data container" an Engine has, it is only nessecary to implement the
+/// for. Therefore, for each "data container" an Engine has, it is only necessary to implement the
 /// `get_x` method for the type it holds.
 pub trait GetData<'a> {
     impl_default_get!(

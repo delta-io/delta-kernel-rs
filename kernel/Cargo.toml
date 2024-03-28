@@ -9,8 +9,6 @@ readme.workspace = true
 version.workspace = true
 
 [dependencies]
-arrow-array = { version = "^49.0" }
-arrow-select = { version = "^49.0" }
 bytes = "1.4"
 chrono = { version = "0.4" }
 either = "1.8"
@@ -36,13 +34,15 @@ derive-macros = { path = "../derive-macros" }
 visibility = "0.1.0"
 
 # Used in default client
+arrow-array = { version = "^49.0", optional = true }
+arrow-select = { version = "^49.0", optional = true }
 arrow-arith = { version = "^49.0", optional = true }
 arrow-json = { version = "^49.0", optional = true }
 arrow-ord = { version = "^49.0", optional = true }
 arrow-schema = { version = "^49.0", optional = true }
 futures = { version = "0.3", optional = true }
 object_store = { version = "^0.8.0", optional = true }
-# Used in default and simple client
+# Used in default and sync client
 parquet = { version = "^49.0", optional = true }
 
 # optionally used with default client (though not required)
@@ -50,13 +50,15 @@ tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
 
 [features]
 arrow-conversion = ["arrow-schema"]
-default = ["simple-client"]
+arrow-expression = ["arrow-arith", "arrow-array", "arrow-ord", "arrow-schema"]
+default = ["sync-client"]
 default-client = [
   "arrow-conversion",
-  "arrow-arith",
+  "arrow-expression",
+  "arrow-array",
   "arrow-json",
-  "arrow-ord",
   "arrow-schema",
+  "arrow-select",
   "futures",
   "object_store",
   "parquet/async",
@@ -65,15 +67,18 @@ default-client = [
 ]
 
 developer-visibility = []
-simple-client = [
+sync-client = [
   "arrow-conversion",
+  "arrow-expression",
+  "arrow-array",
   "arrow-json",
+  "arrow-select",
   "parquet"
 ]
 
 [dev-dependencies]
 arrow = { version = "^49.0", features = ["json", "prettyprint"] }
-deltakernel = { path = ".", features = ["default-client"] }
+deltakernel = { path = ".", features = ["default-client", "sync-client"] }
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 tempfile = "3"
 test-case = { version = "3.1.0" }

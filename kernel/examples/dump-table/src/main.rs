@@ -4,13 +4,15 @@ use std::sync::Arc;
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
-use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
-use deltakernel::client::DefaultTableClient;
+use deltakernel::client::arrow_data::ArrowEngineData;
+use deltakernel::client::default::executor::tokio::TokioBackgroundExecutor;
+use deltakernel::client::default::DefaultEngineInterface;
+use deltakernel::client::sync::SyncEngineInterface;
 use deltakernel::scan::ScanBuilder;
-use deltakernel::simple_client::data::SimpleData;
-use deltakernel::{DeltaResult, Table};
+use deltakernel::schema::Schema;
+use deltakernel::{DeltaResult, EngineInterface, Table};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 /// An example program that dumps out the data of a delta table. Struct and Map types are not
 /// supported.
@@ -19,8 +21,23 @@ use clap::Parser;
 #[command(propagate_version = true)]
 struct Cli {
     /// Path to the table to inspect
-    #[arg(short, long)]
     path: String,
+
+    /// Which EngineInterface to use
+    #[arg(short, long, value_enum, default_value_t = Interface::Default)]
+    interface: Interface,
+
+    /// Comma separated list of columns to select
+    #[arg(long, value_delimiter=',', num_args(0..))]
+    columns: Option<Vec<String>>,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum Interface {
+    /// Use the default, async engine interface
+    Default,
+    /// Use the sync engine interface (local files only)
+    Sync,
 }
 
 fn main() -> DeltaResult<()> {
@@ -29,24 +46,48 @@ fn main() -> DeltaResult<()> {
     let url = url::Url::parse(&cli.path)?;
 
     println!("Reading {url}");
-    let engine_interface = DefaultTableClient::try_new(
-        &url,
-        HashMap::<String, String>::new(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    )?;
+    let engine_interface: Box<dyn EngineInterface> = match cli.interface {
+        Interface::Default => Box::new(DefaultEngineInterface::try_new(
+            &url,
+            HashMap::<String, String>::new(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        )?),
+        Interface::Sync => Box::new(SyncEngineInterface::new()),
+    };
 
     let table = Table::new(url);
-    let snapshot = table.snapshot(&engine_interface, None)?;
+    let snapshot = table.snapshot(engine_interface.as_ref(), None)?;
 
-    let scan = ScanBuilder::new(snapshot).build();
+    let read_schema_opt = cli
+        .columns
+        .map(|cols| {
+            use itertools::Itertools;
+            let table_schema = snapshot.schema();
+            let selected_fields = cols
+                .iter()
+                .map(|col| {
+                    table_schema
+                        .field(col)
+                        .cloned()
+                        .ok_or(deltakernel::Error::Generic(format!(
+                            "Table has no such column: {col}"
+                        )))
+                })
+                .try_collect();
+            selected_fields.map(|selected_fields| Arc::new(Schema::new(selected_fields)))
+        })
+        .transpose()?;
+    let scan = ScanBuilder::new(snapshot)
+        .with_schema_opt(read_schema_opt)
+        .build();
 
     let mut batches = vec![];
-    for res in scan.execute(&engine_interface)?.into_iter() {
+    for res in scan.execute(engine_interface.as_ref())?.into_iter() {
         let data = res.raw_data?;
         let record_batch: RecordBatch = data
             .into_any()
-            .downcast::<SimpleData>()
-            .map_err(|_| deltakernel::Error::EngineDataType("SimpleData".to_string()))?
+            .downcast::<ArrowEngineData>()
+            .map_err(|_| deltakernel::Error::EngineDataType("ArrowEngineData".to_string()))?
             .into();
         let batch = if let Some(mask) = res.mask {
             filter_record_batch(&record_batch, &mask.into())?

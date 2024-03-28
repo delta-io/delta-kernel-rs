@@ -5,7 +5,9 @@
 //! A generic trait [TaskExecutor] can be implemented with your preferred async
 //! runtime. Behind the `tokio` feature flag, we provide a both a single-threaded
 //! and multi-threaded executor based on Tokio.
-use futures::Future;
+use futures::{future::BoxFuture, Future};
+
+use crate::DeltaResult;
 
 /// An executor that can be used to run async tasks. This is used by IO functions
 /// within the default Engineinterface.
@@ -27,14 +29,22 @@ pub trait TaskExecutor: Send + Sync + 'static {
     fn spawn<F>(&self, task: F)
     where
         F: Future<Output = ()> + Send + 'static;
+
+    fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, DeltaResult<R>>
+    where
+        T: FnOnce() -> R + Send + 'static,
+        R: Send + 'static;
 }
 
 #[cfg(any(feature = "tokio", test))]
 pub mod tokio {
     use super::TaskExecutor;
+    use futures::TryFutureExt;
     use futures::{future::BoxFuture, Future};
     use std::sync::mpsc::channel;
     use tokio::runtime::RuntimeFlavor;
+
+    use crate::DeltaResult;
 
     /// A [`TaskExecutor`] that uses the tokio single-threaded runtime in a
     /// background thread to service tasks.
@@ -124,6 +134,14 @@ pub mod tokio {
         {
             self.send_future(Box::pin(task));
         }
+
+        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, DeltaResult<R>>
+        where
+            T: FnOnce() -> R + Send + 'static,
+            R: Send + 'static,
+        {
+            Box::pin(tokio::task::spawn_blocking(task).map_err(crate::Error::join_failure))
+        }
     }
 
     /// A [`TaskExecutor`] that uses the tokio multi-threaded runtime. You can
@@ -178,6 +196,14 @@ pub mod tokio {
             F: Future<Output = ()> + Send + 'static,
         {
             self.handle.spawn(task);
+        }
+
+        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, DeltaResult<R>>
+        where
+            T: FnOnce() -> R + Send + 'static,
+            R: Send + 'static,
+        {
+            Box::pin(tokio::task::spawn_blocking(task).map_err(crate::Error::join_failure))
         }
     }
 

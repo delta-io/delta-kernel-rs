@@ -4,44 +4,40 @@ use crate::{DataVisitor, DeltaResult, Error};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, Int64Type};
-use arrow_array::{Array, GenericListArray, MapArray, RecordBatch, StructArray};
-use arrow_schema::{ArrowError, DataType as ArrowDataType, Schema as ArrowSchema};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use arrow_array::{Array, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray};
+use arrow_schema::{ArrowError, DataType as ArrowDataType};
 use tracing::{debug, warn};
-use url::Url;
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufReader;
 use std::sync::Arc;
 
-/// SimpleData holds a RecordBatch, implements `EngineData` so the kernel can extract from it.
-pub struct SimpleData {
+/// ArrowEngineData holds an Arrow RecordBatch, implements `EngineData` so the kernel can extract from it.
+pub struct ArrowEngineData {
     data: RecordBatch,
 }
 
-impl SimpleData {
-    /// Create a new `SimpleData` from a `RecordBatch`
+impl ArrowEngineData {
+    /// Create a new `ArrowEngineData` from a `RecordBatch`
     pub fn new(data: RecordBatch) -> Self {
-        SimpleData { data }
+        ArrowEngineData { data }
     }
 
-    /// Utility constructor to get a `Box<SimpleData>` out of a `Box<dyn EngineData>`
+    /// Utility constructor to get a `Box<ArrowEngineData>` out of a `Box<dyn EngineData>`
     pub fn try_from_engine_data(engine_data: Box<dyn EngineData>) -> DeltaResult<Box<Self>> {
         engine_data
             .into_any()
-            .downcast::<SimpleData>()
-            .map_err(|_| Error::engine_data_type("SimpleData"))
+            .downcast::<ArrowEngineData>()
+            .map_err(|_| Error::engine_data_type("ArrowEngineData"))
     }
 
-    /// Get a reference to the `RecordBatch` this `SimpleData` is wrapping
+    /// Get a reference to the `RecordBatch` this `ArrowEngineData` is wrapping
     pub fn record_batch(&self) -> &RecordBatch {
         &self.data
     }
 }
 
-impl EngineData for SimpleData {
+impl EngineData for ArrowEngineData {
     fn extract(&self, schema: SchemaRef, visitor: &mut dyn DataVisitor) -> DeltaResult<()> {
         let mut col_array = vec![];
         self.extract_columns(&mut col_array, &schema)?;
@@ -61,20 +57,20 @@ impl EngineData for SimpleData {
     }
 }
 
-impl From<RecordBatch> for SimpleData {
+impl From<RecordBatch> for ArrowEngineData {
     fn from(value: RecordBatch) -> Self {
-        SimpleData::new(value)
+        ArrowEngineData::new(value)
     }
 }
 
-impl From<SimpleData> for RecordBatch {
-    fn from(value: SimpleData) -> Self {
+impl From<ArrowEngineData> for RecordBatch {
+    fn from(value: ArrowEngineData) -> Self {
         value.data
     }
 }
 
-impl From<Box<SimpleData>> for RecordBatch {
-    fn from(value: Box<SimpleData>) -> Self {
+impl From<Box<ArrowEngineData>> for RecordBatch {
+    fn from(value: Box<ArrowEngineData>) -> Self {
         value.data
     }
 }
@@ -100,7 +96,10 @@ impl ProvidesColumnByName for StructArray {
     }
 }
 
-impl EngineList for GenericListArray<i32> {
+impl<OffsetSize> EngineList for GenericListArray<OffsetSize>
+where
+    OffsetSize: OffsetSizeTrait,
+{
     fn len(&self, row_index: usize) -> usize {
         self.value(row_index).len()
     }
@@ -152,38 +151,7 @@ impl EngineMap for MapArray {
     }
 }
 
-impl SimpleData {
-    pub fn try_create_from_json(schema: SchemaRef, location: Url) -> DeltaResult<Self> {
-        let arrow_schema: ArrowSchema = (&*schema).try_into()?;
-        debug!("Reading {:#?} with schema: {:#?}", location, arrow_schema);
-        // todo: Check scheme of url
-        let file = File::open(
-            location
-                .to_file_path()
-                .map_err(|_| Error::generic("can only read local files"))?,
-        )?;
-        let mut json =
-            arrow_json::ReaderBuilder::new(Arc::new(arrow_schema)).build(BufReader::new(file))?;
-        let data = json
-            .next()
-            .ok_or(Error::generic("No data found reading json file"))?;
-        Ok(SimpleData::new(data?))
-    }
-
-    pub fn try_create_from_parquet(_schema: SchemaRef, location: Url) -> DeltaResult<Self> {
-        let file = File::open(
-            location
-                .to_file_path()
-                .map_err(|_| Error::generic("can only read local files"))?,
-        )?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-        let mut reader = builder.build()?;
-        let data = reader
-            .next()
-            .ok_or(Error::generic("No data found reading parquet file"))?;
-        Ok(SimpleData::new(data?))
-    }
-
+impl ArrowEngineData {
     /// Extracts an exploded view (all leaf values), in schema order of that data contained
     /// within. `out_col_array` is filled with [`GetData`] items that can be used to get at the
     /// actual primitive types.
@@ -200,7 +168,7 @@ impl SimpleData {
         schema: &Schema,
     ) -> DeltaResult<()> {
         debug!("Extracting column getters for {:#?}", schema);
-        SimpleData::extract_columns_from_array(out_col_array, schema, Some(&self.data))
+        ArrowEngineData::extract_columns_from_array(out_col_array, schema, Some(&self.data))
     }
 
     fn extract_columns_from_array<'a>(
@@ -247,7 +215,11 @@ impl SimpleData {
             (&ArrowDataType::Struct(_), DataType::Struct(fields)) => {
                 // both structs, so recurse into col
                 let struct_array = col.as_struct();
-                SimpleData::extract_columns_from_array(out_col_array, fields, Some(struct_array))?;
+                ArrowEngineData::extract_columns_from_array(
+                    out_col_array,
+                    fields,
+                    Some(struct_array),
+                )?;
             }
             (&ArrowDataType::Boolean, &DataType::Primitive(PrimitiveType::Boolean)) => {
                 debug!("Pushing boolean array for {}", field.name);
@@ -255,7 +227,7 @@ impl SimpleData {
             }
             (&ArrowDataType::Utf8, &DataType::Primitive(PrimitiveType::String)) => {
                 debug!("Pushing string array for {}", field.name);
-                out_col_array.push(col.as_string::<i32>());
+                out_col_array.push(col.as_string());
             }
             (&ArrowDataType::Int32, &DataType::Primitive(PrimitiveType::Integer)) => {
                 debug!("Pushing int32 array for {}", field.name);
@@ -265,14 +237,62 @@ impl SimpleData {
                 debug!("Pushing int64 array for {}", field.name);
                 out_col_array.push(col.as_primitive::<Int64Type>());
             }
-            (ArrowDataType::List(_arrow_field), DataType::Array(_array_type)) => {
-                // TODO(nick): validate the element types match
-                debug!("Pushing list for {}", field.name);
-                out_col_array.push(col.as_list());
+            (ArrowDataType::List(arrow_field), DataType::Array(_array_type)) => {
+                match arrow_field.data_type() {
+                    ArrowDataType::Utf8 => {
+                        debug!("Pushing list for {}", field.name);
+                        let list: &GenericListArray<i32> = col.as_list();
+                        out_col_array.push(list);
+                    }
+                    _ => {
+                        return Err(Error::UnexpectedColumnType(format!(
+                            "On {}: Only support lists that contain strings",
+                            field.name()
+                        )))
+                    }
+                }
             }
-            (&ArrowDataType::Map(_, _), &DataType::Map(_)) => {
-                debug!("Pushing map for {}", field.name);
-                out_col_array.push(col.as_map());
+            (ArrowDataType::LargeList(arrow_field), DataType::Array(_array_type)) => {
+                match arrow_field.data_type() {
+                    ArrowDataType::Utf8 => {
+                        debug!("Pushing large list for {}", field.name);
+                        let list: &GenericListArray<i64> = col.as_list();
+                        out_col_array.push(list);
+                    }
+                    _ => {
+                        return Err(Error::UnexpectedColumnType(format!(
+                            "On {}: Only support lists that contain strings",
+                            field.name()
+                        )))
+                    }
+                }
+            }
+            (&ArrowDataType::Map(ref map_field, _sorted_keys), &DataType::Map(_)) => {
+                if let ArrowDataType::Struct(fields) = map_field.data_type() {
+                    let mut fcount = 0;
+                    for field in fields {
+                        if field.data_type() != &ArrowDataType::Utf8 {
+                            return Err(Error::UnexpectedColumnType(format!(
+                                "On {}: Only support maps of String->String",
+                                field.name()
+                            )));
+                        }
+                        fcount += 1;
+                    }
+                    if fcount != 2 {
+                        return Err(Error::UnexpectedColumnType(format!(
+                            "On {}: Expect map field struct to have two fields",
+                            field.name()
+                        )));
+                    }
+                    debug!("Pushing map for {}", field.name);
+                    out_col_array.push(col.as_map());
+                } else {
+                    return Err(Error::UnexpectedColumnType(format!(
+                        "On {}: Expect arrow maps to have struct field in DataType",
+                        field.name()
+                    )));
+                }
             }
             (arrow_data_type, data_type) => {
                 warn!(
@@ -317,25 +337,25 @@ mod tests {
     use arrow_array::{RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 
-    use crate::actions::{Metadata, Protocol};
-    use crate::DeltaResult;
     use crate::{
-        actions::get_log_schema,
-        simple_client::{data::SimpleData, SimpleClient},
-        EngineData, EngineInterface,
+        actions::{get_log_schema, Metadata, Protocol},
+        client::sync::SyncEngineInterface,
+        DeltaResult, EngineData, EngineInterface,
     };
+
+    use super::ArrowEngineData;
 
     fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
         let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
         let schema = Arc::new(ArrowSchema::new(vec![string_field]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
             .expect("Can't convert to record batch");
-        Box::new(SimpleData::new(batch))
+        Box::new(ArrowEngineData::new(batch))
     }
 
     #[test]
     fn test_md_extract() -> DeltaResult<()> {
-        let client = SimpleClient::new();
+        let client = SyncEngineInterface::new();
         let handler = client.get_json_handler();
         let json_strings: StringArray = vec![
             r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
@@ -354,7 +374,7 @@ mod tests {
 
     #[test]
     fn test_nullable_struct() -> DeltaResult<()> {
-        let client = SimpleClient::new();
+        let client = SyncEngineInterface::new();
         let handler = client.get_json_handler();
         let json_strings: StringArray = vec![
             r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,

@@ -2,8 +2,8 @@
 //! Must run at the root of the crate
 use std::path::PathBuf;
 
+use deltakernel::client::sync::SyncEngineInterface;
 use deltakernel::scan::ScanBuilder;
-use deltakernel::simple_client::SimpleClient;
 use deltakernel::Table;
 
 use test_log::test;
@@ -12,7 +12,7 @@ use test_log::test;
 fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/"))?;
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine_interface = SimpleClient::new();
+    let engine_interface = SyncEngineInterface::new();
 
     let table = Table::new(url);
     let snapshot = table.snapshot(&engine_interface, None)?;
@@ -37,7 +37,7 @@ fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
 fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/"))?;
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine_interface = SimpleClient::new();
+    let engine_interface = SyncEngineInterface::new();
 
     let table = Table::new(url);
     let snapshot = table.snapshot(&engine_interface, None)?;

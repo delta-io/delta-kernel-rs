@@ -1,18 +1,18 @@
 use std::sync::Arc;
 
 use itertools::Itertools;
+use tracing::debug;
 
 use self::file_stream::log_replay_iter;
 use crate::actions::{get_log_schema, Add, ADD_NAME, REMOVE_NAME};
 use crate::expressions::{Expression, Scalar};
-use crate::schema::{DataType, SchemaRef, StructType};
+use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::{DeltaResult, EngineData, EngineInterface, Error, FileMeta};
 
 mod data_skipping;
 pub mod file_stream;
 
-// TODO projection: something like fn select(self, columns: &[&str])
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
     snapshot: Arc<Snapshot>,
@@ -49,6 +49,15 @@ impl ScanBuilder {
     pub fn with_schema(mut self, schema: SchemaRef) -> Self {
         self.schema = Some(schema);
         self
+    }
+
+    /// Optionally provide a [`Schema`] for columns to select from the [`Snapshot`]. See
+    /// [`with_schema`] for details. If schema_opt is `None` this is a no-op.
+    pub fn with_schema_opt(self, schema_opt: Option<SchemaRef>) -> Self {
+        match schema_opt {
+            Some(schema) => self.with_schema(schema),
+            None => self,
+        }
     }
 
     /// Predicates specified in this crate's [`Expression`] type.
@@ -92,6 +101,13 @@ pub struct ScanResult {
     pub mask: Option<Vec<bool>>,
 }
 
+/// Scan uses this to set up what kinds of columns it is scanning. A reference to the field is
+/// stored so we can get the name and data_type out when building the read expression
+enum ColumnType<'a> {
+    Selected(&'a StructField),
+    Partition(&'a StructField),
+}
+
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
 pub struct Scan {
@@ -128,11 +144,13 @@ impl Scan {
         &self,
         engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
-        let action_schema = get_log_schema().project_as_schema(&[ADD_NAME, REMOVE_NAME])?;
+        let commit_read_schema = get_log_schema().project_as_schema(&[ADD_NAME, REMOVE_NAME])?;
+        let checkpoint_read_schema = get_log_schema().project_as_schema(&[ADD_NAME])?;
 
         let log_iter = self.snapshot.log_segment.replay(
             engine_interface,
-            action_schema,
+            commit_read_schema,
+            checkpoint_read_schema,
             self.predicate.clone(),
         )?;
 
@@ -151,31 +169,33 @@ impl Scan {
     /// from the deletion vector if it was present. See the documentation for [`ScanResult`] for
     /// more details.
     pub fn execute(&self, engine_interface: &dyn EngineInterface) -> DeltaResult<Vec<ScanResult>> {
-        let parquet_handler = engine_interface.get_parquet_handler();
-
         let partition_columns = &self.snapshot.metadata().partition_columns;
-        let read_schema = Arc::new(StructType::new(
-            self.schema()
-                .fields()
-                .filter(|f| !partition_columns.contains(f.name()))
-                .cloned()
-                .collect::<Vec<_>>(),
-        ));
-
-        let mut partition_fields = partition_columns
-            .iter()
-            .map(|column| {
-                self.schema()
-                    .field(column)
-                    .ok_or(Error::generic("Unexpected partition column"))
-            })
-            .collect::<DeltaResult<Vec<_>>>()?;
-        partition_fields.reverse();
-
-        let select_fields = read_schema
+        let mut read_fields = Vec::with_capacity(self.schema().fields.len());
+        let mut have_partition_cols = false;
+        // Loop over all selected fields and note if they are columns that will be read from the
+        // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
+        // be filled in by evaluating an expression ([`ColumnType::Partition`])
+        let all_fields: Vec<_> = self
+            .schema()
             .fields()
-            .map(|f| Expression::column(f.name()))
-            .collect_vec();
+            .map(|field| {
+                if partition_columns.contains(field.name()) {
+                    // Store the raw field, we will turn it into an expression in the inner loop
+                    // since the expression could be different for each add file
+                    have_partition_cols = true;
+                    ColumnType::Partition(field)
+                } else {
+                    // Add to read schema, store field so we can build a `Column` expression later
+                    // if needed (i.e. if we have partition columns)
+                    read_fields.push(field.clone());
+                    ColumnType::Selected(field)
+                }
+            })
+            .collect();
+        let read_schema = Arc::new(StructType::new(read_fields));
+        debug!("Executing scan with read schema {read_schema:#?}");
+        let output_schema = DataType::Struct(Box::new(self.schema().as_ref().clone()));
+        let parquet_handler = engine_interface.get_parquet_handler();
 
         let mut results: Vec<ScanResult> = vec![];
         let files = self.files(engine_interface)?;
@@ -186,9 +206,30 @@ impl Scan {
                 size: add.size as usize,
                 location: self.snapshot.table_root.join(&add.path)?,
             };
-            // TODO(nick) check if we need robert's try_collect change here
+
             let read_results =
-                parquet_handler.read_parquet_files(&[meta], self.read_schema.clone(), None)?;
+                parquet_handler.read_parquet_files(&[meta], read_schema.clone(), None)?;
+
+            let read_expression = if have_partition_cols {
+                // Loop over all fields and create the correct expressions for them
+                let all_fields: Vec<Expression> = all_fields
+                    .iter()
+                    .map(|field| match field {
+                        ColumnType::Partition(field) => {
+                            let value_expression = parse_partition_value(
+                                add.partition_values.get(field.name()),
+                                field.data_type(),
+                            )?;
+                            Ok::<Expression, Error>(Expression::Literal(value_expression))
+                        }
+                        ColumnType::Selected(field) => Ok(Expression::column(field.name())),
+                    })
+                    .try_collect()?;
+                Some(Expression::Struct(all_fields))
+            } else {
+                None
+            };
+            debug!("Final expression for read: {read_expression:?}");
 
             let dv_treemap = add
                 .deletion_vector
@@ -208,26 +249,19 @@ impl Scan {
                     0
                 };
 
-                let read_result = if partition_fields.is_empty() {
-                    read_result
-                } else {
-                    let mut fields = Vec::with_capacity(partition_fields.len() + len);
-                    for field in &partition_fields {
-                        let value_expression = parse_partition_value(
-                            add.partition_values.get(field.name()),
-                            field.data_type(),
-                        )?;
-                        fields.push(Expression::Literal(value_expression));
+                let read_result = match read_expression {
+                    Some(ref read_expression) => engine_interface
+                        .get_expression_handler()
+                        .get_evaluator(
+                            read_schema.clone(),
+                            read_expression.clone(),
+                            output_schema.clone(),
+                        )
+                        .evaluate(read_result?.as_ref()),
+                    None => {
+                        // if we don't have partition columns, the result is just what we read
+                        read_result
                     }
-                    fields.extend(select_fields.clone());
-
-                    let evaluator = engine_interface.get_expression_handler().get_evaluator(
-                        read_schema.clone(),
-                        Expression::Struct(fields),
-                        DataType::Struct(Box::new(self.schema().as_ref().clone())),
-                    );
-
-                    evaluator.evaluate(read_result?.as_ref())
                 };
 
                 // need to split the dv_mask. what's left in dv_mask covers this result, and rest
@@ -263,12 +297,11 @@ fn parse_partition_value(
 
 #[cfg(all(test, feature = "default-client"))]
 mod tests {
-    use itertools::Itertools;
     use std::path::PathBuf;
 
     use super::*;
+    use crate::client::sync::SyncEngineInterface;
     use crate::schema::PrimitiveType;
-    use crate::simple_client::SimpleClient;
     use crate::Table;
 
     #[test]
@@ -276,7 +309,7 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine_interface = SimpleClient::new();
+        let engine_interface = SyncEngineInterface::new();
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine_interface, None).unwrap();
@@ -300,7 +333,7 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine_interface = SimpleClient::new();
+        let engine_interface = SyncEngineInterface::new();
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine_interface, None).unwrap();
@@ -354,5 +387,38 @@ mod tests {
             .unwrap();
             assert_eq!(value, *expected);
         }
+    }
+
+    #[test_log::test]
+    fn test_scan_with_checkpoint() -> DeltaResult<()> {
+        let path = std::fs::canonicalize(PathBuf::from(
+            "./tests/data/with_checkpoint_no_last_checkpoint/",
+        ))?;
+
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine_interface = SyncEngineInterface::new();
+
+        let table = Table::new(url);
+        let snapshot = table.snapshot(&engine_interface, None)?;
+        let scan = ScanBuilder::new(snapshot).build();
+        let files: Vec<DeltaResult<Add>> = scan.files(&engine_interface)?.collect();
+
+        // test case:
+        //
+        // commit0:     P and M, no add/remove
+        // commit1:     add file-ad1
+        // commit2:     remove file-ad1, add file-a19
+        // checkpoint2: remove file-ad1, add file-a19
+        // commit3:     remove file-a19, add file-70b
+        //
+        // thus replay should produce only file-70b
+        assert_eq!(
+            files
+                .into_iter()
+                .map(|file| file.unwrap().path)
+                .collect::<Vec<_>>(),
+            vec!["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"]
+        );
+        Ok(())
     }
 }

@@ -1,3 +1,5 @@
+//! Conversions from kernel types to arrow types
+
 use std::sync::Arc;
 
 use arrow_schema::{

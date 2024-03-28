@@ -4,7 +4,7 @@ members = [
     "derive-macros",
     "ffi",
     "kernel",
-    "kernel/examples/*",
+    "kernel/examples/dump-table", # todo: put back to `examples/*` when inspect-table is fixed
 ]
 # Only check / build main crates by default (check all with `--workspace`)
 default-members = ["acceptance", "kernel"]

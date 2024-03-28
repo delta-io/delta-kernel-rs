@@ -57,16 +57,12 @@ pub use error::{DeltaResult, Error};
 pub use expressions::Expression;
 pub use table::Table;
 
-#[cfg(feature = "arrow-conversion")]
-pub mod arrow_conversion;
-
-#[cfg(feature = "simple-client")]
-pub mod simple_client;
-
-#[cfg(feature = "default-client")]
+#[cfg(any(
+    feature = "default-client",
+    feature = "sync-client",
+    feature = "arrow-conversion"
+))]
 pub mod client;
-#[cfg(feature = "default-client")]
-pub use client::*;
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
@@ -95,7 +91,7 @@ pub struct FileMeta {
 /// Connectors can implement this interface to optimize the evaluation using the
 /// connector specific capabilities.
 pub trait ExpressionEvaluator {
-    /// Evaluate the expression on given ColumnarBatch data.
+    /// Evaluate the expression on a given EngineData.
     ///
     /// Contains one value for each row of the input.
     /// The data type of the output is same as the type output of the expression this evaluator is using.
@@ -179,13 +175,14 @@ pub trait JsonHandler {
 /// Connectors can leverage this interface to provide their own custom
 /// implementation of Parquet data file functionalities to Delta Kernel.
 pub trait ParquetHandler: Send + Sync {
-    /// Read and parse the JSON format file at given locations and return
-    /// the data as EngineData with the columns requested by physical schema.
+    /// Read and parse the Parquet file at given locations and return the data as EngineData with
+    /// the columns requested by physical schema . The ParquetHandler _must_ return exactly the
+    /// columns specified in `physical_schema`, and they _must_ be in schema order.
     ///
     /// # Parameters
     ///
     /// - `files` - File metadata for files to be read.
-    /// - `physical_schema` - Select list of columns to read from the JSON file.
+    /// - `physical_schema` - Select list and order of columns to read from the Parquet file.
     /// - `predicate` - Optional push-down predicate hint (engine is free to ignore it).
     fn read_parquet_files(
         &self,

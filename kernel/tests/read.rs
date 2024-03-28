@@ -5,11 +5,12 @@ use arrow::array::{ArrayRef, Int32Array, StringArray};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use arrow_select::concat::concat_batches;
-use deltakernel::client::DefaultTableClient;
-use deltakernel::executor::tokio::TokioBackgroundExecutor;
+use deltakernel::client::arrow_data::ArrowEngineData;
+use deltakernel::client::default::executor::tokio::TokioBackgroundExecutor;
+use deltakernel::client::default::DefaultEngineInterface;
 use deltakernel::expressions::{BinaryOperator, Expression};
 use deltakernel::scan::ScanBuilder;
-use deltakernel::simple_client::data::SimpleData;
+use deltakernel::schema::Schema;
 use deltakernel::{EngineData, Table};
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use parquet::arrow::arrow_writer::ArrowWriter;
@@ -21,7 +22,7 @@ const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c00
 
 const METADATA: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
 {"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
-{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 
 enum TestAction {
     Add(String),
@@ -70,7 +71,7 @@ async fn add_commit(
 }
 
 fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
-    SimpleData::try_from_engine_data(engine_data)
+    ArrowEngineData::try_from_engine_data(engine_data)
         .unwrap()
         .into()
 }
@@ -97,7 +98,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine_interface = DefaultTableClient::new(
+    let engine_interface = DefaultEngineInterface::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
@@ -151,7 +152,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine_interface = DefaultTableClient::new(
+    let engine_interface = DefaultEngineInterface::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
@@ -209,7 +210,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine_interface = DefaultTableClient::new(
+    let engine_interface = DefaultEngineInterface::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
@@ -287,9 +288,9 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine_interface = DefaultTableClient::new(
+    let engine_interface = DefaultEngineInterface::new(
         storage.clone(),
-        Path::from("/"),
+        Path::from(""),
         Arc::new(TokioBackgroundExecutor::new()),
     );
 
@@ -394,10 +395,14 @@ macro_rules! assert_batches_sorted_eq {
     };
 }
 
-fn read_table_data(path: &str, expected: Vec<&str>) -> Result<(), Box<dyn std::error::Error>> {
+fn read_table_data(
+    path: &str,
+    select_cols: Option<&[&str]>,
+    expected: Vec<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from(path))?;
     let url = url::Url::from_directory_path(path).unwrap();
-    let table_client = DefaultTableClient::try_new(
+    let table_client = DefaultEngineInterface::try_new(
         &url,
         std::iter::empty::<(&str, &str)>(),
         Arc::new(TokioBackgroundExecutor::new()),
@@ -405,14 +410,28 @@ fn read_table_data(path: &str, expected: Vec<&str>) -> Result<(), Box<dyn std::e
 
     let table = Table::new(url);
     let snapshot = table.snapshot(&table_client, None)?;
-    let scan = ScanBuilder::new(snapshot).build();
+
+    let read_schema = select_cols.map(|select_cols| {
+        let table_schema = snapshot.schema();
+        let selected_fields = select_cols
+            .iter()
+            .map(|col| table_schema.field(col).cloned().unwrap())
+            .collect();
+        Arc::new(Schema::new(selected_fields))
+    });
+    let scan = ScanBuilder::new(snapshot.clone())
+        .with_schema_opt(read_schema)
+        .build();
 
     let scan_results = scan.execute(&table_client)?;
     let batches: Vec<RecordBatch> = scan_results
         .into_iter()
         .map(|sr| {
             let data = sr.raw_data.unwrap();
-            data.into_any().downcast::<SimpleData>().unwrap().into()
+            data.into_any()
+                .downcast::<ArrowEngineData>()
+                .unwrap()
+                .into()
         })
         .collect();
     let schema = batches[0].schema();
@@ -436,7 +455,53 @@ fn data() -> Result<(), Box<dyn std::error::Error>> {
         "| e      | 5      | 5.5     |",
         "+--------+--------+---------+",
     ];
-    read_table_data("./tests/data/basic_partitioned", expected)?;
+    read_table_data("./tests/data/basic_partitioned", None, expected)?;
+
+    Ok(())
+}
+
+#[test]
+fn column_ordering() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+---------+--------+--------+",
+        "| a_float | letter | number |",
+        "+---------+--------+--------+",
+        "| 6.6     |        | 6      |",
+        "| 4.4     | a      | 4      |",
+        "| 5.5     | e      | 5      |",
+        "| 1.1     | a      | 1      |",
+        "| 2.2     | b      | 2      |",
+        "| 3.3     | c      | 3      |",
+        "+---------+--------+--------+",
+    ];
+    read_table_data(
+        "./tests/data/basic_partitioned",
+        Some(&["a_float", "letter", "number"]),
+        expected,
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn column_ordering_and_projection() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+---------+--------+",
+        "| a_float | number |",
+        "+---------+--------+",
+        "| 6.6     | 6      |",
+        "| 4.4     | 4      |",
+        "| 5.5     | 5      |",
+        "| 1.1     | 1      |",
+        "| 2.2     | 2      |",
+        "| 3.3     | 3      |",
+        "+---------+--------+",
+    ];
+    read_table_data(
+        "./tests/data/basic_partitioned",
+        Some(&["a_float", "number"]),
+        expected,
+    )?;
 
     Ok(())
 }

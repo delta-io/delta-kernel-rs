@@ -1,14 +1,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_array::{Array, BooleanArray};
-use arrow_select::filter::filter_record_batch;
 use tracing::debug;
 
-use crate::error::{DeltaResult, Error};
+use crate::actions::visitors::SelectionVectorVisitor;
+use crate::error::DeltaResult;
 use crate::expressions::{BinaryOperator, Expression as Expr, VariadicOperator};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
-use crate::simple_client::data::SimpleData;
 use crate::{EngineData, EngineInterface, ExpressionEvaluator, JsonHandler};
 
 /// Returns <op2> (if any) such that B <op2> A is equivalent to A <op> B.
@@ -116,8 +114,8 @@ impl DataSkippingFilter {
             static ref PREDICATE_SCHEMA: DataType = StructType::new(vec![
                 StructField::new("predicate", DataType::BOOLEAN, true),
             ]).into();
-            static ref FILTER_EXPR: Expr = Expr::column("predicate").distinct(Expr::literal(false));
             static ref STATS_EXPR: Expr = Expr::column("add.stats");
+            static ref FILTER_EXPR: Expr = Expr::column("predicate").distinct(Expr::literal(false));
         );
 
         let predicate = match predicate {
@@ -147,17 +145,21 @@ impl DataSkippingFilter {
 
         // Skipping happens in several steps:
         //
-        // 1. The predicate produces false for any file whose stats prove we can safely skip it. A
-        //    value of true means the stats say we must keep the file, and null means we could not
-        //    determine whether the file is safe to skip, because its stats were missing/null.
+        // 1. The stats selector fetches add.stats from the metadata
         //
-        // 2. The nullif(skip, skip) converts true (= keep) to null, producing a result
-        //    that contains only false (= skip) and null (= keep) values.
+        // 2. The predicate (skipping evaluator) produces false for any file whose stats prove we
+        //    can safely skip it. A value of true means the stats say we must keep the file, and
+        //    null means we could not determine whether the file is safe to skip, because its stats
+        //    were missing/null.
         //
-        // 3. The is_null converts null to true, producing a result that contains only true (=
-        //    keep) and false (= skip) values.
-        //
-        // 4. The filter discards every file whose selection vector entry is false.
+        // 3. The selection evaluator does DISTINCT(col(predicate), 'false') to produce true (= keep) when
+        //    the predicate is true/null and false (= skip) when the predicate is false.
+        let select_stats_evaluator = table_client.get_expression_handler().get_evaluator(
+            stats_schema.clone(),
+            STATS_EXPR.clone(),
+            DataType::STRING,
+        );
+
         let skipping_evaluator = table_client.get_expression_handler().get_evaluator(
             stats_schema.clone(),
             Expr::struct_expr([as_data_skipping_predicate(predicate)?]),
@@ -170,12 +172,6 @@ impl DataSkippingFilter {
             DataType::BOOLEAN,
         );
 
-        let select_stats_evaluator = table_client.get_expression_handler().get_evaluator(
-            stats_schema.clone(),
-            STATS_EXPR.clone(),
-            DataType::STRING,
-        );
-
         Some(Self {
             stats_schema,
             select_stats_evaluator,
@@ -185,44 +181,35 @@ impl DataSkippingFilter {
         })
     }
 
-    // TODO(nick): This should not be expressed in terms of SimpleData, but should use only the
-    // expression API
-    pub(crate) fn apply(&self, actions: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+    /// Apply the DataSkippingFilter to an EngineData batch of actions. Returns a selection vector
+    /// which can be applied to the actions to find those that passed data skipping.
+    pub(crate) fn apply(&self, actions: &dyn EngineData) -> DeltaResult<Vec<bool>> {
+        // retrieve and parse stats from actions data
         let stats = self.select_stats_evaluator.evaluate(actions)?;
         let parsed_stats = self
             .json_handler
             .parse_json(stats, self.stats_schema.clone())?;
 
+        // evaluate the predicate on the parsed stats, then convert to selection vector
         let skipping_predicate = self.skipping_evaluator.evaluate(&*parsed_stats)?;
-
-        let skipping_vector = self
+        let selection_vector = self
             .filter_evaluator
             .evaluate(skipping_predicate.as_ref())?;
-        let skipping_vector = skipping_vector
-            .as_any()
-            .downcast_ref::<SimpleData>()
-            .ok_or(Error::engine_data_type("SimpleData"))?
-            .record_batch()
-            .column(0);
-        let skipping_vector = skipping_vector
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or(Error::unexpected_column_type(
-                "Expected type 'BooleanArray'.",
-            ))?;
 
-        let before_count = actions.length();
-        let actions = actions
-            .as_any()
-            .downcast_ref::<SimpleData>()
-            .ok_or(Error::engine_data_type("SimpleData"))?
-            .record_batch();
-        let after = filter_record_batch(actions, skipping_vector)?;
-        debug!(
-            "number of actions before/after data skipping: {before_count} / {}",
-            after.num_rows()
-        );
-        Ok(Box::new(SimpleData::new(after)))
+        // visit the engine's selection vector to produce a Vec<bool>
+        let mut visitor = SelectionVectorVisitor::default();
+        let schema = StructType::new(vec![StructField::new("output", DataType::BOOLEAN, false)]);
+        selection_vector
+            .as_ref()
+            .extract(Arc::new(schema), &mut visitor)?;
+        Ok(visitor.selection_vector)
+
+        // TODO(zach): add some debug info about data skipping that occurred
+        // let before_count = actions.length();
+        // debug!(
+        //     "number of actions before/after data skipping: {before_count} / {}",
+        //     filtered_actions.num_rows()
+        // );
     }
 }
 
