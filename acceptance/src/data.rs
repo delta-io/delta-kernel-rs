@@ -63,7 +63,7 @@ pub fn sort_record_batch(batch: RecordBatch) -> RecordBatch {
 static SKIPPED_TESTS: &[&str; 3] = &[
     // Kernel does not support column mapping yet
     "column_mapping",
-    // We don't support iceberg yet
+    // iceberg compat requires column mapping
     "iceberg_compat_v1",
     // For multi_partitioned_2: The golden table stores the timestamp as an INT96 (which is
     // nanosecond precision), while the spec says we should read partition columns as
