@@ -3,12 +3,13 @@ use quote::{quote, quote_spanned};
 use syn::spanned::Spanned;
 use syn::{parse_macro_input, Data, DataStruct, DeriveInput, Fields, PathArguments, Type};
 
-/// Derive a `deltakernel::schemas::GetField` implementation for the annotated struct. The actual
-/// field names in the schema (and therefore of the struct members) are all mandated by the Delta spec,
-/// and so the user of this macro is responsible for ensuring that e.g. `Metadata::schema_string` is
-/// the snake_case-ified version of `schemaString` from Delta's Change Metadata action (this macro
-/// allows the use of standard rust snake_case, and will convert to the correct delta schema
-/// camelCase version).
+/// Derive a `deltakernel::schemas::ToDataType` implementation for the annotated struct. The actual
+/// field names in the schema (and therefore of the struct members) are all mandated by the Delta
+/// spec, and so the user of this macro is responsible for ensuring that
+/// e.g. `Metadata::schema_string` is the snake_case-ified version of `schemaString` from [Delta's
+/// Change Metadata](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#change-metadata)
+/// action (this macro allows the use of standard rust snake_case, and will convert to the correct
+/// delta schema camelCase version).
 #[proc_macro_derive(Schema)]
 pub fn derive_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -16,17 +17,12 @@ pub fn derive_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream 
 
     let schema_fields = gen_schema_fields(&input.data);
     let output = quote! {
-        impl crate::actions::schemas::GetField for #struct_ident {
-            fn get_field(name: impl Into<String>) -> crate::schema::StructField {
-                use crate::actions::schemas::GetField;
-                crate::schema::StructField::new(
-                    name,
-                    crate::schema::StructType::new(vec![
-                        #schema_fields
-                    ]),
-                    // By default not nullable. To make something nullable wrap it in an Option
-                    false,
-                )
+        impl crate::actions::schemas::ToDataType for #struct_ident {
+            fn to_data_type() -> crate::schema::DataType {
+                use crate::actions::schemas::{ToDataType, GetStructField};
+                crate::schema::StructType::new(vec![
+                    #schema_fields
+                ]).into()
             }
         }
     };
@@ -77,7 +73,7 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
                         _ => panic!("Can only handle <> type path args"),
                     }
                 });
-                quote_spanned! { field.span() => #(#type_path_quoted),* get_field(stringify!(#name))}
+                quote_spanned! { field.span() => #(#type_path_quoted),* get_struct_field(stringify!(#name))}
             }
             _ => {
                 panic!("Can't handle type: {:?}", field.ty);

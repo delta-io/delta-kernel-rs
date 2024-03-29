@@ -8,7 +8,7 @@ use lazy_static::lazy_static;
 use visitors::{AddVisitor, MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::schemas::GetField;
+use crate::actions::schemas::GetStructField;
 use crate::{schema::StructType, DeltaResult, EngineData};
 
 use std::collections::HashMap;
@@ -21,10 +21,10 @@ pub(crate) static PROTOCOL_NAME: &str = "protocol";
 lazy_static! {
     static ref LOG_SCHEMA: StructType = StructType::new(
         vec![
-            Option::<Add>::get_field(ADD_NAME),
-            Option::<Remove>::get_field(REMOVE_NAME),
-            Option::<Metadata>::get_field(METADATA_NAME),
-            Option::<Protocol>::get_field(PROTOCOL_NAME),
+            Option::<Add>::get_struct_field(ADD_NAME),
+            Option::<Remove>::get_struct_field(REMOVE_NAME),
+            Option::<Metadata>::get_struct_field(METADATA_NAME),
+            Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
             // We don't support the following actions yet
             //Option<Cdc>::get_field(CDC_NAME),
             //Option<CommitInfo>::get_field(COMMIT_INFO_NAME),

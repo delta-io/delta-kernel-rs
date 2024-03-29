@@ -4,24 +4,23 @@ use std::collections::HashMap;
 
 use crate::schema::{ArrayType, DataType, MapType, StructField};
 
-/// A trait that allows getting a `StructField` based on the provided name and nullability
-pub(crate) trait GetField {
-    fn get_field(name: impl Into<String>) -> StructField;
+pub(crate) trait ToDataType {
+    fn to_data_type() -> DataType;
 }
 
-macro_rules! impl_get_field {
+macro_rules! impl_to_data_type {
     ( $(($rust_type: ty, $kernel_type: expr)), * ) => {
         $(
-            impl GetField for $rust_type {
-                fn get_field(name: impl Into<String>) -> StructField {
-                    StructField::new(name, $kernel_type, false)
+            impl ToDataType for $rust_type {
+                fn to_data_type() -> DataType {
+                    $kernel_type
                 }
             }
         )*
     };
 }
 
-impl_get_field!(
+impl_to_data_type!(
     (String, DataType::STRING),
     (i64, DataType::LONG),
     (i32, DataType::INTEGER),
@@ -29,15 +28,37 @@ impl_get_field!(
     (char, DataType::BYTE),
     (f32, DataType::FLOAT),
     (f64, DataType::DOUBLE),
-    (bool, DataType::BOOLEAN),
-    (HashMap<String, String>, MapType::new(DataType::STRING, DataType::STRING, false)),
-    (Vec<String>, ArrayType::new(DataType::STRING, false))
+    (bool, DataType::BOOLEAN)
 );
 
-impl<T: GetField> GetField for Option<T> {
-    fn get_field(name: impl Into<String>) -> StructField {
-        let mut inner = T::get_field(name);
-        inner.nullable = true;
-        inner
+// ToDataType impl for non-nullable array types
+impl<T: ToDataType> ToDataType for Vec<T> {
+    fn to_data_type() -> DataType {
+        ArrayType::new(T::to_data_type(), false).into()
+    }
+}
+
+// ToDataType impl for non-nullable map types
+impl<K: ToDataType, V: ToDataType> ToDataType for HashMap<K, V> {
+    fn to_data_type() -> DataType {
+        MapType::new(K::to_data_type(), V::to_data_type(), false).into()
+    }
+}
+
+pub(crate) trait GetStructField {
+    fn get_struct_field(name: impl Into<String>) -> StructField;
+}
+
+// Normal types produce non-nullable fields
+impl<T: ToDataType> GetStructField for T {
+    fn get_struct_field(name: impl Into<String>) -> StructField {
+        StructField::new(name, T::to_data_type(), false)
+    }
+}
+
+// Option types produce nullable fields
+impl<T: ToDataType> GetStructField for Option<T> {
+    fn get_struct_field(name: impl Into<String>) -> StructField {
+        StructField::new(name, T::to_data_type(), true)
     }
 }
