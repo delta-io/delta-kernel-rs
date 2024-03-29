@@ -4,8 +4,8 @@ use syn::spanned::Spanned;
 use syn::{parse_macro_input, Data, DataStruct, DeriveInput, Fields, PathArguments, Type};
 
 /// Derive a `deltakernel::schemas::GetField` implementation for the annotated struct. The actual
-/// field names in the schema (and therefore of the struct members) are all mandated by Delta spec,
-/// and so the user of this macro is responsible for ensuring that e.g. `Metadata::schema_string is
+/// field names in the schema (and therefore of the struct members) are all mandated by the Delta spec,
+/// and so the user of this macro is responsible for ensuring that e.g. `Metadata::schema_string` is
 /// the snake_case-ified version of `schemaString` from Delta's Change Metadata action (this macro
 /// allows the use of standard rust snake_case, and will convert to the correct delta schema
 /// camelCase version).
