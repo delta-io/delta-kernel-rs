@@ -31,7 +31,6 @@ impl_get_field!(
     (f64, DataType::DOUBLE),
     (bool, DataType::BOOLEAN),
     (HashMap<String, String>, MapType::new(DataType::STRING, DataType::STRING, false)),
-    (HashMap<String, Option<String>>, MapType::new(DataType::STRING, DataType::STRING, true)),
     (Vec<String>, ArrayType::new(DataType::STRING, false))
 );
 

@@ -137,14 +137,14 @@ impl EngineMap for MapArray {
         None
     }
 
-    fn materialize(&self, row_index: usize) -> HashMap<String, Option<String>> {
+    fn materialize(&self, row_index: usize) -> HashMap<String, String> {
         let mut ret = HashMap::new();
         let map_val = self.value(row_index);
         let keys = map_val.column(0).as_string::<i32>();
         let values = map_val.column(1).as_string::<i32>();
         for (key, value) in keys.iter().zip(values.iter()) {
-            if let Some(key) = key {
-                ret.insert(key.into(), value.map(|v| v.into()));
+            if let (Some(key), Some(value)) = (key, value) {
+                ret.insert(key.into(), value.into());
             }
         }
         ret

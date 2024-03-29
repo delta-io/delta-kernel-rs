@@ -280,12 +280,9 @@ impl Scan {
     }
 }
 
-fn parse_partition_value(
-    raw: Option<&Option<String>>,
-    data_type: &DataType,
-) -> DeltaResult<Scalar> {
+fn parse_partition_value(raw: Option<&String>, data_type: &DataType) -> DeltaResult<Scalar> {
     match raw {
-        Some(Some(v)) => match data_type {
+        Some(v) => match data_type {
             DataType::Primitive(primitive) => primitive.parse_scalar(v),
             _ => Err(Error::generic(format!(
                 "Unexpected partition column type: {data_type:?}"
@@ -381,7 +378,7 @@ mod tests {
 
         for (raw, data_type, expected) in &cases {
             let value = parse_partition_value(
-                Some(&Some(raw.to_string())),
+                Some(&raw.to_string()),
                 &DataType::Primitive(data_type.clone()),
             )
             .unwrap();

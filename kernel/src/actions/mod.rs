@@ -72,7 +72,7 @@ pub struct Metadata {
     /// The time when this metadata action is created, in milliseconds since the Unix epoch
     pub created_time: Option<i64>,
     /// Configuration options for the metadata action
-    pub configuration: HashMap<String, Option<String>>,
+    pub configuration: HashMap<String, String>,
 }
 
 impl Metadata {
@@ -127,7 +127,7 @@ pub struct Add {
     pub path: String,
 
     /// A map from partition column to value for this logical file.
-    pub partition_values: HashMap<String, Option<String>>,
+    pub partition_values: HashMap<String, String>,
 
     /// The size of this data file in bytes
     pub size: i64,
@@ -145,7 +145,7 @@ pub struct Add {
     pub stats: Option<String>,
 
     /// Map containing metadata about this logical file.
-    pub tags: Option<HashMap<String, Option<String>>>,
+    pub tags: Option<HashMap<String, String>>,
 
     /// Information about deletion vector (DV) associated with this add action
     pub deletion_vector: Option<DeletionVectorDescriptor>,
@@ -198,13 +198,13 @@ pub(crate) struct Remove {
     pub(crate) extended_file_metadata: Option<bool>,
 
     /// A map from partition column to value for this logical file.
-    pub(crate) partition_values: Option<HashMap<String, Option<String>>>,
+    pub(crate) partition_values: Option<HashMap<String, String>>,
 
     /// The size of this data file in bytes
     pub(crate) size: Option<i64>,
 
     /// Map containing metadata about this logical file.
-    pub(crate) tags: Option<HashMap<String, Option<String>>>,
+    pub(crate) tags: Option<HashMap<String, String>>,
 
     /// Information about deletion vector (DV) associated with this add action
     pub(crate) deletion_vector: Option<DeletionVectorDescriptor>,
@@ -264,7 +264,7 @@ mod tests {
                 StructField::new("createdTime", DataType::LONG, true),
                 StructField::new(
                     "configuration",
-                    MapType::new(DataType::STRING, DataType::STRING, true),
+                    MapType::new(DataType::STRING, DataType::STRING, false),
                     false,
                 ),
             ]),
@@ -276,7 +276,7 @@ mod tests {
     fn tags_field() -> StructField {
         StructField::new(
             "tags",
-            MapType::new(DataType::STRING, DataType::STRING, true),
+            MapType::new(DataType::STRING, DataType::STRING, false),
             true,
         )
     }
@@ -284,7 +284,7 @@ mod tests {
     fn partition_values_field() -> StructField {
         StructField::new(
             "partitionValues",
-            MapType::new(DataType::STRING, DataType::STRING, true),
+            MapType::new(DataType::STRING, DataType::STRING, false),
             true,
         )
     }
