@@ -102,11 +102,11 @@ impl LogReplayScanner {
             .transpose()?;
 
         let schema_to_use = if is_log_batch {
-            get_log_schema().project_as_schema(&[ADD_NAME, REMOVE_NAME])?
+            get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?
         } else {
             // All checkpoint actions are already reconciled and Remove actions in checkpoint files
             // only serve as tombstones for vacuum jobs. So no need to load them here.
-            get_log_schema().project_as_schema(&[ADD_NAME])?
+            get_log_schema().project(&[ADD_NAME])?
         };
         let mut visitor = AddRemoveVisitor::new(selection_vector, is_log_batch);
         actions.extract(schema_to_use, &mut visitor)?;

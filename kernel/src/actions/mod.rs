@@ -78,10 +78,7 @@ pub struct Metadata {
 impl Metadata {
     pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
         let mut visitor = MetadataVisitor::default();
-        data.extract(
-            get_log_schema().project_as_schema(&[METADATA_NAME])?,
-            &mut visitor,
-        )?;
+        data.extract(get_log_schema().project(&[METADATA_NAME])?, &mut visitor)?;
         Ok(visitor.metadata)
     }
 
@@ -109,10 +106,7 @@ pub struct Protocol {
 impl Protocol {
     pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
         let mut visitor = ProtocolVisitor::default();
-        data.extract(
-            get_log_schema().project_as_schema(&[PROTOCOL_NAME])?,
-            &mut visitor,
-        )?;
+        data.extract(get_log_schema().project(&[PROTOCOL_NAME])?, &mut visitor)?;
         Ok(visitor.protocol)
     }
 }
@@ -166,10 +160,7 @@ impl Add {
     /// Since we always want to parse multiple adds from data, we return a `Vec<Add>`
     pub fn parse_from_data(data: &dyn EngineData) -> DeltaResult<Vec<Add>> {
         let mut visitor = AddVisitor::default();
-        data.extract(
-            get_log_schema().project_as_schema(&[ADD_NAME])?,
-            &mut visitor,
-        )?;
+        data.extract(get_log_schema().project(&[ADD_NAME])?, &mut visitor)?;
         Ok(visitor.adds)
     }
 
@@ -234,7 +225,7 @@ mod tests {
     #[test]
     fn test_metadata_schema() {
         let schema = get_log_schema()
-            .project_as_schema(&["metaData"])
+            .project(&["metaData"])
             .expect("Couldn't get metaData field");
 
         let expected = Arc::new(StructType::new(vec![StructField::new(
@@ -306,7 +297,7 @@ mod tests {
     #[test]
     fn test_remove_schema() {
         let schema = get_log_schema()
-            .project_as_schema(&["remove"])
+            .project(&["remove"])
             .expect("Couldn't get remove field");
         let expected = Arc::new(StructType::new(vec![StructField::new(
             "remove",

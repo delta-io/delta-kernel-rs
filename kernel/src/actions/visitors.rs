@@ -369,7 +369,7 @@ mod tests {
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
         let add_schema = get_log_schema()
-            .project_as_schema(&[ADD_NAME])
+            .project(&[ADD_NAME])
             .expect("Can't get add schema");
         let mut add_visitor = AddVisitor::default();
         batch.extract(add_schema, &mut add_visitor).unwrap();

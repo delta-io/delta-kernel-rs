@@ -130,7 +130,8 @@ impl FileOpener for ParquetOpener {
             let mut reader = ParquetObjectReader::new(store, meta);
             let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
             let parquet_schema = metadata.schema();
-            let indicies = get_requested_indices(&table_schema, parquet_schema)?;
+            let (indicies, requested_ordering) =
+                get_requested_indices(&table_schema, parquet_schema)?;
             let options = ArrowReaderOptions::new(); //.with_page_index(enable_page_index);
             let mut builder =
                 ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await?;
@@ -152,7 +153,7 @@ impl FileOpener for ParquetOpener {
             let stream = stream.map(move |rbr| {
                 // re-order each batch if needed
                 rbr.map_err(Error::Parquet)
-                    .and_then(|rb| reorder_record_batch(table_schema.clone(), rb, &indicies))
+                    .and_then(|rb| reorder_record_batch(rb, &indicies, &requested_ordering))
             });
             Ok(stream.boxed())
         }))

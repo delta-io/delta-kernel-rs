@@ -143,35 +143,27 @@ impl StructType {
         }
     }
 
-    /// Get a [`StructType`] containing [`StructField`]s of the given names, preserving the original
-    /// order of fields. Returns an Err if a specified field doesn't exist
-    pub fn project(&self, names: &[impl AsRef<str>]) -> DeltaResult<StructType> {
-        let mut indexes: Vec<usize> = names
+    /// Get a [`StructType`] containing [`StructField`]s of the given names. The order of fields in
+    /// the returned schema will match the order passed to this function, which can be different
+    /// from this order in this schema. Returns an Err if a specified field doesn't exist.
+    pub fn project_as_struct(&self, names: &[impl AsRef<str>]) -> DeltaResult<StructType> {
+        let fields = names
             .iter()
             .map(|name| {
                 self.fields
-                    .get_index_of(name.as_ref())
+                    .get(name.as_ref())
+                    .cloned()
                     .ok_or_else(|| Error::missing_column(name.as_ref()))
             })
             .try_collect()?;
-        indexes.sort(); // keep schema order
-        let fields: Vec<StructField> = indexes
-            .iter()
-            .map(|index| {
-                self.fields
-                    .get_index(*index)
-                    .expect("get_index_of returned non-existant index")
-                    .1
-                    .clone()
-            })
-            .collect();
         Ok(Self::new(fields))
     }
 
-    /// Get a [`SchemaRef`] containing [`StructField`]s of the given names, preserving the original
-    /// order of fields. Returns an Err if a specified field doesn't exist
-    pub fn project_as_schema(&self, names: &[impl AsRef<str>]) -> DeltaResult<SchemaRef> {
-        let struct_type = self.project(names)?;
+    /// Get a [`SchemaRef`] containing [`StructField`]s of the given names. The order of fields in
+    /// the returned schema will match the order passed to this function, which can be different
+    /// from this order in this schema. Returns an Err if a specified field doesn't exist.
+    pub fn project(&self, names: &[impl AsRef<str>]) -> DeltaResult<SchemaRef> {
+        let struct_type = self.project_as_struct(names)?;
         Ok(Arc::new(struct_type))
     }
 

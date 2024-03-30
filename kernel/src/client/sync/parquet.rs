@@ -22,7 +22,7 @@ fn try_create_from_parquet(schema: SchemaRef, location: Url) -> DeltaResult<Arro
     let parquet_schema = metadata.schema();
     let requested_schema: ArrowSchema = (&*schema).try_into()?;
     let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let indicies = get_requested_indices(&requested_schema, parquet_schema)?;
+    let (indicies, requested_ordering) = get_requested_indices(&requested_schema, parquet_schema)?;
     if let Some(mask) = generate_mask(
         &requested_schema,
         parquet_schema,
@@ -36,9 +36,9 @@ fn try_create_from_parquet(schema: SchemaRef, location: Url) -> DeltaResult<Arro
         .next()
         .ok_or_else(|| Error::generic("No data found reading parquet file"))?;
     Ok(ArrowEngineData::new(reorder_record_batch(
-        requested_schema.into(),
         data?,
         &indicies,
+        &requested_ordering,
     )?))
 }
 

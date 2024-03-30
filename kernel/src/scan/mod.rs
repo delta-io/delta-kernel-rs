@@ -144,8 +144,8 @@ impl Scan {
         &self,
         engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
-        let commit_read_schema = get_log_schema().project_as_schema(&[ADD_NAME, REMOVE_NAME])?;
-        let checkpoint_read_schema = get_log_schema().project_as_schema(&[ADD_NAME])?;
+        let commit_read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?;
+        let checkpoint_read_schema = get_log_schema().project(&[ADD_NAME])?;
 
         let log_iter = self.snapshot.log_segment.replay(
             engine_interface,
