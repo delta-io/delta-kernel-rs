@@ -2,11 +2,10 @@
 
 use std::sync::Arc;
 
-use crate::DeltaResult;
+use crate::{schema::SchemaRef, DeltaResult, Error};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
-use itertools::Itertools;
 use parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 
 /// Get the indicies in `parquet_schema` of the specified columns in `requested_schema`. This
@@ -16,23 +15,32 @@ use parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 /// that are not selected, and will contain at selected indexes the position that the column should
 /// appear in the output
 pub(crate) fn get_requested_indices(
-    requested_schema: &ArrowSchema,
+    requested_schema: &SchemaRef,
     parquet_schema: &ArrowSchemaRef,
 ) -> DeltaResult<(Vec<usize>, Vec<i32>)> {
-    let mut reorder_indicies = vec![-1; parquet_schema.fields().len()];
-    let indicies = requested_schema
-        .fields
+    let requested_len = requested_schema.fields.len();
+    let mut indicies = vec![0; requested_len];
+    let mut found_count = 0; // verify that we found all requested fields
+    let reorder_indicies = parquet_schema
+        .fields()
         .iter()
         .enumerate()
-        .map(|(position, field)| {
-            // todo: handle nested (then use `leaves` not `roots` below in generate_mask)
-            let index = parquet_schema.index_of(field.name());
-            if let Ok(index) = index {
-                reorder_indicies[index] = position as i32;
-            }
-            index
-        })
-        .try_collect()?;
+        .map(
+            |(parquet_position, field)| match requested_schema.index_of(field.name()) {
+                Some(index) => {
+                    found_count += 1;
+                    indicies[index] = parquet_position;
+                    index as i32
+                }
+                None => -1,
+            },
+        )
+        .collect();
+    if found_count != requested_len {
+        return Err(Error::generic(
+            "Didn't find all requested columns in parquet schema",
+        ));
+    }
     Ok((indicies, reorder_indicies))
 }
 
@@ -40,12 +48,12 @@ pub(crate) fn get_requested_indices(
 /// handle "root" level columns, and hence use `ProjectionMask::roots`, but will support leaf
 /// selection in the future. See issues #86 and #96 as well.
 pub(crate) fn generate_mask(
-    requested_schema: &ArrowSchema,
+    requested_schema: &SchemaRef,
     parquet_schema: &ArrowSchemaRef,
     parquet_physical_schema: &SchemaDescriptor,
     indicies: &[usize],
 ) -> Option<ProjectionMask> {
-    if parquet_schema.fields.size() == requested_schema.fields.size() {
+    if parquet_schema.fields.size() == requested_schema.fields.len() {
         // we assume that in get_requested_indicies we will have caught any column name mismatches,
         // so here we can just say that if we request the same # of columns as the parquet file
         // actually has, we don't need to mask anything out

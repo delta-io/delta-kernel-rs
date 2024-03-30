@@ -55,9 +55,9 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             return Ok(Box::new(std::iter::empty()));
         }
 
-        let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
-        let file_reader = ParquetOpener::new(1024, schema.clone(), self.store.clone());
-        let mut stream = FileStream::new(files.to_vec(), schema, file_reader)?;
+        let arrow_schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
+        let file_reader = ParquetOpener::new(1024, physical_schema.clone(), self.store.clone());
+        let mut stream = FileStream::new(files.to_vec(), arrow_schema, file_reader)?;
 
         // This channel will become the output iterator.
         // The stream will execute in the background and send results to this channel.
@@ -95,19 +95,19 @@ struct ParquetOpener {
     // projection: Arc<[usize]>,
     batch_size: usize,
     limit: Option<usize>,
-    table_schema: ArrowSchemaRef,
+    table_schema: SchemaRef,
     store: Arc<DynObjectStore>,
 }
 
 impl ParquetOpener {
     pub(crate) fn new(
         batch_size: usize,
-        schema: ArrowSchemaRef,
+        table_schema: SchemaRef,
         store: Arc<DynObjectStore>,
     ) -> Self {
         Self {
             batch_size,
-            table_schema: schema,
+            table_schema,
             limit: None,
             store,
         }

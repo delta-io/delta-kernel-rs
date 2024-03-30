@@ -171,6 +171,10 @@ impl StructType {
         self.fields.get(name.as_ref())
     }
 
+    pub fn index_of(&self, name: impl AsRef<str>) -> Option<usize> {
+        self.fields.get_index_of(name.as_ref())
+    }
+
     pub fn fields(&self) -> impl Iterator<Item = &StructField> {
         self.fields.values()
     }
