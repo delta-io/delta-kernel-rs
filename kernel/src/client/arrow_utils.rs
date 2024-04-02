@@ -11,9 +11,13 @@ use parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 /// Get the indicies in `parquet_schema` of the specified columns in `requested_schema`. This
 /// returns a tuples of (Vec<parquet_schema_index>, Vec<requested_index>). The
 /// `parquet_schema_index` is used for generating the mask for reading from the parquet file, while
-/// the requested_index is used for re-ordering. The requested_index vec will be -1 for any columns
-/// that are not selected, and will contain at selected indexes the position that the column should
-/// appear in the output
+/// the requested_index is used for re-ordering. `requested_index` will be the same size as
+/// requested_schema. Each index in `requested_index` represents a column that will be in the read
+/// parquet data at that index. The value stored in `requested_index` is the position that the
+/// column should appear in the final output. For example, if `requested_index` is `[2,0,1]`, then
+/// the re-ordering code should take the third column in the raw-read parquet data, and move it to
+/// the first column in the final output, the first column to the second, and the second to the
+/// third.
 pub(crate) fn get_requested_indices(
     requested_schema: &SchemaRef,
     parquet_schema: &ArrowSchemaRef,
@@ -25,16 +29,13 @@ pub(crate) fn get_requested_indices(
         .fields()
         .iter()
         .enumerate()
-        .map(
-            |(parquet_position, field)| match requested_schema.index_of(field.name()) {
-                Some(index) => {
-                    found_count += 1;
-                    indicies[index] = parquet_position;
-                    index as i32
-                }
-                None => -1,
-            },
-        )
+        .filter_map(|(parquet_position, field)| {
+            requested_schema.index_of(field.name()).map(|index| {
+                found_count += 1;
+                indicies[index] = parquet_position;
+                index as i32
+            })
+        })
         .collect();
     if found_count != requested_len {
         return Err(Error::generic(
@@ -85,15 +86,11 @@ pub(crate) fn reorder_record_batch(
         let mut fields = Vec::with_capacity(indicies.len());
         let reordered_columns = requested_ordering
             .iter()
-            .filter_map(|index| {
-                if *index >= 0 {
-                    let idx = *index as usize;
-                    // cheap clones of `Arc`s
-                    fields.push(input_schema.field(idx).clone());
-                    Some(input_data.column(idx).clone())
-                } else {
-                    None
-                }
+            .map(|index| {
+                let idx = *index as usize;
+                // cheap clones of `Arc`s
+                fields.push(input_schema.field(idx).clone());
+                input_data.column(idx).clone()
             })
             .collect();
         let schema = Arc::new(ArrowSchema::new(fields));
