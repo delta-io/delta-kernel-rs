@@ -17,6 +17,7 @@ pub fn derive_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream 
 
     let schema_fields = gen_schema_fields(&input.data);
     let output = quote! {
+        #[automatically_derived]
         impl crate::actions::schemas::ToDataType for #struct_ident {
             fn to_data_type() -> crate::schema::DataType {
                 use crate::actions::schemas::{ToDataType, GetStructField};
