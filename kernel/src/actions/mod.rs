@@ -13,10 +13,10 @@ use crate::{schema::StructType, DeltaResult, EngineData};
 
 use std::collections::HashMap;
 
-pub(crate) static ADD_NAME: &str = "add";
-pub(crate) static REMOVE_NAME: &str = "remove";
-pub(crate) static METADATA_NAME: &str = "metaData";
-pub(crate) static PROTOCOL_NAME: &str = "protocol";
+pub(crate) const ADD_NAME: &str = "add";
+pub(crate) const REMOVE_NAME: &str = "remove";
+pub(crate) const METADATA_NAME: &str = "metaData";
+pub(crate) const PROTOCOL_NAME: &str = "protocol";
 
 lazy_static! {
     static ref LOG_SCHEMA: StructType = StructType::new(
