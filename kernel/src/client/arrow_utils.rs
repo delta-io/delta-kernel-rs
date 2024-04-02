@@ -9,21 +9,22 @@ use arrow_schema::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 
 /// Get the indicies in `parquet_schema` of the specified columns in `requested_schema`. This
-/// returns a tuples of (Vec<parquet_schema_index>, Vec<requested_index>). The
-/// `parquet_schema_index` is used for generating the mask for reading from the parquet file, while
-/// the requested_index is used for re-ordering. `requested_index` will be the same size as
-/// requested_schema. Each index in `requested_index` represents a column that will be in the read
-/// parquet data at that index. The value stored in `requested_index` is the position that the
-/// column should appear in the final output. For example, if `requested_index` is `[2,0,1]`, then
-/// the re-ordering code should take the third column in the raw-read parquet data, and move it to
-/// the first column in the final output, the first column to the second, and the second to the
-/// third.
+/// returns a tuples of (mask_indicies: Vec<parquet_schema_index>, reorder_indicies:
+/// Vec<requested_index>). `mask_indicies` is used for generating the mask for reading from the
+/// parquet file, and simply contains an entry for each index we wish to select from the parquet
+/// file set to the index of the requested column in the parquet. `reorder_indicies` is used for
+/// re-ordering and will be the same size as `requested_schema`. Each index in `reorder_indicies`
+/// represents a column that will be in the read parquet data at that index. The value stored in
+/// `reorder_indicies` is the position that the column should appear in the final output. For
+/// example, if `reorder_indicies` is `[2,0,1]`, then the re-ordering code should take the third
+/// column in the raw-read parquet data, and move it to the first column in the final output, the
+/// first column to the second, and the second to the third.
 pub(crate) fn get_requested_indices(
     requested_schema: &SchemaRef,
     parquet_schema: &ArrowSchemaRef,
-) -> DeltaResult<(Vec<usize>, Vec<i32>)> {
+) -> DeltaResult<(Vec<usize>, Vec<usize>)> {
     let requested_len = requested_schema.fields.len();
-    let mut indicies = vec![0; requested_len];
+    let mut mask_indicies = vec![0; requested_len];
     let mut found_count = 0; // verify that we found all requested fields
     let reorder_indicies = parquet_schema
         .fields()
@@ -32,8 +33,8 @@ pub(crate) fn get_requested_indices(
         .filter_map(|(parquet_position, field)| {
             requested_schema.index_of(field.name()).map(|index| {
                 found_count += 1;
-                indicies[index] = parquet_position;
-                index as i32
+                mask_indicies[index] = parquet_position;
+                index
             })
         })
         .collect();
@@ -42,7 +43,7 @@ pub(crate) fn get_requested_indices(
             "Didn't find all requested columns in parquet schema",
         ));
     }
-    Ok((indicies, reorder_indicies))
+    Ok((mask_indicies, reorder_indicies))
 }
 
 /// Create a mask that will only select the specified indicies from the parquet. Currently we only
@@ -67,30 +68,29 @@ pub(crate) fn generate_mask(
     }
 }
 
-/// Reorder a RecordBatch to match `requested_ordering`. This method takes `indicies` as computed by
-/// [`get_requested_indicies`] as an optimization. If the indicies are in order, then we don't need
-/// to do any re-ordering. Otherwise, for each non-zero value in `requested_ordering`, the column at
-/// that index will be added in order to returned batch
+/// Reorder a RecordBatch to match `requested_ordering`. This method takes `mask_indicies` as
+/// computed by [`get_requested_indicies`] as an optimization. If the indicies are in order, then we
+/// don't need to do any re-ordering. Otherwise, for each non-zero value in `requested_ordering`,
+/// the column at that index will be added in order to returned batch
 pub(crate) fn reorder_record_batch(
     input_data: RecordBatch,
-    indicies: &[usize],
-    requested_ordering: &[i32],
+    mask_indicies: &[usize],
+    requested_ordering: &[usize],
 ) -> DeltaResult<RecordBatch> {
-    if indicies.windows(2).all(|is| is[0] <= is[1]) {
+    if mask_indicies.windows(2).all(|is| is[0] <= is[1]) {
         // indicies is already sorted, meaning we requested in the order that the columns were
         // stored in the parquet
         Ok(input_data)
     } else {
         // requested an order different from the parquet, reorder
         let input_schema = input_data.schema();
-        let mut fields = Vec::with_capacity(indicies.len());
+        let mut fields = Vec::with_capacity(requested_ordering.len());
         let reordered_columns = requested_ordering
             .iter()
             .map(|index| {
-                let idx = *index as usize;
                 // cheap clones of `Arc`s
-                fields.push(input_schema.field(idx).clone());
-                input_data.column(idx).clone()
+                fields.push(input_schema.field(*index).clone());
+                input_data.column(*index).clone()
             })
             .collect();
         let schema = Arc::new(ArrowSchema::new(fields));
