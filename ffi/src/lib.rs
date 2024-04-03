@@ -1,6 +1,7 @@
 /// FFI interface for the delta kernel
 ///
 /// Exposes that an engine needs to call from C/C++ to interface with kernel
+#[cfg(feature = "default-client")]
 use std::collections::HashMap;
 use std::default::Default;
 use std::os::raw::{c_char, c_void};
@@ -122,7 +123,9 @@ pub enum KernelError {
     GenericError,
     IOErrorError,
     ParquetError,
+    #[cfg(feature = "default-client")]
     ObjectStoreError,
+    #[cfg(feature = "default-client")]
     ObjectStorePathError,
     FileNotFoundError,
     MissingColumnError,
@@ -152,7 +155,9 @@ impl From<Error> for KernelError {
             Error::GenericError { .. } => KernelError::GenericError,
             Error::IOError(_) => KernelError::IOErrorError,
             Error::Parquet(_) => KernelError::ParquetError,
+            #[cfg(feature = "default-client")]
             Error::ObjectStore(_) => KernelError::ObjectStoreError,
+            #[cfg(feature = "default-client")]
             Error::ObjectStorePath(_) => KernelError::ObjectStorePathError,
             Error::FileNotFound(_) => KernelError::FileNotFoundError,
             Error::MissingColumn(_) => KernelError::MissingColumnError,
@@ -332,6 +337,7 @@ unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<U
 /// # Safety
 ///
 /// Caller is responsible to pass a valid path pointer.
+#[cfg(feature = "default-client")]
 #[no_mangle]
 pub unsafe extern "C" fn get_default_client(
     path: KernelStringSlice,
@@ -340,6 +346,7 @@ pub unsafe extern "C" fn get_default_client(
     get_default_client_impl(path, allocate_error).into_extern_result(allocate_error)
 }
 
+#[cfg(feature = "default-client")]
 unsafe fn get_default_client_impl(
     path: KernelStringSlice,
     allocate_error: AllocateErrorFn,
