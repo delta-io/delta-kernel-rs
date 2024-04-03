@@ -7,6 +7,7 @@ use std::default::Default;
 use std::os::raw::{c_char, c_void};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing::debug;
 use url::Url;
 
 use deltakernel::actions::Add;
@@ -189,6 +190,8 @@ pub struct EngineError {
     etype: KernelError,
 }
 
+/// Semantics: Kernel will always immediately return the leaked engine error to the engine (if it
+/// allocated one at all), and engine is responsible to free it.
 #[repr(C)]
 pub enum ExternResult<T> {
     Ok(T),
@@ -298,6 +301,7 @@ impl ArcHandle for ExternEngineInterfaceHandle {
     type Target = dyn ExternEngineInterface;
 }
 
+// TODO missing a drop method
 struct ExternEngineInterfaceVtable {
     // Actual table client instance to use
     client: Arc<dyn EngineInterface>,
@@ -314,6 +318,11 @@ unsafe impl Send for ExternEngineInterfaceVtable {}
 ///
 /// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
 /// responsible to handle any races that could result.
+///
+/// These are needed because anything wrapped in Arc "should" implement it
+/// Basically, by failing to implement these traits, we forbid the engine from being able to declare
+/// its thread-safety (because rust assumes it is not threadsafe). By implementing them, we leave it
+/// up to the engine to enforce thread safety if engine chooses to use threads at all.
 unsafe impl Sync for ExternEngineInterfaceVtable {}
 
 impl ExternEngineInterface for ExternEngineInterfaceVtable {
@@ -439,13 +448,13 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         child_list_id: usize,
-    ) -> (),
+    ),
     visit_string:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice) -> (),
+        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
     visit_integer:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice) -> (),
+        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
     visit_long:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice) -> (),
+        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
 }
 
 /// # Safety
@@ -536,6 +545,7 @@ impl<T> Default for ReferenceSet<T> {
     fn default() -> Self {
         Self {
             map: Default::default(),
+            // NOTE: 0 is interpreted as None
             next_id: 1,
         }
     }
@@ -580,6 +590,7 @@ fn unwrap_kernel_expression(
     state.inflight_expressions.take(exprid)
 }
 
+// TODO move visitors to separate module
 fn visit_expression_binary(
     state: &mut KernelExpressionVisitorState,
     op: BinaryOperator,
@@ -708,6 +719,8 @@ pub struct KernelScanFileIterator {
     files: Box<dyn Iterator<Item = DeltaResult<Add>>>,
 
     // Also keep a reference to the external client for its error allocator.
+    // Parquet and Json handlers don't hold any reference to the tokio reactor, so if the last table
+    // client goes out of scope the iterator terminates early.
     table_client: Arc<dyn ExternEngineInterface>,
 }
 
@@ -715,7 +728,7 @@ impl BoxHandle for KernelScanFileIterator {}
 
 impl Drop for KernelScanFileIterator {
     fn drop(&mut self) {
-        println!("dropping KernelScanFileIterator");
+        debug!("dropping KernelScanFileIterator");
     }
 }
 
@@ -795,6 +808,8 @@ fn kernel_scan_files_next_impl(
 ///
 /// Caller is responsible to (at most once) pass a valid pointer returned by a call to
 /// [kernel_scan_files_init].
+// we should probably be consistent with drop vs. free on engine side (probably the latter is more
+// intuitive to non-rust code)
 #[no_mangle]
 pub unsafe extern "C" fn kernel_scan_files_free(files: *mut KernelScanFileIterator) {
     BoxHandle::drop_handle(files);
