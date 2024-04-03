@@ -3,14 +3,42 @@ pub(crate) mod deletion_vector;
 pub(crate) mod schemas;
 pub(crate) mod visitors;
 
-use std::{collections::HashMap, sync::Arc};
+use derive_macros::Schema;
+use lazy_static::lazy_static;
 use visitors::{AddVisitor, MetadataVisitor, ProtocolVisitor};
 
+use self::deletion_vector::DeletionVectorDescriptor;
+use crate::actions::schemas::GetStructField;
 use crate::{schema::StructType, DeltaResult, EngineData};
 
-use self::deletion_vector::DeletionVectorDescriptor;
+use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) const ADD_NAME: &str = "add";
+pub(crate) const REMOVE_NAME: &str = "remove";
+pub(crate) const METADATA_NAME: &str = "metaData";
+pub(crate) const PROTOCOL_NAME: &str = "protocol";
+
+lazy_static! {
+    static ref LOG_SCHEMA: StructType = StructType::new(
+        vec![
+            Option::<Add>::get_struct_field(ADD_NAME),
+            Option::<Remove>::get_struct_field(REMOVE_NAME),
+            Option::<Metadata>::get_struct_field(METADATA_NAME),
+            Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
+            // We don't support the following actions yet
+            //Option<Cdc>::get_field(CDC_NAME),
+            //Option<CommitInfo>::get_field(COMMIT_INFO_NAME),
+            //Option<DomainMetadata>::get_field(DOMAIN_METADATA_NAME),
+            //Option<Transaction>::get_field(TRANSACTION_NAME),
+        ]
+    );
+}
+
+pub(crate) fn get_log_schema() -> &'static StructType {
+    &LOG_SCHEMA
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Schema)]
 pub struct Format {
     /// Name of the encoding for files in this table
     pub provider: String,
@@ -27,7 +55,7 @@ impl Default for Format {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Schema)]
 pub struct Metadata {
     /// Unique identifier for this table
     pub id: String,
@@ -44,14 +72,13 @@ pub struct Metadata {
     /// The time when this metadata action is created, in milliseconds since the Unix epoch
     pub created_time: Option<i64>,
     /// Configuration options for the metadata action
-    pub configuration: HashMap<String, Option<String>>,
+    pub configuration: HashMap<String, String>,
 }
 
 impl Metadata {
     pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
-        let schema = StructType::new(vec![crate::actions::schemas::METADATA_FIELD.clone()]);
         let mut visitor = MetadataVisitor::default();
-        data.extract(Arc::new(schema), &mut visitor)?;
+        data.extract(get_log_schema().project(&[METADATA_NAME])?, &mut visitor)?;
         Ok(visitor.metadata)
     }
 
@@ -60,7 +87,7 @@ impl Metadata {
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Schema)]
 pub struct Protocol {
     /// The minimum version of the Delta read protocol that a client must implement
     /// in order to correctly read this table
@@ -79,13 +106,12 @@ pub struct Protocol {
 impl Protocol {
     pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
         let mut visitor = ProtocolVisitor::default();
-        let schema = StructType::new(vec![crate::actions::schemas::PROTOCOL_FIELD.clone()]);
-        data.extract(Arc::new(schema), &mut visitor)?;
+        data.extract(get_log_schema().project(&[PROTOCOL_NAME])?, &mut visitor)?;
         Ok(visitor.protocol)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Schema)]
 pub struct Add {
     /// A relative path to a data file from the root of the table or an absolute path to a file
     /// that should be added to the table. The path is a URI as specified by
@@ -95,7 +121,7 @@ pub struct Add {
     pub path: String,
 
     /// A map from partition column to value for this logical file.
-    pub partition_values: HashMap<String, Option<String>>,
+    pub partition_values: HashMap<String, String>,
 
     /// The size of this data file in bytes
     pub size: i64,
@@ -113,7 +139,7 @@ pub struct Add {
     pub stats: Option<String>,
 
     /// Map containing metadata about this logical file.
-    pub tags: HashMap<String, Option<String>>,
+    pub tags: Option<HashMap<String, String>>,
 
     /// Information about deletion vector (DV) associated with this add action
     pub deletion_vector: Option<DeletionVectorDescriptor>,
@@ -134,8 +160,7 @@ impl Add {
     /// Since we always want to parse multiple adds from data, we return a `Vec<Add>`
     pub fn parse_from_data(data: &dyn EngineData) -> DeltaResult<Vec<Add>> {
         let mut visitor = AddVisitor::default();
-        let schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
-        data.extract(Arc::new(schema), &mut visitor)?;
+        data.extract(get_log_schema().project(&[ADD_NAME])?, &mut visitor)?;
         Ok(visitor.adds)
     }
 
@@ -144,7 +169,7 @@ impl Add {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Schema)]
 pub(crate) struct Remove {
     /// A relative path to a data file from the root of the table or an absolute path to a file
     /// that should be added to the table. The path is a URI as specified by
@@ -153,24 +178,24 @@ pub(crate) struct Remove {
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
     pub(crate) path: String,
 
+    /// The time this logical file was created, as milliseconds since the epoch.
+    pub(crate) deletion_timestamp: Option<i64>,
+
     /// When `false` the logical file must already be present in the table or the records
     /// in the added file must be contained in one or more remove actions in the same version.
     pub(crate) data_change: bool,
-
-    /// The time this logical file was created, as milliseconds since the epoch.
-    pub(crate) deletion_timestamp: Option<i64>,
 
     /// When true the fields `partition_values`, `size`, and `tags` are present
     pub(crate) extended_file_metadata: Option<bool>,
 
     /// A map from partition column to value for this logical file.
-    pub(crate) partition_values: Option<HashMap<String, Option<String>>>,
+    pub(crate) partition_values: Option<HashMap<String, String>>,
 
     /// The size of this data file in bytes
     pub(crate) size: Option<i64>,
 
     /// Map containing metadata about this logical file.
-    pub(crate) tags: Option<HashMap<String, Option<String>>>,
+    pub(crate) tags: Option<HashMap<String, String>>,
 
     /// Information about deletion vector (DV) associated with this add action
     pub(crate) deletion_vector: Option<DeletionVectorDescriptor>,
@@ -185,19 +210,111 @@ pub(crate) struct Remove {
 }
 
 impl Remove {
-    // _try_new_from_data for now, to avoid warning, probably will need at some point
-    // pub(crate) fn _try_new_from_data(
-    //     data: &dyn EngineData,
-    // ) -> DeltaResult<Remove> {
-    //     let mut visitor = Visitor::new(visit_remove);
-    //     let schema = StructType::new(vec![crate::actions::schemas::REMOVE_FIELD.clone()]);
-    //     data.extract(Arc::new(schema), &mut visitor)?;
-    //     visitor
-    //         .extracted
-    //         .unwrap_or_else(|| Err(Error::generic("Didn't get expected remove")))
-    // }
-
     pub(crate) fn dv_unique_id(&self) -> Option<String> {
         self.deletion_vector.as_ref().map(|dv| dv.unique_id())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::schema::{ArrayType, DataType, MapType, StructField};
+
+    #[test]
+    fn test_metadata_schema() {
+        let schema = get_log_schema()
+            .project(&["metaData"])
+            .expect("Couldn't get metaData field");
+
+        let expected = Arc::new(StructType::new(vec![StructField::new(
+            "metaData",
+            StructType::new(vec![
+                StructField::new("id", DataType::STRING, false),
+                StructField::new("name", DataType::STRING, true),
+                StructField::new("description", DataType::STRING, true),
+                StructField::new(
+                    "format",
+                    StructType::new(vec![
+                        StructField::new("provider", DataType::STRING, false),
+                        StructField::new(
+                            "options",
+                            MapType::new(DataType::STRING, DataType::STRING, false),
+                            false,
+                        ),
+                    ]),
+                    false,
+                ),
+                StructField::new("schemaString", DataType::STRING, false),
+                StructField::new(
+                    "partitionColumns",
+                    ArrayType::new(DataType::STRING, false),
+                    false,
+                ),
+                StructField::new("createdTime", DataType::LONG, true),
+                StructField::new(
+                    "configuration",
+                    MapType::new(DataType::STRING, DataType::STRING, false),
+                    false,
+                ),
+            ]),
+            true,
+        )]));
+        assert_eq!(schema, expected);
+    }
+
+    fn tags_field() -> StructField {
+        StructField::new(
+            "tags",
+            MapType::new(DataType::STRING, DataType::STRING, false),
+            true,
+        )
+    }
+
+    fn partition_values_field() -> StructField {
+        StructField::new(
+            "partitionValues",
+            MapType::new(DataType::STRING, DataType::STRING, false),
+            true,
+        )
+    }
+
+    fn deletion_vector_field() -> StructField {
+        StructField::new(
+            "deletionVector",
+            DataType::Struct(Box::new(StructType::new(vec![
+                StructField::new("storageType", DataType::STRING, false),
+                StructField::new("pathOrInlineDv", DataType::STRING, false),
+                StructField::new("offset", DataType::INTEGER, true),
+                StructField::new("sizeInBytes", DataType::INTEGER, false),
+                StructField::new("cardinality", DataType::LONG, false),
+            ]))),
+            true,
+        )
+    }
+
+    #[test]
+    fn test_remove_schema() {
+        let schema = get_log_schema()
+            .project(&["remove"])
+            .expect("Couldn't get remove field");
+        let expected = Arc::new(StructType::new(vec![StructField::new(
+            "remove",
+            StructType::new(vec![
+                StructField::new("path", DataType::STRING, false),
+                StructField::new("deletionTimestamp", DataType::LONG, true),
+                StructField::new("dataChange", DataType::BOOLEAN, false),
+                StructField::new("extendedFileMetadata", DataType::BOOLEAN, true),
+                partition_values_field(),
+                StructField::new("size", DataType::LONG, true),
+                tags_field(),
+                deletion_vector_field(),
+                StructField::new("baseRowId", DataType::LONG, true),
+                StructField::new("defaultRowCommitVersion", DataType::LONG, true),
+            ]),
+            true,
+        )]));
+        assert_eq!(schema, expected);
     }
 }

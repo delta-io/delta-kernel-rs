@@ -111,6 +111,9 @@ impl TryFrom<&DataType> for ArrowDataType {
                         // Issue: https://github.com/delta-io/delta/issues/643
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
+                    PrimitiveType::TimestampNtz => {
+                        Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
+                    }
                 }
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(

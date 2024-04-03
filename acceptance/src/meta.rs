@@ -42,6 +42,10 @@ impl TestCaseInfo {
         Url::from_directory_path(table_root).map_err(|_| AssertionError::InvalidTestCase)
     }
 
+    pub fn root_dir(&self) -> &PathBuf {
+        &self.root_dir
+    }
+
     async fn versions(&self) -> TestResult<(TableVersionMetaData, Vec<TableVersionMetaData>)> {
         let expected_root = self.root_dir.join("expected");
         let store = LocalFileSystem::new_with_prefix(&expected_root).unwrap();
@@ -87,7 +91,7 @@ impl TestCaseInfo {
             properties: metadata
                 .configuration
                 .iter()
-                .map(|(k, v)| (k.clone(), v.clone().unwrap()))
+                .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             min_reader_version: protocol.min_reader_version as u32,
             min_writer_version: protocol.min_writer_version as u32,

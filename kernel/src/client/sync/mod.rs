@@ -6,7 +6,6 @@ use crate::{EngineInterface, ExpressionHandler, FileSystemClient, JsonHandler, P
 use std::sync::Arc;
 
 mod fs_client;
-mod get_data;
 pub(crate) mod json;
 mod parquet;
 

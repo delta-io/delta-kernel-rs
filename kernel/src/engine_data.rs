@@ -51,7 +51,7 @@ pub trait EngineMap {
     /// Get the item with the specified key from the map at `row_index` in the raw data, and return it as an `Option<&'a str>`
     fn get<'a>(&'a self, row_index: usize, key: &str) -> Option<&'a str>;
     /// Materialize the entire map at `row_index` in the raw data into a `HashMap`
-    fn materialize(&self, row_index: usize) -> HashMap<String, Option<String>>;
+    fn materialize(&self, row_index: usize) -> HashMap<String, String>;
 }
 
 /// A map item is useful if the Engine needs to know what row of raw data it needs to access to
@@ -70,7 +70,7 @@ impl<'a> MapItem<'a> {
         self.map.get(self.row, key)
     }
 
-    pub fn materialize(&self) -> HashMap<String, Option<String>> {
+    pub fn materialize(&self) -> HashMap<String, String> {
         self.map.materialize(self.row)
     }
 }
@@ -149,14 +149,14 @@ impl<'a> TypedGetData<'a, Vec<String>> for dyn GetData<'a> + '_ {
     }
 }
 
-/// Provide an impl to get a map field as a `HashMap<String, Option<String>>`. Note that this will
+/// Provide an impl to get a map field as a `HashMap<String, String>`. Note that this will
 /// allocate the map and allocate for each entry
-impl<'a> TypedGetData<'a, HashMap<String, Option<String>>> for dyn GetData<'a> + '_ {
+impl<'a> TypedGetData<'a, HashMap<String, String>> for dyn GetData<'a> + '_ {
     fn get_opt(
         &'a self,
         row_index: usize,
         field_name: &str,
-    ) -> DeltaResult<Option<HashMap<String, Option<String>>>> {
+    ) -> DeltaResult<Option<HashMap<String, String>>> {
         let map_opt: Option<MapItem<'_>> = self.get_opt(row_index, field_name)?;
         Ok(map_opt.map(|map| map.materialize()))
     }

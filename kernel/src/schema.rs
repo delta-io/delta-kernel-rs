@@ -3,7 +3,10 @@ use std::sync::Arc;
 use std::{collections::HashMap, fmt::Display};
 
 use indexmap::IndexMap;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+
+use crate::{DeltaResult, Error};
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
@@ -140,8 +143,36 @@ impl StructType {
         }
     }
 
+    /// Get a [`StructType`] containing [`StructField`]s of the given names. The order of fields in
+    /// the returned schema will match the order passed to this function, which can be different
+    /// from this order in this schema. Returns an Err if a specified field doesn't exist.
+    pub fn project_as_struct(&self, names: &[impl AsRef<str>]) -> DeltaResult<StructType> {
+        let fields = names
+            .iter()
+            .map(|name| {
+                self.fields
+                    .get(name.as_ref())
+                    .cloned()
+                    .ok_or_else(|| Error::missing_column(name.as_ref()))
+            })
+            .try_collect()?;
+        Ok(Self::new(fields))
+    }
+
+    /// Get a [`SchemaRef`] containing [`StructField`]s of the given names. The order of fields in
+    /// the returned schema will match the order passed to this function, which can be different
+    /// from this order in this schema. Returns an Err if a specified field doesn't exist.
+    pub fn project(&self, names: &[impl AsRef<str>]) -> DeltaResult<SchemaRef> {
+        let struct_type = self.project_as_struct(names)?;
+        Ok(Arc::new(struct_type))
+    }
+
     pub fn field(&self, name: impl AsRef<str>) -> Option<&StructField> {
         self.fields.get(name.as_ref())
+    }
+
+    pub fn index_of(&self, name: impl AsRef<str>) -> Option<usize> {
+        self.fields.get_index_of(name.as_ref())
     }
 
     pub fn fields(&self) -> impl Iterator<Item = &StructField> {
@@ -286,6 +317,8 @@ pub enum PrimitiveType {
     Date,
     /// Microsecond precision timestamp, adjusted to UTC.
     Timestamp,
+    #[serde(rename = "timestamp_ntz")]
+    TimestampNtz,
     // TODO: timestamp without timezone
     #[serde(
         serialize_with = "serialize_decimal",
@@ -346,6 +379,7 @@ impl Display for PrimitiveType {
             PrimitiveType::Binary => write!(f, "binary"),
             PrimitiveType::Date => write!(f, "date"),
             PrimitiveType::Timestamp => write!(f, "timestamp"),
+            PrimitiveType::TimestampNtz => write!(f, "timestamp_ntz"),
             PrimitiveType::Decimal(precision, scale) => {
                 write!(f, "decimal({}, {})", precision, scale)
             }
