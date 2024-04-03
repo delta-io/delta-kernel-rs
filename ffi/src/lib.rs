@@ -172,7 +172,10 @@ impl From<Error> for KernelError {
             Error::JoinFailure(_) => KernelError::JoinFailureError,
             Error::Utf8Error(_) => KernelError::Utf8Error,
             Error::ParseIntError(_) => KernelError::ParseIntError,
-            Error::Backtraced { source, backtrace: _ } => Self::from(*source),
+            Error::Backtraced {
+                source,
+                backtrace: _,
+            } => Self::from(*source),
         }
     }
 }
