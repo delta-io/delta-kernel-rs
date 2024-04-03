@@ -11,7 +11,10 @@ readme.workspace = true
 version.workspace = true
 
 [dependencies]
-arrow = { version = "^49.0", features = ["json", "prettyprint"] }
+arrow-array = { version = "^49.0" }
+arrow-ord = { version = "^49.0" }
+arrow-select = { version = "^49.0" }
+arrow-schema = { version = "^49.0" }
 deltakernel = { path = "../kernel", features = ["default-client", "developer-visibility"] }
 futures = "0.3"
 object_store = "^0.8.0"

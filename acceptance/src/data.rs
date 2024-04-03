@@ -1,10 +1,10 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
-use arrow::{
-    compute::{concat_batches, filter_record_batch, lexsort_to_indices, take, SortColumn},
-    datatypes::DataType,
-    record_batch::RecordBatch,
-};
+use arrow_array::RecordBatch;
+use arrow_ord::sort::{lexsort_to_indices, SortColumn};
+use arrow_schema::DataType;
+use arrow_select::{concat::concat_batches, filter::filter_record_batch, take::take};
+
 use deltakernel::{client::arrow_data::ArrowEngineData, scan::ScanBuilder, EngineInterface, Table};
 use futures::{stream::TryStreamExt, StreamExt};
 use object_store::{local::LocalFileSystem, ObjectStore};
