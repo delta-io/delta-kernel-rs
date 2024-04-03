@@ -94,7 +94,7 @@ impl Into<KernelStringSlice> for &str {
 }
 
 trait TryFromStringSlice: Sized {
-    unsafe fn try_from_slice(slice: KernelStringSlice) -> DeltaResult<Self>;
+    unsafe fn try_from_slice(slice: KernelStringSlice) -> Self;
 }
 
 impl TryFromStringSlice for String {
@@ -104,12 +104,9 @@ impl TryFromStringSlice for String {
     ///
     /// The slice must be a valid (non-null) pointer, and must point to the indicated number of
     /// valid utf8 bytes.
-    unsafe fn try_from_slice(slice: KernelStringSlice) -> DeltaResult<String> {
+    unsafe fn try_from_slice(slice: KernelStringSlice) -> String {
         let slice = unsafe { std::slice::from_raw_parts(slice.ptr.cast(), slice.len) };
-        match std::str::from_utf8(slice) {
-            Ok(s) => Ok(s.to_string()),
-            Err(e) => Err(Error::generic_err(e)),
-        }
+        std::str::from_utf8(slice).unwrap().to_string()
     }
 }
 
@@ -339,7 +336,7 @@ impl ExternEngineInterface for ExternEngineInterfaceVtable {
 /// Caller is responsible to pass a valid path pointer.
 unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<Url> {
     let path = unsafe { String::try_from_slice(path) };
-    let path = std::fs::canonicalize(PathBuf::from(path?)).map_err(Error::generic)?;
+    let path = std::fs::canonicalize(PathBuf::from(path)).map_err(Error::generic)?;
     Url::from_directory_path(path).map_err(|_| Error::generic("Invalid url"))
 }
 
@@ -677,7 +674,7 @@ unsafe fn visit_expression_column_impl(
     name: KernelStringSlice,
 ) -> DeltaResult<usize> {
     let name = unsafe { String::try_from_slice(name) };
-    Ok(wrap_expression(state, Expression::Column(name?)))
+    Ok(wrap_expression(state, Expression::Column(name)))
 }
 
 /// # Safety
@@ -697,7 +694,7 @@ unsafe fn visit_expression_literal_string_impl(
     let value = unsafe { String::try_from_slice(value) };
     Ok(wrap_expression(
         state,
-        Expression::Literal(Scalar::from(value?)),
+        Expression::Literal(Scalar::from(value)),
     ))
 }
 
