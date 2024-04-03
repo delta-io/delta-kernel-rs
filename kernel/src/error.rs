@@ -1,4 +1,8 @@
-use std::{num::ParseIntError, string::FromUtf8Error};
+use std::{
+    backtrace::{Backtrace, BacktraceStatus},
+    num::ParseIntError,
+    string::FromUtf8Error,
+};
 
 use crate::schema::DataType;
 
@@ -6,9 +10,19 @@ pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    // This is an error that includes a backtrace. To have a particular type of error include such
+    // backtrace (when RUST_BACKTRACE=1), annotate the error with `#[error(transparent)]` and then
+    // add the error type and enum variant to the `from_with_backtrace!` macro invocation below. See
+    // IOError for an example.
+    #[error("{source}\n{backtrace}")]
+    Backtraced {
+        source: Box<Self>,
+        backtrace: Box<Backtrace>,
+    },
+
     #[cfg(any(feature = "default-client", feature = "sync-client"))]
-    #[error("Arrow error: {0}")]
-    Arrow(#[from] arrow_schema::ArrowError),
+    #[error(transparent)]
+    Arrow(arrow_schema::ArrowError),
 
     #[error("Invalid engine data type. Could not convert to {0}")]
     EngineDataType(String),
@@ -25,8 +39,8 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
-    #[error("IO error: {0}")]
-    IOError(#[from] std::io::Error),
+    #[error(transparent)]
+    IOError(std::io::Error),
 
     #[cfg(feature = "parquet")]
     #[error("Arrow error: {0}")]
@@ -63,8 +77,8 @@ pub enum Error {
     #[error("Invalid url: {0}")]
     InvalidUrl(#[from] url::ParseError),
 
-    #[error("Invalid url: {0}")]
-    MalformedJson(#[from] serde_json::Error),
+    #[error(transparent)]
+    MalformedJson(serde_json::Error),
 
     #[error("No table metadata found in delta log.")]
     MissingMetadata,
@@ -118,6 +132,43 @@ impl Error {
     }
     pub fn join_failure(msg: impl ToString) -> Self {
         Self::JoinFailure(msg.to_string())
+    }
+
+    // Capture a backtrace when the error is constructed.
+    #[must_use]
+    pub fn with_backtrace(self) -> Self {
+        let backtrace = Backtrace::capture();
+        match backtrace.status() {
+            BacktraceStatus::Captured => Self::Backtraced {
+                source: Box::new(self),
+                backtrace: Box::new(backtrace),
+            },
+            _ => self,
+        }
+    }
+}
+
+macro_rules! from_with_backtrace(
+    ( $(($error_type: ty, $error_variant: ident)), * ) => {
+        $(
+            impl From<$error_type> for Error {
+                fn from(value: $error_type) -> Self {
+                    Self::$error_variant(value).with_backtrace()
+                }
+            }
+        )*
+    };
+);
+
+from_with_backtrace!(
+    (serde_json::Error, MalformedJson),
+    (std::io::Error, IOError)
+);
+
+#[cfg(any(feature = "default-client", feature = "sync-client"))]
+impl From<arrow_schema::ArrowError> for Error {
+    fn from(value: arrow_schema::ArrowError) -> Self {
+        Self::Arrow(value).with_backtrace()
     }
 }
 
