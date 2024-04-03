@@ -102,6 +102,9 @@ impl LogReplayScanner {
             .transpose()?;
 
         let schema_to_use = if is_log_batch {
+            // NB: We _must_ pass these in the order `ADD_NAME, REMOVE_NAME` as the visitor assumes
+            // the Add action comes first. The [`project`] method honors this order, so this works
+            // as long as we keep this order here.
             get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?
         } else {
             // All checkpoint actions are already reconciled and Remove actions in checkpoint files
