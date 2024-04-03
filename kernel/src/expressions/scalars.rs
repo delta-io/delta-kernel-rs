@@ -179,7 +179,8 @@ impl PrimitiveType {
                 let days = date.signed_duration_since(*UNIX_EPOCH).num_days() as i32;
                 Ok(Scalar::Date(days))
             }
-            Timestamp => {
+            // TODO: Handle timezones properly
+            Timestamp | TimestampNtz => {
                 let timestamp = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
                     .map_err(|_| self.parse_error(raw))?;
                 let timestamp = Utc.from_utc_datetime(&timestamp);
