@@ -169,7 +169,7 @@ impl AddVisitor {
             modification_time,
             data_change,
             stats,
-            tags: HashMap::new(),
+            tags: None,
             deletion_vector,
             base_row_id,
             default_row_commit_version,
@@ -211,20 +211,20 @@ impl RemoveVisitor {
 
         let size: Option<i64> = getters[5].get_opt(row_index, "remove.size")?;
 
-        // TODO(nick) stats are skipped in getters[6] and tags are skipped in getters[7]
+        // TODO(nick) tags are skipped in getters[6]
 
         let deletion_vector = if let Some(storage_type) =
-            getters[8].get_opt(row_index, "remove.deletionVector.storageType")?
+            getters[7].get_opt(row_index, "remove.deletionVector.storageType")?
         {
             // there is a storageType, so the whole DV must be there
             let path_or_inline_dv: String =
-                getters[9].get(row_index, "remove.deletionVector.pathOrInlineDv")?;
+                getters[8].get(row_index, "remove.deletionVector.pathOrInlineDv")?;
             let offset: Option<i32> =
-                getters[10].get_opt(row_index, "remove.deletionVector.offset")?;
+                getters[9].get_opt(row_index, "remove.deletionVector.offset")?;
             let size_in_bytes: i32 =
-                getters[11].get(row_index, "remove.deletionVector.sizeInBytes")?;
+                getters[10].get(row_index, "remove.deletionVector.sizeInBytes")?;
             let cardinality: i64 =
-                getters[12].get(row_index, "remove.deletionVector.cardinality")?;
+                getters[11].get(row_index, "remove.deletionVector.cardinality")?;
             Some(DeletionVectorDescriptor {
                 storage_type,
                 path_or_inline_dv,
@@ -236,9 +236,9 @@ impl RemoveVisitor {
             None
         };
 
-        let base_row_id: Option<i64> = getters[13].get_opt(row_index, "remove.baseRowId")?;
+        let base_row_id: Option<i64> = getters[12].get_opt(row_index, "remove.baseRowId")?;
         let default_row_commit_version: Option<i64> =
-            getters[14].get_opt(row_index, "remove.defaultRowCommitVersion")?;
+            getters[13].get_opt(row_index, "remove.defaultRowCommitVersion")?;
 
         Ok(Remove {
             path,
@@ -277,10 +277,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        actions::schemas::log_schema,
+        actions::{get_log_schema, ADD_NAME},
         client::arrow_data::ArrowEngineData,
         client::sync::{json::SyncJsonHandler, SyncEngineInterface},
-        schema::StructType,
         EngineData, EngineInterface, JsonHandler,
     };
 
@@ -302,7 +301,7 @@ mod tests {
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
         ]
         .into();
-        let output_schema = Arc::new(log_schema().clone());
+        let output_schema = Arc::new(get_log_schema().clone());
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
@@ -331,12 +330,9 @@ mod tests {
         let configuration = HashMap::from_iter([
             (
                 "delta.enableDeletionVectors".to_string(),
-                Some("true".to_string()),
+                "true".to_string(),
             ),
-            (
-                "delta.columnMapping.mode".to_string(),
-                Some("none".to_string()),
-            ),
+            ("delta.columnMapping.mode".to_string(), "none".to_string()),
         ]);
         let expected = Metadata {
             id: "testId".into(),
@@ -368,26 +364,26 @@ mod tests {
             r#"{"add":{"path":"c1=6/c2=a/part-00011-10619b10-b691-4fd0-acc4-2a9608499d7c.c000.snappy.parquet","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":4},\"maxValues\":{\"c3\":4},\"nullCount\":{\"c3\":0}}"}}"#,
         ]
         .into();
-        let output_schema = Arc::new(log_schema().clone());
+        let output_schema = Arc::new(get_log_schema().clone());
         let batch = json_handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
-        let add_schema = StructType::new(vec![crate::actions::schemas::ADD_FIELD.clone()]);
+        let add_schema = get_log_schema()
+            .project(&[ADD_NAME])
+            .expect("Can't get add schema");
         let mut add_visitor = AddVisitor::default();
-        batch
-            .extract(Arc::new(add_schema), &mut add_visitor)
-            .unwrap();
+        batch.extract(add_schema, &mut add_visitor).unwrap();
         let add1 = Add {
             path: "c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet".into(),
             partition_values: HashMap::from([
-                ("c1".to_string(), Some("4".to_string())),
-                ("c2".to_string(), Some("c".to_string())),
+                ("c1".to_string(), "4".to_string()),
+                ("c2".to_string(), "c".to_string()),
             ]),
             size: 452,
             modification_time: 1670892998135,
             data_change: true,
             stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":5},\"maxValues\":{\"c3\":5},\"nullCount\":{\"c3\":0}}".into()),
-            tags: HashMap::new(),
+            tags: None,
             deletion_vector: None,
             base_row_id: None,
             default_row_commit_version: None,
@@ -396,8 +392,8 @@ mod tests {
         let add2 = Add {
             path: "c1=5/c2=b/part-00007-4e73fa3b-2c88-424a-8051-f8b54328ffdb.c000.snappy.parquet".into(),
             partition_values: HashMap::from([
-                ("c1".to_string(), Some("5".to_string())),
-                ("c2".to_string(), Some("b".to_string())),
+                ("c1".to_string(), "5".to_string()),
+                ("c2".to_string(), "b".to_string()),
             ]),
             modification_time: 1670892998136,
             stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":6},\"maxValues\":{\"c3\":6},\"nullCount\":{\"c3\":0}}".into()),
@@ -406,8 +402,8 @@ mod tests {
         let add3 = Add {
             path: "c1=6/c2=a/part-00011-10619b10-b691-4fd0-acc4-2a9608499d7c.c000.snappy.parquet".into(),
             partition_values: HashMap::from([
-                ("c1".to_string(), Some("6".to_string())),
-                ("c2".to_string(), Some("a".to_string())),
+                ("c1".to_string(), "6".to_string()),
+                ("c2".to_string(), "a".to_string()),
             ]),
             modification_time: 1670892998137,
             stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":4},\"maxValues\":{\"c3\":4},\"nullCount\":{\"c3\":0}}".into()),

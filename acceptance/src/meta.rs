@@ -87,7 +87,7 @@ impl TestCaseInfo {
             properties: metadata
                 .configuration
                 .iter()
-                .map(|(k, v)| (k.clone(), v.clone().unwrap()))
+                .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             min_reader_version: protocol.min_reader_version as u32,
             min_writer_version: protocol.min_writer_version as u32,

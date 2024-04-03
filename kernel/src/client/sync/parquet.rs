@@ -1,6 +1,5 @@
 use std::fs::File;
 
-use arrow_schema::Schema as ArrowSchema;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use tracing::debug;
 use url::Url;
@@ -20,15 +19,10 @@ fn try_create_from_parquet(schema: SchemaRef, location: Url) -> DeltaResult<Arro
     )?;
     let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
     let parquet_schema = metadata.schema();
-    let requested_schema: ArrowSchema = (&*schema).try_into()?;
     let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let indicies = get_requested_indices(&requested_schema, parquet_schema)?;
-    if let Some(mask) = generate_mask(
-        &requested_schema,
-        parquet_schema,
-        builder.parquet_schema(),
-        &indicies,
-    ) {
+    let (indicies, requested_ordering) = get_requested_indices(&schema, parquet_schema)?;
+    if let Some(mask) = generate_mask(&schema, parquet_schema, builder.parquet_schema(), &indicies)
+    {
         builder = builder.with_projection(mask);
     }
     let mut reader = builder.build()?;
@@ -36,9 +30,9 @@ fn try_create_from_parquet(schema: SchemaRef, location: Url) -> DeltaResult<Arro
         .next()
         .ok_or_else(|| Error::generic("No data found reading parquet file"))?;
     Ok(ArrowEngineData::new(reorder_record_batch(
-        requested_schema.into(),
         data?,
         &indicies,
+        &requested_ordering,
     )?))
 }
 

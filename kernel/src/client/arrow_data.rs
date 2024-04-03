@@ -137,14 +137,14 @@ impl EngineMap for MapArray {
         None
     }
 
-    fn materialize(&self, row_index: usize) -> HashMap<String, Option<String>> {
+    fn materialize(&self, row_index: usize) -> HashMap<String, String> {
         let mut ret = HashMap::new();
         let map_val = self.value(row_index);
         let keys = map_val.column(0).as_string::<i32>();
         let values = map_val.column(1).as_string::<i32>();
         for (key, value) in keys.iter().zip(values.iter()) {
-            if let Some(key) = key {
-                ret.insert(key.into(), value.map(|v| v.into()));
+            if let (Some(key), Some(value)) = (key, value) {
+                ret.insert(key.into(), value.into());
             }
         }
         ret
@@ -338,7 +338,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 
     use crate::{
-        actions::{schemas::log_schema, Metadata},
+        actions::{get_log_schema, Metadata, Protocol},
         client::sync::SyncEngineInterface,
         DeltaResult, EngineData, EngineInterface,
     };
@@ -361,7 +361,7 @@ mod tests {
             r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
         ]
         .into();
-        let output_schema = Arc::new(log_schema().clone());
+        let output_schema = Arc::new(get_log_schema().clone());
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
@@ -369,6 +369,23 @@ mod tests {
         assert_eq!(metadata.id, "aff5cb91-8cd9-4195-aef9-446908507302");
         assert_eq!(metadata.created_time, Some(1670892997849));
         assert_eq!(metadata.partition_columns, vec!("c1", "c2"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_nullable_struct() -> DeltaResult<()> {
+        let client = SyncEngineInterface::new();
+        let handler = client.get_json_handler();
+        let json_strings: StringArray = vec![
+            r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
+        ]
+        .into();
+        let output_schema = get_log_schema().project(&["metaData"])?;
+        let parsed = handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        let protocol = Protocol::try_new_from_data(parsed.as_ref())?;
+        assert!(protocol.is_none());
         Ok(())
     }
 }

@@ -9,9 +9,9 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::actions::{Metadata, Protocol};
+use crate::actions::{get_log_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
 use crate::path::LogPath;
-use crate::schema::{Schema, SchemaRef, StructType};
+use crate::schema::{Schema, SchemaRef};
 use crate::{DeltaResult, EngineInterface, Error, FileMeta, FileSystemClient, Version};
 use crate::{EngineData, Expression};
 
@@ -69,10 +69,7 @@ impl LogSegment {
         &self,
         engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<Option<(Metadata, Protocol)>> {
-        let schema = Arc::new(StructType::new(vec![
-            crate::actions::schemas::METADATA_FIELD.clone(),
-            crate::actions::schemas::PROTOCOL_FIELD.clone(),
-        ]));
+        let schema = get_log_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
         // read the same protocol and metadata schema for both commits and checkpoints
         // TODO add metadata.table_id is not null and protocol.something_required is not null
         let data_batches = self.replay(engine_interface, schema.clone(), schema, None)?;

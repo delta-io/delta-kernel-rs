@@ -4,7 +4,7 @@ use itertools::Itertools;
 use tracing::debug;
 
 use self::file_stream::log_replay_iter;
-use crate::actions::Add;
+use crate::actions::{get_log_schema, Add, ADD_NAME, REMOVE_NAME};
 use crate::expressions::{Expression, Scalar};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
@@ -51,8 +51,8 @@ impl ScanBuilder {
         self
     }
 
-    /// Optionally provide a [`Schema`] for columns to select from the [`Snapshot`]. See
-    /// [`with_schema`] for details. If schema_opt is `None` this is a no-op.
+    /// Optionally provide a [`SchemaRef`] for columns to select from the [`Snapshot`]. See
+    /// [`ScanBuilder::with_schema`] for details. If schema_opt is `None` this is a no-op.
     pub fn with_schema_opt(self, schema_opt: Option<SchemaRef>) -> Self {
         match schema_opt {
             Some(schema) => self.with_schema(schema),
@@ -144,13 +144,8 @@ impl Scan {
         &self,
         engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
-        let commit_read_schema = Arc::new(StructType::new(vec![
-            crate::actions::schemas::ADD_FIELD.clone(),
-            crate::actions::schemas::REMOVE_FIELD.clone(),
-        ]));
-        let checkpoint_read_schema = Arc::new(StructType::new(vec![
-            crate::actions::schemas::ADD_FIELD.clone(),
-        ]));
+        let commit_read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?;
+        let checkpoint_read_schema = get_log_schema().project(&[ADD_NAME])?;
 
         let log_iter = self.snapshot.log_segment.replay(
             engine_interface,
@@ -285,12 +280,9 @@ impl Scan {
     }
 }
 
-fn parse_partition_value(
-    raw: Option<&Option<String>>,
-    data_type: &DataType,
-) -> DeltaResult<Scalar> {
+fn parse_partition_value(raw: Option<&String>, data_type: &DataType) -> DeltaResult<Scalar> {
     match raw {
-        Some(Some(v)) => match data_type {
+        Some(v) => match data_type {
             DataType::Primitive(primitive) => primitive.parse_scalar(v),
             _ => Err(Error::generic(format!(
                 "Unexpected partition column type: {data_type:?}"
@@ -386,7 +378,7 @@ mod tests {
 
         for (raw, data_type, expected) in &cases {
             let value = parse_partition_value(
-                Some(&Some(raw.to_string())),
+                Some(&raw.to_string()),
                 &DataType::Primitive(data_type.clone()),
             )
             .unwrap();

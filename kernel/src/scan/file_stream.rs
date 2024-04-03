@@ -1,14 +1,14 @@
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use either::Either;
 use tracing::debug;
 
 use super::data_skipping::DataSkippingFilter;
+use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME};
 use crate::actions::{visitors::AddVisitor, visitors::RemoveVisitor, Add, Remove};
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::Expression;
-use crate::schema::{SchemaRef, StructType};
+use crate::schema::SchemaRef;
 use crate::{DataVisitor, DeltaResult, EngineData, EngineInterface};
 
 struct LogReplayScanner {
@@ -101,18 +101,18 @@ impl LogReplayScanner {
             .map(|filter| filter.apply(actions))
             .transpose()?;
 
-        let schema_to_use = StructType::new(if is_log_batch {
-            vec![
-                crate::actions::schemas::ADD_FIELD.clone(),
-                crate::actions::schemas::REMOVE_FIELD.clone(),
-            ]
+        let schema_to_use = if is_log_batch {
+            // NB: We _must_ pass these in the order `ADD_NAME, REMOVE_NAME` as the visitor assumes
+            // the Add action comes first. The [`project`] method honors this order, so this works
+            // as long as we keep this order here.
+            get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?
         } else {
             // All checkpoint actions are already reconciled and Remove actions in checkpoint files
             // only serve as tombstones for vacuum jobs. So no need to load them here.
-            vec![crate::actions::schemas::ADD_FIELD.clone()]
-        });
+            get_log_schema().project(&[ADD_NAME])?
+        };
         let mut visitor = AddRemoveVisitor::new(selection_vector, is_log_batch);
-        actions.extract(Arc::new(schema_to_use), &mut visitor)?;
+        actions.extract(schema_to_use, &mut visitor)?;
 
         for remove in visitor.removes.into_iter() {
             let dv_id = remove.dv_unique_id();
