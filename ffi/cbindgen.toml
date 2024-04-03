@@ -1,0 +1,11 @@
+language = "C++"
+
+# A list of substitutions for converting cfg's to ifdefs. cfgs which aren't
+# defined here will just be discarded.
+#
+# e.g.
+# `#[cfg(target = "freebsd")] ...`
+# becomes
+# `#if defined(DEFINE_FREEBSD) ... #endif`
+[defines]
+"feature = default-client" = "DEFINE_DEFAULT_CLIENT"
