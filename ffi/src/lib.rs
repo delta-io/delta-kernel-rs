@@ -298,7 +298,6 @@ impl ArcHandle for ExternEngineInterfaceHandle {
     type Target = dyn ExternEngineInterface;
 }
 
-// TODO missing a drop method
 struct ExternEngineInterfaceVtable {
     // Actual table client instance to use
     client: Arc<dyn EngineInterface>,
