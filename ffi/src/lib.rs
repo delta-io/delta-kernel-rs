@@ -449,12 +449,10 @@ pub struct EngineSchemaVisitor {
         name: KernelStringSlice,
         child_list_id: usize,
     ),
-    visit_string:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    visit_string: extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
     visit_integer:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
-    visit_long:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    visit_long: extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
 }
 
 /// # Safety
