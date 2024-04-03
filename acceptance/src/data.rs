@@ -5,39 +5,42 @@ use arrow_ord::sort::{lexsort_to_indices, SortColumn};
 use arrow_schema::DataType;
 use arrow_select::{concat::concat_batches, filter::filter_record_batch, take::take};
 
-use deltakernel::{client::arrow_data::ArrowEngineData, scan::ScanBuilder, EngineInterface, Table};
+use deltakernel::{
+    client::arrow_data::ArrowEngineData, scan::ScanBuilder, DeltaResult, EngineInterface, Error,
+    Table,
+};
 use futures::{stream::TryStreamExt, StreamExt};
 use object_store::{local::LocalFileSystem, ObjectStore};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 
 use crate::{TestCaseInfo, TestResult};
 
-pub async fn read_golden(path: &Path, _version: Option<&str>) -> Option<RecordBatch> {
+pub async fn read_golden(path: &Path, _version: Option<&str>) -> DeltaResult<Option<RecordBatch>> {
     let expected_root = path.join("expected").join("latest").join("table_content");
-    let store = Arc::new(LocalFileSystem::new_with_prefix(&expected_root).unwrap());
-    let files = store.list(None).try_collect::<Vec<_>>().await.unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(&expected_root)?);
+    let files = store.list(None).try_collect::<Vec<_>>().await?;
     let mut batches = vec![];
     let mut schema = None;
     for meta in files.into_iter() {
         if let Some(ext) = meta.location.extension() {
             if ext == "parquet" {
                 let reader = ParquetObjectReader::new(store.clone(), meta);
-                let builder = ParquetRecordBatchStreamBuilder::new(reader).await.unwrap();
+                let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
                 if schema.is_none() {
                     schema = Some(builder.schema().clone());
                 }
-                let mut stream = builder.build().unwrap();
+                let mut stream = builder.build()?;
                 while let Some(batch) = stream.next().await {
-                    batches.push(batch.unwrap());
+                    batches.push(batch?);
                 }
             }
         }
     }
-    let all_data = concat_batches(&schema.unwrap(), batches.iter()).unwrap();
-    Some(all_data)
+    let all_data = concat_batches(&schema.unwrap(), &batches)?;
+    Ok(Some(all_data))
 }
 
-pub fn sort_record_batch(batch: RecordBatch) -> RecordBatch {
+pub fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
     // Sort by all columns
     let mut sort_columns = vec![];
     for col in batch.columns() {
@@ -51,13 +54,13 @@ pub fn sort_record_batch(batch: RecordBatch) -> RecordBatch {
             }),
         }
     }
-    let indices = lexsort_to_indices(&sort_columns, None).unwrap();
+    let indices = lexsort_to_indices(&sort_columns, None)?;
     let columns = batch
         .columns()
         .iter()
         .map(|c| take(c, &indices, None).unwrap())
         .collect();
-    RecordBatch::try_new(batch.schema(), columns).unwrap()
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
 static SKIPPED_TESTS: &[&str; 3] = &[
@@ -109,13 +112,13 @@ pub async fn assert_scan_data(
             }
         })
         .collect();
-    let all_data = concat_batches(&schema.unwrap(), batches.iter()).unwrap();
-    let all_data = sort_record_batch(all_data);
+    let all_data = concat_batches(&schema.unwrap(), batches.iter()).map_err(Error::from)?;
+    let all_data = sort_record_batch(all_data)?;
 
     let golden = read_golden(test_case.root_dir(), None)
-        .await
+        .await?
         .expect("Didn't find golden data");
-    let golden = sort_record_batch(golden);
+    let golden = sort_record_batch(golden)?;
     let golden_schema = golden
         .schema()
         .as_ref()
