@@ -15,4 +15,11 @@ fix:
 
 # build and serve the documentation
 docs:
-    cardo docs --open
+    cargo docs --open
+
+# build and test ffi
+ffi:
+    pushd ffi
+    cargo b --features default-client
+    table=../kernel/tests/data/table-without-dv-small make run
+    popd

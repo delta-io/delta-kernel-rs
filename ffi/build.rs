@@ -23,13 +23,10 @@ fn main() {
     let target_dir = get_target_dir(crate_dir.as_str());
 
     // Any `cfgs` we want to turn into ifdefs need to go in here
-    let defines: HashMap<String, String> = HashMap::from([
-        (
-            "feature = default-client".into(),
-            "DEFINE_DEFAULT_CLIENT".into(),
-        ),
-        ("feature = tokio".into(), "DEFINE_TOKIO".into()),
-    ]);
+    let defines: HashMap<String, String> = HashMap::from([(
+        "feature = default-client".into(),
+        "DEFINE_DEFAULT_CLIENT".into(),
+    )]);
 
     // generate cxx bindings
     let output_file_hpp = target_dir

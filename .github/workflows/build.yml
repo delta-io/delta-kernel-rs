@@ -60,3 +60,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: test
         run: cargo test --verbose --all-features
+  ffi_test:
+    runs-on: macOS-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install minimal stable with clippy and rustfmt
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: default
+          toolchain: stable
+          override: true
+      - uses: Swatinem/rust-cache@v2
+      - name: test
+        run: pushd ffi && cargo b --features default-client && make test && popd

@@ -81,9 +81,7 @@ impl<E: TaskExecutor> DefaultEngineInterface<E> {
             expression: Arc::new(ArrowExpressionHandler {}),
         }
     }
-}
 
-impl<E: TaskExecutor> DefaultEngineInterface<E> {
     pub fn get_object_store_for_url(&self, _url: &Url) -> Option<Arc<DynObjectStore>> {
         Some(self.store.clone())
     }
