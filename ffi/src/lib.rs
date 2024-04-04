@@ -717,8 +717,8 @@ pub struct KernelScanFileIterator {
     files: Box<dyn Iterator<Item = DeltaResult<Add>>>,
 
     // Also keep a reference to the external client for its error allocator.
-    // Parquet and Json handlers don't hold any reference to the tokio reactor, so if the last table
-    // client goes out of scope the iterator terminates early.
+    // Parquet and Json handlers don't hold any reference to the tokio reactor, so the iterator
+    // terminates early if the last table client goes out of scope.
     table_client: Arc<dyn ExternEngineInterface>,
 }
 
