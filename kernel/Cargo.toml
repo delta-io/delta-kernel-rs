@@ -8,6 +8,9 @@ repository.workspace = true
 readme.workspace = true
 version.workspace = true
 
+# [lib]
+# crate-type = ["staticlib"]
+
 [dependencies]
 bytes = "1.4"
 chrono = { version = "0.4" }

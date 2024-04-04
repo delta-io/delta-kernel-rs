@@ -794,7 +794,7 @@ fn kernel_scan_files_next_impl(
     engine_visitor: extern "C" fn(engine_context: *mut c_void, file_name: KernelStringSlice),
 ) -> DeltaResult<bool> {
     if let Some(add) = files.files.next().transpose()? {
-        println!("Got file: {}", add.path);
+        debug!("Got file: {}", add.path);
         (engine_visitor)(engine_context, add.path.as_str().into());
         Ok(true)
     } else {

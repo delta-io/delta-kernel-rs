@@ -1,2 +1,2 @@
-kernel.h
-kernel.hpp
+cffi-test
+cffi-test.o
