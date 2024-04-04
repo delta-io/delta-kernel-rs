@@ -5,13 +5,13 @@ use std::sync::Arc;
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
-use deltakernel::client::arrow_data::ArrowEngineData;
-use deltakernel::client::default::executor::tokio::TokioBackgroundExecutor;
-use deltakernel::client::default::DefaultEngineInterface;
-use deltakernel::client::sync::SyncEngineInterface;
-use deltakernel::scan::ScanBuilder;
-use deltakernel::schema::Schema;
-use deltakernel::{DeltaResult, EngineInterface, Table};
+use delta_kernel::client::arrow_data::ArrowEngineData;
+use delta_kernel::client::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::client::default::DefaultEngineInterface;
+use delta_kernel::client::sync::SyncEngineInterface;
+use delta_kernel::scan::ScanBuilder;
+use delta_kernel::schema::Schema;
+use delta_kernel::{DeltaResult, EngineInterface, Table};
 
 use clap::{Parser, ValueEnum};
 
@@ -80,7 +80,7 @@ fn try_main() -> DeltaResult<()> {
                     table_schema
                         .field(col)
                         .cloned()
-                        .ok_or(deltakernel::Error::Generic(format!(
+                        .ok_or(delta_kernel::Error::Generic(format!(
                             "Table has no such column: {col}"
                         )))
                 })
@@ -98,7 +98,7 @@ fn try_main() -> DeltaResult<()> {
         let record_batch: RecordBatch = data
             .into_any()
             .downcast::<ArrowEngineData>()
-            .map_err(|_| deltakernel::Error::EngineDataType("ArrowEngineData".to_string()))?
+            .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
             .into();
         let batch = if let Some(mask) = res.mask {
             filter_record_batch(&record_batch, &mask.into())?

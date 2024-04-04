@@ -4,7 +4,7 @@ use std::io::{Cursor, Read};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use derive_macros::Schema;
+use delta_kernel_derive_macros::Schema;
 use roaring::RoaringTreemap;
 use url::Url;
 

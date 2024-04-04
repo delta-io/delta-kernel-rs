@@ -180,9 +180,9 @@ pub trait DataVisitor {
 /// work is in the [`EngineData::extract`] method. See the docs for that method for more details.
 /// ```rust
 /// # use std::any::Any;
-/// # use deltakernel::DeltaResult;
-/// # use deltakernel::engine_data::{DataVisitor, EngineData, GetData};
-/// # use deltakernel::schema::SchemaRef;
+/// # use delta_kernel::DeltaResult;
+/// # use delta_kernel::engine_data::{DataVisitor, EngineData, GetData};
+/// # use delta_kernel::schema::SchemaRef;
 /// struct MyDataType; // Whatever the engine wants here
 /// impl MyDataType {
 ///   fn do_extraction<'a>(&self) -> Vec<&'a dyn GetData<'a>> {

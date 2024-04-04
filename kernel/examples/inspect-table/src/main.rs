@@ -1,10 +1,10 @@
-use deltakernel::client::executor::tokio::TokioBackgroundExecutor;
-use deltakernel::client::DefaultEngineInterface;
-use deltakernel::scan::ScanBuilder;
-use deltakernel::schema::StructType;
-use deltakernel::{DeltaResult, Table};
+use delta_kernel::client::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::client::DefaultEngineInterface;
+use delta_kernel::scan::ScanBuilder;
+use delta_kernel::schema::StructType;
+use delta_kernel::{DeltaResult, Table};
 
-use deltakernel::actions::{parse_actions, Action, ActionType};
+use delta_kernel::actions::{parse_actions, Action, ActionType};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -88,7 +88,7 @@ fn main() {
             println!("{:#?}", snapshot.schema());
         }
         Commands::Adds => {
-            use deltakernel::Add;
+            use delta_kernel::Add;
             let scan = ScanBuilder::new(snapshot).build();
             let files: Vec<Add> = scan
                 .files(&engine_interface)
@@ -122,7 +122,7 @@ fn main() {
                 .collect::<Vec<DeltaResult<(RecordBatch, bool)>>>();
             let len = batch_vec.len() - 1;
 
-            let batches: Box<dyn Iterator<Item = Result<(RecordBatch, bool), deltakernel::Error>>> =
+            let batches: Box<dyn Iterator<Item = Result<(RecordBatch, bool), delta_kernel::Error>>> =
                 if *forward {
                     Box::new(batch_vec.into_iter().rev())
                 } else {

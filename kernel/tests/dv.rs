@@ -2,9 +2,9 @@
 //! Must run at the root of the crate
 use std::path::PathBuf;
 
-use deltakernel::client::sync::SyncEngineInterface;
-use deltakernel::scan::ScanBuilder;
-use deltakernel::Table;
+use delta_kernel::client::sync::SyncEngineInterface;
+use delta_kernel::scan::ScanBuilder;
+use delta_kernel::Table;
 
 use test_log::test;
 
