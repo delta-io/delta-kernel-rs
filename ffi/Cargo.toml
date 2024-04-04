@@ -19,7 +19,6 @@ delta_kernel = { path = "../kernel", features = ["developer-visibility"] }
 
 [build-dependencies]
 cbindgen = "0.26.0"
-delta_kernel = { path = "../kernel" }
 libc = "0.2.147"
 
 [features]
