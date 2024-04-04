@@ -2,8 +2,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use acceptance::read_dat_case;
-use deltakernel::client::default::executor::tokio::TokioBackgroundExecutor;
-use deltakernel::client::default::DefaultEngineInterface;
+use delta_kernel::client::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::client::default::DefaultEngineInterface;
 
 fn reader_test(path: &Path) -> datatest_stable::Result<()> {
     let root_dir = format!(

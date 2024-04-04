@@ -3,7 +3,7 @@ use quote::{quote, quote_spanned};
 use syn::spanned::Spanned;
 use syn::{parse_macro_input, Data, DataStruct, DeriveInput, Fields, PathArguments, Type};
 
-/// Derive a `deltakernel::schemas::ToDataType` implementation for the annotated struct. The actual
+/// Derive a `delta_kernel::schemas::ToDataType` implementation for the annotated struct. The actual
 /// field names in the schema (and therefore of the struct members) are all mandated by the Delta
 /// spec, and so the user of this macro is responsible for ensuring that
 /// e.g. `Metadata::schema_string` is the snake_case-ified version of `schemaString` from [Delta's
