@@ -1,5 +1,5 @@
 [package]
-name = "delta_kernel_derive_macros"
+name = "delta_kernel_derive"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
