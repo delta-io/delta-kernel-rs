@@ -1,5 +1,5 @@
 [package]
-name = "deltakernel-ffi"
+name = "delta_kernel_ffi"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -15,7 +15,7 @@ crate-type = ["cdylib", "staticlib"]
 [dependencies]
 tracing = "0.1"
 url = "2"
-deltakernel = { path = "../kernel", features = ["developer-visibility"] }
+delta_kernel = { path = "../kernel", features = ["developer-visibility"] }
 
 [build-dependencies]
 cbindgen = "0.26.0"
@@ -23,4 +23,4 @@ libc = "0.2.147"
 
 [features]
 default = ["default-client"]
-default-client = ["deltakernel/default-client"]
+default-client = ["delta_kernel/default-client"]

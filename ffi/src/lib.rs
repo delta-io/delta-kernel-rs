@@ -10,12 +10,12 @@ use std::sync::Arc;
 use tracing::debug;
 use url::Url;
 
-use deltakernel::actions::Add;
-use deltakernel::expressions::{BinaryOperator, Expression, Scalar};
-use deltakernel::scan::ScanBuilder;
-use deltakernel::schema::{DataType, PrimitiveType, StructField, StructType};
-use deltakernel::snapshot::Snapshot;
-use deltakernel::{DeltaResult, EngineInterface, Error};
+use delta_kernel::actions::Add;
+use delta_kernel::expressions::{BinaryOperator, Expression, Scalar};
+use delta_kernel::scan::ScanBuilder;
+use delta_kernel::schema::{DataType, PrimitiveType, StructField, StructType};
+use delta_kernel::snapshot::Snapshot;
+use delta_kernel::{DeltaResult, EngineInterface, Error};
 
 mod handle;
 use handle::{ArcHandle, BoxHandle, SizedArcHandle, Unconstructable};
@@ -361,8 +361,8 @@ unsafe fn get_default_client_impl(
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<*const ExternEngineInterfaceHandle> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) }?;
-    use deltakernel::client::default::executor::tokio::TokioBackgroundExecutor;
-    use deltakernel::client::default::DefaultEngineInterface;
+    use delta_kernel::client::default::executor::tokio::TokioBackgroundExecutor;
+    use delta_kernel::client::default::DefaultEngineInterface;
     let table_client = DefaultEngineInterface::<TokioBackgroundExecutor>::try_new(
         &url,
         HashMap::<String, String>::new(),

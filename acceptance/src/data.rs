@@ -5,7 +5,7 @@ use arrow_ord::sort::{lexsort_to_indices, SortColumn};
 use arrow_schema::DataType;
 use arrow_select::{concat::concat_batches, filter::filter_record_batch, take::take};
 
-use deltakernel::{
+use delta_kernel::{
     client::arrow_data::ArrowEngineData, scan::ScanBuilder, DeltaResult, EngineInterface, Error,
     Table,
 };

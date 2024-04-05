@@ -7,7 +7,7 @@ publish = false
 [dependencies]
 arrow-array = { version = "^49.0" }
 arrow-schema = { version = "^49.0" }
-deltakernel = { path = "../../../kernel", features = [
+delta_kernel = { path = "../../../kernel", features = [
   "default",
   "tokio",
   "developer-visibility",

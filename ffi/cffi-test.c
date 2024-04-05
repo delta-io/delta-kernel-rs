@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "deltakernel-ffi.h"
+#include "delta_kernel_ffi.h"
 
 void visit_file(void *engine_context, struct KernelStringSlice file_name) {
     printf("file: %s\n", file_name.ptr);

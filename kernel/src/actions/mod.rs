@@ -3,7 +3,7 @@ pub(crate) mod deletion_vector;
 pub(crate) mod schemas;
 pub(crate) mod visitors;
 
-use derive_macros::Schema;
+use delta_kernel_derive::Schema;
 use lazy_static::lazy_static;
 use visitors::{AddVisitor, MetadataVisitor, ProtocolVisitor};
 
