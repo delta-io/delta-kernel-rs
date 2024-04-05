@@ -1,6 +1,6 @@
 [package]
 name = "delta_kernel_ffi"
-authors.workspace = true
+description = "Provide C FFI bindings for the delta_kernel crate"
 edition.workspace = true
 homepage.workspace = true
 license.workspace = true

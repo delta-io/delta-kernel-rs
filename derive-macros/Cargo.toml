@@ -1,6 +1,6 @@
 [package]
 name = "delta_kernel_derive"
-authors.workspace = true
+description = "Derive macros for delta_kernel"
 edition.workspace = true
 homepage.workspace = true
 keywords.workspace = true

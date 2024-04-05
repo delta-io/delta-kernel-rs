@@ -11,11 +11,6 @@ default-members = ["acceptance", "kernel"]
 resolver = "2"
 
 [workspace.package]
-authors = [
-  "Zach Schuermann <zach@zvs.io>",
-  "R. Tyler Croy <rtyler@brokenco.de>",
-  "Robert Pack <robstar.pack@gmail.com>",
-]
 edition = "2021"
 homepage = "https://delta.io"
 keywords = ["deltalake", "delta", "datalake"]
