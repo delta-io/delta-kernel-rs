@@ -1,11 +1,14 @@
 //! Functionality to create and execute scans (reads) over data stored in a delta table
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use itertools::Itertools;
 use tracing::debug;
+use url::Url;
 
 use self::file_stream::log_replay_iter;
+use self::state::ScanState;
 use crate::actions::{get_log_schema, Add, ADD_NAME, REMOVE_NAME};
 use crate::expressions::{Expression, Scalar};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
@@ -14,6 +17,7 @@ use crate::{DeltaResult, EngineData, EngineInterface, Error, FileMeta};
 
 mod data_skipping;
 pub mod file_stream;
+mod state;
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
@@ -105,9 +109,30 @@ pub struct ScanResult {
 
 /// Scan uses this to set up what kinds of columns it is scanning. A reference to the field is
 /// stored so we can get the name and data_type out when building the read expression
-enum ColumnType<'a> {
-    Selected(&'a StructField),
-    Partition(&'a StructField),
+pub enum ColumnType<'a> {
+    Selected(Cow<'a, StructField>),
+    Partition(Cow<'a, StructField>),
+}
+
+/// One file to scan, plus associated metadata
+pub struct ScanFile {
+    pub location: Url,
+    pub size: usize,
+    pub partition_values: std::collections::HashMap<String, String>
+}
+
+impl ScanFile {
+    // pub fn location(&self) -> Url {
+    //     self.path.as_str()
+    // }
+
+    fn from_add(add: Add, table_root: &Url) -> DeltaResult<Self> {
+        Ok(ScanFile {
+            location: table_root.join(add.path.as_str())?,
+            size: add.size as usize,
+            partition_values: add.partition_values,
+        })
+    }
 }
 
 /// The result of building a scan over a table. This can be used to get the actual data from
@@ -164,6 +189,50 @@ impl Scan {
         ))
     }
 
+    /// Get an iterator of [`ScanFile`]s that should be included in scan for a query. This handles
+    /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
+    pub fn scan_files(
+        &self,
+        engine_interface: &dyn EngineInterface,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanFile>>> {
+        let table_root = self.snapshot.table_root.clone();
+        Ok(self.files(engine_interface)?.map(move |add_res| {
+            add_res.and_then(|add| ScanFile::from_add(add, &table_root))
+        }))
+    }
+
+    /// get some stuff
+    fn get_state_info<'a>(&'a self, partition_columns: &Vec<String>) -> (Vec<ColumnType<'a>>, Vec<StructField>, bool) {
+        let mut have_partition_cols = false;
+        let mut read_fields = Vec::with_capacity(self.schema().fields.len());
+        let column_types = self
+            .schema()
+            .fields()
+            .map(|field| {
+                if partition_columns.contains(field.name()) {
+                    // todo: this is slow(ish)
+                    // Store the raw field, we will turn it into an expression in the inner loop
+                    // since the expression could be different for each add file
+                    have_partition_cols = true;
+                    ColumnType::Partition(Cow::Borrowed(field))
+                } else {
+                    // Add to read schema, store field so we can build a `Column` expression later
+                    // if needed (i.e. if we have partition columns)
+                    read_fields.push(field.clone());
+                    ColumnType::Selected(Cow::Borrowed(field))
+                }
+            })
+            .collect();
+        (column_types, read_fields, have_partition_cols)
+    }
+
+    pub fn get_scan_state(&self) -> ScanState<'_> {
+        let partition_columns = &self.snapshot.metadata().partition_columns;
+        let (all_fields, read_fields, have_partition_cols) = self.get_state_info(partition_columns);
+        let read_schema = Arc::new(StructType::new(read_fields));
+        ScanState::new(all_fields, have_partition_cols, self.schema().clone(), read_schema)
+    }
+
     /// This is the main method to 'materialize' the scan. It returns a [`Result`] of
     /// `Vec<`[`ScanResult`]`>`. This calls [`Scan::files`] to get a set of `Add` actions for the scan,
     /// and then uses the `engine_interface`'s [`crate::ParquetHandler`] to read the actual table
@@ -172,28 +241,7 @@ impl Scan {
     /// more details.
     pub fn execute(&self, engine_interface: &dyn EngineInterface) -> DeltaResult<Vec<ScanResult>> {
         let partition_columns = &self.snapshot.metadata().partition_columns;
-        let mut read_fields = Vec::with_capacity(self.schema().fields.len());
-        let mut have_partition_cols = false;
-        // Loop over all selected fields and note if they are columns that will be read from the
-        // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
-        // be filled in by evaluating an expression ([`ColumnType::Partition`])
-        let all_fields: Vec<_> = self
-            .schema()
-            .fields()
-            .map(|field| {
-                if partition_columns.contains(field.name()) {
-                    // Store the raw field, we will turn it into an expression in the inner loop
-                    // since the expression could be different for each add file
-                    have_partition_cols = true;
-                    ColumnType::Partition(field)
-                } else {
-                    // Add to read schema, store field so we can build a `Column` expression later
-                    // if needed (i.e. if we have partition columns)
-                    read_fields.push(field.clone());
-                    ColumnType::Selected(field)
-                }
-            })
-            .collect();
+        let (all_fields, read_fields, have_partition_cols) = self.get_state_info(partition_columns);
         let read_schema = Arc::new(StructType::new(read_fields));
         debug!("Executing scan with read schema {read_schema:#?}");
         let output_schema = DataType::Struct(Box::new(self.schema().as_ref().clone()));
@@ -291,6 +339,45 @@ fn parse_partition_value(raw: Option<&String>, data_type: &DataType) -> DeltaRes
             ))),
         },
         _ => Ok(Scalar::Null(data_type.clone())),
+    }
+}
+
+/// Turn raw physical parquet data into the logical format based on a scan state
+pub fn transform_to_logical(
+    engine_interface: &dyn EngineInterface,
+    data: Box<dyn EngineData>,
+    scan_state: &ScanState<'_>,
+    scan_file: &ScanFile,
+) -> DeltaResult<Box<dyn EngineData>> {
+    if scan_state.have_partition_cols {
+        // need to add back partition cols
+        let all_fields: Vec<Expression> = scan_state.column_types
+            .iter()
+            .map(|field| match field {
+                ColumnType::Partition(field) => {
+                    let value_expression = parse_partition_value(
+                        scan_file.partition_values.get(field.name()),
+                        field.data_type(),
+                    )?;
+                    Ok::<Expression, Error>(Expression::Literal(value_expression))
+                }
+                ColumnType::Selected(field) => Ok(Expression::column(field.name())),
+            })
+            .try_collect()?;
+        let read_expression = Expression::Struct(all_fields);
+        let result = engine_interface
+            .get_expression_handler()
+            .get_evaluator(
+                scan_state.read_schema.clone(),
+                read_expression.clone(),
+                DataType::Struct(Box::new(
+                    scan_state.logical_schema.as_ref().clone()
+                ))
+            )
+            .evaluate(data.as_ref())?;
+        Ok(result)
+    } else {
+        Ok(data)
     }
 }
 
