@@ -162,7 +162,8 @@ fn do_work(
     url: Url,
     record_batch_tx: Sender<RecordBatch>,
     scan_file_rx: spmc::Receiver<ScanFile>,
-) { // todo: return a result and don't unwrap everywhere
+) {
+    // todo: return a result and don't unwrap everywhere
     // each thread needs its own copy since engine_interface isn't Clone, Send, or Sync
     let engine_interface: Box<dyn EngineInterface> = match interface {
         Interface::Default => Box::new(
@@ -204,7 +205,6 @@ fn do_work(
                     .get_parquet_handler()
                     .read_parquet_files(meta, scan_state.read_schema(), None)
                     .unwrap();
-
 
                 for read_result in read_results {
                     let len = if let Ok(ref res) = read_result {
