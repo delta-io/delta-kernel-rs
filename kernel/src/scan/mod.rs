@@ -9,7 +9,7 @@ use url::Url;
 
 use self::file_stream::log_replay_iter;
 use self::state::ScanState;
-use crate::actions::deletion_vector::{DeletionVectorDescriptor, treemap_to_bools};
+use crate::actions::deletion_vector::{treemap_to_bools, DeletionVectorDescriptor};
 use crate::actions::{get_log_schema, Add, ADD_NAME, REMOVE_NAME};
 use crate::expressions::{Expression, Scalar};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
@@ -18,7 +18,7 @@ use crate::{DeltaResult, EngineData, EngineInterface, Error, FileMeta};
 
 mod data_skipping;
 pub mod file_stream;
-mod state;
+pub mod state;
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
@@ -115,6 +115,20 @@ pub enum ColumnType<'a> {
     Partition(Cow<'a, StructField>),
 }
 
+impl<'a> ColumnType<'a> {
+    pub(crate) fn into_owned(self) -> ColumnType<'static> {
+        match self {
+            ColumnType::Selected(field) => {
+                let field = field.into_owned();
+                ColumnType::Selected(Cow::Owned(field))
+            }
+            ColumnType::Partition(field) => {
+                let field = field.into_owned();
+                ColumnType::Partition(Cow::Owned(field))
+            }
+        }
+    }
+}
 /// One file to scan, plus associated metadata
 pub struct ScanFile {
     table_root: Url,
@@ -139,7 +153,10 @@ impl ScanFile {
         Ok(self.table_root.join(self.path.as_str())?)
     }
 
-    pub fn selection_vector(&self, engine_interface: &dyn EngineInterface) -> DeltaResult<Option<Vec<bool>>> {
+    pub fn selection_vector(
+        &self,
+        engine_interface: &dyn EngineInterface,
+    ) -> DeltaResult<Option<Vec<bool>>> {
         let dv_treemap = self
             .deletion_vector_descriptor
             .as_ref()
@@ -213,13 +230,16 @@ impl Scan {
         engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanFile>>> {
         let table_root = self.snapshot.table_root.clone();
-        Ok(self.files(engine_interface)?.map(move |add_res| {
-            add_res.map(|add| ScanFile::from_add(add, &table_root))
-        }))
+        Ok(self
+            .files(engine_interface)?
+            .map(move |add_res| add_res.map(|add| ScanFile::from_add(add, &table_root))))
     }
 
     /// get some stuff
-    fn get_state_info<'a>(&'a self, partition_columns: &Vec<String>) -> (Vec<ColumnType<'a>>, Vec<StructField>, bool) {
+    fn get_state_info<'a>(
+        &'a self,
+        partition_columns: &[String],
+    ) -> (Vec<ColumnType<'a>>, Vec<StructField>, bool) {
         let mut have_partition_cols = false;
         let mut read_fields = Vec::with_capacity(self.schema().fields.len());
         let column_types = self
@@ -247,7 +267,12 @@ impl Scan {
         let partition_columns = &self.snapshot.metadata().partition_columns;
         let (all_fields, read_fields, have_partition_cols) = self.get_state_info(partition_columns);
         let read_schema = Arc::new(StructType::new(read_fields));
-        ScanState::new(all_fields, have_partition_cols, self.schema().clone(), read_schema)
+        ScanState::new(
+            all_fields,
+            have_partition_cols,
+            self.schema().clone(),
+            read_schema,
+        )
     }
 
     /// This is the main method to 'materialize' the scan. It returns a [`Result`] of
@@ -368,7 +393,8 @@ pub fn transform_to_logical(
 ) -> DeltaResult<Box<dyn EngineData>> {
     if scan_state.have_partition_cols {
         // need to add back partition cols
-        let all_fields: Vec<Expression> = scan_state.column_types
+        let all_fields: Vec<Expression> = scan_state
+            .column_types
             .iter()
             .map(|field| match field {
                 ColumnType::Partition(field) => {
@@ -387,9 +413,7 @@ pub fn transform_to_logical(
             .get_evaluator(
                 scan_state.read_schema.clone(),
                 read_expression.clone(),
-                DataType::Struct(Box::new(
-                    scan_state.logical_schema.as_ref().clone()
-                ))
+                DataType::Struct(Box::new(scan_state.logical_schema.as_ref().clone())),
             )
             .evaluate(data.as_ref())?;
         Ok(result)
