@@ -9,6 +9,7 @@ use url::Url;
 
 use self::file_stream::log_replay_iter;
 use self::state::ScanState;
+use crate::actions::deletion_vector::{DeletionVectorDescriptor, treemap_to_bools};
 use crate::actions::{get_log_schema, Add, ADD_NAME, REMOVE_NAME};
 use crate::expressions::{Expression, Scalar};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
@@ -116,22 +117,38 @@ pub enum ColumnType<'a> {
 
 /// One file to scan, plus associated metadata
 pub struct ScanFile {
-    pub location: Url,
+    table_root: Url,
+    path: String,
     pub size: usize,
-    pub partition_values: std::collections::HashMap<String, String>
+    pub partition_values: std::collections::HashMap<String, String>,
+    deletion_vector_descriptor: Option<DeletionVectorDescriptor>,
 }
 
 impl ScanFile {
-    // pub fn location(&self) -> Url {
-    //     self.path.as_str()
-    // }
-
-    fn from_add(add: Add, table_root: &Url) -> DeltaResult<Self> {
-        Ok(ScanFile {
-            location: table_root.join(add.path.as_str())?,
+    fn from_add(add: Add, table_root: &Url) -> Self {
+        ScanFile {
+            table_root: table_root.clone(),
+            path: add.path,
             size: add.size as usize,
             partition_values: add.partition_values,
-        })
+            deletion_vector_descriptor: add.deletion_vector.clone(),
+        }
+    }
+
+    pub fn location(&self) -> DeltaResult<Url> {
+        Ok(self.table_root.join(self.path.as_str())?)
+    }
+
+    pub fn selection_vector(&self, engine_interface: &dyn EngineInterface) -> DeltaResult<Option<Vec<bool>>> {
+        let dv_treemap = self
+            .deletion_vector_descriptor
+            .as_ref()
+            .map(|dv_descriptor| {
+                let fs_client = engine_interface.get_file_system_client();
+                dv_descriptor.read(fs_client, self.table_root.clone())
+            })
+            .transpose()?;
+        Ok(dv_treemap.map(treemap_to_bools))
     }
 }
 
@@ -197,7 +214,7 @@ impl Scan {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanFile>>> {
         let table_root = self.snapshot.table_root.clone();
         Ok(self.files(engine_interface)?.map(move |add_res| {
-            add_res.and_then(|add| ScanFile::from_add(add, &table_root))
+            add_res.map(|add| ScanFile::from_add(add, &table_root))
         }))
     }
 
@@ -290,7 +307,7 @@ impl Scan {
                 })
                 .transpose()?;
 
-            let mut dv_mask = dv_treemap.map(super::actions::deletion_vector::treemap_to_bools);
+            let mut dv_mask = dv_treemap.map(treemap_to_bools);
 
             for read_result in read_results {
                 let len = if let Ok(ref res) = read_result {

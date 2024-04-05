@@ -107,9 +107,11 @@ fn try_main() -> DeltaResult<()> {
             FileMeta {
                 last_modified: 0,
                 size: scan_file.size,
-                location: scan_file.location.clone(),
+                location: scan_file.location()?,
             }
         ];
+        let mut selection_vector = scan_file.selection_vector(engine_interface.as_ref())?;
+        // could push selection_vector into the read here if desired
         let read_results = parquet_handler.read_parquet_files(
             meta, scan_state.read_schema(), None
         )?;
@@ -132,12 +134,17 @@ fn try_main() -> DeltaResult<()> {
                 .downcast::<ArrowEngineData>()
                 .map_err(|_| deltakernel::Error::EngineDataType("ArrowEngineData".to_string()))?
                 .into();
-            // let batch = if let Some(mask) = res.mask {
-            //     filter_record_batch(&record_batch, &mask.into())?
-            // } else {
-            //     record_batch
-            // };
-            batches.push(record_batch);
+
+            // need to split the dv_mask. what's left in dv_mask covers this result, and rest
+            // will cover the following results
+            let rest = selection_vector.as_mut().map(|mask| mask.split_off(len));
+            let batch = if let Some(mask) = selection_vector.clone() {
+                filter_record_batch(&record_batch, &mask.into())?
+            } else {
+                record_batch
+            };
+            selection_vector = rest;
+            batches.push(batch);
         }
     }
     print_batches(&batches)?;
