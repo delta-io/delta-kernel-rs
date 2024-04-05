@@ -1,6 +1,7 @@
 [package]
 name = "delta_kernel"
-authors.workspace = true
+description = "Core crate providing a Delta/Deltalake implementation focused on interoperability with a wide range of query engines."
+documentation = "https://docs.rs/delta_kernel"
 edition.workspace = true
 homepage.workspace = true
 license.workspace = true
