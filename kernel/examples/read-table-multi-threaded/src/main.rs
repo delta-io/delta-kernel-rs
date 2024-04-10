@@ -7,14 +7,14 @@ use std::thread;
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
-use deltakernel::client::arrow_data::ArrowEngineData;
-use deltakernel::client::default::executor::tokio::TokioBackgroundExecutor;
-use deltakernel::client::default::DefaultEngineInterface;
-use deltakernel::client::sync::SyncEngineInterface;
-use deltakernel::scan::ScanFile;
-use deltakernel::scan::{state::ScanState, transform_to_logical, ScanBuilder};
-use deltakernel::schema::Schema;
-use deltakernel::{DeltaResult, EngineInterface, FileMeta, Table};
+use delta_kernel::client::arrow_data::ArrowEngineData;
+use delta_kernel::client::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::client::default::DefaultEngineInterface;
+use delta_kernel::client::sync::SyncEngineInterface;
+use delta_kernel::scan::ScanFile;
+use delta_kernel::scan::{state::ScanState, transform_to_logical, ScanBuilder};
+use delta_kernel::schema::Schema;
+use delta_kernel::{DeltaResult, EngineInterface, FileMeta, Table};
 
 use clap::{Parser, ValueEnum};
 use url::Url;
@@ -93,7 +93,7 @@ fn try_main() -> DeltaResult<()> {
                     table_schema
                         .field(col)
                         .cloned()
-                        .ok_or(deltakernel::Error::Generic(format!(
+                        .ok_or(delta_kernel::Error::Generic(format!(
                             "Table has no such column: {col}"
                         )))
                 })
@@ -147,10 +147,7 @@ fn try_main() -> DeltaResult<()> {
     drop(scan_file_tx);
 
     // simply gather up each batch and print them
-    let mut batches = vec![];
-    for received in record_batch_rx {
-        batches.push(received);
-    }
+    let batches: Vec<_> = record_batch_rx.iter().collect();
     print_batches(&batches)?;
     Ok(())
 }
@@ -228,7 +225,7 @@ fn do_work(
                         .into_any()
                         .downcast::<ArrowEngineData>()
                         .map_err(|_| {
-                            deltakernel::Error::EngineDataType("ArrowEngineData".to_string())
+                            delta_kernel::Error::EngineDataType("ArrowEngineData".to_string())
                         })
                         .unwrap()
                         .into();
