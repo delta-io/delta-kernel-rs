@@ -192,15 +192,15 @@ fn do_work(
                 // meta-data was passed to each thread to correctly apply the selection vector
 
                 // build the required metadata and ask our parquet handler to read it.
-                let meta = &[FileMeta {
+                let meta = FileMeta {
                     last_modified: 0,
                     size: scan_file.size,
                     location: scan_file.location().unwrap(),
-                }];
+                };
                 // could push selection_vector into the read here if desired
                 let read_results = engine_interface
                     .get_parquet_handler()
-                    .read_parquet_files(meta, scan_state.read_schema(), None)
+                    .read_parquet_files(&[meta], scan_state.read_schema(), None)
                     .unwrap();
 
                 for read_result in read_results {

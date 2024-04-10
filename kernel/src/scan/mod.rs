@@ -235,13 +235,20 @@ impl Scan {
             .map(move |add_res| add_res.map(|add| ScanFile::from_add(add, &table_root))))
     }
 
-    /// get some stuff
+    /// Get the state needed to process this scan. In particular this returns a triple of
+    /// (all_fields_in_query, fields_to_read_from_parquet, have_partition_cols) where:
+    /// - all_fields_in_query - all fields in the query as [`ColumnType`] enums
+    /// - fields_to_read_from_parquet - Which fields should be read from the raw parquet files
+    /// - have_partition_cols - boolean indicating if we have partition columns in this query
     fn get_state_info<'a>(
         &'a self,
         partition_columns: &[String],
     ) -> (Vec<ColumnType<'a>>, Vec<StructField>, bool) {
         let mut have_partition_cols = false;
         let mut read_fields = Vec::with_capacity(self.schema().fields.len());
+        // Loop over all selected fields and note if they are columns that will be read from the
+        // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
+        // be filled in by evaluating an expression ([`ColumnType::Partition`])
         let column_types = self
             .schema()
             .fields()
