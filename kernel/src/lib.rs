@@ -106,7 +106,7 @@ pub struct FileMeta {
 /// It contains one Expression which can be evaluated on multiple ColumnarBatches.
 /// Connectors can implement this interface to optimize the evaluation using the
 /// connector specific capabilities.
-pub trait ExpressionEvaluator {
+pub trait ExpressionEvaluator: Send + Sync {
     /// Evaluate the expression on a given EngineData.
     ///
     /// Contains one value for each row of the input.
@@ -161,7 +161,7 @@ pub trait FileSystemClient: Send + Sync {
 /// Delta Kernel can use this client to parse JSON strings into Row or read content from JSON files.
 /// Connectors can leverage this interface to provide their best implementation of the JSON parsing
 /// capability to Delta Kernel.
-pub trait JsonHandler {
+pub trait JsonHandler: Send + Sync {
     /// Parse the given json strings and return the fields requested by output schema as columns in [`EngineData`].
     /// json_strings MUST be a single column batch of engine data, and the column type must be string
     fn parse_json(
@@ -211,7 +211,7 @@ pub trait ParquetHandler: Send + Sync {
 /// Interface encapsulating all clients needed by the Delta Kernel in order to read the Delta table.
 ///
 /// Connectors are expected to pass an implementation of this interface when reading a Delta table.
-pub trait EngineInterface {
+pub trait EngineInterface: Send + Sync {
     /// Get the connector provided [`ExpressionHandler`].
     fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler>;
 

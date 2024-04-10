@@ -17,7 +17,6 @@ use delta_kernel::schema::Schema;
 use delta_kernel::{DeltaResult, EngineInterface, FileMeta, Table};
 
 use clap::{Parser, ValueEnum};
-use url::Url;
 
 /// An example program that reads a table using multiple threads. This shows the use of the
 /// scan_files and scan_state methods on a Scan, that can be used to partition work to either
@@ -117,18 +116,21 @@ fn try_main() -> DeltaResult<()> {
     // scan_file_[t/r]x are used to send each scan file from the iterator out to the waiting threads
     let (mut scan_file_tx, scan_file_rx) = spmc::channel();
 
+    // Arc up the engine_interface so we can share it between threads
+    let engine_interface = Arc::new(engine_interface);
+
     // fire up each thread. we don't need the handles as we rely on the channels to indicate when
     // things are done
     let _handles: Vec<_> = (0..cli.thread_count)
         .map(|_| {
             // items that we need to send to the other thread
-            let interface = cli.interface.clone();
+            //let interface = cli.interface.clone();
             let scan_state = scan.get_scan_state().into_owned();
-            let url = url.clone();
             let rb_tx = record_batch_tx.clone();
             let scan_file_rx = scan_file_rx.clone();
+            let interface = engine_interface.clone();
             thread::spawn(move || {
-                do_work(interface, scan_state, url, rb_tx, scan_file_rx);
+                do_work(interface, scan_state, rb_tx, scan_file_rx);
             })
         })
         .collect();
@@ -154,26 +156,13 @@ fn try_main() -> DeltaResult<()> {
 
 // this is the work each thread does
 fn do_work(
-    interface: Interface, // what type of engine_interface was requested
+    engine_interface: Arc<Box<dyn EngineInterface>>,
     scan_state: ScanState<'_>,
-    url: Url,
     record_batch_tx: Sender<RecordBatch>,
     scan_file_rx: spmc::Receiver<ScanFile>,
 ) {
-    // todo: return a result and don't unwrap everywhere
-    // each thread needs its own copy since engine_interface isn't Clone, Send, or Sync
-    let engine_interface: Box<dyn EngineInterface> = match interface {
-        Interface::Default => Box::new(
-            DefaultEngineInterface::try_new(
-                &url,
-                HashMap::<String, String>::new(),
-                Arc::new(TokioBackgroundExecutor::new()),
-            )
-            .unwrap(),
-        ),
-        Interface::Sync => Box::new(SyncEngineInterface::new()),
-    };
-
+    // get the type for the function calls
+    let engine_interface: &dyn EngineInterface = engine_interface.as_ref().as_ref();
     loop {
         // in a loop, try and get a ScanFile
         match scan_file_rx.recv() {
@@ -182,7 +171,7 @@ fn do_work(
 
                 // get the selection vector (i.e. deletion vector)
                 let mut selection_vector = scan_file
-                    .selection_vector(engine_interface.as_ref())
+                    .selection_vector(engine_interface)
                     .unwrap();
 
                 // this example uses the parquet_handler from the engine_client, but an engine could
@@ -212,7 +201,7 @@ fn do_work(
 
                     // ask the kernel to transform the physical data into the correct logical form
                     let logical = transform_to_logical(
-                        engine_interface.as_ref(),
+                        engine_interface,
                         read_result.unwrap(),
                         &scan_state,
                         &scan_file,
