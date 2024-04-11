@@ -4,9 +4,8 @@
 #include "delta_kernel_ffi.h"
 
 void visit_file(void *engine_context, struct KernelStringSlice file_name) {
-    int i;
     printf("file: ");
-    for (i = 0; i < file_name.len; i++) {
+    for (int i = 0; i < file_name.len; i++) {
         printf("%c", file_name.ptr[i]);
     }
     printf("\n");
