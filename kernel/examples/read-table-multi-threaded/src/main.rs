@@ -115,16 +115,20 @@ fn get_scan_files(
 ) -> DeltaResult<impl Iterator<Item = ScanFile>> {
     Ok((0..batch.num_rows()).filter_map(move |row_index| {
         if selection_vector[row_index] {
-            let path_col = batch.column(0).as_string::<i32>();
-            let size_col = batch.column(1).as_primitive::<Int64Type>();
+            let path_col = batch.column_by_name("path")?.as_string::<i32>();
+            let size_col = batch.column_by_name("size")?.as_primitive::<Int64Type>();
 
-            let dv_col = batch.column(3).as_struct();
-            let storage_col = dv_col.column(0).as_string::<i32>();
+            let dv_col = batch.column_by_name("deletionVector")?.as_struct();
+            let storage_col = dv_col.column_by_name("storageType")?.as_string::<i32>();
             let dv_info = if storage_col.is_valid(row_index) {
-                let dv_path_col = dv_col.column(1).as_string::<i32>();
-                let offset_col = dv_col.column(2).as_primitive::<Int32Type>();
-                let size_in_bytes_col = dv_col.column(3).as_primitive::<Int32Type>();
-                let cardinality_col = dv_col.column(4).as_primitive::<Int64Type>();
+                let dv_path_col = dv_col.column_by_name("pathOrInlineDv")?.as_string::<i32>();
+                let offset_col = dv_col.column_by_name("offset")?.as_primitive::<Int32Type>();
+                let size_in_bytes_col = dv_col
+                    .column_by_name("sizeInBytes")?
+                    .as_primitive::<Int32Type>();
+                let cardinality_col = dv_col
+                    .column_by_name("cardinality")?
+                    .as_primitive::<Int64Type>();
                 Some(DvInfo {
                     storage_type: storage_col.value(row_index).to_string(),
                     path_or_inline_dv: dv_path_col.value(row_index).to_string(),
@@ -140,8 +144,8 @@ fn get_scan_files(
                 None
             };
 
-            let constant_vals = batch.column(4).as_struct();
-            let partition_col = constant_vals.column(0).as_map();
+            let constant_vals = batch.column_by_name("fileConstantValues")?.as_struct();
+            let partition_col = constant_vals.column_by_name("partitionValues")?.as_map();
             let partition_values = materialize(partition_col, row_index);
             Some(ScanFile {
                 path: path_col.value(row_index).to_string(),
