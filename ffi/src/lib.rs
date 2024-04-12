@@ -15,7 +15,7 @@ use delta_kernel::expressions::{BinaryOperator, Expression, Scalar};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::{DataType, PrimitiveType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{DeltaResult, EngineInterface, Error};
+use delta_kernel::{DeltaResult, EngineInterface, Error, EngineData};
 
 mod handle;
 use handle::{ArcHandle, BoxHandle, SizedArcHandle, Unconstructable};
@@ -109,6 +109,31 @@ impl TryFromStringSlice for String {
         std::str::from_utf8(slice).unwrap().to_string()
     }
 }
+
+/// TODO
+#[repr(C)]
+pub struct KernelBoolSlice {
+    ptr: *const bool,
+    len: usize,
+}
+
+impl Into<KernelBoolSlice> for Vec<bool> {
+    fn into(self) -> KernelBoolSlice {
+        let len = self.len();
+        let boxed = self.into_boxed_slice();
+        KernelBoolSlice {
+            ptr: Box::into_raw(boxed).cast(),
+            len
+        }
+    }
+}
+
+impl Drop for KernelBoolSlice {
+    fn drop(&mut self) {
+        let _ = unsafe { Box::from_raw(self.ptr as *mut bool) };
+    }
+}
+
 
 #[repr(C)]
 #[derive(Debug)]
@@ -711,6 +736,105 @@ pub extern "C" fn visit_expression_literal_long(
     value: i64,
 ) -> usize {
     wrap_expression(state, Expression::Literal(Scalar::from(value)))
+}
+
+// Intentionally opaque to the engine.
+pub struct KernelScanDataIterator {
+    // Box -> Wrap its unsized content this struct is fixed-size with thin pointers.
+    // Item = String -> Owned items because rust can't correctly express lifetimes for borrowed items
+    // (we would need a way to assert that item lifetimes are bounded by the iterator's lifetime).
+    data: Box<dyn Iterator<Item = DeltaResult<(Box<dyn EngineData>, Vec<bool>)>>>,
+
+    // Also keep a reference to the external client for its error allocator.
+    // Parquet and Json handlers don't hold any reference to the tokio reactor, so the iterator
+    // terminates early if the last table client goes out of scope.
+    table_client: Arc<dyn ExternEngineInterface>,
+}
+
+impl BoxHandle for KernelScanDataIterator {}
+
+impl Drop for KernelScanDataIterator {
+    fn drop(&mut self) {
+        debug!("dropping KernelScanDataIterator");
+    }
+}
+
+
+/// Get the data needed to perform a scan
+#[no_mangle]
+pub unsafe extern "C" fn kernel_scan_data_init(
+    snapshot: *const SnapshotHandle,
+    table_client: *const ExternEngineInterfaceHandle,
+    predicate: Option<&mut EnginePredicate>,
+) -> ExternResult<*mut KernelScanDataIterator> {
+    kernel_scan_data_init_impl(snapshot, table_client, predicate).into_extern_result(table_client)
+}
+
+fn kernel_scan_data_init_impl(
+    snapshot: *const SnapshotHandle,
+    extern_table_client: *const ExternEngineInterfaceHandle,
+    predicate: Option<&mut EnginePredicate>,
+) -> DeltaResult<*mut KernelScanDataIterator> {
+    let snapshot = unsafe { ArcHandle::clone_as_arc(snapshot) };
+    let extern_table_client = unsafe { ArcHandle::clone_as_arc(extern_table_client) };
+    let mut scan_builder = ScanBuilder::new(snapshot.clone());
+    if let Some(predicate) = predicate {
+        let mut visitor_state = KernelExpressionVisitorState::new();
+        let exprid = (predicate.visitor)(predicate.predicate, &mut visitor_state);
+        if let Some(predicate) = unwrap_kernel_expression(&mut visitor_state, exprid) {
+            debug!("Got predicate: {}", predicate);
+            scan_builder = scan_builder.with_predicate(predicate);
+        }
+    }
+    let scan_data = scan_builder
+        .build()
+        .scan_data(extern_table_client.table_client().as_ref())?;
+    let data = KernelScanDataIterator {
+        data: Box::new(scan_data),
+        table_client: extern_table_client,
+    };
+    Ok(data.into_handle())
+}
+
+/// # Safety
+///
+/// The iterator must be valid (returned by [kernel_scan_data_init]) and not yet freed by
+/// [kernel_scan_data_free]. The visitor function pointer must be non-null.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_scan_data_next(
+    data: &mut KernelScanDataIterator,
+    engine_context: *mut c_void,
+    engine_visitor: extern "C" fn(engine_context: *mut c_void, engine_data: *mut c_void, selection_vector: &KernelBoolSlice),
+) -> ExternResult<bool> {
+    kernel_scan_data_next_impl(data, engine_context, engine_visitor)
+        .into_extern_result(data.table_client.error_allocator())
+}
+fn kernel_scan_data_next_impl(
+    data: &mut KernelScanDataIterator,
+    engine_context: *mut c_void,
+    engine_visitor: extern "C" fn(engine_context: *mut c_void, engine_data: *mut c_void, selection_vector: &KernelBoolSlice),
+) -> DeltaResult<bool> {
+    if let Some((data, sel_vec)) = data.data.next().transpose()? {
+        let bool_slice: KernelBoolSlice = sel_vec.into();
+        let data_ptr = Box::into_raw(data);
+        (engine_visitor)(engine_context, data_ptr.cast(), &bool_slice);
+        // ensure we free the data
+        let _ = unsafe { Box::from_raw(data_ptr) };
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// # Safety
+///
+/// Caller is responsible to (at most once) pass a valid pointer returned by a call to
+/// [kernel_scan_files_init].
+// we should probably be consistent with drop vs. free on engine side (probably the latter is more
+// intuitive to non-rust code)
+#[no_mangle]
+pub unsafe extern "C" fn kernel_scan_data_free(data: *mut KernelScanDataIterator) {
+    BoxHandle::drop_handle(data);
 }
 
 // Intentionally opaque to the engine.
