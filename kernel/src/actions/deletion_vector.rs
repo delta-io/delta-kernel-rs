@@ -43,6 +43,22 @@ pub struct DeletionVectorDescriptor {
 }
 
 impl DeletionVectorDescriptor {
+    pub fn new(
+        storage_type: String,
+        path_or_inline_dv: String,
+        offset: Option<i32>,
+        size_in_bytes: i32,
+        cardinality: i64,
+    ) -> Self {
+        DeletionVectorDescriptor {
+            storage_type,
+            path_or_inline_dv,
+            offset,
+            size_in_bytes,
+            cardinality,
+        }
+    }
+
     pub fn unique_id(&self) -> String {
         if let Some(offset) = self.offset {
             format!("{}{}@{offset}", self.storage_type, self.path_or_inline_dv)

@@ -1,7 +1,9 @@
 //! This module encapsulates the state of a scan
 
 use super::ColumnType;
-use crate::schema::SchemaRef;
+use crate::schema::{Schema, SchemaRef};
+
+use serde::{Deserialize, Serialize};
 
 pub struct ScanState<'a> {
     pub(crate) column_types: Vec<ColumnType<'a>>,
@@ -41,4 +43,16 @@ impl<'a> ScanState<'a> {
             read_schema: self.read_schema.clone(),
         }
     }
+}
+
+// will probably actually use this one
+
+/// State that doesn't change beween scans
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GlobalScanState {
+    pub table_root: String,
+    pub partition_columns: Vec<String>,
+    pub logical_schema: Schema,
+    pub read_schema: Schema,
 }

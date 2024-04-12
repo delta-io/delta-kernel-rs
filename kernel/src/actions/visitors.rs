@@ -268,6 +268,45 @@ impl DataVisitor for RemoveVisitor {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct DeletionVectorVisitor {
+    pub(crate) descriptor: Option<DeletionVectorDescriptor>,
+}
+
+impl DeletionVectorVisitor {
+    pub(crate) fn visit_deletion_vector<'a>(
+        row_index: usize,
+        storage_type: String,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<DeletionVectorDescriptor> {
+        let path_or_inline_dv: String =
+            getters[1].get(row_index, "add.deletionVector.pathOrInlineDv")?;
+        let offset: Option<i32> = getters[2].get_opt(row_index, "add.deletionVector.offset")?;
+        let size_in_bytes: i32 = getters[3].get(row_index, "add.deletionVector.sizeInBytes")?;
+        let cardinality: i64 = getters[4].get(row_index, "add.deletionVector.cardinality")?;
+        Ok(DeletionVectorDescriptor {
+            storage_type,
+            path_or_inline_dv,
+            offset,
+            size_in_bytes,
+            cardinality,
+        })
+    }
+}
+
+impl DataVisitor for DeletionVectorVisitor {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for i in 0..row_count {
+            // Since path column is required, use it to detect presence of an Add action
+            if let Some(storage_type) = getters[0].get_opt(i, "deletionVector.storage_type")? {
+                self.descriptor = Some(Self::visit_deletion_vector(i, storage_type, getters)?);
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

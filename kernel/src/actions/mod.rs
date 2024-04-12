@@ -1,5 +1,6 @@
 //! Provides parsing and manipulation of the various actions defined in the [Delta specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
-pub(crate) mod deletion_vector;
+
+pub mod deletion_vector;
 pub(crate) mod schemas;
 pub(crate) mod visitors;
 

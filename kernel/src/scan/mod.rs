@@ -7,12 +7,12 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
-use self::file_stream::log_replay_iter;
-use self::state::ScanState;
+use self::file_stream::{log_replay_iter, scan_action_iter};
+use self::state::{GlobalScanState, ScanState};
 use crate::actions::deletion_vector::{treemap_to_bools, DeletionVectorDescriptor};
 use crate::actions::{get_log_schema, Add, ADD_NAME, REMOVE_NAME};
 use crate::expressions::{Expression, Scalar};
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{DataType, Schema, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::{DeltaResult, EngineData, EngineInterface, Error, FileMeta};
 
@@ -223,6 +223,30 @@ impl Scan {
         ))
     }
 
+    /// Get an iterator of [`EngineData`]s that should be included in scan for a query. This handles
+    /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
+    pub fn scan_data(
+        &self,
+        engine_interface: &dyn EngineInterface,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, Vec<bool>)>>> {
+        let commit_read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?;
+        let checkpoint_read_schema = get_log_schema().project(&[ADD_NAME])?;
+
+        let log_iter = self.snapshot.log_segment.replay(
+            engine_interface,
+            commit_read_schema,
+            checkpoint_read_schema,
+            self.predicate.clone(),
+        )?;
+
+        Ok(scan_action_iter(
+            engine_interface,
+            log_iter,
+            &self.read_schema,
+            &self.predicate,
+        ))
+    }
+
     /// Get an iterator of [`ScanFile`]s that should be included in scan for a query. This handles
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
     pub fn scan_files(
@@ -235,44 +259,11 @@ impl Scan {
             .map(move |add_res| add_res.map(|add| ScanFile::from_add(add, &table_root))))
     }
 
-    /// Get the state needed to process this scan. In particular this returns a triple of
-    /// (all_fields_in_query, fields_to_read_from_parquet, have_partition_cols) where:
-    /// - all_fields_in_query - all fields in the query as [`ColumnType`] enums
-    /// - fields_to_read_from_parquet - Which fields should be read from the raw parquet files
-    /// - have_partition_cols - boolean indicating if we have partition columns in this query
-    fn get_state_info<'a>(
-        &'a self,
-        partition_columns: &[String],
-    ) -> (Vec<ColumnType<'a>>, Vec<StructField>, bool) {
-        let mut have_partition_cols = false;
-        let mut read_fields = Vec::with_capacity(self.schema().fields.len());
-        // Loop over all selected fields and note if they are columns that will be read from the
-        // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
-        // be filled in by evaluating an expression ([`ColumnType::Partition`])
-        let column_types = self
-            .schema()
-            .fields()
-            .map(|field| {
-                if partition_columns.contains(field.name()) {
-                    // todo: this is slow(ish)
-                    // Store the raw field, we will turn it into an expression in the inner loop
-                    // since the expression could be different for each add file
-                    have_partition_cols = true;
-                    ColumnType::Partition(Cow::Borrowed(field))
-                } else {
-                    // Add to read schema, store field so we can build a `Column` expression later
-                    // if needed (i.e. if we have partition columns)
-                    read_fields.push(field.clone());
-                    ColumnType::Selected(Cow::Borrowed(field))
-                }
-            })
-            .collect();
-        (column_types, read_fields, have_partition_cols)
-    }
-
-    pub fn get_scan_state(&self) -> ScanState<'_> {
+    // will probably go away
+    pub fn scan_state(&self) -> ScanState<'_> {
         let partition_columns = &self.snapshot.metadata().partition_columns;
-        let (all_fields, read_fields, have_partition_cols) = self.get_state_info(partition_columns);
+        let (all_fields, read_fields, have_partition_cols) =
+            get_state_info(self.schema().as_ref(), partition_columns);
         let read_schema = Arc::new(StructType::new(read_fields));
         ScanState::new(
             all_fields,
@@ -280,6 +271,22 @@ impl Scan {
             self.schema().clone(),
             read_schema,
         )
+    }
+
+    /// Get global state that is valid for the entire scan. This is somewhat expensive so should
+    /// only be called once per scan.
+    pub fn global_scan_state(&self) -> GlobalScanState {
+        let partition_columns = &self.snapshot.metadata().partition_columns;
+        let (_all_fields, read_fields, _have_partition_cols) =
+            get_state_info(self.schema().as_ref(), partition_columns);
+        let read_schema = StructType::new(read_fields);
+        let logical_schema = self.schema().as_ref().clone();
+        GlobalScanState {
+            table_root: self.snapshot.table_root.to_string(),
+            partition_columns: partition_columns.clone(),
+            logical_schema,
+            read_schema,
+        }
     }
 
     /// This is the main method to 'materialize' the scan. It returns a [`Result`] of
@@ -290,7 +297,8 @@ impl Scan {
     /// more details.
     pub fn execute(&self, engine_interface: &dyn EngineInterface) -> DeltaResult<Vec<ScanResult>> {
         let partition_columns = &self.snapshot.metadata().partition_columns;
-        let (all_fields, read_fields, have_partition_cols) = self.get_state_info(partition_columns);
+        let (all_fields, read_fields, have_partition_cols) =
+            get_state_info(self.schema().as_ref(), partition_columns);
         let read_schema = Arc::new(StructType::new(read_fields));
         debug!("Executing scan with read schema {read_schema:#?}");
         let output_schema = DataType::Struct(Box::new(self.schema().as_ref().clone()));
@@ -391,22 +399,69 @@ fn parse_partition_value(raw: Option<&String>, data_type: &DataType) -> DeltaRes
     }
 }
 
-/// Turn raw physical parquet data into the logical format based on a scan state
+/// Get the state needed to process a scan. In particular this returns a triple of
+/// (all_fields_in_query, fields_to_read_from_parquet, have_partition_cols) where:
+/// - all_fields_in_query - all fields in the query as [`ColumnType`] enums
+/// - fields_to_read_from_parquet - Which fields should be read from the raw parquet files
+/// - have_partition_cols - boolean indicating if we have partition columns in this query
+fn get_state_info<'a>(
+    schema: &'a Schema,
+    partition_columns: &[String],
+) -> (Vec<ColumnType<'a>>, Vec<StructField>, bool) {
+    let mut have_partition_cols = false;
+    let mut read_fields = Vec::with_capacity(schema.fields.len());
+    // Loop over all selected fields and note if they are columns that will be read from the
+    // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
+    // be filled in by evaluating an expression ([`ColumnType::Partition`])
+    let column_types = schema
+        .fields()
+        .map(|field| {
+            if partition_columns.contains(field.name()) {
+                // todo: this is slow(ish)
+                // Store the raw field, we will turn it into an expression in the inner loop
+                // since the expression could be different for each add file
+                have_partition_cols = true;
+                ColumnType::Partition(Cow::Borrowed(field))
+            } else {
+                // Add to read schema, store field so we can build a `Column` expression later
+                // if needed (i.e. if we have partition columns)
+                read_fields.push(field.clone());
+                ColumnType::Selected(Cow::Borrowed(field))
+            }
+        })
+        .collect();
+    (column_types, read_fields, have_partition_cols)
+}
+
+pub fn selection_vector(
+    engine_interface: &dyn EngineInterface,
+    descriptor: &DeletionVectorDescriptor,
+    table_root: &Url,
+) -> DeltaResult<Vec<bool>> {
+    let fs_client = engine_interface.get_file_system_client();
+    let dv_treemap = descriptor.read(fs_client, table_root.clone())?;
+    Ok(treemap_to_bools(dv_treemap))
+}
+
 pub fn transform_to_logical(
     engine_interface: &dyn EngineInterface,
     data: Box<dyn EngineData>,
-    scan_state: &ScanState<'_>,
-    scan_file: &ScanFile,
+    global_state: &GlobalScanState,
+    partition_values: &std::collections::HashMap<String, String>,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    if scan_state.have_partition_cols {
+    let (all_fields, _read_fields, have_partition_cols) = get_state_info(
+        &global_state.logical_schema,
+        &global_state.partition_columns,
+    );
+    let read_schema = Arc::new(global_state.read_schema.clone());
+    if have_partition_cols {
         // need to add back partition cols
-        let all_fields: Vec<Expression> = scan_state
-            .column_types
+        let all_fields: Vec<Expression> = all_fields
             .iter()
             .map(|field| match field {
                 ColumnType::Partition(field) => {
                     let value_expression = parse_partition_value(
-                        scan_file.partition_values.get(field.name()),
+                        partition_values.get(field.name()),
                         field.data_type(),
                     )?;
                     Ok::<Expression, Error>(Expression::Literal(value_expression))
@@ -418,9 +473,9 @@ pub fn transform_to_logical(
         let result = engine_interface
             .get_expression_handler()
             .get_evaluator(
-                scan_state.read_schema.clone(),
+                read_schema.clone(),
                 read_expression.clone(),
-                DataType::Struct(Box::new(scan_state.logical_schema.as_ref().clone())),
+                DataType::Struct(Box::new(global_state.logical_schema.clone())),
             )
             .evaluate(data.as_ref())?;
         Ok(result)
