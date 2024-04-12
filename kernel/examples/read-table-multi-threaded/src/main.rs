@@ -270,7 +270,6 @@ fn do_work(
         match scan_file_rx.recv() {
             Ok(scan_file) => {
                 // we got a scan file, let's process it
-
                 let root_url = Url::parse(&scan_state.table_root).unwrap();
 
                 // get the selection vector (i.e. deletion vector)
@@ -314,7 +313,7 @@ fn do_work(
                         0
                     };
 
-                    // // ask the kernel to transform the physical data into the correct logical form
+                    // ask the kernel to transform the physical data into the correct logical form
                     let logical = transform_to_logical(
                         engine_interface,
                         read_result.unwrap(),

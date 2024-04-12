@@ -48,7 +48,6 @@ impl<'a> ScanState<'a> {
 // will probably actually use this one
 
 /// State that doesn't change beween scans
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GlobalScanState {
     pub table_root: String,
