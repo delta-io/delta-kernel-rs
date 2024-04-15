@@ -7,6 +7,7 @@ use std::default::Default;
 use std::os::raw::{c_char, c_void};
 use std::path::PathBuf;
 use std::sync::Arc;
+use delta_kernel::client::arrow_data::ArrowEngineData;
 use tracing::debug;
 use url::Url;
 
@@ -804,7 +805,7 @@ pub unsafe extern "C" fn kernel_scan_data_next(
     engine_context: *mut c_void,
     engine_visitor: extern "C" fn(
         engine_context: *mut c_void,
-        engine_data: *mut c_void,
+        engine_data: *const c_void,
         selection_vector: &KernelBoolSlice,
     ),
 ) -> ExternResult<bool> {
@@ -816,16 +817,22 @@ fn kernel_scan_data_next_impl(
     engine_context: *mut c_void,
     engine_visitor: extern "C" fn(
         engine_context: *mut c_void,
-        engine_data: *mut c_void,
+        engine_data: *const c_void,
         selection_vector: &KernelBoolSlice,
     ),
 ) -> DeltaResult<bool> {
     if let Some((data, sel_vec)) = data.data.next().transpose()? {
         let bool_slice: KernelBoolSlice = sel_vec.into();
-        let data_ptr = Box::into_raw(data);
-        (engine_visitor)(engine_context, data_ptr.cast(), &bool_slice);
+
+        let arrow_data: Box<ArrowEngineData> = data
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?;
+        let rb_ptr = arrow_data.record_batch() as *const _;
+        let void_ptr = rb_ptr as *const c_void;
+        (engine_visitor)(engine_context, void_ptr, &bool_slice);
         // ensure we free the data
-        let _ = unsafe { Box::from_raw(data_ptr) };
+        //let _ = unsafe { Box::from_raw(data_ptr) };
         Ok(true)
     } else {
         Ok(false)
