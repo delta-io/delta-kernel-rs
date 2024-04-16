@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use either::Either;
 use lazy_static::lazy_static;
@@ -76,7 +77,7 @@ impl DataVisitor for AddRemoveVisitor {
 }
 
 lazy_static! {
-    static ref SCAN_ROW_SCHEMA: DataType = DataType::Struct(Box::new(StructType::new(vec!(
+    pub(crate) static ref SCAN_ROW_SCHEMA: Arc<StructType> = Arc::new(StructType::new(vec!(
         StructField::new("path", DataType::STRING, true),
         StructField::new("size", DataType::LONG, true),
         StructField::new("modificationTime", DataType::LONG, true),
@@ -100,7 +101,9 @@ lazy_static! {
             )]),
             true
         ),
-    ))));
+    )));
+    static ref SCAN_ROW_DATATYPE: DataType =
+        DataType::Struct(Box::new(SCAN_ROW_SCHEMA.as_ref().clone()));
 }
 
 impl LogReplayScanner {
@@ -250,7 +253,7 @@ impl LogReplayScanner {
             .get_evaluator(
                 get_log_schema().project(&[ADD_NAME])?,
                 self.get_add_transform_expr(),
-                SCAN_ROW_SCHEMA.clone(),
+                SCAN_ROW_DATATYPE.clone(),
             )
             .evaluate(actions)?;
         Ok((result, selection_vector))

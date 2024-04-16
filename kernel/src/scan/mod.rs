@@ -8,7 +8,7 @@ use tracing::debug;
 use url::Url;
 
 use self::file_stream::{log_replay_iter, scan_action_iter};
-use self::state::{GlobalScanState, ScanState};
+use self::state::GlobalScanState;
 use crate::actions::deletion_vector::{treemap_to_bools, DeletionVectorDescriptor};
 use crate::actions::{get_log_schema, Add, ADD_NAME, REMOVE_NAME};
 use crate::expressions::{Expression, Scalar};
@@ -115,20 +115,7 @@ pub enum ColumnType<'a> {
     Partition(Cow<'a, StructField>),
 }
 
-impl<'a> ColumnType<'a> {
-    pub(crate) fn into_owned(self) -> ColumnType<'static> {
-        match self {
-            ColumnType::Selected(field) => {
-                let field = field.into_owned();
-                ColumnType::Selected(Cow::Owned(field))
-            }
-            ColumnType::Partition(field) => {
-                let field = field.into_owned();
-                ColumnType::Partition(Cow::Owned(field))
-            }
-        }
-    }
-}
+// this will likely go away
 /// One file to scan, plus associated metadata
 pub struct ScanFile {
     table_root: Url,
@@ -162,7 +149,7 @@ impl ScanFile {
             .as_ref()
             .map(|dv_descriptor| {
                 let fs_client = engine_interface.get_file_system_client();
-                dv_descriptor.read(fs_client, self.table_root.clone())
+                dv_descriptor.read(fs_client, &self.table_root)
             })
             .transpose()?;
         Ok(dv_treemap.map(treemap_to_bools))
@@ -259,20 +246,6 @@ impl Scan {
             .map(move |add_res| add_res.map(|add| ScanFile::from_add(add, &table_root))))
     }
 
-    // will probably go away
-    pub fn scan_state(&self) -> ScanState<'_> {
-        let partition_columns = &self.snapshot.metadata().partition_columns;
-        let (all_fields, read_fields, have_partition_cols) =
-            get_state_info(self.schema().as_ref(), partition_columns);
-        let read_schema = Arc::new(StructType::new(read_fields));
-        ScanState::new(
-            all_fields,
-            have_partition_cols,
-            self.schema().clone(),
-            read_schema,
-        )
-    }
-
     /// Get global state that is valid for the entire scan. This is somewhat expensive so should
     /// only be called once per scan.
     pub fn global_scan_state(&self) -> GlobalScanState {
@@ -343,7 +316,7 @@ impl Scan {
                 .as_ref()
                 .map(|dv_descriptor| {
                     let fs_client = engine_interface.get_file_system_client();
-                    dv_descriptor.read(fs_client, self.snapshot.table_root.clone())
+                    dv_descriptor.read(fs_client, &self.snapshot.table_root)
                 })
                 .transpose()?;
 
@@ -439,7 +412,7 @@ pub fn selection_vector(
     table_root: &Url,
 ) -> DeltaResult<Vec<bool>> {
     let fs_client = engine_interface.get_file_system_client();
-    let dv_treemap = descriptor.read(fs_client, table_root.clone())?;
+    let dv_treemap = descriptor.read(fs_client, table_root)?;
     Ok(treemap_to_bools(dv_treemap))
 }
 

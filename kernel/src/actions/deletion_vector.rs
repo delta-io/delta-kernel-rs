@@ -113,9 +113,9 @@ impl DeletionVectorDescriptor {
     pub fn read(
         &self,
         fs_client: Arc<dyn FileSystemClient>,
-        parent: Url,
+        parent: &Url,
     ) -> DeltaResult<RoaringTreemap> {
-        match self.absolute_path(&parent)? {
+        match self.absolute_path(parent)? {
             None => {
                 let bytes = z85::decode(&self.path_or_inline_dv)
                     .map_err(|_| Error::deletion_vector("Failed to decode DV"))?;
@@ -308,7 +308,7 @@ mod tests {
         let fs_client = sync_interface.get_file_system_client();
 
         let example = dv_example();
-        let tree_map = example.read(fs_client, parent).unwrap();
+        let tree_map = example.read(fs_client, &parent).unwrap();
 
         let expected: Vec<u64> = vec![0, 9];
         let found = tree_map.iter().collect::<Vec<_>>();

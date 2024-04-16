@@ -4,17 +4,14 @@ use std::sync::mpsc::Sender;
 use std::sync::{mpsc, Arc};
 use std::thread;
 
-use arrow::array::{Array, AsArray, MapArray};
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::{Int32Type, Int64Type};
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
-use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
 use delta_kernel::client::arrow_data::ArrowEngineData;
 use delta_kernel::client::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::client::default::DefaultEngineInterface;
 use delta_kernel::client::sync::SyncEngineInterface;
-use delta_kernel::scan::state::GlobalScanState;
+use delta_kernel::scan::state::{DvInfo, GlobalScanState};
 use delta_kernel::scan::{transform_to_logical, ScanBuilder};
 use delta_kernel::schema::Schema;
 use delta_kernel::{DeltaResult, EngineData, EngineInterface, FileMeta, Table};
@@ -64,25 +61,14 @@ fn main() -> ExitCode {
     }
 }
 
-// package up dv info as primitive types
-struct DvInfo {
-    storage_type: String,
-    path_or_inline_dv: String,
-    offset: Option<i32>,
-    size_in_bytes: i32,
-    cardinality: i64,
-}
-
 // the way we as a connector represent data to scan. this is computed from the raw data returned
 // from the scan, and could be any format the engine chooses to use to facilitate distributing work.
 struct ScanFile {
     path: String,
-    size: usize,
+    size: i64,
     partition_values: HashMap<String, String>,
-    dv_info: Option<DvInfo>,
+    dv_info: DvInfo,
 }
-
-// TODO(nick): Maybe move all the arrow support code into a module so it looks less scary
 
 // we know we're using arrow under the hood, so cast an EngineData into something we can work with
 fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
@@ -93,70 +79,21 @@ fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
         .into())
 }
 
-// turn an entry in a MapArray into a HashMap
-fn materialize(arry: &MapArray, row_index: usize) -> HashMap<String, String> {
-    let mut ret = HashMap::new();
-    let map_val = arry.value(row_index);
-    let keys = map_val.column(0).as_string::<i32>();
-    let values = map_val.column(1).as_string::<i32>();
-    for (key, value) in keys.iter().zip(values.iter()) {
-        if let (Some(key), Some(value)) = (key, value) {
-            ret.insert(key.into(), value.into());
-        }
-    }
-    ret
-}
-
-// turn our record batch iteratively into ScanFiles. This looks messy, but it's really just
-// iterating the RecordBatch and pulling out the required information
-fn get_scan_files(
-    batch: RecordBatch,
-    selection_vector: Vec<bool>,
-) -> DeltaResult<impl Iterator<Item = ScanFile>> {
-    Ok((0..batch.num_rows()).filter_map(move |row_index| {
-        if selection_vector[row_index] {
-            let path_col = batch.column_by_name("path")?.as_string::<i32>();
-            let size_col = batch.column_by_name("size")?.as_primitive::<Int64Type>();
-
-            let dv_col = batch.column_by_name("deletionVector")?.as_struct();
-            let storage_col = dv_col.column_by_name("storageType")?.as_string::<i32>();
-            let dv_info = if storage_col.is_valid(row_index) {
-                let dv_path_col = dv_col.column_by_name("pathOrInlineDv")?.as_string::<i32>();
-                let offset_col = dv_col.column_by_name("offset")?.as_primitive::<Int32Type>();
-                let size_in_bytes_col = dv_col
-                    .column_by_name("sizeInBytes")?
-                    .as_primitive::<Int32Type>();
-                let cardinality_col = dv_col
-                    .column_by_name("cardinality")?
-                    .as_primitive::<Int64Type>();
-                Some(DvInfo {
-                    storage_type: storage_col.value(row_index).to_string(),
-                    path_or_inline_dv: dv_path_col.value(row_index).to_string(),
-                    offset: if offset_col.is_valid(row_index) {
-                        Some(offset_col.value(row_index))
-                    } else {
-                        None
-                    },
-                    size_in_bytes: size_in_bytes_col.value(row_index),
-                    cardinality: cardinality_col.value(row_index),
-                })
-            } else {
-                None
-            };
-
-            let constant_vals = batch.column_by_name("fileConstantValues")?.as_struct();
-            let partition_col = constant_vals.column_by_name("partitionValues")?.as_map();
-            let partition_values = materialize(partition_col, row_index);
-            Some(ScanFile {
-                path: path_col.value(row_index).to_string(),
-                size: size_col.value(row_index) as usize,
-                partition_values,
-                dv_info,
-            })
-        } else {
-            None
-        }
-    }))
+// This is the callback that will be called fo each valid scan row
+fn send_scan_file(
+    scan_tx: &mut spmc::Sender<ScanFile>,
+    path: &str,
+    size: i64,
+    dv_info: DvInfo,
+    partition_values: HashMap<String, String>,
+) {
+    let scan_file = ScanFile {
+        path: path.to_string(),
+        size,
+        partition_values,
+        dv_info,
+    };
+    scan_tx.send(scan_file).unwrap();
 }
 
 fn try_main() -> DeltaResult<()> {
@@ -241,13 +178,14 @@ fn try_main() -> DeltaResult<()> {
     // done sending
     drop(record_batch_tx);
 
-    // send out each scan file
     for res in scan_data {
         let (data, vector) = res?;
-        let batch = to_arrow(data)?;
-        for scan_file in get_scan_files(batch, vector)? {
-            scan_file_tx.send(scan_file).unwrap();
-        }
+        scan_file_tx = delta_kernel::scan::state::visit_scan_files(
+            data.as_ref(),
+            vector,
+            scan_file_tx,
+            send_scan_file,
+        )?;
     }
 
     // have sent all scan files, drop this so threads will exit when there's no more work
@@ -277,23 +215,16 @@ fn do_work(
                 let root_url = Url::parse(&scan_state.table_root).unwrap();
 
                 // get the selection vector (i.e. deletion vector)
-                let mut selection_vector = scan_file.dv_info.map(|info| {
-                    let descriptor = DeletionVectorDescriptor::new(
-                        info.storage_type,
-                        info.path_or_inline_dv,
-                        info.offset,
-                        info.size_in_bytes,
-                        info.cardinality,
-                    );
-                    delta_kernel::scan::selection_vector(engine_interface, &descriptor, &root_url)
-                        .unwrap()
-                });
+                let mut selection_vector = scan_file
+                    .dv_info
+                    .get_selection_vector(engine_interface, &root_url)
+                    .unwrap();
 
                 // build the required metadata for our parquet handler to read this file
                 let location = root_url.join(&scan_file.path).unwrap();
                 let meta = FileMeta {
                     last_modified: 0,
-                    size: scan_file.size,
+                    size: scan_file.size as usize,
                     location,
                 };
 

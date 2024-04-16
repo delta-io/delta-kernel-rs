@@ -15,7 +15,7 @@ use delta_kernel::expressions::{BinaryOperator, Expression, Scalar};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::{DataType, PrimitiveType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{DeltaResult, EngineInterface, Error, EngineData};
+use delta_kernel::{DeltaResult, EngineData, EngineInterface, Error};
 
 mod handle;
 use handle::{ArcHandle, BoxHandle, SizedArcHandle, Unconstructable};
@@ -123,7 +123,7 @@ impl Into<KernelBoolSlice> for Vec<bool> {
         let boxed = self.into_boxed_slice();
         KernelBoolSlice {
             ptr: Box::into_raw(boxed).cast(),
-            len
+            len,
         }
     }
 }
@@ -133,7 +133,6 @@ impl Drop for KernelBoolSlice {
         let _ = unsafe { Box::from_raw(self.ptr as *mut bool) };
     }
 }
-
 
 #[repr(C)]
 #[derive(Debug)]
@@ -759,7 +758,6 @@ impl Drop for KernelScanDataIterator {
     }
 }
 
-
 /// Get the data needed to perform a scan
 #[no_mangle]
 pub unsafe extern "C" fn kernel_scan_data_init(
@@ -804,7 +802,11 @@ fn kernel_scan_data_init_impl(
 pub unsafe extern "C" fn kernel_scan_data_next(
     data: &mut KernelScanDataIterator,
     engine_context: *mut c_void,
-    engine_visitor: extern "C" fn(engine_context: *mut c_void, engine_data: *mut c_void, selection_vector: &KernelBoolSlice),
+    engine_visitor: extern "C" fn(
+        engine_context: *mut c_void,
+        engine_data: *mut c_void,
+        selection_vector: &KernelBoolSlice,
+    ),
 ) -> ExternResult<bool> {
     kernel_scan_data_next_impl(data, engine_context, engine_visitor)
         .into_extern_result(data.table_client.error_allocator())
@@ -812,7 +814,11 @@ pub unsafe extern "C" fn kernel_scan_data_next(
 fn kernel_scan_data_next_impl(
     data: &mut KernelScanDataIterator,
     engine_context: *mut c_void,
-    engine_visitor: extern "C" fn(engine_context: *mut c_void, engine_data: *mut c_void, selection_vector: &KernelBoolSlice),
+    engine_visitor: extern "C" fn(
+        engine_context: *mut c_void,
+        engine_data: *mut c_void,
+        selection_vector: &KernelBoolSlice,
+    ),
 ) -> DeltaResult<bool> {
     if let Some((data, sel_vec)) = data.data.next().transpose()? {
         let bool_slice: KernelBoolSlice = sel_vec.into();
