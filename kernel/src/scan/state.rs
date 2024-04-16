@@ -3,7 +3,10 @@
 use std::collections::HashMap;
 
 use crate::{
-    actions::{deletion_vector::{treemap_to_bools, DeletionVectorDescriptor}, visitors::visit_deletion_vector_at},
+    actions::{
+        deletion_vector::{treemap_to_bools, DeletionVectorDescriptor},
+        visitors::visit_deletion_vector_at,
+    },
     engine_data::{GetData, TypedGetData},
     schema::Schema,
     DataVisitor, DeltaResult, EngineData, EngineInterface,
