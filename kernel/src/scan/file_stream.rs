@@ -102,8 +102,7 @@ lazy_static! {
             true
         ),
     )));
-    static ref SCAN_ROW_DATATYPE: DataType =
-        DataType::Struct(Box::new(SCAN_ROW_SCHEMA.as_ref().clone()));
+    static ref SCAN_ROW_DATATYPE: DataType = SCAN_ROW_SCHEMA.as_ref().clone().into();
 }
 
 impl LogReplayScanner {

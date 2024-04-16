@@ -139,19 +139,12 @@ impl AddVisitor {
             getters[7].get_opt(row_index, "add.deletionVector.storageType")?
         {
             // there is a storageType, so the whole DV must be there
-            let path_or_inline_dv: String =
-                getters[8].get(row_index, "add.deletionVector.pathOrInlineDv")?;
-            let offset: Option<i32> = getters[9].get_opt(row_index, "add.deletionVector.offset")?;
-            let size_in_bytes: i32 =
-                getters[10].get(row_index, "add.deletionVector.sizeInBytes")?;
-            let cardinality: i64 = getters[11].get(row_index, "add.deletionVector.cardinality")?;
-            Some(DeletionVectorDescriptor {
+            Some(visit_deletion_vector_at(
+                row_index,
+                7,
                 storage_type,
-                path_or_inline_dv,
-                offset,
-                size_in_bytes,
-                cardinality,
-            })
+                getters,
+            )?)
         } else {
             None
         };
@@ -216,22 +209,12 @@ impl RemoveVisitor {
         let deletion_vector = if let Some(storage_type) =
             getters[7].get_opt(row_index, "remove.deletionVector.storageType")?
         {
-            // there is a storageType, so the whole DV must be there
-            let path_or_inline_dv: String =
-                getters[8].get(row_index, "remove.deletionVector.pathOrInlineDv")?;
-            let offset: Option<i32> =
-                getters[9].get_opt(row_index, "remove.deletionVector.offset")?;
-            let size_in_bytes: i32 =
-                getters[10].get(row_index, "remove.deletionVector.sizeInBytes")?;
-            let cardinality: i64 =
-                getters[11].get(row_index, "remove.deletionVector.cardinality")?;
-            Some(DeletionVectorDescriptor {
+            Some(visit_deletion_vector_at(
+                row_index,
+                7,
                 storage_type,
-                path_or_inline_dv,
-                offset,
-                size_in_bytes,
-                cardinality,
-            })
+                getters,
+            )?)
         } else {
             None
         };
@@ -268,6 +251,31 @@ impl DataVisitor for RemoveVisitor {
     }
 }
 
+/// Get a DV out of some engine data. The column holding `storage_type` is specified as `storage_type_col_index`. We assume the calling code has
+/// extracted `storage_type` already to verify the DV data is there.
+pub(crate) fn visit_deletion_vector_at<'a>(
+    row_index: usize,
+    storage_type_col_index: usize,
+    storage_type: String,
+    getters: &[&'a dyn GetData<'a>],
+) -> DeltaResult<DeletionVectorDescriptor> {
+    let mut idx = storage_type_col_index + 1;
+    let path_or_inline_dv: String = getters[idx].get(row_index, "deletionVector.pathOrInlineDv")?;
+    idx += 1;
+    let offset: Option<i32> = getters[idx].get_opt(row_index, "deletionVector.offset")?;
+    idx += 1;
+    let size_in_bytes: i32 = getters[idx].get(row_index, "deletionVector.sizeInBytes")?;
+    idx += 1;
+    let cardinality: i64 = getters[idx].get(row_index, "deletionVector.cardinality")?;
+    Ok(DeletionVectorDescriptor {
+        storage_type,
+        path_or_inline_dv,
+        offset,
+        size_in_bytes,
+        cardinality,
+    })
+}
+
 #[derive(Default)]
 pub(crate) struct DeletionVectorVisitor {
     pub(crate) descriptor: Option<DeletionVectorDescriptor>,
@@ -279,18 +287,7 @@ impl DeletionVectorVisitor {
         storage_type: String,
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<DeletionVectorDescriptor> {
-        let path_or_inline_dv: String =
-            getters[1].get(row_index, "add.deletionVector.pathOrInlineDv")?;
-        let offset: Option<i32> = getters[2].get_opt(row_index, "add.deletionVector.offset")?;
-        let size_in_bytes: i32 = getters[3].get(row_index, "add.deletionVector.sizeInBytes")?;
-        let cardinality: i64 = getters[4].get(row_index, "add.deletionVector.cardinality")?;
-        Ok(DeletionVectorDescriptor {
-            storage_type,
-            path_or_inline_dv,
-            offset,
-            size_in_bytes,
-            cardinality,
-        })
+        visit_deletion_vector_at(row_index, 0, storage_type, getters)
     }
 }
 

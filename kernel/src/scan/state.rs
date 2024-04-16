@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    actions::deletion_vector::{treemap_to_bools, DeletionVectorDescriptor},
+    actions::{deletion_vector::{treemap_to_bools, DeletionVectorDescriptor}, visitors::visit_deletion_vector_at},
     engine_data::{GetData, TypedGetData},
     schema::Schema,
     DataVisitor, DeltaResult, EngineData, EngineInterface,
@@ -78,7 +78,7 @@ pub fn visit_scan_files<T>(
         size: i64,
         dv_info: DvInfo,
         partition_values: HashMap<String, String>,
-    ) -> (),
+    ),
 ) -> DeltaResult<T> {
     let mut visitor = ScanFileVisitor {
         callback,
@@ -91,7 +91,7 @@ pub fn visit_scan_files<T>(
 
 // add some visitor magic for clients
 struct ScanFileVisitor<T> {
-    callback: fn(&mut T, &str, i64, DvInfo, HashMap<String, String>) -> (),
+    callback: fn(&mut T, &str, i64, DvInfo, HashMap<String, String>),
     selection_vector: Vec<bool>,
     context: T,
 }
@@ -109,27 +109,17 @@ impl<T> DataVisitor for ScanFileVisitor<T> {
                 let deletion_vector = if let Some(storage_type) =
                     getters[3].get_opt(row_index, "scanFile.deletionVector.storageType")?
                 {
-                    // there is a storageType, so the whole DV must be there
-                    let path_or_inline_dv: String =
-                        getters[4].get(row_index, "scanFile.deletionVector.pathOrInlineDv")?;
-                    let offset: Option<i32> =
-                        getters[5].get_opt(row_index, "scanFile.deletionVector.offset")?;
-                    let size_in_bytes: i32 =
-                        getters[6].get(row_index, "scanFile.deletionVector.sizeInBytes")?;
-                    let cardinality: i64 =
-                        getters[7].get(row_index, "scanFile.deletionVector.cardinality")?;
-                    Some(DeletionVectorDescriptor {
+                    Some(visit_deletion_vector_at(
+                        row_index,
+                        3,
                         storage_type,
-                        path_or_inline_dv,
-                        offset,
-                        size_in_bytes,
-                        cardinality,
-                    })
+                        getters,
+                    )?)
                 } else {
                     None
                 };
                 let dv_info = DvInfo { deletion_vector };
-                let partition_values: HashMap<_, _> =
+                let partition_values =
                     getters[8].get(row_index, "scanFile.fileConstantValues.partitionValues")?;
                 (self.callback)(&mut self.context, path, size, dv_info, partition_values)
             }
