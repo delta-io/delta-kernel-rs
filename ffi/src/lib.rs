@@ -12,8 +12,10 @@ use url::Url;
 
 use delta_kernel::actions::Add;
 use delta_kernel::expressions::{BinaryOperator, Expression, Scalar};
-use delta_kernel::scan::{ScanBuilder, Scan as KernelScan};
-use delta_kernel::scan::state::{DvInfo, visit_scan_files, GlobalScanState as KernelGlobalScanState};
+use delta_kernel::scan::state::{
+    visit_scan_files, DvInfo, GlobalScanState as KernelGlobalScanState,
+};
+use delta_kernel::scan::{Scan as KernelScan, ScanBuilder};
 use delta_kernel::schema::{DataType, PrimitiveType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, EngineData, EngineInterface, Error};
@@ -119,6 +121,7 @@ pub struct KernelBoolSlice {
     cap: usize,
 }
 
+#[allow(clippy::from_over_into)]
 impl Into<KernelBoolSlice> for Vec<bool> {
     fn into(self) -> KernelBoolSlice {
         // TODO: Use `into_raw_parts` when it's stable
@@ -132,13 +135,13 @@ impl Into<KernelBoolSlice> for Vec<bool> {
 
 impl Drop for KernelBoolSlice {
     fn drop(&mut self) {
-        let vec = self.into_vec();
+        let vec = self.make_vec();
         debug!("Dropping bool slice. It is {vec:#?}");
     }
 }
 
 impl KernelBoolSlice {
-    fn into_vec(&self) -> Vec<bool> {
+    fn make_vec(&self) -> Vec<bool> {
         unsafe { Vec::from_raw_parts(self.ptr, self.len, self.cap) }
     }
 }
@@ -787,14 +790,13 @@ unsafe fn scan_impl(
     Ok(BoxHandle::into_handle(Scan { kernel_scan }))
 }
 
-
 pub struct GlobalScanState {
     kernel_state: KernelGlobalScanState,
 }
 impl BoxHandle for GlobalScanState {}
 
 #[no_mangle]
-pub extern "C" fn get_global_state(scan: *mut Scan) -> *mut GlobalScanState {
+pub unsafe extern "C" fn get_global_state(scan: *mut Scan) -> *mut GlobalScanState {
     let boxed_scan = unsafe { Box::from_raw(scan) };
     let kernel_state = boxed_scan.kernel_scan.global_scan_state();
     let res = BoxHandle::into_handle(GlobalScanState { kernel_state });
@@ -804,6 +806,7 @@ pub extern "C" fn get_global_state(scan: *mut Scan) -> *mut GlobalScanState {
 }
 
 // Intentionally opaque to the engine.
+#[allow(clippy::type_complexity)]
 pub struct KernelScanDataIterator {
     // Box -> Wrap its unsized content this struct is fixed-size with thin pointers.
     // Item = Box<dyn EngineData>, see above, Vec<bool> -> can become a KernelBoolSlice
@@ -878,7 +881,7 @@ fn kernel_scan_data_next_impl(
         let data_handle = BoxHandle::into_handle(EngineDataHandle { data });
         (engine_visitor)(engine_context, data_handle, &bool_slice);
         // ensure we free the data
-        let _ = unsafe { BoxHandle::drop_handle(data_handle) };
+        unsafe { BoxHandle::drop_handle(data_handle) };
         Ok(true)
     } else {
         Ok(false)
@@ -896,7 +899,7 @@ pub unsafe extern "C" fn kernel_scan_data_free(data: *mut KernelScanDataIterator
     BoxHandle::drop_handle(data);
 }
 
-type CScanCallback =  extern "C" fn(
+type CScanCallback = extern "C" fn(
     engine_context: *mut c_void,
     path: &KernelStringSlice,
     size: i64,
@@ -904,27 +907,42 @@ type CScanCallback =  extern "C" fn(
 );
 
 pub struct CDvInfo {
-    dv_info: DvInfo
+    dv_info: DvInfo,
 }
 impl BoxHandle for CDvInfo {}
 
 #[no_mangle]
-pub extern "C" fn selection_vector_from_dv(raw_info: *mut CDvInfo, extern_engine_interface: *const ExternEngineInterfaceHandle, state: *mut GlobalScanState) -> KernelBoolSlice {
+pub unsafe extern "C" fn selection_vector_from_dv(
+    raw_info: *mut CDvInfo,
+    extern_engine_interface: *const ExternEngineInterfaceHandle,
+    state: *mut GlobalScanState,
+) -> KernelBoolSlice {
     let boxed_info = unsafe { Box::from_raw(raw_info) };
     let extern_engine_interface = unsafe { ArcHandle::clone_as_arc(extern_engine_interface) };
     let boxed_state = unsafe { Box::from_raw(state) };
     let root_url = Url::parse(&boxed_state.kernel_state.table_root).unwrap();
-    let vopt = boxed_info.dv_info.get_selection_vector(extern_engine_interface.table_client().as_ref(), &root_url).unwrap();
+    let vopt = boxed_info
+        .dv_info
+        .get_selection_vector(extern_engine_interface.table_client().as_ref(), &root_url)
+        .unwrap();
     Box::leak(boxed_info);
     Box::leak(boxed_state);
     vopt.unwrap().into()
 }
 
-fn rust_callback(context: &mut ContextWrapper, path: &str, size: i64, dv_info: DvInfo, _partition_values: HashMap<String, String>) {
+fn rust_callback(
+    context: &mut ContextWrapper,
+    path: &str,
+    size: i64,
+    dv_info: DvInfo,
+    _partition_values: HashMap<String, String>,
+) {
     let path_slice: KernelStringSlice = path.into();
     let dv_handle = BoxHandle::into_handle(CDvInfo { dv_info });
     (context.callback)(context.engine_context, &path_slice, size, dv_handle);
-    unsafe { BoxHandle::drop_handle(dv_handle); }
+    unsafe {
+        BoxHandle::drop_handle(dv_handle);
+    }
 }
 
 // Wrap up stuff from C so we can pass it through to our callback
@@ -935,13 +953,13 @@ struct ContextWrapper {
 
 /// Shim for ffi to call visit_scan_data
 #[no_mangle]
-pub extern "C" fn visit_scan_data(
+pub unsafe extern "C" fn visit_scan_data(
     data: *mut EngineDataHandle,
     vector: &KernelBoolSlice,
     engine_context: *mut c_void,
     callback: CScanCallback,
 ) {
-    let selection_vec = vector.into_vec();
+    let selection_vec = vector.make_vec();
     let data: &dyn EngineData = unsafe { (*data).data.as_ref() };
     let context_wrapper = ContextWrapper {
         engine_context,
