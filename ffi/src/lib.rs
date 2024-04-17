@@ -7,13 +7,13 @@ use std::default::Default;
 use std::os::raw::{c_char, c_void};
 use std::path::PathBuf;
 use std::sync::Arc;
-use delta_kernel::client::arrow_data::ArrowEngineData;
 use tracing::debug;
 use url::Url;
 
 use delta_kernel::actions::Add;
 use delta_kernel::expressions::{BinaryOperator, Expression, Scalar};
-use delta_kernel::scan::ScanBuilder;
+use delta_kernel::scan::{ScanBuilder, Scan as KernelScan};
+use delta_kernel::scan::state::{DvInfo, visit_scan_files, GlobalScanState as KernelGlobalScanState};
 use delta_kernel::schema::{DataType, PrimitiveType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, EngineData, EngineInterface, Error};
@@ -114,26 +114,37 @@ impl TryFromStringSlice for String {
 /// TODO
 #[repr(C)]
 pub struct KernelBoolSlice {
-    ptr: *const bool,
+    ptr: *mut bool,
     len: usize,
+    cap: usize,
 }
 
 impl Into<KernelBoolSlice> for Vec<bool> {
     fn into(self) -> KernelBoolSlice {
+        // TODO: Use `into_raw_parts` when it's stable
         let len = self.len();
+        let cap = self.capacity();
         let boxed = self.into_boxed_slice();
-        KernelBoolSlice {
-            ptr: Box::into_raw(boxed).cast(),
-            len,
-        }
+        let ptr = Box::into_raw(boxed).cast();
+        KernelBoolSlice { ptr, len, cap }
     }
 }
 
 impl Drop for KernelBoolSlice {
     fn drop(&mut self) {
-        let _ = unsafe { Box::from_raw(self.ptr as *mut bool) };
+        let vec = self.into_vec();
+        debug!("Dropping bool slice. It is {vec:#?}");
     }
 }
+
+impl KernelBoolSlice {
+    fn into_vec(&self) -> Vec<bool> {
+        unsafe { Vec::from_raw_parts(self.ptr, self.len, self.cap) }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn free_bool_slice(_: KernelBoolSlice) {}
 
 #[repr(C)]
 #[derive(Debug)]
@@ -738,17 +749,70 @@ pub extern "C" fn visit_expression_literal_long(
     wrap_expression(state, Expression::Literal(Scalar::from(value)))
 }
 
+pub struct EngineDataHandle {
+    data: Box<dyn EngineData>,
+}
+
+impl BoxHandle for EngineDataHandle {}
+
+pub struct Scan {
+    kernel_scan: KernelScan,
+}
+impl BoxHandle for Scan {}
+
+#[no_mangle]
+pub unsafe extern "C" fn scan(
+    snapshot: *const SnapshotHandle,
+    engine_interface: *const ExternEngineInterfaceHandle,
+    predicate: Option<&mut EnginePredicate>,
+) -> ExternResult<*mut Scan> {
+    scan_impl(snapshot, predicate).into_extern_result(engine_interface)
+}
+
+unsafe fn scan_impl(
+    snapshot: *const SnapshotHandle,
+    predicate: Option<&mut EnginePredicate>,
+) -> DeltaResult<*mut Scan> {
+    let snapshot = unsafe { ArcHandle::clone_as_arc(snapshot) };
+    let mut scan_builder = ScanBuilder::new(snapshot.clone());
+    if let Some(predicate) = predicate {
+        let mut visitor_state = KernelExpressionVisitorState::new();
+        let exprid = (predicate.visitor)(predicate.predicate, &mut visitor_state);
+        if let Some(predicate) = unwrap_kernel_expression(&mut visitor_state, exprid) {
+            debug!("Got predicate: {}", predicate);
+            scan_builder = scan_builder.with_predicate(predicate);
+        }
+    }
+    let kernel_scan = scan_builder.build();
+    Ok(BoxHandle::into_handle(Scan { kernel_scan }))
+}
+
+
+pub struct GlobalScanState {
+    kernel_state: KernelGlobalScanState,
+}
+impl BoxHandle for GlobalScanState {}
+
+#[no_mangle]
+pub extern "C" fn get_global_state(scan: *mut Scan) -> *mut GlobalScanState {
+    let boxed_scan = unsafe { Box::from_raw(scan) };
+    let kernel_state = boxed_scan.kernel_scan.global_scan_state();
+    let res = BoxHandle::into_handle(GlobalScanState { kernel_state });
+    // leak the box since we don't want this to free the scan
+    Box::leak(boxed_scan);
+    res
+}
+
 // Intentionally opaque to the engine.
 pub struct KernelScanDataIterator {
     // Box -> Wrap its unsized content this struct is fixed-size with thin pointers.
-    // Item = String -> Owned items because rust can't correctly express lifetimes for borrowed items
-    // (we would need a way to assert that item lifetimes are bounded by the iterator's lifetime).
+    // Item = Box<dyn EngineData>, see above, Vec<bool> -> can become a KernelBoolSlice
     data: Box<dyn Iterator<Item = DeltaResult<(Box<dyn EngineData>, Vec<bool>)>>>,
 
     // Also keep a reference to the external client for its error allocator.
     // Parquet and Json handlers don't hold any reference to the tokio reactor, so the iterator
     // terminates early if the last table client goes out of scope.
-    table_client: Arc<dyn ExternEngineInterface>,
+    engine_interface: Arc<dyn ExternEngineInterface>,
 }
 
 impl BoxHandle for KernelScanDataIterator {}
@@ -762,35 +826,23 @@ impl Drop for KernelScanDataIterator {
 /// Get the data needed to perform a scan
 #[no_mangle]
 pub unsafe extern "C" fn kernel_scan_data_init(
-    snapshot: *const SnapshotHandle,
-    table_client: *const ExternEngineInterfaceHandle,
-    predicate: Option<&mut EnginePredicate>,
+    engine_interface: *const ExternEngineInterfaceHandle,
+    scan: *mut Scan,
 ) -> ExternResult<*mut KernelScanDataIterator> {
-    kernel_scan_data_init_impl(snapshot, table_client, predicate).into_extern_result(table_client)
+    kernel_scan_data_init_impl(engine_interface, scan).into_extern_result(engine_interface)
 }
 
-fn kernel_scan_data_init_impl(
-    snapshot: *const SnapshotHandle,
-    extern_table_client: *const ExternEngineInterfaceHandle,
-    predicate: Option<&mut EnginePredicate>,
+unsafe fn kernel_scan_data_init_impl(
+    engine_interface: *const ExternEngineInterfaceHandle,
+    scan: *mut Scan,
 ) -> DeltaResult<*mut KernelScanDataIterator> {
-    let snapshot = unsafe { ArcHandle::clone_as_arc(snapshot) };
-    let extern_table_client = unsafe { ArcHandle::clone_as_arc(extern_table_client) };
-    let mut scan_builder = ScanBuilder::new(snapshot.clone());
-    if let Some(predicate) = predicate {
-        let mut visitor_state = KernelExpressionVisitorState::new();
-        let exprid = (predicate.visitor)(predicate.predicate, &mut visitor_state);
-        if let Some(predicate) = unwrap_kernel_expression(&mut visitor_state, exprid) {
-            debug!("Got predicate: {}", predicate);
-            scan_builder = scan_builder.with_predicate(predicate);
-        }
-    }
-    let scan_data = scan_builder
-        .build()
-        .scan_data(extern_table_client.table_client().as_ref())?;
+    let engine_interface = unsafe { ArcHandle::clone_as_arc(engine_interface) };
+    let boxed_scan = unsafe { Box::from_raw(scan) };
+    let scan = boxed_scan.kernel_scan;
+    let scan_data = scan.scan_data(engine_interface.table_client().as_ref())?;
     let data = KernelScanDataIterator {
         data: Box::new(scan_data),
-        table_client: extern_table_client,
+        engine_interface,
     };
     Ok(data.into_handle())
 }
@@ -805,34 +857,28 @@ pub unsafe extern "C" fn kernel_scan_data_next(
     engine_context: *mut c_void,
     engine_visitor: extern "C" fn(
         engine_context: *mut c_void,
-        engine_data: *const c_void,
+        engine_data: *mut EngineDataHandle,
         selection_vector: &KernelBoolSlice,
     ),
 ) -> ExternResult<bool> {
     kernel_scan_data_next_impl(data, engine_context, engine_visitor)
-        .into_extern_result(data.table_client.error_allocator())
+        .into_extern_result(data.engine_interface.error_allocator())
 }
 fn kernel_scan_data_next_impl(
     data: &mut KernelScanDataIterator,
     engine_context: *mut c_void,
     engine_visitor: extern "C" fn(
         engine_context: *mut c_void,
-        engine_data: *const c_void,
+        engine_data: *mut EngineDataHandle,
         selection_vector: &KernelBoolSlice,
     ),
 ) -> DeltaResult<bool> {
     if let Some((data, sel_vec)) = data.data.next().transpose()? {
         let bool_slice: KernelBoolSlice = sel_vec.into();
-
-        let arrow_data: Box<ArrowEngineData> = data
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?;
-        let rb_ptr = arrow_data.record_batch() as *const _;
-        let void_ptr = rb_ptr as *const c_void;
-        (engine_visitor)(engine_context, void_ptr, &bool_slice);
+        let data_handle = BoxHandle::into_handle(EngineDataHandle { data });
+        (engine_visitor)(engine_context, data_handle, &bool_slice);
         // ensure we free the data
-        //let _ = unsafe { Box::from_raw(data_ptr) };
+        let _ = unsafe { BoxHandle::drop_handle(data_handle) };
         Ok(true)
     } else {
         Ok(false)
@@ -848,6 +894,61 @@ fn kernel_scan_data_next_impl(
 #[no_mangle]
 pub unsafe extern "C" fn kernel_scan_data_free(data: *mut KernelScanDataIterator) {
     BoxHandle::drop_handle(data);
+}
+
+type CScanCallback =  extern "C" fn(
+    engine_context: *mut c_void,
+    path: &KernelStringSlice,
+    size: i64,
+    dv_info: *mut CDvInfo,
+);
+
+pub struct CDvInfo {
+    dv_info: DvInfo
+}
+impl BoxHandle for CDvInfo {}
+
+#[no_mangle]
+pub extern "C" fn selection_vector_from_dv(raw_info: *mut CDvInfo, extern_engine_interface: *const ExternEngineInterfaceHandle, state: *mut GlobalScanState) -> KernelBoolSlice {
+    let boxed_info = unsafe { Box::from_raw(raw_info) };
+    let extern_engine_interface = unsafe { ArcHandle::clone_as_arc(extern_engine_interface) };
+    let boxed_state = unsafe { Box::from_raw(state) };
+    let root_url = Url::parse(&boxed_state.kernel_state.table_root).unwrap();
+    let vopt = boxed_info.dv_info.get_selection_vector(extern_engine_interface.table_client().as_ref(), &root_url).unwrap();
+    Box::leak(boxed_info);
+    Box::leak(boxed_state);
+    vopt.unwrap().into()
+}
+
+fn rust_callback(context: &mut ContextWrapper, path: &str, size: i64, dv_info: DvInfo, _partition_values: HashMap<String, String>) {
+    let path_slice: KernelStringSlice = path.into();
+    let dv_handle = BoxHandle::into_handle(CDvInfo { dv_info });
+    (context.callback)(context.engine_context, &path_slice, size, dv_handle);
+    unsafe { BoxHandle::drop_handle(dv_handle); }
+}
+
+// Wrap up stuff from C so we can pass it through to our callback
+struct ContextWrapper {
+    engine_context: *mut c_void,
+    callback: CScanCallback,
+}
+
+/// Shim for ffi to call visit_scan_data
+#[no_mangle]
+pub extern "C" fn visit_scan_data(
+    data: *mut EngineDataHandle,
+    vector: &KernelBoolSlice,
+    engine_context: *mut c_void,
+    callback: CScanCallback,
+) {
+    let selection_vec = vector.into_vec();
+    let data: &dyn EngineData = unsafe { (*data).data.as_ref() };
+    let context_wrapper = ContextWrapper {
+        engine_context,
+        callback,
+    };
+    visit_scan_files(data, selection_vec.clone(), context_wrapper, rust_callback).unwrap();
+    Box::new(selection_vec).leak();
 }
 
 // Intentionally opaque to the engine.
