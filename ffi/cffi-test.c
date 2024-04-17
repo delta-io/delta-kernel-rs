@@ -12,13 +12,6 @@ void visit_file(void *engine_context, struct KernelStringSlice file_name) {
     printf("\n");
 }
 
-void visit_data(void *engine_context, void *engine_data, struct KernelBoolSlice *selection_vec) {
-  printf("Got some data\n");
-  for (int i = 0; i < selection_vec->len; i++) {
-    printf("sel[i] = %b\n", selection_vec->ptr[i]);
-  }
-}
-
 int main(int argc, char* argv[]) {
 
   if (argc < 2) {
@@ -72,29 +65,6 @@ int main(int argc, char* argv[]) {
   }
 
   kernel_scan_files_free(file_iter);
-
-  ExternResult_____KernelScanDataIterator data_iter_res =
-    kernel_scan_data_init(snapshot_handle, table_client, NULL);
-  if (data_iter_res.tag != Ok_____KernelScanDataIterator) {
-    printf("Failed to construct scan dta iterator\n");
-    return -1;
-  }
-
-  KernelScanDataIterator *data_iter = data_iter_res.ok;
-
-  // iterate scan files
-  for (;;) {
-    ExternResult_bool ok_res = kernel_scan_data_next(data_iter, NULL, visit_data);
-    if (ok_res.tag != Ok_bool) {
-      printf("Failed to iterate scan data\n");
-      return -1;
-    } else if (!ok_res.ok) {
-      break;
-    }
-  }
-
-  kernel_scan_data_free(data_iter);
-
   drop_snapshot(snapshot_handle);
   drop_table_client(table_client);
 
