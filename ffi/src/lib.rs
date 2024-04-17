@@ -758,7 +758,6 @@ pub extern "C" fn visit_expression_literal_long(
     wrap_expression(state, Expression::Literal(Scalar::from(value)))
 }
 
-
 // == Scan and EngineData stuff below. should be split into a module ==
 
 /// Use a pointer that was created via `BoxHandle::into_handle` or `Box::leak` and returned over FFI
@@ -771,7 +770,7 @@ pub extern "C" fn visit_expression_literal_long(
 /// })
 macro_rules! asbox {
     ($raw_name:ident as $box_name:ident => $body:expr) => {{
-        let $box_name = unsafe { Box::from_raw($raw_name)};
+        let $box_name = unsafe { Box::from_raw($raw_name) };
         let res = $body;
         // leak the box since we don't want this to free
         Box::leak($box_name);
@@ -844,7 +843,9 @@ pub unsafe extern "C" fn get_global_scan_state(scan: *mut Scan) -> *mut GlobalSc
 
 #[no_mangle]
 pub unsafe extern "C" fn free_global_scan_state(state: *mut GlobalScanState) {
-    unsafe { drop(Box::from_raw(state)); }
+    unsafe {
+        drop(Box::from_raw(state));
+    }
 }
 
 // Intentionally opaque to the engine.
