@@ -14,14 +14,14 @@ void print_selection_vector(char* indent, const struct KernelBoolSlice *selectio
   }
 }
 
-void* allocate_string(const struct KernelStringSlice *slice) {
-  char* buf = malloc(sizeof(char) * (slice->len + 1)); // +1 for null
-  snprintf(buf, slice->len + 1, "%s", slice->ptr);
+void* allocate_string(const struct KernelStringSlice slice) {
+  char* buf = malloc(sizeof(char) * (slice.len + 1)); // +1 for null
+  snprintf(buf, slice.len + 1, "%s", slice.ptr);
   return buf;
 }
 
-void visit_callback(void* engine_context, const struct KernelStringSlice *path, long size, struct CDvInfo *dv_info, struct CStringMap *partition_values) {
-  printf("called back to actually read!\n  path: %.*s\n", path->len, path->ptr);
+void visit_callback(void* engine_context, const struct KernelStringSlice path, long size, struct CDvInfo *dv_info, struct CStringMap *partition_values) {
+  printf("called back to actually read!\n  path: %.*s\n", path.len, path.ptr);
   struct EngineContext *context = engine_context;
   KernelBoolSlice *selection_vector = selection_vector_from_dv(dv_info, context->engine_interface, context->global_state);
   if (selection_vector) {

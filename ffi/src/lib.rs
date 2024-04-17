@@ -115,7 +115,7 @@ impl TryFromStringSlice for String {
 
 /// We want to allow engines to allocate strings of their own type. the contract of calling a passed
 /// allocate function is that the kernel_str is _only_ valid until the return from the function
-type AllocateStringFn = extern "C" fn(kernel_str: &KernelStringSlice) -> *mut c_void;
+type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> *mut c_void;
 
 /// TODO
 #[repr(C)]
@@ -944,7 +944,7 @@ pub unsafe extern "C" fn kernel_scan_data_free(data: *mut KernelScanDataIterator
 
 type CScanCallback = extern "C" fn(
     engine_context: *mut c_void,
-    path: &KernelStringSlice,
+    path: KernelStringSlice,
     size: i64,
     dv_info: *mut CDvInfo,
     partition_map: *mut CStringMap,
@@ -974,7 +974,7 @@ pub unsafe extern "C" fn get_from_map(
         match boxed_map.values.get(&string_key) {
             Some(v) => {
                 let slice: KernelStringSlice = v.as_str().into();
-                allocate_fn(&slice)
+                allocate_fn(slice)
             }
             None => std::ptr::null_mut(),
         }
@@ -1017,7 +1017,7 @@ fn rust_callback(
     });
     (context.callback)(
         context.engine_context,
-        &path_slice,
+        path_slice,
         size,
         dv_handle,
         partition_map_handle,
