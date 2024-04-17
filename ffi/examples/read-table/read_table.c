@@ -88,7 +88,7 @@ if (argc < 2) {
   }
 
   Scan *scan = scan_res.ok;
-  GlobalScanState *global_state = get_global_state(scan);
+  GlobalScanState *global_state = get_global_scan_state(scan);
   struct EngineContext context = { global_state, engine_interface };
 
   ExternResult_____KernelScanDataIterator data_iter_res =
@@ -112,7 +112,7 @@ if (argc < 2) {
   }
 
   kernel_scan_data_free(data_iter);
-
+  free_global_scan_state(global_state);
   drop_snapshot(snapshot_handle);
   drop_table_client(engine_interface);
 

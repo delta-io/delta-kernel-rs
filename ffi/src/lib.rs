@@ -802,13 +802,18 @@ pub struct GlobalScanState {
 impl BoxHandle for GlobalScanState {}
 
 #[no_mangle]
-pub unsafe extern "C" fn get_global_state(scan: *mut Scan) -> *mut GlobalScanState {
+pub unsafe extern "C" fn get_global_scan_state(scan: *mut Scan) -> *mut GlobalScanState {
     let boxed_scan = unsafe { Box::from_raw(scan) };
     let kernel_state = boxed_scan.kernel_scan.global_scan_state();
     let res = BoxHandle::into_handle(GlobalScanState { kernel_state });
     // leak the box since we don't want this to free the scan
     Box::leak(boxed_scan);
     res
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn free_global_scan_state(state: *mut GlobalScanState) {
+    unsafe { drop(Box::from_raw(state)); }
 }
 
 // Intentionally opaque to the engine.
