@@ -51,7 +51,7 @@ void visit_data(void *engine_context, struct EngineDataHandle *engine_data, cons
 }
 
 int main(int argc, char* argv[]) {
-if (argc < 2) {
+  if (argc < 2) {
     printf("Usage: %s table/path\n", argv[0]);
     return -1;
   }
