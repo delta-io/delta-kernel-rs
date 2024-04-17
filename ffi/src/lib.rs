@@ -796,6 +796,24 @@ unsafe fn scan_impl(
     Ok(BoxHandle::into_handle(Scan { kernel_scan }))
 }
 
+/// Use a pointer that was created via `BoxHandle::into_handle` or `Box::leak` and returned over FFI
+/// without freeing it. returns the result of evaluting `$body`. For example, if `raw_thing` is a
+/// pointer previous created by `BoxHandle::into_handle`, one could do the following to return the
+/// result of `some_method` _without_ freeing `raw_thing`:
+/// ```ignore
+/// asbox!(raw_thing as boxed_thing => {
+///   boxed_thing.some_method() // some_method defined on the thing in the box
+/// })
+macro_rules! asbox {
+    ($raw_name:ident as $box_name:ident => $body:expr) => {{
+        let $box_name = unsafe { Box::from_raw($raw_name)};
+        let res = $body;
+        // leak the box since we don't want this to free
+        Box::leak($box_name);
+        res
+    }};
+}
+
 pub struct GlobalScanState {
     kernel_state: KernelGlobalScanState,
 }
@@ -803,12 +821,10 @@ impl BoxHandle for GlobalScanState {}
 
 #[no_mangle]
 pub unsafe extern "C" fn get_global_scan_state(scan: *mut Scan) -> *mut GlobalScanState {
-    let boxed_scan = unsafe { Box::from_raw(scan) };
-    let kernel_state = boxed_scan.kernel_scan.global_scan_state();
-    let res = BoxHandle::into_handle(GlobalScanState { kernel_state });
-    // leak the box since we don't want this to free the scan
-    Box::leak(boxed_scan);
-    res
+    asbox!(scan as boxed_scan => {
+        let kernel_state = boxed_scan.kernel_scan.global_scan_state();
+        BoxHandle::into_handle(GlobalScanState { kernel_state })
+    })
 }
 
 #[no_mangle]
@@ -937,17 +953,16 @@ pub unsafe extern "C" fn get_from_map(
     key: KernelStringSlice,
     allocate_fn: AllocateStringFn,
 ) -> *mut c_void {
-    let boxed_map = unsafe { Box::from_raw(raw_map) };
-    let string_key = String::try_from_slice(key);
-    let ret = match boxed_map.values.get(&string_key) {
-        Some(v) => {
-            let slice: KernelStringSlice = v.as_str().into();
-            allocate_fn(&slice)
+    asbox!(raw_map as boxed_map => {
+        let string_key = String::try_from_slice(key);
+        match boxed_map.values.get(&string_key) {
+            Some(v) => {
+                let slice: KernelStringSlice = v.as_str().into();
+                allocate_fn(&slice)
+            }
+            None => std::ptr::null_mut(),
         }
-        None => std::ptr::null_mut(),
-    };
-    Box::leak(boxed_map);
-    ret
+    })
 }
 
 #[no_mangle]
@@ -956,20 +971,20 @@ pub unsafe extern "C" fn selection_vector_from_dv(
     extern_engine_interface: *const ExternEngineInterfaceHandle,
     state: *mut GlobalScanState,
 ) -> *mut KernelBoolSlice {
-    let boxed_info = unsafe { Box::from_raw(raw_info) };
-    let extern_engine_interface = unsafe { ArcHandle::clone_as_arc(extern_engine_interface) };
-    let boxed_state = unsafe { Box::from_raw(state) };
-    let root_url = Url::parse(&boxed_state.kernel_state.table_root).unwrap();
-    let vopt = boxed_info
-        .dv_info
-        .get_selection_vector(extern_engine_interface.table_client().as_ref(), &root_url)
-        .unwrap();
-    Box::leak(boxed_info);
-    Box::leak(boxed_state);
-    match vopt {
-        Some(v) => Box::into_raw(Box::new(v.into())),
-        None => std::ptr::null_mut(),
-    }
+    asbox!(raw_info as boxed_info => {
+        asbox!(state as boxed_state => {
+            let extern_engine_interface = unsafe { ArcHandle::clone_as_arc(extern_engine_interface) };
+            let root_url = Url::parse(&boxed_state.kernel_state.table_root).unwrap();
+            let vopt = boxed_info
+                .dv_info
+                .get_selection_vector(extern_engine_interface.table_client().as_ref(), &root_url)
+                .unwrap();
+            match vopt {
+                Some(v) => Box::into_raw(Box::new(v.into())),
+                None => std::ptr::null_mut(),
+            }
+        })
+    })
 }
 
 fn rust_callback(
