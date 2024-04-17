@@ -27,7 +27,7 @@ void visit_callback(void* engine_context, const struct KernelStringSlice path, l
   if (selection_vector) {
     printf("  Deletion vector selection vector:\n");
     print_selection_vector("    ", selection_vector);
-    free_bool_slice(selection_vector);
+    drop_bool_slice(selection_vector);
   } else {
     printf("  No deletion vector for this call\n");
   }
@@ -112,7 +112,7 @@ int main(int argc, char* argv[]) {
   }
 
   kernel_scan_data_free(data_iter);
-  free_global_scan_state(global_state);
+  drop_global_scan_state(global_state);
   drop_snapshot(snapshot_handle);
   drop_table_client(engine_interface);
 

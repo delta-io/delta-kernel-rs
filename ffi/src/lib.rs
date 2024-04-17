@@ -113,9 +113,9 @@ impl TryFromStringSlice for String {
     }
 }
 
-/// We want to allow engines to allocate strings of their own type. the contract of calling a passed
+/// Allow engines to allocate strings of their own type. the contract of calling a passed
 /// allocate function is that the kernel_str is _only_ valid until the return from the function
-type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> *mut c_void;
+pub type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> *mut c_void;
 
 /// TODO
 #[repr(C)]
@@ -150,8 +150,11 @@ impl KernelBoolSlice {
     }
 }
 
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
 #[no_mangle]
-pub unsafe extern "C" fn free_bool_slice(slice: *mut KernelBoolSlice) {
+pub unsafe extern "C" fn drop_bool_slice(slice: *mut KernelBoolSlice) {
     unsafe { drop(Box::from_raw(slice)) };
 }
 
@@ -241,7 +244,7 @@ pub struct EngineError {
 }
 
 /// Semantics: Kernel will always immediately return the leaked engine error to the engine (if it
-/// allocated one at all), and engine is responsible to free it.
+/// allocated one at all), and engine is responsible for freeing it.
 #[repr(C)]
 pub enum ExternResult<T> {
     Ok(T),
@@ -360,13 +363,13 @@ struct ExternEngineInterfaceVtable {
 /// # Safety
 ///
 /// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
-/// responsible to handle any races that could result.
+/// responsible for handling  any races that could result.
 unsafe impl Send for ExternEngineInterfaceVtable {}
 
 /// # Safety
 ///
 /// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
-/// responsible to handle any races that could result.
+/// responsible handling any races that could result.
 ///
 /// These are needed because anything wrapped in Arc "should" implement it
 /// Basically, by failing to implement these traits, we forbid the engine from being able to declare
@@ -385,7 +388,7 @@ impl ExternEngineInterface for ExternEngineInterfaceVtable {
 
 /// # Safety
 ///
-/// Caller is responsible to pass a valid path pointer.
+/// Caller is responsible for passing a valid path pointer.
 unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<Url> {
     let path = unsafe { String::try_from_slice(path) };
     let path = std::fs::canonicalize(PathBuf::from(path)).map_err(Error::generic)?;
@@ -394,7 +397,7 @@ unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<U
 
 /// # Safety
 ///
-/// Caller is responsible to pass a valid path pointer.
+/// Caller is responsible for passing a valid path pointer.
 #[cfg(feature = "default-client")]
 #[no_mangle]
 pub unsafe extern "C" fn get_default_client(
@@ -427,7 +430,7 @@ unsafe fn get_default_client_impl(
 
 /// # Safety
 ///
-/// Caller is responsible to pass a valid handle.
+/// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn drop_table_client(table_client: *const ExternEngineInterfaceHandle) {
     ArcHandle::drop_handle(table_client);
@@ -445,7 +448,7 @@ impl SizedArcHandle for SnapshotHandle {
 ///
 /// # Safety
 ///
-/// Caller is responsible to pass valid handles and path pointer.
+/// Caller is responsible for passing valid handles and path pointer.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot(
     path: KernelStringSlice,
@@ -466,7 +469,7 @@ unsafe fn snapshot_impl(
 
 /// # Safety
 ///
-/// Caller is responsible to pass a valid handle.
+/// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn drop_snapshot(snapshot: *const SnapshotHandle) {
     ArcHandle::drop_handle(snapshot);
@@ -476,7 +479,7 @@ pub unsafe extern "C" fn drop_snapshot(snapshot: *const SnapshotHandle) {
 ///
 /// # Safety
 ///
-/// Caller is responsible to pass a valid handle.
+/// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn version(snapshot: *const SnapshotHandle) -> u64 {
     let snapshot = unsafe { ArcHandle::clone_as_arc(snapshot) };
@@ -506,7 +509,7 @@ pub struct EngineSchemaVisitor {
 
 /// # Safety
 ///
-/// Caller is responsible to pass a valid handle.
+/// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn visit_schema(
     snapshot: *const SnapshotHandle,
@@ -790,6 +793,9 @@ impl BoxHandle for EngineDataHandle {}
 
 /// Allow an engine to "unwrap" an [`EngineDataHandle`] into the raw pointer for the case it wants
 /// to use its own engine data format
+///
+/// # Safety
+/// `data_handle` must be a valid pointer to a kernel allocated `EngineDataHandle`
 pub unsafe extern "C" fn get_raw_engine_data(data_handle: *mut EngineDataHandle) -> *mut c_void {
     let boxed_data = unsafe { Box::from_raw(data_handle) };
     Box::into_raw(boxed_data.data).cast()
@@ -801,6 +807,10 @@ pub struct Scan {
 }
 impl BoxHandle for Scan {}
 
+/// Get a handle to [`Scan`] over the table specified by the passed snapshot.
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot pointer, and engine interface pointer
 #[no_mangle]
 pub unsafe extern "C" fn scan(
     snapshot: *const SnapshotHandle,
@@ -833,6 +843,11 @@ pub struct GlobalScanState {
 }
 impl BoxHandle for GlobalScanState {}
 
+/// Get the global state for a scan. See the docs for [`delta_kernel::scan::state::GlobalScanState`]
+/// for more information.
+///
+/// # Safety
+/// Engine is responsible for providing a valid scan pointer
 #[no_mangle]
 pub unsafe extern "C" fn get_global_scan_state(scan: *mut Scan) -> *mut GlobalScanState {
     asbox!(scan as boxed_scan => {
@@ -841,8 +856,11 @@ pub unsafe extern "C" fn get_global_scan_state(scan: *mut Scan) -> *mut GlobalSc
     })
 }
 
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
 #[no_mangle]
-pub unsafe extern "C" fn free_global_scan_state(state: *mut GlobalScanState) {
+pub unsafe extern "C" fn drop_global_scan_state(state: *mut GlobalScanState) {
     unsafe {
         drop(Box::from_raw(state));
     }
@@ -869,7 +887,13 @@ impl Drop for KernelScanDataIterator {
     }
 }
 
-/// Get the data needed to perform a scan
+/// Get an iterator over the data needed to perform a scan. This will return a
+/// [`KernelScanDataIterator`] which can be passed to [`kernel_scan_data_next`] to get the actual
+/// data in the iterator.
+///
+/// # Safety
+///
+/// Engine is responsible for passing a valid [`ExternEngineInterfaceHandle`] and [`Scan`]
 #[no_mangle]
 pub unsafe extern "C" fn kernel_scan_data_init(
     engine_interface: *const ExternEngineInterfaceHandle,
@@ -933,7 +957,7 @@ fn kernel_scan_data_next_impl(
 
 /// # Safety
 ///
-/// Caller is responsible to (at most once) pass a valid pointer returned by a call to
+/// Caller is responsible for (at most once) passing a valid pointer returned by a call to
 /// [kernel_scan_files_init].
 // we should probably be consistent with drop vs. free on engine side (probably the latter is more
 // intuitive to non-rust code)
@@ -964,6 +988,10 @@ impl BoxHandle for CStringMap {}
 /// allow probing into a CStringMap. If the specified key is in the map, kernel will call
 /// allocate_fn with the value associated with the key and return the value returned from that
 /// function. If the key is not in the map, this will return NULL
+///
+/// # Safety
+///
+/// The engine is responsible for providing a valid [`CStringMap`] pointer and [`KernelStringSlice`]
 pub unsafe extern "C" fn get_from_map(
     raw_map: *mut CStringMap,
     key: KernelStringSlice,
@@ -981,6 +1009,10 @@ pub unsafe extern "C" fn get_from_map(
     })
 }
 
+/// Get a selection vector out of a [`CDvInfo`] struct
+///
+/// # Safety
+/// Engine is responsible for providing valid pointers for each argument
 #[no_mangle]
 pub unsafe extern "C" fn selection_vector_from_dv(
     raw_info: *mut CDvInfo,
@@ -1003,6 +1035,8 @@ pub unsafe extern "C" fn selection_vector_from_dv(
     })
 }
 
+// Wrapper function that gets called by the kernel, transforms the arguments to make the ffi-able,
+// and then calls the ffi specified callback
 fn rust_callback(
     context: &mut ContextWrapper,
     path: &str,
@@ -1033,7 +1067,11 @@ struct ContextWrapper {
     callback: CScanCallback,
 }
 
-/// Shim for ffi to call visit_scan_data
+/// Shim for ffi to call visit_scan_data. This will generally be called when iterating through scan
+/// data which provides the data handle and selection vector as each element in the iterator.
+///
+/// # Safety
+/// engine is responsbile for passing a valid [`EngineDataHandle`] and selection vector.
 #[no_mangle]
 pub unsafe extern "C" fn visit_scan_data(
     data: *mut EngineDataHandle,
@@ -1075,7 +1113,7 @@ impl Drop for KernelScanFileIterator {
 /// Get a FileList for all the files that need to be read from the table.
 /// # Safety
 ///
-/// Caller is responsible to pass a valid snapshot pointer.
+/// Caller is responsible for passing a valid snapshot pointer.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_scan_files_init(
     snapshot: *const SnapshotHandle,
@@ -1146,7 +1184,7 @@ fn kernel_scan_files_next_impl(
 
 /// # Safety
 ///
-/// Caller is responsible to (at most once) pass a valid pointer returned by a call to
+/// Caller is responsible for (at most once) passing a valid pointer returned by a call to
 /// [kernel_scan_files_init].
 // we should probably be consistent with drop vs. free on engine side (probably the latter is more
 // intuitive to non-rust code)
