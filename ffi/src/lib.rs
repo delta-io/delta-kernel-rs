@@ -904,7 +904,7 @@ pub unsafe extern "C" fn kernel_scan_data_next(
     engine_visitor: extern "C" fn(
         engine_context: *mut c_void,
         engine_data: *mut EngineDataHandle,
-        selection_vector: &KernelBoolSlice,
+        selection_vector: KernelBoolSlice,
     ),
 ) -> ExternResult<bool> {
     kernel_scan_data_next_impl(data, engine_context, engine_visitor)
@@ -916,13 +916,13 @@ fn kernel_scan_data_next_impl(
     engine_visitor: extern "C" fn(
         engine_context: *mut c_void,
         engine_data: *mut EngineDataHandle,
-        selection_vector: &KernelBoolSlice,
+        selection_vector: KernelBoolSlice,
     ),
 ) -> DeltaResult<bool> {
     if let Some((data, sel_vec)) = data.data.next().transpose()? {
         let bool_slice: KernelBoolSlice = sel_vec.into();
         let data_handle = BoxHandle::into_handle(EngineDataHandle { data });
-        (engine_visitor)(engine_context, data_handle, &bool_slice);
+        (engine_visitor)(engine_context, data_handle, bool_slice);
         // ensure we free the data
         unsafe { BoxHandle::drop_handle(data_handle) };
         Ok(true)
@@ -1037,7 +1037,7 @@ struct ContextWrapper {
 #[no_mangle]
 pub unsafe extern "C" fn visit_scan_data(
     data: *mut EngineDataHandle,
-    vector: &KernelBoolSlice,
+    vector: KernelBoolSlice,
     engine_context: *mut c_void,
     callback: CScanCallback,
 ) {

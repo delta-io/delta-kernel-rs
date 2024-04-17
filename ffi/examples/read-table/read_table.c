@@ -43,10 +43,10 @@ void visit_callback(void* engine_context, const struct KernelStringSlice path, l
   }
 }
 
-void visit_data(void *engine_context, struct EngineDataHandle *engine_data, const struct KernelBoolSlice *selection_vec) {
+void visit_data(void *engine_context, struct EngineDataHandle *engine_data, const struct KernelBoolSlice selection_vec) {
   printf("Got some data\n");
   printf("  Of this data, here is a selection vector\n");
-  print_selection_vector("    ", selection_vec);
+  print_selection_vector("    ", &selection_vec);
   visit_scan_data(engine_data, selection_vec, engine_context, visit_callback);
 }
 
