@@ -248,7 +248,7 @@ pub enum ExternResult<T> {
     Err(*mut EngineError),
 }
 
-type AllocateErrorFn =
+pub type AllocateErrorFn =
     extern "C" fn(etype: KernelError, msg: KernelStringSlice) -> *mut EngineError;
 
 // NOTE: We can't "just" impl From<DeltaResult<T>> because we require an error allocator.
@@ -265,7 +265,7 @@ impl<T> ExternResult<T> {
 }
 
 /// Represents an engine error allocator. Ultimately all implementations will fall back to an
-/// [AllocateErrorFn] provided by the engine, but the trait allows us to conveniently access the
+/// [`AllocateErrorFn`] provided by the engine, but the trait allows us to conveniently access the
 /// allocator in various types that may wrap it.
 pub trait AllocateError {
     /// Allocates a new error in engine memory and returns the resulting pointer. The engine is
@@ -758,12 +758,45 @@ pub extern "C" fn visit_expression_literal_long(
     wrap_expression(state, Expression::Literal(Scalar::from(value)))
 }
 
+
+// == Scan and EngineData stuff below. should be split into a module ==
+
+/// Use a pointer that was created via `BoxHandle::into_handle` or `Box::leak` and returned over FFI
+/// without freeing it. returns the result of evaluting `$body`. For example, if `raw_thing` is a
+/// pointer previous created by `BoxHandle::into_handle`, one could do the following to return the
+/// result of `some_method` _without_ freeing `raw_thing`:
+/// ```ignore
+/// asbox!(raw_thing as boxed_thing => {
+///   boxed_thing.some_method() // some_method defined on the thing in the box
+/// })
+macro_rules! asbox {
+    ($raw_name:ident as $box_name:ident => $body:expr) => {{
+        let $box_name = unsafe { Box::from_raw($raw_name)};
+        let res = $body;
+        // leak the box since we don't want this to free
+        Box::leak($box_name);
+        res
+    }};
+}
+
+// TODO: Do we want this type at all? Perhaps we should just _always_ pass raw *mut c_void pointers
+// that are the engine data
+/// an opaque struct that encapsulates data read by an engine. this handle can be passed back into
+/// some kernel calls to operate on the data, or can be converted into the raw data as read by the
+/// [`EngineInterface`] by calling [`get_raw_engine_data`]
 pub struct EngineDataHandle {
     data: Box<dyn EngineData>,
 }
-
 impl BoxHandle for EngineDataHandle {}
 
+/// Allow an engine to "unwrap" an [`EngineDataHandle`] into the raw pointer for the case it wants
+/// to use its own engine data format
+pub unsafe extern "C" fn get_raw_engine_data(data_handle: *mut EngineDataHandle) -> *mut c_void {
+    let boxed_data = unsafe { Box::from_raw(data_handle) };
+    Box::into_raw(boxed_data.data).cast()
+}
+
+/// A scan over some delta data. See the docs for [`delta_kernel::scan::Scan`]
 pub struct Scan {
     kernel_scan: KernelScan,
 }
@@ -794,24 +827,6 @@ unsafe fn scan_impl(
     }
     let kernel_scan = scan_builder.build();
     Ok(BoxHandle::into_handle(Scan { kernel_scan }))
-}
-
-/// Use a pointer that was created via `BoxHandle::into_handle` or `Box::leak` and returned over FFI
-/// without freeing it. returns the result of evaluting `$body`. For example, if `raw_thing` is a
-/// pointer previous created by `BoxHandle::into_handle`, one could do the following to return the
-/// result of `some_method` _without_ freeing `raw_thing`:
-/// ```ignore
-/// asbox!(raw_thing as boxed_thing => {
-///   boxed_thing.some_method() // some_method defined on the thing in the box
-/// })
-macro_rules! asbox {
-    ($raw_name:ident as $box_name:ident => $body:expr) => {{
-        let $box_name = unsafe { Box::from_raw($raw_name)};
-        let res = $body;
-        // leak the box since we don't want this to free
-        Box::leak($box_name);
-        res
-    }};
 }
 
 pub struct GlobalScanState {
