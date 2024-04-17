@@ -14,13 +14,33 @@ void print_selection_vector(char* indent, const struct KernelBoolSlice *selectio
   }
 }
 
-void visit_callback(void* engine_context, const struct KernelStringSlice *path, long size, struct CDvInfo *dv_info) { //, void *info, void *pv) {
+void* allocate_string(const struct KernelStringSlice *slice) {
+  char* buf = malloc(sizeof(char) * (slice->len + 1)); // +1 for null
+  snprintf(buf, slice->len + 1, "%s", slice->ptr);
+  return buf;
+}
+
+void visit_callback(void* engine_context, const struct KernelStringSlice *path, long size, struct CDvInfo *dv_info, struct CStringMap *partition_values) {
   printf("called back to actually read!\n  path: %.*s\n", path->len, path->ptr);
   struct EngineContext *context = engine_context;
-  KernelBoolSlice selection_vector = selection_vector_from_dv(dv_info, context->engine_interface, context->global_state);
-  printf("  Deletion vector selection vector:\n");
-  print_selection_vector("    ", &selection_vector);
-  free_bool_slice(selection_vector);
+  KernelBoolSlice *selection_vector = selection_vector_from_dv(dv_info, context->engine_interface, context->global_state);
+  if (selection_vector) {
+    printf("  Deletion vector selection vector:\n");
+    print_selection_vector("    ", selection_vector);
+    free_bool_slice(selection_vector);
+  } else {
+    printf("  No deletion vector for this call\n");
+  }
+  // normally this would be picked out of the schema
+  char* letter_key = "letter";
+  KernelStringSlice key = {letter_key, strlen(letter_key)};
+  char* partition_val = get_from_map(partition_values, key, allocate_string);
+  if (partition_val) {
+    printf("  letter partition here: %s\n", partition_val);
+    free(partition_val);
+  } else {
+    printf("  no partition here\n");
+  }
 }
 
 void visit_data(void *engine_context, struct EngineDataHandle *engine_data, const struct KernelBoolSlice *selection_vec) {

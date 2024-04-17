@@ -113,6 +113,10 @@ impl TryFromStringSlice for String {
     }
 }
 
+/// We want to allow engines to allocate strings of their own type. the contract of calling a passed
+/// allocate function is that the kernel_str is _only_ valid until the return from the function
+type AllocateStringFn = extern "C" fn(kernel_str: &KernelStringSlice) -> *mut c_void;
+
 /// TODO
 #[repr(C)]
 pub struct KernelBoolSlice {
@@ -147,7 +151,9 @@ impl KernelBoolSlice {
 }
 
 #[no_mangle]
-pub extern "C" fn free_bool_slice(_: KernelBoolSlice) {}
+pub unsafe extern "C" fn free_bool_slice(slice: *mut KernelBoolSlice) {
+    unsafe { drop(Box::from_raw(slice)) };
+}
 
 #[repr(C)]
 #[derive(Debug)]
@@ -904,6 +910,7 @@ type CScanCallback = extern "C" fn(
     path: &KernelStringSlice,
     size: i64,
     dv_info: *mut CDvInfo,
+    partition_map: *mut CStringMap,
 );
 
 pub struct CDvInfo {
@@ -911,12 +918,39 @@ pub struct CDvInfo {
 }
 impl BoxHandle for CDvInfo {}
 
+pub struct CStringMap {
+    values: HashMap<String, String>,
+}
+impl BoxHandle for CStringMap {}
+
+#[no_mangle]
+/// allow probing into a CStringMap. If the specified key is in the map, kernel will call
+/// allocate_fn with the value associated with the key and return the value returned from that
+/// function. If the key is not in the map, this will return NULL
+pub unsafe extern "C" fn get_from_map(
+    raw_map: *mut CStringMap,
+    key: KernelStringSlice,
+    allocate_fn: AllocateStringFn,
+) -> *mut c_void {
+    let boxed_map = unsafe { Box::from_raw(raw_map) };
+    let string_key = String::try_from_slice(key);
+    let ret = match boxed_map.values.get(&string_key) {
+        Some(v) => {
+            let slice: KernelStringSlice = v.as_str().into();
+            allocate_fn(&slice)
+        }
+        None => std::ptr::null_mut(),
+    };
+    Box::leak(boxed_map);
+    ret
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn selection_vector_from_dv(
     raw_info: *mut CDvInfo,
     extern_engine_interface: *const ExternEngineInterfaceHandle,
     state: *mut GlobalScanState,
-) -> KernelBoolSlice {
+) -> *mut KernelBoolSlice {
     let boxed_info = unsafe { Box::from_raw(raw_info) };
     let extern_engine_interface = unsafe { ArcHandle::clone_as_arc(extern_engine_interface) };
     let boxed_state = unsafe { Box::from_raw(state) };
@@ -927,7 +961,10 @@ pub unsafe extern "C" fn selection_vector_from_dv(
         .unwrap();
     Box::leak(boxed_info);
     Box::leak(boxed_state);
-    vopt.unwrap().into()
+    match vopt {
+        Some(v) => Box::into_raw(Box::new(v.into())),
+        None => std::ptr::null_mut(),
+    }
 }
 
 fn rust_callback(
@@ -935,11 +972,20 @@ fn rust_callback(
     path: &str,
     size: i64,
     dv_info: DvInfo,
-    _partition_values: HashMap<String, String>,
+    partition_values: HashMap<String, String>,
 ) {
     let path_slice: KernelStringSlice = path.into();
     let dv_handle = BoxHandle::into_handle(CDvInfo { dv_info });
-    (context.callback)(context.engine_context, &path_slice, size, dv_handle);
+    let partition_map_handle = BoxHandle::into_handle(CStringMap {
+        values: partition_values,
+    });
+    (context.callback)(
+        context.engine_context,
+        &path_slice,
+        size,
+        dv_handle,
+        partition_map_handle,
+    );
     unsafe {
         BoxHandle::drop_handle(dv_handle);
     }
