@@ -10,7 +10,7 @@ struct EngineContext {
 
 void print_selection_vector(char* indent, const struct KernelBoolSlice *selection_vec) {
   for (int i = 0; i < selection_vec->len; i++) {
-    printf("%ssel[i] = %b\n", indent, selection_vec->ptr[i]);
+    printf("%ssel[%i] = %b\n", indent, i, selection_vec->ptr[i]);
   }
 }
 
