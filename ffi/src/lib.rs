@@ -1,7 +1,6 @@
 /// FFI interface for the delta kernel
 ///
 /// Exposes that an engine needs to call from C/C++ to interface with kernel
-#[cfg(feature = "default-client")]
 use std::collections::HashMap;
 use std::default::Default;
 use std::os::raw::{c_char, c_void};
@@ -113,8 +112,8 @@ impl TryFromStringSlice for String {
     }
 }
 
-/// Allow engines to allocate strings of their own type. the contract of calling a passed
-/// allocate function is that the kernel_str is _only_ valid until the return from the function
+/// Allow engines to allocate strings of their own type. the contract of calling a passed allocate
+/// function is that `kernel_str` is _only_ valid until the return from this function
 pub type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> *mut c_void;
 
 /// TODO
@@ -799,6 +798,38 @@ impl BoxHandle for EngineDataHandle {}
 pub unsafe extern "C" fn get_raw_engine_data(data_handle: *mut EngineDataHandle) -> *mut c_void {
     let boxed_data = unsafe { Box::from_raw(data_handle) };
     Box::into_raw(boxed_data.data).cast()
+}
+
+#[cfg(feature = "default-client")]
+#[repr(C)]
+pub struct ArrowFFIData {
+    array: arrow_data::ffi::FFI_ArrowArray,
+    schema: arrow_schema::ffi::FFI_ArrowSchema,
+}
+
+#[cfg(feature = "default-client")]
+pub unsafe extern "C" fn get_raw_arrow_data(
+    data_handle: *mut EngineDataHandle,
+    engine_interface: *const ExternEngineInterfaceHandle,
+) -> ExternResult<*mut ArrowFFIData> {
+    get_raw_arrow_data_impl(data_handle).into_extern_result(engine_interface)
+}
+
+#[cfg(feature = "default-client")]
+unsafe fn get_raw_arrow_data_impl(data_handle: *mut EngineDataHandle) -> DeltaResult<*mut ArrowFFIData> {
+    let boxed_data = unsafe { Box::from_raw(data_handle) };
+    let data = boxed_data.data;
+    let record_batch: arrow_array::RecordBatch = data.into_any().downcast::<delta_kernel::client::arrow_data::ArrowEngineData>().map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?.into();
+    let sa: arrow_array::StructArray = record_batch.into();
+    let array_data: arrow_data::ArrayData = sa.into();
+    // these call `clone`. is there a way to not copy anything and what exactly are they cloning?
+    let array = arrow_data::ffi::FFI_ArrowArray::new(&array_data);
+    let schema = arrow_schema::ffi::FFI_ArrowSchema::try_from(array_data.data_type())?;
+    let ret_data = Box::new(ArrowFFIData {
+        array,
+        schema
+    });
+    Ok(Box::leak(ret_data))
 }
 
 /// A scan over some delta data. See the docs for [`delta_kernel::scan::Scan`]

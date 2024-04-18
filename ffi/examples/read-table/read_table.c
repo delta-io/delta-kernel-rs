@@ -1,7 +1,10 @@
-#include <arrow-glib/arrow-glib.h>
 #include <stdio.h>
 #include <string.h>
 #include "delta_kernel_ffi.h"
+
+#ifdef PRINT_ARROW_DATA
+#include "arrow.h"
+#endif
 
 struct EngineContext {
   GlobalScanState *global_state;
