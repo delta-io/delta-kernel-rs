@@ -39,7 +39,6 @@
 //!
 
 #![cfg_attr(all(doc, NIGHTLY_CHANNEL), feature(doc_auto_cfg))]
-
 #![warn(
     unreachable_pub,
     trivial_numeric_casts,
