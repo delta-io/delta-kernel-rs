@@ -1,3 +1,5 @@
+//! Definitions and functions to create and manipulate kernel expressions
+
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 

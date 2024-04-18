@@ -1,6 +1,18 @@
-//! # Engineinterface interfaces
+//! # Delta Kernel
 //!
-//! The Engineinterface interfaces allow connectors to bring their own implementation of functionality
+//! Delta-kernel-rs is an experimental [Delta](https://github.com/delta-io/delta/) implementation
+//! focused on interoperability with a wide range of query engines. It currently only supports
+//! reads. This library defines a number of interfaces which must be implemented to provide a
+//! working "delta reader". The are detailed below. There is a provided "default client" that
+//! implenents all these interfaces and can be used to ease integration work. See
+//! [`DefaultEngineInterface`](client/default/index.html) for more information.
+//!
+//! A full `rust` example for reading table data using the default client can be found
+//! [here](https://github.com/delta-incubator/delta-kernel-rs/blob/main/kernel/examples/dump-table/src/main.rs)
+//!
+//! # EngineInterface interfaces
+//!
+//! The [`EngineInterface`] interfaces allow connectors to bring their own implementation of functionality
 //! such as reading parquet files, listing files in a file system, parsing a JSON string etc.
 //!
 //! The [`EngineInterface`] trait exposes methods to get sub-clients which expose the core
@@ -26,6 +38,8 @@
 //! methods on the [`FileSystemClient`] trait.
 //!
 
+#![cfg_attr(all(doc, NIGHTLY_CHANNEL), feature(doc_auto_cfg))]
+
 #![warn(
     unreachable_pub,
     trivial_numeric_casts,
@@ -46,7 +60,7 @@ pub mod actions;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
-pub mod path;
+pub(crate) mod path;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -67,10 +81,13 @@ pub mod client;
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
 
+/// A specification for a range of bytes to read from a file location
 pub type FileSlice = (Url, Option<Range<usize>>);
 
 /// Data read from a Delta table file and the corresponding scan file information.
 pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
+
+/// An iterator of data read from specified files
 pub type FileDataReadResultIterator =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
 

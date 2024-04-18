@@ -76,6 +76,9 @@ sync-client = [
   "parquet"
 ]
 
+[build-dependencies]
+rustc_version = "0.4.0"
+
 [dev-dependencies]
 arrow = { version = "^49.0", features = ["json", "prettyprint"] }
 delta_kernel = { path = ".", features = ["default-client", "sync-client"] }

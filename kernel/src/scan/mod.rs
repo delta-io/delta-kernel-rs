@@ -1,3 +1,5 @@
+//! Functionality to create and execute scans (reads) over data stored in a delta table
+
 use std::sync::Arc;
 
 use itertools::Itertools;

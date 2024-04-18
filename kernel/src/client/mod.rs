@@ -1,7 +1,8 @@
-//! module for clients that are optionally built into the kernel
+//! Provices clients that implement the required interfaces that are optionally built into the
+//! kernel
 
 #[cfg(feature = "arrow-conversion")]
-pub mod arrow_conversion;
+pub(crate) mod arrow_conversion;
 
 #[cfg(feature = "arrow-expression")]
 pub mod arrow_expression;
@@ -10,10 +11,10 @@ pub mod arrow_expression;
 pub mod arrow_data;
 
 #[cfg(any(feature = "default-client", feature = "sync-client"))]
-pub mod arrow_get_data;
+pub(crate) mod arrow_get_data;
 
 #[cfg(any(feature = "default-client", feature = "sync-client"))]
-pub mod arrow_utils;
+pub(crate) mod arrow_utils;
 
 #[cfg(feature = "default-client")]
 pub mod default;

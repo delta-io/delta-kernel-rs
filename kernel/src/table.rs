@@ -1,3 +1,6 @@
+//! In-memory representation of a Delta table, which acts as an immutable root entity for reading
+//! the different versions
+
 use std::sync::Arc;
 
 use url::Url;

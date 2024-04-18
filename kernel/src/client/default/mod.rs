@@ -1,6 +1,6 @@
 //! # Default Engineinterface
 //!
-//! The default implementation of [`Engineinterface`] is [`DefaultEngineInterface`].
+//! The default implementation of [`EngineInterface`] is [`DefaultEngineInterface`].
 //!
 //! The underlying implementations use asynchronous IO. Async tasks are run on
 //! a separate thread pool, provided by the [`TaskExecutor`] trait. Read more in

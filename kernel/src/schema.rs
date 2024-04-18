@@ -1,3 +1,5 @@
+//! Definitions and functions to create and manipulate kernel schema
+
 use std::fmt::Formatter;
 use std::sync::Arc;
 use std::{collections::HashMap, fmt::Display};
