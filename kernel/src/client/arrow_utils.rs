@@ -23,22 +23,17 @@ pub(crate) fn get_requested_indices(
     requested_schema: &SchemaRef,
     parquet_schema: &ArrowSchemaRef,
 ) -> DeltaResult<(Vec<usize>, Vec<usize>)> {
-    let requested_len = requested_schema.fields.len();
-    let mut mask_indicies = vec![0; requested_len];
-    let mut found_count = 0; // verify that we found all requested fields
-    let reorder_indicies = parquet_schema
+    let (mask_indicies, reorder_indicies): (Vec<usize>, Vec<usize>) = parquet_schema
         .fields()
         .iter()
         .enumerate()
-        .filter_map(|(parquet_position, field)| {
-            requested_schema.index_of(field.name()).map(|index| {
-                found_count += 1;
-                mask_indicies[index] = parquet_position;
-                index
-            })
+        .filter_map(|(parquet_index, field)| {
+            requested_schema
+                .index_of(field.name())
+                .map(|index| (parquet_index, index))
         })
-        .collect();
-    if found_count != requested_len {
+        .unzip();
+    if mask_indicies.len() != requested_schema.fields.len() {
         return Err(Error::generic(
             "Didn't find all requested columns in parquet schema",
         ));
@@ -74,10 +69,9 @@ pub(crate) fn generate_mask(
 /// the column at that index will be added in order to returned batch
 pub(crate) fn reorder_record_batch(
     input_data: RecordBatch,
-    mask_indicies: &[usize],
     requested_ordering: &[usize],
 ) -> DeltaResult<RecordBatch> {
-    if mask_indicies.windows(2).all(|is| is[0] <= is[1]) {
+    if requested_ordering.windows(2).all(|is| is[0] < is[1]) {
         // indicies is already sorted, meaning we requested in the order that the columns were
         // stored in the parquet
         Ok(input_data)
@@ -88,9 +82,8 @@ pub(crate) fn reorder_record_batch(
         let reordered_columns = requested_ordering
             .iter()
             .map(|index| {
-                // cheap clones of `Arc`s
                 fields.push(input_schema.field(*index).clone());
-                input_data.column(*index).clone()
+                input_data.column(*index).clone() // cheap Arc clone
             })
             .collect();
         let schema = Arc::new(ArrowSchema::new(fields));
