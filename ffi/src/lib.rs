@@ -816,19 +816,22 @@ pub unsafe extern "C" fn get_raw_arrow_data(
 }
 
 #[cfg(feature = "default-client")]
-unsafe fn get_raw_arrow_data_impl(data_handle: *mut EngineDataHandle) -> DeltaResult<*mut ArrowFFIData> {
+unsafe fn get_raw_arrow_data_impl(
+    data_handle: *mut EngineDataHandle,
+) -> DeltaResult<*mut ArrowFFIData> {
     let boxed_data = unsafe { Box::from_raw(data_handle) };
     let data = boxed_data.data;
-    let record_batch: arrow_array::RecordBatch = data.into_any().downcast::<delta_kernel::client::arrow_data::ArrowEngineData>().map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?.into();
+    let record_batch: arrow_array::RecordBatch = data
+        .into_any()
+        .downcast::<delta_kernel::client::arrow_data::ArrowEngineData>()
+        .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
+        .into();
     let sa: arrow_array::StructArray = record_batch.into();
     let array_data: arrow_data::ArrayData = sa.into();
     // these call `clone`. is there a way to not copy anything and what exactly are they cloning?
     let array = arrow_data::ffi::FFI_ArrowArray::new(&array_data);
     let schema = arrow_schema::ffi::FFI_ArrowSchema::try_from(array_data.data_type())?;
-    let ret_data = Box::new(ArrowFFIData {
-        array,
-        schema
-    });
+    let ret_data = Box::new(ArrowFFIData { array, schema });
     Ok(Box::leak(ret_data))
 }
 
