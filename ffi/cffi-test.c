@@ -1,10 +1,15 @@
 #include <stdio.h>
 #include <string.h>
+#include <inttypes.h>
 
 #include "delta_kernel_ffi.h"
 
 void visit_file(void *engine_context, struct KernelStringSlice file_name) {
-    printf("file: %s\n", file_name.ptr);
+    printf("file: ");
+    for (int i = 0; i < file_name.len; i++) {
+        printf("%c", file_name.ptr[i]);
+    }
+    printf("\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -37,7 +42,7 @@ int main(int argc, char* argv[]) {
   const SnapshotHandle *snapshot_handle = snapshot_handle_res.ok;
 
   uint64_t v = version(snapshot_handle);
-  printf("version: %llu\n", v);
+  printf("version: %" PRIu64 "\n", v);
 
   ExternResult_____KernelScanFileIterator file_iter_res =
     kernel_scan_files_init(snapshot_handle, table_client, NULL);
