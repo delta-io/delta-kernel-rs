@@ -1,4 +1,4 @@
-//! Provices clients that implement the required interfaces that are optionally built into the
+//! Provides clients that implement the required interfaces that are optionally built into the
 //! kernel
 
 #[cfg(feature = "arrow-conversion")]
