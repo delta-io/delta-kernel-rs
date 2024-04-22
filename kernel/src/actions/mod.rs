@@ -1,4 +1,5 @@
-//! Provides parsing and manipulation of the various actions defined in the [Delta specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
+//! Provides parsing and manipulation of the various actions defined in the [Delta
+//! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
 pub mod deletion_vector;
 pub(crate) mod schemas;
