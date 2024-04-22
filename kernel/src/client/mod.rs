@@ -1,5 +1,6 @@
-//! Provides clients that implement the required interfaces that are optionally built into the
-//! kernel
+//! Provides clients that implement the required interfaces. These clients can optionally be built
+//! into the kernel by setting the `default-client` or `sync-client` feature flag. See the related
+//! modules for more information.
 
 #[cfg(feature = "arrow-conversion")]
 pub(crate) mod arrow_conversion;
