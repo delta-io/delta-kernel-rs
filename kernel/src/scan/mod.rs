@@ -115,47 +115,6 @@ pub enum ColumnType<'a> {
     Partition(Cow<'a, StructField>),
 }
 
-// this will likely go away
-/// One file to scan, plus associated metadata
-pub struct ScanFile {
-    table_root: Url,
-    path: String,
-    pub size: usize,
-    pub partition_values: std::collections::HashMap<String, String>,
-    deletion_vector_descriptor: Option<DeletionVectorDescriptor>,
-}
-
-impl ScanFile {
-    fn from_add(add: Add, table_root: &Url) -> Self {
-        ScanFile {
-            table_root: table_root.clone(),
-            path: add.path,
-            size: add.size as usize,
-            partition_values: add.partition_values,
-            deletion_vector_descriptor: add.deletion_vector.clone(),
-        }
-    }
-
-    pub fn location(&self) -> DeltaResult<Url> {
-        Ok(self.table_root.join(self.path.as_str())?)
-    }
-
-    pub fn selection_vector(
-        &self,
-        engine_interface: &dyn EngineInterface,
-    ) -> DeltaResult<Option<Vec<bool>>> {
-        let dv_treemap = self
-            .deletion_vector_descriptor
-            .as_ref()
-            .map(|dv_descriptor| {
-                let fs_client = engine_interface.get_file_system_client();
-                dv_descriptor.read(fs_client, &self.table_root)
-            })
-            .transpose()?;
-        Ok(dv_treemap.map(treemap_to_bools))
-    }
-}
-
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
 pub struct Scan {
@@ -232,18 +191,6 @@ impl Scan {
             &self.read_schema,
             &self.predicate,
         ))
-    }
-
-    /// Get an iterator of [`ScanFile`]s that should be included in scan for a query. This handles
-    /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
-    pub fn scan_files(
-        &self,
-        engine_interface: &dyn EngineInterface,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanFile>>> {
-        let table_root = self.snapshot.table_root.clone();
-        Ok(self
-            .files(engine_interface)?
-            .map(move |add_res| add_res.map(|add| ScanFile::from_add(add, &table_root))))
     }
 
     /// Get global state that is valid for the entire scan. This is somewhat expensive so should

@@ -57,7 +57,10 @@ impl DvInfo {
 /// * `partition_values`: a `HashMap<String, String>` which are partition values
 ///
 /// ## Context
-/// A note on the `context`. This can be any value the engine wants. This function takes ownership of the passed arg, but then returns it, so the engine can repeatedly call `visit_scan_files` with the same context.
+/// A note on the `context`. This can be any value the engine wants. This function takes ownership
+/// of the passed arg, but then returns it, so the engine can repeatedly call `visit_scan_files`
+/// with the same context.
+///
 /// ## Example
 /// ```ignore
 /// let context = [my context];
