@@ -4,12 +4,13 @@
 
 #include "delta_kernel_ffi.h"
 
-void visit_file(void *engine_context, struct KernelStringSlice file_name) {
-    printf("file: ");
-    for (int i = 0; i < file_name.len; i++) {
-        printf("%c", file_name.ptr[i]);
-    }
-    printf("\n");
+void visit_callback(void* engine_context, const struct KernelStringSlice path, long size, struct CDvInfo *dv_info, struct CStringMap *partition_values) {
+  printf("file: %.*s\n", (int)path.len, path.ptr);
+}
+
+
+void visit_data(void *engine_context, struct EngineDataHandle *engine_data, const struct KernelBoolSlice selection_vec) {
+  visit_scan_data(engine_data, selection_vec, engine_context, visit_callback);
 }
 
 int main(int argc, char* argv[]) {
@@ -24,16 +25,16 @@ int main(int argc, char* argv[]) {
 
   KernelStringSlice table_path_slice = {table_path, strlen(table_path)};
 
-  ExternResult______ExternEngineInterfaceHandle table_client_res =
+  ExternResult______ExternEngineInterfaceHandle engine_interface_res =
     get_default_client(table_path_slice, NULL);
-  if (table_client_res.tag != Ok______ExternEngineInterfaceHandle) {
+  if (engine_interface_res.tag != Ok______ExternEngineInterfaceHandle) {
     printf("Failed to get client\n");
     return -1;
   }
 
-  const ExternEngineInterfaceHandle *table_client = table_client_res.ok;
+  const ExternEngineInterfaceHandle *engine_interface = engine_interface_res.ok;
 
-  ExternResult______SnapshotHandle snapshot_handle_res = snapshot(table_path_slice, table_client);
+  ExternResult______SnapshotHandle snapshot_handle_res = snapshot(table_path_slice, engine_interface);
   if (snapshot_handle_res.tag != Ok______SnapshotHandle) {
     printf("Failed to create snapshot\n");
     return -1;
@@ -43,30 +44,36 @@ int main(int argc, char* argv[]) {
 
   uint64_t v = version(snapshot_handle);
   printf("version: %" PRIu64 "\n", v);
-
-  ExternResult_____KernelScanFileIterator file_iter_res =
-    kernel_scan_files_init(snapshot_handle, table_client, NULL);
-  if (file_iter_res.tag != Ok_____KernelScanFileIterator) {
-    printf("Failed to construct scan file iterator\n");
+  ExternResult_____Scan scan_res = scan(snapshot_handle, engine_interface, NULL);
+  if (scan_res.tag != Ok_____Scan) {
+    printf("Failed to create scan\n");
     return -1;
   }
 
-  KernelScanFileIterator *file_iter = file_iter_res.ok;
+  Scan *scan = scan_res.ok;
+
+  ExternResult_____KernelScanDataIterator data_iter_res =
+    kernel_scan_data_init(engine_interface, scan);
+  if (data_iter_res.tag != Ok_____KernelScanDataIterator) {
+    printf("Failed to construct scan data iterator\n");
+    return -1;
+  }
+
+  KernelScanDataIterator *data_iter = data_iter_res.ok;
 
   // iterate scan files
   for (;;) {
-    ExternResult_bool ok_res = kernel_scan_files_next(file_iter, NULL, visit_file);
+    ExternResult_bool ok_res = kernel_scan_data_next(data_iter, NULL, visit_data);
     if (ok_res.tag != Ok_bool) {
-      printf("Failed to iterate scan file\n");
+      printf("Failed to iterate scan data\n");
       return -1;
     } else if (!ok_res.ok) {
       break;
     }
   }
 
-  kernel_scan_files_free(file_iter);
   drop_snapshot(snapshot_handle);
-  drop_table_client(table_client);
+  drop_table_client(engine_interface);
 
   return 0;
 }
