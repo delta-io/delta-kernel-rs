@@ -201,8 +201,9 @@ impl LogReplayScanner {
             // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
             if !self.seen.contains(&(add.path.clone(), add.dv_unique_id())) {
                 debug!(
-                    "Including file in scan: {}, is log {is_log_batch}",
-                    add.path
+                    "Including file in scan: ({}, {:?}), is log {is_log_batch}",
+                    add.path,
+                    add.dv_unique_id(),
                 );
                 if is_log_batch {
                     // Remember file actions from this batch so we can ignore duplicates
@@ -292,28 +293,30 @@ pub fn scan_action_iter(
 ) -> impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, Vec<bool>)>> {
     let mut log_scanner = LogReplayScanner::new(engine_interface, table_schema, predicate);
     let expression_handler = engine_interface.get_expression_handler();
-    action_iter.map(move |action_res| {
-        action_res.and_then(|(batch, is_log_batch)| {
-            log_scanner.process_scan_batch(
-                expression_handler.as_ref(),
-                batch.as_ref(),
-                is_log_batch,
-            )
+    action_iter
+        .map(move |action_res| {
+            action_res.and_then(|(batch, is_log_batch)| {
+                log_scanner.process_scan_batch(
+                    expression_handler.as_ref(),
+                    batch.as_ref(),
+                    is_log_batch,
+                )
+            })
         })
-    }).filter(|action_res| {
-        match action_res {
-            Ok((_, sel_vec)) => {
-                // don't both returning if everything is filtered out
-                sel_vec.contains(&true)
+        .filter(|action_res| {
+            match action_res {
+                Ok((_, sel_vec)) => {
+                    // don't both returning if everything is filtered out
+                    sel_vec.contains(&true)
+                }
+                Err(_) => true, // just pass through errors
             }
-            Err(_) => true, // just pass through errors
-        }
-    })
+        })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
@@ -322,6 +325,7 @@ mod tests {
     use crate::{
         client::arrow_data::ArrowEngineData,
         client::sync::{json::SyncJsonHandler, SyncEngineInterface},
+        scan::state::DvInfo,
         EngineData, JsonHandler,
     };
 
@@ -334,10 +338,11 @@ mod tests {
         Box::new(ArrowEngineData::new(batch))
     }
 
-    fn add_batch() -> Box<ArrowEngineData> {
+    // simple add
+    fn add_batch_simple() -> Box<ArrowEngineData> {
         let handler = SyncJsonHandler {};
         let json_strings: StringArray = vec![
-            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
         ]
         .into();
@@ -348,9 +353,43 @@ mod tests {
         ArrowEngineData::try_from_engine_data(parsed).unwrap()
     }
 
-    #[test]
-    fn test_scan_action_iter() {
-        let batch = vec![add_batch()];
+    // add batch with a removed file
+    fn add_batch_with_remove() -> Box<ArrowEngineData> {
+        let handler = SyncJsonHandler {};
+        let json_strings: StringArray = vec![
+            r#"{"remove":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","deletionTimestamp":1677811194426,"dataChange":true,"extendedFileMetadata":true,"partitionValues":{},"size":635,"tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
+        ]
+        .into();
+        let output_schema = Arc::new(get_log_schema().clone());
+        let parsed = handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        ArrowEngineData::try_from_engine_data(parsed).unwrap()
+    }
+
+    // dv-info is more complex to validate, we validate that works in the test for visit_scan_files
+    // in state.rs
+    fn validate_simple(
+        _: &mut (),
+        path: &str,
+        size: i64,
+        _: DvInfo,
+        part_vals: HashMap<String, String>,
+    ) {
+        assert_eq!(
+            path,
+            "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
+        );
+        assert_eq!(size, 635);
+        assert_eq!(part_vals.get("date"), Some(&"2017-12-10".to_string()));
+        assert_eq!(part_vals.get("non-existent"), None);
+    }
+
+    #[allow(clippy::vec_box)]
+    fn run_validate_simple_test(batch: Vec<Box<ArrowEngineData>>, expected_sel_vec: Vec<bool>) {
         let interface = SyncEngineInterface::new();
         // doesn't matter here
         let table_schema = Arc::new(StructType::new(vec![StructField::new(
@@ -360,20 +399,30 @@ mod tests {
         )]));
         let iter = scan_action_iter(
             &interface,
-            batch.into_iter().map(|batch| Ok((batch as _, false))),
+            batch.into_iter().map(|batch| Ok((batch as _, true))),
             &table_schema,
             &None,
         );
+        let mut batch_count = 0;
         for res in iter {
             let (batch, sel) = res.unwrap();
-            let record_batch: RecordBatch = batch
-                .into_any()
-                .downcast::<ArrowEngineData>()
-                .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))
-                .unwrap()
-                .into();
-            println!("{:#?}", record_batch);
-            println!("{:#?}", sel);
+            assert_eq!(sel, expected_sel_vec);
+            crate::scan::state::visit_scan_files(batch.as_ref(), sel, (), validate_simple).unwrap();
+            batch_count += 1;
         }
+        assert_eq!(batch_count, 1);
+    }
+
+    #[test]
+    fn test_scan_action_iter() {
+        run_validate_simple_test(vec![add_batch_simple()], vec![true, false]);
+    }
+
+    #[test]
+    fn test_scan_action_iter_with_remove() {
+        run_validate_simple_test(
+            vec![add_batch_with_remove()],
+            vec![false, false, true, false],
+        );
     }
 }
