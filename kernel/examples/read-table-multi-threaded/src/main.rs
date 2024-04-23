@@ -143,7 +143,10 @@ fn try_main() -> DeltaResult<()> {
         .build();
 
     // this gives us an iterator of (our engine data, selection vector). our engine data is just
-    // arrow data. The schema is (TODO link to schema)
+    // arrow data. The schema can be obtained by calling
+    // [`delta_kernel::scan::scan_row_schema`]. Generally engines will not need to interact with
+    // this data directly, and can just call [`visit_scan_files`] to get pre-parsed data back from
+    // the kernel.
     let scan_data = scan.scan_data(engine_interface.as_ref())?;
 
     // get any global state associated with this scan

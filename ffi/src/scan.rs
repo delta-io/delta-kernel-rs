@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use delta_kernel::actions::Add;
 use delta_kernel::scan::state::{
     visit_scan_files, DvInfo, GlobalScanState as KernelGlobalScanState,
 };
@@ -392,106 +391,106 @@ pub unsafe extern "C" fn visit_scan_data(
     Box::new(selection_vec).leak();
 }
 
-// Intentionally opaque to the engine.
-pub struct KernelScanFileIterator {
-    // Box -> Wrap its unsized content this struct is fixed-size with thin pointers.
-    // Item = String -> Owned items because rust can't correctly express lifetimes for borrowed items
-    // (we would need a way to assert that item lifetimes are bounded by the iterator's lifetime).
-    files: Box<dyn Iterator<Item = DeltaResult<Add>>>,
+// // Intentionally opaque to the engine.
+// pub struct KernelScanFileIterator {
+//     // Box -> Wrap its unsized content this struct is fixed-size with thin pointers.
+//     // Item = String -> Owned items because rust can't correctly express lifetimes for borrowed items
+//     // (we would need a way to assert that item lifetimes are bounded by the iterator's lifetime).
+//     files: Box<dyn Iterator<Item = DeltaResult<Add>>>,
 
-    // Also keep a reference to the external client for its error allocator.
-    // Parquet and Json handlers don't hold any reference to the tokio reactor, so the iterator
-    // terminates early if the last table client goes out of scope.
-    table_client: Arc<dyn ExternEngineInterface>,
-}
+//     // Also keep a reference to the external client for its error allocator.
+//     // Parquet and Json handlers don't hold any reference to the tokio reactor, so the iterator
+//     // terminates early if the last table client goes out of scope.
+//     table_client: Arc<dyn ExternEngineInterface>,
+// }
 
-impl BoxHandle for KernelScanFileIterator {}
+// impl BoxHandle for KernelScanFileIterator {}
 
-impl Drop for KernelScanFileIterator {
-    fn drop(&mut self) {
-        debug!("dropping KernelScanFileIterator");
-    }
-}
+// impl Drop for KernelScanFileIterator {
+//     fn drop(&mut self) {
+//         debug!("dropping KernelScanFileIterator");
+//     }
+// }
 
-/// Get a FileList for all the files that need to be read from the table.
-/// # Safety
-///
-/// Caller is responsible for passing a valid snapshot pointer.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_scan_files_init(
-    snapshot: *const SnapshotHandle,
-    table_client: *const ExternEngineInterfaceHandle,
-    predicate: Option<&mut EnginePredicate>,
-) -> ExternResult<*mut KernelScanFileIterator> {
-    kernel_scan_files_init_impl(snapshot, table_client, predicate).into_extern_result(table_client)
-}
+// /// Get a FileList for all the files that need to be read from the table.
+// /// # Safety
+// ///
+// /// Caller is responsible for passing a valid snapshot pointer.
+// #[no_mangle]
+// pub unsafe extern "C" fn kernel_scan_files_init(
+//     snapshot: *const SnapshotHandle,
+//     table_client: *const ExternEngineInterfaceHandle,
+//     predicate: Option<&mut EnginePredicate>,
+// ) -> ExternResult<*mut KernelScanFileIterator> {
+//     kernel_scan_files_init_impl(snapshot, table_client, predicate).into_extern_result(table_client)
+// }
 
-fn kernel_scan_files_init_impl(
-    snapshot: *const SnapshotHandle,
-    extern_table_client: *const ExternEngineInterfaceHandle,
-    predicate: Option<&mut EnginePredicate>,
-) -> DeltaResult<*mut KernelScanFileIterator> {
-    let snapshot = unsafe { ArcHandle::clone_as_arc(snapshot) };
-    let extern_table_client = unsafe { ArcHandle::clone_as_arc(extern_table_client) };
-    let mut scan_builder = ScanBuilder::new(snapshot.clone());
-    if let Some(predicate) = predicate {
-        // TODO: There is a lot of redundancy between the various visit_expression_XXX methods here,
-        // vs. ProvidesMetadataFilter trait and the class hierarchy that supports it. Can we justify
-        // combining the two, so that native rust kernel code also uses the visitor idiom? Doing so
-        // might mean kernel no longer needs to define an expression class hierarchy of its own (at
-        // least, not for data skipping). Things may also look different after we remove arrow code
-        // from the kernel proper and make it one of the sensible default engine clients instead.
-        let mut visitor_state = KernelExpressionVisitorState::new();
-        let exprid = (predicate.visitor)(predicate.predicate, &mut visitor_state);
-        if let Some(predicate) = unwrap_kernel_expression(&mut visitor_state, exprid) {
-            println!("Got predicate: {}", predicate);
-            scan_builder = scan_builder.with_predicate(predicate);
-        }
-    }
-    let scan_adds = scan_builder
-        .build()
-        .files(extern_table_client.table_client().as_ref())?;
-    let files = KernelScanFileIterator {
-        files: Box::new(scan_adds),
-        table_client: extern_table_client,
-    };
-    Ok(files.into_handle())
-}
+// fn kernel_scan_files_init_impl(
+//     snapshot: *const SnapshotHandle,
+//     extern_table_client: *const ExternEngineInterfaceHandle,
+//     predicate: Option<&mut EnginePredicate>,
+// ) -> DeltaResult<*mut KernelScanFileIterator> {
+//     let snapshot = unsafe { ArcHandle::clone_as_arc(snapshot) };
+//     let extern_table_client = unsafe { ArcHandle::clone_as_arc(extern_table_client) };
+//     let mut scan_builder = ScanBuilder::new(snapshot.clone());
+//     if let Some(predicate) = predicate {
+//         // TODO: There is a lot of redundancy between the various visit_expression_XXX methods here,
+//         // vs. ProvidesMetadataFilter trait and the class hierarchy that supports it. Can we justify
+//         // combining the two, so that native rust kernel code also uses the visitor idiom? Doing so
+//         // might mean kernel no longer needs to define an expression class hierarchy of its own (at
+//         // least, not for data skipping). Things may also look different after we remove arrow code
+//         // from the kernel proper and make it one of the sensible default engine clients instead.
+//         let mut visitor_state = KernelExpressionVisitorState::new();
+//         let exprid = (predicate.visitor)(predicate.predicate, &mut visitor_state);
+//         if let Some(predicate) = unwrap_kernel_expression(&mut visitor_state, exprid) {
+//             println!("Got predicate: {}", predicate);
+//             scan_builder = scan_builder.with_predicate(predicate);
+//         }
+//     }
+//     let scan_adds = scan_builder
+//         .build()
+//         .files(extern_table_client.table_client().as_ref())?;
+//     let files = KernelScanFileIterator {
+//         files: Box::new(scan_adds),
+//         table_client: extern_table_client,
+//     };
+//     Ok(files.into_handle())
+// }
 
-/// # Safety
-///
-/// The iterator must be valid (returned by [kernel_scan_files_init]) and not yet freed by
-/// [kernel_scan_files_free]. The visitor function pointer must be non-null.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_scan_files_next(
-    files: &mut KernelScanFileIterator,
-    engine_context: *mut c_void,
-    engine_visitor: extern "C" fn(engine_context: *mut c_void, file_name: KernelStringSlice),
-) -> ExternResult<bool> {
-    kernel_scan_files_next_impl(files, engine_context, engine_visitor)
-        .into_extern_result(files.table_client.error_allocator())
-}
-fn kernel_scan_files_next_impl(
-    files: &mut KernelScanFileIterator,
-    engine_context: *mut c_void,
-    engine_visitor: extern "C" fn(engine_context: *mut c_void, file_name: KernelStringSlice),
-) -> DeltaResult<bool> {
-    if let Some(add) = files.files.next().transpose()? {
-        debug!("Got file: {}", add.path);
-        (engine_visitor)(engine_context, add.path.as_str().into());
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
+// /// # Safety
+// ///
+// /// The iterator must be valid (returned by [kernel_scan_files_init]) and not yet freed by
+// /// [kernel_scan_files_free]. The visitor function pointer must be non-null.
+// #[no_mangle]
+// pub unsafe extern "C" fn kernel_scan_files_next(
+//     files: &mut KernelScanFileIterator,
+//     engine_context: *mut c_void,
+//     engine_visitor: extern "C" fn(engine_context: *mut c_void, file_name: KernelStringSlice),
+// ) -> ExternResult<bool> {
+//     kernel_scan_files_next_impl(files, engine_context, engine_visitor)
+//         .into_extern_result(files.table_client.error_allocator())
+// }
+// fn kernel_scan_files_next_impl(
+//     files: &mut KernelScanFileIterator,
+//     engine_context: *mut c_void,
+//     engine_visitor: extern "C" fn(engine_context: *mut c_void, file_name: KernelStringSlice),
+// ) -> DeltaResult<bool> {
+//     if let Some(add) = files.files.next().transpose()? {
+//         debug!("Got file: {}", add.path);
+//         (engine_visitor)(engine_context, add.path.as_str().into());
+//         Ok(true)
+//     } else {
+//         Ok(false)
+//     }
+// }
 
-/// # Safety
-///
-/// Caller is responsible for (at most once) passing a valid pointer returned by a call to
-/// [kernel_scan_files_init].
-// we should probably be consistent with drop vs. free on engine side (probably the latter is more
-// intuitive to non-rust code)
-#[no_mangle]
-pub unsafe extern "C" fn kernel_scan_files_free(files: *mut KernelScanFileIterator) {
-    BoxHandle::drop_handle(files);
-}
+// /// # Safety
+// ///
+// /// Caller is responsible for (at most once) passing a valid pointer returned by a call to
+// /// [kernel_scan_files_init].
+// // we should probably be consistent with drop vs. free on engine side (probably the latter is more
+// // intuitive to non-rust code)
+// #[no_mangle]
+// pub unsafe extern "C" fn kernel_scan_files_free(files: *mut KernelScanFileIterator) {
+//     BoxHandle::drop_handle(files);
+// }

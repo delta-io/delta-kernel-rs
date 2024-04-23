@@ -77,6 +77,8 @@ impl DataVisitor for AddRemoveVisitor {
 }
 
 lazy_static! {
+    // NB: If you update this schema, ensure you update the comment describing it in the doc comment
+    // for `scan_row_schema` in scan/mod.rs!
     pub(crate) static ref SCAN_ROW_SCHEMA: Arc<StructType> = Arc::new(StructType::new(vec!(
         StructField::new("path", DataType::STRING, true),
         StructField::new("size", DataType::LONG, true),

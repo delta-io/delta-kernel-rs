@@ -133,7 +133,7 @@ impl std::fmt::Debug for Scan {
 }
 
 impl Scan {
-    /// Get a shred reference to the [`Schema`] of the scan.
+    /// Get a shared reference to the [`Schema`] of the scan.
     ///
     /// [`Schema`]: crate::schema::Schema
     pub fn schema(&self) -> &SchemaRef {
@@ -147,7 +147,7 @@ impl Scan {
 
     /// Get an iterator of Add actions that should be included in scan for a query. This handles
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible)
-    pub fn files(
+    pub(crate) fn files(
         &self,
         engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
@@ -170,7 +170,13 @@ impl Scan {
     }
 
     /// Get an iterator of [`EngineData`]s that should be included in scan for a query. This handles
-    /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
+    /// log-replay, reconciling Add and Remove actions, and applying data skipping (if
+    /// possible). Each item in the returned iterator is a tuple of:
+    /// - `Box<dyn EngineData>`: Data in engine format, where each row represents a file to be
+    /// scanned. The schema for each row can be obtained by calling [`scan_row_schema`].
+    /// - `Vec<bool>`: A selection vector. If a row is at index `i` and this vector is `false` at
+    /// index `i`, then that row should *not* be processed (i.e. it is filtered out). If the vector
+    /// is `true` at index `i` the row *should* be processed.
     pub fn scan_data(
         &self,
         engine_interface: &dyn EngineInterface,
@@ -209,12 +215,14 @@ impl Scan {
         }
     }
 
-    /// This is the main method to 'materialize' the scan. It returns a [`Result`] of
-    /// `Vec<`[`ScanResult`]`>`. This calls [`Scan::files`] to get a set of `Add` actions for the scan,
-    /// and then uses the `engine_interface`'s [`crate::ParquetHandler`] to read the actual table
-    /// data. Each [`ScanResult`] encapsulates the raw data and an optional boolean vector built
-    /// from the deletion vector if it was present. See the documentation for [`ScanResult`] for
-    /// more details.
+    /// Perform an "all in one" scan. This will use the provided `engine_interface` to read and
+    /// process all the data for the query. Each [`ScanResult`] in the resultant vector encapsulates
+    /// the raw data and an optional boolean vector built from the deletion vector if it was
+    /// present. See the documentation for [`ScanResult`] for more details. Generally
+    /// connectors/engines will want to use [`Scan::scan_data`] so they can have more control over
+    /// the execution of the scan.
+    // This calls [`Scan::files`] to get a set of `Add` actions for the scan, and then uses the
+    // `engine_interface`'s [`crate::ParquetHandler`] to read the actual table data.
     pub fn execute(&self, engine_interface: &dyn EngineInterface) -> DeltaResult<Vec<ScanResult>> {
         let partition_columns = &self.snapshot.metadata().partition_columns;
         let (all_fields, read_fields, have_partition_cols) =
@@ -305,6 +313,30 @@ impl Scan {
         }
         Ok(results)
     }
+}
+
+/// Get the schema that scan rows (from [`Scan::scan_data`]) will be returned with.
+///
+/// It is:
+/// ```ignored
+/// {
+///    path: string,
+///    size: long,
+///    modificationTime: long,
+///    deletionVector: {
+///      storageType: string,
+///      pathOrInlineDv: string,
+///      offset: int,
+///      sizeInBytes: int,
+///      cardinality: long,
+///    },
+///    fileConstantValues: {
+///      partitionValues: map<string, string>
+///    }
+/// }
+/// ```
+pub fn scan_row_schema() -> Schema {
+    file_stream::SCAN_ROW_SCHEMA.as_ref().clone()
 }
 
 fn parse_partition_value(raw: Option<&String>, data_type: &DataType) -> DeltaResult<Scalar> {
