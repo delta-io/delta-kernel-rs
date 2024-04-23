@@ -134,23 +134,7 @@ impl LogReplayScanner {
             .map(|filter| filter.apply(actions))
             .transpose()?;
 
-        let schema_to_use = if is_log_batch {
-            // NB: We _must_ pass these in the order `ADD_NAME, REMOVE_NAME` as the visitor assumes
-            // the Add action comes first. The [`project`] method honors this order, so this works
-            // as long as we keep this order here.
-            get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?
-        } else {
-            // All checkpoint actions are already reconciled and Remove actions in checkpoint files
-            // only serve as tombstones for vacuum jobs. So no need to load them here.
-            get_log_schema().project(&[ADD_NAME])?
-        };
-        let mut visitor = AddRemoveVisitor::new(selection_vector, is_log_batch);
-        actions.extract(schema_to_use, &mut visitor)?;
-
-        for remove in visitor.removes.into_iter() {
-            let dv_id = remove.dv_unique_id();
-            self.seen.insert((remove.path, dv_id));
-        }
+        let visitor = self.setup_batch_process(selection_vector, actions, is_log_batch)?;
 
         visitor
             .adds
@@ -200,28 +184,14 @@ impl LogReplayScanner {
             .map(|filter| filter.apply(actions))
             .transpose()?;
 
+        // we start our selection vector based on what was filtered. we will add to this vector
+        // below if a file has been removed
         let mut selection_vector = match filter_vector {
             Some(ref filter_vector) => filter_vector.clone(),
             None => vec![false; actions.length()],
         };
 
-        let schema_to_use = if is_log_batch {
-            // NB: We _must_ pass these in the order `ADD_NAME, REMOVE_NAME` as the visitor assumes
-            // the Add action comes first. The [`project`] method honors this order, so this works
-            // as long as we keep this order here.
-            get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?
-        } else {
-            // All checkpoint actions are already reconciled and Remove actions in checkpoint files
-            // only serve as tombstones for vacuum jobs. So no need to load them here.
-            get_log_schema().project(&[ADD_NAME])?
-        };
-        let mut visitor = AddRemoveVisitor::new(filter_vector, is_log_batch);
-        actions.extract(schema_to_use, &mut visitor)?;
-
-        for remove in visitor.removes.into_iter() {
-            let dv_id = remove.dv_unique_id();
-            self.seen.insert((remove.path, dv_id));
-        }
+        let visitor = self.setup_batch_process(filter_vector, actions, is_log_batch)?;
 
         for (add, index) in visitor.adds.into_iter() {
             // Note: each (add.path + add.dv_unique_id()) pair has a
@@ -242,7 +212,7 @@ impl LogReplayScanner {
                 selection_vector[index] = true;
             } else {
                 debug!(
-                    "Filtering out add due to it being removed {}, is log {is_log_batch}",
+                    "Filtering out Add due to it being removed {}, is log {is_log_batch}",
                     add.path
                 );
             }
@@ -256,6 +226,34 @@ impl LogReplayScanner {
             )
             .evaluate(actions)?;
         Ok((result, selection_vector))
+    }
+
+    // work shared between process_batch and process_scan_batch
+    fn setup_batch_process(
+        &mut self,
+        selection_vector: Option<Vec<bool>>,
+        actions: &dyn EngineData,
+        is_log_batch: bool,
+    ) -> DeltaResult<AddRemoveVisitor> {
+        let schema_to_use = if is_log_batch {
+            // NB: We _must_ pass these in the order `ADD_NAME, REMOVE_NAME` as the visitor assumes
+            // the Add action comes first. The [`project`] method honors this order, so this works
+            // as long as we keep this order here.
+            get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?
+        } else {
+            // All checkpoint actions are already reconciled and Remove actions in checkpoint files
+            // only serve as tombstones for vacuum jobs. So no need to load them here.
+            get_log_schema().project(&[ADD_NAME])?
+        };
+        let mut visitor = AddRemoveVisitor::new(selection_vector, is_log_batch);
+        actions.extract(schema_to_use, &mut visitor)?;
+
+        for remove in visitor.removes.drain(..) {
+            let dv_id = remove.dv_unique_id();
+            self.seen.insert((remove.path, dv_id));
+        }
+
+        Ok(visitor)
     }
 }
 
