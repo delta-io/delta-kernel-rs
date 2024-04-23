@@ -300,6 +300,14 @@ pub fn scan_action_iter(
                 is_log_batch,
             )
         })
+    }).filter(|action_res| {
+        match action_res {
+            Ok((_, sel_vec)) => {
+                // don't both returning if everything is filtered out
+                sel_vec.contains(&true)
+            }
+            Err(_) => true, // just pass through errors
+        }
     })
 }
 
