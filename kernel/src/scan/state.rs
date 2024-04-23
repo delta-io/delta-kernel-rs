@@ -133,3 +133,48 @@ impl<T> DataVisitor for ScanFileVisitor<T> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
+
+    use super::DvInfo;
+
+    #[derive(Clone)]
+    struct TestContext {
+        id: usize,
+    }
+
+    fn validate_visit(
+        context: &mut TestContext,
+        path: &str,
+        size: i64,
+        dv_info: DvInfo,
+        part_vals: HashMap<String, String>,
+    ) {
+        assert_eq!(
+            path,
+            "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
+        );
+        assert_eq!(size, 635);
+        assert_eq!(part_vals.get("date"), Some(&"2017-12-10".to_string()));
+        assert_eq!(part_vals.get("non-existent"), None);
+        assert!(dv_info.deletion_vector.is_some());
+        let dv = dv_info.deletion_vector.unwrap();
+        assert_eq!(dv.unique_id(), "uvBn[lx{q8@P<9BNH/isA@1");
+        assert_eq!(context.id, 2);
+    }
+
+    #[test]
+    fn test_simple_visit_scan_data() {
+        let context = TestContext { id: 2 };
+        run_with_validate_callback(
+            vec![add_batch_simple()],
+            vec![true, false],
+            context,
+            validate_visit,
+        );
+    }
+}
