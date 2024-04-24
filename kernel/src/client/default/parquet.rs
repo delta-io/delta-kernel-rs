@@ -7,7 +7,9 @@ use arrow_schema::SchemaRef as ArrowSchemaRef;
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::DynObjectStore;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 
 use super::file_handler::{FileOpenFuture, FileOpener};
@@ -50,14 +52,32 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         physical_schema: SchemaRef,
         _predicate: Option<Expression>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        // TODO at the very least load only required columns ...
         if files.is_empty() {
             return Ok(Box::new(std::iter::empty()));
         }
 
         let arrow_schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
-        let file_reader = ParquetOpener::new(1024, physical_schema.clone(), self.store.clone());
-        let mut stream = FileStream::new(files.to_vec(), arrow_schema, file_reader)?;
+        // get the first FileMeta to decide how to fetch the file
+        // s3://    -> aws   (ParquetOpener)
+        // nothing  -> local (ParquetOpener)
+        // https:// -> assume presigned URL (and fetch without object_store)
+        //   -> reqwest to get data
+        //   -> parse to parquet
+        // SAFETY: we did is_empty check above, this is ok.
+        let mut stream: std::pin::Pin<
+            Box<dyn futures::Stream<Item = DeltaResult<arrow_array::RecordBatch>> + Send>,
+        > = match files[0].location.scheme() {
+            "http" | "https" => Box::pin(FileStream::new(
+                files.to_vec(),
+                arrow_schema,
+                PresignedUrlOpener::new(1024, physical_schema.clone()),
+            )?),
+            _ => Box::pin(FileStream::new(
+                files.to_vec(),
+                arrow_schema,
+                ParquetOpener::new(1024, physical_schema.clone(), self.store.clone()),
+            )?),
+        };
 
         // This channel will become the output iterator.
         // The stream will execute in the background and send results to this channel.
@@ -154,6 +174,60 @@ impl FileOpener for ParquetOpener {
                 // re-order each batch if needed
                 rbr.map_err(Error::Parquet)
                     .and_then(|rb| reorder_record_batch(rb, &requested_ordering))
+            });
+            Ok(stream.boxed())
+        }))
+    }
+}
+
+/// Implements [`FileOpener`] for a opening a parquet file from a presigned URL
+struct PresignedUrlOpener {
+    batch_size: usize,
+    limit: Option<usize>,
+    table_schema: SchemaRef,
+    client: reqwest::Client,
+}
+
+impl PresignedUrlOpener {
+    pub(crate) fn new(batch_size: usize, schema: SchemaRef) -> Self {
+        Self {
+            batch_size,
+            table_schema: schema,
+            limit: None,
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl FileOpener for PresignedUrlOpener {
+    fn open(&self, file_meta: FileMeta, _range: Option<Range<i64>>) -> DeltaResult<FileOpenFuture> {
+        let batch_size = self.batch_size;
+        let table_schema = self.table_schema.clone();
+        let limit = self.limit;
+        let client = self.client.clone(); // uses Arc internally according to reqwest docs
+
+        Ok(Box::pin(async move {
+            // fetch the file from the interweb
+            let reader = client.get(file_meta.location).send().await?.bytes().await?;
+            let metadata = ArrowReaderMetadata::load(&reader, Default::default())?;
+            let parquet_schema = metadata.schema();
+            let (indicies, requested_ordering) =
+                get_requested_indices(&table_schema, parquet_schema)?;
+            let options = ArrowReaderOptions::new();
+            let mut builder =
+                ParquetRecordBatchReaderBuilder::try_new_with_options(reader, options)?;
+
+            if let Some(limit) = limit {
+                builder = builder.with_limit(limit)
+            }
+
+            let reader = builder.with_batch_size(batch_size).build()?;
+
+            let stream = futures::stream::iter(reader);
+            let stream = stream.map(move |rbr| {
+                // re-order each batch if needed
+                rbr.map_err(Error::Arrow)
+                    .and_then(|rb| reorder_record_batch(rb, &indicies, &requested_ordering))
             });
             Ok(stream.boxed())
         }))

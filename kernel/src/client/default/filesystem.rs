@@ -107,11 +107,19 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
                     };
                     let store = store.clone();
                     async move {
-                        if let Some(rng) = range {
-                            store.get_range(&path, rng).await
-                        } else {
-                            let result = store.get(&path).await?;
-                            result.bytes().await
+                        match url.scheme() {
+                            "http" | "https" => {
+                                // have to annotate type here or rustc can't figure it out
+                                Ok::<bytes::Bytes, Error>(reqwest::get(url).await?.bytes().await?)
+                            }
+                            _ => {
+                                if let Some(rng) = range {
+                                    Ok(store.get_range(&path, rng).await?)
+                                } else {
+                                    let result = store.get(&path).await?;
+                                    Ok(result.bytes().await?)
+                                }
+                            }
                         }
                     }
                 })
@@ -120,7 +128,7 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
                 // within a synchronous method.
                 .buffered(self.readahead)
                 .for_each(move |res| {
-                    sender.send(res.map_err(Error::from)).ok();
+                    sender.send(res).ok();
                     futures::future::ready(())
                 }),
         );
