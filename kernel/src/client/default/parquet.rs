@@ -213,9 +213,18 @@ impl FileOpener for PresignedUrlOpener {
             let parquet_schema = metadata.schema();
             let (indicies, requested_ordering) =
                 get_requested_indices(&table_schema, parquet_schema)?;
+
             let options = ArrowReaderOptions::new();
             let mut builder =
                 ParquetRecordBatchReaderBuilder::try_new_with_options(reader, options)?;
+            if let Some(mask) = generate_mask(
+                &table_schema,
+                parquet_schema,
+                builder.parquet_schema(),
+                &indicies,
+            ) {
+                builder = builder.with_projection(mask)
+            }
 
             if let Some(limit) = limit {
                 builder = builder.with_limit(limit)
@@ -227,7 +236,7 @@ impl FileOpener for PresignedUrlOpener {
             let stream = stream.map(move |rbr| {
                 // re-order each batch if needed
                 rbr.map_err(Error::Arrow)
-                    .and_then(|rb| reorder_record_batch(rb, &indicies, &requested_ordering))
+                    .and_then(|rb| reorder_record_batch(rb, &requested_ordering))
             });
             Ok(stream.boxed())
         }))
