@@ -64,8 +64,27 @@ int main(int argc, char* argv[]) {
 
   KernelStringSlice table_path_slice = {table_path, strlen(table_path)};
 
+  ExternResult_____EngineInterfaceBuilder interface_builder_res =
+    get_engine_interface_builder(table_path_slice, NULL);
+  if (interface_builder_res.tag != Ok_____EngineInterfaceBuilder) {
+    printf("Could not get engine interface builder\n");
+    return -1;
+  }
+
+  // an example of using a builder to set options when building a engine interface
+  struct EngineInterfaceBuilder *interface_builder = interface_builder_res.ok;
+  char* key_test = "key1";
+  KernelStringSlice key_slice = {key_test, strlen(key_test)};
+  char* val_test = "val1";
+  KernelStringSlice val_slice = {val_test, strlen(val_test)};
+  set_builder_option(interface_builder, key_slice, val_slice);
   ExternResult______ExternEngineInterfaceHandle engine_interface_res =
-    get_default_client(table_path_slice, NULL);
+    builder_build(interface_builder);
+
+  // alternately if we don't care to set any options on the builder:
+  // ExternResult______ExternEngineInterfaceHandle engine_interface_res =
+  //   get_default_client(table_path_slice, NULL);
+
   if (engine_interface_res.tag != Ok______ExternEngineInterfaceHandle) {
     printf("Failed to get client\n");
     return -1;

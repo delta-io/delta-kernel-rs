@@ -391,6 +391,87 @@ unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<U
     Url::from_directory_path(path).map_err(|_| Error::generic("Invalid url"))
 }
 
+// A client builder allows setting options before building an actual client
+pub struct EngineInterfaceBuilder {
+    url: Url,
+    allocate_fn: AllocateErrorFn,
+    options: HashMap<String, String>,
+}
+
+impl EngineInterfaceBuilder {
+    fn set_option(&mut self, key: String, val: String) {
+        self.options.insert(key, val);
+    }
+}
+
+/// Get a "builder" that can be used to construct an engine client. The function
+/// [`set_builder_option`] can be used to set options on the builder prior to constructing the
+/// actual client
+///
+/// # Safety
+/// Caller is responsible for passing a valid path pointer.
+#[cfg(feature = "default-client")]
+#[no_mangle]
+pub unsafe extern "C" fn get_engine_interface_builder(
+    path: KernelStringSlice,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<*mut EngineInterfaceBuilder> {
+    get_engine_interface_builder_impl(path, allocate_error).into_extern_result(allocate_error)
+}
+
+#[cfg(feature = "default-client")]
+unsafe fn get_engine_interface_builder_impl(
+    path: KernelStringSlice,
+    allocate_fn: AllocateErrorFn,
+) -> DeltaResult<*mut EngineInterfaceBuilder> {
+    let url = unsafe { unwrap_and_parse_path_as_url(path) }?;
+    let builder = Box::new(EngineInterfaceBuilder {
+        url,
+        allocate_fn,
+        options: HashMap::default(),
+    });
+    Ok(Box::leak(builder))
+}
+
+/// Set an option on the builder
+///
+/// # Safety
+///
+/// Client must pass a valid ClientBuilder pointer, and valid slices for key and value
+#[cfg(feature = "default-client")]
+#[no_mangle]
+pub unsafe extern "C" fn set_builder_option(
+    builder: *mut EngineInterfaceBuilder,
+    key: KernelStringSlice,
+    value: KernelStringSlice,
+) {
+    let mut builder_box = unsafe { Box::from_raw(builder) };
+    let key = unsafe { String::try_from_slice(key) };
+    let value = unsafe { String::try_from_slice(value) };
+    builder_box.set_option(key, value);
+    Box::leak(builder_box);
+}
+
+/// Consume the builder and return an engine interface. After calling, the passed pointer is _no
+/// longer valid_.
+///
+/// # Safety
+///
+/// Caller is responsible to pass a valid ClientBuilder pointer, and to not use it again afterwards
+#[cfg(feature = "default-client")]
+#[no_mangle]
+pub unsafe extern "C" fn builder_build(
+    builder: *mut EngineInterfaceBuilder,
+) -> ExternResult<*const ExternEngineInterfaceHandle> {
+    let builder_box = unsafe { Box::from_raw(builder) };
+    get_default_client_impl(
+        builder_box.url,
+        builder_box.options,
+        builder_box.allocate_fn,
+    )
+    .into_extern_result(builder_box.allocate_fn)
+}
+
 /// # Safety
 ///
 /// Caller is responsible for passing a valid path pointer.
@@ -400,20 +481,30 @@ pub unsafe extern "C" fn get_default_client(
     path: KernelStringSlice,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<*const ExternEngineInterfaceHandle> {
-    get_default_client_impl(path, allocate_error).into_extern_result(allocate_error)
+    get_default_default_client_impl(path, allocate_error).into_extern_result(allocate_error)
 }
 
+// get the default version of the default client :)
 #[cfg(feature = "default-client")]
-unsafe fn get_default_client_impl(
+unsafe fn get_default_default_client_impl(
     path: KernelStringSlice,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<*const ExternEngineInterfaceHandle> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) }?;
+    get_default_client_impl(url, HashMap::<String, String>::new(), allocate_error)
+}
+
+#[cfg(feature = "default-client")]
+unsafe fn get_default_client_impl(
+    url: Url,
+    options: HashMap<String, String>,
+    allocate_error: AllocateErrorFn,
+) -> DeltaResult<*const ExternEngineInterfaceHandle> {
     use delta_kernel::client::default::executor::tokio::TokioBackgroundExecutor;
     use delta_kernel::client::default::DefaultEngineInterface;
     let table_client = DefaultEngineInterface::<TokioBackgroundExecutor>::try_new(
         &url,
-        HashMap::<String, String>::new(),
+        options,
         Arc::new(TokioBackgroundExecutor::new()),
     );
     let client = Arc::new(table_client.map_err(Error::generic)?);
