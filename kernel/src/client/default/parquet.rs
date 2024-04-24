@@ -57,7 +57,8 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         }
 
         let arrow_schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
-        // get the first FileMeta to decide how to fetch the file
+        // get the first FileMeta to decide how to fetch the file.
+        // NB: This means that every file in `FileMeta` _must_ have the same scheme or things will break
         // s3://    -> aws   (ParquetOpener)
         // nothing  -> local (ParquetOpener)
         // https:// -> assume presigned URL (and fetch without object_store)
