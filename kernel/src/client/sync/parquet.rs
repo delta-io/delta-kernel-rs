@@ -31,7 +31,6 @@ fn try_create_from_parquet(schema: SchemaRef, location: Url) -> DeltaResult<Arro
         .ok_or_else(|| Error::generic("No data found reading parquet file"))?;
     Ok(ArrowEngineData::new(reorder_record_batch(
         data?,
-        &indicies,
         &requested_ordering,
     )?))
 }
