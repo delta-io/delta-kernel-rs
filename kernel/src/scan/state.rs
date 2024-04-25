@@ -112,18 +112,7 @@ impl<T> DataVisitor for ScanFileVisitor<T> {
             // Since path column is required, use it to detect presence of an Add action
             if let Some(path) = getters[0].get_opt(row_index, "scanFile.path")? {
                 let size = getters[1].get(row_index, "scanFile.size")?;
-                let deletion_vector = if let Some(storage_type) =
-                    getters[3].get_opt(row_index, "scanFile.deletionVector.storageType")?
-                {
-                    Some(visit_deletion_vector_at(
-                        row_index,
-                        3,
-                        storage_type,
-                        getters,
-                    )?)
-                } else {
-                    None
-                };
+                let deletion_vector = visit_deletion_vector_at(row_index, &getters[3..])?;
                 let dv_info = DvInfo { deletion_vector };
                 let partition_values =
                     getters[8].get(row_index, "scanFile.fileConstantValues.partitionValues")?;

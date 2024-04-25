@@ -135,19 +135,7 @@ impl AddVisitor {
 
         // TODO(nick) extract tags if we ever need them at getters[6]
 
-        let deletion_vector = if let Some(storage_type) =
-            getters[7].get_opt(row_index, "add.deletionVector.storageType")?
-        {
-            // there is a storageType, so the whole DV must be there
-            Some(visit_deletion_vector_at(
-                row_index,
-                7,
-                storage_type,
-                getters,
-            )?)
-        } else {
-            None
-        };
+        let deletion_vector = visit_deletion_vector_at(row_index, &getters[7..])?;
 
         let base_row_id: Option<i64> = getters[12].get_opt(row_index, "add.base_row_id")?;
         let default_row_commit_version: Option<i64> =
@@ -206,18 +194,7 @@ impl RemoveVisitor {
 
         // TODO(nick) tags are skipped in getters[6]
 
-        let deletion_vector = if let Some(storage_type) =
-            getters[7].get_opt(row_index, "remove.deletionVector.storageType")?
-        {
-            Some(visit_deletion_vector_at(
-                row_index,
-                7,
-                storage_type,
-                getters,
-            )?)
-        } else {
-            None
-        };
+        let deletion_vector = visit_deletion_vector_at(row_index, &getters[7..])?;
 
         let base_row_id: Option<i64> = getters[12].get_opt(row_index, "remove.baseRowId")?;
         let default_row_commit_version: Option<i64> =
@@ -251,29 +228,29 @@ impl DataVisitor for RemoveVisitor {
     }
 }
 
-/// Get a DV out of some engine data. The column holding `storage_type` is specified as `storage_type_col_index`. We assume the calling code has
-/// extracted `storage_type` already to verify the DV data is there.
+/// Get a DV out of some engine data. The caller is responsible for slicing the `getters` slice such
+/// that the first element contains the `storageType` element of the deletion vector.
 pub(crate) fn visit_deletion_vector_at<'a>(
     row_index: usize,
-    storage_type_col_index: usize,
-    storage_type: String,
     getters: &[&'a dyn GetData<'a>],
-) -> DeltaResult<DeletionVectorDescriptor> {
-    let mut idx = storage_type_col_index + 1;
-    let path_or_inline_dv: String = getters[idx].get(row_index, "deletionVector.pathOrInlineDv")?;
-    idx += 1;
-    let offset: Option<i32> = getters[idx].get_opt(row_index, "deletionVector.offset")?;
-    idx += 1;
-    let size_in_bytes: i32 = getters[idx].get(row_index, "deletionVector.sizeInBytes")?;
-    idx += 1;
-    let cardinality: i64 = getters[idx].get(row_index, "deletionVector.cardinality")?;
-    Ok(DeletionVectorDescriptor {
-        storage_type,
-        path_or_inline_dv,
-        offset,
-        size_in_bytes,
-        cardinality,
-    })
+) -> DeltaResult<Option<DeletionVectorDescriptor>> {
+    if let Some(storage_type) =
+        getters[0].get_opt(row_index, "remove.deletionVector.storageType")? {
+            let path_or_inline_dv: String = getters[1].get(row_index, "deletionVector.pathOrInlineDv")?;
+            let offset: Option<i32> = getters[2].get_opt(row_index, "deletionVector.offset")?;
+            let size_in_bytes: i32 = getters[3].get(row_index, "deletionVector.sizeInBytes")?;
+            let cardinality: i64 = getters[4].get(row_index, "deletionVector.cardinality")?;
+            Ok(Some(DeletionVectorDescriptor {
+                storage_type,
+                path_or_inline_dv,
+                offset,
+                size_in_bytes,
+                cardinality,
+            }))
+        }
+    else {
+        Ok(None)
+    }
 }
 
 #[derive(Default)]
@@ -281,22 +258,12 @@ pub(crate) struct DeletionVectorVisitor {
     pub(crate) descriptor: Option<DeletionVectorDescriptor>,
 }
 
-impl DeletionVectorVisitor {
-    pub(crate) fn visit_deletion_vector<'a>(
-        row_index: usize,
-        storage_type: String,
-        getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<DeletionVectorDescriptor> {
-        visit_deletion_vector_at(row_index, 0, storage_type, getters)
-    }
-}
-
 impl DataVisitor for DeletionVectorVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of an Add action
-            if let Some(storage_type) = getters[0].get_opt(i, "deletionVector.storage_type")? {
-                self.descriptor = Some(Self::visit_deletion_vector(i, storage_type, getters)?);
+            self.descriptor = visit_deletion_vector_at(i, getters)?;
+            if self.descriptor.is_some() {
                 break;
             }
         }

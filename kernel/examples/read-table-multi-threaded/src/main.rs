@@ -245,16 +245,13 @@ fn do_work(
                     .unwrap();
 
                 for read_result in read_results {
-                    let len = if let Ok(ref res) = read_result {
-                        res.length()
-                    } else {
-                        0
-                    };
+                    let read_result = read_result.unwrap();
+                    let len = read_result.length();
 
                     // ask the kernel to transform the physical data into the correct logical form
                     let logical = transform_to_logical(
                         engine_interface,
-                        read_result.unwrap(),
+                        read_result,
                         &scan_state,
                         &scan_file.partition_values,
                     )
