@@ -115,6 +115,8 @@ pub enum ColumnType<'a> {
     Partition(Cow<'a, StructField>),
 }
 
+pub type ScanData = (Box<dyn EngineData>, Vec<bool>);
+
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
 pub struct Scan {
@@ -180,7 +182,7 @@ impl Scan {
     pub fn scan_data(
         &self,
         engine_interface: &dyn EngineInterface,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, Vec<bool>)>>> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanData>>> {
         let commit_read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?;
         let checkpoint_read_schema = get_log_schema().project(&[ADD_NAME])?;
 

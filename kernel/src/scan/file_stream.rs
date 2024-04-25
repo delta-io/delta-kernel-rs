@@ -6,6 +6,7 @@ use lazy_static::lazy_static;
 use tracing::debug;
 
 use super::data_skipping::DataSkippingFilter;
+use super::ScanData;
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME};
 use crate::actions::{visitors::AddVisitor, visitors::RemoveVisitor, Add, Remove};
 use crate::engine_data::{GetData, TypedGetData};
@@ -177,7 +178,7 @@ impl LogReplayScanner {
         expression_handler: &dyn ExpressionHandler,
         actions: &dyn EngineData,
         is_log_batch: bool,
-    ) -> DeltaResult<(Box<dyn EngineData>, Vec<bool>)> {
+    ) -> DeltaResult<ScanData> {
         // apply data skipping to get back a selection vector for actions that passed skipping
         // note: None implies all files passed data skipping.
         let filter_vector = self
@@ -290,7 +291,7 @@ pub fn scan_action_iter(
     action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
     table_schema: &SchemaRef,
     predicate: &Option<Expression>,
-) -> impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, Vec<bool>)>> {
+) -> impl Iterator<Item = DeltaResult<ScanData>> {
     let mut log_scanner = LogReplayScanner::new(engine_interface, table_schema, predicate);
     let expression_handler = engine_interface.get_expression_handler();
     action_iter

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use delta_kernel::scan::state::{
     visit_scan_files, DvInfo, GlobalScanState as KernelGlobalScanState,
 };
-use delta_kernel::scan::{Scan as KernelScan, ScanBuilder};
+use delta_kernel::scan::{Scan as KernelScan, ScanBuilder, ScanData};
 use delta_kernel::{DeltaResult, EngineData};
 use tracing::debug;
 use url::Url;
@@ -149,11 +149,10 @@ pub unsafe extern "C" fn drop_global_scan_state(state: *mut GlobalScanState) {
 }
 
 // Intentionally opaque to the engine.
-#[allow(clippy::type_complexity)]
 pub struct KernelScanDataIterator {
     // Box -> Wrap its unsized content this struct is fixed-size with thin pointers.
     // Item = Box<dyn EngineData>, see above, Vec<bool> -> can become a KernelBoolSlice
-    data: Box<dyn Iterator<Item = DeltaResult<(Box<dyn EngineData>, Vec<bool>)>>>,
+    data: Box<dyn Iterator<Item = DeltaResult<ScanData>>>,
 
     // Also keep a reference to the external client for its error allocator.
     // Parquet and Json handlers don't hold any reference to the tokio reactor, so the iterator
