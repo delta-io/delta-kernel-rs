@@ -135,14 +135,21 @@ impl Into<KernelBoolSlice> for Vec<bool> {
 
 impl Drop for KernelBoolSlice {
     fn drop(&mut self) {
-        let vec = self.make_vec();
+        let vec = unsafe { Vec::from_raw_parts(self.ptr, self.len, self.cap) };
         debug!("Dropping bool slice. It is {vec:#?}");
     }
 }
 
-impl KernelBoolSlice {
-    fn make_vec(&self) -> Vec<bool> {
-        unsafe { Vec::from_raw_parts(self.ptr, self.len, self.cap) }
+trait FromBoolSlice {
+    unsafe fn from_slice(slice: KernelBoolSlice) -> Self;
+}
+
+impl FromBoolSlice for Vec<bool> {
+    unsafe fn from_slice(mut slice: KernelBoolSlice) -> Self {
+        let res = Vec::from_raw_parts(slice.ptr, slice.len, slice.cap);
+        // vec now owns the pointer, so we don't want to free at the end of the func
+        slice.ptr = std::ptr::null_mut();
+        res
     }
 }
 
@@ -365,7 +372,7 @@ unsafe impl Send for ExternEngineInterfaceVtable {}
 /// # Safety
 ///
 /// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
-/// responsible handling any races that could result.
+/// responsible for handling any races that could result.
 ///
 /// These are needed because anything wrapped in Arc "should" implement it
 /// Basically, by failing to implement these traits, we forbid the engine from being able to declare
@@ -430,7 +437,7 @@ unsafe fn get_engine_interface_builder_impl(
         allocate_fn,
         options: HashMap::default(),
     });
-    Ok(Box::leak(builder))
+    Ok(Box::into_raw(builder))
 }
 
 /// Set an option on the builder

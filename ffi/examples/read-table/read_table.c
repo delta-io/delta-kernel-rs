@@ -129,9 +129,12 @@ int main(int argc, char* argv[]) {
       printf("Failed to iterate scan data\n");
       return -1;
     } else if (!ok_res.ok) {
+      printf("Iterator done\n");
       break;
     }
   }
+
+  printf("All done\n");
 
   kernel_scan_data_free(data_iter);
   drop_global_scan_state(global_state);

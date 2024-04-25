@@ -14,7 +14,7 @@ use url::Url;
 
 use crate::{
     unwrap_kernel_expression, AllocateStringFn, EnginePredicate, ExternEngineInterface,
-    ExternEngineInterfaceHandle, ExternResult, IntoExternResult, KernelBoolSlice,
+    ExternEngineInterfaceHandle, ExternResult, FromBoolSlice, IntoExternResult, KernelBoolSlice,
     KernelExpressionVisitorState, KernelStringSlice, SnapshotHandle, TryFromStringSlice,
 };
 
@@ -377,11 +377,11 @@ struct ContextWrapper {
 #[no_mangle]
 pub unsafe extern "C" fn visit_scan_data(
     data: *mut EngineDataHandle,
-    vector: KernelBoolSlice,
+    selection_vector: KernelBoolSlice,
     engine_context: *mut c_void,
     callback: CScanCallback,
 ) {
-    let selection_vec = vector.make_vec();
+    let selection_vec = Vec::<bool>::from_slice(selection_vector);
     let data: &dyn EngineData = unsafe { (*data).data.as_ref() };
     let context_wrapper = ContextWrapper {
         engine_context,
