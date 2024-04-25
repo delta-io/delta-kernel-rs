@@ -118,24 +118,21 @@ pub type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> *mut
 pub struct KernelBoolSlice {
     ptr: *mut bool,
     len: usize,
-    cap: usize,
 }
 
-#[allow(clippy::from_over_into)]
-impl Into<KernelBoolSlice> for Vec<bool> {
-    fn into(self) -> KernelBoolSlice {
+impl From<Vec<bool>> for KernelBoolSlice {
+    fn from(val: Vec<bool>) -> Self {
         // TODO: Use `into_raw_parts` when it's stable
-        let len = self.len();
-        let cap = self.capacity();
-        let boxed = self.into_boxed_slice();
+        let len = val.len();
+        let boxed = val.into_boxed_slice();
         let ptr = Box::into_raw(boxed).cast();
-        KernelBoolSlice { ptr, len, cap }
+        KernelBoolSlice { ptr, len }
     }
 }
 
 impl Drop for KernelBoolSlice {
     fn drop(&mut self) {
-        let vec = unsafe { Vec::from_raw_parts(self.ptr, self.len, self.cap) };
+        let vec = unsafe { Vec::from_raw_parts(self.ptr, self.len, self.len) };
         debug!("Dropping bool slice. It is {vec:#?}");
     }
 }
@@ -146,7 +143,7 @@ trait FromBoolSlice {
 
 impl FromBoolSlice for Vec<bool> {
     unsafe fn from_slice(mut slice: KernelBoolSlice) -> Self {
-        let res = Vec::from_raw_parts(slice.ptr, slice.len, slice.cap);
+        let res = Vec::from_raw_parts(slice.ptr, slice.len, slice.len);
         // vec now owns the pointer, so we don't want to free at the end of the func
         slice.ptr = std::ptr::null_mut();
         res

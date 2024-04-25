@@ -225,7 +225,7 @@ fn kernel_scan_data_next_impl(
     ),
 ) -> DeltaResult<bool> {
     if let Some((data, sel_vec)) = data.data.next().transpose()? {
-        let bool_slice: KernelBoolSlice = sel_vec.into();
+        let bool_slice = KernelBoolSlice::from(sel_vec);
         let data_handle = BoxHandle::into_handle(EngineDataHandle { data });
         (engine_visitor)(engine_context, data_handle, bool_slice);
         // ensure we free the data
