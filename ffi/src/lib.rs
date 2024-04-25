@@ -448,15 +448,13 @@ unsafe fn get_engine_interface_builder_impl(
 #[cfg(feature = "default-client")]
 #[no_mangle]
 pub unsafe extern "C" fn set_builder_option(
-    builder: *mut EngineInterfaceBuilder,
+    builder: &mut EngineInterfaceBuilder,
     key: KernelStringSlice,
     value: KernelStringSlice,
 ) {
-    let mut builder_box = unsafe { Box::from_raw(builder) };
     let key = unsafe { String::try_from_slice(key) };
     let value = unsafe { String::try_from_slice(value) };
-    builder_box.set_option(key, value);
-    Box::leak(builder_box);
+    builder.set_option(key, value);
 }
 
 /// Consume the builder and return an engine interface. After calling, the passed pointer is _no
@@ -498,7 +496,7 @@ unsafe fn get_default_default_client_impl(
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<*const ExternEngineInterfaceHandle> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) }?;
-    get_default_client_impl(url, HashMap::<String, String>::new(), allocate_error)
+    get_default_client_impl(url, Default::default(), allocate_error)
 }
 
 #[cfg(feature = "default-client")]

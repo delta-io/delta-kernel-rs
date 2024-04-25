@@ -20,24 +20,6 @@ use crate::{
 
 use super::handle::{ArcHandle, BoxHandle};
 
-/// Use a pointer that was created via `BoxHandle::into_handle` or `Box::leak` and returned over FFI
-/// without freeing it. returns the result of evaluting `$body`. For example, if `raw_thing` is a
-/// pointer previous created by `BoxHandle::into_handle`, one could do the following to return the
-/// result of `some_method` _without_ freeing `raw_thing`:
-/// ```ignore
-/// asbox!(raw_thing as boxed_thing => {
-///   boxed_thing.some_method() // some_method defined on the thing in the box
-/// })
-macro_rules! asbox {
-    ($raw_name:ident as $box_name:ident => $body:expr) => {{
-        let $box_name = unsafe { Box::from_raw($raw_name) };
-        let res = $body;
-        // leak the box since we don't want this to free
-        Box::leak($box_name);
-        res
-    }};
-}
-
 // TODO: Do we want this type at all? Perhaps we should just _always_ pass raw *mut c_void pointers
 // that are the engine data
 /// an opaque struct that encapsulates data read by an engine. this handle can be passed back into
@@ -151,11 +133,9 @@ impl BoxHandle for GlobalScanState {}
 /// # Safety
 /// Engine is responsible for providing a valid scan pointer
 #[no_mangle]
-pub unsafe extern "C" fn get_global_scan_state(scan: *mut Scan) -> *mut GlobalScanState {
-    asbox!(scan as boxed_scan => {
-        let kernel_state = boxed_scan.kernel_scan.global_scan_state();
-        BoxHandle::into_handle(GlobalScanState { kernel_state })
-    })
+pub unsafe extern "C" fn get_global_scan_state(scan: &mut Scan) -> *mut GlobalScanState {
+    let kernel_state = scan.kernel_scan.global_scan_state();
+    BoxHandle::into_handle(GlobalScanState { kernel_state })
 }
 
 /// # Safety
@@ -295,20 +275,18 @@ impl BoxHandle for CStringMap {}
 ///
 /// The engine is responsible for providing a valid [`CStringMap`] pointer and [`KernelStringSlice`]
 pub unsafe extern "C" fn get_from_map(
-    raw_map: *mut CStringMap,
+    map: &mut CStringMap,
     key: KernelStringSlice,
     allocate_fn: AllocateStringFn,
 ) -> *mut c_void {
-    asbox!(raw_map as boxed_map => {
-        let string_key = String::try_from_slice(key);
-        match boxed_map.values.get(&string_key) {
-            Some(v) => {
-                let slice: KernelStringSlice = v.as_str().into();
-                allocate_fn(slice)
-            }
-            None => std::ptr::null_mut(),
+    let string_key = String::try_from_slice(key);
+    match map.values.get(&string_key) {
+        Some(v) => {
+            let slice: KernelStringSlice = v.as_str().into();
+            allocate_fn(slice)
         }
-    })
+        None => std::ptr::null_mut(),
+    }
 }
 
 /// Get a selection vector out of a [`CDvInfo`] struct
@@ -317,24 +295,20 @@ pub unsafe extern "C" fn get_from_map(
 /// Engine is responsible for providing valid pointers for each argument
 #[no_mangle]
 pub unsafe extern "C" fn selection_vector_from_dv(
-    raw_info: *mut CDvInfo,
+    info: &mut CDvInfo,
     extern_engine_interface: *const ExternEngineInterfaceHandle,
-    state: *mut GlobalScanState,
+    state: &mut GlobalScanState,
 ) -> *mut KernelBoolSlice {
-    asbox!(raw_info as boxed_info => {
-        asbox!(state as boxed_state => {
-            let extern_engine_interface = unsafe { ArcHandle::clone_as_arc(extern_engine_interface) };
-            let root_url = Url::parse(&boxed_state.kernel_state.table_root).unwrap();
-            let vopt = boxed_info
-                .dv_info
-                .get_selection_vector(extern_engine_interface.table_client().as_ref(), &root_url)
-                .unwrap();
-            match vopt {
-                Some(v) => Box::into_raw(Box::new(v.into())),
-                None => std::ptr::null_mut(),
-            }
-        })
-    })
+    let extern_engine_interface = unsafe { ArcHandle::clone_as_arc(extern_engine_interface) };
+    let root_url = Url::parse(&state.kernel_state.table_root).unwrap();
+    let vopt = info
+        .dv_info
+        .get_selection_vector(extern_engine_interface.table_client().as_ref(), &root_url)
+        .unwrap();
+    match vopt {
+        Some(v) => Box::into_raw(Box::new(v.into())),
+        None => std::ptr::null_mut(),
+    }
 }
 
 // Wrapper function that gets called by the kernel, transforms the arguments to make the ffi-able,
