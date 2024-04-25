@@ -28,11 +28,11 @@ void visit_callback(void* engine_context, const struct KernelStringSlice path, l
   struct EngineContext *context = engine_context;
   KernelBoolSlice *selection_vector = selection_vector_from_dv(dv_info, context->engine_interface, context->global_state);
   if (selection_vector) {
-    printf("  Deletion vector selection vector:\n");
+    printf("  Selection vector:\n");
     print_selection_vector("    ", selection_vector);
     drop_bool_slice(selection_vector);
   } else {
-    printf("  No deletion vector for this call\n");
+    printf("  No selection vector for this call\n");
   }
   // normally this would be picked out of the schema
   char* letter_key = "letter";
