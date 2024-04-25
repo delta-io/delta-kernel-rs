@@ -319,21 +319,17 @@ fn rust_callback(
     dv_info: DvInfo,
     partition_values: HashMap<String, String>,
 ) {
-    let path_slice: KernelStringSlice = path.into();
-    let dv_handle = BoxHandle::into_handle(CDvInfo { dv_info });
+    let mut cdv_info = CDvInfo { dv_info };
     let partition_map_handle = BoxHandle::into_handle(CStringMap {
         values: partition_values,
     });
     (context.callback)(
         context.engine_context,
-        path_slice,
+        path.into(),
         size,
-        dv_handle,
+        &mut cdv_info,
         partition_map_handle,
     );
-    unsafe {
-        BoxHandle::drop_handle(dv_handle);
-    }
 }
 
 // Wrap up stuff from C so we can pass it through to our callback
@@ -355,7 +351,8 @@ pub unsafe extern "C" fn visit_scan_data(
     callback: CScanCallback,
 ) {
     let selection_vec = Vec::<bool>::from_slice(selection_vector);
-    let data: &dyn EngineData = unsafe { (*data).data.as_ref() };
+    let data = unsafe { &*data };
+    let data = data.data.as_ref();
     let context_wrapper = ContextWrapper {
         engine_context,
         callback,
