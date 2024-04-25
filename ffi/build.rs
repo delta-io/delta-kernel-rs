@@ -47,12 +47,17 @@ fn main() {
         .display()
         .to_string();
     let mut config_h = Config::default();
+    let mangle_config = MangleConfig {
+        remove_underscores: true,
+        ..Default::default()
+    };
+    let export_config = ExportConfig {
+        mangle: mangle_config,
+        ..Default::default()
+    };
+
     config_h.language = Language::C;
     config_h.defines = defines;
-    let mut mangle_config = MangleConfig::default();
-    mangle_config.remove_underscores = true;
-    let mut export_config = ExportConfig::default();
-    export_config.mangle = mangle_config;
     config_h.export = export_config;
     cbindgen::generate_with_config(&crate_dir, config_h)
         .expect("generate_with_config should have worked for C")

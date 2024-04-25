@@ -280,9 +280,7 @@ pub unsafe extern "C" fn get_from_map(
 ) -> *mut c_void {
     let string_key = String::try_from_slice(key);
     match map.values.get(&string_key) {
-        Some(v) => {
-            allocate_fn(v.as_str().into())
-        }
+        Some(v) => allocate_fn(v.as_str().into()),
         None => std::ptr::null_mut(),
     }
 }
