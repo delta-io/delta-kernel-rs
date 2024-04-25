@@ -235,20 +235,21 @@ pub(crate) fn visit_deletion_vector_at<'a>(
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<Option<DeletionVectorDescriptor>> {
     if let Some(storage_type) =
-        getters[0].get_opt(row_index, "remove.deletionVector.storageType")? {
-            let path_or_inline_dv: String = getters[1].get(row_index, "deletionVector.pathOrInlineDv")?;
-            let offset: Option<i32> = getters[2].get_opt(row_index, "deletionVector.offset")?;
-            let size_in_bytes: i32 = getters[3].get(row_index, "deletionVector.sizeInBytes")?;
-            let cardinality: i64 = getters[4].get(row_index, "deletionVector.cardinality")?;
-            Ok(Some(DeletionVectorDescriptor {
-                storage_type,
-                path_or_inline_dv,
-                offset,
-                size_in_bytes,
-                cardinality,
-            }))
-        }
-    else {
+        getters[0].get_opt(row_index, "remove.deletionVector.storageType")?
+    {
+        let path_or_inline_dv: String =
+            getters[1].get(row_index, "deletionVector.pathOrInlineDv")?;
+        let offset: Option<i32> = getters[2].get_opt(row_index, "deletionVector.offset")?;
+        let size_in_bytes: i32 = getters[3].get(row_index, "deletionVector.sizeInBytes")?;
+        let cardinality: i64 = getters[4].get(row_index, "deletionVector.cardinality")?;
+        Ok(Some(DeletionVectorDescriptor {
+            storage_type,
+            path_or_inline_dv,
+            offset,
+            size_in_bytes,
+            cardinality,
+        }))
+    } else {
         Ok(None)
     }
 }
