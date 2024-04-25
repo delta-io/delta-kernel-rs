@@ -34,10 +34,15 @@ EngineError* allocate_error(KernelError etype, const struct KernelStringSlice ms
   return (EngineError*)error;
 }
 
-void print_selection_vector(char* indent, const struct KernelBoolSlice *selection_vec) {
+void print_selection_vector(const char* indent, const struct KernelBoolSlice *selection_vec) {
   for (int i = 0; i < selection_vec->len; i++) {
     printf("%ssel[%i] = %b\n", indent, i, selection_vec->ptr[i]);
   }
+}
+
+void print_error(const char* indent, Error* err) {
+  printf("%sCode: %i\n", indent, err->etype);
+  printf("%sMsg: %s\n", indent, err->msg);
 }
 
 void visit_callback(void* engine_context, const struct KernelStringSlice path, long size, struct CDvInfo *dv_info, struct CStringMap *partition_values) {
@@ -90,9 +95,7 @@ int main(int argc, char* argv[]) {
     get_engine_interface_builder(table_path_slice, allocate_error);
   if (interface_builder_res.tag != OkEngineInterfaceBuilder) {
     printf("Could not get engine interface builder.\n");
-    Error* err = (Error*)interface_builder_res.err;
-    printf("  Code: %i\n", err->etype);
-    printf("  Msg: %s\n", err->msg);
+    print_error("  ", (Error*)interface_builder_res.err);
     return -1;
   }
 
@@ -112,6 +115,7 @@ int main(int argc, char* argv[]) {
 
   if (engine_interface_res.tag != OkExternEngineInterfaceHandle) {
     printf("Failed to get client\n");
+    print_error("  ", (Error*)interface_builder_res.err);
     return -1;
   }
 
@@ -120,6 +124,7 @@ int main(int argc, char* argv[]) {
   ExternResultSnapshotHandle snapshot_handle_res = snapshot(table_path_slice, engine_interface);
   if (snapshot_handle_res.tag != OkSnapshotHandle) {
     printf("Failed to create snapshot\n");
+    print_error("  ", (Error*)snapshot_handle_res.err);
     return -1;
   }
 
@@ -131,6 +136,7 @@ int main(int argc, char* argv[]) {
   ExternResultScan scan_res = scan(snapshot_handle, engine_interface, NULL);
   if (scan_res.tag != OkScan) {
     printf("Failed to create scan\n");
+    print_error("  ", (Error*)scan_res.err);
     return -1;
   }
 
@@ -142,6 +148,7 @@ int main(int argc, char* argv[]) {
     kernel_scan_data_init(engine_interface, scan);
   if (data_iter_res.tag != OkKernelScanDataIterator) {
     printf("Failed to construct scan data iterator\n");
+    print_error("  ", (Error*)data_iter_res.err);
     return -1;
   }
 
@@ -152,6 +159,7 @@ int main(int argc, char* argv[]) {
     ExternResultbool ok_res = kernel_scan_data_next(data_iter, &context, visit_data);
     if (ok_res.tag != Okbool) {
       printf("Failed to iterate scan data\n");
+      print_error("  ", (Error*)ok_res.err);
       return -1;
     } else if (!ok_res.ok) {
       printf("Iterator done\n");
