@@ -262,7 +262,6 @@ pub(crate) struct DeletionVectorVisitor {
 impl DataVisitor for DeletionVectorVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
-            // Since path column is required, use it to detect presence of an Add action
             self.descriptor = visit_deletion_vector_at(i, getters)?;
             if self.descriptor.is_some() {
                 break;
