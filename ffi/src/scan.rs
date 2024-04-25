@@ -281,8 +281,7 @@ pub unsafe extern "C" fn get_from_map(
     let string_key = String::try_from_slice(key);
     match map.values.get(&string_key) {
         Some(v) => {
-            let slice: KernelStringSlice = v.as_str().into();
-            allocate_fn(slice)
+            allocate_fn(v.as_str().into())
         }
         None => std::ptr::null_mut(),
     }
