@@ -1,6 +1,6 @@
 extern crate cbindgen;
 
-use cbindgen::{Config, Language};
+use cbindgen::{Config, ExportConfig, Language, MangleConfig};
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
@@ -49,6 +49,11 @@ fn main() {
     let mut config_h = Config::default();
     config_h.language = Language::C;
     config_h.defines = defines;
+    let mut mangle_config = MangleConfig::default();
+    mangle_config.remove_underscores = true;
+    let mut export_config = ExportConfig::default();
+    export_config.mangle = mangle_config;
+    config_h.export = export_config;
     cbindgen::generate_with_config(&crate_dir, config_h)
         .expect("generate_with_config should have worked for C")
         .write_to_file(output_file_h);

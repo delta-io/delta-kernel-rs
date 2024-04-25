@@ -25,17 +25,17 @@ int main(int argc, char* argv[]) {
 
   KernelStringSlice table_path_slice = {table_path, strlen(table_path)};
 
-  ExternResult______ExternEngineInterfaceHandle engine_interface_res =
+  ExternResultExternEngineInterfaceHandle engine_interface_res =
     get_default_client(table_path_slice, NULL);
-  if (engine_interface_res.tag != Ok______ExternEngineInterfaceHandle) {
+  if (engine_interface_res.tag != OkExternEngineInterfaceHandle) {
     printf("Failed to get client\n");
     return -1;
   }
 
   const ExternEngineInterfaceHandle *engine_interface = engine_interface_res.ok;
 
-  ExternResult______SnapshotHandle snapshot_handle_res = snapshot(table_path_slice, engine_interface);
-  if (snapshot_handle_res.tag != Ok______SnapshotHandle) {
+  ExternResultSnapshotHandle snapshot_handle_res = snapshot(table_path_slice, engine_interface);
+  if (snapshot_handle_res.tag != OkSnapshotHandle) {
     printf("Failed to create snapshot\n");
     return -1;
   }
@@ -44,17 +44,17 @@ int main(int argc, char* argv[]) {
 
   uint64_t v = version(snapshot_handle);
   printf("version: %" PRIu64 "\n", v);
-  ExternResult_____Scan scan_res = scan(snapshot_handle, engine_interface, NULL);
-  if (scan_res.tag != Ok_____Scan) {
+  ExternResultScan scan_res = scan(snapshot_handle, engine_interface, NULL);
+  if (scan_res.tag != OkScan) {
     printf("Failed to create scan\n");
     return -1;
   }
 
   Scan *scan = scan_res.ok;
 
-  ExternResult_____KernelScanDataIterator data_iter_res =
+  ExternResultKernelScanDataIterator data_iter_res =
     kernel_scan_data_init(engine_interface, scan);
-  if (data_iter_res.tag != Ok_____KernelScanDataIterator) {
+  if (data_iter_res.tag != OkKernelScanDataIterator) {
     printf("Failed to construct scan data iterator\n");
     return -1;
   }
@@ -63,8 +63,8 @@ int main(int argc, char* argv[]) {
 
   // iterate scan files
   for (;;) {
-    ExternResult_bool ok_res = kernel_scan_data_next(data_iter, NULL, visit_data);
-    if (ok_res.tag != Ok_bool) {
+    ExternResultbool ok_res = kernel_scan_data_next(data_iter, NULL, visit_data);
+    if (ok_res.tag != Okbool) {
       printf("Failed to iterate scan data\n");
       return -1;
     } else if (!ok_res.ok) {
