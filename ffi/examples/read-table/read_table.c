@@ -26,7 +26,12 @@ void* allocate_string(const struct KernelStringSlice slice) {
 void visit_callback(void* engine_context, const struct KernelStringSlice path, long size, struct CDvInfo *dv_info, struct CStringMap *partition_values) {
   printf("called back to actually read!\n  path: %.*s\n", path.len, path.ptr);
   struct EngineContext *context = engine_context;
-  KernelBoolSlice *selection_vector = selection_vector_from_dv(dv_info, context->engine_interface, context->global_state);
+  ExternResultKernelBoolSlice selection_vector_res = selection_vector_from_dv(dv_info, context->engine_interface, context->global_state);
+  if (selection_vector_res.tag != OkKernelBoolSlice) {
+    printf("Could not get selection vector from kernel\n");
+    return;
+  }
+  KernelBoolSlice *selection_vector = selection_vector_res.ok;
   if (selection_vector) {
     printf("  Selection vector:\n");
     print_selection_vector("    ", selection_vector);

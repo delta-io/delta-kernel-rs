@@ -297,16 +297,24 @@ pub unsafe extern "C" fn selection_vector_from_dv(
     info: &mut CDvInfo,
     extern_engine_interface: *const ExternEngineInterfaceHandle,
     state: &mut GlobalScanState,
-) -> *mut KernelBoolSlice {
+) -> ExternResult<*mut KernelBoolSlice> {
+    selection_vector_from_dv_impl(info, extern_engine_interface, state)
+        .into_extern_result(extern_engine_interface)
+}
+
+unsafe fn selection_vector_from_dv_impl(
+    info: &mut CDvInfo,
+    extern_engine_interface: *const ExternEngineInterfaceHandle,
+    state: &mut GlobalScanState,
+) -> DeltaResult<*mut KernelBoolSlice> {
     let extern_engine_interface = unsafe { ArcHandle::clone_as_arc(extern_engine_interface) };
-    let root_url = Url::parse(&state.kernel_state.table_root).unwrap();
+    let root_url = Url::parse(&state.kernel_state.table_root)?;
     let vopt = info
         .dv_info
-        .get_selection_vector(extern_engine_interface.table_client().as_ref(), &root_url)
-        .unwrap();
+        .get_selection_vector(extern_engine_interface.table_client().as_ref(), &root_url)?;
     match vopt {
-        Some(v) => Box::into_raw(Box::new(v.into())),
-        None => std::ptr::null_mut(),
+        Some(v) => Ok(Box::into_raw(Box::new(v.into()))),
+        None => Ok(std::ptr::null_mut()),
     }
 }
 
