@@ -69,6 +69,10 @@ pub enum Error {
     #[error("Object store path error: {0}")]
     ObjectStorePath(#[from] object_store::path::Error),
 
+    #[cfg(feature = "default-client")]
+    #[error("Reqwest Error: {0}")]
+    Reqwest(#[from] reqwest::Error),
+
     /// A specified file could not be found
     #[error("File not found: {0}")]
     FileNotFound(String),

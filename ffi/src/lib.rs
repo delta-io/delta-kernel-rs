@@ -125,6 +125,8 @@ pub enum KernelError {
     ObjectStoreError,
     #[cfg(feature = "default-client")]
     ObjectStorePathError,
+    #[cfg(feature = "default-client")]
+    Reqwest,
     FileNotFoundError,
     MissingColumnError,
     UnexpectedColumnTypeError,
@@ -157,6 +159,8 @@ impl From<Error> for KernelError {
             Error::ObjectStore(_) => KernelError::ObjectStoreError,
             #[cfg(feature = "default-client")]
             Error::ObjectStorePath(_) => KernelError::ObjectStorePathError,
+            #[cfg(feature = "default-client")]
+            Error::Reqwest(_) => KernelError::Reqwest,
             Error::FileNotFound(_) => KernelError::FileNotFoundError,
             Error::MissingColumn(_) => KernelError::MissingColumnError,
             Error::UnexpectedColumnType(_) => KernelError::UnexpectedColumnTypeError,
