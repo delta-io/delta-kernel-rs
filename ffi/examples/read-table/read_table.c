@@ -11,16 +11,33 @@ struct EngineContext {
   const ExternEngineInterfaceHandle *engine_interface;
 };
 
-void print_selection_vector(char* indent, const struct KernelBoolSlice *selection_vec) {
-  for (int i = 0; i < selection_vec->len; i++) {
-    printf("%ssel[%i] = %b\n", indent, i, selection_vec->ptr[i]);
-  }
-}
+// This is how we represent our errors. The kernel will ask us to contruct this struct whenever it
+// enounters an error, and then return the contructed EngineError to us
+typedef struct Error {
+  KernelError etype;
+  char* msg;
+} Error;
 
+
+// create a char* from a KernelStringSlice
 void* allocate_string(const struct KernelStringSlice slice) {
   char* buf = malloc(sizeof(char) * (slice.len + 1)); // +1 for null
   snprintf(buf, slice.len + 1, "%s", slice.ptr);
   return buf;
+}
+
+EngineError* allocate_error(KernelError etype, const struct KernelStringSlice msg) {
+  Error* error = malloc(sizeof(Error));
+  error->etype = etype;
+  char* charmsg = allocate_string(msg);
+  error->msg = charmsg;
+  return (EngineError*)error;
+}
+
+void print_selection_vector(char* indent, const struct KernelBoolSlice *selection_vec) {
+  for (int i = 0; i < selection_vec->len; i++) {
+    printf("%ssel[%i] = %b\n", indent, i, selection_vec->ptr[i]);
+  }
 }
 
 void visit_callback(void* engine_context, const struct KernelStringSlice path, long size, struct CDvInfo *dv_info, struct CStringMap *partition_values) {
@@ -70,9 +87,12 @@ int main(int argc, char* argv[]) {
   KernelStringSlice table_path_slice = {table_path, strlen(table_path)};
 
   ExternResultEngineInterfaceBuilder interface_builder_res =
-    get_engine_interface_builder(table_path_slice, NULL);
+    get_engine_interface_builder(table_path_slice, allocate_error);
   if (interface_builder_res.tag != OkEngineInterfaceBuilder) {
-    printf("Could not get engine interface builder\n");
+    printf("Could not get engine interface builder.\n");
+    Error* err = (Error*)interface_builder_res.err;
+    printf("  Code: %i\n", err->etype);
+    printf("  Msg: %s\n", err->msg);
     return -1;
   }
 

@@ -4,7 +4,6 @@
 use std::collections::HashMap;
 use std::default::Default;
 use std::os::raw::{c_char, c_void};
-use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::debug;
 use url::Url;
@@ -391,8 +390,7 @@ impl ExternEngineInterface for ExternEngineInterfaceVtable {
 /// Caller is responsible for passing a valid path pointer.
 unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<Url> {
     let path = unsafe { String::try_from_slice(path) };
-    let path = std::fs::canonicalize(PathBuf::from(path)).map_err(Error::generic)?;
-    Url::from_directory_path(path).map_err(|_| Error::generic("Invalid url"))
+    Ok(Url::parse(&path)?)
 }
 
 // A client builder allows setting options before building an actual client
