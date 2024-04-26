@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use delta_kernel::scan::state::{
-    visit_scan_files, DvInfo, GlobalScanState as KernelGlobalScanState,
+    visit_scan_files, DvInfo, GlobalScanState,
 };
 use delta_kernel::scan::{Scan as KernelScan, ScanBuilder, ScanData};
 use delta_kernel::{DeltaResult, EngineData};
@@ -122,9 +122,6 @@ unsafe fn scan_impl(
     Ok(BoxHandle::into_handle(Scan { kernel_scan }))
 }
 
-pub struct GlobalScanState {
-    kernel_state: KernelGlobalScanState,
-}
 impl BoxHandle for GlobalScanState {}
 
 /// Get the global state for a scan. See the docs for [`delta_kernel::scan::state::GlobalScanState`]
@@ -135,7 +132,7 @@ impl BoxHandle for GlobalScanState {}
 #[no_mangle]
 pub unsafe extern "C" fn get_global_scan_state(scan: &mut Scan) -> *mut GlobalScanState {
     let kernel_state = scan.kernel_scan.global_scan_state();
-    BoxHandle::into_handle(GlobalScanState { kernel_state })
+    BoxHandle::into_handle(kernel_state)
 }
 
 /// # Safety
@@ -143,9 +140,7 @@ pub unsafe extern "C" fn get_global_scan_state(scan: &mut Scan) -> *mut GlobalSc
 /// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn drop_global_scan_state(state: *mut GlobalScanState) {
-    unsafe {
-        drop(Box::from_raw(state));
-    }
+    BoxHandle::drop_handle(state);
 }
 
 // Intentionally opaque to the engine.
@@ -305,7 +300,7 @@ unsafe fn selection_vector_from_dv_impl(
     state: &mut GlobalScanState,
 ) -> DeltaResult<*mut KernelBoolSlice> {
     let extern_engine_interface = unsafe { ArcHandle::clone_as_arc(extern_engine_interface) };
-    let root_url = Url::parse(&state.kernel_state.table_root)?;
+    let root_url = Url::parse(&state.table_root)?;
     let vopt = info
         .dv_info
         .get_selection_vector(extern_engine_interface.table_client().as_ref(), &root_url)?;
