@@ -14,7 +14,7 @@ struct EngineContext {
 // This is how we represent our errors. The kernel will ask us to contruct this struct whenever it
 // enounters an error, and then return the contructed EngineError to us
 typedef struct Error {
-  KernelError etype;
+  struct EngineError etype;
   char* msg;
 } Error;
 
@@ -28,7 +28,7 @@ void* allocate_string(const struct KernelStringSlice slice) {
 
 EngineError* allocate_error(KernelError etype, const struct KernelStringSlice msg) {
   Error* error = malloc(sizeof(Error));
-  error->etype = etype;
+  error->etype.etype = etype;
   char* charmsg = allocate_string(msg);
   error->msg = charmsg;
   return (EngineError*)error;
