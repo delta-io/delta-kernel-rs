@@ -141,10 +141,10 @@ trait FromBoolSlice {
 }
 
 impl FromBoolSlice for Vec<bool> {
-    unsafe fn from_slice(mut slice: KernelBoolSlice) -> Self {
+    unsafe fn from_slice(slice: KernelBoolSlice) -> Self {
         let res = Vec::from_raw_parts(slice.ptr, slice.len, slice.len);
-        // vec now owns the pointer, so we don't want to free at the end of the func
-        slice.ptr = std::ptr::null_mut();
+        // called `from_raw_parts` and consumed the slice, so we don't want `drop` to be called
+        let _ = std::mem::ManuallyDrop::new(slice);
         res
     }
 }
