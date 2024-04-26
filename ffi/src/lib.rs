@@ -129,23 +129,13 @@ impl From<Vec<bool>> for KernelBoolSlice {
     }
 }
 
-impl Drop for KernelBoolSlice {
-    fn drop(&mut self) {
-        let vec = unsafe { Vec::from_raw_parts(self.ptr, self.len, self.len) };
-        debug!("Dropping bool slice. It is {vec:#?}");
-    }
-}
-
 trait FromBoolSlice {
     unsafe fn from_slice(slice: KernelBoolSlice) -> Self;
 }
 
 impl FromBoolSlice for Vec<bool> {
     unsafe fn from_slice(slice: KernelBoolSlice) -> Self {
-        let res = Vec::from_raw_parts(slice.ptr, slice.len, slice.len);
-        // called `from_raw_parts` and consumed the slice, so we don't want `drop` to be called
-        let _ = std::mem::ManuallyDrop::new(slice);
-        res
+        Vec::from_raw_parts(slice.ptr, slice.len, slice.len)
     }
 }
 
@@ -154,7 +144,8 @@ impl FromBoolSlice for Vec<bool> {
 /// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn drop_bool_slice(slice: *mut KernelBoolSlice) {
-    unsafe { drop(Box::from_raw(slice)) };
+    let vec = unsafe { Vec::from_raw_parts((*slice).ptr, (*slice).len, (*slice).len) };
+    debug!("Dropping bool slice. It is {vec:#?}");
 }
 
 #[repr(C)]
