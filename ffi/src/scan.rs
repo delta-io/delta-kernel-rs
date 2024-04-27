@@ -143,9 +143,7 @@ pub unsafe extern "C" fn get_global_scan_state(scan: &mut Scan) -> *mut GlobalSc
 /// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn drop_global_scan_state(state: *mut GlobalScanState) {
-    unsafe {
-        drop(Box::from_raw(state));
-    }
+    unsafe { BoxHandle::drop_handle(state) };
 }
 
 // Intentionally opaque to the engine.
