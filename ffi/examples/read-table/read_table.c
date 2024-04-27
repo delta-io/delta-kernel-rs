@@ -34,6 +34,11 @@ EngineError* allocate_error(KernelError etype, const struct KernelStringSlice ms
   return (EngineError*)error;
 }
 
+void free_error(Error* error) {
+  free(error->msg);
+  free(error);
+}
+
 void print_selection_vector(const char* indent, const struct KernelBoolSlice *selection_vec) {
   for (int i = 0; i < selection_vec->len; i++) {
     printf("%ssel[%i] = %b\n", indent, i, selection_vec->ptr[i]);
@@ -103,6 +108,7 @@ int main(int argc, char* argv[]) {
   if (interface_builder_res.tag != OkEngineInterfaceBuilder) {
     printf("Could not get engine interface builder.\n");
     print_error("  ", (Error*)interface_builder_res.err);
+    free_error((Error*)interface_builder_res.err);
     return -1;
   }
 
@@ -122,6 +128,7 @@ int main(int argc, char* argv[]) {
   if (engine_interface_res.tag != OkExternEngineInterfaceHandle) {
     printf("Failed to get client\n");
     print_error("  ", (Error*)interface_builder_res.err);
+    free_error((Error*)interface_builder_res.err);
     return -1;
   }
 
@@ -131,6 +138,7 @@ int main(int argc, char* argv[]) {
   if (snapshot_handle_res.tag != OkSnapshotHandle) {
     printf("Failed to create snapshot\n");
     print_error("  ", (Error*)snapshot_handle_res.err);
+    free_error((Error*)snapshot_handle_res.err);
     return -1;
   }
 
@@ -143,6 +151,7 @@ int main(int argc, char* argv[]) {
   if (scan_res.tag != OkScan) {
     printf("Failed to create scan\n");
     print_error("  ", (Error*)scan_res.err);
+    free_error((Error*)scan_res.err);
     return -1;
   }
 
@@ -155,6 +164,7 @@ int main(int argc, char* argv[]) {
   if (data_iter_res.tag != OkKernelScanDataIterator) {
     printf("Failed to construct scan data iterator\n");
     print_error("  ", (Error*)data_iter_res.err);
+    free_error((Error*)data_iter_res.err);
     return -1;
   }
 
@@ -166,6 +176,7 @@ int main(int argc, char* argv[]) {
     if (ok_res.tag != Okbool) {
       printf("Failed to iterate scan data\n");
       print_error("  ", (Error*)ok_res.err);
+      free_error((Error*)ok_res.err);
       return -1;
     } else if (!ok_res.ok) {
       printf("Iterator done\n");
