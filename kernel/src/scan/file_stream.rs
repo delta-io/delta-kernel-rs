@@ -137,11 +137,9 @@ impl LogReplayScanner {
             .map(|filter| filter.apply(actions))
             .transpose()?;
 
-        let visitor = self.setup_batch_process(selection_vector, actions, is_log_batch)?;
+        let adds = self.setup_batch_process(selection_vector, actions, is_log_batch)?;
 
-        visitor
-            .adds
-            .into_iter()
+        adds.into_iter()
             .filter_map(|(add, _)| {
                 // Note: each (add.path + add.dv_unique_id()) pair has a
                 // unique Add + Remove pair in the log. For example:
@@ -194,9 +192,9 @@ impl LogReplayScanner {
             None => vec![false; actions.length()],
         };
 
-        let visitor = self.setup_batch_process(filter_vector, actions, is_log_batch)?;
+        let adds = self.setup_batch_process(filter_vector, actions, is_log_batch)?;
 
-        for (add, index) in visitor.adds.into_iter() {
+        for (add, index) in adds.into_iter() {
             // Note: each (add.path + add.dv_unique_id()) pair has a
             // unique Add + Remove pair in the log. For example:
             // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
@@ -238,7 +236,7 @@ impl LogReplayScanner {
         selection_vector: Option<Vec<bool>>,
         actions: &dyn EngineData,
         is_log_batch: bool,
-    ) -> DeltaResult<AddRemoveVisitor> {
+    ) -> DeltaResult<Vec<(Add, usize)>> {
         let schema_to_use = if is_log_batch {
             // NB: We _must_ pass these in the order `ADD_NAME, REMOVE_NAME` as the visitor assumes
             // the Add action comes first. The [`project`] method honors this order, so this works
@@ -252,12 +250,12 @@ impl LogReplayScanner {
         let mut visitor = AddRemoveVisitor::new(selection_vector, is_log_batch);
         actions.extract(schema_to_use, &mut visitor)?;
 
-        for remove in visitor.removes.drain(..) {
+        for remove in visitor.removes.into_iter() {
             let dv_id = remove.dv_unique_id();
             self.seen.insert((remove.path, dv_id));
         }
 
-        Ok(visitor)
+        Ok(visitor.adds)
     }
 }
 
