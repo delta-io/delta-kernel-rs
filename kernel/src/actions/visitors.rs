@@ -8,7 +8,9 @@ use crate::{
     DataVisitor, DeltaResult,
 };
 
-use super::{deletion_vector::DeletionVectorDescriptor, Add, Format, Metadata, Protocol, Remove};
+use super::{
+    deletion_vector::DeletionVectorDescriptor, Add, Format, Metadata, Protocol, Remove, Transaction,
+};
 
 #[derive(Default)]
 pub(crate) struct MetadataVisitor {
@@ -228,6 +230,68 @@ impl DataVisitor for RemoveVisitor {
     }
 }
 
+pub type TransactionMap = HashMap<String, Transaction>;
+
+/// Extact application transaction actions from the log into a map
+///
+/// This visitor maintains the first entry for each application id it
+/// encounters.  When a specific application id is required then
+/// `application_id` can be set. This bounds the memory required for the
+/// visitor to at most one entry and reduces the amount of processing
+/// required.
+///
+#[derive(Default, Debug)]
+pub(crate) struct TransactionVisitor {
+    pub(crate) transactions: TransactionMap,
+    pub(crate) application_id: Option<String>,
+}
+
+impl TransactionVisitor {
+    /// Create a new visitor. When application_id is set then bookkeeping is only for that id only
+    pub(crate) fn new(application_id: Option<String>) -> Self {
+        TransactionVisitor {
+            transactions: HashMap::default(),
+            application_id,
+        }
+    }
+
+    pub(crate) fn visit_txn<'a>(
+        row_index: usize,
+        app_id: String,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<Transaction> {
+        let version: i64 = getters[1].get(row_index, "txn.version")?;
+        let last_updated: Option<i64> = getters[2].get_long(row_index, "txn.lastUpdated")?;
+        Ok(Transaction {
+            app_id,
+            version,
+            last_updated,
+        })
+    }
+}
+
+impl DataVisitor for TransactionVisitor {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        // Assumes batches are visited in reverse order relative to the log
+        for i in 0..row_count {
+            if let Some(app_id) = getters[0].get_opt(i, "txn.appId")? {
+                // if caller requested a specific id then only visit matches
+                if !self
+                    .application_id
+                    .as_ref()
+                    .is_some_and(|requested| !requested.eq(&app_id))
+                {
+                    let txn = TransactionVisitor::visit_txn(i, app_id, getters)?;
+                    if !self.transactions.contains_key(&txn.app_id) {
+                        self.transactions.insert(txn.app_id.clone(), txn);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Get a DV out of some engine data. The caller is responsible for slicing the `getters` slice such
 /// that the first element contains the `storageType` element of the deletion vector.
 pub(crate) fn visit_deletion_vector_at<'a>(
@@ -263,7 +327,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        actions::{get_log_schema, ADD_NAME},
+        actions::{get_log_schema, ADD_NAME, TRANSACTION_NAME},
         client::arrow_data::ArrowEngineData,
         client::sync::{json::SyncJsonHandler, SyncEngineInterface},
         EngineData, EngineInterface, JsonHandler,
@@ -399,5 +463,46 @@ mod tests {
         for (add, expected) in add_visitor.adds.into_iter().zip(expected.into_iter()) {
             assert_eq!(add, expected);
         }
+    }
+
+    #[test]
+    fn test_parse_txn() {
+        let client = SyncEngineInterface::new();
+        let json_handler = client.get_json_handler();
+        let json_strings: StringArray = vec![
+            r#"{"commitInfo":{"timestamp":1670892998177,"operation":"WRITE","operationParameters":{"mode":"Append","partitionBy":"[\"c1\",\"c2\"]"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"3","numOutputRows":"3","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
+            r#"{"add":{"path":"c1=6/c2=a/part-00011-10619b10-b691-4fd0-acc4-2a9608499d7c.c000.snappy.parquet","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":4},\"maxValues\":{\"c3\":4},\"nullCount\":{\"c3\":0}}"}}"#,
+            r#"{"txn":{"appId":"myApp","version": 3}}"#,
+            r#"{"txn":{"appId":"myApp2","version": 4, "lastUpdated": 1670892998177}}"#,
+        ]
+        .into();
+        let output_schema = Arc::new(get_log_schema().clone());
+        let batch = json_handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        let add_schema = get_log_schema()
+            .project(&[TRANSACTION_NAME])
+            .expect("Can't get txn schema");
+        let mut txn_visitor = TransactionVisitor::default();
+        batch.extract(add_schema, &mut txn_visitor).unwrap();
+        let mut actual = txn_visitor.transactions;
+        assert_eq!(
+            actual.remove("myApp2"),
+            Some(Transaction {
+                app_id: "myApp2".to_string(),
+                version: 4,
+                last_updated: Some(1670892998177),
+            },)
+        );
+        assert_eq!(
+            actual.remove("myApp"),
+            Some(Transaction {
+                app_id: "myApp".to_string(),
+                version: 3,
+                last_updated: None,
+            })
+        );
     }
 }
