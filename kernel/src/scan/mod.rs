@@ -1,6 +1,5 @@
 //! Functionality to create and execute scans (reads) over data stored in a delta table
 
-use std::borrow::Cow;
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -111,8 +110,8 @@ pub struct ScanResult {
 /// Scan uses this to set up what kinds of columns it is scanning. A reference to the field is
 /// stored so we can get the name and data_type out when building the read expression
 pub enum ColumnType<'a> {
-    Selected(Cow<'a, StructField>),
-    Partition(Cow<'a, StructField>),
+    Selected(&'a StructField),
+    Partition(&'a StructField),
 }
 
 pub type ScanData = (Box<dyn EngineData>, Vec<bool>);
@@ -375,12 +374,12 @@ fn get_state_info<'a>(
                 // Store the raw field, we will turn it into an expression in the inner loop
                 // since the expression could be different for each add file
                 have_partition_cols = true;
-                ColumnType::Partition(Cow::Borrowed(field))
+                ColumnType::Partition(field)
             } else {
                 // Add to read schema, store field so we can build a `Column` expression later
                 // if needed (i.e. if we have partition columns)
                 read_fields.push(field.clone());
-                ColumnType::Selected(Cow::Borrowed(field))
+                ColumnType::Selected(field)
             }
         })
         .collect();

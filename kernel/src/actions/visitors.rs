@@ -254,23 +254,6 @@ pub(crate) fn visit_deletion_vector_at<'a>(
     }
 }
 
-#[derive(Default)]
-pub(crate) struct DeletionVectorVisitor {
-    pub(crate) descriptor: Option<DeletionVectorDescriptor>,
-}
-
-impl DataVisitor for DeletionVectorVisitor {
-    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        for i in 0..row_count {
-            self.descriptor = visit_deletion_vector_at(i, getters)?;
-            if self.descriptor.is_some() {
-                break;
-            }
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
