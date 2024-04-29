@@ -17,6 +17,7 @@ pub(crate) const ADD_NAME: &str = "add";
 pub(crate) const REMOVE_NAME: &str = "remove";
 pub(crate) const METADATA_NAME: &str = "metaData";
 pub(crate) const PROTOCOL_NAME: &str = "protocol";
+pub(crate) const TRANSACTION_NAME: &str = "txn";
 
 lazy_static! {
     static ref LOG_SCHEMA: StructType = StructType::new(
@@ -25,11 +26,11 @@ lazy_static! {
             Option::<Remove>::get_struct_field(REMOVE_NAME),
             Option::<Metadata>::get_struct_field(METADATA_NAME),
             Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
+            Option::<Transaction>::get_struct_field(TRANSACTION_NAME),
             // We don't support the following actions yet
             //Option<Cdc>::get_field(CDC_NAME),
             //Option<CommitInfo>::get_field(COMMIT_INFO_NAME),
             //Option<DomainMetadata>::get_field(DOMAIN_METADATA_NAME),
-            //Option<Transaction>::get_field(TRANSACTION_NAME),
         ]
     );
 }
@@ -215,6 +216,18 @@ impl Remove {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+pub struct Transaction {
+    /// A unique identifier for the application performing the transaction.
+    pub app_id: String,
+
+    /// An application-specific numeric identifier for this transaction.
+    pub version: i64,
+
+    /// The time when this transaction action was created in milliseconds since the Unix epoch.
+    pub last_updated: Option<i64>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -312,6 +325,24 @@ mod tests {
                 deletion_vector_field(),
                 StructField::new("baseRowId", DataType::LONG, true),
                 StructField::new("defaultRowCommitVersion", DataType::LONG, true),
+            ]),
+            true,
+        )]));
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn test_transaction_schema() {
+        let schema = get_log_schema()
+            .project(&["txn"])
+            .expect("Couldn't get transaction field");
+
+        let expected = Arc::new(StructType::new(vec![StructField::new(
+            "txn",
+            StructType::new(vec![
+                StructField::new("appId", DataType::STRING, false),
+                StructField::new("version", DataType::LONG, false),
+                StructField::new("lastUpdated", DataType::LONG, true),
             ]),
             true,
         )]));
