@@ -22,7 +22,7 @@ fn main() {
     let target_dir = get_target_dir(crate_dir.as_str());
     let cbindgen_toml = Path::new(&crate_dir).join("cbindgen.toml");
     let mut config = Config::from_file(&cbindgen_toml)
-        .expect(&format!("Couldn't find {}", cbindgen_toml.display()));
+        .unwrap_or_else(|_| panic!("Couldn't find {}", cbindgen_toml.display()));
 
     // generate cxx bindings
     let output_file_hpp = target_dir
