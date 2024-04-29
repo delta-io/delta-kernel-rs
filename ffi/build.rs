@@ -16,15 +16,13 @@ fn get_target_dir(manifest_dir: &str) -> PathBuf {
     }
 }
 
-
 fn main() {
     let crate_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set");
     let package_name = env::var("CARGO_PKG_NAME").expect("CARGO_PKG_NAME should be set");
     let target_dir = get_target_dir(crate_dir.as_str());
     let cbindgen_toml = Path::new(&crate_dir).join("cbindgen.toml");
-    let mut config = Config::from_file(&cbindgen_toml).expect(
-        &format!("Couldn't find {}", cbindgen_toml.display())
-    );
+    let mut config = Config::from_file(&cbindgen_toml)
+        .expect(&format!("Couldn't find {}", cbindgen_toml.display()));
 
     // generate cxx bindings
     let output_file_hpp = target_dir
