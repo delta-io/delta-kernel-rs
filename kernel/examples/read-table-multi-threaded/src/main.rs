@@ -103,13 +103,13 @@ fn try_main() -> DeltaResult<()> {
     println!("Reading {url}");
 
     // create the requested interface
-    let engine_interface: Box<dyn EngineInterface> = match cli.interface {
-        Interface::Default => Box::new(DefaultEngineInterface::try_new(
+    let engine_interface: Arc<dyn EngineInterface> = match cli.interface {
+        Interface::Default => Arc::new(DefaultEngineInterface::try_new(
             &url,
             HashMap::<String, String>::new(),
             Arc::new(TokioBackgroundExecutor::new()),
         )?),
-        Interface::Sync => Box::new(SyncEngineInterface::new()),
+        Interface::Sync => Arc::new(SyncEngineInterface::new()),
     };
 
     // build a table and get the lastest snapshot from it
@@ -158,9 +158,6 @@ fn try_main() -> DeltaResult<()> {
     // scan_file_[t/r]x are used to send each scan file from the iterator out to the waiting threads
     let (mut scan_file_tx, scan_file_rx) = spmc::channel();
 
-    // Arc up the engine_interface so we can share it between threads
-    let engine_interface = Arc::new(engine_interface);
-
     // fire up each thread. we don't need the handles as we rely on the channels to indicate when
     // things are done
     let _handles: Vec<_> = (0..cli.thread_count)
@@ -202,13 +199,13 @@ fn try_main() -> DeltaResult<()> {
 
 // this is the work each thread does
 fn do_work(
-    engine_interface: Arc<Box<dyn EngineInterface>>,
+    engine_interface: Arc<dyn EngineInterface>,
     scan_state: GlobalScanState,
     record_batch_tx: Sender<RecordBatch>,
     scan_file_rx: spmc::Receiver<ScanFile>,
 ) {
     // get the type for the function calls
-    let engine_interface: &dyn EngineInterface = engine_interface.as_ref().as_ref();
+    let engine_interface: &dyn EngineInterface = engine_interface.as_ref();
     let read_schema = Arc::new(scan_state.read_schema.clone());
     loop {
         // in a loop, try and get a ScanFile
