@@ -20,13 +20,13 @@ typedef struct Error {
 
 
 // create a char* from a KernelStringSlice
-void* allocate_string(const struct KernelStringSlice slice) {
+void* allocate_string(const KernelStringSlice slice) {
   char* buf = malloc(sizeof(char) * (slice.len + 1)); // +1 for null
   snprintf(buf, slice.len + 1, "%s", slice.ptr);
   return buf;
 }
 
-EngineError* allocate_error(KernelError etype, const struct KernelStringSlice msg) {
+EngineError* allocate_error(KernelError etype, const KernelStringSlice msg) {
   Error* error = malloc(sizeof(Error));
   error->etype.etype = etype;
   char* charmsg = allocate_string(msg);
@@ -39,7 +39,7 @@ void free_error(Error* error) {
   free(error);
 }
 
-void print_selection_vector(const char* indent, const struct KernelBoolSlice *selection_vec) {
+void print_selection_vector(const char* indent, const KernelBoolSlice *selection_vec) {
   for (int i = 0; i < selection_vec->len; i++) {
     printf("%ssel[%i] = %b\n", indent, i, selection_vec->ptr[i]);
   }
@@ -50,13 +50,13 @@ void print_error(const char* indent, Error* err) {
   printf("%sMsg: %s\n", indent, err->msg);
 }
 
-void set_builder_opt(struct EngineInterfaceBuilder *interface_builder, char* key, char* val) {
+void set_builder_opt(EngineInterfaceBuilder *interface_builder, char* key, char* val) {
   KernelStringSlice key_slice = {key, strlen(key)};
   KernelStringSlice val_slice = {val, strlen(val)};
   set_builder_option(interface_builder, key_slice, val_slice);
 }
 
-void visit_callback(void* engine_context, const struct KernelStringSlice path, long size, const DvInfo *dv_info, struct CStringMap *partition_values) {
+void visit_callback(void* engine_context, const KernelStringSlice path, long size, const DvInfo *dv_info, CStringMap *partition_values) {
   printf("called back to actually read!\n  path: %.*s\n", path.len, path.ptr);
   struct EngineContext *context = engine_context;
   ExternResultKernelBoolSlice selection_vector_res = selection_vector_from_dv(dv_info, context->engine_interface, context->global_state);
@@ -84,7 +84,7 @@ void visit_callback(void* engine_context, const struct KernelStringSlice path, l
   }
 }
 
-void visit_data(void *engine_context, struct EngineDataHandle *engine_data, struct KernelBoolSlice selection_vec) {
+void visit_data(void *engine_context, EngineDataHandle *engine_data, KernelBoolSlice selection_vec) {
   printf("Got some data\n");
   printf("  Of this data, here is a selection vector\n");
   print_selection_vector("    ", &selection_vec);
@@ -113,7 +113,7 @@ int main(int argc, char* argv[]) {
   }
 
   // an example of using a builder to set options when building a engine interface
-  struct EngineInterfaceBuilder *interface_builder = interface_builder_res.ok;
+  EngineInterfaceBuilder *interface_builder = interface_builder_res.ok;
   set_builder_opt(interface_builder, "aws_region", "us-west-2");
   // potentially set credentials here
   //set_builder_opt(interface_builder, "aws_access_key_id" , "[redacted]");

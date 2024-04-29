@@ -291,8 +291,8 @@ unsafe fn selection_vector_from_dv_impl(
 ) -> DeltaResult<*mut KernelBoolSlice> {
     let extern_engine_interface = unsafe { ArcHandle::clone_as_arc(extern_engine_interface) };
     let root_url = Url::parse(&state.table_root)?;
-    let vopt = dv_info
-        .get_selection_vector(extern_engine_interface.table_client().as_ref(), &root_url)?;
+    let vopt =
+        dv_info.get_selection_vector(extern_engine_interface.table_client().as_ref(), &root_url)?;
     match vopt {
         Some(v) => Ok(Box::into_raw(Box::new(v.into()))),
         None => Ok(std::ptr::null_mut()),
