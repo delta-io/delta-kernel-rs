@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::default::Default;
 use std::os::raw::{c_char, c_void};
+use std::ptr::NonNull;
 use std::sync::Arc;
 use tracing::debug;
 use url::Url;
@@ -18,17 +19,19 @@ use handle::{ArcHandle, BoxHandle, SizedArcHandle, Unconstructable};
 
 pub mod scan;
 
+pub(crate) type NullableCvoid = Option<NonNull<c_void>>;
+
 /// Model iterators. This allows an engine to specify iteration however it likes, and we simply wrap
 /// the engine functions. The engine retains ownership of the iterator.
 #[repr(C)]
 pub struct EngineIterator {
     // Opaque data that will be iterated over. This data will be passed to the get_next function
     // each time a next item is requested from the iterator
-    data: *mut c_void,
+    data: NonNull<c_void>,
     /// A function that should advance the iterator and return the next time from the data
     /// If the iterator is complete, it should return null. It should be safe to
     /// call `get_next()` multiple times if it is null.
-    get_next: extern "C" fn(data: *mut c_void) -> *const c_void,
+    get_next: extern "C" fn(data: NonNull<c_void>) -> *const c_void,
 }
 
 /// test function to print for items. this assumes each item is an `int`
@@ -110,7 +113,7 @@ impl TryFromStringSlice for String {
 
 /// Allow engines to allocate strings of their own type. the contract of calling a passed allocate
 /// function is that `kernel_str` is _only_ valid until the return from this function
-pub type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> *mut c_void;
+pub type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> NullableCvoid;
 
 /// TODO
 #[repr(C)]
@@ -123,7 +126,6 @@ impl BoxHandle for KernelBoolSlice {}
 
 impl From<Vec<bool>> for KernelBoolSlice {
     fn from(val: Vec<bool>) -> Self {
-        // TODO: Use `into_raw_parts` when it's stable
         let len = val.len();
         let boxed = val.into_boxed_slice();
         let ptr = Box::into_raw(boxed).cast();

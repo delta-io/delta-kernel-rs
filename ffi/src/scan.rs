@@ -13,7 +13,8 @@ use url::Url;
 use crate::{
     unwrap_kernel_expression, AllocateStringFn, EnginePredicate, ExternEngineInterface,
     ExternEngineInterfaceHandle, ExternResult, FromBoolSlice, IntoExternResult, KernelBoolSlice,
-    KernelExpressionVisitorState, KernelStringSlice, SnapshotHandle, TryFromStringSlice,
+    KernelExpressionVisitorState, KernelStringSlice, NullableCvoid, SnapshotHandle,
+    TryFromStringSlice,
 };
 
 use super::handle::{ArcHandle, BoxHandle};
@@ -193,9 +194,9 @@ unsafe fn kernel_scan_data_init_impl(
 #[no_mangle]
 pub unsafe extern "C" fn kernel_scan_data_next(
     data: &mut KernelScanDataIterator,
-    engine_context: *mut c_void,
+    engine_context: NullableCvoid,
     engine_visitor: extern "C" fn(
-        engine_context: *mut c_void,
+        engine_context: NullableCvoid,
         engine_data: *mut EngineDataHandle,
         selection_vector: KernelBoolSlice,
     ),
@@ -205,9 +206,9 @@ pub unsafe extern "C" fn kernel_scan_data_next(
 }
 fn kernel_scan_data_next_impl(
     data: &mut KernelScanDataIterator,
-    engine_context: *mut c_void,
+    engine_context: NullableCvoid,
     engine_visitor: extern "C" fn(
-        engine_context: *mut c_void,
+        engine_context: NullableCvoid,
         engine_data: *mut EngineDataHandle,
         selection_vector: KernelBoolSlice,
     ),
@@ -236,7 +237,7 @@ pub unsafe extern "C" fn kernel_scan_data_free(data: *mut KernelScanDataIterator
 }
 
 type CScanCallback = extern "C" fn(
-    engine_context: *mut c_void,
+    engine_context: NullableCvoid,
     path: KernelStringSlice,
     size: i64,
     dv_info: *const DvInfo,
@@ -262,12 +263,11 @@ pub unsafe extern "C" fn get_from_map(
     map: &mut CStringMap,
     key: KernelStringSlice,
     allocate_fn: AllocateStringFn,
-) -> *mut c_void {
+) -> NullableCvoid {
     let string_key = String::try_from_slice(key);
-    match map.values.get(&string_key) {
-        Some(v) => allocate_fn(v.as_str().into()),
-        None => std::ptr::null_mut(),
-    }
+    map.values
+        .get(&string_key)
+        .and_then(|v| allocate_fn(v.as_str().into()))
 }
 
 /// Get a selection vector out of a [`DvInfo`] struct
@@ -322,7 +322,7 @@ fn rust_callback(
 
 // Wrap up stuff from C so we can pass it through to our callback
 struct ContextWrapper {
-    engine_context: *mut c_void,
+    engine_context: NullableCvoid,
     callback: CScanCallback,
 }
 
@@ -335,7 +335,7 @@ struct ContextWrapper {
 pub unsafe extern "C" fn visit_scan_data(
     data: *mut EngineDataHandle,
     selection_vector: KernelBoolSlice,
-    engine_context: *mut c_void,
+    engine_context: NullableCvoid,
     callback: CScanCallback,
 ) {
     let selection_vec = Vec::<bool>::from_slice(selection_vector);
