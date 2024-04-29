@@ -1,0 +1,18 @@
+# this file gets loaded by build.rs as the set of default options for cbindgen
+
+
+# default to generating c bindings
+language = "C"
+
+# only applies to Cxx
+namespace = "ffi"
+
+[defines]
+"feature = default-client" = "DEFINE_DEFAULT_CLIENT"
+
+[export.mangle]
+remove_underscores = true
+
+[parse]
+parse_deps = true
+include = ["delta_kernel"]
