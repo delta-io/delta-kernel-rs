@@ -56,7 +56,7 @@ void set_builder_opt(struct EngineInterfaceBuilder *interface_builder, char* key
   set_builder_option(interface_builder, key_slice, val_slice);
 }
 
-void visit_callback(void* engine_context, const struct KernelStringSlice path, long size, struct CDvInfo *dv_info, struct CStringMap *partition_values) {
+void visit_callback(void* engine_context, const struct KernelStringSlice path, long size, const DvInfo *dv_info, struct CStringMap *partition_values) {
   printf("called back to actually read!\n  path: %.*s\n", path.len, path.ptr);
   struct EngineContext *context = engine_context;
   ExternResultKernelBoolSlice selection_vector_res = selection_vector_from_dv(dv_info, context->engine_interface, context->global_state);

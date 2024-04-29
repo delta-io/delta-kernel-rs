@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use delta_kernel::scan::state::{visit_scan_files, DvInfo, GlobalScanState};
-use delta_kernel::scan::{Scan as KernelScan, ScanBuilder, ScanData};
+use delta_kernel::scan::{Scan, ScanBuilder, ScanData};
 use delta_kernel::{DeltaResult, EngineData};
 use tracing::debug;
 use url::Url;
@@ -83,13 +83,9 @@ unsafe fn get_raw_arrow_data_impl(
     Ok(Box::leak(ret_data))
 }
 
-/// A scan over some delta data. See the docs for [`delta_kernel::scan::Scan`]
-pub struct Scan {
-    kernel_scan: KernelScan,
-}
 impl BoxHandle for Scan {}
 
-/// Get a handle to [`Scan`] over the table specified by the passed snapshot.
+/// Get a [`Scan`] over the table specified by the passed snapshot.
 /// # Safety
 ///
 /// Caller is responsible for passing a valid snapshot pointer, and engine interface pointer
@@ -116,8 +112,7 @@ unsafe fn scan_impl(
             scan_builder = scan_builder.with_predicate(predicate);
         }
     }
-    let kernel_scan = scan_builder.build();
-    Ok(BoxHandle::into_handle(Scan { kernel_scan }))
+    Ok(BoxHandle::into_handle(scan_builder.build()))
 }
 
 impl BoxHandle for GlobalScanState {}
@@ -129,13 +124,13 @@ impl BoxHandle for GlobalScanState {}
 /// Engine is responsible for providing a valid scan pointer
 #[no_mangle]
 pub unsafe extern "C" fn get_global_scan_state(scan: &mut Scan) -> *mut GlobalScanState {
-    let kernel_state = scan.kernel_scan.global_scan_state();
+    let kernel_state = scan.global_scan_state();
     BoxHandle::into_handle(kernel_state)
 }
 
 /// # Safety
 ///
-/// Caller is responsible for passing a valid handle.
+/// Caller is responsible for passing a valid global scan pointer.
 #[no_mangle]
 pub unsafe extern "C" fn drop_global_scan_state(state: *mut GlobalScanState) {
     BoxHandle::drop_handle(state);
@@ -181,9 +176,9 @@ unsafe fn kernel_scan_data_init_impl(
     scan: *mut Scan,
 ) -> DeltaResult<*mut KernelScanDataIterator> {
     let engine_interface = unsafe { ArcHandle::clone_as_arc(engine_interface) };
+    // we take back and consume the scan here
     let boxed_scan = unsafe { Box::from_raw(scan) };
-    let scan = boxed_scan.kernel_scan;
-    let scan_data = scan.scan_data(engine_interface.table_client().as_ref())?;
+    let scan_data = boxed_scan.scan_data(engine_interface.table_client().as_ref())?;
     let data = KernelScanDataIterator {
         data: Box::new(scan_data),
         engine_interface,
@@ -244,14 +239,11 @@ type CScanCallback = extern "C" fn(
     engine_context: *mut c_void,
     path: KernelStringSlice,
     size: i64,
-    dv_info: *mut CDvInfo,
+    dv_info: *const DvInfo,
     partition_map: *mut CStringMap,
 );
 
-pub struct CDvInfo {
-    dv_info: DvInfo,
-}
-impl BoxHandle for CDvInfo {}
+impl BoxHandle for DvInfo {}
 
 pub struct CStringMap {
     values: HashMap<String, String>,
@@ -278,29 +270,28 @@ pub unsafe extern "C" fn get_from_map(
     }
 }
 
-/// Get a selection vector out of a [`CDvInfo`] struct
+/// Get a selection vector out of a [`DvInfo`] struct
 ///
 /// # Safety
 /// Engine is responsible for providing valid pointers for each argument
 #[no_mangle]
 pub unsafe extern "C" fn selection_vector_from_dv(
-    info: &mut CDvInfo,
+    dv_info: &DvInfo,
     extern_engine_interface: *const ExternEngineInterfaceHandle,
     state: &mut GlobalScanState,
 ) -> ExternResult<*mut KernelBoolSlice> {
-    selection_vector_from_dv_impl(info, extern_engine_interface, state)
+    selection_vector_from_dv_impl(dv_info, extern_engine_interface, state)
         .into_extern_result(extern_engine_interface)
 }
 
 unsafe fn selection_vector_from_dv_impl(
-    info: &mut CDvInfo,
+    dv_info: &DvInfo,
     extern_engine_interface: *const ExternEngineInterfaceHandle,
     state: &mut GlobalScanState,
 ) -> DeltaResult<*mut KernelBoolSlice> {
     let extern_engine_interface = unsafe { ArcHandle::clone_as_arc(extern_engine_interface) };
     let root_url = Url::parse(&state.table_root)?;
-    let vopt = info
-        .dv_info
+    let vopt = dv_info
         .get_selection_vector(extern_engine_interface.table_client().as_ref(), &root_url)?;
     match vopt {
         Some(v) => Ok(Box::into_raw(Box::new(v.into()))),
@@ -317,7 +308,6 @@ fn rust_callback(
     dv_info: DvInfo,
     partition_values: HashMap<String, String>,
 ) {
-    let mut cdv_info = CDvInfo { dv_info };
     let partition_map_handle = BoxHandle::into_handle(CStringMap {
         values: partition_values,
     });
@@ -325,7 +315,7 @@ fn rust_callback(
         context.engine_context,
         path.into(),
         size,
-        &mut cdv_info,
+        &dv_info,
         partition_map_handle,
     );
 }
