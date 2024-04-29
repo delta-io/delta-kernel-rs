@@ -14,7 +14,7 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, EngineInterface, Error};
 
 mod handle;
-use handle::{ArcHandle, SizedArcHandle, Unconstructable};
+use handle::{ArcHandle, BoxHandle, SizedArcHandle, Unconstructable};
 
 pub mod scan;
 
@@ -118,6 +118,8 @@ pub struct KernelBoolSlice {
     ptr: *mut bool,
     len: usize,
 }
+
+impl BoxHandle for KernelBoolSlice {}
 
 impl From<Vec<bool>> for KernelBoolSlice {
     fn from(val: Vec<bool>) -> Self {
