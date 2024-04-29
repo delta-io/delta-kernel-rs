@@ -9,9 +9,11 @@ use crate::{
     },
     engine_data::{GetData, TypedGetData},
     schema::Schema,
-    DataVisitor, DeltaResult, EngineData, EngineInterface,
+    DataVisitor, DeltaResult, EngineData, EngineInterface, Error,
 };
 use serde::{Deserialize, Serialize};
+
+use super::file_stream::SCAN_ROW_SCHEMA;
 
 /// State that doesn't change beween scans
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -112,7 +114,10 @@ impl<T> DataVisitor for ScanFileVisitor<T> {
             // Since path column is required, use it to detect presence of an Add action
             if let Some(path) = getters[0].get_opt(row_index, "scanFile.path")? {
                 let size = getters[1].get(row_index, "scanFile.size")?;
-                let deletion_vector = visit_deletion_vector_at(row_index, &getters[3..])?;
+                let dv_index = SCAN_ROW_SCHEMA
+                    .index_of("deletionVector")
+                    .ok_or_else(|| Error::missing_column("deletionVector"))?;
+                let deletion_vector = visit_deletion_vector_at(row_index, &getters[dv_index..])?;
                 let dv_info = DvInfo { deletion_vector };
                 let partition_values =
                     getters[8].get(row_index, "scanFile.fileConstantValues.partitionValues")?;
