@@ -125,8 +125,7 @@ impl BoxHandle for GlobalScanState {}
 /// Engine is responsible for providing a valid scan pointer
 #[no_mangle]
 pub unsafe extern "C" fn get_global_scan_state(scan: &mut Scan) -> *mut GlobalScanState {
-    let kernel_state = scan.global_scan_state();
-    BoxHandle::into_handle(kernel_state)
+    BoxHandle::into_handle(scan.global_scan_state())
 }
 
 /// # Safety
