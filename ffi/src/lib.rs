@@ -30,7 +30,7 @@ pub struct EngineIterator {
     data: NonNull<c_void>,
     /// A function that should advance the iterator and return the next time from the data
     /// If the iterator is complete, it should return null. It should be safe to
-    /// call `get_next()` multiple times if it is null.
+    /// call `get_next()` multiple times if it returns null.
     get_next: extern "C" fn(data: NonNull<c_void>) -> *const c_void,
 }
 

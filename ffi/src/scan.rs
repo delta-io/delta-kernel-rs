@@ -239,7 +239,7 @@ type CScanCallback = extern "C" fn(
     engine_context: NullableCvoid,
     path: KernelStringSlice,
     size: i64,
-    dv_info: *const DvInfo,
+    dv_info: &DvInfo,
     partition_map: *mut CStringMap,
 );
 
