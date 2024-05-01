@@ -1,18 +1,15 @@
 /// FFI interface for the delta kernel
 ///
 /// Exposes that an engine needs to call from C/C++ to interface with kernel
-#[cfg(feature = "default-client")]
 use std::collections::HashMap;
 use std::default::Default;
 use std::os::raw::{c_char, c_void};
-use std::path::PathBuf;
+use std::ptr::NonNull;
 use std::sync::Arc;
 use tracing::debug;
 use url::Url;
 
-use delta_kernel::actions::Add;
 use delta_kernel::expressions::{BinaryOperator, Expression, Scalar};
-use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::{DataType, PrimitiveType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, EngineInterface, Error};
@@ -20,17 +17,21 @@ use delta_kernel::{DeltaResult, EngineInterface, Error};
 mod handle;
 use handle::{ArcHandle, BoxHandle, SizedArcHandle, Unconstructable};
 
+pub mod scan;
+
+pub(crate) type NullableCvoid = Option<NonNull<c_void>>;
+
 /// Model iterators. This allows an engine to specify iteration however it likes, and we simply wrap
 /// the engine functions. The engine retains ownership of the iterator.
 #[repr(C)]
 pub struct EngineIterator {
     // Opaque data that will be iterated over. This data will be passed to the get_next function
     // each time a next item is requested from the iterator
-    data: *mut c_void,
+    data: NonNull<c_void>,
     /// A function that should advance the iterator and return the next time from the data
     /// If the iterator is complete, it should return null. It should be safe to
-    /// call `get_next()` multiple times if it is null.
-    get_next: extern "C" fn(data: *mut c_void) -> *const c_void,
+    /// call `get_next()` multiple times if it returns null.
+    get_next: extern "C" fn(data: NonNull<c_void>) -> *const c_void,
 }
 
 /// test function to print for items. this assumes each item is an `int`
@@ -108,6 +109,47 @@ impl TryFromStringSlice for String {
         let slice = unsafe { std::slice::from_raw_parts(slice.ptr.cast(), slice.len) };
         std::str::from_utf8(slice).unwrap().to_string()
     }
+}
+
+/// Allow engines to allocate strings of their own type. the contract of calling a passed allocate
+/// function is that `kernel_str` is _only_ valid until the return from this function
+pub type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> NullableCvoid;
+
+/// TODO
+#[repr(C)]
+pub struct KernelBoolSlice {
+    ptr: *mut bool,
+    len: usize,
+}
+
+impl BoxHandle for KernelBoolSlice {}
+
+impl From<Vec<bool>> for KernelBoolSlice {
+    fn from(val: Vec<bool>) -> Self {
+        let len = val.len();
+        let boxed = val.into_boxed_slice();
+        let ptr = Box::into_raw(boxed).cast();
+        KernelBoolSlice { ptr, len }
+    }
+}
+
+trait FromBoolSlice {
+    unsafe fn from_slice(slice: KernelBoolSlice) -> Self;
+}
+
+impl FromBoolSlice for Vec<bool> {
+    unsafe fn from_slice(slice: KernelBoolSlice) -> Self {
+        Vec::from_raw_parts(slice.ptr, slice.len, slice.len)
+    }
+}
+
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn drop_bool_slice(slice: *mut KernelBoolSlice) {
+    let vec = unsafe { Vec::from_raw_parts((*slice).ptr, (*slice).len, (*slice).len) };
+    debug!("Dropping bool slice. It is {vec:#?}");
 }
 
 #[repr(C)]
@@ -196,14 +238,14 @@ pub struct EngineError {
 }
 
 /// Semantics: Kernel will always immediately return the leaked engine error to the engine (if it
-/// allocated one at all), and engine is responsible to free it.
+/// allocated one at all), and engine is responsible for freeing it.
 #[repr(C)]
 pub enum ExternResult<T> {
     Ok(T),
     Err(*mut EngineError),
 }
 
-type AllocateErrorFn =
+pub type AllocateErrorFn =
     extern "C" fn(etype: KernelError, msg: KernelStringSlice) -> *mut EngineError;
 
 // NOTE: We can't "just" impl From<DeltaResult<T>> because we require an error allocator.
@@ -220,7 +262,7 @@ impl<T> ExternResult<T> {
 }
 
 /// Represents an engine error allocator. Ultimately all implementations will fall back to an
-/// [AllocateErrorFn] provided by the engine, but the trait allows us to conveniently access the
+/// [`AllocateErrorFn`] provided by the engine, but the trait allows us to conveniently access the
 /// allocator in various types that may wrap it.
 pub trait AllocateError {
     /// Allocates a new error in engine memory and returns the resulting pointer. The engine is
@@ -315,13 +357,13 @@ struct ExternEngineInterfaceVtable {
 /// # Safety
 ///
 /// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
-/// responsible to handle any races that could result.
+/// responsible for handling  any races that could result.
 unsafe impl Send for ExternEngineInterfaceVtable {}
 
 /// # Safety
 ///
 /// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
-/// responsible to handle any races that could result.
+/// responsible for handling any races that could result.
 ///
 /// These are needed because anything wrapped in Arc "should" implement it
 /// Basically, by failing to implement these traits, we forbid the engine from being able to declare
@@ -340,36 +382,124 @@ impl ExternEngineInterface for ExternEngineInterfaceVtable {
 
 /// # Safety
 ///
-/// Caller is responsible to pass a valid path pointer.
+/// Caller is responsible for passing a valid path pointer.
 unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<Url> {
     let path = unsafe { String::try_from_slice(path) };
-    let path = std::fs::canonicalize(PathBuf::from(path)).map_err(Error::generic)?;
-    Url::from_directory_path(path).map_err(|_| Error::generic("Invalid url"))
+    Ok(Url::parse(&path)?)
+}
+
+// A client builder allows setting options before building an actual client
+pub struct EngineInterfaceBuilder {
+    url: Url,
+    allocate_fn: AllocateErrorFn,
+    options: HashMap<String, String>,
+}
+
+impl EngineInterfaceBuilder {
+    fn set_option(&mut self, key: String, val: String) {
+        self.options.insert(key, val);
+    }
+}
+
+/// Get a "builder" that can be used to construct an engine client. The function
+/// [`set_builder_option`] can be used to set options on the builder prior to constructing the
+/// actual client
+///
+/// # Safety
+/// Caller is responsible for passing a valid path pointer.
+#[cfg(feature = "default-client")]
+#[no_mangle]
+pub unsafe extern "C" fn get_engine_interface_builder(
+    path: KernelStringSlice,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<*mut EngineInterfaceBuilder> {
+    get_engine_interface_builder_impl(path, allocate_error).into_extern_result(allocate_error)
+}
+
+#[cfg(feature = "default-client")]
+unsafe fn get_engine_interface_builder_impl(
+    path: KernelStringSlice,
+    allocate_fn: AllocateErrorFn,
+) -> DeltaResult<*mut EngineInterfaceBuilder> {
+    let url = unsafe { unwrap_and_parse_path_as_url(path) }?;
+    let builder = Box::new(EngineInterfaceBuilder {
+        url,
+        allocate_fn,
+        options: HashMap::default(),
+    });
+    Ok(Box::into_raw(builder))
+}
+
+/// Set an option on the builder
+///
+/// # Safety
+///
+/// Client must pass a valid ClientBuilder pointer, and valid slices for key and value
+#[cfg(feature = "default-client")]
+#[no_mangle]
+pub unsafe extern "C" fn set_builder_option(
+    builder: &mut EngineInterfaceBuilder,
+    key: KernelStringSlice,
+    value: KernelStringSlice,
+) {
+    let key = unsafe { String::try_from_slice(key) };
+    let value = unsafe { String::try_from_slice(value) };
+    builder.set_option(key, value);
+}
+
+/// Consume the builder and return an engine interface. After calling, the passed pointer is _no
+/// longer valid_.
+///
+/// # Safety
+///
+/// Caller is responsible to pass a valid ClientBuilder pointer, and to not use it again afterwards
+#[cfg(feature = "default-client")]
+#[no_mangle]
+pub unsafe extern "C" fn builder_build(
+    builder: *mut EngineInterfaceBuilder,
+) -> ExternResult<*const ExternEngineInterfaceHandle> {
+    let builder_box = unsafe { Box::from_raw(builder) };
+    get_default_client_impl(
+        builder_box.url,
+        builder_box.options,
+        builder_box.allocate_fn,
+    )
+    .into_extern_result(builder_box.allocate_fn)
 }
 
 /// # Safety
 ///
-/// Caller is responsible to pass a valid path pointer.
+/// Caller is responsible for passing a valid path pointer.
 #[cfg(feature = "default-client")]
 #[no_mangle]
 pub unsafe extern "C" fn get_default_client(
     path: KernelStringSlice,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<*const ExternEngineInterfaceHandle> {
-    get_default_client_impl(path, allocate_error).into_extern_result(allocate_error)
+    get_default_default_client_impl(path, allocate_error).into_extern_result(allocate_error)
 }
 
+// get the default version of the default client :)
 #[cfg(feature = "default-client")]
-unsafe fn get_default_client_impl(
+unsafe fn get_default_default_client_impl(
     path: KernelStringSlice,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<*const ExternEngineInterfaceHandle> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) }?;
+    get_default_client_impl(url, Default::default(), allocate_error)
+}
+
+#[cfg(feature = "default-client")]
+unsafe fn get_default_client_impl(
+    url: Url,
+    options: HashMap<String, String>,
+    allocate_error: AllocateErrorFn,
+) -> DeltaResult<*const ExternEngineInterfaceHandle> {
     use delta_kernel::client::default::executor::tokio::TokioBackgroundExecutor;
     use delta_kernel::client::default::DefaultEngineInterface;
     let table_client = DefaultEngineInterface::<TokioBackgroundExecutor>::try_new(
         &url,
-        HashMap::<String, String>::new(),
+        options,
         Arc::new(TokioBackgroundExecutor::new()),
     );
     let client = Arc::new(table_client.map_err(Error::generic)?);
@@ -382,7 +512,7 @@ unsafe fn get_default_client_impl(
 
 /// # Safety
 ///
-/// Caller is responsible to pass a valid handle.
+/// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn drop_table_client(table_client: *const ExternEngineInterfaceHandle) {
     ArcHandle::drop_handle(table_client);
@@ -400,7 +530,7 @@ impl SizedArcHandle for SnapshotHandle {
 ///
 /// # Safety
 ///
-/// Caller is responsible to pass valid handles and path pointer.
+/// Caller is responsible for passing valid handles and path pointer.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot(
     path: KernelStringSlice,
@@ -421,7 +551,7 @@ unsafe fn snapshot_impl(
 
 /// # Safety
 ///
-/// Caller is responsible to pass a valid handle.
+/// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn drop_snapshot(snapshot: *const SnapshotHandle) {
     ArcHandle::drop_handle(snapshot);
@@ -431,7 +561,7 @@ pub unsafe extern "C" fn drop_snapshot(snapshot: *const SnapshotHandle) {
 ///
 /// # Safety
 ///
-/// Caller is responsible to pass a valid handle.
+/// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn version(snapshot: *const SnapshotHandle) -> u64 {
     let snapshot = unsafe { ArcHandle::clone_as_arc(snapshot) };
@@ -461,7 +591,7 @@ pub struct EngineSchemaVisitor {
 
 /// # Safety
 ///
-/// Caller is responsible to pass a valid handle.
+/// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn visit_schema(
     snapshot: *const SnapshotHandle,
@@ -711,108 +841,4 @@ pub extern "C" fn visit_expression_literal_long(
     value: i64,
 ) -> usize {
     wrap_expression(state, Expression::Literal(Scalar::from(value)))
-}
-
-// Intentionally opaque to the engine.
-pub struct KernelScanFileIterator {
-    // Box -> Wrap its unsized content this struct is fixed-size with thin pointers.
-    // Item = String -> Owned items because rust can't correctly express lifetimes for borrowed items
-    // (we would need a way to assert that item lifetimes are bounded by the iterator's lifetime).
-    files: Box<dyn Iterator<Item = DeltaResult<Add>>>,
-
-    // Also keep a reference to the external client for its error allocator.
-    // Parquet and Json handlers don't hold any reference to the tokio reactor, so the iterator
-    // terminates early if the last table client goes out of scope.
-    table_client: Arc<dyn ExternEngineInterface>,
-}
-
-impl BoxHandle for KernelScanFileIterator {}
-
-impl Drop for KernelScanFileIterator {
-    fn drop(&mut self) {
-        debug!("dropping KernelScanFileIterator");
-    }
-}
-
-/// Get a FileList for all the files that need to be read from the table.
-/// # Safety
-///
-/// Caller is responsible to pass a valid snapshot pointer.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_scan_files_init(
-    snapshot: *const SnapshotHandle,
-    table_client: *const ExternEngineInterfaceHandle,
-    predicate: Option<&mut EnginePredicate>,
-) -> ExternResult<*mut KernelScanFileIterator> {
-    kernel_scan_files_init_impl(snapshot, table_client, predicate).into_extern_result(table_client)
-}
-
-fn kernel_scan_files_init_impl(
-    snapshot: *const SnapshotHandle,
-    extern_table_client: *const ExternEngineInterfaceHandle,
-    predicate: Option<&mut EnginePredicate>,
-) -> DeltaResult<*mut KernelScanFileIterator> {
-    let snapshot = unsafe { ArcHandle::clone_as_arc(snapshot) };
-    let extern_table_client = unsafe { ArcHandle::clone_as_arc(extern_table_client) };
-    let mut scan_builder = ScanBuilder::new(snapshot.clone());
-    if let Some(predicate) = predicate {
-        // TODO: There is a lot of redundancy between the various visit_expression_XXX methods here,
-        // vs. ProvidesMetadataFilter trait and the class hierarchy that supports it. Can we justify
-        // combining the two, so that native rust kernel code also uses the visitor idiom? Doing so
-        // might mean kernel no longer needs to define an expression class hierarchy of its own (at
-        // least, not for data skipping). Things may also look different after we remove arrow code
-        // from the kernel proper and make it one of the sensible default engine clients instead.
-        let mut visitor_state = KernelExpressionVisitorState::new();
-        let exprid = (predicate.visitor)(predicate.predicate, &mut visitor_state);
-        if let Some(predicate) = unwrap_kernel_expression(&mut visitor_state, exprid) {
-            println!("Got predicate: {}", predicate);
-            scan_builder = scan_builder.with_predicate(predicate);
-        }
-    }
-    let scan_adds = scan_builder
-        .build()
-        .files(extern_table_client.table_client().as_ref())?;
-    let files = KernelScanFileIterator {
-        files: Box::new(scan_adds),
-        table_client: extern_table_client,
-    };
-    Ok(files.into_handle())
-}
-
-/// # Safety
-///
-/// The iterator must be valid (returned by [kernel_scan_files_init]) and not yet freed by
-/// [kernel_scan_files_free]. The visitor function pointer must be non-null.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_scan_files_next(
-    files: &mut KernelScanFileIterator,
-    engine_context: *mut c_void,
-    engine_visitor: extern "C" fn(engine_context: *mut c_void, file_name: KernelStringSlice),
-) -> ExternResult<bool> {
-    kernel_scan_files_next_impl(files, engine_context, engine_visitor)
-        .into_extern_result(files.table_client.error_allocator())
-}
-fn kernel_scan_files_next_impl(
-    files: &mut KernelScanFileIterator,
-    engine_context: *mut c_void,
-    engine_visitor: extern "C" fn(engine_context: *mut c_void, file_name: KernelStringSlice),
-) -> DeltaResult<bool> {
-    if let Some(add) = files.files.next().transpose()? {
-        debug!("Got file: {}", add.path);
-        (engine_visitor)(engine_context, add.path.as_str().into());
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
-/// # Safety
-///
-/// Caller is responsible to (at most once) pass a valid pointer returned by a call to
-/// [kernel_scan_files_init].
-// we should probably be consistent with drop vs. free on engine side (probably the latter is more
-// intuitive to non-rust code)
-#[no_mangle]
-pub unsafe extern "C" fn kernel_scan_files_free(files: *mut KernelScanFileIterator) {
-    BoxHandle::drop_handle(files);
 }

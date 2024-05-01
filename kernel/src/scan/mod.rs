@@ -4,16 +4,20 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use tracing::debug;
+use url::Url;
 
-use self::file_stream::log_replay_iter;
+use self::file_stream::{log_replay_iter, scan_action_iter};
+use self::state::GlobalScanState;
+use crate::actions::deletion_vector::{treemap_to_bools, DeletionVectorDescriptor};
 use crate::actions::{get_log_schema, Add, ADD_NAME, REMOVE_NAME};
 use crate::expressions::{Expression, Scalar};
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{DataType, Schema, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::{DeltaResult, EngineData, EngineInterface, Error, FileMeta};
 
 mod data_skipping;
 pub mod file_stream;
+pub mod state;
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
@@ -105,10 +109,12 @@ pub struct ScanResult {
 
 /// Scan uses this to set up what kinds of columns it is scanning. A reference to the field is
 /// stored so we can get the name and data_type out when building the read expression
-enum ColumnType<'a> {
+pub enum ColumnType<'a> {
     Selected(&'a StructField),
     Partition(&'a StructField),
 }
+
+pub type ScanData = (Box<dyn EngineData>, Vec<bool>);
 
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
@@ -128,7 +134,7 @@ impl std::fmt::Debug for Scan {
 }
 
 impl Scan {
-    /// Get a shred reference to the [`Schema`] of the scan.
+    /// Get a shared reference to the [`Schema`] of the scan.
     ///
     /// [`Schema`]: crate::schema::Schema
     pub fn schema(&self) -> &SchemaRef {
@@ -142,7 +148,7 @@ impl Scan {
 
     /// Get an iterator of Add actions that should be included in scan for a query. This handles
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible)
-    pub fn files(
+    pub(crate) fn files(
         &self,
         engine_interface: &dyn EngineInterface,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
@@ -164,36 +170,64 @@ impl Scan {
         ))
     }
 
-    /// This is the main method to 'materialize' the scan. It returns a [`Result`] of
-    /// `Vec<`[`ScanResult`]`>`. This calls [`Scan::files`] to get a set of `Add` actions for the scan,
-    /// and then uses the `engine_interface`'s [`crate::ParquetHandler`] to read the actual table
-    /// data. Each [`ScanResult`] encapsulates the raw data and an optional boolean vector built
-    /// from the deletion vector if it was present. See the documentation for [`ScanResult`] for
-    /// more details.
+    /// Get an iterator of [`EngineData`]s that should be included in scan for a query. This handles
+    /// log-replay, reconciling Add and Remove actions, and applying data skipping (if
+    /// possible). Each item in the returned iterator is a tuple of:
+    /// - `Box<dyn EngineData>`: Data in engine format, where each row represents a file to be
+    /// scanned. The schema for each row can be obtained by calling [`scan_row_schema`].
+    /// - `Vec<bool>`: A selection vector. If a row is at index `i` and this vector is `false` at
+    /// index `i`, then that row should *not* be processed (i.e. it is filtered out). If the vector
+    /// is `true` at index `i` the row *should* be processed.
+    pub fn scan_data(
+        &self,
+        engine_interface: &dyn EngineInterface,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanData>>> {
+        let commit_read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?;
+        let checkpoint_read_schema = get_log_schema().project(&[ADD_NAME])?;
+
+        let log_iter = self.snapshot.log_segment.replay(
+            engine_interface,
+            commit_read_schema,
+            checkpoint_read_schema,
+            self.predicate.clone(),
+        )?;
+
+        Ok(scan_action_iter(
+            engine_interface,
+            log_iter,
+            &self.read_schema,
+            &self.predicate,
+        ))
+    }
+
+    /// Get global state that is valid for the entire scan. This is somewhat expensive so should
+    /// only be called once per scan.
+    pub fn global_scan_state(&self) -> GlobalScanState {
+        let partition_columns = &self.snapshot.metadata().partition_columns;
+        let (_all_fields, read_fields, _have_partition_cols) =
+            get_state_info(self.schema().as_ref(), partition_columns);
+        let read_schema = StructType::new(read_fields);
+        let logical_schema = self.schema().as_ref().clone();
+        GlobalScanState {
+            table_root: self.snapshot.table_root.to_string(),
+            partition_columns: partition_columns.clone(),
+            logical_schema,
+            read_schema,
+        }
+    }
+
+    /// Perform an "all in one" scan. This will use the provided `engine_interface` to read and
+    /// process all the data for the query. Each [`ScanResult`] in the resultant vector encapsulates
+    /// the raw data and an optional boolean vector built from the deletion vector if it was
+    /// present. See the documentation for [`ScanResult`] for more details. Generally
+    /// connectors/engines will want to use [`Scan::scan_data`] so they can have more control over
+    /// the execution of the scan.
+    // This calls [`Scan::files`] to get a set of `Add` actions for the scan, and then uses the
+    // `engine_interface`'s [`crate::ParquetHandler`] to read the actual table data.
     pub fn execute(&self, engine_interface: &dyn EngineInterface) -> DeltaResult<Vec<ScanResult>> {
         let partition_columns = &self.snapshot.metadata().partition_columns;
-        let mut read_fields = Vec::with_capacity(self.schema().fields.len());
-        let mut have_partition_cols = false;
-        // Loop over all selected fields and note if they are columns that will be read from the
-        // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
-        // be filled in by evaluating an expression ([`ColumnType::Partition`])
-        let all_fields: Vec<_> = self
-            .schema()
-            .fields()
-            .map(|field| {
-                if partition_columns.contains(field.name()) {
-                    // Store the raw field, we will turn it into an expression in the inner loop
-                    // since the expression could be different for each add file
-                    have_partition_cols = true;
-                    ColumnType::Partition(field)
-                } else {
-                    // Add to read schema, store field so we can build a `Column` expression later
-                    // if needed (i.e. if we have partition columns)
-                    read_fields.push(field.clone());
-                    ColumnType::Selected(field)
-                }
-            })
-            .collect();
+        let (all_fields, read_fields, have_partition_cols) =
+            get_state_info(self.schema().as_ref(), partition_columns);
         let read_schema = Arc::new(StructType::new(read_fields));
         debug!("Executing scan with read schema {read_schema:#?}");
         let output_schema = DataType::Struct(Box::new(self.schema().as_ref().clone()));
@@ -238,11 +272,11 @@ impl Scan {
                 .as_ref()
                 .map(|dv_descriptor| {
                     let fs_client = engine_interface.get_file_system_client();
-                    dv_descriptor.read(fs_client, self.snapshot.table_root.clone())
+                    dv_descriptor.read(fs_client, &self.snapshot.table_root)
                 })
                 .transpose()?;
 
-            let mut dv_mask = dv_treemap.map(super::actions::deletion_vector::treemap_to_bools);
+            let mut dv_mask = dv_treemap.map(treemap_to_bools);
 
             for read_result in read_results {
                 let len = if let Ok(ref res) = read_result {
@@ -282,6 +316,30 @@ impl Scan {
     }
 }
 
+/// Get the schema that scan rows (from [`Scan::scan_data`]) will be returned with.
+///
+/// It is:
+/// ```ignored
+/// {
+///    path: string,
+///    size: long,
+///    modificationTime: long,
+///    deletionVector: {
+///      storageType: string,
+///      pathOrInlineDv: string,
+///      offset: int,
+///      sizeInBytes: int,
+///      cardinality: long,
+///    },
+///    fileConstantValues: {
+///      partitionValues: map<string, string>
+///    }
+/// }
+/// ```
+pub fn scan_row_schema() -> Schema {
+    file_stream::SCAN_ROW_SCHEMA.as_ref().clone()
+}
+
 fn parse_partition_value(raw: Option<&String>, data_type: &DataType) -> DeltaResult<Scalar> {
     match raw {
         Some(v) => match data_type {
@@ -294,7 +352,197 @@ fn parse_partition_value(raw: Option<&String>, data_type: &DataType) -> DeltaRes
     }
 }
 
-#[cfg(all(test, feature = "default-client"))]
+/// Get the state needed to process a scan. In particular this returns a triple of
+/// (all_fields_in_query, fields_to_read_from_parquet, have_partition_cols) where:
+/// - all_fields_in_query - all fields in the query as [`ColumnType`] enums
+/// - fields_to_read_from_parquet - Which fields should be read from the raw parquet files
+/// - have_partition_cols - boolean indicating if we have partition columns in this query
+fn get_state_info<'a>(
+    schema: &'a Schema,
+    partition_columns: &[String],
+) -> (Vec<ColumnType<'a>>, Vec<StructField>, bool) {
+    let mut have_partition_cols = false;
+    let mut read_fields = Vec::with_capacity(schema.fields.len());
+    // Loop over all selected fields and note if they are columns that will be read from the
+    // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
+    // be filled in by evaluating an expression ([`ColumnType::Partition`])
+    let column_types = schema
+        .fields()
+        .map(|field| {
+            if partition_columns.contains(field.name()) {
+                // todo: this is slow(ish)
+                // Store the raw field, we will turn it into an expression in the inner loop
+                // since the expression could be different for each add file
+                have_partition_cols = true;
+                ColumnType::Partition(field)
+            } else {
+                // Add to read schema, store field so we can build a `Column` expression later
+                // if needed (i.e. if we have partition columns)
+                read_fields.push(field.clone());
+                ColumnType::Selected(field)
+            }
+        })
+        .collect();
+    (column_types, read_fields, have_partition_cols)
+}
+
+pub fn selection_vector(
+    engine_interface: &dyn EngineInterface,
+    descriptor: &DeletionVectorDescriptor,
+    table_root: &Url,
+) -> DeltaResult<Vec<bool>> {
+    let fs_client = engine_interface.get_file_system_client();
+    let dv_treemap = descriptor.read(fs_client, table_root)?;
+    Ok(treemap_to_bools(dv_treemap))
+}
+
+pub fn transform_to_logical(
+    engine_interface: &dyn EngineInterface,
+    data: Box<dyn EngineData>,
+    global_state: &GlobalScanState,
+    partition_values: &std::collections::HashMap<String, String>,
+) -> DeltaResult<Box<dyn EngineData>> {
+    let (all_fields, _read_fields, have_partition_cols) = get_state_info(
+        &global_state.logical_schema,
+        &global_state.partition_columns,
+    );
+    let read_schema = Arc::new(global_state.read_schema.clone());
+    if have_partition_cols {
+        // need to add back partition cols
+        let all_fields: Vec<Expression> = all_fields
+            .iter()
+            .map(|field| match field {
+                ColumnType::Partition(field) => {
+                    let value_expression = parse_partition_value(
+                        partition_values.get(field.name()),
+                        field.data_type(),
+                    )?;
+                    Ok::<Expression, Error>(Expression::Literal(value_expression))
+                }
+                ColumnType::Selected(field) => Ok(Expression::column(field.name())),
+            })
+            .try_collect()?;
+        let read_expression = Expression::Struct(all_fields);
+        let result = engine_interface
+            .get_expression_handler()
+            .get_evaluator(
+                read_schema.clone(),
+                read_expression.clone(),
+                DataType::Struct(Box::new(global_state.logical_schema.clone())),
+            )
+            .evaluate(data.as_ref())?;
+        Ok(result)
+    } else {
+        Ok(data)
+    }
+}
+
+// some utils that are used in file_stream.rs and state.rs tests
+#[cfg(test)]
+pub(crate) mod test_utils {
+    use std::{collections::HashMap, sync::Arc};
+
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+
+    use crate::{
+        actions::get_log_schema,
+        client::{
+            arrow_data::ArrowEngineData,
+            sync::{json::SyncJsonHandler, SyncEngineInterface},
+        },
+        scan::file_stream::scan_action_iter,
+        schema::{StructField, StructType},
+        EngineData, JsonHandler,
+    };
+
+    use super::state::DvInfo;
+
+    // TODO(nick): Merge all copies of this into one "test utils" thing
+    fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
+        let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
+        let schema = Arc::new(ArrowSchema::new(vec![string_field]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
+            .expect("Can't convert to record batch");
+        Box::new(ArrowEngineData::new(batch))
+    }
+
+    // simple add
+    pub(crate) fn add_batch_simple() -> Box<ArrowEngineData> {
+        let handler = SyncJsonHandler {};
+        let json_strings: StringArray = vec![
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
+        ]
+        .into();
+        let output_schema = Arc::new(get_log_schema().clone());
+        let parsed = handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        ArrowEngineData::try_from_engine_data(parsed).unwrap()
+    }
+
+    // add batch with a removed file
+    pub(crate) fn add_batch_with_remove() -> Box<ArrowEngineData> {
+        let handler = SyncJsonHandler {};
+        let json_strings: StringArray = vec![
+            r#"{"remove":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","deletionTimestamp":1677811194426,"dataChange":true,"extendedFileMetadata":true,"partitionValues":{},"size":635,"tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
+        ]
+        .into();
+        let output_schema = Arc::new(get_log_schema().clone());
+        let parsed = handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        ArrowEngineData::try_from_engine_data(parsed).unwrap()
+    }
+
+    #[allow(clippy::vec_box)]
+    pub(crate) fn run_with_validate_callback<T: Clone>(
+        batch: Vec<Box<ArrowEngineData>>,
+        expected_sel_vec: Vec<bool>,
+        context: T,
+        validate_callback: fn(
+            context: &mut T,
+            path: &str,
+            size: i64,
+            dv_info: DvInfo,
+            partition_values: HashMap<String, String>,
+        ),
+    ) {
+        let interface = SyncEngineInterface::new();
+        // doesn't matter here
+        let table_schema = Arc::new(StructType::new(vec![StructField::new(
+            "foo",
+            crate::schema::DataType::STRING,
+            false,
+        )]));
+        let iter = scan_action_iter(
+            &interface,
+            batch.into_iter().map(|batch| Ok((batch as _, true))),
+            &table_schema,
+            &None,
+        );
+        let mut batch_count = 0;
+        for res in iter {
+            let (batch, sel) = res.unwrap();
+            assert_eq!(sel, expected_sel_vec);
+            crate::scan::state::visit_scan_files(
+                batch.as_ref(),
+                sel,
+                context.clone(),
+                validate_callback,
+            )
+            .unwrap();
+            batch_count += 1;
+        }
+        assert_eq!(batch_count, 1);
+    }
+}
+
+#[cfg(all(test, feature = "sync-client"))]
 mod tests {
     use std::path::PathBuf;
 

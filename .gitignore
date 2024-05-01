@@ -3,3 +3,4 @@
 /Cargo.lock
 acceptance/tests/dat/
 .vscode
+ffi/examples/read-table/build

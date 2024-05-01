@@ -137,26 +137,7 @@ impl AddVisitor {
 
         // TODO(nick) extract tags if we ever need them at getters[6]
 
-        let deletion_vector = if let Some(storage_type) =
-            getters[7].get_opt(row_index, "add.deletionVector.storageType")?
-        {
-            // there is a storageType, so the whole DV must be there
-            let path_or_inline_dv: String =
-                getters[8].get(row_index, "add.deletionVector.pathOrInlineDv")?;
-            let offset: Option<i32> = getters[9].get_opt(row_index, "add.deletionVector.offset")?;
-            let size_in_bytes: i32 =
-                getters[10].get(row_index, "add.deletionVector.sizeInBytes")?;
-            let cardinality: i64 = getters[11].get(row_index, "add.deletionVector.cardinality")?;
-            Some(DeletionVectorDescriptor {
-                storage_type,
-                path_or_inline_dv,
-                offset,
-                size_in_bytes,
-                cardinality,
-            })
-        } else {
-            None
-        };
+        let deletion_vector = visit_deletion_vector_at(row_index, &getters[7..])?;
 
         let base_row_id: Option<i64> = getters[12].get_opt(row_index, "add.base_row_id")?;
         let default_row_commit_version: Option<i64> =
@@ -215,28 +196,7 @@ impl RemoveVisitor {
 
         // TODO(nick) tags are skipped in getters[6]
 
-        let deletion_vector = if let Some(storage_type) =
-            getters[7].get_opt(row_index, "remove.deletionVector.storageType")?
-        {
-            // there is a storageType, so the whole DV must be there
-            let path_or_inline_dv: String =
-                getters[8].get(row_index, "remove.deletionVector.pathOrInlineDv")?;
-            let offset: Option<i32> =
-                getters[9].get_opt(row_index, "remove.deletionVector.offset")?;
-            let size_in_bytes: i32 =
-                getters[10].get(row_index, "remove.deletionVector.sizeInBytes")?;
-            let cardinality: i64 =
-                getters[11].get(row_index, "remove.deletionVector.cardinality")?;
-            Some(DeletionVectorDescriptor {
-                storage_type,
-                path_or_inline_dv,
-                offset,
-                size_in_bytes,
-                cardinality,
-            })
-        } else {
-            None
-        };
+        let deletion_vector = visit_deletion_vector_at(row_index, &getters[7..])?;
 
         let base_row_id: Option<i64> = getters[12].get_opt(row_index, "remove.baseRowId")?;
         let default_row_commit_version: Option<i64> =
@@ -329,6 +289,32 @@ impl DataVisitor for TransactionVisitor {
             }
         }
         Ok(())
+    }
+}
+
+/// Get a DV out of some engine data. The caller is responsible for slicing the `getters` slice such
+/// that the first element contains the `storageType` element of the deletion vector.
+pub(crate) fn visit_deletion_vector_at<'a>(
+    row_index: usize,
+    getters: &[&'a dyn GetData<'a>],
+) -> DeltaResult<Option<DeletionVectorDescriptor>> {
+    if let Some(storage_type) =
+        getters[0].get_opt(row_index, "remove.deletionVector.storageType")?
+    {
+        let path_or_inline_dv: String =
+            getters[1].get(row_index, "deletionVector.pathOrInlineDv")?;
+        let offset: Option<i32> = getters[2].get_opt(row_index, "deletionVector.offset")?;
+        let size_in_bytes: i32 = getters[3].get(row_index, "deletionVector.sizeInBytes")?;
+        let cardinality: i64 = getters[4].get(row_index, "deletionVector.cardinality")?;
+        Ok(Some(DeletionVectorDescriptor {
+            storage_type,
+            path_or_inline_dv,
+            offset,
+            size_in_bytes,
+            cardinality,
+        }))
+    } else {
+        Ok(None)
     }
 }
 

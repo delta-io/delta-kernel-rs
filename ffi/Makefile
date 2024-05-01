@@ -10,6 +10,8 @@ OBJECTS=$(SOURCES:.c=.o)
 INCFLAGS=$(foreach TMP,$(INCPATHS),-I$(TMP))
 LIBFLAGS=$(foreach TMP,$(LIBPATHS),-L$(TMP))
 
+ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+
 all: $(SOURCES) $(BINARY)
 
 $(BINARY): $(OBJECTS)
@@ -21,7 +23,7 @@ run: $(BINARY)
 	LD_LIBRARY_PATH=$(LIBPATHS) ./$(BINARY) $(table)
 
 test: $(BINARY)
-	LD_LIBRARY_PATH=$(LIBPATHS) ./$(BINARY) ../kernel/tests/data/basic_partitioned
+	LD_LIBRARY_PATH=$(LIBPATHS) ./$(BINARY) file://$(ROOT_DIR)/../kernel/tests/data/basic_partitioned
 
 distclean: clean
 	rm -f $(BINARY)
