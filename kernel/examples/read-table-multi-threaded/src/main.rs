@@ -20,7 +20,7 @@ use clap::{Parser, ValueEnum};
 use url::Url;
 
 /// An example program that reads a table using multiple threads. This shows the use of the
-/// scan_files and scan_state methods on a Scan, that can be used to partition work to either
+/// scan_data and global_scan_state methods on a Scan, that can be used to partition work to either
 /// multiple threads, or workers (in the case of a distributed engine).
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -207,74 +207,67 @@ fn do_work(
     // get the type for the function calls
     let engine_interface: &dyn EngineInterface = engine_interface.as_ref();
     let read_schema = Arc::new(scan_state.read_schema.clone());
-    loop {
-        // in a loop, try and get a ScanFile
-        match scan_file_rx.recv() {
-            Ok(scan_file) => {
-                // we got a scan file, let's process it
-                let root_url = Url::parse(&scan_state.table_root).unwrap();
+    // in a loop, try and get a ScanFile. Note that `recv` will return an `Err` when the other side
+    // hangs up, which indicates there's no more data to process.
+    while let Ok(scan_file) = scan_file_rx.recv() {
+        // we got a scan file, let's process it
+        let root_url = Url::parse(&scan_state.table_root).unwrap();
 
-                // get the selection vector (i.e. deletion vector)
-                let mut selection_vector = scan_file
-                    .dv_info
-                    .get_selection_vector(engine_interface, &root_url)
-                    .unwrap();
+        // get the selection vector (i.e. deletion vector)
+        let mut selection_vector = scan_file
+            .dv_info
+            .get_selection_vector(engine_interface, &root_url)
+            .unwrap();
 
-                // build the required metadata for our parquet handler to read this file
-                let location = root_url.join(&scan_file.path).unwrap();
-                let meta = FileMeta {
-                    last_modified: 0,
-                    size: scan_file.size as usize,
-                    location,
-                };
+        // build the required metadata for our parquet handler to read this file
+        let location = root_url.join(&scan_file.path).unwrap();
+        let meta = FileMeta {
+            last_modified: 0,
+            size: scan_file.size as usize,
+            location,
+        };
 
-                // this example uses the parquet_handler from the engine_client, but an engine could
-                // choose to use whatever method it might want to read a parquet file. The reader
-                // could, for example, fill in the parition columns, or apply deletion vectors. Here
-                // we assume a more naive parquet reader and fix the data up after the fact.
-                // further parallelism would also be possible here as we could read the parquet file
-                // in chunks where each thread reads one chunk. The engine would need to ensure
-                // enough meta-data was passed to each thread to correctly apply the selection
-                // vector
-                let read_results = engine_interface
-                    .get_parquet_handler()
-                    .read_parquet_files(&[meta], read_schema.clone(), None)
-                    .unwrap();
+        // this example uses the parquet_handler from the engine_client, but an engine could
+        // choose to use whatever method it might want to read a parquet file. The reader
+        // could, for example, fill in the parition columns, or apply deletion vectors. Here
+        // we assume a more naive parquet reader and fix the data up after the fact.
+        // further parallelism would also be possible here as we could read the parquet file
+        // in chunks where each thread reads one chunk. The engine would need to ensure
+        // enough meta-data was passed to each thread to correctly apply the selection
+        // vector
+        let read_results = engine_interface
+            .get_parquet_handler()
+            .read_parquet_files(&[meta], read_schema.clone(), None)
+            .unwrap();
 
-                for read_result in read_results {
-                    let read_result = read_result.unwrap();
-                    let len = read_result.length();
+        for read_result in read_results {
+            let read_result = read_result.unwrap();
+            let len = read_result.length();
 
-                    // ask the kernel to transform the physical data into the correct logical form
-                    let logical = transform_to_logical(
-                        engine_interface,
-                        read_result,
-                        &scan_state,
-                        &scan_file.partition_values,
-                    )
-                    .unwrap();
+            // ask the kernel to transform the physical data into the correct logical form
+            let logical = transform_to_logical(
+                engine_interface,
+                read_result,
+                &scan_state,
+                &scan_file.partition_values,
+            )
+            .unwrap();
 
-                    let record_batch = to_arrow(logical).unwrap();
+            let record_batch = to_arrow(logical).unwrap();
 
-                    // need to split the dv_mask. what's left in dv_mask covers this result, and rest
-                    // will cover the following results
-                    let rest = selection_vector.as_mut().map(|mask| mask.split_off(len));
-                    let batch = if let Some(mask) = selection_vector.clone() {
-                        // apply the selection vector
-                        filter_record_batch(&record_batch, &mask.into()).unwrap()
-                    } else {
-                        record_batch
-                    };
-                    selection_vector = rest;
+            // need to split the dv_mask. what's left in dv_mask covers this result, and rest
+            // will cover the following results
+            let rest = selection_vector.as_mut().map(|mask| mask.split_off(len));
+            let batch = if let Some(mask) = selection_vector.clone() {
+                // apply the selection vector
+                filter_record_batch(&record_batch, &mask.into()).unwrap()
+            } else {
+                record_batch
+            };
+            selection_vector = rest;
 
-                    // send back the processed result
-                    record_batch_tx.send(batch).unwrap();
-                }
-            }
-            Err(_) => {
-                // failed to read, so there's no more work, just exit
-                break;
-            }
+            // send back the processed result
+            record_batch_tx.send(batch).unwrap();
         }
     }
 }

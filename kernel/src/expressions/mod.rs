@@ -83,7 +83,7 @@ pub enum Expression {
     Literal(Scalar),
     /// A column reference by name.
     Column(String),
-    ///
+    /// A struct computed from a Vec of expressions
     Struct(Vec<Expression>),
     /// A binary operation.
     BinaryOperation {
