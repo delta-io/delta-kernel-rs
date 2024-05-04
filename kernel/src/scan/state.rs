@@ -9,7 +9,7 @@ use crate::{
     },
     engine_data::{GetData, TypedGetData},
     schema::Schema,
-    DataVisitor, DeltaResult, EngineData, EngineInterface, Error,
+    DataVisitor, DeltaResult, Engine, EngineData, Error,
 };
 use serde::{Deserialize, Serialize};
 
@@ -33,14 +33,14 @@ pub struct DvInfo {
 impl DvInfo {
     pub fn get_selection_vector(
         &self,
-        engine_interface: &dyn EngineInterface,
+        engine: &dyn Engine,
         table_root: &url::Url,
     ) -> DeltaResult<Option<Vec<bool>>> {
         let dv_treemap = self
             .deletion_vector
             .as_ref()
             .map(|dv_descriptor| {
-                let fs_client = engine_interface.get_file_system_client();
+                let fs_client = engine.get_file_system_client();
                 dv_descriptor.read(fs_client, table_root)
             })
             .transpose()?;

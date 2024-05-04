@@ -15,7 +15,7 @@ use arrow_schema::{
 };
 use itertools::Itertools;
 
-use crate::client::arrow_data::ArrowEngineData;
+use crate::engine::arrow_data::ArrowEngineData;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{BinaryOperator, Expression, Scalar, UnaryOperator, VariadicOperator};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};

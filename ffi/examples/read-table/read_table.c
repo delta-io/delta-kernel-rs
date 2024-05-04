@@ -8,7 +8,7 @@
 
 struct EngineContext {
   GlobalScanState *global_state;
-  const ExternEngineInterfaceHandle *engine_interface;
+  const ExternEngineHandle *engine;
 };
 
 // This is how we represent our errors. The kernel will ask us to contruct this struct whenever it
@@ -50,16 +50,16 @@ void print_error(const char* indent, Error* err) {
   printf("%sMsg: %s\n", indent, err->msg);
 }
 
-void set_builder_opt(EngineInterfaceBuilder *interface_builder, char* key, char* val) {
+void set_builder_opt(EngineBuilder *engine_builder, char* key, char* val) {
   KernelStringSlice key_slice = {key, strlen(key)};
   KernelStringSlice val_slice = {val, strlen(val)};
-  set_builder_option(interface_builder, key_slice, val_slice);
+  set_builder_option(engine_builder, key_slice, val_slice);
 }
 
 void visit_callback(void* engine_context, const KernelStringSlice path, long size, const DvInfo *dv_info, CStringMap *partition_values) {
   printf("called back to actually read!\n  path: %.*s\n", path.len, path.ptr);
   struct EngineContext *context = engine_context;
-  ExternResultKernelBoolSlice selection_vector_res = selection_vector_from_dv(dv_info, context->engine_interface, context->global_state);
+  ExternResultKernelBoolSlice selection_vector_res = selection_vector_from_dv(dv_info, context->engine, context->global_state);
   if (selection_vector_res.tag != OkKernelBoolSlice) {
     printf("Could not get selection vector from kernel\n");
     return;
@@ -103,38 +103,38 @@ int main(int argc, char* argv[]) {
 
   KernelStringSlice table_path_slice = {table_path, strlen(table_path)};
 
-  ExternResultEngineInterfaceBuilder interface_builder_res =
-    get_engine_interface_builder(table_path_slice, allocate_error);
-  if (interface_builder_res.tag != OkEngineInterfaceBuilder) {
-    printf("Could not get engine interface builder.\n");
-    print_error("  ", (Error*)interface_builder_res.err);
-    free_error((Error*)interface_builder_res.err);
+  ExternResultEngineBuilder engine_builder_res =
+    get_engine_builder(table_path_slice, allocate_error);
+  if (engine_builder_res.tag != OkEngineBuilder) {
+    printf("Could not get engine builder.\n");
+    print_error("  ", (Error*)engine_builder_res.err);
+    free_error((Error*)engine_builder_res.err);
     return -1;
   }
 
-  // an example of using a builder to set options when building a engine interface
-  EngineInterfaceBuilder *interface_builder = interface_builder_res.ok;
-  set_builder_opt(interface_builder, "aws_region", "us-west-2");
+  // an example of using a builder to set options when building an engine
+  EngineBuilder *engine_builder = engine_builder_res.ok;
+  set_builder_opt(engine_builder, "aws_region", "us-west-2");
   // potentially set credentials here
-  //set_builder_opt(interface_builder, "aws_access_key_id" , "[redacted]");
-  //set_builder_opt(interface_builder, "aws_secret_access_key", "[redacted]");
-  ExternResultExternEngineInterfaceHandle engine_interface_res =
-    builder_build(interface_builder);
+  //set_builder_opt(engine_builder, "aws_access_key_id" , "[redacted]");
+  //set_builder_opt(engine_builder, "aws_secret_access_key", "[redacted]");
+  ExternResultExternEngineHandle engine_res =
+    builder_build(engine_builder);
 
   // alternately if we don't care to set any options on the builder:
-  // ExternResultExternEngineInterfaceHandle engine_interface_res =
+  // ExternResultExternEngineHandle engine_res =
   //   get_default_client(table_path_slice, NULL);
 
-  if (engine_interface_res.tag != OkExternEngineInterfaceHandle) {
+  if (engine_res.tag != OkExternEngineHandle) {
     printf("Failed to get client\n");
-    print_error("  ", (Error*)interface_builder_res.err);
-    free_error((Error*)interface_builder_res.err);
+    print_error("  ", (Error*)engine_builder_res.err);
+    free_error((Error*)engine_builder_res.err);
     return -1;
   }
 
-  const ExternEngineInterfaceHandle *engine_interface = engine_interface_res.ok;
+  const ExternEngineHandle *engine = engine_res.ok;
 
-  ExternResultSnapshotHandle snapshot_handle_res = snapshot(table_path_slice, engine_interface);
+  ExternResultSnapshotHandle snapshot_handle_res = snapshot(table_path_slice, engine);
   if (snapshot_handle_res.tag != OkSnapshotHandle) {
     printf("Failed to create snapshot\n");
     print_error("  ", (Error*)snapshot_handle_res.err);
@@ -147,7 +147,7 @@ int main(int argc, char* argv[]) {
   uint64_t v = version(snapshot_handle);
   printf("version: %llu\n", v);
 
-  ExternResultScan scan_res = scan(snapshot_handle, engine_interface, NULL);
+  ExternResultScan scan_res = scan(snapshot_handle, engine, NULL);
   if (scan_res.tag != OkScan) {
     printf("Failed to create scan\n");
     print_error("  ", (Error*)scan_res.err);
@@ -157,10 +157,10 @@ int main(int argc, char* argv[]) {
 
   Scan *scan = scan_res.ok;
   GlobalScanState *global_state = get_global_scan_state(scan);
-  struct EngineContext context = { global_state, engine_interface };
+  struct EngineContext context = { global_state, engine };
 
   ExternResultKernelScanDataIterator data_iter_res =
-    kernel_scan_data_init(engine_interface, scan);
+    kernel_scan_data_init(engine, scan);
   if (data_iter_res.tag != OkKernelScanDataIterator) {
     printf("Failed to construct scan data iterator\n");
     print_error("  ", (Error*)data_iter_res.err);
@@ -189,7 +189,7 @@ int main(int argc, char* argv[]) {
   kernel_scan_data_free(data_iter);
   drop_global_scan_state(global_state);
   drop_snapshot(snapshot_handle);
-  drop_table_client(engine_interface);
+  drop_engine(engine);
 
   return 0;
 }

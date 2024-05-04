@@ -3,7 +3,7 @@ SOURCES=cffi-test.c
 INCPATHS=../target/ffi-headers
 LIBPATHS=../target/debug
 LDFLAGS=-ldelta_kernel_ffi #`pkg-config --libs arrow-glib`
-CFLAGS=-c -Wall -DDEFINE_DEFAULT_CLIENT #`pkg-config --cflags arrow-glib`
+CFLAGS=-c -Wall -DDEFINE_DEFAULT_ENGINE #`pkg-config --cflags arrow-glib`
 CC=gcc
 
 OBJECTS=$(SOURCES:.c=.o)

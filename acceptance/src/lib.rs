@@ -1,4 +1,4 @@
-//! Helpers to validate Engineinterface implementations
+//! Helpers to validate Engine implementations
 
 pub mod data;
 pub mod meta;

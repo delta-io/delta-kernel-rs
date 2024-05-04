@@ -13,7 +13,7 @@ use crate::actions::{get_log_schema, Add, ADD_NAME, REMOVE_NAME};
 use crate::expressions::{Expression, Scalar};
 use crate::schema::{DataType, Schema, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
-use crate::{DeltaResult, EngineData, EngineInterface, Error, FileMeta};
+use crate::{DeltaResult, Engine, EngineData, Error, FileMeta};
 
 mod data_skipping;
 pub mod file_stream;
@@ -150,20 +150,20 @@ impl Scan {
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible)
     pub(crate) fn files(
         &self,
-        engine_interface: &dyn EngineInterface,
+        engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>>> {
         let commit_read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?;
         let checkpoint_read_schema = get_log_schema().project(&[ADD_NAME])?;
 
         let log_iter = self.snapshot.log_segment.replay(
-            engine_interface,
+            engine,
             commit_read_schema,
             checkpoint_read_schema,
             self.predicate.clone(),
         )?;
 
         Ok(log_replay_iter(
-            engine_interface,
+            engine,
             log_iter,
             &self.read_schema,
             &self.predicate,
@@ -180,20 +180,20 @@ impl Scan {
     /// is `true` at index `i` the row *should* be processed.
     pub fn scan_data(
         &self,
-        engine_interface: &dyn EngineInterface,
+        engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanData>>> {
         let commit_read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?;
         let checkpoint_read_schema = get_log_schema().project(&[ADD_NAME])?;
 
         let log_iter = self.snapshot.log_segment.replay(
-            engine_interface,
+            engine,
             commit_read_schema,
             checkpoint_read_schema,
             self.predicate.clone(),
         )?;
 
         Ok(scan_action_iter(
-            engine_interface,
+            engine,
             log_iter,
             &self.read_schema,
             &self.predicate,
@@ -216,25 +216,25 @@ impl Scan {
         }
     }
 
-    /// Perform an "all in one" scan. This will use the provided `engine_interface` to read and
+    /// Perform an "all in one" scan. This will use the provided `engine` to read and
     /// process all the data for the query. Each [`ScanResult`] in the resultant vector encapsulates
     /// the raw data and an optional boolean vector built from the deletion vector if it was
     /// present. See the documentation for [`ScanResult`] for more details. Generally
     /// connectors/engines will want to use [`Scan::scan_data`] so they can have more control over
     /// the execution of the scan.
     // This calls [`Scan::files`] to get a set of `Add` actions for the scan, and then uses the
-    // `engine_interface`'s [`crate::ParquetHandler`] to read the actual table data.
-    pub fn execute(&self, engine_interface: &dyn EngineInterface) -> DeltaResult<Vec<ScanResult>> {
+    // `engine`'s [`crate::ParquetHandler`] to read the actual table data.
+    pub fn execute(&self, engine: &dyn Engine) -> DeltaResult<Vec<ScanResult>> {
         let partition_columns = &self.snapshot.metadata().partition_columns;
         let (all_fields, read_fields, have_partition_cols) =
             get_state_info(self.schema().as_ref(), partition_columns);
         let read_schema = Arc::new(StructType::new(read_fields));
         debug!("Executing scan with read schema {read_schema:#?}");
         let output_schema = DataType::Struct(Box::new(self.schema().as_ref().clone()));
-        let parquet_handler = engine_interface.get_parquet_handler();
+        let parquet_handler = engine.get_parquet_handler();
 
         let mut results: Vec<ScanResult> = vec![];
-        let files = self.files(engine_interface)?;
+        let files = self.files(engine)?;
         for add_result in files {
             let add = add_result?;
             let meta = FileMeta {
@@ -271,7 +271,7 @@ impl Scan {
                 .deletion_vector
                 .as_ref()
                 .map(|dv_descriptor| {
-                    let fs_client = engine_interface.get_file_system_client();
+                    let fs_client = engine.get_file_system_client();
                     dv_descriptor.read(fs_client, &self.snapshot.table_root)
                 })
                 .transpose()?;
@@ -286,7 +286,7 @@ impl Scan {
                 };
 
                 let read_result = match read_expression {
-                    Some(ref read_expression) => engine_interface
+                    Some(ref read_expression) => engine
                         .get_expression_handler()
                         .get_evaluator(
                             read_schema.clone(),
@@ -387,17 +387,17 @@ fn get_state_info<'a>(
 }
 
 pub fn selection_vector(
-    engine_interface: &dyn EngineInterface,
+    engine: &dyn Engine,
     descriptor: &DeletionVectorDescriptor,
     table_root: &Url,
 ) -> DeltaResult<Vec<bool>> {
-    let fs_client = engine_interface.get_file_system_client();
+    let fs_client = engine.get_file_system_client();
     let dv_treemap = descriptor.read(fs_client, table_root)?;
     Ok(treemap_to_bools(dv_treemap))
 }
 
 pub fn transform_to_logical(
-    engine_interface: &dyn EngineInterface,
+    engine: &dyn Engine,
     data: Box<dyn EngineData>,
     global_state: &GlobalScanState,
     partition_values: &std::collections::HashMap<String, String>,
@@ -423,7 +423,7 @@ pub fn transform_to_logical(
             })
             .try_collect()?;
         let read_expression = Expression::Struct(all_fields);
-        let result = engine_interface
+        let result = engine
             .get_expression_handler()
             .get_evaluator(
                 read_schema.clone(),
@@ -447,9 +447,9 @@ pub(crate) mod test_utils {
 
     use crate::{
         actions::get_log_schema,
-        client::{
+        engine::{
             arrow_data::ArrowEngineData,
-            sync::{json::SyncJsonHandler, SyncEngineInterface},
+            sync::{json::SyncJsonHandler, SyncEngine},
         },
         scan::file_stream::scan_action_iter,
         schema::{StructField, StructType},
@@ -512,7 +512,7 @@ pub(crate) mod test_utils {
             partition_values: HashMap<String, String>,
         ),
     ) {
-        let interface = SyncEngineInterface::new();
+        let engine = SyncEngine::new();
         // doesn't matter here
         let table_schema = Arc::new(StructType::new(vec![StructField::new(
             "foo",
@@ -520,7 +520,7 @@ pub(crate) mod test_utils {
             false,
         )]));
         let iter = scan_action_iter(
-            &interface,
+            &engine,
             batch.into_iter().map(|batch| Ok((batch as _, true))),
             &table_schema,
             &None,
@@ -542,12 +542,12 @@ pub(crate) mod test_utils {
     }
 }
 
-#[cfg(all(test, feature = "sync-client"))]
+#[cfg(all(test, feature = "sync-engine"))]
 mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::client::sync::SyncEngineInterface;
+    use crate::engine::sync::SyncEngine;
     use crate::schema::PrimitiveType;
     use crate::Table;
 
@@ -556,16 +556,12 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine_interface = SyncEngineInterface::new();
+        let engine = SyncEngine::new();
 
         let table = Table::new(url);
-        let snapshot = table.snapshot(&engine_interface, None).unwrap();
+        let snapshot = table.snapshot(&engine, None).unwrap();
         let scan = ScanBuilder::new(snapshot).build();
-        let files: Vec<Add> = scan
-            .files(&engine_interface)
-            .unwrap()
-            .try_collect()
-            .unwrap();
+        let files: Vec<Add> = scan.files(&engine).unwrap().try_collect().unwrap();
 
         assert_eq!(files.len(), 1);
         assert_eq!(
@@ -580,12 +576,12 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine_interface = SyncEngineInterface::new();
+        let engine = SyncEngine::new();
 
         let table = Table::new(url);
-        let snapshot = table.snapshot(&engine_interface, None).unwrap();
+        let snapshot = table.snapshot(&engine, None).unwrap();
         let scan = ScanBuilder::new(snapshot).build();
-        let files = scan.execute(&engine_interface).unwrap();
+        let files = scan.execute(&engine).unwrap();
 
         assert_eq!(files.len(), 1);
         let num_rows = files[0].raw_data.as_ref().unwrap().length();
@@ -643,12 +639,12 @@ mod tests {
         ))?;
 
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine_interface = SyncEngineInterface::new();
+        let engine = SyncEngine::new();
 
         let table = Table::new(url);
-        let snapshot = table.snapshot(&engine_interface, None)?;
+        let snapshot = table.snapshot(&engine, None)?;
         let scan = ScanBuilder::new(snapshot).build();
-        let files: Vec<DeltaResult<Add>> = scan.files(&engine_interface)?.collect();
+        let files: Vec<DeltaResult<Add>> = scan.files(&engine)?.collect();
 
         // test case:
         //

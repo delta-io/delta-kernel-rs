@@ -328,9 +328,9 @@ mod tests {
     use super::*;
     use crate::{
         actions::{get_log_schema, ADD_NAME, TRANSACTION_NAME},
-        client::arrow_data::ArrowEngineData,
-        client::sync::{json::SyncJsonHandler, SyncEngineInterface},
-        EngineData, EngineInterface, JsonHandler,
+        engine::arrow_data::ArrowEngineData,
+        engine::sync::{json::SyncJsonHandler, SyncEngine},
+        Engine, EngineData, JsonHandler,
     };
 
     // TODO(nick): Merge all copies of this into one "test utils" thing
@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_parse_add_partitioned() {
-        let client = SyncEngineInterface::new();
+        let client = SyncEngine::new();
         let json_handler = client.get_json_handler();
         let json_strings: StringArray = vec![
             r#"{"commitInfo":{"timestamp":1670892998177,"operation":"WRITE","operationParameters":{"mode":"Append","partitionBy":"[\"c1\",\"c2\"]"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"3","numOutputRows":"3","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn test_parse_txn() {
-        let client = SyncEngineInterface::new();
+        let client = SyncEngine::new();
         let json_handler = client.get_json_handler();
         let json_strings: StringArray = vec![
             r#"{"commitInfo":{"timestamp":1670892998177,"operation":"WRITE","operationParameters":{"mode":"Append","partitionBy":"[\"c1\",\"c2\"]"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"3","numOutputRows":"3","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,

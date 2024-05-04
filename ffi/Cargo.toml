@@ -27,9 +27,9 @@ cbindgen = "0.26.0"
 libc = "0.2.147"
 
 [features]
-default = ["default-client"]
-default-client = [
-  "delta_kernel/default-client",
+default = ["default-engine"]
+default-engine = [
+  "delta_kernel/default-engine",
   "arrow-array",
   "arrow-data",
   "arrow-schema"

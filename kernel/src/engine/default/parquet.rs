@@ -13,10 +13,10 @@ use parquet::arrow::arrow_reader::{
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 
 use super::file_handler::{FileOpenFuture, FileOpener};
-use crate::client::arrow_data::ArrowEngineData;
-use crate::client::arrow_utils::{generate_mask, get_requested_indices, reorder_record_batch};
-use crate::client::default::executor::TaskExecutor;
-use crate::client::default::file_handler::FileStream;
+use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::arrow_utils::{generate_mask, get_requested_indices, reorder_record_batch};
+use crate::engine::default::executor::TaskExecutor;
+use crate::engine::default::file_handler::FileStream;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, ParquetHandler};
 
@@ -251,7 +251,7 @@ mod tests {
     use arrow_array::RecordBatch;
     use object_store::{local::LocalFileSystem, ObjectStore};
 
-    use crate::{client::default::executor::tokio::TokioBackgroundExecutor, EngineData};
+    use crate::{engine::default::executor::tokio::TokioBackgroundExecutor, EngineData};
 
     use itertools::Itertools;
 

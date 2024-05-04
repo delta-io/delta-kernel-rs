@@ -12,7 +12,7 @@ use crate::actions::{visitors::AddVisitor, visitors::RemoveVisitor, Add, Remove}
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::Expression;
 use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType};
-use crate::{DataVisitor, DeltaResult, EngineData, EngineInterface, ExpressionHandler};
+use crate::{DataVisitor, DeltaResult, Engine, EngineData, ExpressionHandler};
 
 struct LogReplayScanner {
     filter: Option<DataSkippingFilter>,
@@ -110,13 +110,9 @@ lazy_static! {
 
 impl LogReplayScanner {
     /// Create a new [`LogReplayScanner`] instance
-    fn new(
-        table_client: &dyn EngineInterface,
-        table_schema: &SchemaRef,
-        predicate: &Option<Expression>,
-    ) -> Self {
+    fn new(engine: &dyn Engine, table_schema: &SchemaRef, predicate: &Option<Expression>) -> Self {
         Self {
-            filter: DataSkippingFilter::new(table_client, table_schema, predicate),
+            filter: DataSkippingFilter::new(engine, table_schema, predicate),
             seen: Default::default(),
         }
     }
@@ -262,7 +258,7 @@ impl LogReplayScanner {
 /// Given an iterator of (engine_data, bool) tuples and a predicate, returns an iterator of `Adds`.
 /// The boolean flag indicates whether the record batch is a log or checkpoint batch.
 pub fn log_replay_iter(
-    engine_client: &dyn EngineInterface,
+    engine_client: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
     table_schema: &SchemaRef,
     predicate: &Option<Expression>,
@@ -285,13 +281,13 @@ pub fn log_replay_iter(
 /// be processed to complete the scan. Non-selected rows _must_ be ignored. The boolean flag
 /// indicates whether the record batch is a log or checkpoint batch.
 pub fn scan_action_iter(
-    engine_interface: &dyn EngineInterface,
+    engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
     table_schema: &SchemaRef,
     predicate: &Option<Expression>,
 ) -> impl Iterator<Item = DeltaResult<ScanData>> {
-    let mut log_scanner = LogReplayScanner::new(engine_interface, table_schema, predicate);
-    let expression_handler = engine_interface.get_expression_handler();
+    let mut log_scanner = LogReplayScanner::new(engine, table_schema, predicate);
+    let expression_handler = engine.get_expression_handler();
     action_iter
         .map(move |action_res| {
             action_res.and_then(|(batch, is_log_batch)| {

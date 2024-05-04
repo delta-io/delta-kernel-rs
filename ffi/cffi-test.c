@@ -4,7 +4,7 @@
 
 #include "delta_kernel_ffi.h"
 
-void visit_callback(void* engine_context, const struct KernelStringSlice path, long size, struct CDvInfo *dv_info, struct CStringMap *partition_values) {
+void visit_callback(void* engine_context, const struct KernelStringSlice path, long size, const DvInfo *dv_info, struct CStringMap *partition_values) {
   printf("file: %.*s\n", (int)path.len, path.ptr);
 }
 
@@ -25,16 +25,16 @@ int main(int argc, char* argv[]) {
 
   KernelStringSlice table_path_slice = {table_path, strlen(table_path)};
 
-  ExternResultExternEngineInterfaceHandle engine_interface_res =
+  ExternResultExternEngineHandle engine_res =
     get_default_client(table_path_slice, NULL);
-  if (engine_interface_res.tag != OkExternEngineInterfaceHandle) {
+  if (engine_res.tag != OkExternEngineHandle) {
     printf("Failed to get client\n");
     return -1;
   }
 
-  const ExternEngineInterfaceHandle *engine_interface = engine_interface_res.ok;
+  const ExternEngineHandle *engine = engine_res.ok;
 
-  ExternResultSnapshotHandle snapshot_handle_res = snapshot(table_path_slice, engine_interface);
+  ExternResultSnapshotHandle snapshot_handle_res = snapshot(table_path_slice, engine);
   if (snapshot_handle_res.tag != OkSnapshotHandle) {
     printf("Failed to create snapshot\n");
     return -1;
@@ -44,7 +44,7 @@ int main(int argc, char* argv[]) {
 
   uint64_t v = version(snapshot_handle);
   printf("version: %" PRIu64 "\n", v);
-  ExternResultScan scan_res = scan(snapshot_handle, engine_interface, NULL);
+  ExternResultScan scan_res = scan(snapshot_handle, engine, NULL);
   if (scan_res.tag != OkScan) {
     printf("Failed to create scan\n");
     return -1;
@@ -53,7 +53,7 @@ int main(int argc, char* argv[]) {
   Scan *scan = scan_res.ok;
 
   ExternResultKernelScanDataIterator data_iter_res =
-    kernel_scan_data_init(engine_interface, scan);
+    kernel_scan_data_init(engine, scan);
   if (data_iter_res.tag != OkKernelScanDataIterator) {
     printf("Failed to construct scan data iterator\n");
     return -1;
@@ -73,7 +73,7 @@ int main(int argc, char* argv[]) {
   }
 
   drop_snapshot(snapshot_handle);
-  drop_table_client(engine_interface);
+  drop_engine(engine);
 
   return 0;
 }

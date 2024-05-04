@@ -6,7 +6,7 @@ use object_store::path::Path;
 use object_store::DynObjectStore;
 use url::Url;
 
-use crate::client::default::executor::TaskExecutor;
+use crate::engine::default::executor::TaskExecutor;
 use crate::{DeltaResult, Error, FileMeta, FileSlice, FileSystemClient};
 
 #[derive(Debug)]
@@ -143,7 +143,7 @@ mod tests {
 
     use object_store::{local::LocalFileSystem, ObjectStore};
 
-    use crate::client::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 
     use itertools::Itertools;
 

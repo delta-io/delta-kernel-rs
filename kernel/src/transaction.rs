@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::actions::visitors::TransactionVisitor;
 use crate::actions::{get_log_schema, TRANSACTION_NAME};
 use crate::snapshot::Snapshot;
-use crate::EngineInterface;
+use crate::Engine;
 use crate::{actions::Transaction, DeltaResult};
 
 pub use crate::actions::visitors::TransactionMap;
@@ -19,7 +19,7 @@ impl TransactionScanner {
     /// Scan the entire log for all application ids but terminate early if a specific application id is provided
     fn scan_application_transactions(
         &self,
-        engine: &dyn EngineInterface,
+        engine: &dyn Engine,
         application_id: Option<&str>,
     ) -> DeltaResult<TransactionMap> {
         let schema = get_log_schema().project(&[TRANSACTION_NAME])?;
@@ -47,7 +47,7 @@ impl TransactionScanner {
     /// Scan the Delta Log for the latest transaction entry of an application
     pub fn application_transaction(
         &self,
-        engine: &dyn EngineInterface,
+        engine: &dyn Engine,
         application_id: &str,
     ) -> DeltaResult<Option<Transaction>> {
         let mut transactions = self.scan_application_transactions(engine, Some(application_id))?;
@@ -55,38 +55,31 @@ impl TransactionScanner {
     }
 
     /// Scan the Delta Log to obtain the latest transaction for all applications
-    pub fn application_transactions(
-        &self,
-        engine: &dyn EngineInterface,
-    ) -> DeltaResult<TransactionMap> {
+    pub fn application_transactions(&self, engine: &dyn Engine) -> DeltaResult<TransactionMap> {
         self.scan_application_transactions(engine, None)
     }
 }
 
-#[cfg(all(test, feature = "default-client"))]
+#[cfg(all(test, feature = "default-engine"))]
 mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::client::sync::SyncEngineInterface;
+    use crate::engine::sync::SyncEngine;
     use crate::Table;
 
     fn get_latest_transactions(path: &str, app_id: &str) -> (TransactionMap, Option<Transaction>) {
         let path = std::fs::canonicalize(PathBuf::from(path)).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine_interface = SyncEngineInterface::new();
+        let engine = SyncEngine::new();
 
         let table = Table::new(url);
-        let snapshot = table.snapshot(&engine_interface, None).unwrap();
+        let snapshot = table.snapshot(&engine, None).unwrap();
         let txn_scan = TransactionScanner::new(snapshot.clone());
 
         (
-            txn_scan
-                .application_transactions(&engine_interface)
-                .unwrap(),
-            txn_scan
-                .application_transaction(&engine_interface, app_id)
-                .unwrap(),
+            txn_scan.application_transactions(&engine).unwrap(),
+            txn_scan.application_transaction(&engine, app_id).unwrap(),
         )
     }
 

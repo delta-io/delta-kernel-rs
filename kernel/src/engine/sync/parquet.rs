@@ -4,8 +4,8 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReader
 use tracing::debug;
 use url::Url;
 
-use crate::client::arrow_data::ArrowEngineData;
-use crate::client::arrow_utils::{generate_mask, get_requested_indices, reorder_record_batch};
+use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::arrow_utils::{generate_mask, get_requested_indices, reorder_record_batch};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, ParquetHandler};
 

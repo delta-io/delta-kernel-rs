@@ -6,7 +6,7 @@ This crate provides a c foreign function internface (ffi) for delta-kernel-rs.
 You can build static and shared-libraries, as well as the include headers by simply running:
 
 ```sh
-cargo build [--release] [--features default-client]
+cargo build [--release] [--features default-engine]
 ```
 
 to build and run the C program which excercises FFI:

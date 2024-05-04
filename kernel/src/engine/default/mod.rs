@@ -1,6 +1,6 @@
-//! # Default Engineinterface
+//! # The Default Engine
 //!
-//! The default implementation of [`EngineInterface`] is [`DefaultEngineInterface`].
+//! The default implementation of [`Engine`] is [`DefaultEngine`].
 //!
 //! The underlying implementations use asynchronous IO. Async tasks are run on
 //! a separate thread pool, provided by the [`TaskExecutor`] trait. Read more in
@@ -17,7 +17,7 @@ use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
 use super::arrow_expression::ArrowExpressionHandler;
 use crate::{
-    DeltaResult, EngineInterface, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler,
+    DeltaResult, Engine, ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler,
 };
 
 pub mod executor;
@@ -27,7 +27,7 @@ pub mod json;
 pub mod parquet;
 
 #[derive(Debug)]
-pub struct DefaultEngineInterface<E: TaskExecutor> {
+pub struct DefaultEngine<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
     file_system: Arc<ObjectStoreFileSystemClient<E>>,
     json: Arc<DefaultJsonHandler<E>>,
@@ -35,8 +35,8 @@ pub struct DefaultEngineInterface<E: TaskExecutor> {
     expression: Arc<ArrowExpressionHandler>,
 }
 
-impl<E: TaskExecutor> DefaultEngineInterface<E> {
-    /// Create a new [`DefaultEngineInterface`] instance
+impl<E: TaskExecutor> DefaultEngine<E> {
+    /// Create a new [`DefaultEngine`] instance
     ///
     /// The `path` parameter is used to determine the type of storage used.
     ///
@@ -87,7 +87,7 @@ impl<E: TaskExecutor> DefaultEngineInterface<E> {
     }
 }
 
-impl<E: TaskExecutor> EngineInterface for DefaultEngineInterface<E> {
+impl<E: TaskExecutor> Engine for DefaultEngine<E> {
     fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler> {
         self.expression.clone()
     }

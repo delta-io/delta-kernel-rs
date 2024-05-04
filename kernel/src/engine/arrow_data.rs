@@ -339,8 +339,8 @@ mod tests {
 
     use crate::{
         actions::{get_log_schema, Metadata, Protocol},
-        client::sync::SyncEngineInterface,
-        DeltaResult, EngineData, EngineInterface,
+        engine::sync::SyncEngine,
+        DeltaResult, Engine, EngineData,
     };
 
     use super::ArrowEngineData;
@@ -355,7 +355,7 @@ mod tests {
 
     #[test]
     fn test_md_extract() -> DeltaResult<()> {
-        let client = SyncEngineInterface::new();
+        let client = SyncEngine::new();
         let handler = client.get_json_handler();
         let json_strings: StringArray = vec![
             r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn test_nullable_struct() -> DeltaResult<()> {
-        let client = SyncEngineInterface::new();
+        let client = SyncEngine::new();
         let handler = client.get_json_handler();
         let json_strings: StringArray = vec![
             r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,

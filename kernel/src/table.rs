@@ -6,7 +6,7 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::snapshot::Snapshot;
-use crate::{DeltaResult, EngineInterface, Version};
+use crate::{DeltaResult, Engine, Version};
 
 /// In-memory representation of a Delta table, which acts as an immutable root entity for reading
 /// the different versions (see [`Snapshot`]) of the table located in storage.
@@ -39,10 +39,10 @@ impl Table {
     /// If no version is supplied, a snapshot for the latest version will be created.
     pub fn snapshot(
         &self,
-        engine_interface: &dyn EngineInterface,
+        engine: &dyn Engine,
         version: Option<Version>,
     ) -> DeltaResult<Arc<Snapshot>> {
-        Snapshot::try_new(self.location.clone(), engine_interface, version)
+        Snapshot::try_new(self.location.clone(), engine, version)
     }
 }
 
@@ -51,16 +51,16 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::client::sync::SyncEngineInterface;
+    use crate::engine::sync::SyncEngine;
 
     #[test]
     fn test_table() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine_interface = SyncEngineInterface::new();
+        let engine = SyncEngine::new();
         let table = Table::new(url);
-        let snapshot = table.snapshot(&engine_interface, None).unwrap();
+        let snapshot = table.snapshot(&engine, None).unwrap();
         assert_eq!(snapshot.version(), 1)
     }
 }

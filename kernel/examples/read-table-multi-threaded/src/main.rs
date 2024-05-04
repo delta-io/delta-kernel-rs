@@ -7,14 +7,14 @@ use std::thread;
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
-use delta_kernel::client::arrow_data::ArrowEngineData;
-use delta_kernel::client::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::client::default::DefaultEngineInterface;
-use delta_kernel::client::sync::SyncEngineInterface;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::sync::SyncEngine;
 use delta_kernel::scan::state::{DvInfo, GlobalScanState};
 use delta_kernel::scan::{transform_to_logical, ScanBuilder};
 use delta_kernel::schema::Schema;
-use delta_kernel::{DeltaResult, EngineData, EngineInterface, FileMeta, Table};
+use delta_kernel::{DeltaResult, Engine, EngineData, FileMeta, Table};
 
 use clap::{Parser, ValueEnum};
 use url::Url;
@@ -33,9 +33,9 @@ struct Cli {
     #[arg(short, long, default_value_t = 2, value_parser = 1..=2048)]
     thread_count: i64,
 
-    /// Which EngineInterface to use
-    #[arg(short, long, value_enum, default_value_t = Interface::Default)]
-    interface: Interface,
+    /// Which Engine to use
+    #[arg(short, long, value_enum, default_value_t = EngineType::Default)]
+    engine: EngineType,
 
     /// Comma separated list of columns to select
     #[arg(long, value_delimiter=',', num_args(0..))]
@@ -43,10 +43,10 @@ struct Cli {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-enum Interface {
-    /// Use the default, async engine interface
+enum EngineType {
+    /// Use the default, async engine
     Default,
-    /// Use the sync engine interface (local files only)
+    /// Use the sync engine (local files only)
     Sync,
 }
 
@@ -102,19 +102,19 @@ fn try_main() -> DeltaResult<()> {
 
     println!("Reading {url}");
 
-    // create the requested interface
-    let engine_interface: Arc<dyn EngineInterface> = match cli.interface {
-        Interface::Default => Arc::new(DefaultEngineInterface::try_new(
+    // create the requested engine
+    let engine: Arc<dyn Engine> = match cli.engine {
+        EngineType::Default => Arc::new(DefaultEngine::try_new(
             &url,
             HashMap::<String, String>::new(),
             Arc::new(TokioBackgroundExecutor::new()),
         )?),
-        Interface::Sync => Arc::new(SyncEngineInterface::new()),
+        EngineType::Sync => Arc::new(SyncEngine::new()),
     };
 
     // build a table and get the lastest snapshot from it
     let table = Table::new(url.clone());
-    let snapshot = table.snapshot(engine_interface.as_ref(), None)?;
+    let snapshot = table.snapshot(engine.as_ref(), None)?;
 
     // process the columns requested and build a schema from them
     let read_schema_opt = cli
@@ -147,7 +147,7 @@ fn try_main() -> DeltaResult<()> {
     // [`delta_kernel::scan::scan_row_schema`]. Generally engines will not need to interact with
     // this data directly, and can just call [`visit_scan_files`] to get pre-parsed data back from
     // the kernel.
-    let scan_data = scan.scan_data(engine_interface.as_ref())?;
+    let scan_data = scan.scan_data(engine.as_ref())?;
 
     // get any global state associated with this scan
     let global_state = scan.global_scan_state();
@@ -163,13 +163,12 @@ fn try_main() -> DeltaResult<()> {
     let _handles: Vec<_> = (0..cli.thread_count)
         .map(|_| {
             // items that we need to send to the other thread
-            //let interface = cli.interface.clone();
             let scan_state = global_state.clone();
             let rb_tx = record_batch_tx.clone();
             let scan_file_rx = scan_file_rx.clone();
-            let interface = engine_interface.clone();
+            let engine = engine.clone();
             thread::spawn(move || {
-                do_work(interface, scan_state, rb_tx, scan_file_rx);
+                do_work(engine, scan_state, rb_tx, scan_file_rx);
             })
         })
         .collect();
@@ -199,13 +198,13 @@ fn try_main() -> DeltaResult<()> {
 
 // this is the work each thread does
 fn do_work(
-    engine_interface: Arc<dyn EngineInterface>,
+    engine: Arc<dyn Engine>,
     scan_state: GlobalScanState,
     record_batch_tx: Sender<RecordBatch>,
     scan_file_rx: spmc::Receiver<ScanFile>,
 ) {
     // get the type for the function calls
-    let engine_interface: &dyn EngineInterface = engine_interface.as_ref();
+    let engine: &dyn Engine = engine.as_ref();
     let read_schema = Arc::new(scan_state.read_schema.clone());
     // in a loop, try and get a ScanFile. Note that `recv` will return an `Err` when the other side
     // hangs up, which indicates there's no more data to process.
@@ -216,7 +215,7 @@ fn do_work(
         // get the selection vector (i.e. deletion vector)
         let mut selection_vector = scan_file
             .dv_info
-            .get_selection_vector(engine_interface, &root_url)
+            .get_selection_vector(engine, &root_url)
             .unwrap();
 
         // build the required metadata for our parquet handler to read this file
@@ -235,7 +234,7 @@ fn do_work(
         // in chunks where each thread reads one chunk. The engine would need to ensure
         // enough meta-data was passed to each thread to correctly apply the selection
         // vector
-        let read_results = engine_interface
+        let read_results = engine
             .get_parquet_handler()
             .read_parquet_files(&[meta], read_schema.clone(), None)
             .unwrap();
@@ -246,7 +245,7 @@ fn do_work(
 
             // ask the kernel to transform the physical data into the correct logical form
             let logical = transform_to_logical(
-                engine_interface,
+                engine,
                 read_result,
                 &scan_state,
                 &scan_file.partition_values,

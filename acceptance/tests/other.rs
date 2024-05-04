@@ -38,10 +38,10 @@ async fn test_read_table_with_checkpoint() {
     ))
     .unwrap();
     let location = url::Url::from_directory_path(path).unwrap();
-    let engine_interface = Arc::new(
-        DefaultEngineInterface::try_new(&location, HashMap::<String, String>::new()).unwrap(),
+    let engine = Arc::new(
+        DefaultEngine::try_new(&location, HashMap::<String, String>::new()).unwrap(),
     );
-    let snapshot = Snapshot::try_new(location, engine_interface, None)
+    let snapshot = Snapshot::try_new(location, engine, None)
         .await
         .unwrap();
 

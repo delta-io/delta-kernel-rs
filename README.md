@@ -20,7 +20,7 @@ just load-dat
 Then we can build and run tests via
 
 ```sh
-cargo test --features acceptance,default-client
+cargo test --features acceptance,default-engine
 ```
 
 or using just again:
@@ -66,7 +66,7 @@ Some design principles which should be considered:
 ```json
 {
   "editor.formatOnSave": true,
-  "rust-analyzer.cargo.features": ["default-client", "acceptance"]
+  "rust-analyzer.cargo.features": ["default-engine", "acceptance"]
 }
 ```
 

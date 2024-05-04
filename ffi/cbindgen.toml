@@ -8,7 +8,7 @@ language = "C"
 namespace = "ffi"
 
 [defines]
-"feature = default-client" = "DEFINE_DEFAULT_CLIENT"
+"feature = default-engine" = "DEFINE_DEFAULT_ENGINE"
 
 [export.mangle]
 remove_underscores = true

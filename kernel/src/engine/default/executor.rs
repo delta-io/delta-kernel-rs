@@ -10,7 +10,7 @@ use futures::{future::BoxFuture, Future};
 use crate::DeltaResult;
 
 /// An executor that can be used to run async tasks. This is used by IO functions
-/// within the default Engineinterface.
+/// within the `DefaultEngine`.
 ///
 /// This must be capable of running within an async context and running futures
 /// on another thread. This could be a multi-threaded runtime, like Tokio's or

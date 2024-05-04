@@ -17,7 +17,7 @@ use object_store::{DynObjectStore, GetResultPayload};
 
 use super::executor::TaskExecutor;
 use super::file_handler::{FileOpenFuture, FileOpener, FileStream};
-use crate::client::arrow_data::ArrowEngineData;
+use crate::engine::arrow_data::ArrowEngineData;
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, EngineData, Error, Expression, FileDataReadResultIterator, FileMeta, JsonHandler,
@@ -249,7 +249,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        actions::get_log_schema, client::default::executor::tokio::TokioBackgroundExecutor,
+        actions::get_log_schema, engine::default::executor::tokio::TokioBackgroundExecutor,
     };
 
     fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {

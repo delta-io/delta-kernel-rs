@@ -16,7 +16,7 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
-use crate::client::arrow_data::ArrowEngineData;
+use crate::engine::arrow_data::ArrowEngineData;
 
 pub(crate) struct SyncJsonHandler;
 

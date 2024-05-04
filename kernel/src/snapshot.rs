@@ -12,7 +12,7 @@ use url::Url;
 use crate::actions::{get_log_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
 use crate::path::{version_from_location, LogPath};
 use crate::schema::{Schema, SchemaRef};
-use crate::{DeltaResult, EngineInterface, Error, FileMeta, FileSystemClient, Version};
+use crate::{DeltaResult, Engine, Error, FileMeta, FileSystemClient, Version};
 use crate::{EngineData, Expression};
 
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
@@ -43,18 +43,18 @@ impl LogSegment {
     #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
     fn replay(
         &self,
-        engine_interface: &dyn EngineInterface,
+        engine: &dyn Engine,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
         predicate: Option<Expression>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>> {
-        let json_client = engine_interface.get_json_handler();
+        let json_client = engine.get_json_handler();
         // TODO change predicate to: predicate AND add.path not null and remove.path not null
         let commit_stream = json_client
             .read_json_files(&self.commit_files, commit_read_schema, predicate.clone())?
             .map_ok(|batch| (batch, true));
 
-        let parquet_client = engine_interface.get_parquet_handler();
+        let parquet_client = engine.get_parquet_handler();
         // TODO change predicate to: predicate AND add.path not null
         let checkpoint_stream = parquet_client
             .read_parquet_files(&self.checkpoint_files, checkpoint_read_schema, predicate)?
@@ -65,14 +65,11 @@ impl LogSegment {
         Ok(batches)
     }
 
-    fn read_metadata(
-        &self,
-        engine_interface: &dyn EngineInterface,
-    ) -> DeltaResult<Option<(Metadata, Protocol)>> {
+    fn read_metadata(&self, engine: &dyn Engine) -> DeltaResult<Option<(Metadata, Protocol)>> {
         let schema = get_log_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
         // read the same protocol and metadata schema for both commits and checkpoints
         // TODO add metadata.table_id is not null and protocol.something_required is not null
-        let data_batches = self.replay(engine_interface, schema.clone(), schema, None)?;
+        let data_batches = self.replay(engine, schema.clone(), schema, None)?;
         let mut metadata_opt: Option<Metadata> = None;
         let mut protocol_opt: Option<Protocol> = None;
         for batch in data_batches {
@@ -127,14 +124,14 @@ impl Snapshot {
     /// # Parameters
     ///
     /// - `location`: url pointing at the table root (where `_delta_log` folder is located)
-    /// - `engine_interface`: Implementation of [`EngineInterface`] apis.
+    /// - `engine`: Implementation of [`Engine`] apis.
     /// - `version`: target version of the [`Snapshot`]
     pub fn try_new(
         table_root: Url,
-        engine_interface: &dyn EngineInterface,
+        engine: &dyn Engine,
         version: Option<Version>,
     ) -> DeltaResult<Arc<Self>> {
-        let fs_client = engine_interface.get_file_system_client();
+        let fs_client = engine.get_file_system_client();
         let log_url = LogPath::new(&table_root).child("_delta_log/").unwrap();
 
         // List relevant files from log
@@ -181,7 +178,7 @@ impl Snapshot {
             table_root,
             log_segment,
             version_eff,
-            engine_interface,
+            engine,
         )?))
     }
 
@@ -190,10 +187,10 @@ impl Snapshot {
         location: Url,
         log_segment: LogSegment,
         version: Version,
-        engine_interface: &dyn EngineInterface,
+        engine: &dyn Engine,
     ) -> DeltaResult<Self> {
         let (metadata, protocol) = log_segment
-            .read_metadata(engine_interface)?
+            .read_metadata(engine)?
             .ok_or(Error::MissingMetadata)?;
         let schema = metadata.schema()?;
         Ok(Self {
@@ -372,9 +369,9 @@ mod tests {
     use object_store::local::LocalFileSystem;
     use object_store::path::Path;
 
-    use crate::client::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::client::default::filesystem::ObjectStoreFileSystemClient;
-    use crate::client::sync::SyncEngineInterface;
+    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::engine::default::filesystem::ObjectStoreFileSystemClient;
+    use crate::engine::sync::SyncEngine;
     use crate::schema::StructType;
 
     #[test]
@@ -383,7 +380,7 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
-        let client = SyncEngineInterface::new();
+        let client = SyncEngine::new();
         let snapshot = Snapshot::try_new(url, &client, Some(1)).unwrap();
 
         let expected = Protocol {
@@ -405,7 +402,7 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
-        let client = SyncEngineInterface::new();
+        let client = SyncEngine::new();
         let snapshot = Snapshot::try_new(url, &client, None).unwrap();
 
         let expected = Protocol {
@@ -447,8 +444,8 @@ mod tests {
         ))
         .unwrap();
         let location = url::Url::from_directory_path(path).unwrap();
-        let engine_interface = SyncEngineInterface::new();
-        let snapshot = Snapshot::try_new(location, &engine_interface, None).unwrap();
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::try_new(location, &engine, None).unwrap();
 
         assert_eq!(snapshot.log_segment.checkpoint_files.len(), 1);
         assert_eq!(

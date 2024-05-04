@@ -8,7 +8,7 @@ publish = false
 arrow = { version = "^49.0", features = ["prettyprint"] }
 clap = { version = "^4.4", features = ["derive"] }
 delta_kernel = { path = "../../../kernel", features = [
-  "default-client",
+  "default-engine",
   "tokio",
   "developer-visibility",
 ] }
