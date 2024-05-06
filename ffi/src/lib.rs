@@ -300,7 +300,7 @@ impl AllocateError for AllocateErrorFn {
 impl AllocateError for *const ExternEngineHandle {
     /// # Safety
     ///
-    /// In addition to the usual requirements, the table client handle must be valid.
+    /// In addition to the usual requirements, the engine handle must be valid.
     unsafe fn allocate_error(
         &self,
         etype: KernelError,
@@ -349,8 +349,8 @@ impl ArcHandle for ExternEngineHandle {
 }
 
 struct ExternEngineVtable {
-    // Actual table client instance to use
-    client: Arc<dyn Engine>,
+    // Actual engine instance to use
+    engine: Arc<dyn Engine>,
     allocate_error: AllocateErrorFn,
 }
 
@@ -373,7 +373,7 @@ unsafe impl Sync for ExternEngineVtable {}
 
 impl ExternEngine for ExternEngineVtable {
     fn engine(&self) -> Arc<dyn Engine> {
-        self.client.clone()
+        self.engine.clone()
     }
     fn error_allocator(&self) -> &dyn AllocateError {
         &self.allocate_error
@@ -389,6 +389,7 @@ unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<U
 }
 
 // A client builder allows setting options before building an actual client
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 pub struct EngineBuilder {
     url: Url,
     allocate_fn: AllocateErrorFn,
@@ -401,9 +402,9 @@ impl EngineBuilder {
     }
 }
 
-/// Get a "builder" that can be used to construct an engine client. The function
+/// Get a "builder" that can be used to construct an engine. The function
 /// [`set_builder_option`] can be used to set options on the builder prior to constructing the
-/// actual client
+/// actual engine
 ///
 /// # Safety
 /// Caller is responsible for passing a valid path pointer.
@@ -434,7 +435,7 @@ unsafe fn get_engine_builder_impl(
 ///
 /// # Safety
 ///
-/// Client must pass a valid ClientBuilder pointer, and valid slices for key and value
+/// Caller must pass a valid EngineBuilder pointer, and valid slices for key and value
 #[cfg(feature = "default-engine")]
 #[no_mangle]
 pub unsafe extern "C" fn set_builder_option(
@@ -452,14 +453,14 @@ pub unsafe extern "C" fn set_builder_option(
 ///
 /// # Safety
 ///
-/// Caller is responsible to pass a valid ClientBuilder pointer, and to not use it again afterwards
+/// Caller is responsible to pass a valid EngineBuilder pointer, and to not use it again afterwards
 #[cfg(feature = "default-engine")]
 #[no_mangle]
 pub unsafe extern "C" fn builder_build(
     builder: *mut EngineBuilder,
 ) -> ExternResult<*const ExternEngineHandle> {
     let builder_box = unsafe { Box::from_raw(builder) };
-    get_default_client_impl(
+    get_default_engine_impl(
         builder_box.url,
         builder_box.options,
         builder_box.allocate_fn,
@@ -472,25 +473,25 @@ pub unsafe extern "C" fn builder_build(
 /// Caller is responsible for passing a valid path pointer.
 #[cfg(feature = "default-engine")]
 #[no_mangle]
-pub unsafe extern "C" fn get_default_client(
+pub unsafe extern "C" fn get_default_engine(
     path: KernelStringSlice,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<*const ExternEngineHandle> {
-    get_default_default_client_impl(path, allocate_error).into_extern_result(allocate_error)
+    get_default_default_engine_impl(path, allocate_error).into_extern_result(allocate_error)
 }
 
-// get the default version of the default client :)
+// get the default version of the default engine :)
 #[cfg(feature = "default-engine")]
-unsafe fn get_default_default_client_impl(
+unsafe fn get_default_default_engine_impl(
     path: KernelStringSlice,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<*const ExternEngineHandle> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) }?;
-    get_default_client_impl(url, Default::default(), allocate_error)
+    get_default_engine_impl(url, Default::default(), allocate_error)
 }
 
 #[cfg(feature = "default-engine")]
-unsafe fn get_default_client_impl(
+unsafe fn get_default_engine_impl(
     url: Url,
     options: HashMap<String, String>,
     allocate_error: AllocateErrorFn,
@@ -502,12 +503,12 @@ unsafe fn get_default_client_impl(
         options,
         Arc::new(TokioBackgroundExecutor::new()),
     );
-    let client = Arc::new(engine.map_err(Error::generic)?);
-    let client: Arc<dyn ExternEngine> = Arc::new(ExternEngineVtable {
-        client,
+    let engine = Arc::new(engine.map_err(Error::generic)?);
+    let engine: Arc<dyn ExternEngine> = Arc::new(ExternEngineVtable {
+        engine,
         allocate_error,
     });
-    Ok(ArcHandle::into_handle(client))
+    Ok(ArcHandle::into_handle(engine))
 }
 
 /// # Safety

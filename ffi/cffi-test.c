@@ -26,9 +26,9 @@ int main(int argc, char* argv[]) {
   KernelStringSlice table_path_slice = {table_path, strlen(table_path)};
 
   ExternResultExternEngineHandle engine_res =
-    get_default_client(table_path_slice, NULL);
+    get_default_engine(table_path_slice, NULL);
   if (engine_res.tag != OkExternEngineHandle) {
-    printf("Failed to get client\n");
+    printf("Failed to get engine\n");
     return -1;
   }
 

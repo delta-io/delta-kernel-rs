@@ -1,4 +1,4 @@
-//! The default client uses Async IO to read files, but the kernel APIs are all
+//! The default engine uses Async IO to read files, but the kernel APIs are all
 //! synchronous. Therefore, we need an executor to run the async IO on in the
 //! background.
 //!

@@ -62,7 +62,7 @@ impl JsonHandler for SyncJsonHandler {
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        // TODO: This is taken from the default client as it's the same. We should share an
+        // TODO: This is taken from the default engine as it's the same. We should share an
         // implementation at some point
         let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
         if json_strings.num_columns() != 1 {

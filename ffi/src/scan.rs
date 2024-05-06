@@ -54,7 +54,7 @@ pub struct ArrowFFIData {
 ///
 /// # Safety
 /// data_handle must be a valid EngineDataHandle as read by the [`DefaultEngine`] obtained
-/// from `get_default_client`.
+/// from `get_default_engine`.
 #[cfg(feature = "default-engine")]
 pub unsafe extern "C" fn get_raw_arrow_data(
     data_handle: *mut EngineDataHandle,
@@ -141,9 +141,9 @@ pub struct KernelScanDataIterator {
     // Item = Box<dyn EngineData>, see above, Vec<bool> -> can become a KernelBoolSlice
     data: Box<dyn Iterator<Item = DeltaResult<ScanData>>>,
 
-    // Also keep a reference to the external client for its error allocator.
+    // Also keep a reference to the external engine for its error allocator.
     // Parquet and Json handlers don't hold any reference to the tokio reactor, so the iterator
-    // terminates early if the last table client goes out of scope.
+    // terminates early if the last engine goes out of scope.
     engine: Arc<dyn ExternEngine>,
 }
 

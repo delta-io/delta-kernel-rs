@@ -17,7 +17,7 @@ tracing = "0.1"
 url = "2"
 delta_kernel = { path = "../kernel", features = ["developer-visibility"] }
 
-# used if we use the default client to be able to move arrow data into the c-ffi format
+# used if we use the default engine to be able to move arrow data into the c-ffi format
 arrow-schema = { version = "^49.0", default-features = false, features = ["ffi"], optional = true }
 arrow-data = { version = "^49.0", default-features = false, features = ["ffi"], optional = true }
 arrow-array = { version = "^49.0", default-features = false, optional = true }

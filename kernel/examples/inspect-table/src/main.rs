@@ -61,7 +61,7 @@ fn main() {
     );
     let Ok(engine) = engine else {
         println!(
-            "Failed to construct table client: {}",
+            "Failed to construct engine: {}",
             engine.err().unwrap()
         );
         return;

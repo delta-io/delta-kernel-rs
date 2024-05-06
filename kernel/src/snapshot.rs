@@ -380,8 +380,8 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
-        let client = SyncEngine::new();
-        let snapshot = Snapshot::try_new(url, &client, Some(1)).unwrap();
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::try_new(url, &engine, Some(1)).unwrap();
 
         let expected = Protocol {
             min_reader_version: 3,
@@ -402,8 +402,8 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
-        let client = SyncEngine::new();
-        let snapshot = Snapshot::try_new(url, &client, None).unwrap();
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::try_new(url, &engine, None).unwrap();
 
         let expected = Protocol {
             min_reader_version: 3,

@@ -3,18 +3,18 @@
 //! Delta-kernel-rs is an experimental [Delta](https://github.com/delta-io/delta/) implementation
 //! focused on interoperability with a wide range of query engines. It currently only supports
 //! reads. This library defines a number of traits which must be implemented to provide a
-//! working "delta reader". The are detailed below. There is a provided "default client" that
+//! working "delta reader". The are detailed below. There is a provided "default engine" that
 //! implenents all these traits and can be used to ease integration work. See
-//! [`DefaultEngine`](client/default/index.html) for more information.
+//! [`DefaultEngine`](engine/default/index.html) for more information.
 //!
-//! A full `rust` example for reading table data using the default client can be found
+//! A full `rust` example for reading table data using the default engine can be found
 //! [here](https://github.com/delta-incubator/delta-kernel-rs/blob/main/kernel/examples/dump-table/src/main.rs)
 //!
 //! # Engine traits
 //!
 //! The [`Engine`] trait allow connectors to bring their own implementation of functionality such as
 //! reading parquet files, listing files in a file system, parsing a JSON string etc.  This trait
-//! exposes methods to get sub-clients which expose the core functionalities customizable by
+//! exposes methods to get sub-engines which expose the core functionalities customizable by
 //! connectors.
 //!
 //! ## Expression handling
@@ -116,7 +116,7 @@ pub trait ExpressionEvaluator: Send + Sync {
 
 /// Provides expression evaluation capability to Delta Kernel.
 ///
-/// Delta Kernel can use this client to evaluate predicate on partition filters,
+/// Delta Kernel can use this handler to evaluate predicate on partition filters,
 /// fill up partition column values and any computation on data using Expressions.
 pub trait ExpressionHandler {
     /// Create an [`ExpressionEvaluator`] that can evaluate the given [`Expression`]

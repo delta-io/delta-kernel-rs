@@ -97,7 +97,7 @@ pub fn visit_scan_files<T>(
     Ok(visitor.context)
 }
 
-// add some visitor magic for clients
+// add some visitor magic for engines
 struct ScanFileVisitor<T> {
     callback: fn(&mut T, &str, i64, DvInfo, HashMap<String, String>),
     selection_vector: Vec<bool>,
