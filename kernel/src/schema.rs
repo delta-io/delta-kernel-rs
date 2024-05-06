@@ -421,6 +421,7 @@ impl From<ArrayType> for DataType {
     }
 }
 
+/// cbindgen:ignore
 impl DataType {
     pub const STRING: Self = DataType::Primitive(PrimitiveType::String);
     pub const LONG: Self = DataType::Primitive(PrimitiveType::Long);

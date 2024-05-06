@@ -15,7 +15,7 @@ crate-type = ["cdylib", "staticlib"]
 [dependencies]
 tracing = "0.1"
 url = "2"
-delta_kernel = { path = "../kernel", features = ["developer-visibility"] }
+delta_kernel = { path = "../kernel", default-features = false, features = ["developer-visibility"] }
 
 # used if we use the default engine to be able to move arrow data into the c-ffi format
 arrow-schema = { version = "^49.0", default-features = false, features = ["ffi"], optional = true }
@@ -34,3 +34,4 @@ default-engine = [
   "arrow-data",
   "arrow-schema"
 ]
+sync-engine = ["delta_kernel/sync-engine"]

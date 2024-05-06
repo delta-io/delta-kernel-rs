@@ -9,6 +9,7 @@ namespace = "ffi"
 
 [defines]
 "feature = default-engine" = "DEFINE_DEFAULT_ENGINE"
+"feature = sync-engine" = "DEFINE_SYNC_ENGINE"
 
 [export.mangle]
 remove_underscores = true

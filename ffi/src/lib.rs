@@ -1,6 +1,7 @@
 /// FFI interface for the delta kernel
 ///
 /// Exposes that an engine needs to call from C/C++ to interface with kernel
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 use std::collections::HashMap;
 use std::default::Default;
 use std::os::raw::{c_char, c_void};
@@ -157,11 +158,13 @@ pub unsafe extern "C" fn drop_bool_slice(slice: *mut KernelBoolSlice) {
 pub enum KernelError {
     UnknownError, // catch-all for unrecognized kernel Error types
     FFIError,     // errors encountered in the code layer that supports FFI
+    #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
     ArrowError,
     EngineDataTypeError,
     ExtractError,
     GenericError,
     IOErrorError,
+    #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
     ParquetError,
     #[cfg(feature = "default-engine")]
     ObjectStoreError,
@@ -190,12 +193,14 @@ impl From<Error> for KernelError {
     fn from(e: Error) -> Self {
         match e {
             // NOTE: By definition, no kernel Error maps to FFIError
+            #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
             Error::Arrow(_) => KernelError::ArrowError,
             Error::EngineDataType(_) => KernelError::EngineDataTypeError,
             Error::Extract(..) => KernelError::ExtractError,
             Error::Generic(_) => KernelError::GenericError,
             Error::GenericError { .. } => KernelError::GenericError,
             Error::IOError(_) => KernelError::IOErrorError,
+            #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
             Error::Parquet(_) => KernelError::ParquetError,
             #[cfg(feature = "default-engine")]
             Error::ObjectStore(_) => KernelError::ObjectStoreError,
@@ -396,6 +401,7 @@ pub struct EngineBuilder {
     options: HashMap<String, String>,
 }
 
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 impl EngineBuilder {
     fn set_option(&mut self, key: String, val: String) {
         self.options.insert(key, val);
