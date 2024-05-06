@@ -22,6 +22,8 @@ pub enum Scalar {
     Boolean(bool),
     /// Microsecond precision timestamp, adjusted to UTC.
     Timestamp(i64),
+    /// Microsecond precision timestamp, without any timezone.
+    TimestampNtz(i64),
     /// Date stored as a signed 32bit int days since UNIX epoch 1970-01-01
     Date(i32),
     Binary(Vec<u8>),
@@ -32,17 +34,18 @@ pub enum Scalar {
 impl Scalar {
     pub fn data_type(&self) -> DataType {
         match self {
-            Self::Integer(_) => DataType::Primitive(PrimitiveType::Integer),
-            Self::Long(_) => DataType::Primitive(PrimitiveType::Long),
-            Self::Short(_) => DataType::Primitive(PrimitiveType::Short),
-            Self::Byte(_) => DataType::Primitive(PrimitiveType::Byte),
-            Self::Float(_) => DataType::Primitive(PrimitiveType::Float),
-            Self::Double(_) => DataType::Primitive(PrimitiveType::Double),
-            Self::String(_) => DataType::Primitive(PrimitiveType::String),
-            Self::Boolean(_) => DataType::Primitive(PrimitiveType::Boolean),
-            Self::Timestamp(_) => DataType::Primitive(PrimitiveType::Timestamp),
-            Self::Date(_) => DataType::Primitive(PrimitiveType::Date),
-            Self::Binary(_) => DataType::Primitive(PrimitiveType::Binary),
+            Self::Integer(_) => DataType::INTEGER,
+            Self::Long(_) => DataType::LONG,
+            Self::Short(_) => DataType::SHORT,
+            Self::Byte(_) => DataType::BYTE,
+            Self::Float(_) => DataType::FLOAT,
+            Self::Double(_) => DataType::DOUBLE,
+            Self::String(_) => DataType::STRING,
+            Self::Boolean(_) => DataType::BOOLEAN,
+            Self::Timestamp(_) => DataType::TIMESTAMP,
+            Self::TimestampNtz(_) => DataType::TIMESTAMP_NTZ,
+            Self::Date(_) => DataType::DATE,
+            Self::Binary(_) => DataType::BINARY,
             Self::Decimal(_, precision, scale) => DataType::decimal(*precision, *scale),
             Self::Null(data_type) => data_type.clone(),
         }
@@ -61,6 +64,7 @@ impl Display for Scalar {
             Self::String(s) => write!(f, "'{}'", s),
             Self::Boolean(b) => write!(f, "{}", b),
             Self::Timestamp(ts) => write!(f, "{}", ts),
+            Self::TimestampNtz(ts) => write!(f, "{}", ts),
             Self::Date(d) => write!(f, "{}", d),
             Self::Binary(b) => write!(f, "{:?}", b),
             Self::Decimal(value, _, scale) => match scale.cmp(&0) {

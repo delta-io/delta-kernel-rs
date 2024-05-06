@@ -43,6 +43,8 @@ impl Scalar {
             String(val) => Arc::new(StringArray::from(vec![val.clone(); num_rows])),
             Boolean(val) => Arc::new(BooleanArray::from(vec![*val; num_rows])),
             Timestamp(val) => Arc::new(TimestampMicrosecondArray::from_value(*val, num_rows)),
+            // TODO: Is this correct?
+            TimestampNtz(val) => Arc::new(TimestampMicrosecondArray::from_value(*val, num_rows)),
             Date(val) => Arc::new(Date32Array::from_value(*val, num_rows)),
             Binary(val) => Arc::new(BinaryArray::from(vec![val.as_slice(); num_rows])),
             Decimal(val, precision, scale) => Arc::new(
