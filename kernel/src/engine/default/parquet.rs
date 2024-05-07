@@ -3,7 +3,6 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_schema::SchemaRef as ArrowSchemaRef;
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::DynObjectStore;
@@ -12,11 +11,9 @@ use parquet::arrow::arrow_reader::{
 };
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 
-use super::file_handler::{FileOpenFuture, FileOpener};
-use crate::engine::arrow_data::ArrowEngineData;
+use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use crate::engine::arrow_utils::{generate_mask, get_requested_indices, reorder_record_batch};
 use crate::engine::default::executor::TaskExecutor;
-use crate::engine::default::file_handler::FileStream;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, ParquetHandler};
 
@@ -56,7 +53,6 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             return Ok(Box::new(std::iter::empty()));
         }
 
-        let arrow_schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
         // get the first FileMeta to decide how to fetch the file.
         // NB: This means that every file in `FileMeta` _must_ have the same scheme or things will break
         // s3://    -> aws   (ParquetOpener)
@@ -65,49 +61,21 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         //   -> reqwest to get data
         //   -> parse to parquet
         // SAFETY: we did is_empty check above, this is ok.
-        let mut stream: std::pin::Pin<
-            Box<dyn futures::Stream<Item = DeltaResult<arrow_array::RecordBatch>> + Send>,
-        > = match files[0].location.scheme() {
-            "http" | "https" => Box::pin(FileStream::new(
-                files.to_vec(),
-                arrow_schema,
-                PresignedUrlOpener::new(1024, physical_schema.clone()),
-            )?),
-            _ => Box::pin(FileStream::new(
-                files.to_vec(),
-                arrow_schema,
-                ParquetOpener::new(1024, physical_schema.clone(), self.store.clone()),
-            )?),
+        let file_opener: Box<dyn FileOpener> = match files[0].location.scheme() {
+            "http" | "https" => Box::new(PresignedUrlOpener::new(1024, physical_schema.clone())),
+            _ => Box::new(ParquetOpener::new(
+                1024,
+                physical_schema.clone(),
+                self.store.clone(),
+            )),
         };
-
-        // This channel will become the output iterator.
-        // The stream will execute in the background and send results to this channel.
-        // The channel will buffer up to `readahead` results, allowing the background
-        // stream to get ahead of the consumer.
-        let (sender, receiver) = std::sync::mpsc::sync_channel(self.readahead);
-
-        let executor_for_block = self.task_executor.clone();
-        self.task_executor.spawn(async move {
-            while let Some(res) = stream.next().await {
-                let sender = sender.clone();
-                let join_res = executor_for_block
-                    .spawn_blocking(move || sender.send(res))
-                    .await;
-                match join_res {
-                    Ok(send_res) => match send_res {
-                        Ok(()) => continue,
-                        Err(_) => break,
-                    },
-                    Err(je) => {
-                        panic!("Couldn't join spawned task, runtime is likely in bad state: {je}")
-                    }
-                }
-            }
-        });
-
-        Ok(Box::new(receiver.into_iter().map(|rbr| {
-            rbr.map(|rb| Box::new(ArrowEngineData::new(rb)) as _)
-        })))
+        FileStream::new_async_read_iterator(
+            self.task_executor.clone(),
+            Arc::new(physical_schema.as_ref().try_into()?),
+            file_opener,
+            files,
+            self.readahead,
+        )
     }
 }
 
@@ -251,7 +219,9 @@ mod tests {
     use arrow_array::RecordBatch;
     use object_store::{local::LocalFileSystem, ObjectStore};
 
-    use crate::{engine::default::executor::tokio::TokioBackgroundExecutor, EngineData};
+    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::EngineData;
 
     use itertools::Itertools;
 

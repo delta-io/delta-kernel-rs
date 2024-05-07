@@ -13,7 +13,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::file_stream::SCAN_ROW_SCHEMA;
+use super::log_replay::SCAN_ROW_SCHEMA;
 
 /// State that doesn't change beween scans
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -93,7 +93,7 @@ pub fn visit_scan_files<T>(
         selection_vector,
         context,
     };
-    data.extract(super::file_stream::SCAN_ROW_SCHEMA.clone(), &mut visitor)?;
+    data.extract(super::log_replay::SCAN_ROW_SCHEMA.clone(), &mut visitor)?;
     Ok(visitor.context)
 }
 

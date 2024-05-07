@@ -16,7 +16,7 @@ use object_store::path::Path;
 use object_store::{DynObjectStore, GetResultPayload};
 
 use super::executor::TaskExecutor;
-use super::file_handler::{FileOpenFuture, FileOpener, FileStream};
+use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::schema::SchemaRef;
 use crate::{
@@ -126,37 +126,14 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         }
 
         let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
-        let store = self.store.clone();
-        let file_reader = JsonOpener::new(self.batch_size, schema.clone(), store);
-        let mut stream = FileStream::new(files.to_vec(), schema, file_reader)?;
-
-        // This channel will become the output iterator
-        // The stream will execute in the background, and we allow up to `readahead`
-        // batches to be buffered in the channel.
-        let (sender, receiver) = std::sync::mpsc::sync_channel(self.readahead);
-
-        let executor_for_block = self.task_executor.clone();
-        self.task_executor.spawn(async move {
-            while let Some(res) = stream.next().await {
-                let sender = sender.clone();
-                let join_res = executor_for_block
-                    .spawn_blocking(move || sender.send(res))
-                    .await;
-                match join_res {
-                    Ok(send_res) => match send_res {
-                        Ok(()) => continue,
-                        Err(_) => break,
-                    },
-                    Err(je) => {
-                        panic!("Couldn't join spawned task, runtime is likely in bad state: {je}")
-                    }
-                }
-            }
-        });
-
-        Ok(Box::new(receiver.into_iter().map(|rbr| {
-            rbr.map(|rb| Box::new(ArrowEngineData::new(rb)) as _)
-        })))
+        let file_opener = JsonOpener::new(self.batch_size, schema.clone(), self.store.clone());
+        FileStream::new_async_read_iterator(
+            self.task_executor.clone(),
+            schema,
+            Box::new(file_opener),
+            files,
+            self.readahead,
+        )
     }
 }
 

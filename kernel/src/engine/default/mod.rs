@@ -21,7 +21,7 @@ use crate::{
 };
 
 pub mod executor;
-pub mod file_handler;
+pub mod file_stream;
 pub mod filesystem;
 pub mod json;
 pub mod parquet;

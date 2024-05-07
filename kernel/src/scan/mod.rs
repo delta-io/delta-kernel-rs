@@ -6,7 +6,7 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
-use self::file_stream::{log_replay_iter, scan_action_iter};
+use self::log_replay::{log_replay_iter, scan_action_iter};
 use self::state::GlobalScanState;
 use crate::actions::deletion_vector::{treemap_to_bools, DeletionVectorDescriptor};
 use crate::actions::{get_log_schema, Add, ADD_NAME, REMOVE_NAME};
@@ -16,7 +16,7 @@ use crate::snapshot::Snapshot;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta};
 
 mod data_skipping;
-pub mod file_stream;
+pub mod log_replay;
 pub mod state;
 
 /// Builder to scan a snapshot of a table.
@@ -337,7 +337,7 @@ impl Scan {
 /// }
 /// ```
 pub fn scan_row_schema() -> Schema {
-    file_stream::SCAN_ROW_SCHEMA.as_ref().clone()
+    log_replay::SCAN_ROW_SCHEMA.as_ref().clone()
 }
 
 fn parse_partition_value(raw: Option<&String>, data_type: &DataType) -> DeltaResult<Scalar> {
@@ -451,7 +451,7 @@ pub(crate) mod test_utils {
             arrow_data::ArrowEngineData,
             sync::{json::SyncJsonHandler, SyncEngine},
         },
-        scan::file_stream::scan_action_iter,
+        scan::log_replay::scan_action_iter,
         schema::{StructField, StructType},
         EngineData, JsonHandler,
     };
