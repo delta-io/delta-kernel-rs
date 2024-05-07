@@ -181,7 +181,7 @@ fn try_main() -> DeltaResult<()> {
         let (data, vector) = res?;
         scan_file_tx = delta_kernel::scan::state::visit_scan_files(
             data.as_ref(),
-            vector,
+            &vector,
             scan_file_tx,
             send_scan_file,
         )?;

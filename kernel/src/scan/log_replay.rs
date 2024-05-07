@@ -340,7 +340,7 @@ mod tests {
     fn test_scan_action_iter() {
         run_with_validate_callback(
             vec![add_batch_simple()],
-            vec![true, false],
+            &[true, false],
             (),
             validate_simple,
         );
@@ -350,7 +350,7 @@ mod tests {
     fn test_scan_action_iter_with_remove() {
         run_with_validate_callback(
             vec![add_batch_with_remove()],
-            vec![false, false, true, false],
+            &[false, false, true, false],
             (),
             validate_simple,
         );

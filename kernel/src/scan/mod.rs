@@ -502,7 +502,7 @@ pub(crate) mod test_utils {
     #[allow(clippy::vec_box)]
     pub(crate) fn run_with_validate_callback<T: Clone>(
         batch: Vec<Box<ArrowEngineData>>,
-        expected_sel_vec: Vec<bool>,
+        expected_sel_vec: &[bool],
         context: T,
         validate_callback: fn(
             context: &mut T,
@@ -531,7 +531,7 @@ pub(crate) mod test_utils {
             assert_eq!(sel, expected_sel_vec);
             crate::scan::state::visit_scan_files(
                 batch.as_ref(),
-                sel,
+                &sel,
                 context.clone(),
                 validate_callback,
             )

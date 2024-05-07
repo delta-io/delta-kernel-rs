@@ -78,7 +78,7 @@ impl DvInfo {
 /// ```
 pub fn visit_scan_files<T>(
     data: &dyn EngineData,
-    selection_vector: Vec<bool>,
+    selection_vector: &[bool],
     context: T,
     callback: fn(
         context: &mut T,
@@ -98,13 +98,13 @@ pub fn visit_scan_files<T>(
 }
 
 // add some visitor magic for engines
-struct ScanFileVisitor<T> {
+struct ScanFileVisitor<'a, T> {
     callback: fn(&mut T, &str, i64, DvInfo, HashMap<String, String>),
-    selection_vector: Vec<bool>,
+    selection_vector: &'a [bool],
     context: T,
 }
 
-impl<T> DataVisitor for ScanFileVisitor<T> {
+impl<T> DataVisitor for ScanFileVisitor<'_, T> {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for row_index in 0..row_count {
             if !self.selection_vector[row_index] {
@@ -166,7 +166,7 @@ mod tests {
         let context = TestContext { id: 2 };
         run_with_validate_callback(
             vec![add_batch_simple()],
-            vec![true, false],
+            &[true, false],
             context,
             validate_visit,
         );

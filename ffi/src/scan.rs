@@ -12,7 +12,7 @@ use url::Url;
 
 use crate::{
     unwrap_kernel_expression, AllocateStringFn, EnginePredicate, ExternEngine, ExternEngineHandle,
-    ExternResult, FromBoolSlice, IntoExternResult, KernelBoolSlice, KernelExpressionVisitorState,
+    ExternResult, IntoExternResult, KernelBoolSlice, KernelExpressionVisitorState,
     KernelStringSlice, NullableCvoid, SnapshotHandle, TryFromStringSlice,
 };
 
@@ -212,9 +212,8 @@ fn kernel_scan_data_next_impl(
     ),
 ) -> DeltaResult<bool> {
     if let Some((data, sel_vec)) = data.data.next().transpose()? {
-        let bool_slice = KernelBoolSlice::from(sel_vec);
         let data_handle = BoxHandle::into_handle(EngineDataHandle { data });
-        (engine_visitor)(engine_context, data_handle, bool_slice);
+        (engine_visitor)(engine_context, data_handle, sel_vec.into());
         // ensure we free the data
         unsafe { BoxHandle::drop_handle(data_handle) };
         Ok(true)
@@ -277,7 +276,7 @@ pub unsafe extern "C" fn selection_vector_from_dv(
     dv_info: &DvInfo,
     extern_engine: *const ExternEngineHandle,
     state: &mut GlobalScanState,
-) -> ExternResult<*mut KernelBoolSlice> {
+) -> ExternResult<KernelBoolSlice> {
     selection_vector_from_dv_impl(dv_info, extern_engine, state).into_extern_result(extern_engine)
 }
 
@@ -285,13 +284,13 @@ unsafe fn selection_vector_from_dv_impl(
     dv_info: &DvInfo,
     extern_engine: *const ExternEngineHandle,
     state: &mut GlobalScanState,
-) -> DeltaResult<*mut KernelBoolSlice> {
+) -> DeltaResult<KernelBoolSlice> {
     let extern_engine = unsafe { ArcHandle::clone_as_arc(extern_engine) };
     let root_url = Url::parse(&state.table_root)?;
     let vopt = dv_info.get_selection_vector(extern_engine.engine().as_ref(), &root_url)?;
     match vopt {
-        Some(v) => Ok(BoxHandle::into_handle(v.into())),
-        None => Ok(std::ptr::null_mut()),
+        Some(v) => Ok(v.into()),
+        None => Ok(KernelBoolSlice::empty()),
     }
 }
 
@@ -330,17 +329,16 @@ struct ContextWrapper {
 #[no_mangle]
 pub unsafe extern "C" fn visit_scan_data(
     data: *mut EngineDataHandle,
-    selection_vector: KernelBoolSlice,
+    selection_vec: KernelBoolSlice,
     engine_context: NullableCvoid,
     callback: CScanCallback,
 ) {
-    let selection_vec = Vec::<bool>::from_slice(selection_vector);
+    let selection_vec = unsafe { selection_vec.as_ref() };
     let data = unsafe { &*data };
     let data = data.data.as_ref();
     let context_wrapper = ContextWrapper {
         engine_context,
         callback,
     };
-    visit_scan_files(data, selection_vec.clone(), context_wrapper, rust_callback).unwrap();
-    Box::new(selection_vec).leak();
+    visit_scan_files(data, selection_vec, context_wrapper, rust_callback).unwrap();
 }

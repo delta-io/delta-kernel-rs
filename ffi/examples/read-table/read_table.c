@@ -64,7 +64,7 @@ void visit_callback(void* engine_context, const KernelStringSlice path, long siz
     printf("Could not get selection vector from kernel\n");
     return;
   }
-  KernelBoolSlice *selection_vector = selection_vector_res.ok;
+  KernelBoolSlice selection_vector = selection_vector_res.ok;
   if (selection_vector) {
     printf("  Selection vector:\n");
     print_selection_vector("    ", selection_vector);
