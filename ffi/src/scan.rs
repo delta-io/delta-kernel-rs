@@ -139,7 +139,7 @@ pub unsafe extern "C" fn drop_global_scan_state(state: *mut GlobalScanState) {
 pub struct KernelScanDataIterator {
     // Box -> Wrap its unsized content this struct is fixed-size with thin pointers.
     // Item = Box<dyn EngineData>, see above, Vec<bool> -> can become a KernelBoolSlice
-    data: Box<dyn Iterator<Item = DeltaResult<ScanData>>>,
+    data: Box<dyn Iterator<Item = DeltaResult<ScanData>> + Send + Sync>,
 
     // Also keep a reference to the external engine for its error allocator.
     // Parquet and Json handlers don't hold any reference to the tokio reactor, so the iterator

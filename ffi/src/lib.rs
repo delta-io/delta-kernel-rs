@@ -385,7 +385,7 @@ impl<T> IntoExternResult<T> for DeltaResult<T> {
 }
 
 // A wrapper for Engine which defines additional FFI-specific methods.
-pub trait ExternEngine {
+pub trait ExternEngine: Send + Sync {
     fn engine(&self) -> Arc<dyn Engine>;
     fn error_allocator(&self) -> &dyn AllocateError;
 }

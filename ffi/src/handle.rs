@@ -15,7 +15,7 @@ use std::sync::Arc;
 /// leaked thin pointer. Does not include any reference-counting capability, so engine is
 /// responsible to do whatever reference counting the engine may need. Engine is also responsible
 /// not to drop an in-use handle, so kernel code can safely dereference the pointer.
-pub trait BoxHandle: Sized {
+pub trait BoxHandle: Sized + Send + Sync {
     fn into_handle(self) -> *mut Self {
         Box::into_raw(Box::new(self))
     }
@@ -145,7 +145,7 @@ pub type Unconstructable = unconstructable::Unconstructable;
 /// * The handle is (correctly) `Send`
 pub trait ArcHandle: Sized {
     /// The target type this handle represents.
-    type Target: ?Sized;
+    type Target: ?Sized + Send + Sync;
 
     /// Converts the target Arc into a (leaked) "handle" that can cross the FFI boundary. The Arc
     /// refcount does not change. The handle remains valid until passed to [Self::drop_handle].
@@ -189,7 +189,7 @@ pub trait ArcHandle: Sized {
 /// A special kind of [ArcHandle] which is optimized for [Sized] types. Handles for sized types are
 /// more efficient if they implement this trait instead of [ArcHandle].
 pub trait SizedArcHandle: Sized {
-    type Target: Sized;
+    type Target: Sized + Send + Sync;
 }
 
 // A blanket implementation of `ArcHandle` for all types satisfying `SizedArcHandle`.
@@ -214,6 +214,7 @@ pub trait SizedArcHandle: Sized {
 impl<H, T> ArcHandle for H
 where
     H: SizedArcHandle<Target = T>,
+    T: Send + Sync,
 {
     type Target = T;
 

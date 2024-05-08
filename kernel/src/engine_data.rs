@@ -206,7 +206,7 @@ pub trait DataVisitor {
 ///   }
 /// }
 /// ```
-pub trait EngineData: Send {
+pub trait EngineData: Send + Sync {
     /// Request that the data be visited for the passed schema. The contract of this method is that
     /// it will call back into the passed [`DataVisitor`]s `visit` method. The call to `visit` must
     /// include `GetData` items for each leaf of the schema, as well as the number of rows in this

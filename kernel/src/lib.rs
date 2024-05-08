@@ -88,7 +88,7 @@ pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
 
 /// An iterator of data read from specified files
 pub type FileDataReadResultIterator =
-    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
+    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + Sync>;
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,7 +118,7 @@ pub trait ExpressionEvaluator: Send + Sync {
 ///
 /// Delta Kernel can use this handler to evaluate predicate on partition filters,
 /// fill up partition column values and any computation on data using Expressions.
-pub trait ExpressionHandler {
+pub trait ExpressionHandler: Send + Sync {
     /// Create an [`ExpressionEvaluator`] that can evaluate the given [`Expression`]
     /// on columnar batches with the given [`Schema`] to produce data of [`DataType`].
     ///
