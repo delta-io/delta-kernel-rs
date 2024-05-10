@@ -4,6 +4,8 @@
 # default to generating c bindings
 language = "C"
 
+pragma_once = true
+
 # only applies to Cxx
 namespace = "ffi"
 

@@ -261,7 +261,7 @@ pub struct MapType {
     pub key_type: DataType,
     /// The type of element used for the value of this map
     pub value_type: DataType,
-    /// Denoting whether this array can contain one or more null values
+    /// Denoting whether this map can contain one or more null values
     #[serde(default = "default_true")]
     pub value_contains_null: bool,
 }

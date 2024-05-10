@@ -22,7 +22,7 @@ use super::handle::{ArcHandle, BoxHandle};
 // that are the engine data
 /// an opaque struct that encapsulates data read by an engine. this handle can be passed back into
 /// some kernel calls to operate on the data, or can be converted into the raw data as read by the
-/// [`Engine`] by calling [`get_raw_engine_data`]
+/// [`delta_kernel::Engine`] by calling [`get_raw_engine_data`]
 pub struct EngineDataHandle {
     data: Box<dyn EngineData>,
 }
@@ -53,8 +53,8 @@ pub struct ArrowFFIData {
 /// the schema.
 ///
 /// # Safety
-/// data_handle must be a valid EngineDataHandle as read by the [`DefaultEngine`] obtained
-/// from `get_default_engine`.
+/// data_handle must be a valid EngineDataHandle as read by the
+/// [`delta_kernel::engine::default::DefaultEngine`] obtained from `get_default_engine`.
 #[cfg(feature = "default-engine")]
 pub unsafe extern "C" fn get_raw_arrow_data(
     data_handle: *mut EngineDataHandle,
@@ -225,7 +225,7 @@ fn kernel_scan_data_next_impl(
 /// # Safety
 ///
 /// Caller is responsible for (at most once) passing a valid pointer returned by a call to
-/// [kernel_scan_files_init].
+/// [`kernel_scan_data_init`].
 // we should probably be consistent with drop vs. free on engine side (probably the latter is more
 // intuitive to non-rust code)
 #[no_mangle]

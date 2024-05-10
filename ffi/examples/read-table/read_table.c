@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <string.h>
+
 #include "delta_kernel_ffi.h"
+#include "schema.h"
 
 #ifdef PRINT_ARROW_DATA
 #include "arrow.h"
@@ -65,13 +67,13 @@ void visit_callback(void* engine_context, const KernelStringSlice path, long siz
     return;
   }
   KernelBoolSlice selection_vector = selection_vector_res.ok;
-  if (selection_vector) {
+  if (selection_vector.len > 0) {
     printf("  Selection vector:\n");
-    print_selection_vector("    ", selection_vector);
-    drop_bool_slice(selection_vector);
+    print_selection_vector("    ", &selection_vector);
   } else {
     printf("  No selection vector for this call\n");
   }
+  drop_bool_slice(selection_vector);
   // normally this would be picked out of the schema
   char* letter_key = "letter";
   KernelStringSlice key = {letter_key, strlen(letter_key)};
@@ -89,7 +91,7 @@ void visit_data(void *engine_context, EngineDataHandle *engine_data, KernelBoolS
   printf("  Of this data, here is a selection vector\n");
   print_selection_vector("    ", &selection_vec);
   visit_scan_data(engine_data, selection_vec, engine_context, visit_callback);
-  drop_bool_slice(&selection_vec);
+  drop_bool_slice(selection_vec);
 }
 
 int main(int argc, char* argv[]) {
@@ -145,7 +147,8 @@ int main(int argc, char* argv[]) {
   const SnapshotHandle *snapshot_handle = snapshot_handle_res.ok;
 
   uint64_t v = version(snapshot_handle);
-  printf("version: %llu\n", v);
+  printf("version: %llu\n\n", v);
+  print_schema(snapshot_handle);
 
   ExternResultScan scan_res = scan(snapshot_handle, engine, NULL);
   if (scan_res.tag != OkScan) {
