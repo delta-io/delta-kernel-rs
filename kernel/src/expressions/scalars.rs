@@ -4,6 +4,7 @@ use std::fmt::{Display, Formatter};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 
 use crate::schema::{DataType, PrimitiveType};
+use crate::utils::require;
 use crate::Error;
 
 /// A single value, which can be null. Used for representing literal values
@@ -225,9 +226,7 @@ impl PrimitiveType {
                 (base, exp[1..].parse()?)
             }
         };
-        if base.is_empty() {
-            return Err(self.parse_error(raw));
-        }
+        require!(!base.is_empty(), self.parse_error(raw));
 
         // now split on any '.' and parse
         let (int_part, frac_part, frac_digits) = match base.find('.') {
@@ -249,9 +248,7 @@ impl PrimitiveType {
         // most i128::MAX, and 0-i128::MAX doesn't underflow
         let scale = frac_digits - exp;
         let scale: i8 = scale.try_into().map_err(|_| self.parse_error(raw))?;
-        if scale != expected_scale {
-            return Err(self.parse_error(raw));
-        }
+        require!(scale == expected_scale, self.parse_error(raw));
 
         let int: i128 = match frac_part {
             None => int_part.parse()?,

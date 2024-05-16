@@ -8,6 +8,7 @@ use indexmap::IndexMap;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
+use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 pub type Schema = StructType;
@@ -342,12 +343,10 @@ where
     D: serde::Deserializer<'de>,
 {
     let str_value = String::deserialize(deserializer)?;
-    if !str_value.starts_with("decimal(") || !str_value.ends_with(')') {
-        return Err(serde::de::Error::custom(format!(
-            "Invalid decimal: {}",
-            str_value
-        )));
-    }
+    require!(
+        str_value.starts_with("decimal(") && str_value.ends_with(')'),
+        serde::de::Error::custom(format!("Invalid decimal: {}", str_value))
+    );
 
     let mut parts = str_value[8..str_value.len() - 1].split(',');
     let precision = parts

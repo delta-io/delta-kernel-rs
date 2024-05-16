@@ -5,8 +5,8 @@ use std::{
 };
 
 use crate::{
-    schema::SchemaRef, DeltaResult, EngineData, Error, Expression, FileDataReadResultIterator,
-    FileMeta, JsonHandler,
+    schema::SchemaRef, utils::require, DeltaResult, EngineData, Error, Expression,
+    FileDataReadResultIterator, FileMeta, JsonHandler,
 };
 use arrow_array::{cast::AsArray, RecordBatch};
 use arrow_json::ReaderBuilder;
@@ -65,9 +65,10 @@ impl JsonHandler for SyncJsonHandler {
         // TODO: This is taken from the default engine as it's the same. We should share an
         // implementation at some point
         let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
-        if json_strings.num_columns() != 1 {
-            return Err(Error::missing_column("Expected single column"));
-        }
+        require!(
+            json_strings.num_columns() == 1,
+            Error::missing_column("Expected single column")
+        );
         let json_strings =
             json_strings
                 .column(0)

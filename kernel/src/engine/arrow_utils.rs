@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::{schema::SchemaRef, DeltaResult, Error};
+use crate::{schema::SchemaRef, utils::require, DeltaResult, Error};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
@@ -33,11 +33,10 @@ pub(crate) fn get_requested_indices(
                 .map(|index| (parquet_index, index))
         })
         .unzip();
-    if mask_indicies.len() != requested_schema.fields.len() {
-        return Err(Error::generic(
-            "Didn't find all requested columns in parquet schema",
-        ));
-    }
+    require!(
+        mask_indicies.len() == requested_schema.fields.len(),
+        Error::generic("Didn't find all requested columns in parquet schema")
+    );
     Ok((mask_indicies, reorder_indicies))
 }
 

@@ -8,6 +8,7 @@ use delta_kernel_derive::Schema;
 use roaring::RoaringTreemap;
 use url::Url;
 
+use crate::utils::require;
 use crate::{DeltaResult, Error, FileSystemClient};
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
@@ -55,11 +56,10 @@ impl DeletionVectorDescriptor {
         match self.storage_type.as_str() {
             "u" => {
                 let path_len = self.path_or_inline_dv.len();
-                if path_len < 20 {
-                    return Err(Error::deletion_vector(
-                        "Invalid length {path_len}, must be >20",
-                    ));
-                }
+                require!(
+                    path_len >= 20,
+                    Error::deletion_vector("Invalid length {path_len}, must be >= 20",)
+                );
                 let prefix_len = path_len - 20;
                 let decoded = z85::decode(&self.path_or_inline_dv[prefix_len..])
                     .map_err(|_| Error::deletion_vector("Failed to decode DV uuid"))?;
@@ -128,24 +128,26 @@ impl DeletionVectorDescriptor {
                     .read(&mut version_buf)
                     .map_err(|err| Error::DeletionVector(err.to_string()))?;
                 let version = u8::from_be_bytes(version_buf);
-                if version != 1 {
-                    return Err(Error::DeletionVector(format!("Invalid version: {version}")));
-                }
+                require!(
+                    version == 1,
+                    Error::DeletionVector(format!("Invalid version: {version}"))
+                );
 
                 if let Some(offset) = offset {
                     cursor.set_position(offset as u64);
                 }
                 let dv_size = read_u32(&mut cursor, Endian::Big)?;
-                if dv_size != size_in_bytes as u32 {
-                    return Err(Error::DeletionVector(format!(
+                require!(
+                    dv_size == size_in_bytes as u32,
+                    Error::DeletionVector(format!(
                         "DV size mismatch. Log indicates {size_in_bytes}, file says: {dv_size}"
-                    )));
-                }
+                    ))
+                );
                 let magic = read_u32(&mut cursor, Endian::Little)?;
-
-                if magic != 1681511377 {
-                    return Err(Error::DeletionVector(format!("Invalid magic: {magic}")));
-                }
+                require!(
+                    magic == 1681511377,
+                    Error::DeletionVector(format!("Invalid magic: {magic}"))
+                );
 
                 // get the Bytes back out and limit it to dv_size
                 let position = cursor.position();

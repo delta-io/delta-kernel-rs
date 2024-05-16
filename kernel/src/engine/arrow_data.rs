@@ -1,5 +1,6 @@
 use crate::engine_data::{EngineData, EngineList, EngineMap, GetData};
 use crate::schema::{DataType, PrimitiveType, Schema, SchemaRef, StructField};
+use crate::utils::require;
 use crate::{DataVisitor, DeltaResult, Error};
 
 use arrow_array::cast::AsArray;
@@ -271,20 +272,22 @@ impl ArrowEngineData {
                 if let ArrowDataType::Struct(fields) = map_field.data_type() {
                     let mut fcount = 0;
                     for field in fields {
-                        if field.data_type() != &ArrowDataType::Utf8 {
-                            return Err(Error::UnexpectedColumnType(format!(
+                        require!(
+                            field.data_type() == &ArrowDataType::Utf8,
+                            Error::UnexpectedColumnType(format!(
                                 "On {}: Only support maps of String->String",
                                 field.name()
-                            )));
-                        }
+                            ))
+                        );
                         fcount += 1;
                     }
-                    if fcount != 2 {
-                        return Err(Error::UnexpectedColumnType(format!(
+                    require!(
+                        fcount == 2,
+                        Error::UnexpectedColumnType(format!(
                             "On {}: Expect map field struct to have two fields",
                             field.name()
-                        )));
-                    }
+                        ))
+                    );
                     debug!("Pushing map for {}", field.name);
                     out_col_array.push(col.as_map());
                 } else {
