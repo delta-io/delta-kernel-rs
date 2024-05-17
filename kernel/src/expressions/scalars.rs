@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 
-use crate::schema::{DataType, PrimitiveType};
+use crate::schema::{DataType, PrimitiveType, StructField};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
@@ -11,11 +11,17 @@ use crate::{DeltaResult, Error};
 /// in [Expressions][crate::expressions::Expression].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Scalar {
+    /// 32bit integer
     Integer(i32),
+    /// 64bit integer
     Long(i64),
+    /// 16bit integer
     Short(i16),
+    /// 8bit integer
     Byte(i8),
+    /// 32bit floating point
     Float(f32),
+    /// 64bit floating point
     Double(f64),
     /// utf-8 encoded string.
     String(String),
@@ -23,13 +29,18 @@ pub enum Scalar {
     Boolean(bool),
     /// Microsecond precision timestamp, adjusted to UTC.
     Timestamp(i64),
-    /// Microsecond precision timestamp, without any timezone.
+    /// Microsecond precision timestamp, with no timezone.
     TimestampNtz(i64),
     /// Date stored as a signed 32bit int days since UNIX epoch 1970-01-01
     Date(i32),
+    /// Binary data
     Binary(Vec<u8>),
+    /// Decimal value with a given precision and scale.
     Decimal(i128, u8, u8),
+    /// Null value with a given data type.
     Null(DataType),
+    /// Struct value
+    Struct(Vec<Scalar>, Vec<StructField>),
 }
 
 impl Scalar {
@@ -49,7 +60,13 @@ impl Scalar {
             Self::Binary(_) => DataType::BINARY,
             Self::Decimal(_, precision, scale) => DataType::decimal_unchecked(*precision, *scale),
             Self::Null(data_type) => data_type.clone(),
+            Self::Struct(_, fields) => DataType::struct_type(fields.clone()),
         }
+    }
+
+    /// Returns true if this scalar is null.
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Null(_))
     }
 }
 
@@ -92,6 +109,16 @@ impl Display for Scalar {
                 }
             },
             Self::Null(_) => write!(f, "null"),
+            Self::Struct(values, fields) => {
+                write!(f, "{{")?;
+                for (i, (value, field)) in values.iter().zip(fields.iter()).enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {}", field.name, value)?;
+                }
+                write!(f, "}}")
+            }
         }
     }
 }
