@@ -111,11 +111,10 @@ impl Display for Scalar {
             Self::Null(_) => write!(f, "null"),
             Self::Struct(values, fields) => {
                 write!(f, "{{")?;
-                for (i, (value, field)) in values.iter().zip(fields.iter()).enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}: {}", field.name, value)?;
+                let mut delim = "";
+                for (value, field) in values.iter().zip(fields.iter()) {
+                    write!(f, "{delim}{}: {value}", field.name)?;
+                    delim = ", ";
                 }
                 write!(f, "}}")
             }
