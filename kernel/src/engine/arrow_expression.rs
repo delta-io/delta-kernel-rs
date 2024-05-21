@@ -80,16 +80,11 @@ impl Scalar {
                 DataType::Struct { .. } => unimplemented!(),
             },
             Struct(values, fields) => {
-                let mut columns = Vec::with_capacity(values.len());
-                for val in values {
-                    columns.push(val.to_array(num_rows)?);
-                }
-                Arc::new(StructArray::try_new(
-                    fields
-                        .iter()
-                        .map(TryInto::<ArrowField>::try_into)
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into(),
+let columns = values.iter().map(|val| val.to_array(num_rows)).try_collect()?;
+let fields = fields.iter().map(ArrowField::try_from).try_collect()?;
+Arc::new(StructArray::try_new(
+    fields.into(),
+    columns,
                     columns,
                     None,
                 )?)
