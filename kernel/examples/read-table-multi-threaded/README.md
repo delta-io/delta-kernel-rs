@@ -25,11 +25,11 @@ thread has exited (which closes that last sender).
 
 # Examples
 
-All paths must start with `file://` and be absolute.
+Assuming you're running in the directory this README is in:
 
 - Read and print the table in `kernel/tests/data/table-with-dv-small/`:
 
-`cargo run -- file://[path-to-kernel-repo]/delta-kernel-rs/kernel/tests/data/table-with-dv-small/`
+`cargo run -- ../../../kernel/tests/data/table-with-dv-small/`
 
 - Get usage info:
 
@@ -37,11 +37,11 @@ All paths must start with `file://` and be absolute.
 
 - Use the sync engine to read `kernel/tests/data/basic_partitioned/`
 
-`cargo run -- -i sync file://[path-to-kernel-repo]/delta-kernel-rs/kernel/tests/data/basic_partitioned/`
+`cargo run -- -e sync ../../../kernel/tests/data/basic_partitioned/`
 
 - Read some giant table using 100 threads:
 
-`cargo run -- -t 100 file:///path/to/my/giant/table`
+`cargo run -- -t 100 /path/to/my/giant/table`
 
 ## selecting specific columns
 
@@ -49,4 +49,4 @@ To select specific columns you need a `--` after the column list specification.
 
 - Read `letter` and `data` columns from the `multi_partitioned` dat table:
 
-`cargo run -- --columns letter,data -- file://[path-to-kernel-repo]/delta-kernel-rs/acceptance/tests/dat/out/reader_tests/generated/multi_partitioned/delta/`
+`cargo run -- --columns letter,data -- ../../../acceptance/tests/dat/out/reader_tests/generated/multi_partitioned/delta/`

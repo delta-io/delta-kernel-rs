@@ -31,6 +31,10 @@ datatest-stable
 https://github.com/nextest-rs/datatest-stable
 Licence: MIT OR Apache-2.0
 
+delta-rs
+https://github.com/delta-io/delta-rs/
+Licence: Apache-2.0
+
 either
 https://github.com/bluss/either
 Licence: MIT OR Apache-2.0
