@@ -11,7 +11,7 @@ use arrow_array::{
 };
 use arrow_ord::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{
-    ArrowError, DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    ArrowError, DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
 };
 use itertools::Itertools;
 
@@ -80,14 +80,12 @@ impl Scalar {
                 DataType::Struct { .. } => unimplemented!(),
             },
             Struct(values, fields) => {
-let columns = values.iter().map(|val| val.to_array(num_rows)).try_collect()?;
-let fields = fields.iter().map(ArrowField::try_from).try_collect()?;
-Arc::new(StructArray::try_new(
-    fields.into(),
-    columns,
-                    columns,
-                    None,
-                )?)
+                let arrays = values
+                    .iter()
+                    .map(|val| val.to_array(num_rows))
+                    .try_collect()?;
+                let fields: Fields = fields.iter().map(ArrowField::try_from).try_collect()?;
+                Arc::new(StructArray::try_new(fields, arrays, None)?)
             }
         };
         Ok(arr)
