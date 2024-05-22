@@ -1,8 +1,8 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use arrow_array::RecordBatch;
 use arrow_ord::sort::{lexsort_to_indices, SortColumn};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Schema};
 use arrow_select::{concat::concat_batches, filter::filter_record_batch, take::take};
 
 use delta_kernel::{
@@ -62,9 +62,7 @@ pub fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
-static SKIPPED_TESTS: &[&str; 3] = &[
-    // Kernel does not support column mapping yet
-    "column_mapping",
+static SKIPPED_TESTS: &[&str; 2] = &[
     // iceberg compat requires column mapping
     "iceberg_compat_v1",
     // For multi_partitioned_2: The golden table stores the timestamp as an INT96 (which is
@@ -73,6 +71,34 @@ static SKIPPED_TESTS: &[&str; 3] = &[
     // `dat` upstream, we can stop skipping this test
     "multi_partitioned_2",
 ];
+
+// Ensure that two schema have the same field names, data types, nullability, and
+// dict_id/ordering. Basically just ignore the metadata because that diverges from the real data to
+// the golden tabled data
+fn assert_schema_fields_match(schema: &Schema, golden: &Schema) {
+    for (schema_field, golden_field) in schema.fields.iter().zip(golden.fields.iter()) {
+        assert!(
+            schema_field.name() == golden_field.name(),
+            "Field names don't match"
+        );
+        assert!(
+            schema_field.data_type() == golden_field.data_type(),
+            "Field data types don't match"
+        );
+        assert!(
+            schema_field.is_nullable() == golden_field.is_nullable(),
+            "Field nullability doesn't match"
+        );
+        assert!(
+            schema_field.dict_id() == golden_field.dict_id(),
+            "Field dict_id doesn't match"
+        );
+        assert!(
+            schema_field.dict_is_ordered() == golden_field.dict_is_ordered(),
+            "Field dict_is_ordered doesn't match"
+        );
+    }
+}
 
 pub async fn assert_scan_data(engine: Arc<dyn Engine>, test_case: &TestCaseInfo) -> TestResult<()> {
     let root_dir = test_case.root_dir();
@@ -86,7 +112,7 @@ pub async fn assert_scan_data(engine: Arc<dyn Engine>, test_case: &TestCaseInfo)
     let table_root = test_case.table_root()?;
     let table = Table::new(table_root);
     let snapshot = table.snapshot(engine, None)?;
-    let scan = ScanBuilder::new(snapshot).build();
+    let scan = ScanBuilder::new(snapshot).build()?;
     let mut schema = None;
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
@@ -110,25 +136,16 @@ pub async fn assert_scan_data(engine: Arc<dyn Engine>, test_case: &TestCaseInfo)
         .collect();
     let all_data = concat_batches(&schema.unwrap(), batches.iter()).map_err(Error::from)?;
     let all_data = sort_record_batch(all_data)?;
-
     let golden = read_golden(test_case.root_dir(), None)
         .await?
         .expect("Didn't find golden data");
     let golden = sort_record_batch(golden)?;
-    let golden_schema = golden
-        .schema()
-        .as_ref()
-        .clone()
-        .with_metadata(HashMap::new());
 
     assert!(
         all_data.columns() == golden.columns(),
         "Read data does not equal golden data"
     );
-    assert!(
-        all_data.schema() == Arc::new(golden_schema),
-        "Schemas not equal"
-    );
+    assert_schema_fields_match(all_data.schema().as_ref(), golden.schema().as_ref());
     assert!(
         all_data.num_rows() == golden.num_rows(),
         "Didn't have same number of rows"

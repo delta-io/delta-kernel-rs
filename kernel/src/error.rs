@@ -133,6 +133,9 @@ pub enum Error {
     #[error("Could not parse int: {0}")]
     ParseIntError(#[from] ParseIntError),
 
+    #[error("Invalid column mapping mode: {0}")]
+    InvalidColumnMappingMode(String),
+
     /// Asked for a table at an invalid location
     #[error("Invalid table location: {0}.")]
     InvalidTableLocation(String),
@@ -171,6 +174,10 @@ impl Error {
     }
     pub fn invalid_table_location(location: impl ToString) -> Self {
         Self::InvalidTableLocation(location.to_string())
+    }
+
+    pub fn invalid_column_mapping_mode(mode: impl ToString) -> Self {
+        Self::InvalidColumnMappingMode(mode.to_string())
     }
 
     // Capture a backtrace when the error is constructed.

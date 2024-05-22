@@ -139,7 +139,7 @@ fn try_main() -> DeltaResult<()> {
     // build a scan with the specified schema
     let scan = ScanBuilder::new(snapshot)
         .with_schema_opt(read_schema_opt)
-        .build();
+        .build()?;
 
     // this gives us an iterator of (our engine data, selection vector). our engine data is just
     // arrow data. The schema can be obtained by calling

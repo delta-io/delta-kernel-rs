@@ -16,7 +16,7 @@ fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
 
     let table = Table::new(url);
     let snapshot = table.snapshot(&engine, None)?;
-    let scan = ScanBuilder::new(snapshot).build();
+    let scan = ScanBuilder::new(snapshot).build()?;
 
     let stream = scan.execute(&engine)?;
     let mut total_rows = 0;
@@ -41,7 +41,7 @@ fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
 
     let table = Table::new(url);
     let snapshot = table.snapshot(&engine, None)?;
-    let scan = ScanBuilder::new(snapshot).build();
+    let scan = ScanBuilder::new(snapshot).build()?;
 
     let stream = scan.execute(&engine)?;
     let mut total_rows = 0;

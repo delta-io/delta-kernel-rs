@@ -89,7 +89,7 @@ fn main() {
         }
         Commands::Adds => {
             use delta_kernel::Add;
-            let scan = ScanBuilder::new(snapshot).build();
+            let scan = ScanBuilder::new(snapshot).build().unwrap();
             let files: Vec<Add> = scan
                 .files(&engine)
                 .unwrap()

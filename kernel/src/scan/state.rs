@@ -7,6 +7,7 @@ use crate::{
         deletion_vector::{treemap_to_bools, DeletionVectorDescriptor},
         visitors::visit_deletion_vector_at,
     },
+    column_mapping::ColumnMappingMode,
     engine_data::{GetData, TypedGetData},
     schema::Schema,
     DataVisitor, DeltaResult, Engine, EngineData, Error,
@@ -22,6 +23,7 @@ pub struct GlobalScanState {
     pub partition_columns: Vec<String>,
     pub logical_schema: Schema,
     pub read_schema: Schema,
+    pub column_mapping_mode: ColumnMappingMode,
 }
 
 /// this struct can be used by an engine to materialize a selection vector
