@@ -3,10 +3,10 @@
 //!
 
 use std::cmp::Ordering;
-use std::sync::Arc;
 
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 use url::Url;
 
 use crate::actions::{get_log_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
@@ -48,8 +48,7 @@ impl LogSegment {
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
         predicate: Option<Expression>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send + Sync>
-    {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
         let json_client = engine.get_json_handler();
         // TODO change predicate to: predicate AND add.path not null and remove.path not null
         let commit_stream = json_client
@@ -110,6 +109,12 @@ pub struct Snapshot {
     schema: Schema,
 }
 
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        debug!("Dropping snapshot");
+    }
+}
+
 impl std::fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Snapshot")
@@ -132,7 +137,7 @@ impl Snapshot {
         table_root: Url,
         engine: &dyn Engine,
         version: Option<Version>,
-    ) -> DeltaResult<Arc<Self>> {
+    ) -> DeltaResult<Self> {
         let fs_client = engine.get_file_system_client();
         let log_url = LogPath::new(&table_root).child("_delta_log/").unwrap();
 
@@ -176,12 +181,7 @@ impl Snapshot {
             checkpoint_files,
         };
 
-        Ok(Arc::new(Self::try_new_from_log_segment(
-            table_root,
-            log_segment,
-            version_eff,
-            engine,
-        )?))
+        Self::try_new_from_log_segment(table_root, log_segment, version_eff, engine)
     }
 
     /// Create a new [`Snapshot`] instance.
@@ -367,6 +367,7 @@ mod tests {
     use super::*;
 
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use object_store::local::LocalFileSystem;
     use object_store::path::Path;

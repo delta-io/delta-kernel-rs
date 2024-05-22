@@ -75,7 +75,7 @@ mod tests {
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine, None).unwrap();
-        let txn_scan = TransactionScanner::new(snapshot.clone());
+        let txn_scan = TransactionScanner::new(snapshot.into());
 
         (
             txn_scan.application_transactions(&engine).unwrap(),

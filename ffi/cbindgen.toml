@@ -17,5 +17,12 @@ namespace = "ffi"
 remove_underscores = true
 
 [parse]
+# Whether to parse dependent crates and include their types in the output
+# default: false
 parse_deps = true
+
+# An allow-list of crate names that are allowed to be parsed. If this is defined,
+# only crates found in this list will ever be parsed.
+#
+# default: there is no allow-list (NOTE: this is the opposite of [])
 include = ["delta_kernel"]

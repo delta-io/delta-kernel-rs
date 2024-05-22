@@ -4,12 +4,12 @@
 
 #include "delta_kernel_ffi.h"
 
-void visit_callback(void* engine_context, const struct KernelStringSlice path, long size, const DvInfo *dv_info, struct CStringMap *partition_values) {
+void visit_callback(void* engine_context, KernelStringSlice path, long long size, const DvInfo *dv_info, const CStringMap *partition_values) {
   printf("file: %.*s\n", (int)path.len, path.ptr);
 }
 
 
-void visit_data(void *engine_context, struct EngineDataHandle *engine_data, const struct KernelBoolSlice selection_vec) {
+void visit_data(void *engine_context, EngineData *engine_data, const KernelBoolSlice selection_vec) {
   visit_scan_data(engine_data, selection_vec, engine_context, visit_callback);
 }
 
@@ -25,41 +25,41 @@ int main(int argc, char* argv[]) {
 
   KernelStringSlice table_path_slice = {table_path, strlen(table_path)};
 
-  ExternResultExternEngineHandle engine_res =
+  ExternResultHandleSharedExternEngine engine_res =
     get_default_engine(table_path_slice, NULL);
-  if (engine_res.tag != OkExternEngineHandle) {
+  if (engine_res.tag != OkHandleSharedExternEngine) {
     printf("Failed to get engine\n");
     return -1;
   }
 
-  const ExternEngineHandle *engine = engine_res.ok;
+  SharedExternEngine *engine = engine_res.ok;
 
-  ExternResultSnapshotHandle snapshot_handle_res = snapshot(table_path_slice, engine);
-  if (snapshot_handle_res.tag != OkSnapshotHandle) {
+  ExternResultHandleSharedSnapshot snapshot_res = snapshot(table_path_slice, engine);
+  if (snapshot_res.tag != OkHandleSharedSnapshot) {
     printf("Failed to create snapshot\n");
     return -1;
   }
 
-  const SnapshotHandle *snapshot_handle = snapshot_handle_res.ok;
+  SharedSnapshot *snapshot = snapshot_res.ok;
 
-  uint64_t v = version(snapshot_handle);
+  uint64_t v = version(snapshot);
   printf("version: %" PRIu64 "\n", v);
-  ExternResultScan scan_res = scan(snapshot_handle, engine, NULL);
-  if (scan_res.tag != OkScan) {
+  ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL);
+  if (scan_res.tag != OkHandleSharedScan) {
     printf("Failed to create scan\n");
     return -1;
   }
 
-  Scan *scan = scan_res.ok;
+  SharedScan *scan = scan_res.ok;
 
-  ExternResultKernelScanDataIterator data_iter_res =
+  ExternResultHandleSharedScanDataIterator data_iter_res =
     kernel_scan_data_init(engine, scan);
-  if (data_iter_res.tag != OkKernelScanDataIterator) {
+  if (data_iter_res.tag != OkHandleSharedScanDataIterator) {
     printf("Failed to construct scan data iterator\n");
     return -1;
   }
 
-  KernelScanDataIterator *data_iter = data_iter_res.ok;
+  SharedScanDataIterator *data_iter = data_iter_res.ok;
 
   // iterate scan files
   for (;;) {
@@ -72,7 +72,8 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  drop_snapshot(snapshot_handle);
+  drop_scan(scan);
+  drop_snapshot(snapshot);
   drop_engine(engine);
 
   return 0;
