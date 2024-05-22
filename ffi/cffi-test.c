@@ -4,7 +4,7 @@
 
 #include "delta_kernel_ffi.h"
 
-void visit_callback(void* engine_context, KernelStringSlice path, long long size, const DvInfo *dv_info, const CStringMap *partition_values) {
+void visit_callback(void* engine_context, KernelStringSlice path, int64_t size, const DvInfo *dv_info, const CStringMap *partition_values) {
   printf("file: %.*s\n", (int)path.len, path.ptr);
 }
 
