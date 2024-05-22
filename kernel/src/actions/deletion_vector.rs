@@ -1,14 +1,20 @@
 //! Code relating to parsing and using deletion vectors
 
 use std::io::{Cursor, Read};
+use std::iter::Peekable;
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut, IndexMut};
+
 use std::sync::Arc;
 
 use bytes::Bytes;
-use delta_kernel_derive::Schema;
+use roaring::treemap::IntoIter;
 use roaring::RoaringTreemap;
 use url::Url;
 
 use crate::utils::require;
+use delta_kernel_derive::Schema;
+
 use crate::{DeltaResult, Error, FileSystemClient};
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
@@ -223,15 +229,111 @@ pub(crate) fn treemap_to_bools(treemap: RoaringTreemap) -> Vec<bool> {
     }
 }
 
+#[derive(PartialEq)]
+#[repr(C)]
+pub enum VectorType {
+    Selection,
+    Deletion,
+}
+
+pub trait BitSet<V> {
+    fn set_bit(&mut self, idx: usize, value: impl Into<V>);
+}
+
+pub trait ContainerIterator<C, V>
+where
+    C: BitSet<V>,
+{
+    fn next_batch(&mut self, mut container: C, batch_size: usize) -> Option<C> {
+        self.next_batch_with(&mut container, batch_size)
+            .map(|_| container)
+    }
+    fn next_batch_with(&mut self, container: &mut C, batch_size: usize) -> Option<()>;
+}
+
+impl<C, V> BitSet<V> for C
+where
+    C: AsMut<[V]>,
+{
+    fn set_bit(&mut self, idx: usize, value: impl Into<V>) {
+        if let Some(i) = self.as_mut().get_mut(idx) {
+            *i = value.into();
+        } else {
+            tracing::info!("Index value in DV: {} is None", idx);
+        }
+    }
+}
+
+#[repr(C)]
+pub struct DeletionVectorBatch {
+    inner_iter: Peekable<IntoIter>,
+    position: usize,
+    total_rows: usize,
+    vector_type: VectorType,
+   
+}
+
+impl DeletionVectorBatch {
+    pub fn new(treemap: RoaringTreemap, total_rows: usize, vector_type: VectorType) -> Self {
+        let inner_iter = treemap.into_iter().peekable();
+        Self {
+            inner_iter,
+            position: 0,
+            total_rows,
+            vector_type,
+        }
+    }
+
+    pub fn full_vector(&mut self) -> Option<Vec<bool>> {
+        self.next_batch(vec![false; self.total_rows], self.total_rows)
+    }
+    
+    pub fn full_bit_vector(&mut self) -> Option<Vec<u8>> {
+        self.next_batch(vec![0; self.total_rows], self.total_rows)
+    }
+
+    #[inline]
+    fn flip_value(&self) -> bool {
+        self.vector_type == VectorType::Deletion
+    }
+}
+
+impl<C, V> ContainerIterator<C, V> for DeletionVectorBatch
+where
+    C: BitSet<V> + AsMut<[V]>,
+    V: From<bool> + Copy,
+{
+    fn next_batch_with(&mut self, container: &mut C, batch_size: usize) -> Option<()> {
+        if self.position >= self.total_rows {
+            return None;
+        }
+        let slice_range = self.position as u64 + batch_size as u64;
+
+        while let Some(bit) = self.inner_iter.next() {
+            container.set_bit(bit as usize - self.position, self.flip_value());
+
+            if let Some(next_bit) = self.inner_iter.peek() {
+                if *next_bit > slice_range {
+                    break;
+                }
+            }
+        }
+        self.position += batch_size;
+        Some(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use roaring::RoaringTreemap;
     use std::path::PathBuf;
 
-    use super::*;
+    use roaring::RoaringTreemap;
+    use tokio::io::AsyncReadExt;
+
     use crate::{engine::sync::SyncEngine, Engine};
 
     use super::DeletionVectorDescriptor;
+    use super::*;
 
     fn dv_relative() -> DeletionVectorDescriptor {
         DeletionVectorDescriptor {
@@ -357,5 +459,33 @@ mod tests {
         expected[4294967297] = false;
         expected[4294967300] = false;
         assert_eq!(bools, expected);
+    }
+
+    #[tokio::test]
+    async fn test_dv_wrapper() -> Result<(), Box<dyn std::error::Error>> {
+        let example = dv_inline();
+
+        let de_comp = z85::decode(&example.path_or_inline_dv)?;
+        dbg!(de_comp.len());
+
+        let mut cursor: Cursor<&[u8]> = Cursor::new(&de_comp);
+        let version = cursor.read_u32_le().await?;
+        dbg!(version);
+        let found = RoaringTreemap::deserialize_from(&mut cursor)?;
+        dbg!(&found);
+
+        let mut dvc = DeletionVectorBatch::new(found, 50, VectorType::Deletion);
+
+        // let mut container = [false; 50];
+        // while dvc.next_batch_with(&mut container, 50).is_some() {
+        //     println!("{:?}", container);
+        //     container.fill(false);
+        // }
+
+        while let Some(b) = dvc.next_batch(vec![0; 10], 10) {
+            println!("{:?}", b);
+        }
+
+        Ok(())
     }
 }
