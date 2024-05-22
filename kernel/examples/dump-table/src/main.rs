@@ -91,7 +91,7 @@ fn try_main() -> DeltaResult<()> {
         .transpose()?;
     let scan = ScanBuilder::new(snapshot)
         .with_schema_opt(read_schema_opt)
-        .build();
+        .build()?;
 
     let mut batches = vec![];
     for res in scan.execute(engine.as_ref())?.into_iter() {
