@@ -16,6 +16,7 @@ crate-type = ["cdylib", "staticlib"]
 tracing = "0.1"
 url = "2"
 delta_kernel = { path = "../kernel", default-features = false, features = ["developer-visibility"] }
+delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.0.1" }
 
 # used if we use the default engine to be able to move arrow data into the c-ffi format
 arrow-schema = { version = "^49.0", default-features = false, features = ["ffi"], optional = true }
@@ -25,6 +26,9 @@ arrow-array = { version = "^49.0", default-features = false, optional = true }
 [build-dependencies]
 cbindgen = "0.26.0"
 libc = "0.2.147"
+
+[dev-dependencies]
+rand = "0.8.5"
 
 [features]
 default = ["default-engine"]

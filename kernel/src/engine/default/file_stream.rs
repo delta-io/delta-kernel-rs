@@ -13,7 +13,7 @@ use futures::FutureExt;
 
 use super::executor::TaskExecutor;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::{DeltaResult, Error, FileDataReadResultIterator, FileMeta};
+use crate::{DeltaResult, FileDataReadResultIterator, FileMeta};
 
 /// A fallible future that resolves to a stream of [`RecordBatch`]
 /// cbindgen:ignore
@@ -134,21 +134,9 @@ impl FileStream {
             }
         });
 
-        // Create a thread-safe iterator, because engine may consume it from multiple threads.
-        //
-        // NOTE: Every call to the iterator's `next` method will lock the mutex before accessing the
-        // underlying stream. This should not be a bottleneck because the stream will immediately
-        // return an item (if ready) and would anyway block if not ready. Additionally, each
-        // iterator element corresponds to a file access whose cost dwarfs any mutex overhead.
-        let it = receiver
-            .into_iter()
-            .map(|rbr| rbr.map(|rb| Box::new(ArrowEngineData::new(rb)) as _));
-        let it = std::sync::Mutex::new(it);
-        let it = std::iter::from_fn(move || match it.lock() {
-            Ok(mut i) => i.next(),
-            Err(_) => Some(Err(Error::generic("Poisoned mutex"))),
-        });
-        Ok(Box::new(it))
+        Ok(Box::new(receiver.into_iter().map(|rbr| {
+            rbr.map(|rb| Box::new(ArrowEngineData::new(rb)) as _)
+        })))
     }
 
     /// Create a new `FileStream` using the given `FileOpener` to scan underlying files

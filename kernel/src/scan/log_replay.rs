@@ -259,7 +259,7 @@ impl LogReplayScanner {
 /// The boolean flag indicates whether the record batch is a log or checkpoint batch.
 pub fn log_replay_iter(
     engine: &dyn Engine,
-    action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send + Sync,
+    action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send,
     table_schema: &SchemaRef,
     predicate: &Option<Expression>,
 ) -> impl Iterator<Item = DeltaResult<Add>> {

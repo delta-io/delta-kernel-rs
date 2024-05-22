@@ -37,9 +37,9 @@ impl std::fmt::Debug for ScanBuilder {
 
 impl ScanBuilder {
     /// Create a new [`ScanBuilder`] instance.
-    pub fn new(snapshot: Arc<Snapshot>) -> Self {
+    pub fn new(snapshot: impl Into<Arc<Snapshot>>) -> Self {
         Self {
-            snapshot,
+            snapshot: snapshot.into(),
             schema: None,
             predicate: None,
         }
@@ -151,7 +151,7 @@ impl Scan {
     pub(crate) fn files(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>> + Send + Sync> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Add>> + Send> {
         let commit_read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?;
         let checkpoint_read_schema = get_log_schema().project(&[ADD_NAME])?;
 

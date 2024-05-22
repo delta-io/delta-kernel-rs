@@ -286,7 +286,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let table = Table::new(location);
-    let snapshot = table.snapshot(&engine, None)?;
+    let snapshot = Arc::new(table.snapshot(&engine, None)?);
 
     // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
     // we validate the boundary values where we expect the set of matched files to change.
@@ -407,7 +407,7 @@ fn read_table_data(
             .collect();
         Arc::new(Schema::new(selected_fields))
     });
-    let scan = ScanBuilder::new(snapshot.clone())
+    let scan = ScanBuilder::new(snapshot)
         .with_schema_opt(read_schema)
         .build();
 

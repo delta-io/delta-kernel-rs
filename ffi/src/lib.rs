@@ -14,9 +14,10 @@ use delta_kernel::expressions::{BinaryOperator, Expression, Scalar};
 use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Engine, Error, Table};
+use delta_kernel_ffi_macros::handle_descriptor;
 
-mod handle;
-use handle::{ArcHandle, SizedArcHandle, Unconstructable};
+pub(crate) mod handle;
+use handle::Handle;
 
 pub mod scan;
 
@@ -33,16 +34,6 @@ pub struct EngineIterator {
     /// If the iterator is complete, it should return null. It should be safe to
     /// call `get_next()` multiple times if it returns null.
     get_next: extern "C" fn(data: NonNull<c_void>) -> *const c_void,
-}
-
-/// test function to print for items. this assumes each item is an `int`
-#[no_mangle]
-extern "C" fn iterate(it: &mut EngineIterator) {
-    for i in it {
-        let i = i as *mut i32;
-        let ii = unsafe { &*i };
-        println!("Got an item: {:?}", ii);
-    }
 }
 
 impl Iterator for EngineIterator {
@@ -69,8 +60,10 @@ impl Iterator for EngineIterator {
 /// Whoever instantiates the struct must ensure it does not outlive the data it points to. The
 /// compiler cannot help us here, because raw pointers don't have lifetimes. To reduce the risk of
 /// accidental misuse, it is recommended to only instantiate this struct as a function arg, by
-/// converting a `&str` value `Into<KernelStringSlice>`, so the borrowed reference protects the
-/// function call (callee must not retain any references to the slice after the call returns):
+/// converting a string slice `Into` a `KernelStringSlice`. That way, the borrowed reference at call
+/// site protects the `KernelStringSlice` until the function returns. Meanwhile, the callee should
+/// assume that the slice is only valid until the function returns, and must not retain any
+/// references to the slice or its data that could outlive the function call.
 ///
 /// ```
 /// fn wants_slice(slice: KernelStringSlice) { ... }
@@ -83,14 +76,15 @@ pub struct KernelStringSlice {
     len: usize,
 }
 
-// Intentionally not From, in order to reduce risk of accidental misuse. The main use is for callers
-// to pass e.g. `my_str.as_str().into()` as a function arg.
-#[allow(clippy::from_over_into)]
-impl Into<KernelStringSlice> for &str {
-    fn into(self) -> KernelStringSlice {
+// We can construct a `KernelStringSlice` from anything that acts like a Rust string slice. The user
+// of this trait is still responsible to ensure the result doesn't outlive the input data tho --
+// especially if it crosses an FFI boundary to or from external code.
+impl<T: AsRef<[u8]>> From<T> for KernelStringSlice {
+    fn from(s: T) -> Self {
+        let s = s.as_ref();
         KernelStringSlice {
-            ptr: self.as_ptr().cast(),
-            len: self.len(),
+            ptr: s.as_ptr().cast(),
+            len: s.len(),
         }
     }
 }
@@ -121,7 +115,7 @@ pub type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> Null
 mod private {
     /// Represents an owned slice of boolean values allocated by the kernel. Any time the engine
     /// receives a `KernelBoolSlice` as a return value from a kernel method, engine is responsible
-    /// to free that slice, by calling [drop_bool_slice] exactly once.
+    /// to free that slice, by calling [super::drop_bool_slice] exactly once.
     #[repr(C)]
     pub struct KernelBoolSlice {
         ptr: *mut bool,
@@ -178,8 +172,8 @@ mod private {
     /// # Safety
     ///
     /// Whenever kernel passes a [KernelBoolSlice] to engine, engine assumes ownership of the slice
-    /// memory, but must only free it by calling [drop_bool_slice]. Since the global allocator is
-    /// threadsafe, it doesn't matter which engine thread invokes that method.
+    /// memory, but must only free it by calling [super::drop_bool_slice]. Since the global
+    /// allocator is threadsafe, it doesn't matter which engine thread invokes that method.
     unsafe impl Send for KernelBoolSlice {}
 
     /// # Safety
@@ -349,7 +343,7 @@ impl AllocateError for AllocateErrorFn {
         self(etype, msg)
     }
 }
-impl AllocateError for *const ExternEngineHandle {
+impl AllocateError for Handle<SharedExternEngine> {
     /// # Safety
     ///
     /// In addition to the usual requirements, the engine handle must be valid.
@@ -358,9 +352,7 @@ impl AllocateError for *const ExternEngineHandle {
         etype: KernelError,
         msg: KernelStringSlice,
     ) -> *mut EngineError {
-        ArcHandle::clone_as_arc(*self)
-            .error_allocator()
-            .allocate_error(etype, msg)
+        self.as_ref().error_allocator().allocate_error(etype, msg)
     }
 }
 
@@ -392,18 +384,19 @@ pub trait ExternEngine: Send + Sync {
     fn error_allocator(&self) -> &dyn AllocateError;
 }
 
-pub struct ExternEngineHandle {
-    _unconstructable: Unconstructable,
-}
-
-impl ArcHandle for ExternEngineHandle {
-    type Target = dyn ExternEngine;
-}
+#[handle_descriptor(target=dyn ExternEngine, mutable=false)]
+pub struct SharedExternEngine;
 
 struct ExternEngineVtable {
     // Actual engine instance to use
     engine: Arc<dyn Engine>,
     allocate_error: AllocateErrorFn,
+}
+
+impl Drop for ExternEngineVtable {
+    fn drop(&mut self) {
+        debug!("dropping engine interface");
+    }
 }
 
 /// # Safety
@@ -512,7 +505,7 @@ pub unsafe extern "C" fn set_builder_option(
 #[no_mangle]
 pub unsafe extern "C" fn builder_build(
     builder: *mut EngineBuilder,
-) -> ExternResult<*const ExternEngineHandle> {
+) -> ExternResult<Handle<SharedExternEngine>> {
     let builder_box = unsafe { Box::from_raw(builder) };
     get_default_engine_impl(
         builder_box.url,
@@ -530,7 +523,7 @@ pub unsafe extern "C" fn builder_build(
 pub unsafe extern "C" fn get_default_engine(
     path: KernelStringSlice,
     allocate_error: AllocateErrorFn,
-) -> ExternResult<*const ExternEngineHandle> {
+) -> ExternResult<Handle<SharedExternEngine>> {
     get_default_default_engine_impl(path, allocate_error).into_extern_result(allocate_error)
 }
 
@@ -539,7 +532,7 @@ pub unsafe extern "C" fn get_default_engine(
 unsafe fn get_default_default_engine_impl(
     path: KernelStringSlice,
     allocate_error: AllocateErrorFn,
-) -> DeltaResult<*const ExternEngineHandle> {
+) -> DeltaResult<Handle<SharedExternEngine>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) }?;
     get_default_engine_impl(url, Default::default(), allocate_error)
 }
@@ -549,7 +542,7 @@ unsafe fn get_default_engine_impl(
     url: Url,
     options: HashMap<String, String>,
     allocate_error: AllocateErrorFn,
-) -> DeltaResult<*const ExternEngineHandle> {
+) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
     use delta_kernel::engine::default::DefaultEngine;
     let engine = DefaultEngine::<TokioBackgroundExecutor>::try_new(
@@ -562,24 +555,20 @@ unsafe fn get_default_engine_impl(
         engine,
         allocate_error,
     });
-    Ok(ArcHandle::into_handle(engine))
+    Ok(engine.into())
 }
 
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
 #[no_mangle]
-pub unsafe extern "C" fn drop_engine(engine: *const ExternEngineHandle) {
-    ArcHandle::drop_handle(engine);
+pub unsafe extern "C" fn drop_engine(engine: Handle<SharedExternEngine>) {
+    debug!("engine released engine");
+    engine.drop_handle();
 }
 
-pub struct SnapshotHandle {
-    _unconstructable: Unconstructable,
-}
-
-impl SizedArcHandle for SnapshotHandle {
-    type Target = Snapshot;
-}
+#[handle_descriptor(target=Snapshot, mutable=false, sized=true)]
+pub struct SharedSnapshot;
 
 /// Get the latest snapshot from the specified table
 ///
@@ -589,27 +578,28 @@ impl SizedArcHandle for SnapshotHandle {
 #[no_mangle]
 pub unsafe extern "C" fn snapshot(
     path: KernelStringSlice,
-    engine: *const ExternEngineHandle,
-) -> ExternResult<*const SnapshotHandle> {
-    snapshot_impl(path, engine).into_extern_result(engine)
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<SharedSnapshot>> {
+    snapshot_impl(path, &engine).into_extern_result(engine)
 }
 
 unsafe fn snapshot_impl(
     path: KernelStringSlice,
-    extern_engine: *const ExternEngineHandle,
-) -> DeltaResult<*const SnapshotHandle> {
+    extern_engine: &Handle<SharedExternEngine>,
+) -> DeltaResult<Handle<SharedSnapshot>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) }?;
-    let extern_engine = unsafe { ArcHandle::clone_as_arc(extern_engine) };
+    let extern_engine = unsafe { extern_engine.as_ref() };
     let snapshot = Snapshot::try_new(url, extern_engine.engine().as_ref(), None)?;
-    Ok(ArcHandle::into_handle(snapshot))
+    Ok(Arc::new(snapshot).into())
 }
 
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
 #[no_mangle]
-pub unsafe extern "C" fn drop_snapshot(snapshot: *const SnapshotHandle) {
-    ArcHandle::drop_handle(snapshot);
+pub unsafe extern "C" fn drop_snapshot(snapshot: Handle<SharedSnapshot>) {
+    debug!("engine released snapshot");
+    snapshot.drop_handle();
 }
 
 /// Get the version of the specified snapshot
@@ -618,8 +608,8 @@ pub unsafe extern "C" fn drop_snapshot(snapshot: *const SnapshotHandle) {
 ///
 /// Caller is responsible for passing a valid handle.
 #[no_mangle]
-pub unsafe extern "C" fn version(snapshot: *const SnapshotHandle) -> u64 {
-    let snapshot = unsafe { ArcHandle::clone_as_arc(snapshot) };
+pub unsafe extern "C" fn version(snapshot: Handle<SharedSnapshot>) -> u64 {
+    let snapshot = unsafe { snapshot.as_ref() };
     snapshot.version()
 }
 
@@ -756,10 +746,10 @@ pub struct EngineSchemaVisitor {
 /// Caller is responsible for passing a valid snapshot handle and schema visitor.
 #[no_mangle]
 pub unsafe extern "C" fn visit_schema(
-    snapshot: *const SnapshotHandle,
+    snapshot: Handle<SharedSnapshot>,
     visitor: &mut EngineSchemaVisitor,
 ) -> usize {
-    let snapshot = unsafe { ArcHandle::clone_as_arc(snapshot) };
+    let snapshot = unsafe { snapshot.as_ref() };
     // Visit all the fields of a struct and return the list of children
     fn visit_struct_fields(visitor: &EngineSchemaVisitor, s: &StructType) -> usize {
         let child_list_id = (visitor.make_field_list)(visitor.data, s.fields.len());
