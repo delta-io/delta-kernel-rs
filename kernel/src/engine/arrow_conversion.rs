@@ -8,6 +8,7 @@ use arrow_schema::{
 };
 use itertools::Itertools;
 
+use crate::error::Error;
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
 
 impl TryFrom<&StructType> for ArrowSchema {
@@ -92,25 +93,20 @@ impl TryFrom<&DataType> for ArrowDataType {
                     PrimitiveType::Boolean => Ok(ArrowDataType::Boolean),
                     PrimitiveType::Binary => Ok(ArrowDataType::Binary),
                     PrimitiveType::Decimal(precision, scale) => {
-                        if precision <= &38 {
-                            Ok(ArrowDataType::Decimal128(*precision, *scale))
-                        } else {
-                            // NOTE: since we are converting from delta, we should never get here.
-                            Err(ArrowError::SchemaError(format!(
-                                "Precision too large to be represented as Delta type: {} > 38",
-                                precision
-                            )))
-                        }
+                        PrimitiveType::check_decimal(*precision, *scale)
+                            .map_err(|e| ArrowError::from_external_error(e.into()))?;
+                        Ok(ArrowDataType::Decimal128(*precision, *scale as i8))
                     }
                     PrimitiveType::Date => {
                         // A calendar date, represented as a year-month-day triple without a
                         // timezone. Stored as 4 bytes integer representing days since 1970-01-01
                         Ok(ArrowDataType::Date32)
                     }
-                    PrimitiveType::Timestamp => {
-                        // Issue: https://github.com/delta-io/delta/issues/643
-                        Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
-                    }
+                    // TODO: https://github.com/delta-io/delta/issues/643
+                    PrimitiveType::Timestamp => Ok(ArrowDataType::Timestamp(
+                        TimeUnit::Microsecond,
+                        Some("UTC".into()),
+                    )),
                     PrimitiveType::TimestampNtz => {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
@@ -206,11 +202,19 @@ impl TryFrom<&ArrowDataType> for DataType {
             ArrowDataType::Binary => Ok(DataType::Primitive(PrimitiveType::Binary)),
             ArrowDataType::FixedSizeBinary(_) => Ok(DataType::Primitive(PrimitiveType::Binary)),
             ArrowDataType::LargeBinary => Ok(DataType::Primitive(PrimitiveType::Binary)),
-            ArrowDataType::Decimal128(p, s) => Ok(DataType::decimal(*p, *s)),
+            ArrowDataType::Decimal128(p, s) => {
+                if *s < 0 {
+                    return Err(ArrowError::from_external_error(
+                        Error::invalid_decimal("Negative scales are not supported in Delta").into(),
+                    ));
+                };
+                DataType::decimal(*p, *s as u8)
+                    .map_err(|e| ArrowError::from_external_error(e.into()))
+            }
             ArrowDataType::Date32 => Ok(DataType::Primitive(PrimitiveType::Date)),
             ArrowDataType::Date64 => Ok(DataType::Primitive(PrimitiveType::Date)),
             ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => {
-                Ok(DataType::Primitive(PrimitiveType::Timestamp))
+                Ok(DataType::Primitive(PrimitiveType::TimestampNtz))
             }
             ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(tz))
                 if tz.eq_ignore_ascii_case("utc") =>
@@ -251,6 +255,9 @@ impl TryFrom<&ArrowDataType> for DataType {
                     panic!("DataType::Map should contain a struct field child");
                 }
             }
+            // Dictionary types are just an optimized in-memory representation of an array.
+            // Schema-wise, they are the same as the value type.
+            ArrowDataType::Dictionary(_, value_type) => Ok(value_type.as_ref().try_into()?),
             s => Err(ArrowError::SchemaError(format!(
                 "Invalid data type for Delta Lake: {s}"
             ))),

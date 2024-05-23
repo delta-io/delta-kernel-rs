@@ -228,6 +228,7 @@ pub enum KernelError {
     ParseIntError,
     InvalidColumnMappingMode,
     InvalidTableLocation,
+    InvalidDecimalError,
 }
 
 impl From<Error> for KernelError {
@@ -266,6 +267,7 @@ impl From<Error> for KernelError {
             Error::ParseIntError(_) => KernelError::ParseIntError,
             Error::InvalidColumnMappingMode(_) => KernelError::InvalidColumnMappingMode,
             Error::InvalidTableLocation(_) => KernelError::InvalidTableLocation,
+            Error::InvalidDecimal(_) => KernelError::InvalidDecimalError,
             Error::Backtraced {
                 source,
                 backtrace: _,
@@ -686,7 +688,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         precision: u8,
-        scale: i8,
+        scale: u8,
     ),
 
     /// Visit a `string` belonging to the list identified by `sibling_list_id`.

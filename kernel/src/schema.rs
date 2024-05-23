@@ -356,18 +356,18 @@ pub enum PrimitiveType {
         deserialize_with = "deserialize_decimal",
         untagged
     )]
-    Decimal(u8, i8),
+    Decimal(u8, u8),
 }
 
 fn serialize_decimal<S: serde::Serializer>(
     precision: &u8,
-    scale: &i8,
+    scale: &u8,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(&format!("decimal({},{})", precision, scale))
 }
 
-fn deserialize_decimal<'de, D>(deserializer: D) -> Result<(u8, i8), D::Error>
+fn deserialize_decimal<'de, D>(deserializer: D) -> Result<(u8, u8), D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -386,11 +386,11 @@ where
         })?;
     let scale = parts
         .next()
-        .and_then(|part| part.trim().parse::<i8>().ok())
+        .and_then(|part| part.trim().parse::<u8>().ok())
         .ok_or_else(|| {
             serde::de::Error::custom(format!("Invalid scale in decimal: {}", str_value))
         })?;
-
+    PrimitiveType::check_decimal(precision, scale).map_err(serde::de::Error::custom)?;
     Ok((precision, scale))
 }
 
@@ -464,8 +464,17 @@ impl DataType {
     pub const TIMESTAMP: Self = DataType::Primitive(PrimitiveType::Timestamp);
     pub const TIMESTAMP_NTZ: Self = DataType::Primitive(PrimitiveType::TimestampNtz);
 
-    pub fn decimal(precision: u8, scale: i8) -> Self {
-        DataType::Primitive(PrimitiveType::Decimal(precision, scale))
+    pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
+        PrimitiveType::check_decimal(precision, scale)?;
+        Ok(DataType::Primitive(PrimitiveType::Decimal(
+            precision, scale,
+        )))
+    }
+
+    // This function assumes that the caller has already checked the precision and scale
+    // and that they are valid. Will panic if they are not.
+    pub fn decimal_unchecked(precision: u8, scale: u8) -> Self {
+        Self::decimal(precision, scale).unwrap()
     }
 }
 
@@ -647,5 +656,28 @@ mod tests {
         let file = std::fs::File::open("./tests/serde/checkpoint_schema.json").unwrap();
         let schema: Result<Schema, _> = serde_json::from_reader(file);
         assert!(schema.is_ok())
+    }
+
+    #[test]
+    fn test_invalid_decimal() {
+        let data = r#"
+        {
+            "name": "a",
+            "type": "decimal(39, 10)",
+            "nullable": false,
+            "metadata": {}
+        }
+        "#;
+        assert!(serde_json::from_str::<StructField>(data).is_err());
+
+        let data = r#"
+        {
+            "name": "a",
+            "type": "decimal(10, 39)",
+            "nullable": false,
+            "metadata": {}
+        }
+        "#;
+        assert!(serde_json::from_str::<StructField>(data).is_err());
     }
 }

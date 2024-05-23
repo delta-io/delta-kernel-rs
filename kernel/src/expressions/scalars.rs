@@ -5,7 +5,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 
 use crate::schema::{DataType, PrimitiveType};
 use crate::utils::require;
-use crate::Error;
+use crate::{DeltaResult, Error};
 
 /// A single value, which can be null. Used for representing literal values
 /// in [Expressions][crate::expressions::Expression].
@@ -28,7 +28,7 @@ pub enum Scalar {
     /// Date stored as a signed 32bit int days since UNIX epoch 1970-01-01
     Date(i32),
     Binary(Vec<u8>),
-    Decimal(i128, u8, i8),
+    Decimal(i128, u8, u8),
     Null(DataType),
 }
 
@@ -47,7 +47,7 @@ impl Scalar {
             Self::TimestampNtz(_) => DataType::TIMESTAMP_NTZ,
             Self::Date(_) => DataType::DATE,
             Self::Binary(_) => DataType::BINARY,
-            Self::Decimal(_, precision, scale) => DataType::decimal(*precision, *scale),
+            Self::Decimal(_, precision, scale) => DataType::decimal_unchecked(*precision, *scale),
             Self::Null(data_type) => data_type.clone(),
         }
     }
@@ -85,7 +85,7 @@ impl Display for Scalar {
                 }
                 Ordering::Less => {
                     write!(f, "{}", value)?;
-                    for _ in 0..(scale.abs()) {
+                    for _ in 0..*scale {
                         write!(f, "0")?;
                     }
                     Ok(())
@@ -141,6 +141,24 @@ impl From<String> for Scalar {
 // TODO: add more From impls
 
 impl PrimitiveType {
+    /// Check if the given precision and scale are valid for a decimal type.
+    pub fn check_decimal(precision: u8, scale: u8) -> DeltaResult<()> {
+        require!(
+            0 < precision && precision <= 38,
+            Error::invalid_decimal(format!(
+                "precision must in range 1..38 inclusive, found: {}.",
+                precision
+            ))
+        );
+        require!(
+            scale <= precision,
+            Error::invalid_decimal(format!(
+                "scale must be in range 0..precision inclusive, found: {scale}."
+            ))
+        );
+        Ok(())
+    }
+
     fn data_type(&self) -> DataType {
         DataType::Primitive(self.clone())
     }
@@ -184,7 +202,10 @@ impl PrimitiveType {
                 let days = date.signed_duration_since(*UNIX_EPOCH).num_days() as i32;
                 Ok(Scalar::Date(days))
             }
-            // TODO: Handle timezones properly
+            // NOTE: Timestamp and TimestampNtz are parsed in the same way, as microsecond since unix epoch.
+            // The difference arrises mostly in how they are to be handled on the engine side - i.e. timestampNTZ
+            // is not adjusted to UTC, this is just so we can (de-)serialize it as a date sting.
+            // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
             Timestamp | TimestampNtz => {
                 let timestamp = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
                     .map_err(|_| self.parse_error(raw))?;
@@ -193,7 +214,11 @@ impl PrimitiveType {
                     .signed_duration_since(*UNIX_EPOCH)
                     .num_microseconds()
                     .ok_or(self.parse_error(raw))?;
-                Ok(Scalar::Timestamp(micros))
+                match self {
+                    Timestamp => Ok(Scalar::Timestamp(micros)),
+                    TimestampNtz => Ok(Scalar::TimestampNtz(micros)),
+                    _ => unreachable!(),
+                }
             }
         }
     }
@@ -217,7 +242,7 @@ impl PrimitiveType {
         }
     }
 
-    fn parse_decimal(&self, raw: &str, precision: u8, expected_scale: i8) -> Result<Scalar, Error> {
+    fn parse_decimal(&self, raw: &str, precision: u8, expected_scale: u8) -> Result<Scalar, Error> {
         let (base, exp): (&str, i128) = match raw.find(['e', 'E']) {
             None => (raw, 0), // no 'e' or 'E', so there's no exponent
             Some(pos) => {
@@ -247,8 +272,9 @@ impl PrimitiveType {
         // we can assume this won't underflow since `frac_digits` is at minimum 0, and exp is at
         // most i128::MAX, and 0-i128::MAX doesn't underflow
         let scale = frac_digits - exp;
-        let scale: i8 = scale.try_into().map_err(|_| self.parse_error(raw))?;
+        let scale: u8 = scale.try_into().map_err(|_| self.parse_error(raw))?;
         require!(scale == expected_scale, self.parse_error(raw));
+        Self::check_decimal(precision, scale)?;
 
         let int: i128 = match frac_part {
             None => int_part.parse()?,
@@ -272,16 +298,13 @@ mod tests {
 
         let s = Scalar::Decimal(123456789, 9, 9);
         assert_eq!(s.to_string(), "0.123456789");
-
-        let s = Scalar::Decimal(123, 9, -3);
-        assert_eq!(s.to_string(), "123000");
     }
 
     fn assert_decimal(
         raw: &str,
         expect_int: i128,
         expect_prec: u8,
-        expect_scale: i8,
+        expect_scale: u8,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let s = PrimitiveType::Decimal(expect_prec, expect_scale);
         match s.parse_scalar(raw)? {
@@ -297,26 +320,22 @@ mod tests {
 
     #[test]
     fn test_parse_decimal() -> Result<(), Box<dyn std::error::Error>> {
-        assert_decimal("0", 0, 0, 0)?;
+        assert_decimal("0", 0, 1, 0)?;
         assert_decimal("0.00", 0, 3, 2)?;
         assert_decimal("123", 123, 3, 0)?;
         assert_decimal("-123", -123, 3, 0)?;
         assert_decimal("-123.", -123, 3, 0)?;
-        assert_decimal("1.23E3", 123, 3, -1)?;
         assert_decimal("123000", 123000, 6, 0)?;
-        assert_decimal("12.3E+7", 123, 9, -6)?;
         assert_decimal("12.0", 120, 3, 1)?;
         assert_decimal("12.3", 123, 3, 1)?;
         assert_decimal("0.00123", 123, 5, 5)?;
-        assert_decimal("-1.23E-12", -123, 3, 14)?;
         assert_decimal("1234.5E-4", 12345, 5, 5)?;
-        assert_decimal("0E+7", 0, 0, -7)?;
-        assert_decimal("-0", 0, 0, 0)?;
+        assert_decimal("-0", 0, 1, 0)?;
         assert_decimal("12.000000000000000000", 12000000000000000000, 38, 18)?;
         Ok(())
     }
 
-    fn expect_fail_parse(raw: &str, prec: u8, scale: i8) {
+    fn expect_fail_parse(raw: &str, prec: u8, scale: u8) {
         let s = PrimitiveType::Decimal(prec, scale);
         let res = s.parse_scalar(raw);
         assert!(res.is_err(), "Fail on {raw}");

@@ -4,3 +4,4 @@
 acceptance/tests/dat/
 .vscode
 ffi/examples/read-table/build
+/build
