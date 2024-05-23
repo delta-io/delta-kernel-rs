@@ -5,8 +5,8 @@ edition = "2021"
 publish = false
 
 [dependencies]
-arrow-array = { version = "^49.0" }
-arrow-schema = { version = "^49.0" }
+arrow-array = { version = "^51.0" }
+arrow-schema = { version = "^51.0" }
 delta_kernel = { path = "../../../kernel", features = [
   "default",
   "tokio",
