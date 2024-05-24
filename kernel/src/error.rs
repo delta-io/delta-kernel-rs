@@ -3,7 +3,7 @@
 use std::{
     backtrace::{Backtrace, BacktraceStatus},
     num::ParseIntError,
-    string::FromUtf8Error,
+    str::Utf8Error,
 };
 
 use crate::schema::DataType;
@@ -127,7 +127,7 @@ pub enum Error {
 
     /// Could not convert to string from utf-8
     #[error("Could not convert to string from utf-8: {0}")]
-    Utf8Error(#[from] FromUtf8Error),
+    Utf8Error(#[from] Utf8Error),
 
     /// Could not parse an integer
     #[error("Could not parse int: {0}")]
