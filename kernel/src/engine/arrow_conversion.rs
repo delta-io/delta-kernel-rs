@@ -11,6 +11,8 @@ use itertools::Itertools;
 use crate::error::Error;
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
 
+pub(crate) const LIST_ARRAY_ROOT: &str = "item";
+
 impl TryFrom<&StructType> for ArrowSchema {
     type Error = ArrowError;
 
@@ -47,7 +49,7 @@ impl TryFrom<&ArrayType> for ArrowField {
 
     fn try_from(a: &ArrayType) -> Result<Self, ArrowError> {
         Ok(ArrowField::new(
-            "item",
+            LIST_ARRAY_ROOT,
             ArrowDataType::try_from(a.element_type())?,
             a.contains_null(),
         ))
@@ -118,31 +120,8 @@ impl TryFrom<&DataType> for ArrowDataType {
                     .collect::<Result<Vec<ArrowField>, ArrowError>>()?
                     .into(),
             )),
-            DataType::Array(a) => Ok(ArrowDataType::List(Arc::new(<ArrowField as TryFrom<
-                &ArrayType,
-            >>::try_from(a)?))),
-            DataType::Map(m) => Ok(ArrowDataType::Map(
-                Arc::new(ArrowField::new(
-                    "entries",
-                    ArrowDataType::Struct(
-                        vec![
-                            ArrowField::new(
-                                "keys",
-                                <ArrowDataType as TryFrom<&DataType>>::try_from(m.key_type())?,
-                                false,
-                            ),
-                            ArrowField::new(
-                                "values",
-                                <ArrowDataType as TryFrom<&DataType>>::try_from(m.value_type())?,
-                                m.value_contains_null(),
-                            ),
-                        ]
-                        .into(),
-                    ),
-                    true,
-                )),
-                false,
-            )),
+            DataType::Array(a) => Ok(ArrowDataType::List(Arc::new(a.as_ref().try_into()?))),
+            DataType::Map(m) => Ok(ArrowDataType::Map(Arc::new(m.as_ref().try_into()?), false)),
         }
     }
 }

@@ -6,8 +6,8 @@ use arrow_arith::numeric::{add, div, mul, sub};
 use arrow_array::cast::AsArray;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
-    StructArray, TimestampMicrosecondArray,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, RecordBatch,
+    StringArray, StructArray, TimestampMicrosecondArray,
 };
 use arrow_ord::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{
@@ -15,6 +15,7 @@ use arrow_schema::{
 };
 use itertools::Itertools;
 
+use super::arrow_conversion::LIST_ARRAY_ROOT;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{BinaryOperator, Expression, Scalar, UnaryOperator, VariadicOperator};
@@ -52,6 +53,14 @@ impl Scalar {
                 Decimal128Array::from_value(*val, num_rows)
                     .with_precision_and_scale(*precision, *scale as i8)?,
             ),
+            Struct(values, fields) => {
+                let arrays = values
+                    .iter()
+                    .map(|val| val.to_array(num_rows))
+                    .try_collect()?;
+                let fields: Fields = fields.iter().map(ArrowField::try_from).try_collect()?;
+                Arc::new(StructArray::try_new(fields, arrays, None)?)
+            }
             Null(data_type) => match data_type {
                 DataType::Primitive(primitive) => match primitive {
                     PrimitiveType::Byte => Arc::new(Int8Array::new_null(num_rows)),
@@ -75,18 +84,17 @@ impl Scalar {
                             .with_precision_and_scale(*precision, *scale as i8)?,
                     ),
                 },
-                DataType::Array(_) => unimplemented!(),
+                DataType::Struct(t) => {
+                    let fields: Fields = t.fields().map(ArrowField::try_from).try_collect()?;
+                    Arc::new(StructArray::new_null(fields, num_rows))
+                }
+                DataType::Array(t) => {
+                    let field =
+                        ArrowField::new(LIST_ARRAY_ROOT, t.element_type().try_into()?, true);
+                    Arc::new(ListArray::new_null(Arc::new(field), num_rows))
+                }
                 DataType::Map { .. } => unimplemented!(),
-                DataType::Struct { .. } => unimplemented!(),
             },
-            Struct(values, fields) => {
-                let arrays = values
-                    .iter()
-                    .map(|val| val.to_array(num_rows))
-                    .try_collect()?;
-                let fields: Fields = fields.iter().map(ArrowField::try_from).try_collect()?;
-                Arc::new(StructArray::try_new(fields, arrays, None)?)
-            }
         };
         Ok(arr)
     }
