@@ -40,6 +40,16 @@ struct Cli {
     /// Comma separated list of columns to select
     #[arg(long, value_delimiter=',', num_args(0..))]
     columns: Option<Vec<String>>,
+
+    /// Region to specify to the cloud access store (only applies if using the default engine)
+    #[arg(long)]
+    region: Option<String>,
+
+    /// Specify that the table is "public" (i.e. no cloud credentials are needed). This is required
+    /// for things like s3 public buckets, otherwise the kernel will try and authenticate by talking
+    /// to the aws metadata server, which will fail unless you're on an ec2 instance.
+    #[arg(long)]
+    public: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -105,11 +115,21 @@ fn try_main() -> DeltaResult<()> {
 
     // create the requested engine
     let engine: Arc<dyn Engine> = match cli.engine {
-        EngineType::Default => Arc::new(DefaultEngine::try_new(
-            table.location(),
-            HashMap::<String, String>::new(),
-            Arc::new(TokioBackgroundExecutor::new()),
-        )?),
+        EngineType::Default => {
+            let mut options = if let Some(region) = cli.region {
+                HashMap::from([("region", region)])
+            } else {
+                HashMap::new()
+            };
+            if cli.public {
+                options.insert("skip_signature", "true".to_string());
+            }
+            Arc::new(DefaultEngine::try_new(
+                table.location(),
+                options,
+                Arc::new(TokioBackgroundExecutor::new()),
+            )?)
+        }
         EngineType::Sync => Arc::new(SyncEngine::new()),
     };
 

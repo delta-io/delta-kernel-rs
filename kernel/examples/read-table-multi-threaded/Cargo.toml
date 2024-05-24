@@ -9,6 +9,7 @@ arrow = { version = "^51.0", features = ["prettyprint"] }
 clap = { version = "^4.4", features = ["derive"] }
 delta_kernel = { path = "../../../kernel", features = [
   "default-engine",
+  "cloud",
   "tokio",
   "developer-visibility",
 ] }

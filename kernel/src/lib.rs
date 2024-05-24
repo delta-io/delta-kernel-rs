@@ -210,8 +210,8 @@ pub trait ParquetHandler: Send + Sync {
     ) -> DeltaResult<FileDataReadResultIterator>;
 }
 
-/// The `Engine` trait encapsulates all the functionality and engine or connector needs to provide
-/// tothe Delta Kernel in order to read the Delta table.
+/// The `Engine` trait encapsulates all the functionality an engine or connector needs to provide
+/// to the Delta Kernel in order to read the Delta table.
 ///
 /// Engines/Connectors are expected to pass an implementation of this trait when reading a Delta
 /// table.
