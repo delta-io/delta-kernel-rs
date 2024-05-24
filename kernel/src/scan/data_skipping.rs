@@ -9,7 +9,7 @@ use crate::expressions::{BinaryOperator, Expression as Expr, VariadicOperator};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{Engine, EngineData, ExpressionEvaluator, JsonHandler};
 
-/// Returns <op2> (if any) such that B <op2> A is equivalent to A <op> B.
+/// Returns `<op2>` (if any) such that `B <op2> A` is equivalent to `A <op> B`.
 fn commute(op: &BinaryOperator) -> Option<BinaryOperator> {
     use BinaryOperator::*;
     match op {

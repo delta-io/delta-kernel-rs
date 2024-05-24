@@ -1,0 +1,32 @@
+error[E0382]: use of moved value: `h`
+  --> tests/invalid-handle-code/moved-from-handle.rs:13:22
+   |
+11 |     let mut h: Handle<MutFoo> = Box::new(s).into();
+   |         ----- move occurs because `h` has type `Handle<MutFoo>`, which does not implement the `Copy` trait
+12 |     unsafe { h.drop_handle() };
+   |                ------------- `h` moved due to this method call
+13 |     let _ = unsafe { h.into_inner() };
+   |                      ^ value used here after move
+   |
+note: `Handle::<H>::drop_handle` takes ownership of the receiver `self`, which moves `h`
+  --> src/handle.rs
+   |
+   |         pub unsafe fn drop_handle(self) {
+   |                                   ^^^^
+
+error[E0382]: borrow of moved value: `h`
+  --> tests/invalid-handle-code/moved-from-handle.rs:14:22
+   |
+11 |     let mut h: Handle<MutFoo> = Box::new(s).into();
+   |         ----- move occurs because `h` has type `Handle<MutFoo>`, which does not implement the `Copy` trait
+12 |     unsafe { h.drop_handle() };
+13 |     let _ = unsafe { h.into_inner() };
+   |                        ------------ `h` moved due to this method call
+14 |     let _ = unsafe { h.as_mut() };
+   |                      ^ value borrowed here after move
+   |
+note: `Handle::<H>::into_inner` takes ownership of the receiver `self`, which moves `h`
+  --> src/handle.rs
+   |
+   |         pub unsafe fn into_inner(self) -> H::From {
+   |                                  ^^^^

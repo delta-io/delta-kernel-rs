@@ -16,8 +16,20 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Engine, Error, Table};
 use delta_kernel_ffi_macros::handle_descriptor;
 
+// cbindgen doesn't understand our use of feature flags here, and by default it parses `mod handle`
+// twice. So we tell it to ignore one of the declarations to avoid double-definition errors.
+/// cbindgen:ignore
+#[cfg(feature = "developer-visibility")]
+pub mod handle;
+#[cfg(not(feature = "developer-visibility"))]
 pub(crate) mod handle;
+
 use handle::Handle;
+
+// The handle_descriptor macro needs this, because it needs to emit fully qualified type names. THe
+// actual prod code could use `crate::`, but doc tests can't because they're not "inside" the crate.
+// relies on `crate::`
+extern crate self as delta_kernel_ffi;
 
 pub mod scan;
 
@@ -66,8 +78,9 @@ impl Iterator for EngineIterator {
 /// references to the slice or its data that could outlive the function call.
 ///
 /// ```
-/// fn wants_slice(slice: KernelStringSlice) { ... }
-/// let msg = String::from(...);
+/// # use delta_kernel_ffi::KernelStringSlice;
+/// fn wants_slice(slice: KernelStringSlice) { }
+/// let msg = String::from("hello");
 /// wants_slice(msg.into());
 /// ```
 #[repr(C)]

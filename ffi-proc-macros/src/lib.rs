@@ -80,10 +80,22 @@ fn bool_to_boolean(b: bool) -> TokenStream2 {
     } else {
         quote! { False }
     };
-    quote! { crate::handle::#name }
+    quote! { delta_kernel_ffi::handle::#name }
 }
 
 /// Macro for conveniently deriving a `delta_kernel_ffi::handle::HandleDescriptor`.
+///
+/// When targeting a struct, it is invoked with three arguments:
+/// ```ignore
+/// #[handle_descriptor(target = Foo, mutable = false. sized = true)]
+/// pub struct SharedFoo;
+/// ```
+///
+/// When targeting a trait, two arguments suffice (`sized = false` is implied):
+/// ```ignore
+/// #[handle_descriptor(target = dyn Bar, mutable = true)]
+/// pub struct MutableBar;
+/// ```
 #[proc_macro_attribute]
 pub fn handle_descriptor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let descriptor_params = parse_macro_input!(attr as HandleDescriptorParams);
@@ -105,7 +117,7 @@ pub fn handle_descriptor(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Inject a single unconstructible member to produce a NZST
     let ident = &st.ident;
-    let new_struct = quote! { struct #ident(crate::handle::Unconstructable); };
+    let new_struct = quote! { struct #ident(delta_kernel_ffi::handle::Unconstructable); };
     let new_struct = new_struct.into();
     let new_struct = parse_macro_input!(new_struct as ItemStruct);
     st.fields = new_struct.fields;
@@ -116,7 +128,7 @@ pub fn handle_descriptor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let target = &descriptor_params.target;
     let descriptor_impl = quote! {
         #[automatically_derived]
-        impl crate::handle::HandleDescriptor for #ident {
+        impl delta_kernel_ffi::handle::HandleDescriptor for #ident {
             type Target = #target;
             type Mutable = #mutable;
             type Sized = #sized;

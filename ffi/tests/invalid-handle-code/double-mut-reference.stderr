@@ -1,0 +1,21 @@
+error[E0499]: cannot borrow `h` as mutable more than once at a time
+  --> tests/invalid-handle-code/double-mut-reference.rs:13:22
+   |
+12 |     let r = unsafe { h.as_mut() };
+   |                      - first mutable borrow occurs here
+13 |     let _ = unsafe { h.as_mut() };
+   |                      ^ second mutable borrow occurs here
+14 |     let _ = unsafe { h.as_ref() };
+15 |     r.0 = 1;
+   |     ------- first borrow later used here
+
+error[E0502]: cannot borrow `h` as immutable because it is also borrowed as mutable
+  --> tests/invalid-handle-code/double-mut-reference.rs:14:22
+   |
+12 |     let r = unsafe { h.as_mut() };
+   |                      - mutable borrow occurs here
+13 |     let _ = unsafe { h.as_mut() };
+14 |     let _ = unsafe { h.as_ref() };
+   |                      ^ immutable borrow occurs here
+15 |     r.0 = 1;
+   |     ------- mutable borrow later used here

@@ -1,0 +1,59 @@
+error[E0599]: the method `clone_as_arc` exists for struct `Handle<SharedNotSync>`, but its trait bounds were not satisfied
+  --> tests/invalid-handle-code/shared-not-sync.rs:15:15
+   |
+10 | pub struct SharedNotSync;
+   | ------------------------ doesn't satisfy `SharedNotSync: handle::private::SharedHandle` or `_: SharedHandleOps<_, _>`
+...
+15 |     let r = h.clone_as_arc();
+   |               ^^^^^^^^^^^^ method cannot be called on `Handle<SharedNotSync>` due to unsatisfied trait bounds
+   |
+   = note: the following trait bounds were not satisfied:
+           `SharedNotSync: handle::private::SharedHandleOps<_, _>`
+           `SharedNotSync: handle::private::SharedHandle`
+           which is required by `SharedNotSync: handle::private::SharedHandleOps<_, _>`
+note: the traits `handle::private::SharedHandle` and `handle::private::SharedHandleOps` must be implemented
+  --> src/handle.rs
+   |
+   |     pub trait SharedHandle {}
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+...
+   |     pub trait SharedHandleOps<T: ?Sized, S>: HandleOps<T, False, S> + SharedHandle {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0277]: `*mut u32` cannot be shared between threads safely
+  --> tests/invalid-handle-code/shared-not-sync.rs:14:48
+   |
+14 |     let h: Handle<SharedNotSync> = Arc::new(s).into();
+   |                                                ^^^^ `*mut u32` cannot be shared between threads safely
+   |
+   = help: within `NotSync`, the trait `Sync` is not implemented for `*mut u32`, which is required by `Arc<NotSync>: Into<_>`
+note: required because it appears within the type `NotSync`
+  --> tests/invalid-handle-code/shared-not-sync.rs:5:12
+   |
+5  | pub struct NotSync(*mut u32);
+   |            ^^^^^^^
+   = note: required for `SharedNotSync` to implement `handle::private::SharedHandleOps<NotSync, True>`
+   = note: required for `Handle<SharedNotSync>` to implement `From<Arc<NotSync>>`
+   = note: required for `Arc<NotSync>` to implement `Into<Handle<SharedNotSync>>`
+
+error[E0599]: the method `clone_handle` exists for struct `Handle<SharedNotSync>`, but its trait bounds were not satisfied
+  --> tests/invalid-handle-code/shared-not-sync.rs:16:15
+   |
+10 | pub struct SharedNotSync;
+   | ------------------------ doesn't satisfy `SharedNotSync: handle::private::SharedHandle` or `_: SharedHandleOps<_, _>`
+...
+16 |     let h = h.clone_handle();
+   |               ^^^^^^^^^^^^
+   |
+   = note: the following trait bounds were not satisfied:
+           `SharedNotSync: handle::private::SharedHandleOps<_, _>`
+           `SharedNotSync: handle::private::SharedHandle`
+           which is required by `SharedNotSync: handle::private::SharedHandleOps<_, _>`
+note: the traits `handle::private::SharedHandle` and `handle::private::SharedHandleOps` must be implemented
+  --> src/handle.rs
+   |
+   |     pub trait SharedHandle {}
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+...
+   |     pub trait SharedHandleOps<T: ?Sized, S>: HandleOps<T, False, S> + SharedHandle {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

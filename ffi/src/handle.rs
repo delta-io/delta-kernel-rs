@@ -3,7 +3,7 @@
 //!
 //! Creating a [`Handle<T>`] always implies some kind of ownership transfer. A mutable handle takes
 //! ownership of the object itself (analagous to [`Box<T>`]), while a non-mutable (shared) handle
-//! takes ownership of a shared reference to the object (analagous to [`Arc<T>`]). Thus, a created
+//! takes ownership of a shared reference to the object (analagous to [`std::sync::Arc<T>`]). Thus, a created
 //! handle remains [valid][Handle#Validity], and its underlying object remains accessible, until the
 //! handle is explicitly dropped or consumed. Dropping a mutable handle always drops the underlying
 //! object as well; dropping a shared handle only drops the underlying object if the handle was the
@@ -18,20 +18,33 @@
 //! advised to maintain "unique pointer" semantics for mutable handles.
 //!
 //! NOTE: While shared handles could conceptually impl [`Clone`], cloning would require unsafe code
-//! and so we can't actually implement the trait. Use [`CloneHandle::clone_handle`] instead.
+//! and so we can't actually implement the trait. Use [`Handle::clone_handle`] instead.
 
 /// Describes the kind of handle a given opaque pointer type represents.
 ///
 /// It is not normally necessary to implement this trait directly; instead, use the provided
-/// attribute macro `#[handle_descriptor]` to generate the implementation automatically, e.g.
+/// attribute macro [`#[handle_descriptor]`][delta_kernel_ffi_macros::handle_descriptor] to generate
+/// the implementation automatically, e.g.
 /// ```
+/// # use delta_kernel_ffi_macros::handle_descriptor;
+/// # use delta_kernel_ffi::handle::Handle;
 /// pub struct Foo {
 ///     x: usize,
 /// }
 ///
-/// #[handle_descriptor(target = "Foo", mutable = true, sized = true)]
+/// #[handle_descriptor(target = Foo, mutable = true, sized = true)]
 /// pub struct MutableFoo;
+///
+/// pub trait Bar: Send {}
+///
+/// #[handle_descriptor(target = dyn Bar, mutable = false)]
+/// pub struct SharedBar;
+///
 /// ```
+///
+/// NOTE: For obscure rust generic type constraint reasons, a `HandleDescriptor` must specifically
+/// state whether the target type is [`Sized`]. However, two arguments suffice for trait targets,
+/// because `sized=true` is implied.
 pub trait HandleDescriptor {
     /// The true type of the handle's underlying object
     type Target: ?Sized + Send;
@@ -53,7 +66,17 @@ mod private {
     use super::*;
 
     /// Represents an object that crosses the FFI boundary and which outlives the scope that created
-    /// it. It can be passed freely between rust code and external code.
+    /// it. It can be passed freely between rust code and external code. The
+    ///
+    /// An accompanying [`HandleDescriptor`] trait defines the behavior of each handle type:
+    ///
+    /// * The true underlying ("target") type the handle represents. For safety reasons, target type
+    /// must always be [`Send`].
+    ///
+    /// * Mutable (`Box`-like) vs. shared (`Arc`-like). For safety reasons, the target type of a
+    /// shared handle must always be [`Send`]+[`Sync`].
+    ///
+    /// * Sized vs. unsized. Sized types allow handle operations to be implemented more efficiently.
     ///
     /// # Validity
     ///
@@ -512,11 +535,17 @@ mod tests {
     }
     unsafe impl Send for NotSync {}
 
-    #[handle_descriptor(target=NotSync, mutable=false, sized=true)]
-    pub struct SharedNotSync;
-
     #[handle_descriptor(target=NotSync, mutable=true, sized=true)]
     pub struct MutNotSync;
+
+    // Because tests compile as binaries against packages, this test can only run correctly if we
+    // use developer-visibility to make mod handle public. Otherwise it's inaccessible for testing.
+    #[test]
+    #[cfg(feature = "developer-visibility")]
+    fn invalid_handle_code() {
+        let t = trybuild::TestCases::new();
+        t.compile_fail("tests/invalid-handle-code/*.rs");
+    }
 
     #[test]
     fn test_handle_use_cases_compile() {
@@ -525,11 +554,6 @@ mod tests {
         };
         let h: Handle<MutNotSync> = Box::new(s).into();
         unsafe { h.drop_handle() };
-
-        // error[E0277]: `*mut u32` cannot be shared between threads safely
-        // let s = NotSync { ptr: std::ptr::null_mut() };
-        // let h: Handle<SharedNotSync> = Arc::new(s).into();
-        // unsafe { h.drop_handle() };
 
         let f = Foo {
             x: rand::random::<usize>(),
@@ -540,17 +564,7 @@ mod tests {
         let r = unsafe { h.as_mut() };
         assert_eq!(format!("{r:?}"), s);
 
-        // error[E0599]: the method `clone_as_arc` exists for struct `Handle<FooHandle>`,
-        //               but its trait bounds were not satisfied
-        //let _ = unsafe { h.clone_as_arc() };
-
         unsafe { h.drop_handle() };
-
-        // error[E0382]: borrow of moved value: `h`
-        // let _ = unsafe { h.as_mut() };
-
-        // error[E0451]: field `ptr` of struct `Handle` is private
-        // let h = Handle::<FooHandle>{ ptr: std::ptr::null() };
 
         let b = Bar {
             x: rand::random::<usize>(),
@@ -561,16 +575,9 @@ mod tests {
         let r = unsafe { h.as_ref() };
         assert_eq!(format!("{r:?}"), s);
 
-        // error[E0599]: the method `as_mut` exists for struct `Handle<BarHandle>`,
-        //               but its trait bounds were not satisfied
-        // let r = unsafe { h.as_mut() };
-
         let r = unsafe { h.clone_as_arc() };
         assert_eq!(format!("{r:?}"), s);
         unsafe { h.drop_handle() };
-
-        // error[E0382]: borrow of moved value: `h`
-        // let _ = unsafe { h.as_ref() };
 
         let b = Bar {
             x: rand::random::<usize>(),
@@ -604,10 +611,6 @@ mod tests {
         assert_eq!(s, r.squawk());
 
         unsafe { h.drop_handle() };
-
-        // error[E0599]: the method `clone_as_arc` exists for struct `Handle<FooHandle>`,
-        //               but its trait bounds were not satisfied
-        //let _ = unsafe { h.clone_as_arc() };
 
         let r = unsafe { h2.as_ref() };
         assert_eq!(r.squawk(), s2);
