@@ -292,7 +292,7 @@ pub struct CStringMap {
 ///
 /// The engine is responsible for providing a valid [`CStringMap`] pointer and [`KernelStringSlice`]
 pub unsafe extern "C" fn get_from_map(
-    map: &mut CStringMap,
+    map: &CStringMap,
     key: KernelStringSlice,
     allocate_fn: AllocateStringFn,
 ) -> NullableCvoid {
