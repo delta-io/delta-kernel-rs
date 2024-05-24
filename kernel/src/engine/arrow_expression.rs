@@ -53,12 +53,17 @@ impl Scalar {
                 Decimal128Array::from_value(*val, num_rows)
                     .with_precision_and_scale(*precision, *scale as i8)?,
             ),
-            Struct(values, fields) => {
-                let arrays = values
+            Struct(data) => {
+                let arrays = data
+                    .values()
                     .iter()
                     .map(|val| val.to_array(num_rows))
                     .try_collect()?;
-                let fields: Fields = fields.iter().map(ArrowField::try_from).try_collect()?;
+                let fields: Fields = data
+                    .fields()
+                    .iter()
+                    .map(ArrowField::try_from)
+                    .try_collect()?;
                 Arc::new(StructArray::try_new(fields, arrays, None)?)
             }
             Null(data_type) => match data_type {

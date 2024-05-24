@@ -7,6 +7,64 @@ use crate::schema::{DataType, PrimitiveType, StructField};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructData {
+    fields: Vec<StructField>,
+    values: Vec<Scalar>,
+}
+
+impl StructData {
+    /// Try to create a new struct data with the given fields and values.
+    ///
+    /// This will return an error:
+    /// - if the number of fields and values do not match
+    /// - if the data types of the values do not match the data types of the fields
+    /// - if a null value is assigned to a non-nullable field
+    pub fn try_new(fields: Vec<StructField>, values: Vec<Scalar>) -> DeltaResult<Self> {
+        require!(
+            fields.len() == values.len(),
+            Error::invalid_struct_data(format!(
+                "Incorrect number of values for Struct fields, expected {} got {}",
+                fields.len(),
+                values.len()
+            ))
+        );
+
+        for (f, a) in fields.iter().zip(&values) {
+            require!(
+                f.data_type() == &a.data_type(),
+                Error::invalid_struct_data(format!(
+                    "Incorrect datatype for Struct field {:?}, expected {} got {}",
+                    f.name(),
+                    f.data_type(),
+                    a.data_type()
+                ))
+            );
+
+            if !f.is_nullable() {
+                require!(
+                    !a.is_null(),
+                    Error::invalid_struct_data(format!(
+                        "Value for non-nullable field {:?} cannto be null, got {}",
+                        f.name(),
+                        a
+                    ))
+                );
+            }
+        }
+
+        Ok(Self { fields, values })
+    }
+
+    pub fn fields(&self) -> &[StructField] {
+        &self.fields
+    }
+
+    pub fn values(&self) -> &[Scalar] {
+        &self.values
+    }
+}
+
 /// A single value, which can be null. Used for representing literal values
 /// in [Expressions][crate::expressions::Expression].
 #[derive(Debug, Clone, PartialEq)]
@@ -40,7 +98,7 @@ pub enum Scalar {
     /// Null value with a given data type.
     Null(DataType),
     /// Struct value
-    Struct(Vec<Scalar>, Vec<StructField>),
+    Struct(StructData),
 }
 
 impl Scalar {
@@ -60,7 +118,7 @@ impl Scalar {
             Self::Binary(_) => DataType::BINARY,
             Self::Decimal(_, precision, scale) => DataType::decimal_unchecked(*precision, *scale),
             Self::Null(data_type) => data_type.clone(),
-            Self::Struct(_, fields) => DataType::struct_type(fields.clone()),
+            Self::Struct(data) => DataType::struct_type(data.fields.clone()),
         }
     }
 
@@ -109,10 +167,10 @@ impl Display for Scalar {
                 }
             },
             Self::Null(_) => write!(f, "null"),
-            Self::Struct(values, fields) => {
+            Self::Struct(data) => {
                 write!(f, "{{")?;
                 let mut delim = "";
-                for (value, field) in values.iter().zip(fields.iter()) {
+                for (value, field) in data.values.iter().zip(data.fields.iter()) {
                     write!(f, "{delim}{}: {value}", field.name)?;
                     delim = ", ";
                 }

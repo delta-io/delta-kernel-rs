@@ -243,6 +243,7 @@ pub enum KernelError {
     InvalidColumnMappingMode,
     InvalidTableLocation,
     InvalidDecimalError,
+    InvalidStructData,
 }
 
 impl From<Error> for KernelError {
@@ -282,6 +283,7 @@ impl From<Error> for KernelError {
             Error::InvalidColumnMappingMode(_) => KernelError::InvalidColumnMappingMode,
             Error::InvalidTableLocation(_) => KernelError::InvalidTableLocation,
             Error::InvalidDecimal(_) => KernelError::InvalidDecimalError,
+            Error::InvalidStructData(_) => KernelError::InvalidStructData,
             Error::Backtraced {
                 source,
                 backtrace: _,

@@ -143,6 +143,10 @@ pub enum Error {
     /// Precision or scale not compliant with delta specification
     #[error("Inavlid decimal: {0}")]
     InvalidDecimal(String),
+
+    /// Incosistent data passed to struct scalar
+    #[error("Invalid struct data: {0}")]
+    InvalidStructData(String),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -184,6 +188,9 @@ impl Error {
     }
     pub fn invalid_decimal(msg: impl ToString) -> Self {
         Self::InvalidDecimal(msg.to_string())
+    }
+    pub fn invalid_struct_data(msg: impl ToString) -> Self {
+        Self::InvalidStructData(msg.to_string())
     }
 
     // Capture a backtrace when the error is constructed.
