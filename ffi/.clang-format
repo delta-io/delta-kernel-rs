@@ -1,0 +1,5 @@
+BasedOnStyle: Mozilla
+ColumnLimit: 100
+BreakBeforeBraces: Attach
+AlwaysBreakAfterReturnType: None
+AlwaysBreakAfterDefinitionReturnType: None

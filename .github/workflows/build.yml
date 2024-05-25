@@ -77,4 +77,4 @@ jobs:
           override: true
       - uses: Swatinem/rust-cache@v2
       - name: test
-        run: pushd ffi && cargo b --features default-engine && make test && popd
+        run: pushd ffi && cargo b --features default-engine,sync-engine && make test && popd
