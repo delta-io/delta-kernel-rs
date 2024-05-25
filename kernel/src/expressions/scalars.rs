@@ -41,16 +41,14 @@ impl StructData {
                 ))
             );
 
-            if !f.is_nullable() {
-                require!(
-                    !a.is_null(),
-                    Error::invalid_struct_data(format!(
-                        "Value for non-nullable field {:?} cannto be null, got {}",
-                        f.name(),
-                        a
-                    ))
-                );
-            }
+            require!(
+                f.is_nullable() || !a.is_null(),
+                Error::invalid_struct_data(format!(
+                    "Value for non-nullable field {:?} cannto be null, got {}",
+                    f.name(),
+                    a
+                ))
+            );
         }
 
         Ok(Self { fields, values })
