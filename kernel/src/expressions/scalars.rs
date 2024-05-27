@@ -3,19 +3,81 @@ use std::fmt::{Display, Formatter};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 
-use crate::schema::{DataType, PrimitiveType};
+use crate::schema::{DataType, PrimitiveType, StructField};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructData {
+    fields: Vec<StructField>,
+    values: Vec<Scalar>,
+}
+
+impl StructData {
+    /// Try to create a new struct data with the given fields and values.
+    ///
+    /// This will return an error:
+    /// - if the number of fields and values do not match
+    /// - if the data types of the values do not match the data types of the fields
+    /// - if a null value is assigned to a non-nullable field
+    pub fn try_new(fields: Vec<StructField>, values: Vec<Scalar>) -> DeltaResult<Self> {
+        require!(
+            fields.len() == values.len(),
+            Error::invalid_struct_data(format!(
+                "Incorrect number of values for Struct fields, expected {} got {}",
+                fields.len(),
+                values.len()
+            ))
+        );
+
+        for (f, a) in fields.iter().zip(&values) {
+            require!(
+                f.data_type() == &a.data_type(),
+                Error::invalid_struct_data(format!(
+                    "Incorrect datatype for Struct field {:?}, expected {} got {}",
+                    f.name(),
+                    f.data_type(),
+                    a.data_type()
+                ))
+            );
+
+            require!(
+                f.is_nullable() || !a.is_null(),
+                Error::invalid_struct_data(format!(
+                    "Value for non-nullable field {:?} cannto be null, got {}",
+                    f.name(),
+                    a
+                ))
+            );
+        }
+
+        Ok(Self { fields, values })
+    }
+
+    pub fn fields(&self) -> &[StructField] {
+        &self.fields
+    }
+
+    pub fn values(&self) -> &[Scalar] {
+        &self.values
+    }
+}
 
 /// A single value, which can be null. Used for representing literal values
 /// in [Expressions][crate::expressions::Expression].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Scalar {
+    /// 32bit integer
     Integer(i32),
+    /// 64bit integer
     Long(i64),
+    /// 16bit integer
     Short(i16),
+    /// 8bit integer
     Byte(i8),
+    /// 32bit floating point
     Float(f32),
+    /// 64bit floating point
     Double(f64),
     /// utf-8 encoded string.
     String(String),
@@ -23,13 +85,18 @@ pub enum Scalar {
     Boolean(bool),
     /// Microsecond precision timestamp, adjusted to UTC.
     Timestamp(i64),
-    /// Microsecond precision timestamp, without any timezone.
+    /// Microsecond precision timestamp, with no timezone.
     TimestampNtz(i64),
     /// Date stored as a signed 32bit int days since UNIX epoch 1970-01-01
     Date(i32),
+    /// Binary data
     Binary(Vec<u8>),
+    /// Decimal value with a given precision and scale.
     Decimal(i128, u8, u8),
+    /// Null value with a given data type.
     Null(DataType),
+    /// Struct value
+    Struct(StructData),
 }
 
 impl Scalar {
@@ -49,7 +116,13 @@ impl Scalar {
             Self::Binary(_) => DataType::BINARY,
             Self::Decimal(_, precision, scale) => DataType::decimal_unchecked(*precision, *scale),
             Self::Null(data_type) => data_type.clone(),
+            Self::Struct(data) => DataType::struct_type(data.fields.clone()),
         }
+    }
+
+    /// Returns true if this scalar is null.
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Null(_))
     }
 }
 
@@ -92,6 +165,15 @@ impl Display for Scalar {
                 }
             },
             Self::Null(_) => write!(f, "null"),
+            Self::Struct(data) => {
+                write!(f, "{{")?;
+                let mut delim = "";
+                for (value, field) in data.values.iter().zip(data.fields.iter()) {
+                    write!(f, "{delim}{}: {value}", field.name)?;
+                    delim = ", ";
+                }
+                write!(f, "}}")
+            }
         }
     }
 }

@@ -476,6 +476,10 @@ impl DataType {
     pub fn decimal_unchecked(precision: u8, scale: u8) -> Self {
         Self::decimal(precision, scale).unwrap()
     }
+
+    pub fn struct_type(fields: Vec<StructField>) -> Self {
+        DataType::Struct(Box::new(StructType::new(fields)))
+    }
 }
 
 impl Display for DataType {
