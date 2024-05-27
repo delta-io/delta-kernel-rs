@@ -72,9 +72,10 @@ static SKIPPED_TESTS: &[&str; 2] = &[
     "multi_partitioned_2",
 ];
 
-// Ensure that two schema have the same field names, data types, nullability, and
-// dict_id/ordering. Basically just ignore the metadata because that diverges from the real data to
-// the golden tabled data
+// Ensure that two schema have the same field names, data types, and dict_id/ordering.
+// We ignore:
+//  - nullability: parquet marks many things as nullable that we don't in our schema
+//  - metadata: because that diverges from the real data to the golden tabled data
 fn assert_schema_fields_match(schema: &Schema, golden: &Schema) {
     for (schema_field, golden_field) in schema.fields.iter().zip(golden.fields.iter()) {
         assert!(
@@ -84,10 +85,6 @@ fn assert_schema_fields_match(schema: &Schema, golden: &Schema) {
         assert!(
             schema_field.data_type() == golden_field.data_type(),
             "Field data types don't match"
-        );
-        assert!(
-            schema_field.is_nullable() == golden_field.is_nullable(),
-            "Field nullability doesn't match"
         );
         assert!(
             schema_field.dict_id() == golden_field.dict_id(),
