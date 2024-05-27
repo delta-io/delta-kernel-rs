@@ -20,6 +20,7 @@ use crate::engine::arrow_data::ArrowEngineData;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{BinaryOperator, Expression, Scalar, UnaryOperator, VariadicOperator};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
+use crate::utils::require;
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
 
 // TODO leverage scalars / Datum
@@ -160,6 +161,80 @@ fn column_as_struct<'a>(
         .ok_or(ArrowError::SchemaError(format!("{} is not a struct", name)))
 }
 
+fn make_arrow_error(s: String) -> Error {
+    Error::Arrow(arrow_schema::ArrowError::InvalidArgumentError(s))
+}
+
+/// Ensure a kernel data type matches an arrow data type. This only ensures that the actual "type"
+/// is the same, but does so recursively into structs, and ensures lists and maps have the correct
+/// associated types as well. This returns an `Ok(())` if the types are compatible, or an error if
+/// the types do not match.
+fn ensure_data_types(kernel_type: &DataType, arrow_type: &ArrowDataType) -> DeltaResult<()> {
+    match (kernel_type, arrow_type) {
+        (DataType::Primitive(_), _) if arrow_type.is_primitive() => Ok(()),
+        (DataType::Primitive(PrimitiveType::Boolean), ArrowDataType::Boolean)
+        | (DataType::Primitive(PrimitiveType::String), ArrowDataType::Utf8)
+        | (DataType::Primitive(PrimitiveType::Binary), ArrowDataType::Binary) => {
+            // strings, bools, and binary  aren't primitive in arrow
+            Ok(())
+        }
+        (
+            DataType::Primitive(PrimitiveType::Decimal(kernel_prec, kernel_scale)),
+            ArrowDataType::Decimal128(arrow_prec, arrow_scale),
+        ) if arrow_prec == kernel_prec && *arrow_scale == *kernel_scale as i8 => {
+            // decimal isn't primitive in arrow. cast above is okay as we limit range
+            Ok(())
+        }
+        (DataType::Array(inner_type), ArrowDataType::List(arrow_list_type)) => {
+            let kernel_array_type = &inner_type.element_type;
+            let arrow_list_type = arrow_list_type.data_type();
+            ensure_data_types(kernel_array_type, arrow_list_type)
+        }
+        (DataType::Map(kernel_map_type), ArrowDataType::Map(arrow_map_type, _)) => {
+            if let ArrowDataType::Struct(fields) = arrow_map_type.data_type() {
+                let mut fiter = fields.iter();
+                if let Some(key_type) = fiter.next() {
+                    ensure_data_types(&kernel_map_type.key_type, key_type.data_type())?;
+                } else {
+                    return Err(make_arrow_error(
+                        "Arrow map struct didn't have a key type".to_string(),
+                    ));
+                }
+                if let Some(value_type) = fiter.next() {
+                    ensure_data_types(&kernel_map_type.value_type, value_type.data_type())?;
+                } else {
+                    return Err(make_arrow_error(
+                        "Arrow map struct didn't have a value type".to_string(),
+                    ));
+                }
+                Ok(())
+            } else {
+                Err(make_arrow_error(
+                    "Arrow map type wasn't a struct.".to_string(),
+                ))
+            }
+        }
+        (DataType::Struct(kernel_fields), ArrowDataType::Struct(arrow_fields)) => {
+            require!(
+                kernel_fields.fields.len() == arrow_fields.len(),
+                make_arrow_error(format!(
+                    "Struct types have different numbers of fields. Expected {}, got {}",
+                    kernel_fields.fields.len(),
+                    arrow_fields.len()
+                ))
+            );
+            for (kernel_field, arrow_field) in kernel_fields.fields().zip(arrow_fields.iter()) {
+                ensure_data_types(&kernel_field.data_type, arrow_field.data_type())?;
+            }
+            Ok(())
+        }
+        _ => Err(make_arrow_error(format!(
+            "Incorrect datatype. Expected {}, got {}",
+            kernel_type, arrow_type
+        ))),
+    }
+}
+
 fn evaluate_expression(
     expression: &Expression,
     batch: &RecordBatch,
@@ -185,13 +260,24 @@ fn evaluate_expression(
             }
         }
         (Struct(fields), Some(DataType::Struct(schema))) => {
-            let output_schema: ArrowSchema = schema.as_ref().try_into()?;
             let columns = fields
                 .iter()
                 .zip(schema.fields())
                 .map(|(expr, field)| evaluate_expression(expr, batch, Some(field.data_type())));
-            let result =
-                StructArray::try_new(output_schema.fields().clone(), columns.try_collect()?, None)?;
+            let output_cols: Vec<Arc<dyn Array>> = columns.try_collect()?;
+            let output_fields: Vec<ArrowField> = output_cols
+                .iter()
+                .zip(schema.fields())
+                .map(|(array, input_field)| -> DeltaResult<_> {
+                    ensure_data_types(input_field.data_type(), array.data_type())?;
+                    Ok(ArrowField::new(
+                        input_field.name(),
+                        array.data_type().clone(),
+                        array.is_nullable(),
+                    ))
+                })
+                .try_collect()?;
+            let result = StructArray::try_new(output_fields.into(), output_cols, None)?;
             Ok(Arc::new(result))
         }
         (Struct(_), _) => Err(Error::generic(
