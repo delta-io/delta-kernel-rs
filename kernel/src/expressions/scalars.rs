@@ -202,6 +202,18 @@ impl From<i64> for Scalar {
     }
 }
 
+impl From<f32> for Scalar {
+    fn from(i: f32) -> Self {
+        Self::Float(i)
+    }
+}
+
+impl From<f64> for Scalar {
+    fn from(i: f64) -> Self {
+        Self::Double(i)
+    }
+}
+
 impl From<bool> for Scalar {
     fn from(b: bool) -> Self {
         Self::Boolean(b)

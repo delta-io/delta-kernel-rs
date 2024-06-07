@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tracing::debug;
 use url::Url;
 
-use delta_kernel::expressions::{BinaryOperator, Expression, Scalar};
+use delta_kernel::expressions::{BinaryOperator, Expression, Scalar, UnaryOperator};
 use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Engine, Error, Table};
@@ -851,6 +851,8 @@ pub unsafe extern "C" fn visit_schema(
     visit_struct_fields(visitor, snapshot.schema())
 }
 
+// TODO move expression visitors to separate module
+
 // A set that can identify its contents by address
 pub struct ReferenceSet<T> {
     map: std::collections::HashMap<usize, T>,
@@ -944,7 +946,6 @@ fn unwrap_kernel_expression(
     state.inflight_expressions.take(exprid)
 }
 
-// TODO move visitors to separate module
 fn visit_expression_binary(
     state: &mut KernelExpressionVisitorState,
     op: BinaryOperator,
@@ -959,6 +960,16 @@ fn visit_expression_binary(
         }
         None => 0, // invalid child => invalid node
     }
+}
+
+fn visit_expression_unary(
+    state: &mut KernelExpressionVisitorState,
+    op: UnaryOperator,
+    inner_expr: usize,
+) -> usize {
+    unwrap_kernel_expression(state, inner_expr).map_or(0, |expr| {
+        wrap_expression(state, Expression::unary(op, expr))
+    })
 }
 
 // The EngineIterator is not thread safe, not reentrant, not owned by callee, not freed by callee.
@@ -1036,6 +1047,22 @@ fn visit_expression_column_impl(
     Ok(wrap_expression(state, Expression::Column(name?)))
 }
 
+#[no_mangle]
+pub extern "C" fn visit_expression_not(
+    state: &mut KernelExpressionVisitorState,
+    inner_expr: usize,
+) -> usize {
+    visit_expression_unary(state, UnaryOperator::Not, inner_expr)
+}
+
+#[no_mangle]
+pub extern "C" fn visit_expression_is_null(
+    state: &mut KernelExpressionVisitorState,
+    inner_expr: usize,
+) -> usize {
+    visit_expression_unary(state, UnaryOperator::IsNull, inner_expr)
+}
+
 /// # Safety
 /// The string slice must be valid
 #[no_mangle]
@@ -1057,10 +1084,26 @@ fn visit_expression_literal_string_impl(
     ))
 }
 
-#[no_mangle]
-pub extern "C" fn visit_expression_literal_long(
-    state: &mut KernelExpressionVisitorState,
-    value: i64,
-) -> usize {
-    wrap_expression(state, Expression::Literal(Scalar::from(value)))
+macro_rules! fn_visit_literal_prim {
+    ( $(($name: ident, $typ: ty)), * ) => {
+        $(
+            #[no_mangle]
+            pub extern "C" fn $name(
+                state: &mut KernelExpressionVisitorState,
+                value: $typ,
+            ) -> usize {
+                wrap_expression(state, Expression::literal(value))
+            }
+        )*
+    };
 }
+
+fn_visit_literal_prim!(
+    (visit_expression_literal_int, i32),
+    (visit_expression_literal_long, i64),
+    (visit_expression_literal_short, i16),
+    (visit_expression_literal_byte, i8),
+    (visit_expression_literal_float, f32),
+    (visit_expression_literal_double, f64),
+    (visit_expression_literal_bool, bool) // TODO: timestamp/date/decimal?
+);
