@@ -59,7 +59,7 @@ impl ScanBuilder {
     }
 
     /// Optionally provide a [`SchemaRef`] for columns to select from the [`Snapshot`]. See
-    /// [`ScanBuilder::with_schema`] for details. If schema_opt is `None` this is a no-op.
+    /// [`ScanBuilder::with_schema`] for details. If `schema_opt` is `None` this is a no-op.
     pub fn with_schema_opt(self, schema_opt: Option<SchemaRef>) -> Self {
         match schema_opt {
             Some(schema) => self.with_schema(schema),
@@ -74,6 +74,15 @@ impl ScanBuilder {
     pub fn with_predicate(mut self, predicate: Expression) -> Self {
         self.predicate = Some(predicate);
         self
+    }
+
+    /// Optionally provide an [`Expression`] to filter rows. See [`ScanBuilder::with_predicate`] for
+    /// details. If `predicate_opt` is `None`, this is a no-op.
+    pub fn with_predicate_opt(self, predicate_opt: Option<Expression>) -> Self {
+        match predicate_opt {
+            Some(predicate) => self.with_predicate(predicate),
+            None => self,
+        }
     }
 
     /// Build the [`Scan`].

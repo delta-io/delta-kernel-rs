@@ -1,3 +1,4 @@
+use std::ops::Not;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -8,7 +9,7 @@ use arrow_select::concat::concat_batches;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::expressions::{BinaryOperator, Expression};
+use delta_kernel::expressions::{BinaryOperator, Expression, Scalar};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::Schema;
 use delta_kernel::{EngineData, Table};
@@ -386,6 +387,7 @@ macro_rules! assert_batches_sorted_eq {
 fn read_table_data(
     path: &str,
     select_cols: Option<&[&str]>,
+    predicate: Option<Expression>,
     expected: Vec<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from(path))?;
@@ -409,6 +411,7 @@ fn read_table_data(
     });
     let scan = ScanBuilder::new(snapshot)
         .with_schema_opt(read_schema)
+        .with_predicate_opt(predicate)
         .build()?;
 
     let scan_results = scan.execute(&engine)?;
@@ -422,10 +425,14 @@ fn read_table_data(
                 .into()
         })
         .collect();
-    let schema = batches[0].schema();
-    let batch = concat_batches(&schema, &batches)?;
 
-    assert_batches_sorted_eq!(&expected, &[batch]);
+    if expected.is_empty() {
+        assert_eq!(batches.len(), 0);
+    } else {
+        let schema = batches[0].schema();
+        let batch = concat_batches(&schema, &batches)?;
+        assert_batches_sorted_eq!(&expected, &[batch]);
+    }
     Ok(())
 }
 
@@ -443,7 +450,7 @@ fn data() -> Result<(), Box<dyn std::error::Error>> {
         "| e      | 5      | 5.5     |",
         "+--------+--------+---------+",
     ];
-    read_table_data("./tests/data/basic_partitioned", None, expected)?;
+    read_table_data("./tests/data/basic_partitioned", None, None, expected)?;
 
     Ok(())
 }
@@ -465,6 +472,7 @@ fn column_ordering() -> Result<(), Box<dyn std::error::Error>> {
     read_table_data(
         "./tests/data/basic_partitioned",
         Some(&["a_float", "letter", "number"]),
+        None,
         expected,
     )?;
 
@@ -488,8 +496,63 @@ fn column_ordering_and_projection() -> Result<(), Box<dyn std::error::Error>> {
     read_table_data(
         "./tests/data/basic_partitioned",
         Some(&["a_float", "number"]),
+        None,
         expected,
     )?;
 
+    Ok(())
+}
+
+#[test]
+fn predicate_on_number() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+---------+--------+",
+        "| a_float | number |",
+        "+---------+--------+",
+        "| 1.1     | 1      |",
+        "| 2.2     | 2      |",
+        "| 3.3     | 3      |",
+        "+---------+--------+",
+    ];
+    read_table_data(
+        "./tests/data/basic_partitioned",
+        Some(&["a_float", "number"]),
+        Some(Expression::Column("number".to_string()).lt(Expression::Literal(Scalar::Long(4)))),
+        expected,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn predicate_on_number_with_not_null() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+---------+--------+",
+        "| a_float | number |",
+        "+---------+--------+",
+        "| 1.1     | 1      |",
+        "| 2.2     | 2      |",
+        "+---------+--------+",
+    ];
+    read_table_data(
+        "./tests/data/basic_partitioned",
+        Some(&["a_float", "number"]),
+        Some(Expression::and(
+            Expression::Column("number".to_string()).is_null().not(),
+            Expression::Column("number".to_string()).lt(Expression::Literal(Scalar::Long(3))),
+        )),
+        expected,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn predicate_null() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![]; // number is never null
+    read_table_data(
+        "./tests/data/basic_partitioned",
+        Some(&["a_float", "number"]),
+        Some(Expression::Column("number".to_string()).is_null()),
+        expected,
+    )?;
     Ok(())
 }
