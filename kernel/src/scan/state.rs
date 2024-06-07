@@ -9,7 +9,7 @@ use crate::{
     },
     column_mapping::ColumnMappingMode,
     engine_data::{GetData, TypedGetData},
-    schema::Schema,
+    schema::SchemaRef,
     DataVisitor, DeltaResult, Engine, EngineData, Error,
 };
 use serde::{Deserialize, Serialize};
@@ -21,8 +21,8 @@ use super::log_replay::SCAN_ROW_SCHEMA;
 pub struct GlobalScanState {
     pub table_root: String,
     pub partition_columns: Vec<String>,
-    pub logical_schema: Schema,
-    pub read_schema: Schema,
+    pub logical_schema: SchemaRef,
+    pub read_schema: SchemaRef,
     pub column_mapping_mode: ColumnMappingMode,
 }
 

@@ -224,7 +224,7 @@ fn do_work(
 ) {
     // get the type for the function calls
     let engine: &dyn Engine = engine.as_ref();
-    let read_schema = Arc::new(scan_state.read_schema.clone());
+    let read_schema = scan_state.read_schema.clone();
     // in a loop, try and get a ScanFile. Note that `recv` will return an `Err` when the other side
     // hangs up, which indicates there's no more data to process.
     while let Ok(scan_file) = scan_file_rx.recv() {
