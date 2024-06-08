@@ -4,12 +4,14 @@
 #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 use std::collections::HashMap;
 use std::default::Default;
+use std::ffi::{c_long, c_longlong, c_ulonglong};
 use std::os::raw::{c_char, c_void};
 use std::ptr::NonNull;
 use std::sync::Arc;
 use tracing::debug;
 use url::Url;
 
+use delta_kernel::actions::deletion_vector::DeletionVector;
 use delta_kernel::expressions::{BinaryOperator, Expression, Scalar};
 use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
 use delta_kernel::snapshot::Snapshot;
@@ -113,12 +115,20 @@ pub type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> Null
 // Put KernelBoolSlice in a sub-module, with non-public members, so rust code cannot instantiate it
 // directly. It can only be created by converting `From<Vec<bool>>`.
 mod private {
+    use delta_kernel::actions::deletion_vector::DeletionVector;
+
     /// Represents an owned slice of boolean values allocated by the kernel. Any time the engine
     /// receives a `KernelBoolSlice` as a return value from a kernel method, engine is responsible
     /// to free that slice, by calling [super::drop_bool_slice] exactly once.
     #[repr(C)]
     pub struct KernelBoolSlice {
         ptr: *mut bool,
+        len: usize,
+    }
+
+    #[repr(C)]
+    pub struct KernelRowIndexArray {
+        ptr: *mut u64,
         len: usize,
     }
 
@@ -175,13 +185,43 @@ mod private {
     /// memory, but must only free it by calling [super::drop_bool_slice]. Since the global
     /// allocator is threadsafe, it doesn't matter which engine thread invokes that method.
     unsafe impl Send for KernelBoolSlice {}
+    unsafe impl Send for KernelRowIndexArray {}
 
     /// # Safety
     ///
     /// If engine chooses to leverage concurrency, engine is responsible to prevent data races.
     unsafe impl Sync for KernelBoolSlice {}
+    unsafe impl Sync for KernelRowIndexArray {}
+
+    impl KernelRowIndexArray {
+        /// Converts this slice back into a `Vec<u64>`.
+        ///
+        /// # Safety
+        ///
+        /// The slice must have been originally created `From<Vec<u64>>`, and must not have been
+        /// already been consumed by a previous call to this method.
+        pub unsafe fn into_vec(self) -> Vec<u64> {
+            if self.ptr.is_null() {
+                Default::default()
+            } else {
+                Vec::from_raw_parts(self.ptr, self.len, self.len)
+            }
+        }
+    }
+
+    impl From<DeletionVector> for KernelRowIndexArray {
+        fn from(value: DeletionVector) -> Self {
+            let mut vec = value.row_indexes();
+            vec.shrink_to_fit();
+            let len = vec.len();
+            let boxed = vec.into_boxed_slice();
+            let ptr = Box::into_raw(boxed).cast();
+            KernelRowIndexArray { ptr, len }
+        }
+    }
 }
 pub use private::KernelBoolSlice;
+pub use private::KernelRowIndexArray;
 
 /// # Safety
 ///
@@ -190,6 +230,11 @@ pub use private::KernelBoolSlice;
 pub unsafe extern "C" fn drop_bool_slice(slice: KernelBoolSlice) {
     let vec = unsafe { slice.into_vec() };
     debug!("Dropping bool slice. It is {vec:#?}");
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn drop_row_indexes(slice: KernelRowIndexArray) {
+    let _ = slice.into_vec();
 }
 
 #[repr(C)]
