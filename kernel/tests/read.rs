@@ -9,7 +9,7 @@ use arrow_select::concat::concat_batches;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::expressions::{BinaryOperator, Expression, Scalar};
+use delta_kernel::expressions::{BinaryOperator, Expression};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::Schema;
 use delta_kernel::{EngineData, Table};
@@ -354,13 +354,11 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 macro_rules! assert_batches_sorted_eq {
-    ($EXPECTED_LINES: expr, $CHUNKS: expr) => {
-        let mut expected_lines: Vec<String> = $EXPECTED_LINES.iter().map(|&s| s.into()).collect();
-
+    ($expected_lines: expr, $CHUNKS: expr) => {
         // sort except for header + footer
-        let num_lines = expected_lines.len();
+        let num_lines = $expected_lines.len();
         if num_lines > 3 {
-            expected_lines.as_mut_slice()[2..num_lines - 1].sort_unstable()
+            $expected_lines.as_mut_slice()[2..num_lines - 1].sort_unstable()
         }
 
         let formatted = arrow::util::pretty::pretty_format_batches($CHUNKS)
@@ -377,9 +375,9 @@ macro_rules! assert_batches_sorted_eq {
         }
 
         assert_eq!(
-            expected_lines, actual_lines,
+            $expected_lines, actual_lines,
             "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
-            expected_lines, actual_lines
+            $expected_lines, actual_lines
         );
     };
 }
@@ -388,7 +386,7 @@ fn read_table_data(
     path: &str,
     select_cols: Option<&[&str]>,
     predicate: Option<Expression>,
-    expected: Vec<&str>,
+    mut expected: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from(path))?;
     let url = url::Url::from_directory_path(path).unwrap();
@@ -431,9 +429,24 @@ fn read_table_data(
     } else {
         let schema = batches[0].schema();
         let batch = concat_batches(&schema, &batches)?;
-        assert_batches_sorted_eq!(&expected, &[batch]);
+        assert_batches_sorted_eq!(expected, &[batch]);
     }
     Ok(())
+}
+
+// util to take a Vec<&str> and call read_table_data with Vec<String>
+fn read_table_data_str(
+    path: &str,
+    select_cols: Option<&[&str]>,
+    predicate: Option<Expression>,
+    expected: Vec<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    read_table_data(
+        path,
+        select_cols,
+        predicate,
+        expected.into_iter().map(String::from).collect(),
+    )
 }
 
 #[test]
@@ -450,7 +463,7 @@ fn data() -> Result<(), Box<dyn std::error::Error>> {
         "| e      | 5      | 5.5     |",
         "+--------+--------+---------+",
     ];
-    read_table_data("./tests/data/basic_partitioned", None, None, expected)?;
+    read_table_data_str("./tests/data/basic_partitioned", None, None, expected)?;
 
     Ok(())
 }
@@ -469,7 +482,7 @@ fn column_ordering() -> Result<(), Box<dyn std::error::Error>> {
         "| 3.3     | c      | 3      |",
         "+---------+--------+--------+",
     ];
-    read_table_data(
+    read_table_data_str(
         "./tests/data/basic_partitioned",
         Some(&["a_float", "letter", "number"]),
         None,
@@ -493,7 +506,7 @@ fn column_ordering_and_projection() -> Result<(), Box<dyn std::error::Error>> {
         "| 3.3     | 3      |",
         "+---------+--------+",
     ];
-    read_table_data(
+    read_table_data_str(
         "./tests/data/basic_partitioned",
         Some(&["a_float", "number"]),
         None,
@@ -503,23 +516,99 @@ fn column_ordering_and_projection() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn predicate_on_number() -> Result<(), Box<dyn std::error::Error>> {
-    let expected = vec![
+// get the basic_partitioned table for a set of expected numbers
+fn table_for_numbers(nums: Vec<u32>) -> Vec<String> {
+    let mut res: Vec<String> = vec![
         "+---------+--------+",
         "| a_float | number |",
         "+---------+--------+",
-        "| 1.1     | 1      |",
-        "| 2.2     | 2      |",
-        "| 3.3     | 3      |",
-        "+---------+--------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    for num in nums.iter() {
+        res.push(format!("| {num}.{num}     | {num}      |"));
+    }
+    res.push("+---------+--------+".to_string());
+    res
+}
+
+#[test]
+fn predicate_on_number() -> Result<(), Box<dyn std::error::Error>> {
+    let cases = vec![
+        (
+            Expression::column("number").lt(Expression::literal(4i64)),
+            table_for_numbers(vec![1, 2, 3]),
+        ),
+        (
+            Expression::column("number").le(Expression::literal(4i64)),
+            table_for_numbers(vec![1, 2, 3, 4]),
+        ),
+        (
+            Expression::column("number").gt(Expression::literal(4i64)),
+            table_for_numbers(vec![5, 6]),
+        ),
+        (
+            Expression::column("number").ge(Expression::literal(4i64)),
+            table_for_numbers(vec![4, 5, 6]),
+        ),
+        (
+            Expression::column("number").eq(Expression::literal(4i64)),
+            table_for_numbers(vec![4]),
+        ),
+        (
+            Expression::column("number").ne(Expression::literal(4i64)),
+            table_for_numbers(vec![1, 2, 3, 5, 6]),
+        ),
     ];
-    read_table_data(
-        "./tests/data/basic_partitioned",
-        Some(&["a_float", "number"]),
-        Some(Expression::Column("number".to_string()).lt(Expression::Literal(Scalar::Long(4)))),
-        expected,
-    )?;
+
+    for (expr, expected) in cases.into_iter() {
+        read_table_data(
+            "./tests/data/basic_partitioned",
+            Some(&["a_float", "number"]),
+            Some(expr),
+            expected,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn predicate_on_number_not() -> Result<(), Box<dyn std::error::Error>> {
+    let cases = vec![
+        (
+            Expression::not(Expression::column("number").lt(Expression::literal(4i64))),
+            table_for_numbers(vec![4, 5, 6]),
+        ),
+        (
+            Expression::not(Expression::column("number").le(Expression::literal(4i64))),
+            table_for_numbers(vec![5, 6]),
+        ),
+        (
+            Expression::not(Expression::column("number").gt(Expression::literal(4i64))),
+            table_for_numbers(vec![1, 2, 3, 4]),
+        ),
+        (
+            Expression::not(Expression::column("number").ge(Expression::literal(4i64))),
+            table_for_numbers(vec![1, 2, 3]),
+        ),
+        (
+            Expression::not(Expression::column("number").eq(Expression::literal(4i64))),
+            table_for_numbers(vec![1, 2, 3, 5, 6]),
+        ),
+        (
+            Expression::not(Expression::column("number").ne(Expression::literal(4i64))),
+            table_for_numbers(vec![4]),
+        ),
+    ];
+    for (expr, expected) in cases.into_iter() {
+        read_table_data(
+            "./tests/data/basic_partitioned",
+            Some(&["a_float", "number"]),
+            Some(expr),
+            expected,
+        )?;
+    }
     Ok(())
 }
 
@@ -533,12 +622,12 @@ fn predicate_on_number_with_not_null() -> Result<(), Box<dyn std::error::Error>>
         "| 2.2     | 2      |",
         "+---------+--------+",
     ];
-    read_table_data(
+    read_table_data_str(
         "./tests/data/basic_partitioned",
         Some(&["a_float", "number"]),
         Some(Expression::and(
-            Expression::Column("number".to_string()).is_null().not(),
-            Expression::Column("number".to_string()).lt(Expression::Literal(Scalar::Long(3))),
+            Expression::not(Expression::column("number").is_null()),
+            Expression::column("number").lt(Expression::literal(3i64)),
         )),
         expected,
     )?;
@@ -548,11 +637,200 @@ fn predicate_on_number_with_not_null() -> Result<(), Box<dyn std::error::Error>>
 #[test]
 fn predicate_null() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![]; // number is never null
-    read_table_data(
+    read_table_data_str(
         "./tests/data/basic_partitioned",
         Some(&["a_float", "number"]),
-        Some(Expression::Column("number".to_string()).is_null()),
+        Some(Expression::column("number").is_null()),
         expected,
     )?;
+    Ok(())
+}
+
+#[test]
+fn mixed_null() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+------+--------------+",
+        "| part | n            |",
+        "+------+--------------+",
+        "| 0    |              |",
+        "| 0    |              |",
+        "| 0    |              |",
+        "| 0    |              |",
+        "| 0    |              |",
+        "| 2    |              |",
+        "| 2    | non-null-mix |",
+        "| 2    |              |",
+        "| 2    | non-null-mix |",
+        "| 2    |              |",
+        "+------+--------------+",
+    ];
+    read_table_data_str(
+        "./tests/data/mixed-nulls",
+        Some(&["part", "n"]),
+        Some(Expression::column("n").is_null()),
+        expected,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn mixed_not_null() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+------+--------------+",
+        "| part | n            |",
+        "+------+--------------+",
+        "| 1    | non-null     |",
+        "| 1    | non-null     |",
+        "| 1    | non-null     |",
+        "| 1    | non-null     |",
+        "| 1    | non-null     |",
+        "| 2    |              |",
+        "| 2    |              |",
+        "| 2    |              |",
+        "| 2    | non-null-mix |",
+        "| 2    | non-null-mix |",
+        "+------+--------------+",
+    ];
+    read_table_data_str(
+        "./tests/data/mixed-nulls",
+        Some(&["part", "n"]),
+        Some(Expression::not(Expression::column("n").is_null())),
+        expected,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
+    let cases = vec![
+        (
+            Expression::column("number")
+                .gt(Expression::literal(4i64))
+                .and(Expression::column("a_float").gt(Expression::literal(5.5))),
+            table_for_numbers(vec![6]),
+        ),
+        (
+            Expression::column("number")
+                .gt(Expression::literal(4i64))
+                .and(Expression::not(
+                    Expression::column("a_float").gt(Expression::literal(5.5)),
+                )),
+            table_for_numbers(vec![5]),
+        ),
+        (
+            Expression::column("number")
+                .gt(Expression::literal(4i64))
+                .or(Expression::column("a_float").gt(Expression::literal(5.5))),
+            table_for_numbers(vec![5, 6]),
+        ),
+        (
+            Expression::column("number")
+                .gt(Expression::literal(4i64))
+                .or(Expression::not(
+                    Expression::column("a_float").gt(Expression::literal(5.5)),
+                )),
+            table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
+        ),
+    ];
+    for (expr, expected) in cases.into_iter() {
+        read_table_data(
+            "./tests/data/basic_partitioned",
+            Some(&["a_float", "number"]),
+            Some(expr),
+            expected,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn not_and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
+    let cases = vec![
+        (
+            Expression::not(
+                Expression::column("number")
+                    .gt(Expression::literal(4i64))
+                    .and(Expression::column("a_float").gt(Expression::literal(5.5))),
+            ),
+            table_for_numbers(vec![1, 2, 3, 4, 5]),
+        ),
+        (
+            Expression::not(
+                Expression::column("number")
+                    .gt(Expression::literal(4i64))
+                    .and(Expression::not(
+                        Expression::column("a_float").gt(Expression::literal(5.5)),
+                    )),
+            ),
+            table_for_numbers(vec![1, 2, 3, 4, 6]),
+        ),
+        (
+            Expression::not(
+                Expression::column("number")
+                    .gt(Expression::literal(4i64))
+                    .or(Expression::column("a_float").gt(Expression::literal(5.5))),
+            ),
+            table_for_numbers(vec![1, 2, 3, 4]),
+        ),
+        (
+            Expression::not(
+                Expression::column("number")
+                    .gt(Expression::literal(4i64))
+                    .or(Expression::not(
+                        Expression::column("a_float").gt(Expression::literal(5.5)),
+                    )),
+            ),
+            vec![],
+        ),
+    ];
+    for (expr, expected) in cases.into_iter() {
+        read_table_data(
+            "./tests/data/basic_partitioned",
+            Some(&["a_float", "number"]),
+            Some(expr),
+            expected,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
+    let cases = vec![
+        (
+            Expression::literal(3i64),
+            table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
+        ),
+        (
+            Expression::column("number").distinct(Expression::literal(3i64)),
+            table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
+        ),
+        (
+            Expression::column("number").gt(Expression::struct_expr(vec![])),
+            table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
+        ),
+        (
+            Expression::column("number").and(Expression::struct_expr(vec![]).is_null()),
+            table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
+        ),
+        (
+            Expression::not(Expression::column("number").gt(Expression::struct_expr(vec![]))),
+            table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
+        ),
+        (
+            Expression::not(
+                Expression::column("number").and(Expression::struct_expr(vec![]).is_null()),
+            ),
+            table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
+        ),
+    ];
+    for (expr, expected) in cases.into_iter() {
+        read_table_data(
+            "./tests/data/basic_partitioned",
+            Some(&["a_float", "number"]),
+            Some(expr),
+            expected,
+        )?;
+    }
     Ok(())
 }
