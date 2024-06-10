@@ -21,13 +21,13 @@ delta_kernel = { path = "../kernel", default-features = false, features = [
 delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.1.0" }
 
 # used if we use the default engine to be able to move arrow data into the c-ffi format
-arrow-schema = { version = "^51.0", default-features = false, features = [
+arrow-schema = { version = "^52.0", default-features = false, features = [
   "ffi",
 ], optional = true }
-arrow-data = { version = "^51.0", default-features = false, features = [
+arrow-data = { version = "^52.0", default-features = false, features = [
   "ffi",
 ], optional = true }
-arrow-array = { version = "^51.0", default-features = false, optional = true }
+arrow-array = { version = "^52.0", default-features = false, optional = true }
 
 [build-dependencies]
 cbindgen = "0.26.0"

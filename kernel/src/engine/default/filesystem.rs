@@ -155,9 +155,18 @@ mod tests {
         let tmp_store = LocalFileSystem::new_with_prefix(tmp.path()).unwrap();
 
         let data = Bytes::from("kernel-data");
-        tmp_store.put(&Path::from("a"), data.clone()).await.unwrap();
-        tmp_store.put(&Path::from("b"), data.clone()).await.unwrap();
-        tmp_store.put(&Path::from("c"), data.clone()).await.unwrap();
+        tmp_store
+            .put(&Path::from("a"), data.clone().into())
+            .await
+            .unwrap();
+        tmp_store
+            .put(&Path::from("b"), data.clone().into())
+            .await
+            .unwrap();
+        tmp_store
+            .put(&Path::from("c"), data.clone().into())
+            .await
+            .unwrap();
 
         let mut url = Url::from_directory_path(tmp.path()).unwrap();
 

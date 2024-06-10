@@ -37,16 +37,16 @@ delta_kernel_derive = { path = "../derive-macros", version = "0.1.0" }
 visibility = "0.1.0"
 
 # Used in default engine
-arrow-array = { version = "^51.0", optional = true }
-arrow-select = { version = "^51.0", optional = true }
-arrow-arith = { version = "^51.0", optional = true }
-arrow-json = { version = "^51.0", optional = true }
-arrow-ord = { version = "^51.0", optional = true }
-arrow-schema = { version = "^51.0", optional = true }
+arrow-array = { workspace = true, optional = true }
+arrow-select = { workspace = true, optional = true }
+arrow-arith = { workspace = true, optional = true }
+arrow-json = { workspace = true, optional = true }
+arrow-ord = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
 futures = { version = "0.3", optional = true }
-object_store = { version = "^0.9.0", optional = true }
+object_store = { workspace = true, optional = true }
 # Used in default and sync engine
-parquet = { version = "^51.0", optional = true }
+parquet = { workspace = true, optional = true }
 # Used for fetching direct urls (like pre-signed urls)
 reqwest = { version = "^0.12.0", optional = true }
 
@@ -92,7 +92,7 @@ sync-engine = [
 rustc_version = "0.4.0"
 
 [dev-dependencies]
-arrow = { version = "^51.0", features = ["json", "prettyprint"] }
+arrow = { workspace = true, features = ["json", "prettyprint"] }
 delta_kernel = { path = ".", features = ["default-engine", "sync-engine"] }
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 tempfile = "3"
