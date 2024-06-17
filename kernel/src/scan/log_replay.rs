@@ -213,6 +213,8 @@ impl LogReplayScanner {
                     "Filtering out Add due to it being removed {}, is log {is_log_batch}",
                     add.path
                 );
+                // we may have a true here because the data-skipping predicate included the file
+                selection_vector[index] = false;
             }
         }
 
