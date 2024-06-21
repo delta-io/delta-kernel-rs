@@ -398,7 +398,7 @@ mod tests {
         let parent = Url::parse("http://not.used").unwrap();
         let dv = example.to_deletion_vector(fs_client, &parent).unwrap();
         let row_idx = dv.row_indexes();
-        
+
         assert_eq!(row_idx.len(), 6);
         assert_eq!(&row_idx, &[3, 4, 7, 11, 18, 29]);
     }

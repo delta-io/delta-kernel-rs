@@ -127,7 +127,7 @@ pub type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> Null
 // Put KernelBoolSlice in a sub-module, with non-public members, so rust code cannot instantiate it
 // directly. It can only be created by converting `From<Vec<bool>>`.
 mod private {
- 
+
     /// Represents an owned slice of boolean values allocated by the kernel. Any time the engine
     /// receives a `KernelBoolSlice` as a return value from a kernel method, engine is responsible
     /// to free that slice, by calling [super::drop_bool_slice] exactly once.
