@@ -167,8 +167,8 @@ impl DeletionVectorDescriptor {
         }
     }
 
-    pub fn into_deletion_vector(
-        self,
+    pub fn to_deletion_vector(
+        &self,
         fs_client: Arc<dyn FileSystemClient>,
         parent: &Url,
     ) -> DeltaResult<DeletionVector> {
@@ -242,7 +242,7 @@ impl DeletionVector {
     pub fn new(
         fs_client: Arc<dyn FileSystemClient>,
         parent: &Url,
-        descriptor: DeletionVectorDescriptor,
+        descriptor: &DeletionVectorDescriptor,
     ) -> DeltaResult<Self> {
         let inner = descriptor.read(fs_client, parent)?;
         Ok(Self { inner })
@@ -390,15 +390,16 @@ mod tests {
         assert_eq!(bools, expected);
     }
 
-    #[tokio::test]
-    async fn test_dv_wrapper() -> Result<(), Box<dyn std::error::Error>> {
+    #[test]
+    fn test_dv_wrapper() {
         let example = dv_inline();
         let sync_engine = SyncEngine::new();
         let fs_client = sync_engine.get_file_system_client();
-        let parent = Url::parse("http://not.used")?;
-        let dv = example.into_deletion_vector(fs_client, &parent)?;
+        let parent = Url::parse("http://not.used").unwrap();
+        let dv = example.to_deletion_vector(fs_client, &parent).unwrap();
         let row_idx = dv.row_indexes();
-        dbg!(row_idx);
-        Ok(())
+        
+        assert_eq!(row_idx.len(), 6);
+        assert_eq!(&row_idx, &[3, 4, 7, 11, 18, 29]);
     }
 }

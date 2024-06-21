@@ -4,15 +4,13 @@
 #[cfg(feature = "default-engine")]
 use std::collections::HashMap;
 use std::default::Default;
-use std::ffi::{c_long, c_longlong, c_ulonglong};
 use std::os::raw::{c_char, c_void};
 use std::ptr::NonNull;
 use std::sync::Arc;
 use tracing::debug;
 use url::Url;
 
-use delta_kernel::actions::deletion_vector::DeletionVector;
-use delta_kernel::expressions::{BinaryOperator, Expression, Scalar};
+use delta_kernel::expressions::{BinaryOperator, Expression, Scalar, UnaryOperator};
 use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Engine, Error, Table};
@@ -129,8 +127,7 @@ pub type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> Null
 // Put KernelBoolSlice in a sub-module, with non-public members, so rust code cannot instantiate it
 // directly. It can only be created by converting `From<Vec<bool>>`.
 mod private {
-    use delta_kernel::actions::deletion_vector::DeletionVector;
-
+ 
     /// Represents an owned slice of boolean values allocated by the kernel. Any time the engine
     /// receives a `KernelBoolSlice` as a return value from a kernel method, engine is responsible
     /// to free that slice, by calling [super::drop_bool_slice] exactly once.
@@ -221,11 +218,18 @@ mod private {
                 Vec::from_raw_parts(self.ptr, self.len, self.len)
             }
         }
+
+        /// Creates an empty slice.
+        pub fn empty() -> KernelRowIndexArray {
+            Self {
+                ptr: std::ptr::null_mut(),
+                len: 0,
+            }
+        }
     }
 
-    impl From<DeletionVector> for KernelRowIndexArray {
-        fn from(value: DeletionVector) -> Self {
-            let mut vec = value.row_indexes();
+    impl From<Vec<u64>> for KernelRowIndexArray {
+        fn from(mut vec: Vec<u64>) -> Self {
             vec.shrink_to_fit();
             let len = vec.len();
             let boxed = vec.into_boxed_slice();
@@ -246,8 +250,11 @@ pub unsafe extern "C" fn drop_bool_slice(slice: KernelBoolSlice) {
     debug!("Dropping bool slice. It is {vec:#?}");
 }
 
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
 #[no_mangle]
-pub unsafe extern "C" fn drop_row_indexes(slice: KernelRowIndexArray) {
+pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
     let _ = slice.into_vec();
 }
 

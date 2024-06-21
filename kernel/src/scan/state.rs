@@ -48,6 +48,24 @@ impl DvInfo {
             .transpose()?;
         Ok(dv_treemap.map(treemap_to_bools))
     }
+
+    pub fn get_row_indexes(
+        &self,
+        engine: &dyn Engine,
+        table_root: &url::Url,
+    ) -> DeltaResult<Option<Vec<u64>>> {
+        let indexes = self
+            .deletion_vector
+            .as_ref()
+            .map(|dv_descriptor| {
+                let fs_client = engine.get_file_system_client();
+                dv_descriptor.to_deletion_vector(fs_client, table_root)
+            })
+            .transpose()?
+            .map(|dv| dv.row_indexes());
+
+        Ok(indexes)
+    }
 }
 
 /// Request that the kernel call a callback on each valid file that needs to be read for the
