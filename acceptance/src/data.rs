@@ -62,9 +62,7 @@ pub fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
-static SKIPPED_TESTS: &[&str; 2] = &[
-    // iceberg compat requires column mapping
-    "iceberg_compat_v1",
+static SKIPPED_TESTS: &[&str; 1] = &[
     // For multi_partitioned_2: The golden table stores the timestamp as an INT96 (which is
     // nanosecond precision), while the spec says we should read partition columns as
     // microseconds. This means the read and golden data don't line up. When this is released in

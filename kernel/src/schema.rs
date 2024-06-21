@@ -21,6 +21,11 @@ pub enum MetadataValue {
     Number(i32),
     String(String),
     Boolean(bool),
+    // The [PROTOCOL](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#struct-field) states
+    // only that the metadata is "A JSON map containing information about this column.", so we can
+    // actually have any valid json here. `Other` is therefore a catchall for things we don't need
+    // to handle.
+    Other(serde_json::Value),
 }
 
 impl From<String> for MetadataValue {
