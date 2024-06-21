@@ -3,7 +3,7 @@
 use std::{
     backtrace::{Backtrace, BacktraceStatus},
     num::ParseIntError,
-    string::FromUtf8Error,
+    str::Utf8Error,
 };
 
 use crate::schema::DataType;
@@ -127,7 +127,7 @@ pub enum Error {
 
     /// Could not convert to string from utf-8
     #[error("Could not convert to string from utf-8: {0}")]
-    Utf8Error(#[from] FromUtf8Error),
+    Utf8Error(#[from] Utf8Error),
 
     /// Could not parse an integer
     #[error("Could not parse int: {0}")]
@@ -139,6 +139,14 @@ pub enum Error {
     /// Asked for a table at an invalid location
     #[error("Invalid table location: {0}.")]
     InvalidTableLocation(String),
+
+    /// Precision or scale not compliant with delta specification
+    #[error("Inavlid decimal: {0}")]
+    InvalidDecimal(String),
+
+    /// Incosistent data passed to struct scalar
+    #[error("Invalid struct data: {0}")]
+    InvalidStructData(String),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -175,9 +183,14 @@ impl Error {
     pub fn invalid_table_location(location: impl ToString) -> Self {
         Self::InvalidTableLocation(location.to_string())
     }
-
     pub fn invalid_column_mapping_mode(mode: impl ToString) -> Self {
         Self::InvalidColumnMappingMode(mode.to_string())
+    }
+    pub fn invalid_decimal(msg: impl ToString) -> Self {
+        Self::InvalidDecimal(msg.to_string())
+    }
+    pub fn invalid_struct_data(msg: impl ToString) -> Self {
+        Self::InvalidStructData(msg.to_string())
     }
 
     // Capture a backtrace when the error is constructed.

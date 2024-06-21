@@ -59,7 +59,7 @@ impl ScanBuilder {
     }
 
     /// Optionally provide a [`SchemaRef`] for columns to select from the [`Snapshot`]. See
-    /// [`ScanBuilder::with_schema`] for details. If schema_opt is `None` this is a no-op.
+    /// [`ScanBuilder::with_schema`] for details. If `schema_opt` is `None` this is a no-op.
     pub fn with_schema_opt(self, schema_opt: Option<SchemaRef>) -> Self {
         match schema_opt {
             Some(schema) => self.with_schema(schema),
@@ -74,6 +74,15 @@ impl ScanBuilder {
     pub fn with_predicate(mut self, predicate: Expression) -> Self {
         self.predicate = Some(predicate);
         self
+    }
+
+    /// Optionally provide an [`Expression`] to filter rows. See [`ScanBuilder::with_predicate`] for
+    /// details. If `predicate_opt` is `None`, this is a no-op.
+    pub fn with_predicate_opt(self, predicate_opt: Option<Expression>) -> Self {
+        match predicate_opt {
+            Some(predicate) => self.with_predicate(predicate),
+            None => self,
+        }
     }
 
     /// Build the [`Scan`].
@@ -225,8 +234,8 @@ impl Scan {
         GlobalScanState {
             table_root: self.snapshot.table_root.to_string(),
             partition_columns: self.snapshot.metadata().partition_columns.clone(),
-            logical_schema: self.logical_schema.as_ref().clone(),
-            read_schema: self.physical_schema.as_ref().clone(),
+            logical_schema: self.logical_schema.clone(),
+            read_schema: self.physical_schema.clone(),
             column_mapping_mode: self.snapshot.column_mapping_mode,
         }
     }
@@ -244,7 +253,7 @@ impl Scan {
             "Executing scan with logical schema {:#?} and physical schema {:#?}",
             self.logical_schema, self.physical_schema
         );
-        let output_schema = DataType::Struct(Box::new(self.schema().as_ref().clone()));
+        let output_schema = DataType::from(self.schema().clone());
         let parquet_handler = engine.get_parquet_handler();
 
         let mut results: Vec<ScanResult> = vec![];
@@ -432,7 +441,7 @@ pub fn transform_to_logical(
         &global_state.partition_columns,
         global_state.column_mapping_mode,
     )?;
-    let read_schema = Arc::new(global_state.read_schema.clone());
+    let read_schema = global_state.read_schema.clone();
     if have_partition_cols || global_state.column_mapping_mode != ColumnMappingMode::None {
         // need to add back partition cols and/or fix-up mapped columns
         let all_fields = all_fields
@@ -459,9 +468,9 @@ pub fn transform_to_logical(
         let result = engine
             .get_expression_handler()
             .get_evaluator(
-                read_schema.clone(),
+                read_schema,
                 read_expression.clone(),
-                DataType::Struct(Box::new(global_state.logical_schema.clone())),
+                global_state.logical_schema.clone().into(),
             )
             .evaluate(data.as_ref())?;
         Ok(result)

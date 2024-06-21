@@ -5,7 +5,7 @@ use std::fmt::{Display, Formatter};
 
 use itertools::Itertools;
 
-pub use self::scalars::Scalar;
+pub use self::scalars::{Scalar, StructData};
 
 mod scalars;
 
@@ -36,10 +36,50 @@ pub enum BinaryOperator {
     Distinct,
 }
 
+impl BinaryOperator {
+    /// Returns `<op2>` (if any) such that `B <op2> A` is equivalent to `A <op> B`.
+    pub(crate) fn commute(&self) -> Option<BinaryOperator> {
+        use BinaryOperator::*;
+        match self {
+            GreaterThan => Some(LessThan),
+            GreaterThanOrEqual => Some(LessThanOrEqual),
+            LessThan => Some(GreaterThan),
+            LessThanOrEqual => Some(GreaterThanOrEqual),
+            Equal | NotEqual | Plus | Multiply => Some(self.clone()),
+            _ => None,
+        }
+    }
+
+    // invert an operator. Returns Some<InvertedOp> if the operator supports inversion, None if it
+    // cannot be inverted
+    pub(crate) fn invert(&self) -> Option<BinaryOperator> {
+        use BinaryOperator::*;
+        match self {
+            LessThan => Some(GreaterThanOrEqual),
+            LessThanOrEqual => Some(GreaterThan),
+            GreaterThan => Some(LessThanOrEqual),
+            GreaterThanOrEqual => Some(LessThan),
+            Equal => Some(NotEqual),
+            NotEqual => Some(Equal),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum VariadicOperator {
     And,
     Or,
+}
+
+impl VariadicOperator {
+    pub(crate) fn invert(&self) -> VariadicOperator {
+        use VariadicOperator::*;
+        match self {
+            And => Or,
+            Or => And,
+        }
+    }
 }
 
 impl Display for BinaryOperator {

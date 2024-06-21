@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use delta_kernel::scan::state::{visit_scan_files, DvInfo, GlobalScanState};
 use delta_kernel::scan::{Scan, ScanBuilder, ScanData};
+use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, EngineData as KernelEngineData, Error};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
@@ -73,14 +74,14 @@ pub unsafe extern "C" fn get_raw_arrow_data(
     data: Handle<EngineData>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<*mut ArrowFFIData> {
-    get_raw_arrow_data_impl(data).into_extern_result(engine)
+    // TODO(frj): This consumes the handle. Is that what we really want?
+    let data = unsafe { data.into_inner() };
+    get_raw_arrow_data_impl(data).into_extern_result(&engine.as_ref())
 }
 
 // TODO: This method leaks the returned pointer memory. How will the engine free it?
 #[cfg(feature = "default-engine")]
-unsafe fn get_raw_arrow_data_impl(data: Handle<EngineData>) -> DeltaResult<*mut ArrowFFIData> {
-    // TODO(frj): This consumes the handle. Is that what we really want?
-    let data = unsafe { data.into_inner() };
+fn get_raw_arrow_data_impl(data: Box<dyn KernelEngineData>) -> DeltaResult<*mut ArrowFFIData> {
     let record_batch: arrow_array::RecordBatch = data
         .into_any()
         .downcast::<delta_kernel::engine::arrow_data::ArrowEngineData>()
@@ -119,14 +120,14 @@ pub unsafe extern "C" fn scan(
     engine: Handle<SharedExternEngine>,
     predicate: Option<&mut EnginePredicate>,
 ) -> ExternResult<Handle<SharedScan>> {
-    scan_impl(snapshot, predicate).into_extern_result(engine)
+    let snapshot = unsafe { snapshot.clone_as_arc() };
+    scan_impl(snapshot, predicate).into_extern_result(&engine.as_ref())
 }
 
-unsafe fn scan_impl(
-    snapshot: Handle<SharedSnapshot>,
+fn scan_impl(
+    snapshot: Arc<Snapshot>,
     predicate: Option<&mut EnginePredicate>,
 ) -> DeltaResult<Handle<SharedScan>> {
-    let snapshot = unsafe { snapshot.clone_as_arc() };
     let mut scan_builder = ScanBuilder::new(snapshot);
     if let Some(predicate) = predicate {
         let mut visitor_state = KernelExpressionVisitorState::new();
@@ -202,19 +203,19 @@ pub unsafe extern "C" fn kernel_scan_data_init(
     engine: Handle<SharedExternEngine>,
     scan: Handle<SharedScan>,
 ) -> ExternResult<Handle<SharedScanDataIterator>> {
-    kernel_scan_data_init_impl(&engine, scan).into_extern_result(engine)
-}
-
-unsafe fn kernel_scan_data_init_impl(
-    engine: &Handle<SharedExternEngine>,
-    scan: Handle<SharedScan>,
-) -> DeltaResult<Handle<SharedScanDataIterator>> {
     let engine = unsafe { engine.clone_as_arc() };
     let scan = unsafe { scan.as_ref() };
+    kernel_scan_data_init_impl(&engine, scan).into_extern_result(&engine.as_ref())
+}
+
+fn kernel_scan_data_init_impl(
+    engine: &Arc<dyn ExternEngine>,
+    scan: &Scan,
+) -> DeltaResult<Handle<SharedScanDataIterator>> {
     let scan_data = scan.scan_data(engine.engine().as_ref())?;
     let data = KernelScanDataIterator {
         data: Mutex::new(Box::new(scan_data)),
-        engine,
+        engine: engine.clone(),
     };
     Ok(Arc::new(data).into())
 }
@@ -235,7 +236,7 @@ pub unsafe extern "C" fn kernel_scan_data_next(
 ) -> ExternResult<bool> {
     let data = unsafe { data.as_ref() };
     kernel_scan_data_next_impl(data, engine_context, engine_visitor)
-        .into_extern_result(data.engine.error_allocator())
+        .into_extern_result(&data.engine.as_ref())
 }
 fn kernel_scan_data_next_impl(
     data: &KernelScanDataIterator,
@@ -291,14 +292,15 @@ pub struct CStringMap {
 ///
 /// The engine is responsible for providing a valid [`CStringMap`] pointer and [`KernelStringSlice`]
 pub unsafe extern "C" fn get_from_map(
-    map: &mut CStringMap,
+    map: &CStringMap,
     key: KernelStringSlice,
     allocate_fn: AllocateStringFn,
 ) -> NullableCvoid {
-    let string_key = String::try_from_slice(key);
+    // TODO: Return ExternResult to caller instead of panicking?
+    let string_key = unsafe { String::try_from_slice(key) };
     map.values
-        .get(&string_key)
-        .and_then(|v| allocate_fn(v.as_str().into()))
+        .get(&string_key.unwrap())
+        .and_then(|v| allocate_fn(v.into()))
 }
 
 /// Get a selection vector out of a [`DvInfo`] struct
@@ -308,19 +310,19 @@ pub unsafe extern "C" fn get_from_map(
 #[no_mangle]
 pub unsafe extern "C" fn selection_vector_from_dv(
     dv_info: &DvInfo,
-    extern_engine: Handle<SharedExternEngine>,
+    engine: Handle<SharedExternEngine>,
     state: Handle<SharedGlobalScanState>,
 ) -> ExternResult<KernelBoolSlice> {
-    selection_vector_from_dv_impl(dv_info, &extern_engine, state).into_extern_result(extern_engine)
+    let state = unsafe { state.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    selection_vector_from_dv_impl(dv_info, engine, state).into_extern_result(&engine)
 }
 
-unsafe fn selection_vector_from_dv_impl(
+fn selection_vector_from_dv_impl(
     dv_info: &DvInfo,
-    extern_engine: &Handle<SharedExternEngine>,
-    state: Handle<SharedGlobalScanState>,
+    extern_engine: &dyn ExternEngine,
+    state: &GlobalScanState,
 ) -> DeltaResult<KernelBoolSlice> {
-    let state = unsafe { state.as_ref() };
-    let extern_engine = unsafe { extern_engine.clone_as_arc() };
     let root_url = Url::parse(&state.table_root)?;
     match dv_info.get_selection_vector(extern_engine.engine().as_ref(), &root_url)? {
         Some(v) => Ok(v.into()),
@@ -373,5 +375,6 @@ pub unsafe extern "C" fn visit_scan_data(
         engine_context,
         callback,
     };
+    // TODO: return ExternResult to caller instead of panicking?
     visit_scan_files(data, selection_vec, context_wrapper, rust_callback).unwrap();
 }

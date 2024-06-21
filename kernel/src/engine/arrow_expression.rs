@@ -1,24 +1,26 @@
 //! Expression handling based on arrow-rs compute kernels.
 use std::sync::Arc;
 
-use arrow_arith::boolean::{and, is_null, not, or};
+use arrow_arith::boolean::{and_kleene, is_null, not, or_kleene};
 use arrow_arith::numeric::{add, div, mul, sub};
 use arrow_array::cast::AsArray;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
-    StructArray, TimestampMicrosecondArray,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, RecordBatch,
+    StringArray, StructArray, TimestampMicrosecondArray,
 };
 use arrow_ord::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{
-    ArrowError, DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    ArrowError, DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
 };
 use itertools::Itertools;
 
+use super::arrow_conversion::LIST_ARRAY_ROOT;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{BinaryOperator, Expression, Scalar, UnaryOperator, VariadicOperator};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
+use crate::utils::require;
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
 
 // TODO leverage scalars / Datum
@@ -42,15 +44,29 @@ impl Scalar {
             Double(val) => Arc::new(Float64Array::from_value(*val, num_rows)),
             String(val) => Arc::new(StringArray::from(vec![val.clone(); num_rows])),
             Boolean(val) => Arc::new(BooleanArray::from(vec![*val; num_rows])),
-            Timestamp(val) => Arc::new(TimestampMicrosecondArray::from_value(*val, num_rows)),
-            // TODO: Is this correct?
+            Timestamp(val) => {
+                Arc::new(TimestampMicrosecondArray::from_value(*val, num_rows).with_timezone_utc())
+            }
             TimestampNtz(val) => Arc::new(TimestampMicrosecondArray::from_value(*val, num_rows)),
             Date(val) => Arc::new(Date32Array::from_value(*val, num_rows)),
             Binary(val) => Arc::new(BinaryArray::from(vec![val.as_slice(); num_rows])),
             Decimal(val, precision, scale) => Arc::new(
                 Decimal128Array::from_value(*val, num_rows)
-                    .with_precision_and_scale(*precision, *scale)?,
+                    .with_precision_and_scale(*precision, *scale as i8)?,
             ),
+            Struct(data) => {
+                let arrays = data
+                    .values()
+                    .iter()
+                    .map(|val| val.to_array(num_rows))
+                    .try_collect()?;
+                let fields: Fields = data
+                    .fields()
+                    .iter()
+                    .map(ArrowField::try_from)
+                    .try_collect()?;
+                Arc::new(StructArray::try_new(fields, arrays, None)?)
+            }
             Null(data_type) => match data_type {
                 DataType::Primitive(primitive) => match primitive {
                     PrimitiveType::Byte => Arc::new(Int8Array::new_null(num_rows)),
@@ -61,19 +77,29 @@ impl Scalar {
                     PrimitiveType::Double => Arc::new(Float64Array::new_null(num_rows)),
                     PrimitiveType::String => Arc::new(StringArray::new_null(num_rows)),
                     PrimitiveType::Boolean => Arc::new(BooleanArray::new_null(num_rows)),
-                    PrimitiveType::Timestamp | PrimitiveType::TimestampNtz => {
+                    PrimitiveType::Timestamp => {
+                        Arc::new(TimestampMicrosecondArray::new_null(num_rows).with_timezone_utc())
+                    }
+                    PrimitiveType::TimestampNtz => {
                         Arc::new(TimestampMicrosecondArray::new_null(num_rows))
                     }
                     PrimitiveType::Date => Arc::new(Date32Array::new_null(num_rows)),
                     PrimitiveType::Binary => Arc::new(BinaryArray::new_null(num_rows)),
                     PrimitiveType::Decimal(precision, scale) => Arc::new(
                         Decimal128Array::new_null(num_rows)
-                            .with_precision_and_scale(*precision, *scale)?,
+                            .with_precision_and_scale(*precision, *scale as i8)?,
                     ),
                 },
-                DataType::Array(_) => unimplemented!(),
+                DataType::Struct(t) => {
+                    let fields: Fields = t.fields().map(ArrowField::try_from).try_collect()?;
+                    Arc::new(StructArray::new_null(fields, num_rows))
+                }
+                DataType::Array(t) => {
+                    let field =
+                        ArrowField::new(LIST_ARRAY_ROOT, t.element_type().try_into()?, true);
+                    Arc::new(ListArray::new_null(Arc::new(field), num_rows))
+                }
                 DataType::Map { .. } => unimplemented!(),
-                DataType::Struct { .. } => unimplemented!(),
             },
         };
         Ok(arr)
@@ -135,6 +161,80 @@ fn column_as_struct<'a>(
         .ok_or(ArrowError::SchemaError(format!("{} is not a struct", name)))
 }
 
+fn make_arrow_error(s: String) -> Error {
+    Error::Arrow(arrow_schema::ArrowError::InvalidArgumentError(s))
+}
+
+/// Ensure a kernel data type matches an arrow data type. This only ensures that the actual "type"
+/// is the same, but does so recursively into structs, and ensures lists and maps have the correct
+/// associated types as well. This returns an `Ok(())` if the types are compatible, or an error if
+/// the types do not match.
+fn ensure_data_types(kernel_type: &DataType, arrow_type: &ArrowDataType) -> DeltaResult<()> {
+    match (kernel_type, arrow_type) {
+        (DataType::Primitive(_), _) if arrow_type.is_primitive() => Ok(()),
+        (DataType::Primitive(PrimitiveType::Boolean), ArrowDataType::Boolean)
+        | (DataType::Primitive(PrimitiveType::String), ArrowDataType::Utf8)
+        | (DataType::Primitive(PrimitiveType::Binary), ArrowDataType::Binary) => {
+            // strings, bools, and binary  aren't primitive in arrow
+            Ok(())
+        }
+        (
+            DataType::Primitive(PrimitiveType::Decimal(kernel_prec, kernel_scale)),
+            ArrowDataType::Decimal128(arrow_prec, arrow_scale),
+        ) if arrow_prec == kernel_prec && *arrow_scale == *kernel_scale as i8 => {
+            // decimal isn't primitive in arrow. cast above is okay as we limit range
+            Ok(())
+        }
+        (DataType::Array(inner_type), ArrowDataType::List(arrow_list_type)) => {
+            let kernel_array_type = &inner_type.element_type;
+            let arrow_list_type = arrow_list_type.data_type();
+            ensure_data_types(kernel_array_type, arrow_list_type)
+        }
+        (DataType::Map(kernel_map_type), ArrowDataType::Map(arrow_map_type, _)) => {
+            if let ArrowDataType::Struct(fields) = arrow_map_type.data_type() {
+                let mut fiter = fields.iter();
+                if let Some(key_type) = fiter.next() {
+                    ensure_data_types(&kernel_map_type.key_type, key_type.data_type())?;
+                } else {
+                    return Err(make_arrow_error(
+                        "Arrow map struct didn't have a key type".to_string(),
+                    ));
+                }
+                if let Some(value_type) = fiter.next() {
+                    ensure_data_types(&kernel_map_type.value_type, value_type.data_type())?;
+                } else {
+                    return Err(make_arrow_error(
+                        "Arrow map struct didn't have a value type".to_string(),
+                    ));
+                }
+                Ok(())
+            } else {
+                Err(make_arrow_error(
+                    "Arrow map type wasn't a struct.".to_string(),
+                ))
+            }
+        }
+        (DataType::Struct(kernel_fields), ArrowDataType::Struct(arrow_fields)) => {
+            require!(
+                kernel_fields.fields.len() == arrow_fields.len(),
+                make_arrow_error(format!(
+                    "Struct types have different numbers of fields. Expected {}, got {}",
+                    kernel_fields.fields.len(),
+                    arrow_fields.len()
+                ))
+            );
+            for (kernel_field, arrow_field) in kernel_fields.fields().zip(arrow_fields.iter()) {
+                ensure_data_types(&kernel_field.data_type, arrow_field.data_type())?;
+            }
+            Ok(())
+        }
+        _ => Err(make_arrow_error(format!(
+            "Incorrect datatype. Expected {}, got {}",
+            kernel_type, arrow_type
+        ))),
+    }
+}
+
 fn evaluate_expression(
     expression: &Expression,
     batch: &RecordBatch,
@@ -160,13 +260,24 @@ fn evaluate_expression(
             }
         }
         (Struct(fields), Some(DataType::Struct(schema))) => {
-            let output_schema: ArrowSchema = schema.as_ref().try_into()?;
             let columns = fields
                 .iter()
                 .zip(schema.fields())
                 .map(|(expr, field)| evaluate_expression(expr, batch, Some(field.data_type())));
-            let result =
-                StructArray::try_new(output_schema.fields().clone(), columns.try_collect()?, None)?;
+            let output_cols: Vec<Arc<dyn Array>> = columns.try_collect()?;
+            let output_fields: Vec<ArrowField> = output_cols
+                .iter()
+                .zip(schema.fields())
+                .map(|(array, input_field)| -> DeltaResult<_> {
+                    ensure_data_types(input_field.data_type(), array.data_type())?;
+                    Ok(ArrowField::new(
+                        input_field.name(),
+                        array.data_type().clone(),
+                        array.is_nullable(),
+                    ))
+                })
+                .try_collect()?;
+            let result = StructArray::try_new(output_fields.into(), output_cols, None)?;
             Ok(Arc::new(result))
         }
         (Struct(_), _) => Err(Error::generic(
@@ -203,8 +314,8 @@ fn evaluate_expression(
         (VariadicOperation { op, exprs }, None | Some(&DataType::BOOLEAN)) => {
             type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
             let (reducer, default): (Operation, _) = match op {
-                VariadicOperator::And => (and, true),
-                VariadicOperator::Or => (or, false),
+                VariadicOperator::And => (and_kleene, true),
+                VariadicOperator::Or => (or_kleene, false),
             };
             exprs
                 .iter()

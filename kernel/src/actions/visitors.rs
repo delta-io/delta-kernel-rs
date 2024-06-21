@@ -1,5 +1,5 @@
 //! This module defines visitors that can be used to extract the various delta actions from
-//! [`EngineData`] types.
+//! [`crate::engine_data::EngineData`] types.
 
 use std::collections::HashMap;
 

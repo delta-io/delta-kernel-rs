@@ -62,10 +62,8 @@ pub(crate) fn generate_mask(
     }
 }
 
-/// Reorder a RecordBatch to match `requested_ordering`. This method takes `mask_indicies` as
-/// computed by [`get_requested_indicies`] as an optimization. If the indicies are in order, then we
-/// don't need to do any re-ordering. Otherwise, for each non-zero value in `requested_ordering`,
-/// the column at that index will be added in order to returned batch
+/// Reorder a RecordBatch to match `requested_ordering`. For each non-zero value in
+/// `requested_ordering`, the column at that index will be added in order to returned batch
 pub(crate) fn reorder_record_batch(
     input_data: RecordBatch,
     requested_ordering: &[usize],

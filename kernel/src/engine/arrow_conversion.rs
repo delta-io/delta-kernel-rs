@@ -8,7 +8,10 @@ use arrow_schema::{
 };
 use itertools::Itertools;
 
+use crate::error::Error;
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
+
+pub(crate) const LIST_ARRAY_ROOT: &str = "item";
 
 impl TryFrom<&StructType> for ArrowSchema {
     type Error = ArrowError;
@@ -46,7 +49,7 @@ impl TryFrom<&ArrayType> for ArrowField {
 
     fn try_from(a: &ArrayType) -> Result<Self, ArrowError> {
         Ok(ArrowField::new(
-            "item",
+            LIST_ARRAY_ROOT,
             ArrowDataType::try_from(a.element_type())?,
             a.contains_null(),
         ))
@@ -92,25 +95,20 @@ impl TryFrom<&DataType> for ArrowDataType {
                     PrimitiveType::Boolean => Ok(ArrowDataType::Boolean),
                     PrimitiveType::Binary => Ok(ArrowDataType::Binary),
                     PrimitiveType::Decimal(precision, scale) => {
-                        if precision <= &38 {
-                            Ok(ArrowDataType::Decimal128(*precision, *scale))
-                        } else {
-                            // NOTE: since we are converting from delta, we should never get here.
-                            Err(ArrowError::SchemaError(format!(
-                                "Precision too large to be represented as Delta type: {} > 38",
-                                precision
-                            )))
-                        }
+                        PrimitiveType::check_decimal(*precision, *scale)
+                            .map_err(|e| ArrowError::from_external_error(e.into()))?;
+                        Ok(ArrowDataType::Decimal128(*precision, *scale as i8))
                     }
                     PrimitiveType::Date => {
                         // A calendar date, represented as a year-month-day triple without a
                         // timezone. Stored as 4 bytes integer representing days since 1970-01-01
                         Ok(ArrowDataType::Date32)
                     }
-                    PrimitiveType::Timestamp => {
-                        // Issue: https://github.com/delta-io/delta/issues/643
-                        Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
-                    }
+                    // TODO: https://github.com/delta-io/delta/issues/643
+                    PrimitiveType::Timestamp => Ok(ArrowDataType::Timestamp(
+                        TimeUnit::Microsecond,
+                        Some("UTC".into()),
+                    )),
                     PrimitiveType::TimestampNtz => {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
@@ -122,31 +120,8 @@ impl TryFrom<&DataType> for ArrowDataType {
                     .collect::<Result<Vec<ArrowField>, ArrowError>>()?
                     .into(),
             )),
-            DataType::Array(a) => Ok(ArrowDataType::List(Arc::new(<ArrowField as TryFrom<
-                &ArrayType,
-            >>::try_from(a)?))),
-            DataType::Map(m) => Ok(ArrowDataType::Map(
-                Arc::new(ArrowField::new(
-                    "entries",
-                    ArrowDataType::Struct(
-                        vec![
-                            ArrowField::new(
-                                "keys",
-                                <ArrowDataType as TryFrom<&DataType>>::try_from(m.key_type())?,
-                                false,
-                            ),
-                            ArrowField::new(
-                                "values",
-                                <ArrowDataType as TryFrom<&DataType>>::try_from(m.value_type())?,
-                                m.value_contains_null(),
-                            ),
-                        ]
-                        .into(),
-                    ),
-                    true,
-                )),
-                false,
-            )),
+            DataType::Array(a) => Ok(ArrowDataType::List(Arc::new(a.as_ref().try_into()?))),
+            DataType::Map(m) => Ok(ArrowDataType::Map(Arc::new(m.as_ref().try_into()?), false)),
         }
     }
 }
@@ -199,18 +174,26 @@ impl TryFrom<&ArrowDataType> for DataType {
             ArrowDataType::UInt64 => Ok(DataType::Primitive(PrimitiveType::Long)), // undocumented type
             ArrowDataType::UInt32 => Ok(DataType::Primitive(PrimitiveType::Integer)),
             ArrowDataType::UInt16 => Ok(DataType::Primitive(PrimitiveType::Short)),
-            ArrowDataType::UInt8 => Ok(DataType::Primitive(PrimitiveType::Boolean)),
+            ArrowDataType::UInt8 => Ok(DataType::Primitive(PrimitiveType::Byte)),
             ArrowDataType::Float32 => Ok(DataType::Primitive(PrimitiveType::Float)),
             ArrowDataType::Float64 => Ok(DataType::Primitive(PrimitiveType::Double)),
             ArrowDataType::Boolean => Ok(DataType::Primitive(PrimitiveType::Boolean)),
             ArrowDataType::Binary => Ok(DataType::Primitive(PrimitiveType::Binary)),
             ArrowDataType::FixedSizeBinary(_) => Ok(DataType::Primitive(PrimitiveType::Binary)),
             ArrowDataType::LargeBinary => Ok(DataType::Primitive(PrimitiveType::Binary)),
-            ArrowDataType::Decimal128(p, s) => Ok(DataType::decimal(*p, *s)),
+            ArrowDataType::Decimal128(p, s) => {
+                if *s < 0 {
+                    return Err(ArrowError::from_external_error(
+                        Error::invalid_decimal("Negative scales are not supported in Delta").into(),
+                    ));
+                };
+                DataType::decimal(*p, *s as u8)
+                    .map_err(|e| ArrowError::from_external_error(e.into()))
+            }
             ArrowDataType::Date32 => Ok(DataType::Primitive(PrimitiveType::Date)),
             ArrowDataType::Date64 => Ok(DataType::Primitive(PrimitiveType::Date)),
             ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => {
-                Ok(DataType::Primitive(PrimitiveType::Timestamp))
+                Ok(DataType::Primitive(PrimitiveType::TimestampNtz))
             }
             ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(tz))
                 if tz.eq_ignore_ascii_case("utc") =>
@@ -251,6 +234,9 @@ impl TryFrom<&ArrowDataType> for DataType {
                     panic!("DataType::Map should contain a struct field child");
                 }
             }
+            // Dictionary types are just an optimized in-memory representation of an array.
+            // Schema-wise, they are the same as the value type.
+            ArrowDataType::Dictionary(_, value_type) => Ok(value_type.as_ref().try_into()?),
             s => Err(ArrowError::SchemaError(format!(
                 "Invalid data type for Delta Lake: {s}"
             ))),

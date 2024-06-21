@@ -5,15 +5,15 @@ edition = "2021"
 publish = false
 
 [dependencies]
-arrow = { version = "^49.0", features = ["prettyprint"] }
+arrow = { workspace = true, features = ["prettyprint", "chrono-tz"] }
 clap = { version = "^4.4", features = ["derive"] }
 delta_kernel = { path = "../../../kernel", features = [
+  "cloud",
   "default-engine",
-  "tokio",
   "developer-visibility",
+  "tokio",
 ] }
 env_logger = "0.11.3"
-itertools = "0.12.1"
+itertools = "0.13"
 spmc = "0.3.0"
 url = "2"
-

@@ -20,6 +20,7 @@ pub type SchemaRef = Arc<StructType>;
 pub enum MetadataValue {
     Number(i32),
     String(String),
+    Boolean(bool),
 }
 
 impl From<String> for MetadataValue {
@@ -37,6 +38,12 @@ impl From<&String> for MetadataValue {
 impl From<i32> for MetadataValue {
     fn from(value: i32) -> Self {
         Self::Number(value)
+    }
+}
+
+impl From<bool> for MetadataValue {
+    fn from(value: bool) -> Self {
+        Self::Boolean(value)
     }
 }
 
@@ -356,18 +363,18 @@ pub enum PrimitiveType {
         deserialize_with = "deserialize_decimal",
         untagged
     )]
-    Decimal(u8, i8),
+    Decimal(u8, u8),
 }
 
 fn serialize_decimal<S: serde::Serializer>(
     precision: &u8,
-    scale: &i8,
+    scale: &u8,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(&format!("decimal({},{})", precision, scale))
 }
 
-fn deserialize_decimal<'de, D>(deserializer: D) -> Result<(u8, i8), D::Error>
+fn deserialize_decimal<'de, D>(deserializer: D) -> Result<(u8, u8), D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -386,11 +393,11 @@ where
         })?;
     let scale = parts
         .next()
-        .and_then(|part| part.trim().parse::<i8>().ok())
+        .and_then(|part| part.trim().parse::<u8>().ok())
         .ok_or_else(|| {
             serde::de::Error::custom(format!("Invalid scale in decimal: {}", str_value))
         })?;
-
+    PrimitiveType::check_decimal(precision, scale).map_err(serde::de::Error::custom)?;
     Ok((precision, scale))
 }
 
@@ -398,10 +405,10 @@ impl Display for PrimitiveType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             PrimitiveType::String => write!(f, "string"),
-            PrimitiveType::Long => write!(f, "bigint"),
-            PrimitiveType::Integer => write!(f, "int"),
-            PrimitiveType::Short => write!(f, "smallint"),
-            PrimitiveType::Byte => write!(f, "tinyint"),
+            PrimitiveType::Long => write!(f, "long"),
+            PrimitiveType::Integer => write!(f, "integer"),
+            PrimitiveType::Short => write!(f, "short"),
+            PrimitiveType::Byte => write!(f, "byte"),
             PrimitiveType::Float => write!(f, "float"),
             PrimitiveType::Double => write!(f, "double"),
             PrimitiveType::Boolean => write!(f, "boolean"),
@@ -410,7 +417,7 @@ impl Display for PrimitiveType {
             PrimitiveType::Timestamp => write!(f, "timestamp"),
             PrimitiveType::TimestampNtz => write!(f, "timestamp_ntz"),
             PrimitiveType::Decimal(precision, scale) => {
-                write!(f, "decimal({}, {})", precision, scale)
+                write!(f, "decimal({},{})", precision, scale)
             }
         }
     }
@@ -449,6 +456,12 @@ impl From<ArrayType> for DataType {
     }
 }
 
+impl From<SchemaRef> for DataType {
+    fn from(schema: SchemaRef) -> Self {
+        Arc::unwrap_or_clone(schema).into()
+    }
+}
+
 /// cbindgen:ignore
 impl DataType {
     pub const STRING: Self = DataType::Primitive(PrimitiveType::String);
@@ -464,8 +477,21 @@ impl DataType {
     pub const TIMESTAMP: Self = DataType::Primitive(PrimitiveType::Timestamp);
     pub const TIMESTAMP_NTZ: Self = DataType::Primitive(PrimitiveType::TimestampNtz);
 
-    pub fn decimal(precision: u8, scale: i8) -> Self {
-        DataType::Primitive(PrimitiveType::Decimal(precision, scale))
+    pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
+        PrimitiveType::check_decimal(precision, scale)?;
+        Ok(DataType::Primitive(PrimitiveType::Decimal(
+            precision, scale,
+        )))
+    }
+
+    // This function assumes that the caller has already checked the precision and scale
+    // and that they are valid. Will panic if they are not.
+    pub fn decimal_unchecked(precision: u8, scale: u8) -> Self {
+        Self::decimal(precision, scale).unwrap()
+    }
+
+    pub fn struct_type(fields: Vec<StructField>) -> Self {
+        DataType::Struct(Box::new(StructType::new(fields)))
     }
 }
 
@@ -647,5 +673,28 @@ mod tests {
         let file = std::fs::File::open("./tests/serde/checkpoint_schema.json").unwrap();
         let schema: Result<Schema, _> = serde_json::from_reader(file);
         assert!(schema.is_ok())
+    }
+
+    #[test]
+    fn test_invalid_decimal() {
+        let data = r#"
+        {
+            "name": "a",
+            "type": "decimal(39, 10)",
+            "nullable": false,
+            "metadata": {}
+        }
+        "#;
+        assert!(serde_json::from_str::<StructField>(data).is_err());
+
+        let data = r#"
+        {
+            "name": "a",
+            "type": "decimal(10, 39)",
+            "nullable": false,
+            "metadata": {}
+        }
+        "#;
+        assert!(serde_json::from_str::<StructField>(data).is_err());
     }
 }
