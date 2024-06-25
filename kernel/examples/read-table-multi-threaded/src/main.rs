@@ -11,7 +11,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::sync::SyncEngine;
-use delta_kernel::scan::state::{DvInfo, GlobalScanState};
+use delta_kernel::scan::state::{DvInfo, GlobalScanState, Stats};
 use delta_kernel::scan::{transform_to_logical, ScanBuilder};
 use delta_kernel::schema::Schema;
 use delta_kernel::{DeltaResult, Engine, EngineData, FileMeta, Table};
@@ -94,6 +94,7 @@ fn send_scan_file(
     scan_tx: &mut spmc::Sender<ScanFile>,
     path: &str,
     size: i64,
+    _stats: Option<Stats>,
     dv_info: DvInfo,
     partition_values: HashMap<String, String>,
 ) {

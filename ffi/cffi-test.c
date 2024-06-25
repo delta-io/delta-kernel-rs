@@ -7,9 +7,15 @@
 void visit_callback(void* engine_context,
                     KernelStringSlice path,
                     int64_t size,
+                    const Stats* stats,
                     const DvInfo* dv_info,
                     const CStringMap* partition_values) {
-  printf("file: %.*s\n", (int)path.len, path.ptr);
+  printf("file: %.*s (size: %" PRId64 ", num_records:", (int)path.len, path.ptr, size);
+  if (stats) {
+    printf("%" PRId64 ")\n", stats->num_records);
+  } else {
+    printf(" [no stats])\n");
+  }
 }
 
 void visit_data(void* engine_context,
