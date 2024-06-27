@@ -168,7 +168,9 @@ fn make_arrow_error(s: String) -> Error {
 /// Ensure a kernel data type matches an arrow data type. This only ensures that the actual "type"
 /// is the same, but does so recursively into structs, and ensures lists and maps have the correct
 /// associated types as well. This returns an `Ok(())` if the types are compatible, or an error if
-/// the types do not match.
+/// the types do not match. If there is a `struct` type included, we only ensure that the named
+/// fields that the kernel is asking for exist, and that for those fields the types
+/// match. Un-selected fields are ignored.
 fn ensure_data_types(kernel_type: &DataType, arrow_type: &ArrowDataType) -> DeltaResult<()> {
     match (kernel_type, arrow_type) {
         (DataType::Primitive(_), _) if arrow_type.is_primitive() => Ok(()),
@@ -215,17 +217,28 @@ fn ensure_data_types(kernel_type: &DataType, arrow_type: &ArrowDataType) -> Delt
             }
         }
         (DataType::Struct(kernel_fields), ArrowDataType::Struct(arrow_fields)) => {
-            require!(
-                kernel_fields.fields.len() == arrow_fields.len(),
-                make_arrow_error(format!(
-                    "Struct types have different numbers of fields. Expected {}, got {}",
-                    kernel_fields.fields.len(),
-                    arrow_fields.len()
-                ))
-            );
-            for (kernel_field, arrow_field) in kernel_fields.fields().zip(arrow_fields.iter()) {
+            // build a list of kernel fields that matches the order of the arrow fields
+            let mapped_fields = arrow_fields
+                .iter()
+                .flat_map(|f| kernel_fields.fields.get(f.name()));
+
+            // keep track of how many fields we matched up
+            let mut found_fields = 0;
+            // ensure that for the fields that we found, the types match
+            for (kernel_field, arrow_field) in mapped_fields.zip(arrow_fields) {
                 ensure_data_types(&kernel_field.data_type, arrow_field.data_type())?;
+                found_fields += 1;
             }
+
+            // require that we found the number of fields that we requested.
+            require!(kernel_fields.fields.len() == found_fields, {
+                let kernel_field_names = kernel_fields.fields.keys().join(", ");
+                let arrow_field_names = arrow_fields.iter().map(|f| f.name()).join(", ");
+                make_arrow_error(format!(
+                    "Missing Struct fields. Requested: {}, found: {}",
+                    kernel_field_names, arrow_field_names,
+                ))
+            });
             Ok(())
         }
         _ => Err(make_arrow_error(format!(

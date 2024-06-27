@@ -353,6 +353,7 @@ impl Scan {
 ///    path: string,
 ///    size: long,
 ///    modificationTime: long,
+///    stats: string,
 ///    deletionVector: {
 ///      storageType: string,
 ///      pathOrInlineDv: string,
@@ -482,7 +483,7 @@ pub fn transform_to_logical(
 // some utils that are used in file_stream.rs and state.rs tests
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
 
     use arrow_array::{RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
@@ -498,7 +499,7 @@ pub(crate) mod test_utils {
         EngineData, JsonHandler,
     };
 
-    use super::state::DvInfo;
+    use super::state::ScanCallback;
 
     // TODO(nick): Merge all copies of this into one "test utils" thing
     fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
@@ -546,13 +547,7 @@ pub(crate) mod test_utils {
         batch: Vec<Box<ArrowEngineData>>,
         expected_sel_vec: &[bool],
         context: T,
-        validate_callback: fn(
-            context: &mut T,
-            path: &str,
-            size: i64,
-            dv_info: DvInfo,
-            partition_values: HashMap<String, String>,
-        ),
+        validate_callback: ScanCallback<T>,
     ) {
         let engine = SyncEngine::new();
         // doesn't matter here

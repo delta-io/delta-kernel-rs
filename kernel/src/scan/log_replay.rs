@@ -79,11 +79,13 @@ impl DataVisitor for AddRemoveVisitor {
 
 lazy_static! {
     // NB: If you update this schema, ensure you update the comment describing it in the doc comment
-    // for `scan_row_schema` in scan/mod.rs!
+    // for `scan_row_schema` in scan/mod.rs! You'll also need to update ScanFileVisitor as the
+    // indexes will be off
     pub(crate) static ref SCAN_ROW_SCHEMA: Arc<StructType> = Arc::new(StructType::new(vec!(
         StructField::new("path", DataType::STRING, true),
         StructField::new("size", DataType::LONG, true),
         StructField::new("modificationTime", DataType::LONG, true),
+        StructField::new("stats", DataType::STRING, true),
         StructField::new(
             "deletionVector",
             StructType::new(vec![
@@ -162,6 +164,7 @@ impl LogReplayScanner {
             Expression::column("add.path"),
             Expression::column("add.size"),
             Expression::column("add.modificationTime"),
+            Expression::column("add.stats"),
             Expression::column("add.deletionVector"),
             Expression::Struct(vec![Expression::column("add.partitionValues")]),
         ])
@@ -316,7 +319,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::scan::{
-        state::DvInfo,
+        state::{DvInfo, Stats},
         test_utils::{add_batch_simple, add_batch_with_remove, run_with_validate_callback},
     };
 
@@ -326,6 +329,7 @@ mod tests {
         _: &mut (),
         path: &str,
         size: i64,
+        stats: Option<Stats>,
         _: DvInfo,
         part_vals: HashMap<String, String>,
     ) {
@@ -334,6 +338,8 @@ mod tests {
             "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
         );
         assert_eq!(size, 635);
+        assert!(stats.is_some());
+        assert_eq!(stats.as_ref().unwrap().num_records, 10);
         assert_eq!(part_vals.get("date"), Some(&"2017-12-10".to_string()));
         assert_eq!(part_vals.get("non-existent"), None);
     }
