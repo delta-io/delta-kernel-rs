@@ -167,12 +167,12 @@ impl DeletionVectorDescriptor {
         }
     }
 
-    pub fn to_deletion_vector(
+    pub fn row_indexes(
         &self,
         fs_client: Arc<dyn FileSystemClient>,
         parent: &Url,
-    ) -> DeltaResult<DeletionVector> {
-        DeletionVector::new(fs_client, parent, self)
+    ) -> DeltaResult<Vec<u64>> {
+        Ok(self.read(fs_client, parent)?.into_iter().collect())
     }
 }
 
@@ -229,27 +229,6 @@ pub(crate) fn treemap_to_bools(treemap: RoaringTreemap) -> Vec<bool> {
             // empty set, return empty vec
             vec![]
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-#[repr(C)]
-pub struct DeletionVector {
-    inner: RoaringTreemap,
-}
-
-impl DeletionVector {
-    pub fn new(
-        fs_client: Arc<dyn FileSystemClient>,
-        parent: &Url,
-        descriptor: &DeletionVectorDescriptor,
-    ) -> DeltaResult<Self> {
-        let inner = descriptor.read(fs_client, parent)?;
-        Ok(Self { inner })
-    }
-
-    pub fn row_indexes(self) -> Vec<u64> {
-        self.inner.into_iter().collect::<Vec<u64>>()
     }
 }
 
@@ -396,8 +375,7 @@ mod tests {
         let sync_engine = SyncEngine::new();
         let fs_client = sync_engine.get_file_system_client();
         let parent = Url::parse("http://not.used").unwrap();
-        let dv = example.to_deletion_vector(fs_client, &parent).unwrap();
-        let row_idx = dv.row_indexes();
+        let row_idx = example.row_indexes(fs_client, &parent).unwrap();
 
         assert_eq!(row_idx.len(), 6);
         assert_eq!(&row_idx, &[3, 4, 7, 11, 18, 29]);

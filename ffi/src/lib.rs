@@ -137,6 +137,8 @@ mod private {
         len: usize,
     }
 
+    /// An owned slice of u64 row indexes allocated by the kernel. The engine is responsible for
+    /// freeing this slice by calling [super::free_row_indexes] once.
     #[repr(C)]
     pub struct KernelRowIndexArray {
         ptr: *mut u64,
@@ -209,7 +211,7 @@ mod private {
         ///
         /// # Safety
         ///
-        /// The slice must have been originally created `From<Vec<u64>>`, and must not have been
+        /// The slice must have been originally created `From<Vec<u64>>`, and must not have
         /// already been consumed by a previous call to this method.
         pub unsafe fn into_vec(self) -> Vec<u64> {
             if self.ptr.is_null() {

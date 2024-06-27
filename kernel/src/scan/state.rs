@@ -75,12 +75,11 @@ impl DvInfo {
         let indexes = self
             .deletion_vector
             .as_ref()
-            .map(|dv_descriptor| {
+            .map(|dv| {
                 let fs_client = engine.get_file_system_client();
-                dv_descriptor.to_deletion_vector(fs_client, table_root)
+                dv.row_indexes(fs_client, table_root)
             })
-            .transpose()?
-            .map(|dv| dv.row_indexes());
+            .transpose()?;
 
         Ok(indexes)
     }
