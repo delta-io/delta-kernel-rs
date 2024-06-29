@@ -582,7 +582,7 @@ mod tests {
         let schema = Schema::new(vec![arr_field.clone()]);
         let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
-        
+
         let str_not_op = Expression::binary(
             BinaryOperator::NotIn,
             Expression::literal("bye"),
@@ -594,7 +594,7 @@ mod tests {
             Expression::literal("hi"),
             Expression::column("item"),
         );
-        
+
         let result = evaluate_expression(&str_in_op, &batch, None).unwrap();
         let expected = BooleanArray::from(vec![true, true, true]);
         assert_eq!(result.as_ref(), &expected);
