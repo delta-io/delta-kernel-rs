@@ -408,9 +408,15 @@ impl PrimitiveType {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use arrow_array::builder::{ListBuilder, StringBuilder};
+    use arrow_array::GenericStringArray;
+    use arrow_ord::comparison::in_list_utf8;
+    use std::f32::consts::PI;
+
     use crate::expressions::BinaryOperator;
     use crate::Expression;
+
+    use super::*;
 
     #[test]
     fn test_decimal_display() {
@@ -492,12 +498,30 @@ mod tests {
     }
 
     #[test]
-    fn test_array_scalars() {
+    fn test_arrays() {
         let array = Scalar::Array(ArrayData {
             tpe: ArrayType::new(DataType::Primitive(PrimitiveType::Integer), false),
             elements: vec![Scalar::Integer(1), Scalar::Integer(2), Scalar::Integer(3)],
         });
-        let op = Expression::binary(BinaryOperator::In, 10, array);
-        println!("{}", op);
+
+        let column = Expression::column("item");
+        let array_op = Expression::binary(BinaryOperator::In, 10, array.clone());
+        let array_not_op = Expression::binary(BinaryOperator::NotIn, 10, array);
+        let column_op = Expression::binary(BinaryOperator::In, PI, column.clone());
+        let column_not_op = Expression::binary(BinaryOperator::NotIn, "Cool", column);
+        assert_eq!(&format!("{}", array_op), "10 IN (1, 2, 3)");
+        assert_eq!(&format!("{}", array_not_op), "10 NOT IN (1, 2, 3)");
+        assert_eq!(&format!("{}", column_op), "3.1415927 IN Column(item)");
+        assert_eq!(&format!("{}", column_not_op), "'Cool' NOT IN Column(item)");
+
+        let mut string_list = ListBuilder::new(StringBuilder::new());
+        string_list.values().append_value("Hi");
+        string_list.values().append_value("Bye");
+        string_list.values().append_value("Hello");
+        string_list.append(true);
+        let arr = string_list.finish();
+
+        let string_col = GenericStringArray::<i32>::from(vec!["Bye"]);
+        println!("{:?}", in_list_utf8(&string_col, &arr));
     }
 }

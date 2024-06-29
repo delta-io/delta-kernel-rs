@@ -12,7 +12,7 @@ use arrow_array::{
 };
 use arrow_buffer::OffsetBuffer;
 use arrow_ord::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq};
-use arrow_ord::comparison::in_list;
+use arrow_ord::comparison::{in_list, in_list_utf8};
 use arrow_schema::{
     ArrowError, DataType as ArrowDataType, Field as ArrowField, Fields, IntervalUnit,
     Schema as ArrowSchema, TimeUnit,
@@ -334,6 +334,11 @@ fn evaluate_expression(
         ) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
+            if let Some(string_arr) = left_arr.as_string_opt::<i32>() {
+                return in_list_utf8(string_arr, right_arr.as_list::<i32>())
+                    .map(wrap_comparison_result)
+                    .map_err(Error::generic_err);
+            }
             prim_array_cmp! {
                 left_arr, right_arr,
                 (ArrowDataType::Int8, Int8Type),
@@ -378,6 +383,11 @@ fn evaluate_expression(
         ) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
+            if let Some(string_arr) = left_arr.as_string_opt::<i32>() {
+                return not(&in_list_utf8(string_arr, right_arr.as_list::<i32>())?)
+                    .map(wrap_comparison_result)
+                    .map_err(Error::generic_err);
+            }
             prim_array_cmp_neg! {
                 left_arr, right_arr,
                 (ArrowDataType::Int8, Int8Type),
@@ -518,10 +528,9 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
 
 #[cfg(test)]
 mod tests {
-    use arrow::util::pretty::print_batches;
     use std::ops::{Add, Div, Mul, Sub};
 
-    use arrow_array::Int32Array;
+    use arrow_array::{GenericStringArray, Int32Array};
     use arrow_buffer::ScalarBuffer;
     use arrow_schema::{DataType, Field, Fields, Schema};
 
@@ -539,23 +548,60 @@ mod tests {
         let schema = Schema::new(vec![arr_field.clone()]);
 
         let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
-        let batch =
-            RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array.clone())]).unwrap();
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
-        let op = Expression::binary(
+        let not_op = Expression::binary(
             BinaryOperator::NotIn,
             Expression::literal(5),
             Expression::column("item"),
         );
-        let bool_field = Arc::new(Field::new(format!("{}", &op), DataType::Boolean, false));
-        let all_fields = Schema::new(vec![arr_field, bool_field]);
-        let result = evaluate_expression(&op, &batch, None).unwrap();
-        let result_batch = RecordBatch::try_new(
-            Arc::new(all_fields),
-            vec![Arc::new(array), Arc::new(result)],
-        )
-        .unwrap();
-        print_batches(&[result_batch]).unwrap();
+
+        let in_op = Expression::binary(
+            BinaryOperator::NotIn,
+            Expression::literal(5),
+            Expression::column("item"),
+        );
+
+        let result = evaluate_expression(&not_op, &batch, None).unwrap();
+        let expected = BooleanArray::from(vec![true, false, true]);
+        assert_eq!(result.as_ref(), &expected);
+
+        let in_result = evaluate_expression(&in_op, &batch, None).unwrap();
+        let in_expected = BooleanArray::from(vec![true, false, true]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+    }
+
+    #[test]
+    fn test_str_arrays() {
+        let values = GenericStringArray::<i32>::from(vec![
+            "hi", "bye", "hi", "hi", "bye", "bye", "hi", "bye", "hi",
+        ]);
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6, 9]));
+        let field = Arc::new(Field::new("item", DataType::Utf8, true));
+        let arr_field = Arc::new(Field::new("item", DataType::List(field.clone()), true));
+        let schema = Schema::new(vec![arr_field.clone()]);
+        let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
+        
+        let str_not_op = Expression::binary(
+            BinaryOperator::NotIn,
+            Expression::literal("bye"),
+            Expression::column("item"),
+        );
+
+        let str_in_op = Expression::binary(
+            BinaryOperator::In,
+            Expression::literal("hi"),
+            Expression::column("item"),
+        );
+        
+        let result = evaluate_expression(&str_in_op, &batch, None).unwrap();
+        let expected = BooleanArray::from(vec![true, true, true]);
+        assert_eq!(result.as_ref(), &expected);
+
+        let in_result = evaluate_expression(&str_not_op, &batch, None).unwrap();
+        let in_expected = BooleanArray::from(vec![false, false, false]);
+        assert_eq!(in_result.as_ref(), &in_expected);
     }
 
     #[test]
