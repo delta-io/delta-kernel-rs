@@ -34,6 +34,10 @@ pub enum BinaryOperator {
     NotEqual,
     /// Distinct
     Distinct,
+    /// IN
+    In,
+    /// NOT IN
+    NotIn,
 }
 
 impl BinaryOperator {
@@ -50,8 +54,8 @@ impl BinaryOperator {
         }
     }
 
-    // invert an operator. Returns Some<InvertedOp> if the operator supports inversion, None if it
-    // cannot be inverted
+    /// invert an operator. Returns Some<InvertedOp> if the operator supports inversion, None if it
+    /// cannot be inverted
     pub(crate) fn invert(&self) -> Option<BinaryOperator> {
         use BinaryOperator::*;
         match self {
@@ -61,6 +65,8 @@ impl BinaryOperator {
             GreaterThanOrEqual => Some(LessThan),
             Equal => Some(NotEqual),
             NotEqual => Some(Equal),
+            In => Some(NotIn),
+            NotIn => Some(In),
             _ => None,
         }
     }
@@ -97,8 +103,10 @@ impl Display for BinaryOperator {
             Self::NotEqual => write!(f, "!="),
             // TODO(roeap): AFAIK DISTINCT does not have a commonly used operator symbol
             // so ideally this would not be used as we use Display for rendering expressions
-            // in our code we take care of this, bot thers might now ...
+            // in our code we take care of this, but theirs might now ...
             Self::Distinct => write!(f, "DISTINCT"),
+            Self::In => write!(f, "IN"),
+            Self::NotIn => write!(f, "NOT IN"),
         }
     }
 }

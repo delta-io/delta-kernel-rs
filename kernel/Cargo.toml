@@ -38,6 +38,7 @@ visibility = "0.1.0"
 
 # Used in default engine
 arrow-array = { workspace = true, optional = true }
+arrow-buffer = { workspace = true, optional = true }
 arrow-select = { workspace = true, optional = true }
 arrow-arith = { workspace = true, optional = true }
 arrow-json = { workspace = true, optional = true }
@@ -67,6 +68,7 @@ default-engine = [
   "arrow-conversion",
   "arrow-expression",
   "arrow-array",
+  "arrow-buffer",
   "arrow-json",
   "arrow-schema",
   "arrow-select",

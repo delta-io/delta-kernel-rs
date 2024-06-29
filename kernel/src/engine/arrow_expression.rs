@@ -4,24 +4,31 @@ use std::sync::Arc;
 use arrow_arith::boolean::{and_kleene, is_null, not, or_kleene};
 use arrow_arith::numeric::{add, div, mul, sub};
 use arrow_array::cast::AsArray;
+use arrow_array::types::*;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum, Decimal128Array, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, RecordBatch,
     StringArray, StructArray, TimestampMicrosecondArray,
 };
+use arrow_buffer::OffsetBuffer;
 use arrow_ord::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq};
+use arrow_ord::comparison::in_list;
 use arrow_schema::{
-    ArrowError, DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
+    ArrowError, DataType as ArrowDataType, Field as ArrowField, Fields, IntervalUnit,
+    Schema as ArrowSchema, TimeUnit,
 };
+use arrow_select::concat::concat;
 use itertools::Itertools;
 
-use super::arrow_conversion::LIST_ARRAY_ROOT;
 use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::arrow_utils::{prim_array_cmp, prim_array_cmp_neg};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{BinaryOperator, Expression, Scalar, UnaryOperator, VariadicOperator};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
+
+use super::arrow_conversion::LIST_ARRAY_ROOT;
 
 // TODO leverage scalars / Datum
 
@@ -66,6 +73,20 @@ impl Scalar {
                     .map(ArrowField::try_from)
                     .try_collect()?;
                 Arc::new(StructArray::try_new(fields, arrays, None)?)
+            }
+            Array(data) => {
+                let values = data.array_elements();
+                let vecs: Vec<_> = values.iter().map(|v| v.to_array(num_rows)).try_collect()?;
+                let values = vecs.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
+                let offsets = vecs.iter().map(|v| v.len()).collect::<Vec<_>>();
+                let offset_buffer = OffsetBuffer::from_lengths(offsets);
+                let field = ArrowField::try_from(data.array_type())?;
+                Arc::new(ListArray::new(
+                    Arc::new(field),
+                    offset_buffer,
+                    concat(values.as_slice())?,
+                    None,
+                ))
             }
             Null(data_type) => match data_type {
                 DataType::Primitive(primitive) => match primitive {
@@ -303,6 +324,94 @@ fn evaluate_expression(
                 UnaryOperator::IsNull => Arc::new(is_null(&arr)?),
             })
         }
+        (
+            BinaryOperation {
+                op: In,
+                left,
+                right,
+            },
+            _,
+        ) => {
+            let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
+            let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
+            prim_array_cmp! {
+                left_arr, right_arr,
+                (ArrowDataType::Int8, Int8Type),
+                (ArrowDataType::Int16, Int16Type),
+                (ArrowDataType::Int32, Int32Type),
+                (ArrowDataType::Int64, Int64Type),
+                (ArrowDataType::UInt8, UInt8Type),
+                (ArrowDataType::UInt16, UInt16Type),
+                (ArrowDataType::UInt32, UInt32Type),
+                (ArrowDataType::UInt64, UInt64Type),
+                (ArrowDataType::Float16, Float16Type),
+                (ArrowDataType::Float32, Float32Type),
+                (ArrowDataType::Float64, Float64Type),
+                (ArrowDataType::Timestamp(TimeUnit::Second, _), TimestampSecondType),
+                (ArrowDataType::Timestamp(TimeUnit::Millisecond, _), TimestampMillisecondType),
+                (ArrowDataType::Timestamp(TimeUnit::Microsecond, _), TimestampMicrosecondType),
+                (ArrowDataType::Timestamp(TimeUnit::Nanosecond, _), TimestampNanosecondType),
+                (ArrowDataType::Date32, Date32Type),
+                (ArrowDataType::Date64, Date64Type),
+                (ArrowDataType::Time32(TimeUnit::Second), Time32SecondType),
+                (ArrowDataType::Time32(TimeUnit::Millisecond), Time32MillisecondType),
+                (ArrowDataType::Time64(TimeUnit::Microsecond), Time64MicrosecondType),
+                (ArrowDataType::Time64(TimeUnit::Nanosecond), Time64NanosecondType),
+                (ArrowDataType::Duration(TimeUnit::Second), DurationSecondType),
+                (ArrowDataType::Duration(TimeUnit::Millisecond), DurationMillisecondType),
+                (ArrowDataType::Duration(TimeUnit::Microsecond), DurationMicrosecondType),
+                (ArrowDataType::Duration(TimeUnit::Nanosecond), DurationNanosecondType),
+                (ArrowDataType::Interval(IntervalUnit::DayTime), IntervalDayTimeType),
+                (ArrowDataType::Interval(IntervalUnit::YearMonth), IntervalYearMonthType),
+                (ArrowDataType::Interval(IntervalUnit::MonthDayNano), IntervalMonthDayNanoType),
+                (ArrowDataType::Decimal128(_, _), Decimal128Type),
+                (ArrowDataType::Decimal256(_, _), Decimal256Type)
+            }
+        }
+        (
+            BinaryOperation {
+                op: NotIn,
+                left,
+                right,
+            },
+            _,
+        ) => {
+            let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
+            let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
+            prim_array_cmp_neg! {
+                left_arr, right_arr,
+                (ArrowDataType::Int8, Int8Type),
+                (ArrowDataType::Int16, Int16Type),
+                (ArrowDataType::Int32, Int32Type),
+                (ArrowDataType::Int64, Int64Type),
+                (ArrowDataType::UInt8, UInt8Type),
+                (ArrowDataType::UInt16, UInt16Type),
+                (ArrowDataType::UInt32, UInt32Type),
+                (ArrowDataType::UInt64, UInt64Type),
+                (ArrowDataType::Float16, Float16Type),
+                (ArrowDataType::Float32, Float32Type),
+                (ArrowDataType::Float64, Float64Type),
+                (ArrowDataType::Timestamp(TimeUnit::Second, _), TimestampSecondType),
+                (ArrowDataType::Timestamp(TimeUnit::Millisecond, _), TimestampMillisecondType),
+                (ArrowDataType::Timestamp(TimeUnit::Microsecond, _), TimestampMicrosecondType),
+                (ArrowDataType::Timestamp(TimeUnit::Nanosecond, _), TimestampNanosecondType),
+                (ArrowDataType::Date32, Date32Type),
+                (ArrowDataType::Date64, Date64Type),
+                (ArrowDataType::Time32(TimeUnit::Second), Time32SecondType),
+                (ArrowDataType::Time32(TimeUnit::Millisecond), Time32MillisecondType),
+                (ArrowDataType::Time64(TimeUnit::Microsecond), Time64MicrosecondType),
+                (ArrowDataType::Time64(TimeUnit::Nanosecond), Time64NanosecondType),
+                (ArrowDataType::Duration(TimeUnit::Second), DurationSecondType),
+                (ArrowDataType::Duration(TimeUnit::Millisecond), DurationMillisecondType),
+                (ArrowDataType::Duration(TimeUnit::Microsecond), DurationMicrosecondType),
+                (ArrowDataType::Duration(TimeUnit::Nanosecond), DurationNanosecondType),
+                (ArrowDataType::Interval(IntervalUnit::DayTime), IntervalDayTimeType),
+                (ArrowDataType::Interval(IntervalUnit::YearMonth), IntervalYearMonthType),
+                (ArrowDataType::Interval(IntervalUnit::MonthDayNano), IntervalMonthDayNanoType),
+                (ArrowDataType::Decimal128(_, _), Decimal128Type),
+                (ArrowDataType::Decimal256(_, _), Decimal256Type)
+            }
+        }
         (BinaryOperation { op, left, right }, _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
@@ -320,6 +429,7 @@ fn evaluate_expression(
                 Equal => |l, r| eq(l, r).map(wrap_comparison_result),
                 NotEqual => |l, r| neq(l, r).map(wrap_comparison_result),
                 Distinct => |l, r| distinct(l, r).map(wrap_comparison_result),
+                _ => return Err(Error::generic("Invalid expression given")),
             };
 
             eval(&left_arr, &right_arr).map_err(Error::generic_err)
@@ -408,11 +518,45 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
 
 #[cfg(test)]
 mod tests {
+    use arrow::util::pretty::print_batches;
+    use std::ops::{Add, Div, Mul, Sub};
+
+    use arrow_array::Int32Array;
+    use arrow_buffer::ScalarBuffer;
+    use arrow_schema::{DataType, Field, Fields, Schema};
+
+    use crate::expressions::*;
 
     use super::*;
-    use arrow_array::Int32Array;
-    use arrow_schema::{DataType, Field, Fields, Schema};
-    use std::ops::{Add, Div, Mul, Sub};
+
+    #[test]
+    fn test_array_column() {
+        let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6, 9]));
+        let field = Arc::new(Field::new("item", DataType::Int32, true));
+        let arr_field = Arc::new(Field::new("item", DataType::List(field.clone()), true));
+
+        let schema = Schema::new(vec![arr_field.clone()]);
+
+        let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
+        let batch =
+            RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array.clone())]).unwrap();
+
+        let op = Expression::binary(
+            BinaryOperator::NotIn,
+            Expression::literal(5),
+            Expression::column("item"),
+        );
+        let bool_field = Arc::new(Field::new(format!("{}", &op), DataType::Boolean, false));
+        let all_fields = Schema::new(vec![arr_field, bool_field]);
+        let result = evaluate_expression(&op, &batch, None).unwrap();
+        let result_batch = RecordBatch::try_new(
+            Arc::new(all_fields),
+            vec![Arc::new(array), Arc::new(result)],
+        )
+        .unwrap();
+        print_batches(&[result_batch]).unwrap();
+    }
 
     #[test]
     fn test_extract_column() {

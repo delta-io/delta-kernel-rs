@@ -8,6 +8,39 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 
+macro_rules! prim_array_cmp {
+    ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
+
+        return match $left_arr.data_type() {
+        $(
+            $data_ty => in_list(
+                $left_arr.as_primitive::<$prim_ty>(),
+                $right_arr.as_list::<i32>(),
+            ).map(wrap_comparison_result),
+        )+
+            _ => unimplemented!()
+        }.map_err(Error::generic_err);
+    };
+}
+
+macro_rules! prim_array_cmp_neg {
+    ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
+
+        return match $left_arr.data_type() {
+        $(
+            $data_ty => not(&in_list(
+                $left_arr.as_primitive::<$prim_ty>(),
+                $right_arr.as_list::<i32>(),
+            )?).map(wrap_comparison_result),
+        )+
+            _ => unimplemented!()
+        }.map_err(Error::generic_err);
+    };
+}
+
+pub(crate) use prim_array_cmp;
+pub(crate) use prim_array_cmp_neg;
+
 /// Get the indicies in `parquet_schema` of the specified columns in `requested_schema`. This
 /// returns a tuples of (mask_indicies: Vec<parquet_schema_index>, reorder_indicies:
 /// Vec<requested_index>). `mask_indicies` is used for generating the mask for reading from the

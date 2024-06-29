@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 
-use crate::schema::{DataType, PrimitiveType, StructField};
+use crate::schema::{ArrayType, DataType, PrimitiveType, StructField};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
@@ -11,6 +11,22 @@ use crate::{DeltaResult, Error};
 pub struct StructData {
     fields: Vec<StructField>,
     values: Vec<Scalar>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArrayData {
+    tpe: ArrayType,
+    pub elements: Vec<Scalar>,
+}
+
+impl ArrayData {
+    pub fn array_type(&self) -> &ArrayType {
+        &self.tpe
+    }
+
+    pub fn array_elements(&self) -> &[Scalar] {
+        &self.elements
+    }
 }
 
 impl StructData {
@@ -97,6 +113,8 @@ pub enum Scalar {
     Null(DataType),
     /// Struct value
     Struct(StructData),
+    /// Array Value
+    Array(ArrayData),
 }
 
 impl Scalar {
@@ -117,6 +135,7 @@ impl Scalar {
             Self::Decimal(_, precision, scale) => DataType::decimal_unchecked(*precision, *scale),
             Self::Null(data_type) => data_type.clone(),
             Self::Struct(data) => DataType::struct_type(data.fields.clone()),
+            Self::Array(data) => DataType::array_type(data.tpe.clone()),
         }
     }
 
@@ -173,6 +192,15 @@ impl Display for Scalar {
                     delim = ", ";
                 }
                 write!(f, "}}")
+            }
+            Self::Array(data) => {
+                write!(f, "(")?;
+                let mut delim = "";
+                for element in &data.elements {
+                    write!(f, "{delim}{}", element)?;
+                    delim = ", ";
+                }
+                write!(f, ")")
             }
         }
     }
@@ -381,6 +409,8 @@ impl PrimitiveType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expressions::BinaryOperator;
+    use crate::Expression;
 
     #[test]
     fn test_decimal_display() {
@@ -459,5 +489,15 @@ mod tests {
         expect_fail_parse("0.999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999", 0, 0);
         // scale will be too small to fit in i8
         expect_fail_parse("0.E170141183460469231731687303715884105727", 0, 0);
+    }
+
+    #[test]
+    fn test_array_scalars() {
+        let array = Scalar::Array(ArrayData {
+            tpe: ArrayType::new(DataType::Primitive(PrimitiveType::Integer), false),
+            elements: vec![Scalar::Integer(1), Scalar::Integer(2), Scalar::Integer(3)],
+        });
+        let op = Expression::binary(BinaryOperator::In, 10, array);
+        println!("{}", op);
     }
 }
