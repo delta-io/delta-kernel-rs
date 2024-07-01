@@ -18,7 +18,7 @@ macro_rules! prim_array_cmp {
                 $right_arr.as_list::<i32>(),
             ).map(wrap_comparison_result),
         )+
-            _ => unimplemented!()
+            _ => Err(ArrowError::CastError(format!("Bad Comparison between: {:?} and {:?}", $left_arr.data_type(), $right_arr.data_type())))
         }.map_err(Error::generic_err);
     };
 }
