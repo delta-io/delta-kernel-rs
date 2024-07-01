@@ -6,46 +6,50 @@ use std::sync::{Arc, Mutex};
 
 use delta_kernel::scan::state::{visit_scan_files, DvInfo, GlobalScanState};
 use delta_kernel::scan::{Scan, ScanBuilder, ScanData};
+use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{DeltaResult, EngineData as KernelEngineData, Error};
+use delta_kernel::{DeltaResult, EngineData, Error};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
 
 use crate::{
-    unwrap_kernel_expression, AllocateStringFn, EnginePredicate, ExternEngine, ExternResult,
-    IntoExternResult, KernelBoolSlice, KernelExpressionVisitorState, KernelStringSlice,
-    NullableCvoid, SharedExternEngine, SharedSnapshot, TryFromStringSlice,
+    unwrap_kernel_expression, AllocateStringFn, EnginePredicate, ExclusiveEngineData, ExternEngine,
+    ExternResult, IntoExternResult, KernelBoolSlice, KernelExpressionVisitorState,
+    KernelStringSlice, NullableCvoid, SharedExternEngine, SharedSnapshot, StringIter,
+    StringSliceIterator, TryFromStringSlice,
 };
 
 use super::handle::Handle;
 
-// TODO: Do we want this handle at all? Perhaps we should just _always_ pass raw *mut c_void pointers
-// that are the engine data? Even if we want the type, should it be a shared handle instead?
-/// an opaque struct that encapsulates data read by an engine. this handle can be passed back into
-/// some kernel calls to operate on the data, or can be converted into the raw data as read by the
-/// [`delta_kernel::Engine`] by calling [`get_raw_engine_data`]
-#[handle_descriptor(target=dyn KernelEngineData, mutable=true, sized=false)]
-pub struct EngineData;
+/// Get the number of rows in an engine data
+///
+/// # Safety
+/// `data_handle` must be a valid pointer to a kernel allocated `ExclusiveEngineData`
+#[no_mangle]
+pub unsafe extern "C" fn engine_data_length(data: &mut Handle<ExclusiveEngineData>) -> usize {
+    let data = unsafe { data.as_mut() };
+    data.length()
+}
 
-/// Allow an engine to "unwrap" an [`EngineData`] into the raw pointer for the case it wants
+/// Allow an engine to "unwrap" an [`ExclusiveEngineData`] into the raw pointer for the case it wants
 /// to use its own engine data format
 ///
 /// # Safety
 ///
-/// `data_handle` must be a valid pointer to a kernel allocated `EngineData`. The Engine must
+/// `data_handle` must be a valid pointer to a kernel allocated `ExclusiveEngineData`. The Engine must
 /// ensure the handle outlives the returned pointer.
 // TODO(frj): What is the engine actually doing with this method?? If we need access to raw extern
 // pointers, we will need to define an `ExternEngineData` trait that exposes such capability, along
 // with an ExternEngineDataVtable that implements it. See `ExternEngine` and `ExternEngineVtable`
 // for examples of how that works.
 #[no_mangle]
-pub unsafe extern "C" fn get_raw_engine_data(mut data: Handle<EngineData>) -> *mut c_void {
-    let ptr = get_raw_engine_data_impl(&mut data) as *mut dyn KernelEngineData;
+pub unsafe extern "C" fn get_raw_engine_data(mut data: Handle<ExclusiveEngineData>) -> *mut c_void {
+    let ptr = get_raw_engine_data_impl(&mut data) as *mut dyn EngineData;
     ptr as _
 }
 
-unsafe fn get_raw_engine_data_impl(data: &mut Handle<EngineData>) -> &mut dyn KernelEngineData {
+unsafe fn get_raw_engine_data_impl(data: &mut Handle<ExclusiveEngineData>) -> &mut dyn EngineData {
     let _data = unsafe { data.as_mut() };
     todo!() // See TODO comment for EngineData
 }
@@ -54,8 +58,7 @@ unsafe fn get_raw_engine_data_impl(data: &mut Handle<EngineData>) -> &mut dyn Ke
 /// Interface](https://arrow.apache.org/docs/format/CDataInterface.html). This includes the data and
 /// the schema.
 #[cfg(feature = "default-engine")]
-// FIXME: cbindgen doesn't recognize the FFI_ArrowFoo fields in this struct
-//#[repr(C)]
+#[repr(C)]
 pub struct ArrowFFIData {
     pub array: arrow_data::ffi::FFI_ArrowArray,
     pub schema: arrow_schema::ffi::FFI_ArrowSchema,
@@ -66,12 +69,12 @@ pub struct ArrowFFIData {
 /// the schema.
 ///
 /// # Safety
-/// data_handle must be a valid EngineData as read by the
+/// data_handle must be a valid ExclusiveEngineData as read by the
 /// [`delta_kernel::engine::default::DefaultEngine`] obtained from `get_default_engine`.
 #[cfg(feature = "default-engine")]
 #[no_mangle]
 pub unsafe extern "C" fn get_raw_arrow_data(
-    data: Handle<EngineData>,
+    data: Handle<ExclusiveEngineData>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<*mut ArrowFFIData> {
     // TODO(frj): This consumes the handle. Is that what we really want?
@@ -81,7 +84,7 @@ pub unsafe extern "C" fn get_raw_arrow_data(
 
 // TODO: This method leaks the returned pointer memory. How will the engine free it?
 #[cfg(feature = "default-engine")]
-fn get_raw_arrow_data_impl(data: Box<dyn KernelEngineData>) -> DeltaResult<*mut ArrowFFIData> {
+fn get_raw_arrow_data_impl(data: Box<dyn EngineData>) -> DeltaResult<*mut ArrowFFIData> {
     let record_batch: arrow_array::RecordBatch = data
         .into_any()
         .downcast::<delta_kernel::engine::arrow_data::ArrowEngineData>()
@@ -106,7 +109,7 @@ pub struct SharedScan;
 /// # Safety
 /// Caller is responsible for passing a [valid][Handle#Validity] scan handle.
 #[no_mangle]
-pub unsafe extern "C" fn drop_scan(scan: Handle<SharedScan>) {
+pub unsafe extern "C" fn free_scan(scan: Handle<SharedScan>) {
     scan.drop_handle();
 }
 
@@ -142,6 +145,8 @@ fn scan_impl(
 
 #[handle_descriptor(target=GlobalScanState, mutable=false, sized=true)]
 pub struct SharedGlobalScanState;
+#[handle_descriptor(target=Schema, mutable=false, sized=true)]
+pub struct SharedSchema;
 
 /// Get the global state for a scan. See the docs for [`delta_kernel::scan::state::GlobalScanState`]
 /// for more information.
@@ -156,11 +161,56 @@ pub unsafe extern "C" fn get_global_scan_state(
     Arc::new(scan.global_scan_state()).into()
 }
 
-/// # Safety
+/// Get the kernel view of the physical read schema that an engine should read from parquet file in
+/// a scan
 ///
+/// # Safety
+/// Engine is responsible for providing a valid GlobalScanState pointer
+#[no_mangle]
+pub unsafe extern "C" fn get_global_read_schema(
+    state: Handle<SharedGlobalScanState>,
+) -> Handle<SharedSchema> {
+    let state = unsafe { state.as_ref() };
+    state.read_schema.clone().into()
+}
+
+/// Free a global read schema
+///
+/// # Safety
+/// Engine is responsible for providing a valid schema obtained via [`get_global_read_schema`]
+#[no_mangle]
+pub unsafe extern "C" fn free_global_read_schema(schema: Handle<SharedSchema>) {
+    schema.drop_handle();
+}
+
+/// Get a count of the number of partition columns for this scan
+///
+/// # Safety
 /// Caller is responsible for passing a valid global scan pointer.
 #[no_mangle]
-pub unsafe extern "C" fn drop_global_scan_state(state: Handle<SharedGlobalScanState>) {
+pub unsafe extern "C" fn get_partition_column_count(state: Handle<SharedGlobalScanState>) -> usize {
+    let state = unsafe { state.as_ref() };
+    state.partition_columns.len()
+}
+
+/// Get an iterator of the list of partition columns for this scan.
+///
+/// # Safety
+/// Caller is responsible for passing a valid global scan pointer.
+#[no_mangle]
+pub unsafe extern "C" fn get_partition_columns(
+    state: Handle<SharedGlobalScanState>,
+) -> Handle<StringSliceIterator> {
+    let state = unsafe { state.as_ref() };
+    let iter: Box<StringIter> = Box::new(state.partition_columns.clone().into_iter());
+    iter.into()
+}
+
+/// # Safety
+///
+/// Caller is responsible for passing a valid global scan state pointer.
+#[no_mangle]
+pub unsafe extern "C" fn free_global_scan_state(state: Handle<SharedGlobalScanState>) {
     state.drop_handle();
 }
 
@@ -173,7 +223,7 @@ pub unsafe extern "C" fn drop_global_scan_state(state: Handle<SharedGlobalScanSt
 pub struct KernelScanDataIterator {
     // Mutex -> Allow the iterator to be accessed safely by multiple threads.
     // Box -> Wrap its unsized content this struct is fixed-size with thin pointers.
-    // Item = Box<dyn KernelEngineData>, see above, Vec<bool> -> can become a KernelBoolSlice
+    // Item = DeltaResult<ScanData>
     data: Mutex<Box<dyn Iterator<Item = DeltaResult<ScanData>> + Send>>,
 
     // Also keep a reference to the external engine for its error allocator. The default Parquet and
@@ -223,14 +273,14 @@ fn kernel_scan_data_init_impl(
 /// # Safety
 ///
 /// The iterator must be valid (returned by [kernel_scan_data_init]) and not yet freed by
-/// [kernel_scan_data_free]. The visitor function pointer must be non-null.
+/// [`free_kernel_scan_data`]. The visitor function pointer must be non-null.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_scan_data_next(
     data: Handle<SharedScanDataIterator>,
     engine_context: NullableCvoid,
     engine_visitor: extern "C" fn(
         engine_context: NullableCvoid,
-        engine_data: Handle<EngineData>,
+        engine_data: Handle<ExclusiveEngineData>,
         selection_vector: KernelBoolSlice,
     ),
 ) -> ExternResult<bool> {
@@ -243,7 +293,7 @@ fn kernel_scan_data_next_impl(
     engine_context: NullableCvoid,
     engine_visitor: extern "C" fn(
         engine_context: NullableCvoid,
-        engine_data: Handle<EngineData>,
+        engine_data: Handle<ExclusiveEngineData>,
         selection_vector: KernelBoolSlice,
     ),
 ) -> DeltaResult<bool> {
@@ -267,7 +317,7 @@ fn kernel_scan_data_next_impl(
 // we should probably be consistent with drop vs. free on engine side (probably the latter is more
 // intuitive to non-rust code)
 #[no_mangle]
-pub unsafe extern "C" fn kernel_scan_data_free(data: Handle<SharedScanDataIterator>) {
+pub unsafe extern "C" fn free_kernel_scan_data(data: Handle<SharedScanDataIterator>) {
     data.drop_handle();
 }
 
@@ -308,7 +358,7 @@ pub unsafe extern "C" fn get_from_map(
     allocate_fn: AllocateStringFn,
 ) -> NullableCvoid {
     // TODO: Return ExternResult to caller instead of panicking?
-    let string_key = unsafe { String::try_from_slice(key) };
+    let string_key = unsafe { String::try_from_slice(&key) };
     map.values
         .get(&string_key.unwrap())
         .and_then(|v| allocate_fn(v.into()))
@@ -377,10 +427,10 @@ struct ContextWrapper {
 /// data which provides the data handle and selection vector as each element in the iterator.
 ///
 /// # Safety
-/// engine is responsbile for passing a valid [`EngineData`] and selection vector.
+/// engine is responsbile for passing a valid [`ExclusiveEngineData`] and selection vector.
 #[no_mangle]
 pub unsafe extern "C" fn visit_scan_data(
-    data: Handle<EngineData>,
+    data: Handle<ExclusiveEngineData>,
     selection_vec: KernelBoolSlice,
     engine_context: NullableCvoid,
     callback: CScanCallback,

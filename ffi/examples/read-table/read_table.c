@@ -1,34 +1,77 @@
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 
-#include "delta_kernel_ffi.h"
+#include "arrow.h"
+#include "read_table.h"
 #include "schema.h"
 
-#ifdef PRINT_ARROW_DATA
-#include "arrow.h"
+// some diagnostic functions
+void print_diag(char* fmt, ...)
+{
+#ifdef VERBOSE
+  va_list args;
+  va_start(args, fmt);
+  vprintf(fmt, args);
+  va_end(args);
+#else
+  (void)(fmt);
 #endif
-
-struct EngineContext {
-  GlobalScanState *global_state;
-  const ExternEngineHandle *engine;
-};
-
-// This is how we represent our errors. The kernel will ask us to contruct this struct whenever it
-// enounters an error, and then return the contructed EngineError to us
-typedef struct Error {
-  struct EngineError etype;
-  char* msg;
-} Error;
-
-
-// create a char* from a KernelStringSlice
-void* allocate_string(const KernelStringSlice slice) {
-  char* buf = malloc(sizeof(char) * (slice.len + 1)); // +1 for null
-  snprintf(buf, slice.len + 1, "%s", slice.ptr);
-  return buf;
 }
 
-EngineError* allocate_error(KernelError etype, const KernelStringSlice msg) {
+// Print out an error message, plus the code and kernel message of an error
+void print_error(const char* msg, Error* err)
+{
+  printf("[ERROR] %s\n", msg);
+  printf("  Kernel Code: %i\n", err->etype.etype);
+  printf("  Kernel Msg: %s\n", err->msg);
+}
+
+// free an error
+void free_error(Error* error)
+{
+  free(error->msg);
+  free(error);
+}
+
+// Print the content of a selection vector if `VERBOSE` is defined in read_table.h
+void print_selection_vector(const char* indent, const KernelBoolSlice* selection_vec)
+{
+#ifdef VERBOSE
+  for (uintptr_t i = 0; i < selection_vec->len; i++) {
+    printf("%ssel[%i] = %b\n", indent, i, selection_vec->ptr[i]);
+  }
+#else
+  (void)indent;
+  (void)selection_vec;
+#endif
+}
+
+// Print info about table partitions if `VERBOSE` is defined in read_table.h
+void print_partition_info(struct EngineContext* context, const CStringMap* partition_values)
+{
+#ifdef VERBOSE
+  for (int i = 0; i < context->partition_cols->len; i++) {
+    char* col = context->partition_cols->cols[i];
+    KernelStringSlice key = { col, strlen(col) };
+    char* partition_val = get_from_map(partition_values, key, allocate_string);
+    if (partition_val) {
+      print_diag("  partition '%s' here: %s\n", col, partition_val);
+      free(partition_val);
+    } else {
+      print_diag("  no partition here\n");
+    }
+  }
+#else
+  (void)context;
+  (void)partition_values;
+#endif
+}
+
+// kernel will call this to allocate our errors. This can be used to create an "engine native" type
+// error
+EngineError* allocate_error(KernelError etype, const KernelStringSlice msg)
+{
   Error* error = malloc(sizeof(Error));
   error->etype.etype = etype;
   char* charmsg = allocate_string(msg);
@@ -36,65 +79,116 @@ EngineError* allocate_error(KernelError etype, const KernelStringSlice msg) {
   return (EngineError*)error;
 }
 
-void free_error(Error* error) {
-  free(error->msg);
-  free(error);
+// utility to turn a slice into a char*
+void* allocate_string(const KernelStringSlice slice)
+{
+  return strndup(slice.ptr, slice.len);
 }
 
-void print_selection_vector(const char* indent, const KernelBoolSlice *selection_vec) {
-  for (int i = 0; i < selection_vec->len; i++) {
-    printf("%ssel[%i] = %b\n", indent, i, selection_vec->ptr[i]);
-  }
-}
-
-void print_error(const char* indent, Error* err) {
-  printf("%sCode: %i\n", indent, err->etype);
-  printf("%sMsg: %s\n", indent, err->msg);
-}
-
-void set_builder_opt(EngineBuilder *engine_builder, char* key, char* val) {
-  KernelStringSlice key_slice = {key, strlen(key)};
-  KernelStringSlice val_slice = {val, strlen(val)};
+// utility function to convert key/val into slices and set them on a builder
+void set_builder_opt(EngineBuilder* engine_builder, char* key, char* val)
+{
+  KernelStringSlice key_slice = { key, strlen(key) };
+  KernelStringSlice val_slice = { val, strlen(val) };
   set_builder_option(engine_builder, key_slice, val_slice);
 }
 
-void visit_callback(void* engine_context, const KernelStringSlice path, long size, const DvInfo *dv_info, CStringMap *partition_values) {
-  printf("called back to actually read!\n  path: %.*s\n", path.len, path.ptr);
-  struct EngineContext *context = engine_context;
-  ExternResultKernelBoolSlice selection_vector_res = selection_vector_from_dv(dv_info, context->engine, context->global_state);
+// Kernel will call this function for each file that should be scanned. The arguments include enough
+// context to constuct the correct logical data from the physically read parquet
+void scan_row_callback(
+  void* engine_context,
+  KernelStringSlice path,
+  int64_t size,
+  const DvInfo* dv_info,
+  const CStringMap* partition_values)
+{
+  (void)size; // not using this at the moment
+  struct EngineContext* context = engine_context;
+  print_diag("Called back to read file: %.*s\n", (int)path.len, path.ptr);
+  ExternResultKernelBoolSlice selection_vector_res =
+    selection_vector_from_dv(dv_info, context->engine, context->global_state);
   if (selection_vector_res.tag != OkKernelBoolSlice) {
     printf("Could not get selection vector from kernel\n");
-    return;
+    exit(-1);
   }
   KernelBoolSlice selection_vector = selection_vector_res.ok;
   if (selection_vector.len > 0) {
-    printf("  Selection vector:\n");
+    print_diag("  Selection vector for this file:\n");
     print_selection_vector("    ", &selection_vector);
   } else {
-    printf("  No selection vector for this call\n");
+    print_diag("  No selection vector for this file\n");
   }
-  drop_bool_slice(selection_vector);
-  // normally this would be picked out of the schema
-  char* letter_key = "letter";
-  KernelStringSlice key = {letter_key, strlen(letter_key)};
-  char* partition_val = get_from_map(partition_values, key, allocate_string);
-  if (partition_val) {
-    printf("  letter partition here: %s\n", partition_val);
-    free(partition_val);
-  } else {
-    printf("  no partition here\n");
-  }
+  context->partition_values = partition_values;
+  print_partition_info(context, partition_values);
+#ifdef PRINT_ARROW_DATA
+  c_read_parquet_file(context, path, selection_vector);
+#endif
+  free_bool_slice(selection_vector);
+  context->partition_values = NULL;
 }
 
-void visit_data(void *engine_context, EngineDataHandle *engine_data, KernelBoolSlice selection_vec) {
-  printf("Got some data\n");
-  printf("  Of this data, here is a selection vector\n");
+// For each chunk of scan data (which may contain multiple files to scan), kernel will call this
+// function (named do_visit_scan_data to avoid conflict with visit_scan_data exported by kernel)
+void do_visit_scan_data(
+  void* engine_context,
+  ExclusiveEngineData* engine_data,
+  KernelBoolSlice selection_vec)
+{
+  print_diag("\nScan iterator found some data to read\n  Of this data, here is "
+             "a selection vector\n");
   print_selection_vector("    ", &selection_vec);
-  visit_scan_data(engine_data, selection_vec, engine_context, visit_callback);
-  drop_bool_slice(selection_vec);
+  // Ask kernel to iterate each individual file and call us back with extracted metadata
+  print_diag("Asking kernel to call us back for each scan row (file to read)\n");
+  visit_scan_data(engine_data, selection_vec, engine_context, scan_row_callback);
+  free_bool_slice(selection_vec);
 }
 
-int main(int argc, char* argv[]) {
+// Called for each element of the partition StringSliceIterator. We just turn the slice into a
+// `char*` and append it to our list. We knew the total number of partitions up front, so this
+// assumes that `list->cols` has been allocated with enough space to store the pointer.
+void visit_partition(void* context, const KernelStringSlice partition)
+{
+  PartitionList* list = context;
+  char* col = allocate_string(partition);
+  list->cols[list->len] = col;
+  list->len++;
+}
+
+// Build a list of partition column names.
+PartitionList* get_partition_list(SharedGlobalScanState* state)
+{
+  print_diag("Building list of partition columns\n");
+  int count = get_partition_column_count(state);
+  PartitionList* list = malloc(sizeof(PartitionList));
+  // We set the `len` to 0 here and use it to track how many items we've added to the list
+  list->len = 0;
+  list->cols = malloc(sizeof(char*) * count);
+  StringSliceIterator* part_iter = get_partition_columns(state);
+  for (;;) {
+    bool has_next = string_slice_next(part_iter, list, visit_partition);
+    if (!has_next) {
+      print_diag("Done iterating partition columns\n");
+      break;
+    }
+  }
+  if (list->len != count) {
+    printf("Error, partition iterator did not return get_partition_column_count columns\n");
+    exit(-1);
+  }
+  if (list->len > 0) {
+    print_diag("Partition columns are:\n");
+    for (int i = 0; i < list->len; i++) {
+      print_diag("  - %s\n", list->cols[i]);
+    }
+  } else {
+    print_diag("Table has no partition columns\n");
+  }
+  free_string_slice_data(part_iter);
+  return list;
+}
+
+int main(int argc, char* argv[])
+{
   if (argc < 2) {
     printf("Usage: %s table/path\n", argv[0]);
     return -1;
@@ -103,96 +197,114 @@ int main(int argc, char* argv[]) {
   char* table_path = argv[1];
   printf("Reading table at %s\n", table_path);
 
-  KernelStringSlice table_path_slice = {table_path, strlen(table_path)};
+  KernelStringSlice table_path_slice = { table_path, strlen(table_path) };
 
   ExternResultEngineBuilder engine_builder_res =
     get_engine_builder(table_path_slice, allocate_error);
   if (engine_builder_res.tag != OkEngineBuilder) {
-    printf("Could not get engine builder.\n");
-    print_error("  ", (Error*)engine_builder_res.err);
+    print_error("Could not get engine builder.", (Error*)engine_builder_res.err);
     free_error((Error*)engine_builder_res.err);
     return -1;
   }
 
   // an example of using a builder to set options when building an engine
-  EngineBuilder *engine_builder = engine_builder_res.ok;
+  EngineBuilder* engine_builder = engine_builder_res.ok;
   set_builder_opt(engine_builder, "aws_region", "us-west-2");
   // potentially set credentials here
-  //set_builder_opt(engine_builder, "aws_access_key_id" , "[redacted]");
-  //set_builder_opt(engine_builder, "aws_secret_access_key", "[redacted]");
-  ExternResultExternEngineHandle engine_res =
-    builder_build(engine_builder);
+  // set_builder_opt(engine_builder, "aws_access_key_id" , "[redacted]");
+  // set_builder_opt(engine_builder, "aws_secret_access_key", "[redacted]");
+  ExternResultHandleSharedExternEngine engine_res = builder_build(engine_builder);
 
   // alternately if we don't care to set any options on the builder:
   // ExternResultExternEngineHandle engine_res =
   //   get_default_engine(table_path_slice, NULL);
 
-  if (engine_res.tag != OkExternEngineHandle) {
-    printf("Failed to get engine\n");
-    print_error("  ", (Error*)engine_builder_res.err);
+  if (engine_res.tag != OkHandleSharedExternEngine) {
+    print_error("File to get engine", (Error*)engine_builder_res.err);
     free_error((Error*)engine_builder_res.err);
     return -1;
   }
 
-  const ExternEngineHandle *engine = engine_res.ok;
+  SharedExternEngine* engine = engine_res.ok;
 
-  ExternResultSnapshotHandle snapshot_handle_res = snapshot(table_path_slice, engine);
-  if (snapshot_handle_res.tag != OkSnapshotHandle) {
-    printf("Failed to create snapshot\n");
-    print_error("  ", (Error*)snapshot_handle_res.err);
-    free_error((Error*)snapshot_handle_res.err);
+  ExternResultHandleSharedSnapshot snapshot_res = snapshot(table_path_slice, engine);
+  if (snapshot_res.tag != OkHandleSharedSnapshot) {
+    print_error("Failed to create snapshot.", (Error*)snapshot_res.err);
+    free_error((Error*)snapshot_res.err);
     return -1;
   }
 
-  const SnapshotHandle *snapshot_handle = snapshot_handle_res.ok;
+  SharedSnapshot* snapshot = snapshot_res.ok;
 
-  uint64_t v = version(snapshot_handle);
-  printf("version: %llu\n\n", v);
-  print_schema(snapshot_handle);
+  uint64_t v = version(snapshot);
+  printf("version: %" PRIu64 "\n\n", v);
+  print_schema(snapshot);
 
-  ExternResultScan scan_res = scan(snapshot_handle, engine, NULL);
-  if (scan_res.tag != OkScan) {
+  char* table_root = snapshot_table_root(snapshot, allocate_string);
+  print_diag("Table root: %s\n", table_root);
+
+  print_diag("Starting table scan\n\n");
+
+  ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL);
+  if (scan_res.tag != OkHandleSharedScan) {
     printf("Failed to create scan\n");
-    print_error("  ", (Error*)scan_res.err);
-    free_error((Error*)scan_res.err);
     return -1;
   }
 
-  Scan *scan = scan_res.ok;
-  GlobalScanState *global_state = get_global_scan_state(scan);
-  struct EngineContext context = { global_state, engine };
+  SharedScan* scan = scan_res.ok;
+  SharedGlobalScanState* global_state = get_global_scan_state(scan);
+  SharedSchema* read_schema = get_global_read_schema(global_state);
+  PartitionList* partition_cols = get_partition_list(global_state);
+  struct EngineContext context = {
+    global_state,
+    read_schema,
+    table_root,
+    engine,
+    partition_cols,
+    .partition_values = NULL,
+#ifdef PRINT_ARROW_DATA
+    .arrow_context = init_arrow_context(),
+#endif
+  };
 
-  ExternResultKernelScanDataIterator data_iter_res =
-    kernel_scan_data_init(engine, scan);
-  if (data_iter_res.tag != OkKernelScanDataIterator) {
-    printf("Failed to construct scan data iterator\n");
-    print_error("  ", (Error*)data_iter_res.err);
+  ExternResultHandleSharedScanDataIterator data_iter_res = kernel_scan_data_init(engine, scan);
+  if (data_iter_res.tag != OkHandleSharedScanDataIterator) {
+    print_error("Failed to construct scan data iterator.", (Error*)data_iter_res.err);
     free_error((Error*)data_iter_res.err);
     return -1;
   }
 
-  KernelScanDataIterator *data_iter = data_iter_res.ok;
+  SharedScanDataIterator* data_iter = data_iter_res.ok;
+
+  print_diag("\nIterating scan data\n");
 
   // iterate scan files
   for (;;) {
-    ExternResultbool ok_res = kernel_scan_data_next(data_iter, &context, visit_data);
+    ExternResultbool ok_res = kernel_scan_data_next(data_iter, &context, do_visit_scan_data);
     if (ok_res.tag != Okbool) {
-      printf("Failed to iterate scan data\n");
-      print_error("  ", (Error*)ok_res.err);
+      print_error("Failed to iterate scan data.", (Error*)ok_res.err);
       free_error((Error*)ok_res.err);
       return -1;
     } else if (!ok_res.ok) {
-      printf("Iterator done\n");
+      print_diag("Scan data iterator done\n");
       break;
     }
   }
 
-  printf("All done\n");
+  print_diag("All done reading table data\n");
 
-  kernel_scan_data_free(data_iter);
-  drop_global_scan_state(global_state);
-  drop_snapshot(snapshot_handle);
-  drop_engine(engine);
+#ifdef PRINT_ARROW_DATA
+  print_arrow_context(context.arrow_context);
+  free_arrow_context(context.arrow_context);
+  context.arrow_context = NULL;
+#endif
+
+  free_kernel_scan_data(data_iter);
+  free_global_read_schema(read_schema);
+  free_global_scan_state(global_state);
+  free_snapshot(snapshot);
+  free_engine(engine);
+  free(context.table_root);
 
   return 0;
 }
