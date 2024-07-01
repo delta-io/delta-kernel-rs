@@ -23,23 +23,7 @@ macro_rules! prim_array_cmp {
     };
 }
 
-macro_rules! prim_array_cmp_neg {
-    ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
-
-        return match $left_arr.data_type() {
-        $(
-            $data_ty => not(&in_list(
-                $left_arr.as_primitive::<$prim_ty>(),
-                $right_arr.as_list::<i32>(),
-            )?).map(wrap_comparison_result),
-        )+
-            _ => unimplemented!()
-        }.map_err(Error::generic_err);
-    };
-}
-
 pub(crate) use prim_array_cmp;
-pub(crate) use prim_array_cmp_neg;
 
 /// Get the indicies in `parquet_schema` of the specified columns in `requested_schema`. This
 /// returns a tuples of (mask_indicies: Vec<parquet_schema_index>, reorder_indicies:

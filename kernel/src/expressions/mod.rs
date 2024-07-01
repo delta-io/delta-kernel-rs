@@ -103,7 +103,7 @@ impl Display for BinaryOperator {
             Self::NotEqual => write!(f, "!="),
             // TODO(roeap): AFAIK DISTINCT does not have a commonly used operator symbol
             // so ideally this would not be used as we use Display for rendering expressions
-            // in our code we take care of this, but theirs might now ...
+            // in our code we take care of this, but theirs might not ...
             Self::Distinct => write!(f, "DISTINCT"),
             Self::In => write!(f, "IN"),
             Self::NotIn => write!(f, "NOT IN"),
