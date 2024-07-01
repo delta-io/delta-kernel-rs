@@ -77,8 +77,8 @@ impl Scalar {
             Array(data) => {
                 let values = data.array_elements();
                 let vecs: Vec<_> = values.iter().map(|v| v.to_array(num_rows)).try_collect()?;
-                let values = vecs.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
-                let offsets = vecs.iter().map(|v| v.len()).collect::<Vec<_>>();
+                let values: Vec<_> = vecs.iter().map(|x| x.as_ref()).collect:();
+                let offsets: Vec<_> = vecs.iter().map(|v| v.len()).collect();
                 let offset_buffer = OffsetBuffer::from_lengths(offsets);
                 let field = ArrowField::try_from(data.array_type())?;
                 Arc::new(ListArray::new(
