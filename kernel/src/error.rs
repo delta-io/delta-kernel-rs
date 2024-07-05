@@ -52,7 +52,7 @@ pub enum Error {
     #[error(transparent)]
     IOError(std::io::Error),
 
-    /// An error enountered while working with parquet data
+    /// An error encountered while working with parquet data
     #[cfg(feature = "parquet")]
     #[error("Arrow error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
@@ -101,7 +101,7 @@ pub enum Error {
     #[error("Invalid url: {0}")]
     InvalidUrl(#[from] url::ParseError),
 
-    /// serde enountered malformed json
+    /// serde encountered malformed json
     #[error(transparent)]
     MalformedJson(serde_json::Error),
 
@@ -141,12 +141,16 @@ pub enum Error {
     InvalidTableLocation(String),
 
     /// Precision or scale not compliant with delta specification
-    #[error("Inavlid decimal: {0}")]
+    #[error("Invalid decimal: {0}")]
     InvalidDecimal(String),
 
-    /// Incosistent data passed to struct scalar
+    /// Inconsistent data passed to struct scalar
     #[error("Invalid struct data: {0}")]
     InvalidStructData(String),
+
+    /// Expressions did not parse or evaluate correctly
+    #[error("Invalid expression evaluation: {0}")]
+    InvalidExpressionEvaluation(String),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -191,6 +195,9 @@ impl Error {
     }
     pub fn invalid_struct_data(msg: impl ToString) -> Self {
         Self::InvalidStructData(msg.to_string())
+    }
+    pub fn invalid_expression(msg: impl ToString) -> Self {
+        Self::InvalidExpressionEvaluation(msg.to_string())
     }
 
     // Capture a backtrace when the error is constructed.

@@ -276,7 +276,6 @@ fn evaluate_expression(
 ) -> DeltaResult<ArrayRef> {
     use BinaryOperator::*;
     use Expression::*;
-
     match (expression, result_type) {
         (Literal(scalar), _) => Ok(scalar.to_array(batch.num_rows())?),
         (Column(name), _) => {

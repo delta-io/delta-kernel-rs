@@ -13,12 +13,24 @@ macro_rules! prim_array_cmp {
 
         return match $left_arr.data_type() {
         $(
-            $data_ty => in_list(
-                $left_arr.as_primitive::<$prim_ty>(),
-                $right_arr.as_list::<i32>(),
-            ).map(wrap_comparison_result),
+            $data_ty => {
+                let prim_array = $left_arr.as_primitive_opt::<$prim_ty>()
+                        .ok_or(Error::invalid_expression(
+                            format!("Cannot cast to primitive array: {}", $left_arr.data_type()))
+                        )?;
+                    let list_array = $right_arr.as_list_opt::<i32>()
+                        .ok_or(Error::invalid_expression(
+                            format!("Cannot cast to list array: {}", $right_arr.data_type()))
+                        )?;
+                in_list(prim_array, list_array).map(wrap_comparison_result)
+            }
         )+
-            _ => Err(ArrowError::CastError(format!("Bad Comparison between: {:?} and {:?}", $left_arr.data_type(), $right_arr.data_type())))
+            _ => Err(ArrowError::CastError(
+                        format!("Bad Comparison between: {:?} and {:?}",
+                            $left_arr.data_type(),
+                            $right_arr.data_type())
+                        )
+                )
         }.map_err(Error::generic_err);
     };
 }

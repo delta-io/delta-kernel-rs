@@ -15,7 +15,7 @@ pub struct StructData {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArrayData {
-    tpe: ArrayType,
+    pub tpe: ArrayType,
     pub elements: Vec<Scalar>,
 }
 
