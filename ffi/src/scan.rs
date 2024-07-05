@@ -16,7 +16,7 @@ use url::Url;
 use crate::{
     unwrap_kernel_expression, AllocateStringFn, EnginePredicate, ExclusiveEngineData, ExternEngine,
     ExternResult, IntoExternResult, KernelBoolSlice, KernelExpressionVisitorState,
-    KernelRowIndexArray, KernelStringSlice, NullableCvoid, SharedExternEngine, SharedSnapshot, 
+    KernelRowIndexArray, KernelStringSlice, NullableCvoid, SharedExternEngine, SharedSnapshot,
     StringIter, StringSliceIterator, TryFromStringSlice,
 };
 

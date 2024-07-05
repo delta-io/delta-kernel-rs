@@ -232,8 +232,7 @@ mod private {
     }
 
     impl From<Vec<u64>> for KernelRowIndexArray {
-        fn from(mut vec: Vec<u64>) -> Self {
-            vec.shrink_to_fit();
+        fn from(vec: Vec<u64>) -> Self {
             let len = vec.len();
             let boxed = vec.into_boxed_slice();
             let ptr = Box::into_raw(boxed).cast();

@@ -72,16 +72,13 @@ impl DvInfo {
         engine: &dyn Engine,
         table_root: &url::Url,
     ) -> DeltaResult<Option<Vec<u64>>> {
-        let indexes = self
-            .deletion_vector
+        self.deletion_vector
             .as_ref()
             .map(|dv| {
                 let fs_client = engine.get_file_system_client();
                 dv.row_indexes(fs_client, table_root)
             })
-            .transpose()?;
-
-        Ok(indexes)
+            .transpose()
     }
 }
 
