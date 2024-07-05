@@ -218,6 +218,10 @@ impl Snapshot {
         &self.log_segment
     }
 
+    pub fn table_root(&self) -> &Url {
+        &self.table_root
+    }
+
     /// Version of this `Snapshot` in the table.
     pub fn version(&self) -> Version {
         self.version

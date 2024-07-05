@@ -19,7 +19,7 @@ void visit_callback(void* engine_context,
 }
 
 void visit_data(void* engine_context,
-                EngineData* engine_data,
+                ExclusiveEngineData* engine_data,
                 const KernelBoolSlice selection_vec) {
   visit_scan_data(engine_data, selection_vec, engine_context, visit_callback);
 }
@@ -70,9 +70,9 @@ int test_engine(KernelStringSlice table_path_slice,
     }
   }
 
-  drop_scan(scan);
-  drop_snapshot(snapshot);
-  drop_engine(engine);
+  free_scan(scan);
+  free_snapshot(snapshot);
+  free_engine(engine);
   return 0;
 }
 
