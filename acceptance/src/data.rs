@@ -5,9 +5,7 @@ use arrow_ord::sort::{lexsort_to_indices, SortColumn};
 use arrow_schema::{DataType, Schema};
 use arrow_select::{concat::concat_batches, filter::filter_record_batch, take::take};
 
-use delta_kernel::{
-    engine::arrow_data::ArrowEngineData, DeltaResult, Engine, Error, Table,
-};
+use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Engine, Error, Table};
 use futures::{stream::TryStreamExt, StreamExt};
 use object_store::{local::LocalFileSystem, ObjectStore};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};

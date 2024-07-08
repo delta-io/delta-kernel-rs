@@ -338,9 +338,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
             left: Box::new(Expression::column("id")),
             right: Box::new(Expression::literal(value)),
         };
-        let scan = snapshot.scan_builder()
-            .with_predicate(predicate)
-            .build()?;
+        let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
 
         let expected_files = expected_batches.len();
         let mut files_scanned = 0;
@@ -535,7 +533,8 @@ fn read_table_data(
             .collect();
         Arc::new(Schema::new(selected_fields))
     });
-    let scan = snapshot.scan_builder()
+    let scan = snapshot
+        .scan_builder()
         .with_schema_opt(read_schema)
         .with_predicate_opt(predicate)
         .build()?;
