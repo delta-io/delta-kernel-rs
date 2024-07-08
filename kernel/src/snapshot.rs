@@ -12,6 +12,7 @@ use url::Url;
 use crate::actions::{get_log_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
 use crate::column_mapping::{ColumnMappingMode, COLUMN_MAPPING_MODE_KEY};
 use crate::path::{version_from_location, LogPath};
+use crate::scan::ScanBuilder;
 use crate::schema::{Schema, SchemaRef};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, FileSystemClient, Version};
@@ -247,6 +248,11 @@ impl Snapshot {
     /// `Snapshot`s version.
     pub fn column_mapping_mode(&self) -> ColumnMappingMode {
         self.column_mapping_mode
+    }
+
+    /// Create a [`ScanBuilder`] for this `Snapshot`.
+    pub fn scan_builder(self) -> ScanBuilder {
+        ScanBuilder::new(self)
     }
 }
 
