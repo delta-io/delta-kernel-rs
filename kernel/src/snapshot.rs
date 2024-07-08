@@ -20,7 +20,7 @@ use crate::{EngineData, Expression};
 
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
 struct LogSegment {
@@ -102,6 +102,8 @@ impl LogSegment {
 /// throughout time, `Snapshot`s represent a view of a table at a specific point in time; they
 /// have a defined schema (which may change over time for any given table), specific version, and
 /// frozen log segment.
+
+#[derive(Clone)]
 pub struct Snapshot {
     pub(crate) table_root: Url,
     pub(crate) log_segment: LogSegment,
@@ -249,10 +251,9 @@ impl Snapshot {
     pub fn column_mapping_mode(&self) -> ColumnMappingMode {
         self.column_mapping_mode
     }
-
     /// Create a [`ScanBuilder`] for this `Snapshot`.
-    pub fn scan_builder(self) -> ScanBuilder {
-        ScanBuilder::new(self)
+    pub fn scan_builder(&self) -> ScanBuilder {
+        ScanBuilder::new(self.clone())
     }
 }
 

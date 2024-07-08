@@ -131,7 +131,7 @@ fn scan_impl(
     snapshot: Arc<Snapshot>,
     predicate: Option<&mut EnginePredicate>,
 ) -> DeltaResult<Handle<SharedScan>> {
-    let mut scan_builder = ScanBuilder::new(snapshot);
+    let mut scan_builder = snapshot.scan_builder();
     if let Some(predicate) = predicate {
         let mut visitor_state = KernelExpressionVisitorState::new();
         let exprid = (predicate.visitor)(predicate.predicate, &mut visitor_state);
