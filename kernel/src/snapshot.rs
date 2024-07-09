@@ -252,11 +252,12 @@ impl Snapshot {
         self.column_mapping_mode
     }
 
-    /// Create a [`ScanBuilder`] for this `Snapshot`.
+    /// Create a [`ScanBuilder`] for an `Arc<Snapshot>`.
     pub fn scan_builder(self: Arc<Self>) -> ScanBuilder {
         ScanBuilder::new(self)
     }
 
+    /// Consume this `Snapshot` to create a [`ScanBuilder`]
     pub fn into_scan_builder(self) -> ScanBuilder {
         ScanBuilder::new(self)
     }
