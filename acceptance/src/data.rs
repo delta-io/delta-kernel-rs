@@ -105,7 +105,7 @@ pub async fn assert_scan_data(engine: Arc<dyn Engine>, test_case: &TestCaseInfo)
     let table_root = test_case.table_root()?;
     let table = Table::new(table_root);
     let snapshot = table.snapshot(engine, None)?;
-    let scan = snapshot.scan_builder().build()?;
+    let scan = snapshot.into_scan_builder().build()?;
     let mut schema = None;
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?

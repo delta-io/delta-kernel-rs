@@ -159,7 +159,7 @@ fn try_main() -> DeltaResult<()> {
 
     // build a scan with the specified schema
     let scan = snapshot
-        .scan_builder()
+        .into_scan_builder()
         .with_schema_opt(read_schema_opt)
         .build()?;
 

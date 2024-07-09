@@ -110,7 +110,7 @@ fn try_main() -> DeltaResult<()> {
         })
         .transpose()?;
     let scan = snapshot
-        .scan_builder()
+        .into_scan_builder()
         .with_schema_opt(read_schema_opt)
         .build()?;
 

@@ -112,7 +112,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let expected_data = vec![batch.clone(), batch];
 
     let snapshot = table.snapshot(&engine, None)?;
-    let scan = snapshot.scan_builder().build()?;
+    let scan = snapshot.into_scan_builder().build()?;
 
     let mut files = 0;
     let stream = scan.execute(&engine)?.into_iter().zip(expected_data);
@@ -163,7 +163,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let expected_data = vec![batch.clone(), batch];
 
     let snapshot = table.snapshot(&engine, None).unwrap();
-    let scan = snapshot.scan_builder().build()?;
+    let scan = snapshot.into_scan_builder().build()?;
 
     let mut files = 0;
     let stream = scan.execute(&engine)?.into_iter().zip(expected_data);
@@ -218,7 +218,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let expected_data = vec![batch];
 
     let snapshot = table.snapshot(&engine, None)?;
-    let scan = snapshot.scan_builder().build()?;
+    let scan = snapshot.into_scan_builder().build()?;
 
     let stream = scan.execute(&engine)?.into_iter().zip(expected_data);
 
@@ -338,7 +338,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
             left: Box::new(Expression::column("id")),
             right: Box::new(Expression::literal(value)),
         };
-        let scan = snapshot.scan_builder().with_predicate(predicate).build()?;
+        let scan = snapshot.clone().scan_builder().with_predicate(predicate).build()?;
 
         let expected_files = expected_batches.len();
         let mut files_scanned = 0;
@@ -534,7 +534,7 @@ fn read_table_data(
         Arc::new(Schema::new(selected_fields))
     });
     let scan = snapshot
-        .scan_builder()
+        .into_scan_builder()
         .with_schema_opt(read_schema)
         .with_predicate_opt(predicate)
         .build()?;
