@@ -338,7 +338,11 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
             left: Box::new(Expression::column("id")),
             right: Box::new(Expression::literal(value)),
         };
-        let scan = snapshot.clone().scan_builder().with_predicate(predicate).build()?;
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .with_predicate(predicate)
+            .build()?;
 
         let expected_files = expected_batches.len();
         let mut files_scanned = 0;
