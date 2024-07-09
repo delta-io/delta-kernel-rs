@@ -45,6 +45,7 @@ arrow-ord = { workspace = true, optional = true }
 arrow-schema = { workspace = true, optional = true }
 futures = { version = "0.3", optional = true }
 object_store = { workspace = true, optional = true }
+hdfs-native-object-store = {workspace = true, optional = true}
 # Used in default and sync engine
 parquet = { workspace = true, optional = true }
 # Used for fetching direct urls (like pre-signed urls)
@@ -76,6 +77,7 @@ default-engine = [
   "parquet/object_store",
   "reqwest",
   "tokio",
+  "hdfs-native-object-store"
 ]
 
 developer-visibility = []
