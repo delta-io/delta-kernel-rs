@@ -109,7 +109,8 @@ fn try_main() -> DeltaResult<()> {
             selected_fields.map(|selected_fields| Arc::new(Schema::new(selected_fields)))
         })
         .transpose()?;
-    let scan = ScanBuilder::new(snapshot)
+    let scan = snapshot
+        .into_scan_builder()
         .with_schema_opt(read_schema_opt)
         .build()?;
 

@@ -597,7 +597,7 @@ mod tests {
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine, None).unwrap();
-        let scan = ScanBuilder::new(snapshot).build().unwrap();
+        let scan = snapshot.into_scan_builder().build().unwrap();
         let files: Vec<Add> = scan.files(&engine).unwrap().try_collect().unwrap();
 
         assert_eq!(files.len(), 1);
@@ -617,7 +617,7 @@ mod tests {
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine, None).unwrap();
-        let scan = ScanBuilder::new(snapshot).build().unwrap();
+        let scan = snapshot.into_scan_builder().build().unwrap();
         let files = scan.execute(&engine).unwrap();
 
         assert_eq!(files.len(), 1);
@@ -680,7 +680,7 @@ mod tests {
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine, None)?;
-        let scan = ScanBuilder::new(snapshot).build()?;
+        let scan = snapshot.into_scan_builder().build()?;
         let files: Vec<DeltaResult<Add>> = scan.files(&engine)?.collect();
 
         // test case:

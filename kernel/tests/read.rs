@@ -13,7 +13,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{BinaryOperator, Expression};
 use delta_kernel::scan::state::{visit_scan_files, DvInfo, Stats};
-use delta_kernel::scan::{transform_to_logical, Scan, ScanBuilder};
+use delta_kernel::scan::{transform_to_logical, Scan};
 use delta_kernel::schema::Schema;
 use delta_kernel::{DeltaResult, Engine, EngineData, FileMeta, Table};
 use object_store::{memory::InMemory, path::Path, ObjectStore};
@@ -112,7 +112,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let expected_data = vec![batch.clone(), batch];
 
     let snapshot = table.snapshot(&engine, None)?;
-    let scan = ScanBuilder::new(snapshot).build()?;
+    let scan = snapshot.into_scan_builder().build()?;
 
     let mut files = 0;
     let stream = scan.execute(&engine)?.into_iter().zip(expected_data);
@@ -163,7 +163,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let expected_data = vec![batch.clone(), batch];
 
     let snapshot = table.snapshot(&engine, None).unwrap();
-    let scan = ScanBuilder::new(snapshot).build()?;
+    let scan = snapshot.into_scan_builder().build()?;
 
     let mut files = 0;
     let stream = scan.execute(&engine)?.into_iter().zip(expected_data);
@@ -218,7 +218,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let expected_data = vec![batch];
 
     let snapshot = table.snapshot(&engine, None)?;
-    let scan = ScanBuilder::new(snapshot).build()?;
+    let scan = snapshot.into_scan_builder().build()?;
 
     let stream = scan.execute(&engine)?.into_iter().zip(expected_data);
 
@@ -338,7 +338,9 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
             left: Box::new(Expression::column("id")),
             right: Box::new(Expression::literal(value)),
         };
-        let scan = ScanBuilder::new(snapshot.clone())
+        let scan = snapshot
+            .clone()
+            .scan_builder()
             .with_predicate(predicate)
             .build()?;
 
@@ -535,7 +537,8 @@ fn read_table_data(
             .collect();
         Arc::new(Schema::new(selected_fields))
     });
-    let scan = ScanBuilder::new(snapshot)
+    let scan = snapshot
+        .into_scan_builder()
         .with_schema_opt(read_schema)
         .with_predicate_opt(predicate)
         .build()?;

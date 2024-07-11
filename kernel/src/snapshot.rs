@@ -3,6 +3,7 @@
 //!
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,7 @@ use url::Url;
 use crate::actions::{get_log_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
 use crate::column_mapping::{ColumnMappingMode, COLUMN_MAPPING_MODE_KEY};
 use crate::path::{version_from_location, LogPath};
+use crate::scan::ScanBuilder;
 use crate::schema::{Schema, SchemaRef};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, FileSystemClient, Version};
@@ -101,6 +103,7 @@ impl LogSegment {
 /// throughout time, `Snapshot`s represent a view of a table at a specific point in time; they
 /// have a defined schema (which may change over time for any given table), specific version, and
 /// frozen log segment.
+
 pub struct Snapshot {
     pub(crate) table_root: Url,
     pub(crate) log_segment: LogSegment,
@@ -247,6 +250,16 @@ impl Snapshot {
     /// `Snapshot`s version.
     pub fn column_mapping_mode(&self) -> ColumnMappingMode {
         self.column_mapping_mode
+    }
+
+    /// Create a [`ScanBuilder`] for an `Arc<Snapshot>`.
+    pub fn scan_builder(self: Arc<Self>) -> ScanBuilder {
+        ScanBuilder::new(self)
+    }
+
+    /// Consume this `Snapshot` to create a [`ScanBuilder`]
+    pub fn into_scan_builder(self) -> ScanBuilder {
+        ScanBuilder::new(self)
     }
 }
 
