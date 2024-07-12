@@ -54,6 +54,10 @@ reqwest = { version = "^0.12.0", optional = true }
 # optionally used with default engine (though not required)
 tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
 
+# Used in integration tests
+hdfs-native = {workspace = true, optional = true}
+walkdir = {workspace = true, optional = true}
+
 [features]
 arrow-conversion = ["arrow-schema"]
 arrow-expression = ["arrow-arith", "arrow-array", "arrow-ord", "arrow-schema"]
@@ -88,6 +92,11 @@ sync-engine = [
   "arrow-json",
   "arrow-select",
   "parquet",
+]
+integration-test = [
+  "hdfs-native-object-store/integration-test",
+  "hdfs-native",
+  "walkdir",
 ]
 
 [build-dependencies]
