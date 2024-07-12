@@ -62,6 +62,7 @@ cloud = [
   "object_store/azure",
   "object_store/gcp",
   "object_store/http",
+  "hdfs-native-object-store",
 ]
 default = ["sync-engine"]
 default-engine = [
@@ -77,7 +78,6 @@ default-engine = [
   "parquet/object_store",
   "reqwest",
   "tokio",
-  "hdfs-native-object-store"
 ]
 
 developer-visibility = []
