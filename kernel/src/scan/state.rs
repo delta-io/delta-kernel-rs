@@ -30,7 +30,7 @@ pub struct GlobalScanState {
 /// this struct can be used by an engine to materialize a selection vector
 #[derive(Debug)]
 pub struct DvInfo {
-    deletion_vector: Option<DeletionVectorDescriptor>,
+    pub(crate) deletion_vector: Option<DeletionVectorDescriptor>,
 }
 
 /// Give engines an easy way to consume stats

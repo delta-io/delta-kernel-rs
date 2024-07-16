@@ -37,9 +37,10 @@ delta_kernel_derive = { path = "../derive-macros", version = "0.1.1" }
 visibility = "0.1.0"
 
 # Used in default engine
-arrow-array = { workspace = true, optional = true }
+arrow-array = { workspace = true, optional = true, features = ["chrono-tz"] }
 arrow-select = { workspace = true, optional = true }
 arrow-arith = { workspace = true, optional = true }
+arrow-cast = { workspace = true, optional = true }
 arrow-json = { workspace = true, optional = true }
 arrow-ord = { workspace = true, optional = true }
 arrow-schema = { workspace = true, optional = true }
@@ -73,6 +74,7 @@ default-engine = [
   "arrow-conversion",
   "arrow-expression",
   "arrow-array",
+  "arrow-cast",
   "arrow-json",
   "arrow-schema",
   "arrow-select",
@@ -86,6 +88,7 @@ default-engine = [
 
 developer-visibility = []
 sync-engine = [
+  "arrow-cast",
   "arrow-conversion",
   "arrow-expression",
   "arrow-array",
