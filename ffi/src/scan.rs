@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use delta_kernel::scan::state::{visit_scan_files, DvInfo, GlobalScanState};
-use delta_kernel::scan::{Scan, ScanBuilder, ScanData};
+use delta_kernel::scan::{Scan, ScanData};
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, EngineData, Error};

@@ -60,11 +60,12 @@ pub fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
-static SKIPPED_TESTS: &[&str; 1] = &[
-    // For multi_partitioned_2: The golden table stores the timestamp as an INT96 (which is
-    // nanosecond precision), while the spec says we should read partition columns as
-    // microseconds. This means the read and golden data don't line up. When this is released in
-    // `dat` upstream, we can stop skipping this test
+static SKIPPED_TESTS: &[&str; 2] = &[
+    // For all_primitive_types and multi_partitioned_2: The golden table stores the timestamp as an
+    // INT96 (which is nanosecond precision), while the spec says we should read partition columns
+    // as microseconds. This means the read and golden data don't line up. When this is released in
+    // `dat` upstream, we can stop skipping these tests
+    "all_primitive_types",
     "multi_partitioned_2",
 ];
 
