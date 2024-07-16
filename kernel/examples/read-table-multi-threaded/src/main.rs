@@ -172,7 +172,7 @@ fn try_main() -> DeltaResult<()> {
     let scan_data = scan.scan_data(engine.as_ref())?;
 
     // get any global state associated with this scan
-    let global_state = scan.global_scan_state();
+    let global_state = Arc::new(scan.global_scan_state());
 
     // create the channels we'll use. record_batch_[t/r]x are used for the threads to send back the
     // processed RecordBatches to themain thread
@@ -221,7 +221,7 @@ fn try_main() -> DeltaResult<()> {
 // this is the work each thread does
 fn do_work(
     engine: Arc<dyn Engine>,
-    scan_state: GlobalScanState,
+    scan_state: Arc<GlobalScanState>,
     record_batch_tx: Sender<RecordBatch>,
     scan_file_rx: spmc::Receiver<ScanFile>,
 ) {
