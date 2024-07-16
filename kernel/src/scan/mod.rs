@@ -288,8 +288,9 @@ impl Scan {
                             let field = self.logical_schema.fields.get_index(*field_idx).ok_or_else(|| {
                                 Error::generic("logical schema did not contain expected field, can't execute scan")
                             })?.1;
+                            let name = field.physical_name(self.snapshot.column_mapping_mode)?;
                             let value_expression = parse_partition_value(
-                                add.partition_values.get(field.name()),
+                                add.partition_values.get(name),
                                 field.data_type(),
                             )?;
                             Ok::<Expression, Error>(Expression::Literal(value_expression))
@@ -462,8 +463,9 @@ pub fn transform_to_logical(
                         .ok_or_else(|| {
                             Error::generic("logical schema did not contain expected field, can't transform data")
                         })?.1;
+                    let name = field.physical_name(global_state.column_mapping_mode)?;
                     let value_expression = parse_partition_value(
-                        partition_values.get(field.name()),
+                        partition_values.get(name),
                         field.data_type(),
                     )?;
                     Ok::<Expression, Error>(Expression::Literal(value_expression))
