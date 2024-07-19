@@ -7,8 +7,10 @@
 //! implenents all these traits and can be used to ease integration work. See
 //! [`DefaultEngine`](engine/default/index.html) for more information.
 //!
-//! A full `rust` example for reading table data using the default engine can be found
-//! [here](https://github.com/delta-incubator/delta-kernel-rs/blob/main/kernel/examples/dump-table/src/main.rs)
+//! A full `rust` example for reading table data using the default engine can be found in the
+//! [inspect-table] example.
+//!
+//! [inspect-table]: (https://github.com/delta-incubator/delta-kernel-rs/blob/main/kernel/examples/inspect-table/src/main.rs)
 //!
 //! # Engine traits
 //!
