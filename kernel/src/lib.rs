@@ -10,7 +10,7 @@
 //! A full `rust` example for reading table data using the default engine can be found in the
 //! [inspect-table] example.
 //!
-//! [inspect-table]: (https://github.com/delta-incubator/delta-kernel-rs/blob/main/kernel/examples/inspect-table/src/main.rs)
+//! [inspect-table]: https://github.com/delta-incubator/delta-kernel-rs/blob/main/kernel/examples/inspect-table/src/main.rs
 //!
 //! # Engine traits
 //!
