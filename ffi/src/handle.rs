@@ -25,9 +25,9 @@
 /// It is not normally necessary to implement this trait directly; instead, use the provided
 /// attribute macro [`#[handle_descriptor]`][delta_kernel_ffi_macros::handle_descriptor] to generate
 /// the implementation automatically, e.g.
-/// ```
+/// ```ignore
 /// # use delta_kernel_ffi_macros::handle_descriptor;
-/// # use delta_kernel_ffi::handle::Handle;
+/// # use handle::Handle;
 /// pub struct Foo {
 ///     x: usize,
 /// }
@@ -495,6 +495,7 @@ mod tests {
     use super::*;
     use delta_kernel_ffi_macros::handle_descriptor;
 
+    #[allow(dead_code)]
     #[derive(Debug)]
     pub struct Foo {
         pub x: usize,
@@ -504,6 +505,7 @@ mod tests {
     #[handle_descriptor(target=Foo, mutable=true, sized=true)]
     pub struct MutableFoo;
 
+    #[allow(dead_code)]
     #[derive(Debug)]
     pub struct Bar {
         pub x: usize,
@@ -529,6 +531,7 @@ mod tests {
     #[handle_descriptor(target=dyn Baz, mutable=false)]
     pub struct SharedBaz;
 
+    #[allow(dead_code)]
     #[derive(Debug)]
     pub struct NotSync {
         pub ptr: *mut u32,

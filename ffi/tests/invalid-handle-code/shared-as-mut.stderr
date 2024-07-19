@@ -2,29 +2,13 @@ error[E0599]: the method `as_mut` exists for struct `Handle<SharedFoo>`, but its
   --> tests/invalid-handle-code/shared-as-mut.rs:12:15
    |
 7  | pub struct SharedFoo;
-   | -------------------- doesn't satisfy `<SharedFoo as HandleDescriptor>::Mutable = True`, `SharedFoo: handle::private::HandleOps<_, True, _>`, `SharedFoo: handle::private::MutableHandleOps<_, _>` or `SharedFoo: handle::private::MutableHandle`
+   | -------------------- doesn't satisfy `<SharedFoo as HandleDescriptor>::Mutable = True`
 ...
 12 |     let r = h.as_mut();
    |               ^^^^^^ method cannot be called on `Handle<SharedFoo>` due to unsatisfied trait bounds
    |
    = note: the following trait bounds were not satisfied:
            `<SharedFoo as HandleDescriptor>::Mutable = True`
-           `SharedFoo: handle::private::MutableHandleOps<_, _>`
-           `SharedFoo: handle::private::MutableHandle`
-           which is required by `SharedFoo: handle::private::MutableHandleOps<_, _>`
-           `SharedFoo: handle::private::HandleOps<_, True, _>`
-           which is required by `SharedFoo: handle::private::MutableHandleOps<_, _>`
-note: the traits `handle::private::MutableHandle`, `handle::private::HandleOps`,  and `handle::private::MutableHandleOps` must be implemented
-  --> src/handle.rs
-   |
-   |     pub trait MutableHandle {}
-   |     ^^^^^^^^^^^^^^^^^^^^^^^
-...
-   |     pub trait HandleOps<T: ?Sized, M, S> {
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-...
-   |     pub trait MutableHandleOps<T: ?Sized, S>: HandleOps<T, True, S> + MutableHandle {
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 error[E0271]: type mismatch resolving `<SharedFoo as HandleDescriptor>::Mutable == True`
   --> tests/invalid-handle-code/shared-as-mut.rs:11:44
