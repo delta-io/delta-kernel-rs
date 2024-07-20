@@ -128,13 +128,14 @@ pub type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> Null
 // Put KernelBoolSlice in a sub-module, with non-public members, so rust code cannot instantiate it
 // directly. It can only be created by converting `From<Vec<bool>>`.
 mod private {
+    use std::ptr::NonNull;
 
     /// Represents an owned slice of boolean values allocated by the kernel. Any time the engine
     /// receives a `KernelBoolSlice` as a return value from a kernel method, engine is responsible
     /// to free that slice, by calling [super::free_bool_slice] exactly once.
     #[repr(C)]
     pub struct KernelBoolSlice {
-        ptr: *mut bool,
+        ptr: NonNull<bool>,
         len: usize,
     }
 
@@ -142,7 +143,7 @@ mod private {
     /// freeing this slice by calling [super::free_row_indexes] once.
     #[repr(C)]
     pub struct KernelRowIndexArray {
-        ptr: *mut u64,
+        ptr: NonNull<u64>,
         len: usize,
     }
 
@@ -150,7 +151,7 @@ mod private {
         /// Creates an empty slice.
         pub fn empty() -> KernelBoolSlice {
             KernelBoolSlice {
-                ptr: std::ptr::null_mut(),
+                ptr: NonNull::dangling(),
                 len: 0,
             }
         }
@@ -162,10 +163,10 @@ mod private {
         /// The slice must have been originally created `From<Vec<bool>>`, and must not have been
         /// already been consumed by a previous call to this method.
         pub unsafe fn as_ref(&self) -> &[bool] {
-            if self.ptr.is_null() {
+            if self.len == 0 {
                 Default::default()
             } else {
-                unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+                unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
             }
         }
 
@@ -176,10 +177,10 @@ mod private {
         /// The slice must have been originally created `From<Vec<bool>>`, and must not have been
         /// already been consumed by a previous call to this method.
         pub unsafe fn into_vec(self) -> Vec<bool> {
-            if self.ptr.is_null() {
+            if self.len == 0 {
                 Default::default()
             } else {
-                Vec::from_raw_parts(self.ptr, self.len, self.len)
+                Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len)
             }
         }
     }
@@ -189,7 +190,11 @@ mod private {
             let len = val.len();
             let boxed = val.into_boxed_slice();
             let ptr = Box::leak(boxed).as_mut_ptr();
-            KernelBoolSlice { ptr, len }
+            if let Some(ptr) = NonNull::new(ptr) {
+                KernelBoolSlice { ptr, len }
+            } else {
+                KernelBoolSlice::empty()
+            }
         }
     }
 
@@ -215,17 +220,17 @@ mod private {
         /// The slice must have been originally created `From<Vec<u64>>`, and must not have
         /// already been consumed by a previous call to this method.
         pub unsafe fn into_vec(self) -> Vec<u64> {
-            if self.ptr.is_null() {
+            if self.len == 0 {
                 Default::default()
             } else {
-                Vec::from_raw_parts(self.ptr, self.len, self.len)
+                Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len)
             }
         }
 
         /// Creates an empty slice.
         pub fn empty() -> KernelRowIndexArray {
             Self {
-                ptr: std::ptr::null_mut(),
+                ptr: NonNull::dangling(),
                 len: 0,
             }
         }
@@ -236,7 +241,11 @@ mod private {
             let len = vec.len();
             let boxed = vec.into_boxed_slice();
             let ptr = Box::leak(boxed).as_mut_ptr();
-            KernelRowIndexArray { ptr, len }
+            if let Some(ptr) = NonNull::new(ptr) {
+                KernelRowIndexArray { ptr, len }
+            } else {
+                KernelRowIndexArray::empty()
+            }
         }
     }
 }
