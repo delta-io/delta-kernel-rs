@@ -52,7 +52,11 @@ pub enum Error {
     #[error(transparent)]
     IOError(std::io::Error),
 
-    /// An error encountered while working with parquet data
+    /// An internal error that means kernel found an unexpected situation, which is likely a bug
+    #[error("Internal error {0}. This is a kernel bug, please report.")]
+    InternalError(String),
+
+    /// An error enountered while working with parquet data
     #[cfg(feature = "parquet")]
     #[error("Arrow error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
@@ -198,6 +202,10 @@ impl Error {
     }
     pub fn invalid_expression(msg: impl ToString) -> Self {
         Self::InvalidExpressionEvaluation(msg.to_string())
+    }
+
+    pub fn internal_error(msg: impl ToString) -> Self {
+        Self::InternalError(msg.to_string()).with_backtrace()
     }
 
     // Capture a backtrace when the error is constructed.

@@ -7,12 +7,13 @@ use std::thread;
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
+use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::sync::SyncEngine;
 use delta_kernel::scan::state::{DvInfo, GlobalScanState, Stats};
-use delta_kernel::scan::{transform_to_logical, ScanBuilder};
+use delta_kernel::scan::transform_to_logical;
 use delta_kernel::schema::Schema;
 use delta_kernel::{DeltaResult, Engine, EngineData, FileMeta, Table};
 
@@ -158,7 +159,8 @@ fn try_main() -> DeltaResult<()> {
         .transpose()?;
 
     // build a scan with the specified schema
-    let scan = ScanBuilder::new(snapshot)
+    let scan = snapshot
+        .into_scan_builder()
         .with_schema_opt(read_schema_opt)
         .build()?;
 
@@ -170,7 +172,7 @@ fn try_main() -> DeltaResult<()> {
     let scan_data = scan.scan_data(engine.as_ref())?;
 
     // get any global state associated with this scan
-    let global_state = scan.global_scan_state();
+    let global_state = Arc::new(scan.global_scan_state());
 
     // create the channels we'll use. record_batch_[t/r]x are used for the threads to send back the
     // processed RecordBatches to themain thread
@@ -219,7 +221,7 @@ fn try_main() -> DeltaResult<()> {
 // this is the work each thread does
 fn do_work(
     engine: Arc<dyn Engine>,
-    scan_state: GlobalScanState,
+    scan_state: Arc<GlobalScanState>,
     record_batch_tx: Sender<RecordBatch>,
     scan_file_rx: spmc::Receiver<ScanFile>,
 ) {
@@ -276,7 +278,7 @@ fn do_work(
 
             // need to split the dv_mask. what's left in dv_mask covers this result, and rest
             // will cover the following results
-            let rest = selection_vector.as_mut().map(|mask| mask.split_off(len));
+            let rest = split_vector(selection_vector.as_mut(), len, Some(true));
             let batch = if let Some(mask) = selection_vector.clone() {
                 // apply the selection vector
                 filter_record_batch(&record_batch, &mask.into()).unwrap()

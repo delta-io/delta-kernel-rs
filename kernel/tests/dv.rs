@@ -3,7 +3,6 @@
 use std::path::PathBuf;
 
 use delta_kernel::engine::sync::SyncEngine;
-use delta_kernel::scan::ScanBuilder;
 use delta_kernel::Table;
 
 use test_log::test;
@@ -16,7 +15,7 @@ fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
 
     let table = Table::new(url);
     let snapshot = table.snapshot(&engine, None)?;
-    let scan = ScanBuilder::new(snapshot).build()?;
+    let scan = snapshot.into_scan_builder().build()?;
 
     let stream = scan.execute(&engine)?;
     let mut total_rows = 0;
@@ -41,7 +40,7 @@ fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
 
     let table = Table::new(url);
     let snapshot = table.snapshot(&engine, None)?;
-    let scan = ScanBuilder::new(snapshot).build()?;
+    let scan = snapshot.into_scan_builder().build()?;
 
     let stream = scan.execute(&engine)?;
     let mut total_rows = 0;

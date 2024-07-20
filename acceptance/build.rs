@@ -1,5 +1,6 @@
 //! Build script for DAT
 
+use std::env;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
@@ -31,7 +32,14 @@ fn download_dat_files() -> Vec<u8> {
         version = VERSION
     );
 
-    let response = ureq::get(&tarball_url).call().unwrap();
+    let response = if let Ok(proxy_url) = env::var("HTTPS_PROXY") {
+        let proxy = ureq::Proxy::new(proxy_url).unwrap();
+        let agent = ureq::AgentBuilder::new().proxy(proxy).build();
+        agent.get(&tarball_url).call().unwrap()
+    } else {
+        ureq::get(&tarball_url).call().unwrap()
+    };
+
     let mut tarball_data: Vec<u8> = Vec::new();
     response
         .into_reader()

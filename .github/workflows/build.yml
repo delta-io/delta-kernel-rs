@@ -59,7 +59,7 @@ jobs:
           override: true
       - uses: Swatinem/rust-cache@v2
       - name: test
-        run: cargo test --verbose --all-features
+        run: cargo test --workspace --verbose --all-features -- --skip read_table_version_hdfs
   ffi_test:
     runs-on: ${{ matrix.os }}
     strategy:

@@ -82,7 +82,7 @@ lazy_static! {
     // for `scan_row_schema` in scan/mod.rs! You'll also need to update ScanFileVisitor as the
     // indexes will be off
     pub(crate) static ref SCAN_ROW_SCHEMA: Arc<StructType> = Arc::new(StructType::new(vec!(
-        StructField::new("path", DataType::STRING, true),
+        StructField::new("path", DataType::STRING, false),
         StructField::new("size", DataType::LONG, true),
         StructField::new("modificationTime", DataType::LONG, true),
         StructField::new("stats", DataType::STRING, true),

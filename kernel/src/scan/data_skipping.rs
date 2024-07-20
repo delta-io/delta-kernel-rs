@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::actions::visitors::SelectionVectorVisitor;
+use crate::actions::{get_log_schema, ADD_NAME};
 use crate::error::DeltaResult;
 use crate::expressions::{BinaryOperator, Expression as Expr, UnaryOperator, VariadicOperator};
 use crate::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
@@ -242,7 +243,8 @@ impl DataSkippingFilter {
         // 3. The selection evaluator does DISTINCT(col(predicate), 'false') to produce true (= keep) when
         //    the predicate is true/null and false (= skip) when the predicate is false.
         let select_stats_evaluator = engine.get_expression_handler().get_evaluator(
-            stats_schema.clone(),
+            // safety: kernel is very broken if we don't have the schema for Add actions
+            get_log_schema().project(&[ADD_NAME]).unwrap(),
             STATS_EXPR.clone(),
             DataType::STRING,
         );

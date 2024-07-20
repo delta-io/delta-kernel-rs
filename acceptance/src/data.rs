@@ -5,9 +5,7 @@ use arrow_ord::sort::{lexsort_to_indices, SortColumn};
 use arrow_schema::{DataType, Schema};
 use arrow_select::{concat::concat_batches, filter::filter_record_batch, take::take};
 
-use delta_kernel::{
-    engine::arrow_data::ArrowEngineData, scan::ScanBuilder, DeltaResult, Engine, Error, Table,
-};
+use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Engine, Error, Table};
 use futures::{stream::TryStreamExt, StreamExt};
 use object_store::{local::LocalFileSystem, ObjectStore};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
@@ -62,11 +60,12 @@ pub fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
-static SKIPPED_TESTS: &[&str; 1] = &[
-    // For multi_partitioned_2: The golden table stores the timestamp as an INT96 (which is
-    // nanosecond precision), while the spec says we should read partition columns as
-    // microseconds. This means the read and golden data don't line up. When this is released in
-    // `dat` upstream, we can stop skipping this test
+static SKIPPED_TESTS: &[&str; 2] = &[
+    // For all_primitive_types and multi_partitioned_2: The golden table stores the timestamp as an
+    // INT96 (which is nanosecond precision), while the spec says we should read partition columns
+    // as microseconds. This means the read and golden data don't line up. When this is released in
+    // `dat` upstream, we can stop skipping these tests
+    "all_primitive_types",
     "multi_partitioned_2",
 ];
 
@@ -107,7 +106,7 @@ pub async fn assert_scan_data(engine: Arc<dyn Engine>, test_case: &TestCaseInfo)
     let table_root = test_case.table_root()?;
     let table = Table::new(table_root);
     let snapshot = table.snapshot(engine, None)?;
-    let scan = ScanBuilder::new(snapshot).build()?;
+    let scan = snapshot.into_scan_builder().build()?;
     let mut schema = None;
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?

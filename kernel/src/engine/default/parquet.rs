@@ -12,7 +12,7 @@ use parquet::arrow::arrow_reader::{
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
-use crate::engine::arrow_utils::{generate_mask, get_requested_indices, reorder_record_batch};
+use crate::engine::arrow_utils::{generate_mask, get_requested_indices, reorder_struct_array};
 use crate::engine::default::executor::TaskExecutor;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, ParquetHandler};
@@ -141,8 +141,9 @@ impl FileOpener for ParquetOpener {
 
             let stream = stream.map(move |rbr| {
                 // re-order each batch if needed
-                rbr.map_err(Error::Parquet)
-                    .and_then(|rb| reorder_record_batch(rb, &requested_ordering))
+                rbr.map_err(Error::Parquet).and_then(|rb| {
+                    reorder_struct_array(rb.into(), &requested_ordering).map(Into::into)
+                })
             });
             Ok(stream.boxed())
         }))
@@ -204,8 +205,9 @@ impl FileOpener for PresignedUrlOpener {
             let stream = futures::stream::iter(reader);
             let stream = stream.map(move |rbr| {
                 // re-order each batch if needed
-                rbr.map_err(Error::Arrow)
-                    .and_then(|rb| reorder_record_batch(rb, &requested_ordering))
+                rbr.map_err(Error::Arrow).and_then(|rb| {
+                    reorder_struct_array(rb.into(), &requested_ordering).map(Into::into)
+                })
             });
             Ok(stream.boxed())
         }))
@@ -232,7 +234,7 @@ mod tests {
     ) -> DeltaResult<RecordBatch> {
         engine_data
             .and_then(ArrowEngineData::try_from_engine_data)
-            .map(|sd| sd.into())
+            .map(Into::into)
     }
 
     #[tokio::test]
