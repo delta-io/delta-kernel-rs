@@ -197,7 +197,7 @@ impl Display for Scalar {
                 write!(f, "(")?;
                 let mut delim = "";
                 for element in &data.elements {
-                    write!(f, "{delim}{}", element)?;
+                    write!(f, "{delim}{element}")?;
                     delim = ", ";
                 }
                 write!(f, ")")

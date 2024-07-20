@@ -34,7 +34,7 @@ macro_rules! prim_array_cmp {
                         .ok_or(Error::invalid_expression(
                             format!("Cannot cast to list array: {}", $right_arr.data_type()))
                         )?;
-                in_list(prim_array, list_array).map(wrap_comparison_result)
+                arrow_ord::comparison::in_list(prim_array, list_array).map(wrap_comparison_result)
             }
         )+
             _ => Err(ArrowError::CastError(

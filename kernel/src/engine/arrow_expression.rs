@@ -12,7 +12,7 @@ use arrow_array::{
 };
 use arrow_buffer::OffsetBuffer;
 use arrow_ord::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq};
-use arrow_ord::comparison::{in_list, in_list_utf8};
+use arrow_ord::comparison::in_list_utf8;
 use arrow_schema::{
     ArrowError, DataType as ArrowDataType, Field as ArrowField, Fields, IntervalUnit,
     Schema as ArrowSchema, TimeUnit,
@@ -21,10 +21,10 @@ use arrow_select::concat::concat;
 use itertools::Itertools;
 
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::prim_array_cmp;
+use crate::engine::arrow_utils::{prim_array_cmp};
 use crate::engine::arrow_utils::ensure_data_types;
 use crate::error::{DeltaResult, Error};
-use crate::expressions::{BinaryOperator, Expression, Scalar, UnaryOperator, VariadicOperator};
+use crate::expressions::{BinaryOperator, Expression, UnaryOperator, VariadicOperator, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
 
@@ -243,48 +243,61 @@ fn evaluate_expression(
                 right,
             },
             _,
-        ) => {
-            let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
-            let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
-            if let Some(string_arr) = left_arr.as_string_opt::<i32>() {
-                return in_list_utf8(string_arr, right_arr.as_list::<i32>())
-                    .map(wrap_comparison_result)
-                    .map_err(Error::generic_err);
+        ) => match (left.as_ref(), right.as_ref()) {
+            (Column(_), Literal(Scalar::Array(ad))) => {
+                let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             }
-            prim_array_cmp! {
-                left_arr, right_arr,
-                (ArrowDataType::Int8, Int8Type),
-                (ArrowDataType::Int16, Int16Type),
-                (ArrowDataType::Int32, Int32Type),
-                (ArrowDataType::Int64, Int64Type),
-                (ArrowDataType::UInt8, UInt8Type),
-                (ArrowDataType::UInt16, UInt16Type),
-                (ArrowDataType::UInt32, UInt32Type),
-                (ArrowDataType::UInt64, UInt64Type),
-                (ArrowDataType::Float16, Float16Type),
-                (ArrowDataType::Float32, Float32Type),
-                (ArrowDataType::Float64, Float64Type),
-                (ArrowDataType::Timestamp(TimeUnit::Second, _), TimestampSecondType),
-                (ArrowDataType::Timestamp(TimeUnit::Millisecond, _), TimestampMillisecondType),
-                (ArrowDataType::Timestamp(TimeUnit::Microsecond, _), TimestampMicrosecondType),
-                (ArrowDataType::Timestamp(TimeUnit::Nanosecond, _), TimestampNanosecondType),
-                (ArrowDataType::Date32, Date32Type),
-                (ArrowDataType::Date64, Date64Type),
-                (ArrowDataType::Time32(TimeUnit::Second), Time32SecondType),
-                (ArrowDataType::Time32(TimeUnit::Millisecond), Time32MillisecondType),
-                (ArrowDataType::Time64(TimeUnit::Microsecond), Time64MicrosecondType),
-                (ArrowDataType::Time64(TimeUnit::Nanosecond), Time64NanosecondType),
-                (ArrowDataType::Duration(TimeUnit::Second), DurationSecondType),
-                (ArrowDataType::Duration(TimeUnit::Millisecond), DurationMillisecondType),
-                (ArrowDataType::Duration(TimeUnit::Microsecond), DurationMicrosecondType),
-                (ArrowDataType::Duration(TimeUnit::Nanosecond), DurationNanosecondType),
-                (ArrowDataType::Interval(IntervalUnit::DayTime), IntervalDayTimeType),
-                (ArrowDataType::Interval(IntervalUnit::YearMonth), IntervalYearMonthType),
-                (ArrowDataType::Interval(IntervalUnit::MonthDayNano), IntervalMonthDayNanoType),
-                (ArrowDataType::Decimal128(_, _), Decimal128Type),
-                (ArrowDataType::Decimal256(_, _), Decimal256Type)
+            (_, Column(_)) => {
+                let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
+                let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
+                if let Some(string_arr) = left_arr.as_string_opt::<i32>() {
+                    return in_list_utf8(string_arr, right_arr.as_list::<i32>())
+                        .map(wrap_comparison_result)
+                        .map_err(Error::generic_err);
+                }
+                prim_array_cmp! {
+                    left_arr, right_arr,
+                    (ArrowDataType::Int8, Int8Type),
+                    (ArrowDataType::Int16, Int16Type),
+                    (ArrowDataType::Int32, Int32Type),
+                    (ArrowDataType::Int64, Int64Type),
+                    (ArrowDataType::UInt8, UInt8Type),
+                    (ArrowDataType::UInt16, UInt16Type),
+                    (ArrowDataType::UInt32, UInt32Type),
+                    (ArrowDataType::UInt64, UInt64Type),
+                    (ArrowDataType::Float16, Float16Type),
+                    (ArrowDataType::Float32, Float32Type),
+                    (ArrowDataType::Float64, Float64Type),
+                    (ArrowDataType::Timestamp(TimeUnit::Second, _), TimestampSecondType),
+                    (ArrowDataType::Timestamp(TimeUnit::Millisecond, _), TimestampMillisecondType),
+                    (ArrowDataType::Timestamp(TimeUnit::Microsecond, _), TimestampMicrosecondType),
+                    (ArrowDataType::Timestamp(TimeUnit::Nanosecond, _), TimestampNanosecondType),
+                    (ArrowDataType::Date32, Date32Type),
+                    (ArrowDataType::Date64, Date64Type),
+                    (ArrowDataType::Time32(TimeUnit::Second), Time32SecondType),
+                    (ArrowDataType::Time32(TimeUnit::Millisecond), Time32MillisecondType),
+                    (ArrowDataType::Time64(TimeUnit::Microsecond), Time64MicrosecondType),
+                    (ArrowDataType::Time64(TimeUnit::Nanosecond), Time64NanosecondType),
+                    (ArrowDataType::Duration(TimeUnit::Second), DurationSecondType),
+                    (ArrowDataType::Duration(TimeUnit::Millisecond), DurationMillisecondType),
+                    (ArrowDataType::Duration(TimeUnit::Microsecond), DurationMicrosecondType),
+                    (ArrowDataType::Duration(TimeUnit::Nanosecond), DurationNanosecondType),
+                    (ArrowDataType::Interval(IntervalUnit::DayTime), IntervalDayTimeType),
+                    (ArrowDataType::Interval(IntervalUnit::YearMonth), IntervalYearMonthType),
+                    (ArrowDataType::Interval(IntervalUnit::MonthDayNano), IntervalMonthDayNanoType),
+                    (ArrowDataType::Decimal128(_, _), Decimal128Type),
+                    (ArrowDataType::Decimal256(_, _), Decimal256Type)
+                }
             }
-        }
+            (Literal(lit), Literal(Scalar::Array(ad))) => {
+                let exists = ad.array_elements().contains(lit);
+                Ok(Arc::new(BooleanArray::from(vec![exists])))
+            }
+            (_, _) => Err(Error::invalid_expression(format!(
+                "Invalid right value for (NOT) IN comparison, right is: {:?}",
+                right
+            ))),
+        },
         (
             BinaryOperation {
                 op: NotIn,

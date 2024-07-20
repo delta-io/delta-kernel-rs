@@ -37,7 +37,6 @@ delta_kernel_derive = { path = "../derive-macros", version = "0.2.0" }
 visibility = "0.1.0"
 
 # Used in default engine
-arrow-array = { workspace = true, optional = true }
 arrow-buffer = { workspace = true, optional = true }
 arrow-array = { workspace = true, optional = true, features = ["chrono-tz"] }
 arrow-select = { workspace = true, optional = true }
