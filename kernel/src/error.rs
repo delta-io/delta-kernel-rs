@@ -52,6 +52,10 @@ pub enum Error {
     #[error(transparent)]
     IOError(std::io::Error),
 
+    /// An internal error that means kernel found an unexpected situation, which is likely a bug
+    #[error("Internal error {0}. This is a kernel bug, please report.")]
+    InternalError(String),
+
     /// An error enountered while working with parquet data
     #[cfg(feature = "parquet")]
     #[error("Arrow error: {0}")]
@@ -191,6 +195,10 @@ impl Error {
     }
     pub fn invalid_struct_data(msg: impl ToString) -> Self {
         Self::InvalidStructData(msg.to_string())
+    }
+
+    pub fn internal_error(msg: impl ToString) -> Self {
+        Self::InternalError(msg.to_string()).with_backtrace()
     }
 
     // Capture a backtrace when the error is constructed.

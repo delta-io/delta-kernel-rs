@@ -8,7 +8,8 @@
 
 use std::sync::Arc;
 
-use object_store::{parse_url_opts, path::Path, DynObjectStore};
+use self::storage::parse_url_opts;
+use object_store::{path::Path, DynObjectStore};
 use url::Url;
 
 use self::executor::TaskExecutor;
@@ -25,6 +26,7 @@ pub mod file_stream;
 pub mod filesystem;
 pub mod json;
 pub mod parquet;
+pub mod storage;
 
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {

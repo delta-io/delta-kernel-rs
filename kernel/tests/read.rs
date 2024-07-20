@@ -7,13 +7,15 @@ use arrow::array::{ArrayRef, Int32Array, StringArray};
 use arrow::compute::filter_record_batch;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use arrow_schema::SchemaRef as ArrowSchemaRef;
 use arrow_select::concat::concat_batches;
+use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{BinaryOperator, Expression};
 use delta_kernel::scan::state::{visit_scan_files, DvInfo, Stats};
-use delta_kernel::scan::{transform_to_logical, Scan, ScanBuilder};
+use delta_kernel::scan::{transform_to_logical, Scan};
 use delta_kernel::schema::Schema;
 use delta_kernel::{DeltaResult, Engine, EngineData, FileMeta, Table};
 use object_store::{memory::InMemory, path::Path, ObjectStore};
@@ -26,7 +28,7 @@ const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c00
 
 const METADATA: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
 {"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
-{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 
 enum TestAction {
     Add(String),
@@ -112,7 +114,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let expected_data = vec![batch.clone(), batch];
 
     let snapshot = table.snapshot(&engine, None)?;
-    let scan = ScanBuilder::new(snapshot).build()?;
+    let scan = snapshot.into_scan_builder().build()?;
 
     let mut files = 0;
     let stream = scan.execute(&engine)?.into_iter().zip(expected_data);
@@ -163,7 +165,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let expected_data = vec![batch.clone(), batch];
 
     let snapshot = table.snapshot(&engine, None).unwrap();
-    let scan = ScanBuilder::new(snapshot).build()?;
+    let scan = snapshot.into_scan_builder().build()?;
 
     let mut files = 0;
     let stream = scan.execute(&engine)?.into_iter().zip(expected_data);
@@ -218,7 +220,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let expected_data = vec![batch];
 
     let snapshot = table.snapshot(&engine, None)?;
-    let scan = ScanBuilder::new(snapshot).build()?;
+    let scan = snapshot.into_scan_builder().build()?;
 
     let stream = scan.execute(&engine)?.into_iter().zip(expected_data);
 
@@ -300,7 +302,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     use BinaryOperator::{
         Equal, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual, NotEqual,
     };
-    let test_cases: Vec<(_, i64, _)> = vec![
+    let test_cases: Vec<(_, i32, _)> = vec![
         (Equal, 0, vec![]),
         (Equal, 1, vec![&batch1]),
         (Equal, 3, vec![&batch1]),
@@ -338,7 +340,9 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
             left: Box::new(Expression::column("id")),
             right: Box::new(Expression::literal(value)),
         };
-        let scan = ScanBuilder::new(snapshot.clone())
+        let scan = snapshot
+            .clone()
+            .scan_builder()
             .with_predicate(predicate)
             .build()?;
 
@@ -396,13 +400,19 @@ fn read_with_execute(
     scan: &Scan,
     expected: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let result_schema: ArrowSchemaRef = Arc::new(scan.schema().as_ref().try_into()?);
     let scan_results = scan.execute(engine)?;
     let batches: Vec<RecordBatch> = scan_results
         .into_iter()
         .map(|sr| {
             let data = sr.raw_data.unwrap();
             let record_batch = to_arrow(data).unwrap();
-            if let Some(mask) = sr.mask {
+            if let Some(mut mask) = sr.mask {
+                let extra_rows = record_batch.num_rows() - mask.len();
+                if extra_rows > 0 {
+                    // we need to extend the mask here in case it's too short
+                    mask.extend(std::iter::repeat(true).take(extra_rows));
+                }
                 filter_record_batch(&record_batch, &mask.into()).unwrap()
             } else {
                 record_batch
@@ -413,8 +423,7 @@ fn read_with_execute(
     if expected.is_empty() {
         assert_eq!(batches.len(), 0);
     } else {
-        let schema = batches[0].schema();
-        let batch = concat_batches(&schema, &batches)?;
+        let batch = concat_batches(&result_schema, &batches)?;
         assert_batches_sorted_eq!(expected, &[batch]);
     }
     Ok(())
@@ -450,6 +459,7 @@ fn read_with_scan_data(
     expected: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let global_state = scan.global_scan_state();
+    let result_schema: ArrowSchemaRef = Arc::new(scan.schema().as_ref().try_into()?);
     let scan_data = scan.scan_data(engine)?;
     let mut scan_files = vec![];
     for data in scan_data {
@@ -488,7 +498,7 @@ fn read_with_scan_data(
             .unwrap();
 
             let record_batch = to_arrow(logical).unwrap();
-            let rest = selection_vector.as_mut().map(|mask| mask.split_off(len));
+            let rest = split_vector(selection_vector.as_mut(), len, Some(true));
             let batch = if let Some(mask) = selection_vector.clone() {
                 // apply the selection vector
                 filter_record_batch(&record_batch, &mask.into()).unwrap()
@@ -503,8 +513,7 @@ fn read_with_scan_data(
     if expected.is_empty() {
         assert_eq!(batches.len(), 0);
     } else {
-        let schema = batches[0].schema();
-        let batch = concat_batches(&schema, &batches)?;
+        let batch = concat_batches(&result_schema, &batches)?;
         assert_batches_sorted_eq!(expected, &[batch]);
     }
     Ok(())
@@ -535,7 +544,8 @@ fn read_table_data(
             .collect();
         Arc::new(Schema::new(selected_fields))
     });
-    let scan = ScanBuilder::new(snapshot)
+    let scan = snapshot
+        .into_scan_builder()
         .with_schema_opt(read_schema)
         .with_predicate_opt(predicate)
         .build()?;
@@ -970,6 +980,67 @@ fn with_predicate_and_removes() -> Result<(), Box<dyn std::error::Error>> {
             Expression::column("value"),
             Expression::literal(3),
         )),
+        expected,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn short_dv() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+----+-------+--------------------------+---------------------+",
+        "| id | value | timestamp                | rand                |",
+        "+----+-------+--------------------------+---------------------+",
+        "| 3  | 3     | 2023-05-31T18:58:33.633Z | 0.7918174793484931  |",
+        "| 4  | 4     | 2023-05-31T18:58:33.633Z | 0.9281049271981882  |",
+        "| 5  | 5     | 2023-05-31T18:58:33.633Z | 0.27796520310701633 |",
+        "| 6  | 6     | 2023-05-31T18:58:33.633Z | 0.15263801464228832 |",
+        "| 7  | 7     | 2023-05-31T18:58:33.633Z | 0.1981143710215575  |",
+        "| 8  | 8     | 2023-05-31T18:58:33.633Z | 0.3069439236599195  |",
+        "| 9  | 9     | 2023-05-31T18:58:33.633Z | 0.5175919190815845  |",
+        "+----+-------+--------------------------+---------------------+",
+    ];
+    read_table_data_str("./tests/data/with-short-dv/", None, None, expected)?;
+    Ok(())
+}
+
+#[test]
+fn basic_decimal() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+----------------+---------+--------------+------------------------+",
+        "| part           | col1    | col2         | col3                   |",
+        "+----------------+---------+--------------+------------------------+",
+        "| -2342342.23423 | -999.99 | -99999.99999 | -9999999999.9999999999 |",
+        "| 0.00004        | 0.00    | 0.00000      | 0.0000000000           |",
+        "| 234.00000      | 1.00    | 2.00000      | 3.0000000000           |",
+        "| 2342222.23454  | 111.11  | 22222.22222  | 3333333333.3333333333  |",
+        "+----------------+---------+--------------+------------------------+",
+    ];
+    read_table_data_str("./tests/data/basic-decimal-table/", None, None, expected)?;
+    Ok(())
+}
+
+#[test]
+fn timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+----+----------------------------+----------------------------+",
+        "| id | tsNtz                      | tsNtzPartition             |",
+        "+----+----------------------------+----------------------------+",
+        "| 0  | 2021-11-18T02:30:00.123456 | 2021-11-18T02:30:00.123456 |",
+        "| 1  | 2013-07-05T17:01:00.123456 | 2021-11-18T02:30:00.123456 |",
+        "| 2  |                            | 2021-11-18T02:30:00.123456 |",
+        "| 3  | 2021-11-18T02:30:00.123456 | 2013-07-05T17:01:00.123456 |",
+        "| 4  | 2013-07-05T17:01:00.123456 | 2013-07-05T17:01:00.123456 |",
+        "| 5  |                            | 2013-07-05T17:01:00.123456 |",
+        "| 6  | 2021-11-18T02:30:00.123456 |                            |",
+        "| 7  | 2013-07-05T17:01:00.123456 |                            |",
+        "| 8  |                            |                            |",
+        "+----+----------------------------+----------------------------+",
+    ];
+    read_table_data_str(
+        "./tests/data/data-reader-timestamp_ntz/",
+        None,
+        None,
         expected,
     )?;
     Ok(())

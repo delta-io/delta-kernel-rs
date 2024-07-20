@@ -35,7 +35,7 @@ As it is a library, in general you will want to depend on `delta-kernel-rs` by a
 dependency to your `Cargo.toml`. For example:
 
 ```toml
-delta_kernel = "0.1"
+delta_kernel = "0.2"
 ```
 
 ### Versions and Api Stability

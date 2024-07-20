@@ -2,23 +2,14 @@ error[E0599]: the method `clone_as_arc` exists for struct `Handle<SharedNotSync>
   --> tests/invalid-handle-code/shared-not-sync.rs:15:15
    |
 10 | pub struct SharedNotSync;
-   | ------------------------ doesn't satisfy `SharedNotSync: handle::private::SharedHandle` or `_: SharedHandleOps<_, _>`
+   | ------------------------ doesn't satisfy `_: SharedHandleOps<NotSync, True>`
 ...
 15 |     let r = h.clone_as_arc();
    |               ^^^^^^^^^^^^ method cannot be called on `Handle<SharedNotSync>` due to unsatisfied trait bounds
    |
    = note: the following trait bounds were not satisfied:
-           `SharedNotSync: handle::private::SharedHandleOps<_, _>`
-           `SharedNotSync: handle::private::SharedHandle`
-           which is required by `SharedNotSync: handle::private::SharedHandleOps<_, _>`
-note: the traits `handle::private::SharedHandle` and `handle::private::SharedHandleOps` must be implemented
-  --> src/handle.rs
-   |
-   |     pub trait SharedHandle {}
-   |     ^^^^^^^^^^^^^^^^^^^^^^
-...
-   |     pub trait SharedHandleOps<T: ?Sized, S>: HandleOps<T, False, S> + SharedHandle {
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+           `*mut u32: Sync`
+           which is required by `SharedNotSync: handle::private::SharedHandleOps<NotSync, True>`
 
 error[E0277]: `*mut u32` cannot be shared between threads safely
   --> tests/invalid-handle-code/shared-not-sync.rs:14:48
@@ -40,20 +31,11 @@ error[E0599]: the method `clone_handle` exists for struct `Handle<SharedNotSync>
   --> tests/invalid-handle-code/shared-not-sync.rs:16:15
    |
 10 | pub struct SharedNotSync;
-   | ------------------------ doesn't satisfy `SharedNotSync: handle::private::SharedHandle` or `_: SharedHandleOps<_, _>`
+   | ------------------------ doesn't satisfy `_: SharedHandleOps<NotSync, True>`
 ...
 16 |     let h = h.clone_handle();
    |               ^^^^^^^^^^^^
    |
    = note: the following trait bounds were not satisfied:
-           `SharedNotSync: handle::private::SharedHandleOps<_, _>`
-           `SharedNotSync: handle::private::SharedHandle`
-           which is required by `SharedNotSync: handle::private::SharedHandleOps<_, _>`
-note: the traits `handle::private::SharedHandle` and `handle::private::SharedHandleOps` must be implemented
-  --> src/handle.rs
-   |
-   |     pub trait SharedHandle {}
-   |     ^^^^^^^^^^^^^^^^^^^^^^
-...
-   |     pub trait SharedHandleOps<T: ?Sized, S>: HandleOps<T, False, S> + SharedHandle {
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+           `*mut u32: Sync`
+           which is required by `SharedNotSync: handle::private::SharedHandleOps<NotSync, True>`

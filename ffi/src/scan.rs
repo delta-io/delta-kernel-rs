@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use delta_kernel::scan::state::{visit_scan_files, DvInfo, GlobalScanState};
-use delta_kernel::scan::{Scan, ScanBuilder, ScanData};
+use delta_kernel::scan::{Scan, ScanData};
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, EngineData, Error};
@@ -131,7 +131,7 @@ fn scan_impl(
     snapshot: Arc<Snapshot>,
     predicate: Option<&mut EnginePredicate>,
 ) -> DeltaResult<Handle<SharedScan>> {
-    let mut scan_builder = ScanBuilder::new(snapshot);
+    let mut scan_builder = snapshot.scan_builder();
     if let Some(predicate) = predicate {
         let mut visitor_state = KernelExpressionVisitorState::new();
         let exprid = (predicate.visitor)(predicate.predicate, &mut visitor_state);
