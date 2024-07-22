@@ -16,18 +16,15 @@
  */
 
 #ifdef VERBOSE
-// this macro magic freaks out gcc
-#pragma GCC diagnostic ignored "-Wformat-extra-args"
-#pragma GCC diagnostic ignored "-Wformat"
 #define _NTH_ARG(_1, _2, _3, _4, _5, N, ...) N
 #define NUMARGS(...) _NTH_ARG(__VA_ARGS__, 5, 4, 3, 2, 1)
 #define CHILD_FMT "Asked to visit %s named %s belonging to list %li. %s are in %li.\n"
 #define NO_CHILD_FMT "Asked to visit %s named %s belonging to list %li.\n"
-#define PRINT_VISIT(...)                                                                           \
-  NUMARGS(__VA_ARGS__) == 5 ? printf(CHILD_FMT, __VA_ARGS__) : printf(NO_CHILD_FMT, __VA_ARGS__)
+#define PRINT_CHILD_VISIT(...) printf(CHILD_FMT, __VA_ARGS__)
+#define PRINT_NO_CHILD_VISIT(...) printf(NO_CHILD_FMT, __VA_ARGS__)
 #else
-#define PRINT_VISIT(...)
-#pragma GCC diagnostic pop
+#define PRINT_CHILD_VISIT(...)
+#define PRINT_NO_CHILD_VISIT(...)
 #endif
 
 typedef struct SchemaItemList SchemaItemList;
@@ -112,7 +109,7 @@ void visit_struct(
 {
   SchemaBuilder* builder = data;
   char* name_ptr = allocate_string(name);
-  PRINT_VISIT("struct", name_ptr, sibling_list_id, "Children", child_list_id);
+  PRINT_CHILD_VISIT("struct", name_ptr, sibling_list_id, "Children", child_list_id);
   SchemaItem* struct_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "struct");
   struct_item->children = child_list_id;
 }
@@ -127,7 +124,7 @@ void visit_array(
   char* name_ptr = malloc(sizeof(char) * (name.len + 24));
   snprintf(name_ptr, name.len + 1, "%s", name.ptr);
   snprintf(name_ptr + name.len, 24, " (contains null: %s)", contains_null ? "true" : "false");
-  PRINT_VISIT("array", name_ptr, sibling_list_id, "Types", child_list_id);
+  PRINT_CHILD_VISIT("array", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* array_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "array");
   array_item->children = child_list_id;
 }
@@ -142,7 +139,7 @@ void visit_map(
   char* name_ptr = malloc(sizeof(char) * (name.len + 24));
   snprintf(name_ptr, name.len + 1, "%s", name.ptr);
   snprintf(name_ptr + name.len, 24, " (contains null: %s)", value_contains_null ? "true" : "false");
-  PRINT_VISIT("map", name_ptr, sibling_list_id, "Types", child_list_id);
+  PRINT_CHILD_VISIT("map", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* map_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "map");
   map_item->children = child_list_id;
 }
@@ -158,7 +155,7 @@ void visit_decimal(
   char* name_ptr = allocate_string(name);
   char* type = malloc(19 * sizeof(char));
   snprintf(type, 19, "decimal(%u)(%d)", precision, scale);
-  PRINT_VISIT(type, name_ptr, sibling_list_id);
+  PRINT_NO_CHILD_VISIT(type, name_ptr, sibling_list_id);
   add_to_list(&builder->lists[sibling_list_id], name_ptr, type);
 }
 
@@ -170,7 +167,7 @@ void visit_simple_type(
 {
   SchemaBuilder* builder = data;
   char* name_ptr = allocate_string(name);
-  PRINT_VISIT(type, name_ptr, sibling_list_id);
+  PRINT_NO_CHILD_VISIT(type, name_ptr, sibling_list_id);
   add_to_list(&builder->lists[sibling_list_id], name_ptr, type);
 }
 
@@ -242,7 +239,7 @@ void print_schema(SharedSnapshot* snapshot)
   };
   uintptr_t schema_list_id = visit_schema(snapshot, &visitor);
 #ifdef VERBOSE
-  printf("Schema returned in list %i\n", schema_list_id);
+  printf("Schema returned in list %" PRIxPTR "\n", schema_list_id);
 #endif
   print_diag("Done building schema\n");
   printf("Schema:\n");

@@ -1,0 +1,101 @@
+Reading table at ../../../../acceptance/tests/dat/out/reader_tests/generated/all_primitive_types/delta/
+version: 0
+
+Schema:
+├─ utf8: string
+├─ int64: long
+├─ int32: integer
+├─ int16: short
+├─ int8: byte
+├─ float32: float
+├─ float64: double
+├─ bool: boolean
+├─ binary: binary
+├─ decimal: decimal(5)(3)
+├─ date32: date
+└─ timestamp: timestamp
+
+utf8:  [
+  "0",
+  "1",
+  "2",
+  "3",
+  "4"
+]
+int64:  [
+  0,
+  1,
+  2,
+  3,
+  4
+]
+int32:  [
+  0,
+  1,
+  2,
+  3,
+  4
+]
+int16:  [
+  0,
+  1,
+  2,
+  3,
+  4
+]
+int8:  [
+  0,
+  1,
+  2,
+  3,
+  4
+]
+float32:  [
+  0,
+  1,
+  2,
+  3,
+  4
+]
+float64:  [
+  0,
+  1,
+  2,
+  3,
+  4
+]
+bool:  [
+  true,
+  false,
+  true,
+  false,
+  true
+]
+binary:  [
+  ,
+  00,
+  0000,
+  000000,
+  00000000
+]
+decimal:  [
+  10.000,
+  11.000,
+  12.000,
+  13.000,
+  14.000
+]
+date32:  [
+  1970-01-01,
+  1970-01-02,
+  1970-01-03,
+  1970-01-04,
+  1970-01-05
+]
+timestamp:  [
+  1970-01-01 00:00:00.000000Z,
+  1970-01-01 01:00:00.000000Z,
+  1970-01-01 02:00:00.000000Z,
+  1970-01-01 03:00:00.000000Z,
+  1970-01-01 04:00:00.000000Z
+]
