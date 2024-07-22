@@ -11,6 +11,7 @@ version.workspace = true
 
 [dependencies]
 arrow-array = { workspace = true }
+arrow-cast = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-select = { workspace = true }
 arrow-schema = { workspace = true }

@@ -7,25 +7,25 @@ Schema:
 └─ a_float: double
 
 number:  [
-  6,
   4,
   5,
+  6,
   1,
   2,
   3
 ]
 a_float:  [
-  6.6,
   4.4,
   5.5,
+  6.6,
   1.1,
   2.2,
   3.3
 ]
 letter:  [
-  null,
   "a",
   "e",
+  "f",
   "a",
   "b",
   "c"
