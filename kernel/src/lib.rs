@@ -8,9 +8,11 @@
 //! [`DefaultEngine`](engine/default/index.html) for more information.
 //!
 //! A full `rust` example for reading table data using the default engine can be found in the
-//! [inspect-table] example.
+//! [read-table-single-threaded] example (and for a more complex multi-threaded reader see the
+//! [read-table-multi-threaded] example).
 //!
-//! [inspect-table]: https://github.com/delta-incubator/delta-kernel-rs/blob/main/kernel/examples/inspect-table/src/main.rs
+//! [read-table-single-threaded]: https://github.com/delta-incubator/delta-kernel-rs/tree/main/kernel/examples/read-table-single-threaded
+//! [read-table-multi-threaded]: https://github.com/delta-incubator/delta-kernel-rs/tree/main/kernel/examples/read-table-multi-threaded
 //!
 //! # Engine traits
 //!
