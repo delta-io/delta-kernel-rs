@@ -16,9 +16,7 @@ ArrowContext* init_arrow_context()
 // unref all the data in the context
 void free_arrow_context(ArrowContext* context)
 {
-  for (gsize i = 0; i < context->num_batches; i++) {
-    g_object_unref(context->batches[i]);
-  }
+  g_list_free_full(g_steal_pointer(&context->batches), g_object_unref);
   free(context);
 }
 
@@ -141,9 +139,7 @@ static void add_batch_to_context(
     printf("Failed to add parition columns, not adding batch\n");
     return;
   }
-  context->batches =
-    realloc(context->batches, sizeof(GArrowRecordBatch*) * (context->num_batches + 1));
-  context->batches[context->num_batches] = record_batch;
+  context->batches = g_list_append(context->batches, record_batch);
   context->num_batches++;
   print_diag(
     "  Added batch to arrow context, have %i batches in context now\n", context->num_batches);
@@ -241,23 +237,50 @@ void c_read_parquet_file(
   free_read_result_iter(read_iter);
 }
 
-// Concat all our batches into a `GArrowTable`, call to_string on it, and print the result
+struct extract_col_data {
+  GList* list;
+  guint col_idx;
+};
+
+void extract_col(GArrowRecordBatch* element, struct extract_col_data* data) {
+  GArrowArray* array_data = garrow_record_batch_get_column_data(element, data->col_idx);
+  data->list = g_list_append(data->list, array_data);
+}
+
+// Print the whole set of data. We iterate over each column, and concat each batch's data for that
+// column together, then print the result.
 void print_arrow_context(ArrowContext* context)
 {
   if (context->num_batches > 0) {
     GError* error = NULL;
-    GArrowSchema* schema = garrow_record_batch_get_schema(context->batches[0]);
-    GArrowTable* table =
-      garrow_table_new_record_batches(schema, context->batches, context->num_batches, &error);
-    if (report_g_error("Can't create table from batches", error)) {
-      return;
+    guint cols = garrow_record_batch_get_n_columns(context->batches->data);
+    for (guint c = 0; c < cols; c++) {
+      // name owned by instance, so no need to free
+      const gchar* name = garrow_record_batch_get_column_name(context->batches->data, c);
+      printf("%s:  ", name);
+      GArrowRecordBatch* batch = context->batches->data;
+      GArrowArray* data = garrow_record_batch_get_column_data(batch, c);
+      GList* remaining = g_list_nth(context->batches, 1);
+      if (remaining != NULL) {
+        struct extract_col_data remaining_data = {
+          .list = NULL,
+          .col_idx = c,
+        };
+        g_list_foreach(remaining, (GFunc)extract_col, &remaining_data);
+        data = garrow_array_concatenate(data, remaining_data.list, &error);
+        if (report_g_error("Can't concat array data", error)) {
+          return;
+        }
+      }
+      gchar* array_out = garrow_array_to_string(data, &error);
+      if (report_g_error("Can't get array as string", error)) {
+        g_object_unref(data);
+        return;
+      }
+      printf("%s\n", array_out);
+      g_free(array_out);
+      g_object_unref(data);
     }
-    gchar* out = garrow_table_to_string(table, &error);
-    if (!report_g_error("Can't turn table into string", error)) {
-      printf("\nTable Data:\n-----------\n\n%s\n", out);
-      g_free(out);
-    }
-    g_object_unref(table);
   } else {
     printf("[No data]\n");
   }
