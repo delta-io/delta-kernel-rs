@@ -20,15 +20,14 @@ use arrow_schema::{
 use arrow_select::concat::concat;
 use itertools::Itertools;
 
+use super::arrow_conversion::LIST_ARRAY_ROOT;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::{prim_array_cmp};
 use crate::engine::arrow_utils::ensure_data_types;
+use crate::engine::arrow_utils::prim_array_cmp;
 use crate::error::{DeltaResult, Error};
-use crate::expressions::{BinaryOperator, Expression, UnaryOperator, VariadicOperator, Scalar};
+use crate::expressions::{BinaryOperator, Expression, Scalar, UnaryOperator, VariadicOperator};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
-
-use super::arrow_conversion::LIST_ARRAY_ROOT;
 
 // TODO leverage scalars / Datum
 
@@ -244,9 +243,16 @@ fn evaluate_expression(
             },
             _,
         ) => match (left.as_ref(), right.as_ref()) {
-            (Column(_), Literal(Scalar::Array(ad))) => {
-                let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
-            }
+            /// TODO: https://github.com/delta-incubator/delta-kernel-rs/issues/291
+            /// Rework some aspects of expression evaluation to better handle these cases
+            /// right now we copy a literal array for every row in a batch.
+            // (Column(_), Literal(Scalar::Array(ad))) => {
+            //     let elements = ad.try_into()?;
+            //     let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
+            //     if let Some(stats) = stats {
+            //         stats
+            //     }
+            // }
             (_, Column(_)) => {
                 let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
                 let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
