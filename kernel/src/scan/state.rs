@@ -67,6 +67,7 @@ impl DvInfo {
         Ok(dv_treemap.map(treemap_to_bools))
     }
 
+    /// Returns a vector of row indexes that should be *removed* from the result set
     pub fn get_row_indexes(
         &self,
         engine: &dyn Engine,

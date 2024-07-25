@@ -210,6 +210,10 @@ mod private {
     ///
     /// If engine chooses to leverage concurrency, engine is responsible to prevent data races.
     unsafe impl Sync for KernelBoolSlice {}
+    /// # Safety
+    ///
+    /// If engine chooses to leverage concurrency, engine is responsible to prevent data races.
+    /// Same contract as KernelBoolSlice above
     unsafe impl Sync for KernelRowIndexArray {}
 
     impl KernelRowIndexArray {
