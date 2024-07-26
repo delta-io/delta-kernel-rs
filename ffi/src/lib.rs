@@ -189,12 +189,10 @@ mod private {
         fn from(val: Vec<bool>) -> Self {
             let len = val.len();
             let boxed = val.into_boxed_slice();
-            let ptr = Box::leak(boxed).as_mut_ptr();
-            if let Some(ptr) = NonNull::new(ptr) {
-                KernelBoolSlice { ptr, len }
-            } else {
-                KernelBoolSlice::empty()
-            }
+            let leaked_ptr = Box::leak(boxed).as_mut_ptr();
+            let ptr = NonNull::new(leaked_ptr)
+                .expect("This should never be non-null please report this bug.");
+            KernelBoolSlice { ptr, len }
         }
     }
 
@@ -245,12 +243,10 @@ mod private {
         fn from(vec: Vec<u64>) -> Self {
             let len = vec.len();
             let boxed = vec.into_boxed_slice();
-            let ptr = Box::leak(boxed).as_mut_ptr();
-            if let Some(ptr) = NonNull::new(ptr) {
-                KernelRowIndexArray { ptr, len }
-            } else {
-                KernelRowIndexArray::empty()
-            }
+            let leaked_ptr = Box::leak(boxed).as_mut_ptr();
+            let ptr = NonNull::new(leaked_ptr)
+                .expect("This should never be non-null please report this bug.");
+            KernelRowIndexArray { ptr, len }
         }
     }
 }
