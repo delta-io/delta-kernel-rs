@@ -204,6 +204,11 @@ mod private {
     /// memory, but must only free it by calling [super::free_bool_slice]. Since the global
     /// allocator is threadsafe, it doesn't matter which engine thread invokes that method.
     unsafe impl Send for KernelBoolSlice {}
+    /// # Safety
+    ///
+    /// This follows the same contract as KernelBoolSlice above, engine assumes ownership of the
+    /// slice memory, but must only free it by calling [super::free_row_indexes]. It does not matter
+    /// from which thread the engine invoke that method
     unsafe impl Send for KernelRowIndexArray {}
 
     /// # Safety
@@ -224,11 +229,7 @@ mod private {
         /// The slice must have been originally created `From<Vec<u64>>`, and must not have
         /// already been consumed by a previous call to this method.
         pub unsafe fn into_vec(self) -> Vec<u64> {
-            if self.len == 0 {
-                Default::default()
-            } else {
-                Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len)
-            }
+            Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len)
         }
 
         /// Creates an empty slice.
