@@ -394,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dv_wrapper() {
+    fn test_dv_row_indexes() {
         let example = dv_inline();
         let sync_engine = SyncEngine::new();
         let fs_client = sync_engine.get_file_system_client();
