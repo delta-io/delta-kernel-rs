@@ -3,8 +3,8 @@
 //! Delta-kernel-rs is an experimental [Delta](https://github.com/delta-io/delta/) implementation
 //! focused on interoperability with a wide range of query engines. It currently only supports
 //! reads. This library defines a number of traits which must be implemented to provide a
-//! working "delta reader". The are detailed below. There is a provided "default engine" that
-//! implenents all these traits and can be used to ease integration work. See
+//! working "delta reader". They are detailed below. There is a provided "default engine" that
+//! implements all these traits and can be used to ease integration work. See
 //! [`DefaultEngine`](engine/default/index.html) for more information.
 //!
 //! A full `rust` example for reading table data using the default engine can be found
@@ -26,7 +26,7 @@
 //! ## File system interactions
 //!
 //! Delta Kernel needs to perform some basic operations against file systems like listing and reading files.
-//! These interactions are encapsulated in the [`FileSystemClient`] trait. Implementors must take take
+//! These interactions are encapsulated in the [`FileSystemClient`] trait. Implementors must take
 //! care that all assumptions on the behavior if the functions - like sorted results - are respected.
 //!
 //! ## Reading log and data files

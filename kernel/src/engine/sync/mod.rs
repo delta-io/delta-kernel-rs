@@ -9,7 +9,7 @@ mod fs_client;
 pub(crate) mod json;
 mod parquet;
 
-/// This is a simple implemention of [`Engine`]. It only supports reading data from the local
+/// This is a simple implementation of [`Engine`]. It only supports reading data from the local
 /// filesystem, and internally represents data using `Arrow`.
 pub struct SyncEngine {
     fs_client: Arc<fs_client::SyncFilesystemClient>,
