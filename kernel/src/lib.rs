@@ -7,8 +7,12 @@
 //! implements all these traits and can be used to ease integration work. See
 //! [`DefaultEngine`](engine/default/index.html) for more information.
 //!
-//! A full `rust` example for reading table data using the default engine can be found
-//! [here](https://github.com/delta-incubator/delta-kernel-rs/blob/main/kernel/examples/dump-table/src/main.rs)
+//! A full `rust` example for reading table data using the default engine can be found in the
+//! [read-table-single-threaded] example (and for a more complex multi-threaded reader see the
+//! [read-table-multi-threaded] example).
+//!
+//! [read-table-single-threaded]: https://github.com/delta-incubator/delta-kernel-rs/tree/main/kernel/examples/read-table-single-threaded
+//! [read-table-multi-threaded]: https://github.com/delta-incubator/delta-kernel-rs/tree/main/kernel/examples/read-table-multi-threaded
 //!
 //! # Engine traits
 //!
