@@ -108,9 +108,11 @@ rustc_version = "0.4.0"
 [dev-dependencies]
 arrow = { workspace = true, features = ["json", "prettyprint"] }
 delta_kernel = { path = ".", features = ["default-engine", "sync-engine"] }
+paste = "1.0"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 tempfile = "3"
-test-case = { version = "3.1.0" }
+tar = "0.4"
+zstd = "0.13"
 tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "fmt",

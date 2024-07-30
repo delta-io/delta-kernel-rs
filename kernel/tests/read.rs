@@ -17,11 +17,14 @@ use delta_kernel::expressions::{BinaryOperator, Expression};
 use delta_kernel::scan::state::{visit_scan_files, DvInfo, Stats};
 use delta_kernel::scan::{transform_to_logical, Scan};
 use delta_kernel::schema::Schema;
-use delta_kernel::{DeltaResult, Engine, EngineData, FileMeta, Table};
+use delta_kernel::{Engine, EngineData, FileMeta, Table};
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use url::Url;
+
+#[macro_use] mod common;
+use common::to_arrow;
 
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
 const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c000.snappy.parquet";
@@ -360,16 +363,6 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-macro_rules! sort_lines {
-    ($lines: expr) => {{
-        // sort except for header + footer
-        let num_lines = $lines.len();
-        if num_lines > 3 {
-            $lines.as_mut_slice()[2..num_lines - 1].sort_unstable()
-        }
-    }};
-}
-
 // NB: expected_lines_sorted MUST be pre-sorted (via sort_lines!())
 macro_rules! assert_batches_sorted_eq {
     ($expected_lines_sorted: expr, $CHUNKS: expr) => {
@@ -385,14 +378,6 @@ macro_rules! assert_batches_sorted_eq {
             $expected_lines_sorted, actual_lines
         );
     };
-}
-
-fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
-    Ok(data
-        .into_any()
-        .downcast::<ArrowEngineData>()
-        .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
-        .into())
 }
 
 fn read_with_execute(
