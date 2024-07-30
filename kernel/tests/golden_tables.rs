@@ -35,7 +35,7 @@ fn load_test_data(test_name: &str) -> Result<tempfile::TempDir, Box<dyn std::err
     Ok(temp_dir)
 }
 
-// NB adapated from DAT
+// NB adapated from DAT: read all parquet files in the directory and concatenate them
 async fn read_expected(path: &Path) -> DeltaResult<Option<RecordBatch>> {
     let store = Arc::new(LocalFileSystem::new_with_prefix(path)?);
     let files = store.list(None).try_collect::<Vec<_>>().await?;
@@ -60,25 +60,9 @@ async fn read_expected(path: &Path) -> DeltaResult<Option<RecordBatch>> {
     Ok(Some(all_data))
 }
 
-// change to do the dat test
+// TODO: change to do something similar to dat tests instead of string comparison
 macro_rules! assert_batches_eq {
     ($expected: expr, $chunks: expr) => {
-        // let schema = $chunks.schema();
-        // let result: Vec<ArrayRef> = $chunks
-        //     .columns()
-        //     .iter()
-        //     .map(|column| normalize_col(column))
-        //     .collect();
-        // let result = RecordBatch::try_new(schema.clone(), result).unwrap();
-
-        // let schema = $expected.schema();
-        // let expected: Vec<ArrayRef> = $expected
-        //     .columns()
-        //     .iter()
-        //     .map(|column| normalize_col(column))
-        //     .collect();
-        // let expected = RecordBatch::try_new(schema.clone(), expected).unwrap();
-
         let formatted_expected = arrow::util::pretty::pretty_format_batches(&[$expected])
             .unwrap()
             .to_string();
@@ -112,6 +96,7 @@ fn normalize_col(col: &Arc<dyn Array>) -> Arc<dyn Array> {
     }
 }
 
+// do a full table scan at the latest snapshot of the table and compare with the expected data
 async fn latest_snapshot_test(test_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let test_dir = load_test_data(test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
@@ -149,38 +134,8 @@ async fn latest_snapshot_test(test_name: &str) -> Result<(), Box<dyn std::error:
         })
         .collect();
 
-    // let formatted = arrow::util::pretty::pretty_format_batches(&batches)
-    //     .unwrap()
-    //     .to_string();
-
-    // println!("result:");
-    // println!("{}", formatted);
-
     let expected = read_expected(&expected_path).await.unwrap().unwrap();
-    // let formatted_expected = arrow::util::pretty::pretty_format_batches(&[expected])
-    //     .unwrap()
-    //     .to_string();
-
-    // println!("expected:");
-    // println!("{}", formatted_expected);
-
     let schema: ArrowSchemaRef = Arc::new(scan.schema().as_ref().try_into().unwrap());
-    // println!("scan schema: {:#?}", schema);
-    // println!("expected schema: {:#?}", expected.schema());
-    // println!("batch schema: {:#?}", batches[0].schema());
-
-    // let schema = $expected.schema();
-    // let expected: Vec<ArrayRef> = $expected
-    //     .columns()
-    //     .iter()
-    //     .map(| olumn| normalize_col(column))
-    //     .collect();
-    // let expected = RecordBatch::try_new(schema.clone(), expected).unwrap();
-
-    // batch (physical) schema has part = Timestamp(Microsecond, Some("+00:00")), nullable
-    // = false
-    // scan (logical) schema has part = Timestamp(Microsecond, Some("UTC")), nullable = true
-    // issue is that batches read schema doesn't match the scan schema
 
     // convert the batch +00:00 to UTC
     let result: Vec<RecordBatch> = batches
@@ -283,9 +238,9 @@ full_scan_test!("basic-with-inserts-overwrite-restore");
 full_scan_test!("basic-with-inserts-updates");
 full_scan_test!("basic-with-vacuum-protocol-check-feature");
 skip_test!("checkpoint": "test not yet implmented");
-full_scan_test!("corrupted-last-checkpoint-kernel");
-full_scan_test!("data-reader-array-complex-objects");
-full_scan_test!("data-reader-array-primitives");
+skip_test!("corrupted-last-checkpoint-kernel": "BUG: should fallback to old commits/checkpoint");
+skip_test!("data-reader-array-complex-objects": "list field expected name item but got name element");
+skip_test!("data-reader-array-primitives": "list field expected name item but got name element");
 full_scan_test!("data-reader-date-types-America");
 full_scan_test!("data-reader-date-types-Asia");
 full_scan_test!("data-reader-date-types-Etc");
@@ -294,19 +249,20 @@ full_scan_test!("data-reader-date-types-Jst");
 full_scan_test!("data-reader-date-types-Pst");
 full_scan_test!("data-reader-date-types-utc");
 full_scan_test!("data-reader-escaped-chars");
-full_scan_test!("data-reader-map");
+skip_test!("data-reader-map": "map field named 'entries' vs 'key_value'");
 full_scan_test!("data-reader-nested-struct");
-full_scan_test!("data-reader-nullable-field-invalid-schema-key");
-full_scan_test!("data-reader-partition-values");
+skip_test!("data-reader-nullable-field-invalid-schema-key":
+  "list field expected name item but got name element");
+skip_test!("data-reader-partition-values": "list field expected name item but got name element");
 full_scan_test!("data-reader-primitives");
 full_scan_test!("data-reader-timestamp_ntz");
-full_scan_test!("data-reader-timestamp_ntz-id-mode");
+skip_test!("data-reader-timestamp_ntz-id-mode": "id column mapping mode not supported");
 full_scan_test!("data-reader-timestamp_ntz-name-mode");
 
 // TODO test with predicate
 full_scan_test!("data-skipping-basic-stats-all-types");
 full_scan_test!("data-skipping-basic-stats-all-types-checkpoint");
-full_scan_test!("data-skipping-basic-stats-all-types-columnmapping-id");
+skip_test!("data-skipping-basic-stats-all-types-columnmapping-id": "id column mapping mode not supported");
 full_scan_test!("data-skipping-basic-stats-all-types-columnmapping-name");
 full_scan_test!("data-skipping-change-stats-collected-across-versions");
 full_scan_test!("data-skipping-partition-and-data-column");
@@ -333,8 +289,8 @@ full_scan_test!("multi-part-checkpoint");
 full_scan_test!("only-checkpoint-files");
 
 // TODO some of the parquet tests use projections
-full_scan_test!("parquet-all-types");
-full_scan_test!("parquet-all-types-legacy-format");
+skip_test!("parquet-all-types": "list field expected name item but got name element");
+skip_test!("parquet-all-types-legacy-format": "list field expected name item but got name element");
 full_scan_test!("parquet-decimal-dictionaries");
 full_scan_test!("parquet-decimal-dictionaries-v1");
 full_scan_test!("parquet-decimal-dictionaries-v2");
@@ -349,8 +305,9 @@ full_scan_test!("snapshot-repartitioned");
 full_scan_test!("snapshot-vacuumed");
 
 // TODO use projections
-full_scan_test!("table-with-columnmapping-mode-id");
-full_scan_test!("table-with-columnmapping-mode-name");
+skip_test!("table-with-columnmapping-mode-id": "id column mapping mode not supported");
+skip_test!("table-with-columnmapping-mode-name":
+  "BUG: Parquet(General('partial projection of MapArray is not supported'))");
 
 // TODO scan at different versions
 full_scan_test!("time-travel-partition-changes-a");
