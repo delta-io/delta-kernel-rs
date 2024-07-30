@@ -23,7 +23,8 @@ use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use url::Url;
 
-#[macro_use] mod common;
+#[macro_use]
+mod common;
 use common::to_arrow;
 
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
