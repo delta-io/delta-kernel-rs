@@ -141,11 +141,7 @@ async fn latest_snapshot_test(test_name: &str) -> Result<(), Box<dyn std::error:
     let result: Vec<RecordBatch> = batches
         .iter()
         .map(|batch| {
-            let result: Vec<ArrayRef> = batch
-                .columns()
-                .iter()
-                .map(normalize_col)
-                .collect();
+            let result: Vec<ArrayRef> = batch.columns().iter().map(normalize_col).collect();
             RecordBatch::try_new(schema.clone(), result).unwrap()
         })
         .collect();
