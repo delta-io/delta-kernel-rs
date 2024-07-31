@@ -164,7 +164,7 @@ fn setup_golden_table(
     )
     .unwrap();
     let expected_path = test_path.join("expected");
-    let expected_path = expected_path.exists().then(|| expected_path);
+    let expected_path = expected_path.exists().then_some(expected_path);
     (engine, table, expected_path, test_dir)
 }
 

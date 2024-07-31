@@ -147,9 +147,7 @@ pub async fn assert_scan_data(engine: Arc<dyn Engine>, test_case: &TestCaseInfo)
         .collect();
     let all_data = concat_batches(&schema.unwrap(), batches.iter()).map_err(Error::from)?;
     let all_data = sort_record_batch(all_data)?;
-    let golden = read_golden(test_case.root_dir(), None)
-        .await?
-        .expect("Didn't find golden data");
+    let golden = read_golden(test_case.root_dir(), None).await?;
     let golden = sort_record_batch(golden)?;
 
     assert_columns_match(all_data.columns(), golden.columns());
