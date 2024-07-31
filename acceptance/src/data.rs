@@ -12,7 +12,7 @@ use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream
 
 use crate::{TestCaseInfo, TestResult};
 
-pub async fn read_golden(path: &Path, _version: Option<&str>) -> DeltaResult<Option<RecordBatch>> {
+pub async fn read_golden(path: &Path, _version: Option<&str>) -> DeltaResult<RecordBatch> {
     let expected_root = path.join("expected").join("latest").join("table_content");
     let store = Arc::new(LocalFileSystem::new_with_prefix(&expected_root)?);
     let files = store.list(None).try_collect::<Vec<_>>().await?;
@@ -34,7 +34,7 @@ pub async fn read_golden(path: &Path, _version: Option<&str>) -> DeltaResult<Opt
         }
     }
     let all_data = concat_batches(&schema.unwrap(), &batches)?;
-    Ok(Some(all_data))
+    Ok(all_data)
 }
 
 pub fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {

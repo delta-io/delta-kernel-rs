@@ -4,10 +4,9 @@
 //! Each table directory has a table/ and expected/ subdirectory with the input/output respectively
 
 use arrow::{compute::filter_record_batch, record_batch::RecordBatch};
-use arrow_array::ArrayRef;
 use arrow_select::concat::concat_batches;
 use paste::paste;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef as ArrowSchemaRef;
@@ -25,7 +24,8 @@ use delta_kernel::engine::default::DefaultEngine;
 mod common;
 use common::to_arrow;
 
-// load the test data from <test_table>.tar.zst file
+/// unpack the test data from test_table.tar.zst into a temp dir, and return the dir it was
+/// unpacked into
 fn load_test_data(test_name: &str) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
     let path = format!("tests/golden_data/{}.tar.zst", test_name);
     let tar = zstd::Decoder::new(std::fs::File::open(path)?)?;
@@ -36,7 +36,7 @@ fn load_test_data(test_name: &str) -> Result<tempfile::TempDir, Box<dyn std::err
 }
 
 // NB adapated from DAT: read all parquet files in the directory and concatenate them
-async fn read_expected(path: &Path) -> DeltaResult<Option<RecordBatch>> {
+async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
     let store = Arc::new(LocalFileSystem::new_with_prefix(path)?);
     let files = store.list(None).try_collect::<Vec<_>>().await?;
     let mut batches = vec![];
@@ -57,10 +57,11 @@ async fn read_expected(path: &Path) -> DeltaResult<Option<RecordBatch>> {
         }
     }
     let all_data = concat_batches(&schema.unwrap(), &batches)?;
-    Ok(Some(all_data))
+    Ok(all_data)
 }
 
-// TODO: change to do something similar to dat tests instead of string comparison
+// TODO: change to use arrow's column Eq like dat does, instead of string comparison. Should print
+// out string when test fails to make debugging easier
 macro_rules! assert_batches_eq {
     ($expected: expr, $chunks: expr) => {
         let formatted_expected = arrow::util::pretty::pretty_format_batches(&[$expected])
@@ -97,21 +98,11 @@ fn normalize_col(col: &Arc<dyn Array>) -> Arc<dyn Array> {
 }
 
 // do a full table scan at the latest snapshot of the table and compare with the expected data
-async fn latest_snapshot_test(test_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let test_dir = load_test_data(test_name).unwrap();
-    let test_path = test_dir.path().join(test_name);
-    let table_path = std::fs::canonicalize(test_path.join("table")).unwrap();
-    let table_path = url::Url::from_directory_path(table_path).unwrap();
-    let expected_path = std::fs::canonicalize(test_path.join("expected")).unwrap();
-
-    let engine = DefaultEngine::try_new(
-        &table_path,
-        std::iter::empty::<(&str, &str)>(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    )
-    .unwrap();
-
-    let table = Table::new(table_path);
+async fn latest_snapshot_test(
+    engine: DefaultEngine<TokioBackgroundExecutor>,
+    table: Table,
+    expected_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = table.snapshot(&engine, None).unwrap();
 
     let scan = snapshot.into_scan_builder().build().unwrap();
@@ -134,14 +125,16 @@ async fn latest_snapshot_test(test_name: &str) -> Result<(), Box<dyn std::error:
         })
         .collect();
 
-    let expected = read_expected(&expected_path).await.unwrap().unwrap();
+    let expected = read_expected(&expected_path.expect("expect an expected dir"))
+        .await
+        .unwrap();
     let schema: ArrowSchemaRef = Arc::new(scan.schema().as_ref().try_into().unwrap());
 
     // convert the batch +00:00 to UTC
     let result: Vec<RecordBatch> = batches
         .iter()
         .map(|batch| {
-            let result: Vec<ArrayRef> = batch.columns().iter().map(normalize_col).collect();
+            let result = batch.columns().iter().map(normalize_col).collect();
             RecordBatch::try_new(schema.clone(), result).unwrap()
         })
         .collect();
@@ -151,15 +144,28 @@ async fn latest_snapshot_test(test_name: &str) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-macro_rules! full_scan_test {
-    ($test_name:literal) => {
-        paste! {
-            #[tokio::test]
-            async fn [<golden_ $test_name:snake>]() {
-                latest_snapshot_test($test_name).await.unwrap();
-            }
-        }
-    };
+fn setup_golden_table(
+    test_name: &str,
+) -> (
+    DefaultEngine<TokioBackgroundExecutor>,
+    Table,
+    Option<PathBuf>,
+    tempfile::TempDir,
+) {
+    let test_dir = load_test_data(test_name).unwrap();
+    let test_path = test_dir.path().join(test_name);
+    let table_path = test_path.join("table");
+    let table = Table::try_from_uri(table_path.to_str().expect("table path to string"))
+        .expect("table from uri");
+    let engine = DefaultEngine::try_new(
+        table.location(),
+        std::iter::empty::<(&str, &str)>(),
+        Arc::new(TokioBackgroundExecutor::new()),
+    )
+    .unwrap();
+    let expected_path = test_path.join("expected");
+    let expected_path = expected_path.exists().then(|| expected_path);
+    (engine, table, expected_path, test_dir)
 }
 
 // same as golden_test but we expect the test to fail
@@ -170,7 +176,8 @@ macro_rules! negative_test {
             #[tokio::test]
             #[should_panic]
             async fn [<golden_negative_ $test_name:snake>]() {
-                latest_snapshot_test($test_name).await.unwrap();
+                let (engine, table, expected, _test_dir) = setup_golden_table($test_name);
+                latest_snapshot_test(engine, table, expected).await.unwrap();
             }
         }
     };
@@ -181,9 +188,7 @@ macro_rules! skip_test {
         paste! {
             #[ignore = $reason]
             #[tokio::test]
-            async fn [<golden_skip_ $test_name:snake>]() {
-                latest_snapshot_test($test_name).await.unwrap();
-            }
+            async fn [<golden_skip_ $test_name:snake>]() {}
         }
     };
 }
@@ -193,112 +198,126 @@ macro_rules! golden_test {
         paste! {
             #[tokio::test]
             async fn [<golden_ $test_name:snake>]() -> Result<(), Box<dyn std::error::Error>> {
-                let test_dir = load_test_data($test_name).unwrap();
-                let test_path = test_dir.path().join($test_name);
-                let table_path = std::fs::canonicalize(test_path.join("table")).unwrap();
-                let table_path = url::Url::from_directory_path(table_path).unwrap();
-                let engine =
-                    DefaultEngine::try_new(
-                        &table_path,
-                        std::iter::empty::<(&str, &str)>(),
-                        Arc::new(TokioBackgroundExecutor::new()),
-                    ).unwrap();
-                let table = Table::new(table_path);
-                $test_fn(engine, table);
+                let (engine, table, expected, test_dir) = setup_golden_table($test_name);
+                $test_fn(engine, table, expected).await?;
+                // print testdir
+                println!("{:?}", test_dir);
                 Ok(())
             }
         }
     };
 }
 
-fn check_version_is_one(engine: DefaultEngine<TokioBackgroundExecutor>, table: Table) {
+async fn check_version_is_one(
+    engine: DefaultEngine<TokioBackgroundExecutor>,
+    table: Table,
+    _expected: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // assert latest version is 1
     // TODO and there are no AddFiles
     let snapshot = table.snapshot(&engine, None).unwrap();
     assert_eq!(snapshot.version(), 1);
+    Ok(())
 }
 
 // All the test cases are below. Four test cases are currently supported:
-// 1. full_scan! - run the test with the latest snapshot
+// 1. golden_test! - run a test function against the golden table
 // 2. negative_test! - run the test with the latest snapshot and expect it to fail
-// 3. golden_test! - run the test with the latest snapshot and a custom test function
-// 4. skip_test! - skip the test with a reason
+// 3. skip_test! - skip the test with a reason
 
-full_scan_test!("124-decimal-decode-bug");
-full_scan_test!("125-iterator-bug");
-full_scan_test!("basic-decimal-table");
-full_scan_test!("basic-decimal-table-legacy");
-full_scan_test!("basic-with-inserts-deletes-checkpoint");
-full_scan_test!("basic-with-inserts-merge");
-full_scan_test!("basic-with-inserts-overwrite-restore");
-full_scan_test!("basic-with-inserts-updates");
-full_scan_test!("basic-with-vacuum-protocol-check-feature");
+golden_test!("124-decimal-decode-bug", latest_snapshot_test);
+golden_test!("125-iterator-bug", latest_snapshot_test);
+golden_test!("basic-decimal-table", latest_snapshot_test);
+golden_test!("basic-decimal-table-legacy", latest_snapshot_test);
+golden_test!(
+    "basic-with-inserts-deletes-checkpoint",
+    latest_snapshot_test
+);
+golden_test!("basic-with-inserts-merge", latest_snapshot_test);
+golden_test!("basic-with-inserts-overwrite-restore", latest_snapshot_test);
+golden_test!("basic-with-inserts-updates", latest_snapshot_test);
+golden_test!(
+    "basic-with-vacuum-protocol-check-feature",
+    latest_snapshot_test
+);
 skip_test!("checkpoint": "test not yet implmented");
 skip_test!("corrupted-last-checkpoint-kernel": "BUG: should fallback to old commits/checkpoint");
 skip_test!("data-reader-array-complex-objects": "list field expected name item but got name element");
 skip_test!("data-reader-array-primitives": "list field expected name item but got name element");
-full_scan_test!("data-reader-date-types-America");
-full_scan_test!("data-reader-date-types-Asia");
-full_scan_test!("data-reader-date-types-Etc");
-full_scan_test!("data-reader-date-types-Iceland");
-full_scan_test!("data-reader-date-types-Jst");
-full_scan_test!("data-reader-date-types-Pst");
-full_scan_test!("data-reader-date-types-utc");
-full_scan_test!("data-reader-escaped-chars");
+golden_test!("data-reader-date-types-America", latest_snapshot_test);
+golden_test!("data-reader-date-types-Asia", latest_snapshot_test);
+golden_test!("data-reader-date-types-Etc", latest_snapshot_test);
+golden_test!("data-reader-date-types-Iceland", latest_snapshot_test);
+golden_test!("data-reader-date-types-Jst", latest_snapshot_test);
+golden_test!("data-reader-date-types-Pst", latest_snapshot_test);
+golden_test!("data-reader-date-types-utc", latest_snapshot_test);
+golden_test!("data-reader-escaped-chars", latest_snapshot_test);
 skip_test!("data-reader-map": "map field named 'entries' vs 'key_value'");
-full_scan_test!("data-reader-nested-struct");
+golden_test!("data-reader-nested-struct", latest_snapshot_test);
 skip_test!("data-reader-nullable-field-invalid-schema-key":
   "list field expected name item but got name element");
 skip_test!("data-reader-partition-values": "list field expected name item but got name element");
-full_scan_test!("data-reader-primitives");
-full_scan_test!("data-reader-timestamp_ntz");
+golden_test!("data-reader-primitives", latest_snapshot_test);
+golden_test!("data-reader-timestamp_ntz", latest_snapshot_test);
 skip_test!("data-reader-timestamp_ntz-id-mode": "id column mapping mode not supported");
-full_scan_test!("data-reader-timestamp_ntz-name-mode");
+golden_test!("data-reader-timestamp_ntz-name-mode", latest_snapshot_test);
 
 // TODO test with predicate
-full_scan_test!("data-skipping-basic-stats-all-types");
-full_scan_test!("data-skipping-basic-stats-all-types-checkpoint");
+golden_test!("data-skipping-basic-stats-all-types", latest_snapshot_test);
+golden_test!(
+    "data-skipping-basic-stats-all-types-checkpoint",
+    latest_snapshot_test
+);
 skip_test!("data-skipping-basic-stats-all-types-columnmapping-id": "id column mapping mode not supported");
-full_scan_test!("data-skipping-basic-stats-all-types-columnmapping-name");
-full_scan_test!("data-skipping-change-stats-collected-across-versions");
-full_scan_test!("data-skipping-partition-and-data-column");
+golden_test!(
+    "data-skipping-basic-stats-all-types-columnmapping-name",
+    latest_snapshot_test
+);
+golden_test!(
+    "data-skipping-change-stats-collected-across-versions",
+    latest_snapshot_test
+);
+golden_test!(
+    "data-skipping-partition-and-data-column",
+    latest_snapshot_test
+);
 
-full_scan_test!("decimal-various-scale-precision");
+golden_test!("decimal-various-scale-precision", latest_snapshot_test);
 
 // deltalog-getChanges test currently passing but needs to test the following:
 // assert(snapshotImpl.getLatestTransactionVersion(engine, "fakeAppId") === Optional.of(3L))
 // assert(!snapshotImpl.getLatestTransactionVersion(engine, "nonExistentAppId").isPresent)
-full_scan_test!("deltalog-getChanges");
+golden_test!("deltalog-getChanges", latest_snapshot_test);
 
-full_scan_test!("dv-partitioned-with-checkpoint");
-full_scan_test!("dv-with-columnmapping");
+golden_test!("dv-partitioned-with-checkpoint", latest_snapshot_test);
+golden_test!("dv-with-columnmapping", latest_snapshot_test);
 skip_test!("hive": "test not yet implmented - different file structure");
-full_scan_test!("kernel-timestamp-int96");
-full_scan_test!("kernel-timestamp-pst");
-full_scan_test!("kernel-timestamp-timestamp_micros");
-full_scan_test!("kernel-timestamp-timestamp_millis");
-full_scan_test!("log-replay-dv-key-cases");
-full_scan_test!("log-replay-latest-metadata-protocol");
-full_scan_test!("log-replay-special-characters");
-full_scan_test!("log-replay-special-characters-a");
-full_scan_test!("multi-part-checkpoint");
-full_scan_test!("only-checkpoint-files");
+golden_test!("kernel-timestamp-int96", latest_snapshot_test);
+golden_test!("kernel-timestamp-pst", latest_snapshot_test);
+golden_test!("kernel-timestamp-timestamp_micros", latest_snapshot_test);
+golden_test!("kernel-timestamp-timestamp_millis", latest_snapshot_test);
+golden_test!("log-replay-dv-key-cases", latest_snapshot_test);
+golden_test!("log-replay-latest-metadata-protocol", latest_snapshot_test);
+golden_test!("log-replay-special-characters", latest_snapshot_test);
+golden_test!("log-replay-special-characters-a", latest_snapshot_test);
+golden_test!("multi-part-checkpoint", latest_snapshot_test);
+golden_test!("only-checkpoint-files", latest_snapshot_test);
 
 // TODO some of the parquet tests use projections
 skip_test!("parquet-all-types": "list field expected name item but got name element");
 skip_test!("parquet-all-types-legacy-format": "list field expected name item but got name element");
-full_scan_test!("parquet-decimal-dictionaries");
-full_scan_test!("parquet-decimal-dictionaries-v1");
-full_scan_test!("parquet-decimal-dictionaries-v2");
-full_scan_test!("parquet-decimal-type");
+golden_test!("parquet-decimal-dictionaries", latest_snapshot_test);
+golden_test!("parquet-decimal-dictionaries-v1", latest_snapshot_test);
+golden_test!("parquet-decimal-dictionaries-v2", latest_snapshot_test);
+golden_test!("parquet-decimal-type", latest_snapshot_test);
 
-full_scan_test!("snapshot-data0");
-full_scan_test!("snapshot-data1");
-full_scan_test!("snapshot-data2");
-full_scan_test!("snapshot-data2-deleted");
-full_scan_test!("snapshot-data3");
-full_scan_test!("snapshot-repartitioned");
-full_scan_test!("snapshot-vacuumed");
+golden_test!("snapshot-data0", latest_snapshot_test);
+golden_test!("snapshot-data1", latest_snapshot_test);
+golden_test!("snapshot-data2", latest_snapshot_test);
+golden_test!("snapshot-data2-deleted", latest_snapshot_test);
+golden_test!("snapshot-data3", latest_snapshot_test);
+golden_test!("snapshot-repartitioned", latest_snapshot_test);
+golden_test!("snapshot-vacuumed", latest_snapshot_test);
 
 // TODO use projections
 skip_test!("table-with-columnmapping-mode-id": "id column mapping mode not supported");
@@ -306,16 +325,16 @@ skip_test!("table-with-columnmapping-mode-name":
   "BUG: Parquet(General('partial projection of MapArray is not supported'))");
 
 // TODO scan at different versions
-full_scan_test!("time-travel-partition-changes-a");
-full_scan_test!("time-travel-partition-changes-b");
-full_scan_test!("time-travel-schema-changes-a");
-full_scan_test!("time-travel-schema-changes-b");
-full_scan_test!("time-travel-start");
-full_scan_test!("time-travel-start-start20");
-full_scan_test!("time-travel-start-start20-start40");
+golden_test!("time-travel-partition-changes-a", latest_snapshot_test);
+golden_test!("time-travel-partition-changes-b", latest_snapshot_test);
+golden_test!("time-travel-schema-changes-a", latest_snapshot_test);
+golden_test!("time-travel-schema-changes-b", latest_snapshot_test);
+golden_test!("time-travel-start", latest_snapshot_test);
+golden_test!("time-travel-start-start20", latest_snapshot_test);
+golden_test!("time-travel-start-start20-start40", latest_snapshot_test);
 
-full_scan_test!("v2-checkpoint-json"); // currently passing without v2 checkpoint support
-full_scan_test!("v2-checkpoint-parquet"); // currently passing without v2 checkpoint support
+golden_test!("v2-checkpoint-json", latest_snapshot_test); // passing without v2 checkpoint support
+golden_test!("v2-checkpoint-parquet", latest_snapshot_test); // passing without v2 checkpoint support
 
 golden_test!("canonicalized-paths-normal-a", check_version_is_one);
 golden_test!("canonicalized-paths-normal-b", check_version_is_one);
