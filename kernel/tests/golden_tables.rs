@@ -218,7 +218,10 @@ async fn canonicalized_paths_test(
     // assert latest version is 1 and there are no files in the snapshot (add is removed)
     let snapshot = table.snapshot(&engine, None).unwrap();
     assert_eq!(snapshot.version(), 1);
-    let scan = snapshot.into_scan_builder().build().expect("build the scan");
+    let scan = snapshot
+        .into_scan_builder()
+        .build()
+        .expect("build the scan");
     let mut scan_data = scan.scan_data(&engine).expect("scan data");
     assert!(scan_data.next().is_none());
     Ok(())
@@ -231,13 +234,15 @@ async fn checkpoint_test(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = table.snapshot(&engine, None).unwrap();
     let version = snapshot.version();
-    let scan = snapshot.into_scan_builder().build().expect("build the scan");
+    let scan = snapshot
+        .into_scan_builder()
+        .build()
+        .expect("build the scan");
     let scan_data: Vec<_> = scan.scan_data(&engine).expect("scan data").collect();
     assert_eq!(version, 14);
     assert!(scan_data.len() == 1);
     Ok(())
 }
-
 
 // All the test cases are below. Four test cases are currently supported:
 // 1. golden_test! - run a test function against the golden table
