@@ -154,7 +154,7 @@ fn setup_golden_table(
 ) {
     let test_dir = load_test_data(test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
-    let table_path = test_path.join("table");
+    let table_path = test_path.join("delta");
     let table = Table::try_from_uri(table_path.to_str().expect("table path to string"))
         .expect("table from uri");
     let engine = DefaultEngine::try_new(
@@ -208,17 +208,36 @@ macro_rules! golden_test {
     };
 }
 
-async fn check_version_is_one(
+// TODO use in canonicalized paths tests
+#[allow(dead_code)]
+async fn canonicalized_paths_test(
     engine: DefaultEngine<TokioBackgroundExecutor>,
     table: Table,
     _expected: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // assert latest version is 1
-    // TODO and there are no AddFiles
+    // assert latest version is 1 and there are no files in the snapshot (add is removed)
     let snapshot = table.snapshot(&engine, None).unwrap();
     assert_eq!(snapshot.version(), 1);
+    let scan = snapshot.into_scan_builder().build().expect("build the scan");
+    let mut scan_data = scan.scan_data(&engine).expect("scan data");
+    assert!(scan_data.next().is_none());
     Ok(())
 }
+
+async fn checkpoint_test(
+    engine: DefaultEngine<TokioBackgroundExecutor>,
+    table: Table,
+    _expected: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let snapshot = table.snapshot(&engine, None).unwrap();
+    let version = snapshot.version();
+    let scan = snapshot.into_scan_builder().build().expect("build the scan");
+    let scan_data: Vec<_> = scan.scan_data(&engine).expect("scan data").collect();
+    assert_eq!(version, 14);
+    assert!(scan_data.len() == 1);
+    Ok(())
+}
+
 
 // All the test cases are below. Four test cases are currently supported:
 // 1. golden_test! - run a test function against the golden table
@@ -240,7 +259,7 @@ golden_test!(
     "basic-with-vacuum-protocol-check-feature",
     latest_snapshot_test
 );
-skip_test!("checkpoint": "test not yet implmented");
+golden_test!("checkpoint", checkpoint_test);
 skip_test!("corrupted-last-checkpoint-kernel": "BUG: should fallback to old commits/checkpoint");
 skip_test!("data-reader-array-complex-objects": "list field expected name item but got name element");
 skip_test!("data-reader-array-primitives": "list field expected name item but got name element");
@@ -336,10 +355,24 @@ golden_test!("time-travel-start-start20-start40", latest_snapshot_test);
 golden_test!("v2-checkpoint-json", latest_snapshot_test); // passing without v2 checkpoint support
 golden_test!("v2-checkpoint-parquet", latest_snapshot_test); // passing without v2 checkpoint support
 
-golden_test!("canonicalized-paths-normal-a", check_version_is_one);
-golden_test!("canonicalized-paths-normal-b", check_version_is_one);
-golden_test!("canonicalized-paths-special-a", check_version_is_one);
-golden_test!("canonicalized-paths-special-b", check_version_is_one);
+// BUG:
+// - AddFile: 'file:/some/unqualified/absolute/path'
+// - RemoveFile: '/some/unqualified/absolute/path'
+// --> should give no files for the table, but currently gives 1 file
+// golden_test!("canonicalized-paths-normal-a", canonicalized_paths_test);
+skip_test!("canonicalized-paths-normal-a": "BUG: path canonicalization");
+// BUG:
+// - AddFile: 'file:///some/unqualified/absolute/path'
+// - RemoveFile: '/some/unqualified/absolute/path'
+// --> should give no files for the table, but currently gives 1 file
+// golden_test!("canonicalized-paths-normal-b", canonicalized_paths_test);
+skip_test!("canonicalized-paths-normal-b": "BUG: path canonicalization");
+
+// BUG: same issue as above but with path = '/some/unqualified/with%20space/p@%23h'
+// golden_test!("canonicalized-paths-special-a", canonicalized_paths_test);
+// golden_test!("canonicalized-paths-special-b", canonicalized_paths_test);
+skip_test!("canonicalized-paths-special-a": "BUG: path canonicalization");
+skip_test!("canonicalized-paths-special-b": "BUG: path canonicalization");
 
 // no table data, to implement:
 // assert(foundFiles.length == 2)
