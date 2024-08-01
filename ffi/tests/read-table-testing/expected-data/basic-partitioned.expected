@@ -1,0 +1,32 @@
+Reading table at ../../../../acceptance/tests/dat/out/reader_tests/generated/basic_partitioned/delta/
+version: 1
+
+Schema:
+├─ letter: string
+├─ number: long
+└─ a_float: double
+
+number:  [
+  4,
+  5,
+  6,
+  1,
+  2,
+  3
+]
+a_float:  [
+  4.4,
+  5.5,
+  6.6,
+  1.1,
+  2.2,
+  3.3
+]
+letter:  [
+  "a",
+  "e",
+  "f",
+  "a",
+  "b",
+  "c"
+]
