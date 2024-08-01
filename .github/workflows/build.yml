@@ -81,7 +81,8 @@ jobs:
         uses: codecov/codecov-action@v3
         with:
           files: codecov.json
-          fail_ci_if_error: true
+          fail_ci_if_error: true   
+           token: ${{ secrets.CODECOV_TOKEN }}
   ffi_test:
     runs-on: ${{ matrix.os }}
     strategy:
