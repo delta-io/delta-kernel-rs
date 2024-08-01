@@ -198,7 +198,9 @@ macro_rules! golden_test {
         paste! {
             #[tokio::test]
             async fn [<golden_ $test_name:snake>]() -> Result<(), Box<dyn std::error::Error>> {
-                let (engine, table, expected, test_dir) = setup_golden_table($test_name);
+                // we don't use _test_dir but we don't want it to go out of scope before the test
+                // is done since it will cleanup the directory when it runs drop
+                let (engine, table, expected, _test_dir) = setup_golden_table($test_name);
                 $test_fn(engine, table, expected).await?;
                 Ok(())
             }
