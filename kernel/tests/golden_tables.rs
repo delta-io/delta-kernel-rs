@@ -200,8 +200,6 @@ macro_rules! golden_test {
             async fn [<golden_ $test_name:snake>]() -> Result<(), Box<dyn std::error::Error>> {
                 let (engine, table, expected, test_dir) = setup_golden_table($test_name);
                 $test_fn(engine, table, expected).await?;
-                // print testdir
-                println!("{:?}", test_dir);
                 Ok(())
             }
         }
