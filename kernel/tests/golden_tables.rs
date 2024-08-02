@@ -4,8 +4,10 @@
 //! Each table directory has a table/ and expected/ subdirectory with the input/output respectively
 
 use arrow::{compute::filter_record_batch, record_batch::RecordBatch};
-use arrow_select::concat::concat_batches;
+use arrow_ord::sort::{lexsort_to_indices, SortColumn};
+use arrow_select::{concat::concat_batches, take::take};
 use paste::paste;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -60,26 +62,41 @@ async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
     Ok(all_data)
 }
 
-// TODO: change to use arrow's column Eq like dat does, instead of string comparison. Should print
-// out string when test fails to make debugging easier
-macro_rules! assert_batches_eq {
-    ($expected: expr, $chunks: expr) => {
-        let formatted_expected = arrow::util::pretty::pretty_format_batches(&[$expected])
-            .unwrap()
-            .to_string();
-        let formatted_result = arrow::util::pretty::pretty_format_batches(&[$chunks])
-            .unwrap()
-            .to_string();
-        let mut sorted_expected: Vec<&str> = formatted_expected.trim().lines().collect();
-        let mut sorted_result: Vec<&str> = formatted_result.trim().lines().collect();
-        sort_lines!(sorted_expected);
-        sort_lines!(sorted_result);
-        assert_eq!(
-            sorted_expected, sorted_result,
-            "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
-            sorted_expected, sorted_result,
-        );
-    };
+/// assert two record batches are equal by sorting all columns then comparing each
+/// TODO: should print out string when test fails to make debugging easier
+fn assert_batches_eq(left: &RecordBatch, right: &RecordBatch) {
+    // clear metadata, the expected data has parquet metadata while the actual data doesn't. also
+    // the result metadata will have column mapping etc., while the expected data won't.
+    let left_schema = arrow_schema::Schema::new(
+        left.schema()
+            .fields()
+            .iter()
+            .map(|f| (&*(*f)).clone().with_metadata(HashMap::new()))
+            .collect::<Vec<_>>(),
+    );
+    let right_schema = arrow_schema::Schema::new(
+        right
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| (&*(*f)).clone().with_metadata(HashMap::new()))
+            .collect::<Vec<_>>(),
+    );
+
+    // make clones with normalized columns
+    let left = left.columns().iter().map(normalize_col).collect::<Vec<_>>();
+    let right = right
+        .columns()
+        .iter()
+        .map(normalize_col)
+        .collect::<Vec<_>>();
+
+    let left: RecordBatch =
+        RecordBatch::try_new(left_schema.into(), left).expect("create record batch");
+    let right: RecordBatch =
+        RecordBatch::try_new(right_schema.into(), right).expect("create record batch");
+
+    assert_eq!(sort_record_batch(left), sort_record_batch(right));
 }
 
 // copypasta from DAT
@@ -95,6 +112,31 @@ fn normalize_col(col: &Arc<dyn Array>) -> Arc<dyn Array> {
     } else {
         col.clone()
     }
+}
+
+// copypasta from DAT
+// sort all columns in the record batch
+pub fn sort_record_batch(batch: RecordBatch) -> RecordBatch {
+    // Sort by all columns
+    let mut sort_columns = vec![];
+    for col in batch.columns() {
+        match col.data_type() {
+            DataType::Struct(_) | DataType::List(_) | DataType::Map(_, _) => {
+                // can't sort structs, lists, or maps
+            }
+            _ => sort_columns.push(SortColumn {
+                values: col.clone(),
+                options: None,
+            }),
+        }
+    }
+    let indices = lexsort_to_indices(&sort_columns, None).expect("lexsort to indices");
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|c| take(c, &indices, None).unwrap())
+        .collect();
+    RecordBatch::try_new(batch.schema(), columns).expect("create record batch")
 }
 
 // do a full table scan at the latest snapshot of the table and compare with the expected data
@@ -140,7 +182,7 @@ async fn latest_snapshot_test(
         .collect();
 
     let result = concat_batches(&schema, &result).unwrap();
-    assert_batches_eq!(expected, result);
+    assert_batches_eq(&expected, &result);
     Ok(())
 }
 
