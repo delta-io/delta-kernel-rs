@@ -70,7 +70,7 @@ fn assert_batches_eq(left: &RecordBatch, right: &RecordBatch) {
         left.schema()
             .fields()
             .iter()
-            .map(|f| (&*(*f)).clone().with_metadata(HashMap::new()))
+            .map(|f| (**f).clone().with_metadata(HashMap::new()))
             .collect::<Vec<_>>(),
     );
     let right_schema = arrow_schema::Schema::new(
@@ -78,7 +78,7 @@ fn assert_batches_eq(left: &RecordBatch, right: &RecordBatch) {
             .schema()
             .fields()
             .iter()
-            .map(|f| (&*(*f)).clone().with_metadata(HashMap::new()))
+            .map(|f| (**f).clone().with_metadata(HashMap::new()))
             .collect::<Vec<_>>(),
     );
 
