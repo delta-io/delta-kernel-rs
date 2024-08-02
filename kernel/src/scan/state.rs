@@ -66,6 +66,21 @@ impl DvInfo {
             .transpose()?;
         Ok(dv_treemap.map(treemap_to_bools))
     }
+
+    /// Returns a vector of row indexes that should be *removed* from the result set
+    pub fn get_row_indexes(
+        &self,
+        engine: &dyn Engine,
+        table_root: &url::Url,
+    ) -> DeltaResult<Option<Vec<u64>>> {
+        self.deletion_vector
+            .as_ref()
+            .map(|dv| {
+                let fs_client = engine.get_file_system_client();
+                dv.row_indexes(fs_client, table_root)
+            })
+            .transpose()
+    }
 }
 
 pub type ScanCallback<T> = fn(

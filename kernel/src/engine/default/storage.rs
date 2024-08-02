@@ -34,5 +34,5 @@ where
         .collect();
     let store = HdfsObjectStore::with_config(url.as_str(), options_map)?;
     let path = Path::parse(url.path())?;
-    return Ok((Box::new(store), path));
+    Ok((Box::new(store), path))
 }
