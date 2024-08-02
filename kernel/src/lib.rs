@@ -59,10 +59,10 @@ use url::Url;
 use self::schema::{DataType, SchemaRef};
 
 pub mod actions;
-pub mod column_mapping;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
+pub mod features;
 pub(crate) mod path;
 pub mod scan;
 pub mod schema;
