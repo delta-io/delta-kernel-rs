@@ -23,7 +23,6 @@ use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use url::Url;
 
-#[macro_use]
 mod common;
 use common::to_arrow;
 
@@ -362,6 +361,16 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(expected_files, files_scanned);
     }
     Ok(())
+}
+
+macro_rules! sort_lines {
+    ($lines: expr) => {{
+        // sort except for header + footer
+        let num_lines = $lines.len();
+        if num_lines > 3 {
+            $lines.as_mut_slice()[2..num_lines - 1].sort_unstable()
+        }
+    }};
 }
 
 // NB: expected_lines_sorted MUST be pre-sorted (via sort_lines!())

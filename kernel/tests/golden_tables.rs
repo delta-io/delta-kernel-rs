@@ -22,7 +22,6 @@ use arrow_schema::DataType;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 
-#[macro_use]
 mod common;
 use common::to_arrow;
 
