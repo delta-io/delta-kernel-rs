@@ -83,19 +83,17 @@ fn assert_batches_eq(left: &RecordBatch, right: &RecordBatch) {
     );
 
     // make clones with normalized columns
-    let left = left.columns().iter().map(normalize_col).collect::<Vec<_>>();
-    let right = right
+    let l = left.columns().iter().map(normalize_col).collect::<Vec<_>>();
+    let r = right
         .columns()
         .iter()
         .map(normalize_col)
         .collect::<Vec<_>>();
 
-    let left: RecordBatch =
-        RecordBatch::try_new(left_schema.into(), left).expect("create record batch");
-    let right: RecordBatch =
-        RecordBatch::try_new(right_schema.into(), right).expect("create record batch");
+    let l = RecordBatch::try_new(left_schema.into(), l).expect("create record batch");
+    let r = RecordBatch::try_new(right_schema.into(), r).expect("create record batch");
 
-    assert_eq!(sort_record_batch(left), sort_record_batch(right));
+    assert_eq!(sort_record_batch(l), sort_record_batch(r));
 }
 
 // copypasta from DAT
@@ -171,16 +169,7 @@ async fn latest_snapshot_test(
         .unwrap();
     let schema: ArrowSchemaRef = Arc::new(scan.schema().as_ref().try_into().unwrap());
 
-    // convert the batch +00:00 to UTC
-    let result: Vec<RecordBatch> = batches
-        .iter()
-        .map(|batch| {
-            let result = batch.columns().iter().map(normalize_col).collect();
-            RecordBatch::try_new(schema.clone(), result).unwrap()
-        })
-        .collect();
-
-    let result = concat_batches(&schema, &result).unwrap();
+    let result = concat_batches(&schema, &batches).unwrap();
     assert_batches_eq(&expected, &result);
     Ok(())
 }
