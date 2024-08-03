@@ -1,6 +1,6 @@
 //! Schema definitions for action types
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::schema::{ArrayType, DataType, MapType, StructField};
 
@@ -33,6 +33,12 @@ impl_to_data_type!(
 
 // ToDataType impl for non-nullable array types
 impl<T: ToDataType> ToDataType for Vec<T> {
+    fn to_data_type() -> DataType {
+        ArrayType::new(T::to_data_type(), false).into()
+    }
+}
+
+impl<T: ToDataType> ToDataType for HashSet<T> {
     fn to_data_type() -> DataType {
         ArrayType::new(T::to_data_type(), false).into()
     }
