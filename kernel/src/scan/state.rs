@@ -7,8 +7,8 @@ use crate::{
         deletion_vector::{treemap_to_bools, DeletionVectorDescriptor},
         visitors::visit_deletion_vector_at,
     },
-    column_mapping::ColumnMappingMode,
     engine_data::{GetData, TypedGetData},
+    features::ColumnMappingMode,
     schema::SchemaRef,
     DataVisitor, DeltaResult, Engine, EngineData, Error,
 };

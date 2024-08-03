@@ -9,8 +9,8 @@ use url::Url;
 
 use crate::actions::deletion_vector::{split_vector, treemap_to_bools, DeletionVectorDescriptor};
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME};
-use crate::column_mapping::ColumnMappingMode;
 use crate::expressions::{Expression, Scalar};
+use crate::features::ColumnMappingMode;
 use crate::scan::state::{DvInfo, Stats};
 use crate::schema::{DataType, Schema, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
@@ -184,14 +184,14 @@ impl Scan {
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if
     /// possible). Each item in the returned iterator is a tuple of:
     /// - `Box<dyn EngineData>`: Data in engine format, where each row represents a file to be
-    ///     scanned. The schema for each row can be obtained by calling [`scan_row_schema`].
+    ///   scanned. The schema for each row can be obtained by calling [`scan_row_schema`].
     /// - `Vec<bool>`: A selection vector. If a row is at index `i` and this vector is `false` at
-    ///     index `i`, then that row should *not* be processed (i.e. it is filtered out). If the vector
-    ///     is `true` at index `i` the row *should* be processed. If the selector vector is *shorter*
-    ///     than the number of rows returned, missing elements are considered `true`, i.e. included in
-    ///     the query. NB: If you are using the default engine and plan to call arrow's
-    ///     `filter_record_batch`, you _need_ to extend this vector to the full length of the batch or
-    ///     arrow will drop the extra rows.
+    ///   index `i`, then that row should *not* be processed (i.e. it is filtered out). If the vector
+    ///   is `true` at index `i` the row *should* be processed. If the selector vector is *shorter*
+    ///   than the number of rows returned, missing elements are considered `true`, i.e. included in
+    ///   the query. NB: If you are using the default engine and plan to call arrow's
+    ///   `filter_record_batch`, you _need_ to extend this vector to the full length of the batch or
+    ///   arrow will drop the extra rows.
     pub fn scan_data(
         &self,
         engine: &dyn Engine,

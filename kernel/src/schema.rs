@@ -8,7 +8,7 @@ use indexmap::IndexMap;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::column_mapping::ColumnMappingMode;
+use crate::features::ColumnMappingMode;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
