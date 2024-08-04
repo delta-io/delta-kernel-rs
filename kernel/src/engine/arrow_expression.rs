@@ -243,9 +243,9 @@ fn evaluate_expression(
             },
             _,
         ) => match (left.as_ref(), right.as_ref()) {
-            /// TODO: https://github.com/delta-incubator/delta-kernel-rs/issues/291
-            /// Rework some aspects of expression evaluation to better handle these cases
-            /// right now we copy a literal array for every row in a batch.
+            // TODO: https://github.com/delta-incubator/delta-kernel-rs/issues/291
+            // Rework some aspects of expression evaluation to better handle these cases
+            // right now we copy a literal array for every row in a batch.
             // (Column(_), Literal(Scalar::Array(ad))) => {
             //     let elements = ad.try_into()?;
             //     let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
