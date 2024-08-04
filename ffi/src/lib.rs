@@ -327,6 +327,7 @@ pub enum KernelError {
     InvalidDecimalError,
     InvalidStructDataError,
     InternalError,
+    InvalidExpression,
 }
 
 impl From<Error> for KernelError {
@@ -372,6 +373,7 @@ impl From<Error> for KernelError {
                 source,
                 backtrace: _,
             } => Self::from(*source),
+            Error::InvalidExpressionEvaluation(_) => KernelError::InvalidExpression,
         }
     }
 }
