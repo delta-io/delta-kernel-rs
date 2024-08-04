@@ -51,6 +51,10 @@ struct Cli {
     /// to the aws metadata server, which will fail unless you're on an ec2 instance.
     #[arg(long)]
     public: bool,
+
+    /// Limit to printing only LIMIT rows.
+    #[arg(short, long)]
+    limit: Option<usize>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -88,6 +92,16 @@ fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
         .downcast::<ArrowEngineData>()
         .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
         .into())
+}
+
+// truncate a batch to the specified number of rows
+fn truncate_batch(batch: RecordBatch, rows: usize) -> RecordBatch {
+    let cols = batch
+        .columns()
+        .iter()
+        .map(|col| col.slice(0, rows))
+        .collect();
+    RecordBatch::try_new(batch.schema(), cols).unwrap()
 }
 
 // This is the callback that will be called fo each valid scan row
@@ -212,8 +226,27 @@ fn try_main() -> DeltaResult<()> {
     // have sent all scan files, drop this so threads will exit when there's no more work
     drop(scan_file_tx);
 
-    // simply gather up each batch and print them
-    let batches: Vec<_> = record_batch_rx.iter().collect();
+    let batches = if let Some(limit) = cli.limit {
+        // gather batches while we need
+        let mut batches = vec![];
+        let mut rows_so_far = 0;
+        for mut batch in record_batch_rx.iter() {
+            let batch_rows = batch.num_rows();
+            if rows_so_far < limit {
+                if rows_so_far + batch_rows > limit {
+                    // truncate this batch
+                    batch = truncate_batch(batch, limit - rows_so_far);
+                }
+                batches.push(batch);
+            }
+            rows_so_far += batch_rows;
+        }
+        println!("Printing first {limit} rows of {rows_so_far} total rows");
+        batches
+    } else {
+        // simply gather up all batches
+        record_batch_rx.iter().collect()
+    };
     print_batches(&batches)?;
     Ok(())
 }

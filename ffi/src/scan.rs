@@ -16,8 +16,8 @@ use url::Url;
 use crate::{
     unwrap_kernel_expression, AllocateStringFn, EnginePredicate, ExclusiveEngineData, ExternEngine,
     ExternResult, IntoExternResult, KernelBoolSlice, KernelExpressionVisitorState,
-    KernelStringSlice, NullableCvoid, SharedExternEngine, SharedSnapshot, StringIter,
-    StringSliceIterator, TryFromStringSlice,
+    KernelRowIndexArray, KernelStringSlice, NullableCvoid, SharedExternEngine, SharedSnapshot,
+    StringIter, StringSliceIterator, TryFromStringSlice,
 };
 
 use super::handle::Handle;
@@ -388,6 +388,33 @@ fn selection_vector_from_dv_impl(
     match dv_info.get_selection_vector(extern_engine.engine().as_ref(), &root_url)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelBoolSlice::empty()),
+    }
+}
+
+/// Get a vector of row indexes out of a [`DvInfo`] struct
+///
+/// # Safety
+/// Engine is responsible for providing valid pointers for each argument
+#[no_mangle]
+pub unsafe extern "C" fn row_indexes_from_dv(
+    dv_info: &DvInfo,
+    engine: Handle<SharedExternEngine>,
+    state: Handle<SharedGlobalScanState>,
+) -> ExternResult<KernelRowIndexArray> {
+    let state = unsafe { state.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    row_indexes_from_dv_impl(dv_info, engine, state).into_extern_result(&engine)
+}
+
+fn row_indexes_from_dv_impl(
+    dv_info: &DvInfo,
+    extern_engine: &dyn ExternEngine,
+    state: &GlobalScanState,
+) -> DeltaResult<KernelRowIndexArray> {
+    let root_url = Url::parse(&state.table_root)?;
+    match dv_info.get_row_indexes(extern_engine.engine().as_ref(), &root_url)? {
+        Some(v) => Ok(v.into()),
+        None => Ok(KernelRowIndexArray::empty()),
     }
 }
 
