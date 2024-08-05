@@ -12,6 +12,9 @@ use crate::error::Error;
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
 
 pub(crate) const LIST_ARRAY_ROOT: &str = "item";
+pub(crate) const MAP_ROOT_DEFAULT: &str = "key_value";
+pub(crate) const MAP_KEY_DEFAULT: &str = "key";
+pub(crate) const MAP_VALUE_DEFAULT: &str = "value";
 
 impl TryFrom<&StructType> for ArrowSchema {
     type Error = ArrowError;
@@ -61,12 +64,16 @@ impl TryFrom<&MapType> for ArrowField {
 
     fn try_from(a: &MapType) -> Result<Self, ArrowError> {
         Ok(ArrowField::new(
-            "entries",
+            MAP_ROOT_DEFAULT,
             ArrowDataType::Struct(
                 vec![
-                    ArrowField::new("keys", ArrowDataType::try_from(a.key_type())?, false),
                     ArrowField::new(
-                        "values",
+                        MAP_KEY_DEFAULT,
+                        ArrowDataType::try_from(a.key_type())?,
+                        false,
+                    ),
+                    ArrowField::new(
+                        MAP_VALUE_DEFAULT,
                         ArrowDataType::try_from(a.value_type())?,
                         a.value_contains_null(),
                     ),
