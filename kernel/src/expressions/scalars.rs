@@ -408,9 +408,6 @@ impl PrimitiveType {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::builder::{ListBuilder, StringBuilder};
-    use arrow_array::GenericStringArray;
-    use arrow_ord::comparison::in_list_utf8;
     use std::f32::consts::PI;
 
     use crate::expressions::BinaryOperator;
@@ -513,15 +510,5 @@ mod tests {
         assert_eq!(&format!("{}", array_not_op), "10 NOT IN (1, 2, 3)");
         assert_eq!(&format!("{}", column_op), "3.1415927 IN Column(item)");
         assert_eq!(&format!("{}", column_not_op), "'Cool' NOT IN Column(item)");
-
-        let mut string_list = ListBuilder::new(StringBuilder::new());
-        string_list.values().append_value("Hi");
-        string_list.values().append_value("Bye");
-        string_list.values().append_value("Hello");
-        string_list.append(true);
-        let arr = string_list.finish();
-
-        let string_col = GenericStringArray::<i32>::from(vec!["Bye"]);
-        println!("{:?}", in_list_utf8(&string_col, &arr));
     }
 }
