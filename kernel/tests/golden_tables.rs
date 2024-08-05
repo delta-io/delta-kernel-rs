@@ -169,7 +169,16 @@ async fn latest_snapshot_test(
         .unwrap();
     let schema: ArrowSchemaRef = Arc::new(scan.schema().as_ref().try_into().unwrap());
 
-    let result = concat_batches(&schema, &batches).unwrap();
+    // convert the batch +00:00 to UTC
+    let result: Vec<RecordBatch> = batches
+        .iter()
+        .map(|batch| {
+            let result = batch.columns().iter().map(normalize_col).collect();
+            RecordBatch::try_new(schema.clone(), result).unwrap()
+        })
+        .collect();
+
+    let result = concat_batches(&schema, &result).unwrap();
     assert_batches_eq(&expected, &result);
     Ok(())
 }
