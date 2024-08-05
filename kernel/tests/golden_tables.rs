@@ -82,18 +82,12 @@ fn assert_batches_eq(left: &RecordBatch, right: &RecordBatch) {
             .collect::<Vec<_>>(),
     );
 
-    // make clones with normalized columns
-    let l = left.columns().iter().map(normalize_col).collect::<Vec<_>>();
-    let r = right
-        .columns()
-        .iter()
-        .map(normalize_col)
-        .collect::<Vec<_>>();
+    let left = RecordBatch::try_new(left_schema.into(), left.columns().to_vec())
+        .expect("create record batch");
+    let right = RecordBatch::try_new(right_schema.into(), right.columns().to_vec())
+        .expect("create record batch");
 
-    let l = RecordBatch::try_new(left_schema.into(), l).expect("create record batch");
-    let r = RecordBatch::try_new(right_schema.into(), r).expect("create record batch");
-
-    assert_eq!(sort_record_batch(l), sort_record_batch(r));
+    assert_eq!(sort_record_batch(left), sort_record_batch(right));
 }
 
 // copypasta from DAT
@@ -113,7 +107,7 @@ fn normalize_col(col: &Arc<dyn Array>) -> Arc<dyn Array> {
 
 // copypasta from DAT
 // sort all columns in the record batch
-pub fn sort_record_batch(batch: RecordBatch) -> RecordBatch {
+fn sort_record_batch(batch: RecordBatch) -> RecordBatch {
     // Sort by all columns
     let mut sort_columns = vec![];
     for col in batch.columns() {
@@ -169,7 +163,8 @@ async fn latest_snapshot_test(
         .unwrap();
     let schema: ArrowSchemaRef = Arc::new(scan.schema().as_ref().try_into().unwrap());
 
-    // convert the batch +00:00 to UTC
+    // The parquet files have '+00:00' as timestamp timezone, but we expect 'UTC' in the schema.
+    // In order to concat_batches we convert the batch's physical schema with '+00:00' to 'UTC'
     let result: Vec<RecordBatch> = batches
         .iter()
         .map(|batch| {
