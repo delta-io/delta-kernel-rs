@@ -11,6 +11,7 @@ version.workspace = true
 
 [dependencies]
 arrow-array = { workspace = true }
+arrow-cast = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-select = { workspace = true }
 arrow-schema = { workspace = true }
@@ -36,7 +37,7 @@ datatest-stable = "0.2"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 tempfile = "3"
 test-case = { version = "3.1.0" }
-tokio = { version = "1" }
+tokio = { version = "1.39" }
 tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "fmt",

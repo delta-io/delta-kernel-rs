@@ -128,12 +128,22 @@ pub type AllocateStringFn = extern "C" fn(kernel_str: KernelStringSlice) -> Null
 // Put KernelBoolSlice in a sub-module, with non-public members, so rust code cannot instantiate it
 // directly. It can only be created by converting `From<Vec<bool>>`.
 mod private {
+    use std::ptr::NonNull;
+
     /// Represents an owned slice of boolean values allocated by the kernel. Any time the engine
     /// receives a `KernelBoolSlice` as a return value from a kernel method, engine is responsible
     /// to free that slice, by calling [super::free_bool_slice] exactly once.
     #[repr(C)]
     pub struct KernelBoolSlice {
-        ptr: *mut bool,
+        ptr: NonNull<bool>,
+        len: usize,
+    }
+
+    /// An owned slice of u64 row indexes allocated by the kernel. The engine is responsible for
+    /// freeing this slice by calling [super::free_row_indexes] once.
+    #[repr(C)]
+    pub struct KernelRowIndexArray {
+        ptr: NonNull<u64>,
         len: usize,
     }
 
@@ -141,7 +151,7 @@ mod private {
         /// Creates an empty slice.
         pub fn empty() -> KernelBoolSlice {
             KernelBoolSlice {
-                ptr: std::ptr::null_mut(),
+                ptr: NonNull::dangling(),
                 len: 0,
             }
         }
@@ -153,10 +163,10 @@ mod private {
         /// The slice must have been originally created `From<Vec<bool>>`, and must not have been
         /// already been consumed by a previous call to this method.
         pub unsafe fn as_ref(&self) -> &[bool] {
-            if self.ptr.is_null() {
+            if self.len == 0 {
                 Default::default()
             } else {
-                unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+                unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
             }
         }
 
@@ -167,10 +177,10 @@ mod private {
         /// The slice must have been originally created `From<Vec<bool>>`, and must not have been
         /// already been consumed by a previous call to this method.
         pub unsafe fn into_vec(self) -> Vec<bool> {
-            if self.ptr.is_null() {
+            if self.len == 0 {
                 Default::default()
             } else {
-                Vec::from_raw_parts(self.ptr, self.len, self.len)
+                Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len)
             }
         }
     }
@@ -179,7 +189,9 @@ mod private {
         fn from(val: Vec<bool>) -> Self {
             let len = val.len();
             let boxed = val.into_boxed_slice();
-            let ptr = Box::into_raw(boxed).cast();
+            let leaked_ptr = Box::leak(boxed).as_mut_ptr();
+            let ptr = NonNull::new(leaked_ptr)
+                .expect("This should never be non-null please report this bug.");
             KernelBoolSlice { ptr, len }
         }
     }
@@ -190,13 +202,56 @@ mod private {
     /// memory, but must only free it by calling [super::free_bool_slice]. Since the global
     /// allocator is threadsafe, it doesn't matter which engine thread invokes that method.
     unsafe impl Send for KernelBoolSlice {}
+    /// # Safety
+    ///
+    /// This follows the same contract as KernelBoolSlice above, engine assumes ownership of the
+    /// slice memory, but must only free it by calling [super::free_row_indexes]. It does not matter
+    /// from which thread the engine invoke that method
+    unsafe impl Send for KernelRowIndexArray {}
 
     /// # Safety
     ///
     /// If engine chooses to leverage concurrency, engine is responsible to prevent data races.
     unsafe impl Sync for KernelBoolSlice {}
+    /// # Safety
+    ///
+    /// If engine chooses to leverage concurrency, engine is responsible to prevent data races.
+    /// Same contract as KernelBoolSlice above
+    unsafe impl Sync for KernelRowIndexArray {}
+
+    impl KernelRowIndexArray {
+        /// Converts this slice back into a `Vec<u64>`.
+        ///
+        /// # Safety
+        ///
+        /// The slice must have been originally created `From<Vec<u64>>`, and must not have
+        /// already been consumed by a previous call to this method.
+        pub unsafe fn into_vec(self) -> Vec<u64> {
+            Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.len)
+        }
+
+        /// Creates an empty slice.
+        pub fn empty() -> KernelRowIndexArray {
+            Self {
+                ptr: NonNull::dangling(),
+                len: 0,
+            }
+        }
+    }
+
+    impl From<Vec<u64>> for KernelRowIndexArray {
+        fn from(vec: Vec<u64>) -> Self {
+            let len = vec.len();
+            let boxed = vec.into_boxed_slice();
+            let leaked_ptr = Box::leak(boxed).as_mut_ptr();
+            let ptr = NonNull::new(leaked_ptr)
+                .expect("This should never be non-null please report this bug.");
+            KernelRowIndexArray { ptr, len }
+        }
+    }
 }
 pub use private::KernelBoolSlice;
+pub use private::KernelRowIndexArray;
 
 /// # Safety
 ///
@@ -205,6 +260,14 @@ pub use private::KernelBoolSlice;
 pub unsafe extern "C" fn free_bool_slice(slice: KernelBoolSlice) {
     let vec = unsafe { slice.into_vec() };
     debug!("Dropping bool slice. It is {vec:#?}");
+}
+
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
+    let _ = slice.into_vec();
 }
 
 // TODO: Do we want this handle at all? Perhaps we should just _always_ pass raw *mut c_void pointers

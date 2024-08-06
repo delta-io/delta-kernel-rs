@@ -11,7 +11,7 @@ use tracing::debug;
 use url::Url;
 
 use crate::actions::{get_log_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
-use crate::column_mapping::{ColumnMappingMode, COLUMN_MAPPING_MODE_KEY};
+use crate::features::{ColumnMappingMode, COLUMN_MAPPING_MODE_KEY};
 use crate::path::{version_from_location, LogPath};
 use crate::scan::ScanBuilder;
 use crate::schema::{Schema, SchemaRef};
