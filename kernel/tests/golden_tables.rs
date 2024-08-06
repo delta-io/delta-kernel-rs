@@ -5,13 +5,12 @@
 
 use arrow::{compute::filter_record_batch, record_batch::RecordBatch};
 use arrow_ord::sort::{lexsort_to_indices, SortColumn};
+use arrow_schema::Schema;
 use arrow_select::{concat::concat_batches, take::take};
 use paste::paste;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow_schema::SchemaRef as ArrowSchemaRef;
 use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Table};
 use futures::{stream::TryStreamExt, StreamExt};
 use object_store::{local::LocalFileSystem, ObjectStore};
@@ -61,53 +60,8 @@ async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
     Ok(all_data)
 }
 
-/// assert two record batches are equal by sorting all columns then comparing each
-/// TODO: should print out string when test fails to make debugging easier
-fn assert_batches_eq(left: &RecordBatch, right: &RecordBatch) {
-    // clear metadata, the expected data has parquet metadata while the actual data doesn't. also
-    // the result metadata will have column mapping etc., while the expected data won't.
-    let left_schema = arrow_schema::Schema::new(
-        left.schema()
-            .fields()
-            .iter()
-            .map(|f| (**f).clone().with_metadata(HashMap::new()))
-            .collect::<Vec<_>>(),
-    );
-    let right_schema = arrow_schema::Schema::new(
-        right
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| (**f).clone().with_metadata(HashMap::new()))
-            .collect::<Vec<_>>(),
-    );
-
-    let left = RecordBatch::try_new(left_schema.into(), left.columns().to_vec())
-        .expect("create record batch");
-    let right = RecordBatch::try_new(right_schema.into(), right.columns().to_vec())
-        .expect("create record batch");
-
-    assert_eq!(sort_record_batch(left), sort_record_batch(right));
-}
-
-// copypasta from DAT
-// some things are equivalent, but don't show up as equivalent for `==`, so we normalize here
-fn normalize_col(col: &Arc<dyn Array>) -> Arc<dyn Array> {
-    if let DataType::Timestamp(unit, Some(zone)) = col.data_type() {
-        if **zone == *"+00:00" {
-            arrow_cast::cast::cast(&col, &DataType::Timestamp(*unit, Some("UTC".into())))
-                .expect("Could not cast to UTC")
-        } else {
-            col.clone()
-        }
-    } else {
-        col.clone()
-    }
-}
-
-// copypasta from DAT
-// sort all columns in the record batch
-fn sort_record_batch(batch: RecordBatch) -> RecordBatch {
+// copied from DAT
+fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
     // Sort by all columns
     let mut sort_columns = vec![];
     for col in batch.columns() {
@@ -121,13 +75,63 @@ fn sort_record_batch(batch: RecordBatch) -> RecordBatch {
             }),
         }
     }
-    let indices = lexsort_to_indices(&sort_columns, None).expect("lexsort to indices");
+    let indices = lexsort_to_indices(&sort_columns, None)?;
     let columns = batch
         .columns()
         .iter()
         .map(|c| take(c, &indices, None).unwrap())
         .collect();
-    RecordBatch::try_new(batch.schema(), columns).expect("create record batch")
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
+}
+
+// copied from DAT
+// Ensure that two schema have the same field names, and dict_id/ordering.
+// We ignore:
+//  - data type: This is checked already in `assert_columns_match`
+//  - nullability: parquet marks many things as nullable that we don't in our schema
+//  - metadata: because that diverges from the real data to the golden tabled data
+fn assert_schema_fields_match(schema: &Schema, golden: &Schema) {
+    for (schema_field, golden_field) in schema.fields.iter().zip(golden.fields.iter()) {
+        assert!(
+            schema_field.name() == golden_field.name(),
+            "Field names don't match"
+        );
+        assert!(
+            schema_field.dict_id() == golden_field.dict_id(),
+            "Field dict_id doesn't match"
+        );
+        assert!(
+            schema_field.dict_is_ordered() == golden_field.dict_is_ordered(),
+            "Field dict_is_ordered doesn't match"
+        );
+    }
+}
+
+// copied from DAT
+// some things are equivalent, but don't show up as equivalent for `==`, so we normalize here
+fn normalize_col(col: Arc<dyn Array>) -> Arc<dyn Array> {
+    if let DataType::Timestamp(unit, Some(zone)) = col.data_type() {
+        if **zone == *"+00:00" {
+            arrow_cast::cast::cast(&col, &DataType::Timestamp(*unit, Some("UTC".into())))
+                .expect("Could not cast to UTC")
+        } else {
+            col
+        }
+    } else {
+        col
+    }
+}
+
+// copied from DAT
+fn assert_columns_match(actual: &[Arc<dyn Array>], expected: &[Arc<dyn Array>]) {
+    for (actual, expected) in actual.iter().zip(expected) {
+        // note that array equality includes data_type equality
+        // See: https://arrow.apache.org/rust/arrow_data/equal/fn.equal.html
+        assert_eq!(
+            &actual, &expected,
+            "Column data didn't match. Got {actual:?}, expected {expected:?}"
+        );
+    }
 }
 
 // do a full table scan at the latest snapshot of the table and compare with the expected data
@@ -161,20 +165,32 @@ async fn latest_snapshot_test(
     let expected = read_expected(&expected_path.expect("expect an expected dir"))
         .await
         .unwrap();
-    let schema: ArrowSchemaRef = Arc::new(scan.schema().as_ref().try_into().unwrap());
+
+    let schema: Arc<Schema> = Arc::new(scan.schema().as_ref().try_into().unwrap());
 
     // The parquet files have '+00:00' as timestamp timezone, but we expect 'UTC' in the schema.
     // In order to concat_batches we convert the batch's physical schema with '+00:00' to 'UTC'
     let result: Vec<RecordBatch> = batches
         .iter()
         .map(|batch| {
-            let result = batch.columns().iter().map(normalize_col).collect();
+            let result = batch
+                .columns()
+                .iter()
+                .map(|c| normalize_col(c.clone()))
+                .collect();
             RecordBatch::try_new(schema.clone(), result).unwrap()
         })
         .collect();
 
     let result = concat_batches(&schema, &result).unwrap();
-    assert_batches_eq(&expected, &result);
+    let result = sort_record_batch(result).unwrap();
+    let expected = sort_record_batch(expected).unwrap();
+    assert_columns_match(expected.columns(), result.columns());
+    assert_schema_fields_match(expected.schema().as_ref(), result.schema().as_ref());
+    assert!(
+        expected.num_rows() == result.num_rows(),
+        "Didn't have same number of rows"
+    );
     Ok(())
 }
 
