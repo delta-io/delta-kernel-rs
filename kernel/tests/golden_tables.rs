@@ -125,6 +125,8 @@ fn normalize_col(col: Arc<dyn Array>) -> Arc<dyn Array> {
 // copied from DAT
 fn assert_columns_match(actual: &[Arc<dyn Array>], expected: &[Arc<dyn Array>]) {
     for (actual, expected) in actual.iter().zip(expected) {
+        let actual = normalize_col(actual.clone());
+        let expected = normalize_col(expected.clone());
         // note that array equality includes data_type equality
         // See: https://arrow.apache.org/rust/arrow_data/equal/fn.equal.html
         assert_eq!(
@@ -168,21 +170,7 @@ async fn latest_snapshot_test(
 
     let schema: Arc<Schema> = Arc::new(scan.schema().as_ref().try_into().unwrap());
 
-    // The parquet files have '+00:00' as timestamp timezone, but we expect 'UTC' in the schema.
-    // In order to concat_batches we convert the batch's physical schema with '+00:00' to 'UTC'
-    let result: Vec<RecordBatch> = batches
-        .iter()
-        .map(|batch| {
-            let result = batch
-                .columns()
-                .iter()
-                .map(|c| normalize_col(c.clone()))
-                .collect();
-            RecordBatch::try_new(schema.clone(), result).unwrap()
-        })
-        .collect();
-
-    let result = concat_batches(&schema, &result).unwrap();
+    let result = concat_batches(&schema, &batches).unwrap();
     let result = sort_record_batch(result).unwrap();
     let expected = sort_record_batch(expected).unwrap();
     assert_columns_match(expected.columns(), result.columns());
