@@ -1,10 +1,15 @@
 # Changelog
 
-## [v0.2.1](https://github.com/delta-incubator/delta-kernel-rs/tree/v0.2.1/) (2024-08-07)
+## [v0.3.0](https://github.com/delta-incubator/delta-kernel-rs/tree/v0.3.0/) (2024-08-07)
 
-[Full Changelog](https://github.com/delta-incubator/delta-kernel-rs/compare/v0.2.0...v0.2.1)
+[Full Changelog](https://github.com/delta-incubator/delta-kernel-rs/compare/v0.2.0...v0.3.0)
 
 **API Changes**
+
+*Breaking*
+
+1. `delta_kernel::column_mapping` module moved to `delta_kernel::features::column_mapping` [\#222](https://github.com/delta-incubator/delta-kernel-rs/pull/297)
+
 
 *Additions*
 
