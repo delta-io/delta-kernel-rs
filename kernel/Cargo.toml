@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 readme.workspace = true
 version.workspace = true
+# exclude golden tests + golden test data since they push us over 10MB crate size limit
+exclude = ["tests/golden_tables.rs", "tests/golden_data/" ]
 
 [package.metadata.docs.rs]
 all-features = true
