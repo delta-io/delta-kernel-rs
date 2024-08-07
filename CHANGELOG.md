@@ -22,7 +22,7 @@
 
 **Fixed bugs:**
 
-- Read UTC timestamps as "UTC" instead of "+00:00" for timezone [\#295](https://github.com/delta-incubator/delta-kernel-rs/pull/295)
+- Evaluate timestamps as "UTC" instead of "+00:00" for timezone [\#295](https://github.com/delta-incubator/delta-kernel-rs/pull/295)
 - Make Map arrow type field naming consistent with parquet field naming [\#299](https://github.com/delta-incubator/delta-kernel-rs/pull/299)
 
 
