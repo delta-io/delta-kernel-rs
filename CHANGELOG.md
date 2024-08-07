@@ -1,5 +1,31 @@
 # Changelog
 
+## [v0.2.1](https://github.com/delta-incubator/delta-kernel-rs/tree/v0.2.1/) (2024-08-06)
+
+[Full Changelog](https://github.com/delta-incubator/delta-kernel-rs/compare/v0.2.0...v0.2.1)
+
+**API Changes**
+
+*Additions*
+
+1. New deletion vector API `row_indexes` (and accompanying FFI) to get row indexes instead of seletion vector of deleted rows. This can be more efficient for sparse DVs. [\#215](https://github.com/delta-incubator/delta-kernel-rs/pull/215)
+2. Typed table features: `ReaderFeatures`, `WriterFeatures` enums and `has_reader_feature`/`has_writer_feature` API [\#222](https://github.com/delta-incubator/delta-kernel-rs/pull/297)
+
+**Implemented enhancements:**
+
+- Add `--limit` option to example `read-table-multi-threaded` [\#297](https://github.com/delta-incubator/delta-kernel-rs/pull/297)
+- FFI now built with cmake. Move to using the read-test example as an ffi-test. And building on macos. [\#288](https://github.com/delta-incubator/delta-kernel-rs/pull/288)
+- Golden table tests migrated from delta-spark/delta-kernel java [\#295](https://github.com/delta-incubator/delta-kernel-rs/pull/295)
+- Code coverage implemented via [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) and reported with [codecov](https://app.codecov.io/github/delta-incubator/delta-kernel-rs) [\#287](https://github.com/delta-incubator/delta-kernel-rs/pull/287)
+- All tests enabled to run in CI [\#284](https://github.com/delta-incubator/delta-kernel-rs/pull/284)
+- Updated DAT to 0.3 [\#290](https://github.com/delta-incubator/delta-kernel-rs/pull/290)
+
+**Fixed bugs:**
+
+- Read UTC timestamps as "UTC" instead of "+00:00" for timezone [\#295](https://github.com/delta-incubator/delta-kernel-rs/pull/295)
+- Make Map arrow type field naming consistent with parquet field naming [\#299](https://github.com/delta-incubator/delta-kernel-rs/pull/299)
+
+
 ## [v0.2.0](https://github.com/delta-incubator/delta-kernel-rs/tree/v0.2.0/) (2024-07-17)
 
 [Full Changelog](https://github.com/delta-incubator/delta-kernel-rs/compare/v0.1.1...v0.2.0)
