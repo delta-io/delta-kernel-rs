@@ -62,12 +62,26 @@ async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
 
 // copied from DAT
 fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
-    // Sort by all columns
+    if batch.num_rows() < 2 {
+        // 0 or 1 rows doesn't need sorting
+        return Ok(batch);
+    }
+    // Sort by as many columns as possible
     let mut sort_columns = vec![];
     for col in batch.columns() {
         match col.data_type() {
-            DataType::Struct(_) | DataType::List(_) | DataType::Map(_, _) => {
-                // can't sort structs, lists, or maps
+            DataType::Struct(_) | DataType::Map(_, _) => {
+                // can't sort by structs or maps
+            }
+            DataType::List(list_field) => {
+                let list_dt = list_field.data_type();
+                if list_dt.is_primitive() {
+                    // we can sort lists of primitives
+                    sort_columns.push(SortColumn {
+                        values: col.clone(),
+                        options: None,
+                    })
+                }
             }
             _ => sort_columns.push(SortColumn {
                 values: col.clone(),
@@ -129,10 +143,7 @@ fn assert_columns_match(actual: &[Arc<dyn Array>], expected: &[Arc<dyn Array>]) 
         let expected = normalize_col(expected.clone());
         // note that array equality includes data_type equality
         // See: https://arrow.apache.org/rust/arrow_data/equal/fn.equal.html
-        assert_eq!(
-            &actual, &expected,
-            "Column data didn't match. Got {actual:?}, expected {expected:?}"
-        );
+        assert_eq!(&actual, &expected, "Column data didn't match.");
     }
 }
 
@@ -173,7 +184,7 @@ async fn latest_snapshot_test(
     let result = concat_batches(&schema, &batches).unwrap();
     let result = sort_record_batch(result).unwrap();
     let expected = sort_record_batch(expected).unwrap();
-    assert_columns_match(expected.columns(), result.columns());
+    assert_columns_match(result.columns(), expected.columns());
     assert_schema_fields_match(expected.schema().as_ref(), result.schema().as_ref());
     assert!(
         expected.num_rows() == result.num_rows(),
@@ -304,8 +315,8 @@ golden_test!(
 );
 golden_test!("checkpoint", checkpoint_test);
 skip_test!("corrupted-last-checkpoint-kernel": "BUG: should fallback to old commits/checkpoint");
-skip_test!("data-reader-array-complex-objects": "list field expected name item but got name element");
-skip_test!("data-reader-array-primitives": "list field expected name item but got name element");
+golden_test!("data-reader-array-complex-objects", latest_snapshot_test);
+golden_test!("data-reader-array-primitives", latest_snapshot_test);
 golden_test!("data-reader-date-types-America", latest_snapshot_test);
 golden_test!("data-reader-date-types-Asia", latest_snapshot_test);
 golden_test!("data-reader-date-types-Etc", latest_snapshot_test);
@@ -314,11 +325,13 @@ golden_test!("data-reader-date-types-Jst", latest_snapshot_test);
 golden_test!("data-reader-date-types-Pst", latest_snapshot_test);
 golden_test!("data-reader-date-types-utc", latest_snapshot_test);
 golden_test!("data-reader-escaped-chars", latest_snapshot_test);
-skip_test!("data-reader-map": "map field named 'entries' vs 'key_value'");
+golden_test!("data-reader-map", latest_snapshot_test);
 golden_test!("data-reader-nested-struct", latest_snapshot_test);
-skip_test!("data-reader-nullable-field-invalid-schema-key":
-  "list field expected name item but got name element");
-skip_test!("data-reader-partition-values": "list field expected name item but got name element");
+golden_test!(
+    "data-reader-nullable-field-invalid-schema-key",
+    latest_snapshot_test
+);
+skip_test!("data-reader-partition-values": "Golden data needs to have 2021-09-08T11:11:11+00:00 as expected value for as_timestamp col");
 golden_test!("data-reader-primitives", latest_snapshot_test);
 golden_test!("data-reader-timestamp_ntz", latest_snapshot_test);
 skip_test!("data-reader-timestamp_ntz-id-mode": "id column mapping mode not supported");
@@ -366,8 +379,8 @@ golden_test!("multi-part-checkpoint", latest_snapshot_test);
 golden_test!("only-checkpoint-files", latest_snapshot_test);
 
 // TODO some of the parquet tests use projections
-skip_test!("parquet-all-types": "list field expected name item but got name element");
-skip_test!("parquet-all-types-legacy-format": "list field expected name item but got name element");
+skip_test!("parquet-all-types": "schemas disagree about nullability, need to figure out which is correct and adjust");
+skip_test!("parquet-all-types-legacy-format": "legacy parquet has name `array`, we should have adjusted this to `element`");
 golden_test!("parquet-decimal-dictionaries", latest_snapshot_test);
 golden_test!("parquet-decimal-dictionaries-v1", latest_snapshot_test);
 golden_test!("parquet-decimal-dictionaries-v2", latest_snapshot_test);
@@ -381,7 +394,7 @@ golden_test!("snapshot-data3", latest_snapshot_test);
 golden_test!("snapshot-repartitioned", latest_snapshot_test);
 golden_test!("snapshot-vacuumed", latest_snapshot_test);
 
-// TODO use projections
+// TODO fix column mapping
 skip_test!("table-with-columnmapping-mode-id": "id column mapping mode not supported");
 skip_test!("table-with-columnmapping-mode-name":
   "BUG: Parquet(General('partial projection of MapArray is not supported'))");
@@ -402,7 +415,6 @@ golden_test!("v2-checkpoint-parquet", latest_snapshot_test); // passing without 
 // - AddFile: 'file:/some/unqualified/absolute/path'
 // - RemoveFile: '/some/unqualified/absolute/path'
 // --> should give no files for the table, but currently gives 1 file
-// golden_test!("canonicalized-paths-normal-a", canonicalized_paths_test);
 skip_test!("canonicalized-paths-normal-a": "BUG: path canonicalization");
 // BUG:
 // - AddFile: 'file:///some/unqualified/absolute/path'
