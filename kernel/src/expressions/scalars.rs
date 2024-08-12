@@ -15,8 +15,9 @@ pub struct StructData {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArrayData {
-    pub tpe: ArrayType,
-    pub elements: Vec<Scalar>,
+    tpe: ArrayType,
+    /// This exists currently for literal list comparisons, but should not be depended on see below
+    elements: Vec<Scalar>,
 }
 
 impl ArrayData {
@@ -24,6 +25,9 @@ impl ArrayData {
         &self.tpe
     }
 
+    #[deprecated(
+        note = "These fields will be removed eventually and are unstable. See https://github.com/delta-incubator/delta-kernel-rs/issues/291"
+    )]
     pub fn array_elements(&self) -> &[Scalar] {
         &self.elements
     }
@@ -496,6 +500,7 @@ mod tests {
 
     #[test]
     fn test_arrays() {
+        #[allow(deprecated)]
         let array = Scalar::Array(ArrayData {
             tpe: ArrayType::new(DataType::Primitive(PrimitiveType::Integer), false),
             elements: vec![Scalar::Integer(1), Scalar::Integer(2), Scalar::Integer(3)],
