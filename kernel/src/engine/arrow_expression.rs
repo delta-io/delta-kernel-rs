@@ -150,7 +150,7 @@ impl ProvidesColumnByName for StructArray {
 fn extract_column<'array, 'path>(
     array: &'array dyn ProvidesColumnByName,
     path_step: &str,
-    remaining_path_steps: &mut impl Iterator<Item = &'path str>,
+    remaining_path_steps: &mut impl Iterator<Item=&'path str>,
 ) -> Result<&'array Arc<dyn Array>, ArrowError> {
     let child = array
         .column_by_name(path_step)
@@ -596,7 +596,7 @@ mod tests {
             Arc::new(schema.clone()),
             vec![Arc::new(struct_array.clone())],
         )
-        .unwrap();
+            .unwrap();
         let column = Expression::column("b.a");
         let results = evaluate_expression(&column, &batch, None).unwrap();
         assert_eq!(results.as_ref(), &values);
@@ -642,7 +642,7 @@ mod tests {
             Arc::new(schema.clone()),
             vec![Arc::new(values.clone()), Arc::new(values)],
         )
-        .unwrap();
+            .unwrap();
         let column_a = Expression::column("a");
         let column_b = Expression::column("b");
 
@@ -714,7 +714,7 @@ mod tests {
                 Arc::new(BooleanArray::from(vec![false, true])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let column_a = Expression::column("a");
         let column_b = Expression::column("b");
 
