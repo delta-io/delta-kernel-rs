@@ -12,7 +12,7 @@ use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream
 
 use crate::{TestCaseInfo, TestResult};
 
-pub async fn read_golden(path: &Path, _version: Option<&str>) -> DeltaResult<Option<RecordBatch>> {
+pub async fn read_golden(path: &Path, _version: Option<&str>) -> DeltaResult<RecordBatch> {
     let expected_root = path.join("expected").join("latest").join("table_content");
     let store = Arc::new(LocalFileSystem::new_with_prefix(&expected_root)?);
     let files = store.list(None).try_collect::<Vec<_>>().await?;
@@ -34,7 +34,7 @@ pub async fn read_golden(path: &Path, _version: Option<&str>) -> DeltaResult<Opt
         }
     }
     let all_data = concat_batches(&schema.unwrap(), &batches)?;
-    Ok(Some(all_data))
+    Ok(all_data)
 }
 
 pub fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
@@ -147,9 +147,7 @@ pub async fn assert_scan_data(engine: Arc<dyn Engine>, test_case: &TestCaseInfo)
         .collect();
     let all_data = concat_batches(&schema.unwrap(), batches.iter()).map_err(Error::from)?;
     let all_data = sort_record_batch(all_data)?;
-    let golden = read_golden(test_case.root_dir(), None)
-        .await?
-        .expect("Didn't find golden data");
+    let golden = read_golden(test_case.root_dir(), None).await?;
     let golden = sort_record_batch(golden)?;
 
     assert_columns_match(all_data.columns(), golden.columns());

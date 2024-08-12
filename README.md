@@ -35,7 +35,7 @@ As it is a library, in general you will want to depend on `delta-kernel-rs` by a
 dependency to your `Cargo.toml`. For example:
 
 ```toml
-delta_kernel = "0.2"
+delta_kernel = "0.3"
 ```
 
 ### Versions and Api Stability
@@ -106,6 +106,7 @@ Some design principles which should be considered:
 ```
 
 - The crate's documentation can be easily reviewed with: `cargo docs --open`
+- Code coverage is available on codecov via [cargo-llvm-cov]. See their docs for instructions to install/run locally.
 
 [delta]: https://delta.io
 [delta-protocol]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md
@@ -116,3 +117,4 @@ Some design principles which should be considered:
 [dat]: https://github.com/delta-incubator/dat
 [derive-macros]: https://doc.rust-lang.org/reference/procedural-macros.html
 [API Docs]: https://docs.rs/delta_kernel/latest/delta_kernel/
+[cargo-llvm-cov]: https://github.com/taiki-e/cargo-llvm-cov
