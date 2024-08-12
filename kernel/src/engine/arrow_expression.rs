@@ -150,7 +150,7 @@ impl ProvidesColumnByName for StructArray {
 fn extract_column<'array, 'path>(
     array: &'array dyn ProvidesColumnByName,
     path_step: &str,
-    remaining_path_steps: &mut impl Iterator<Item = &'path str>,
+    remaining_path_steps: &mut impl Iterator<Item=&'path str>,
 ) -> Result<&'array Arc<dyn Array>, ArrowError> {
     let child = array
         .column_by_name(path_step)
@@ -432,9 +432,10 @@ mod tests {
     use arrow_buffer::ScalarBuffer;
     use arrow_schema::{DataType, Field, Fields, Schema};
 
-    use crate::expressions::*;
-
     use super::*;
+    use crate::expressions::*;
+    use crate::schema::ArrayType;
+    use crate::DataType as DeltaDataTypes;
 
     #[test]
     fn test_array_column() {
@@ -489,6 +490,26 @@ mod tests {
             in_result.unwrap_err().to_string(),
             "Invalid expression evaluation: Right side column: item is not a list or a fixed size list".to_string()
         )
+    }
+
+    #[test]
+    fn test_literal_type_array() {
+        let field = Arc::new(Field::new("item", DataType::Int32, true));
+        let schema = Schema::new(vec![field.clone()]);
+        let batch = RecordBatch::new_empty(Arc::new(schema));
+
+        let in_op = Expression::binary(
+            BinaryOperator::NotIn,
+            Expression::literal(5),
+            Expression::literal(Scalar::Array(ArrayData::new(
+                ArrayType::new(DeltaDataTypes::Primitive(PrimitiveType::Integer), false),
+                vec![Scalar::Integer(1), Scalar::Integer(2)],
+            ))),
+        );
+
+        let in_result = evaluate_expression(&in_op, &batch, None).unwrap();
+        let in_expected = BooleanArray::from(vec![true]);
+        assert_eq!(in_result.as_ref(), &in_expected);
     }
 
     #[test]
@@ -550,7 +571,7 @@ mod tests {
             Arc::new(schema.clone()),
             vec![Arc::new(struct_array.clone())],
         )
-        .unwrap();
+            .unwrap();
         let column = Expression::column("b.a");
         let results = evaluate_expression(&column, &batch, None).unwrap();
         assert_eq!(results.as_ref(), &values);
@@ -596,7 +617,7 @@ mod tests {
             Arc::new(schema.clone()),
             vec![Arc::new(values.clone()), Arc::new(values)],
         )
-        .unwrap();
+            .unwrap();
         let column_a = Expression::column("a");
         let column_b = Expression::column("b");
 
@@ -668,7 +689,7 @@ mod tests {
                 Arc::new(BooleanArray::from(vec![false, true])),
             ],
         )
-        .unwrap();
+            .unwrap();
         let column_a = Expression::column("a");
         let column_b = Expression::column("b");
 

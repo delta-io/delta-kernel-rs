@@ -21,6 +21,10 @@ pub struct ArrayData {
 }
 
 impl ArrayData {
+    #[cfg(test)]
+    pub(crate) fn new(tpe: ArrayType, elements: Vec<Scalar>) -> Self {
+        Self { tpe, elements }
+    }
     pub fn array_type(&self) -> &ArrayType {
         &self.tpe
     }
