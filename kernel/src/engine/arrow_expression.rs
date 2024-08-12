@@ -244,15 +244,14 @@ fn evaluate_expression(
             },
             _,
         ) => match (left.as_ref(), right.as_ref()) {
-            (_, Column(c)) => {
+            (Literal(_), Column(c)) => {
                 let list_type = batch.column_by_name(c).map(|c| c.data_type());
                 if !matches!(
                     list_type,
                     Some(ArrowDataType::List(_)) | Some(ArrowDataType::FixedSizeList(_, _))
                 ) {
                     return Err(Error::InvalidExpressionEvaluation(format!(
-                        "Right side column: {} is not a list or a fixed size list",
-                        c
+                        "Right side column: {c} is not a list or a fixed size list"
                     )));
                 }
                 let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
@@ -301,9 +300,8 @@ fn evaluate_expression(
                 let exists = ad.array_elements().contains(lit);
                 Ok(Arc::new(BooleanArray::from(vec![exists])))
             }
-            (_, _) => Err(Error::invalid_expression(format!(
-                "Invalid right value for (NOT) IN comparison, right is: {:?}",
-                right
+            (l, r) => Err(Error::invalid_expression(format!(
+                "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
             ))),
         },
         (
@@ -510,6 +508,33 @@ mod tests {
         let in_result = evaluate_expression(&in_op, &batch, None).unwrap();
         let in_expected = BooleanArray::from(vec![true]);
         assert_eq!(in_result.as_ref(), &in_expected);
+    }
+
+    #[test]
+    fn test_invalid_array_sides() {
+        let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6, 9]));
+        let field = Arc::new(Field::new("item", DataType::Int32, true));
+        let arr_field = Arc::new(Field::new("item", DataType::List(field.clone()), true));
+
+        let schema = Schema::new(vec![arr_field.clone()]);
+
+        let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
+
+        let in_op = Expression::binary(
+            BinaryOperator::NotIn,
+            Expression::column("item"),
+            Expression::column("item"),
+        );
+
+        let in_result = evaluate_expression(&in_op, &batch, None);
+
+        assert!(in_result.is_err());
+        assert_eq!(
+            in_result.unwrap_err().to_string(),
+            "Invalid expression evaluation: Invalid right value for (NOT) IN comparison, left is: Column(item) right is: Column(item)".to_string()
+        )
     }
 
     #[test]
