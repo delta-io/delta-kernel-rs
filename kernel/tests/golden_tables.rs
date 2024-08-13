@@ -314,7 +314,7 @@ golden_test!(
     latest_snapshot_test
 );
 golden_test!("checkpoint", checkpoint_test);
-skip_test!("corrupted-last-checkpoint-kernel": "BUG: should fallback to old commits/checkpoint");
+golden_test!("corrupted-last-checkpoint-kernel", latest_snapshot_test);
 golden_test!("data-reader-array-complex-objects", latest_snapshot_test);
 golden_test!("data-reader-array-primitives", latest_snapshot_test);
 golden_test!("data-reader-date-types-America", latest_snapshot_test);
