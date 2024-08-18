@@ -314,7 +314,7 @@ golden_test!(
     latest_snapshot_test
 );
 golden_test!("checkpoint", checkpoint_test);
-skip_test!("corrupted-last-checkpoint-kernel": "BUG: should fallback to old commits/checkpoint");
+golden_test!("corrupted-last-checkpoint-kernel", latest_snapshot_test);
 golden_test!("data-reader-array-complex-objects", latest_snapshot_test);
 golden_test!("data-reader-array-primitives", latest_snapshot_test);
 golden_test!("data-reader-date-types-America", latest_snapshot_test);
@@ -408,8 +408,8 @@ golden_test!("time-travel-start", latest_snapshot_test);
 golden_test!("time-travel-start-start20", latest_snapshot_test);
 golden_test!("time-travel-start-start20-start40", latest_snapshot_test);
 
-golden_test!("v2-checkpoint-json", latest_snapshot_test); // passing without v2 checkpoint support
-golden_test!("v2-checkpoint-parquet", latest_snapshot_test); // passing without v2 checkpoint support
+skip_test!("v2-checkpoint-json": "v2 checkpoint not supported");
+skip_test!("v2-checkpoint-parquet": "v2 checkpoint not supported");
 
 // BUG:
 // - AddFile: 'file:/some/unqualified/absolute/path'

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 use url::Url;
 
 use crate::actions::{get_log_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
@@ -149,6 +149,9 @@ impl Snapshot {
         // List relevant files from log
         let (mut commit_files, checkpoint_files) =
             match (read_last_checkpoint(fs_client.as_ref(), &log_url)?, version) {
+                (Some(cp), None) => {
+                    list_log_files_with_checkpoint(&cp, fs_client.as_ref(), &log_url)?
+                }
                 (Some(cp), Some(version)) if cp.version >= version => {
                     list_log_files_with_checkpoint(&cp, fs_client.as_ref(), &log_url)?
                 }
@@ -287,7 +290,12 @@ struct CheckpointMetadata {
 
 /// Try reading the `_last_checkpoint` file.
 ///
-/// In case the file is not found, `None` is returned.
+/// Note that we typically want to ignore a missing/invalid `_last_checkpoint` file without failing
+/// the read. Thus, the semantics of this function are to return `None` if the file is not found or
+/// is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and are assumed to
+/// cause failure.
+///
+/// TODO: java kernel retries three times before failing, should we do the same?
 fn read_last_checkpoint(
     fs_client: &dyn FileSystemClient,
     log_root: &Url,
@@ -297,7 +305,9 @@ fn read_last_checkpoint(
         .read_files(vec![(file_path, None)])
         .and_then(|mut data| data.next().expect("read_files should return one file"))
     {
-        Ok(data) => Ok(Some(serde_json::from_slice(&data)?)),
+        Ok(data) => Ok(serde_json::from_slice(&data)
+            .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
+            .ok()),
         Err(Error::FileNotFound(_)) => Ok(None),
         Err(err) => Err(err),
     }
@@ -402,7 +412,9 @@ mod tests {
     use std::sync::Arc;
 
     use object_store::local::LocalFileSystem;
+    use object_store::memory::InMemory;
     use object_store::path::Path;
+    use object_store::ObjectStore;
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::filesystem::ObjectStoreFileSystemClient;
@@ -470,6 +482,47 @@ mod tests {
         );
         let cp = read_last_checkpoint(&client, &url).unwrap();
         assert!(cp.is_none())
+    }
+
+    fn valid_last_checkpoint() -> Vec<u8> {
+        r#"{"size":8,"size_in_bytes":21857,"version":1}"#.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn test_read_table_with_invalid_last_checkpoint() {
+        // in memory file system
+        let store = Arc::new(InMemory::new());
+
+        // put _last_checkpoint file
+        let data = valid_last_checkpoint();
+        let invalid_data = "invalid".as_bytes().to_vec();
+        let path = Path::from("valid/_last_checkpoint");
+        let invalid_path = Path::from("invalid/_last_checkpoint");
+
+        tokio::runtime::Runtime::new()
+            .expect("create tokio runtime")
+            .block_on(async {
+                store
+                    .put(&path, data.into())
+                    .await
+                    .expect("put _last_checkpoint");
+                store
+                    .put(&invalid_path, invalid_data.into())
+                    .await
+                    .expect("put _last_checkpoint");
+            });
+
+        let client = ObjectStoreFileSystemClient::new(
+            store,
+            Path::from("/"),
+            Arc::new(TokioBackgroundExecutor::new()),
+        );
+        let url = Url::parse("memory:///valid/").expect("valid url");
+        let valid = read_last_checkpoint(&client, &url).expect("read last checkpoint");
+        let url = Url::parse("memory:///invalid/").expect("valid url");
+        let invalid = read_last_checkpoint(&client, &url).expect("read last checkpoint");
+        assert!(valid.is_some());
+        assert!(invalid.is_none())
     }
 
     #[test_log::test]
