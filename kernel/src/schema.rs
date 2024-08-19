@@ -506,6 +506,10 @@ impl DataType {
     pub fn struct_type(fields: Vec<StructField>) -> Self {
         DataType::Struct(Box::new(StructType::new(fields)))
     }
+
+    pub fn array_type(elements: ArrayType) -> Self {
+        DataType::Array(Box::new(elements))
+    }
 }
 
 impl Display for DataType {

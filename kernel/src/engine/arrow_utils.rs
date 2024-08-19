@@ -20,6 +20,39 @@ use itertools::Itertools;
 use parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 use tracing::debug;
 
+macro_rules! prim_array_cmp {
+    ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
+
+        return match $left_arr.data_type() {
+        $(
+            $data_ty => {
+                let prim_array = $left_arr.as_primitive_opt::<$prim_ty>()
+                        .ok_or(Error::invalid_expression(
+                            format!("Cannot cast to primitive array: {}", $left_arr.data_type()))
+                        )?;
+                    let list_array = $right_arr.as_list_opt::<i32>()
+                        .ok_or(Error::invalid_expression(
+                            format!("Cannot cast to list array: {}", $right_arr.data_type()))
+                        )?;
+                arrow_ord::comparison::in_list(prim_array, list_array).map(wrap_comparison_result)
+            }
+        )+
+            _ => Err(ArrowError::CastError(
+                        format!("Bad Comparison between: {:?} and {:?}",
+                            $left_arr.data_type(),
+                            $right_arr.data_type())
+                        )
+                )
+        }.map_err(Error::generic_err);
+    };
+}
+
+pub(crate) use prim_array_cmp;
+
+/// Get the indicies in `parquet_schema` of the specified columns in `requested_schema`. This
+/// returns a tuples of (mask_indicies: Vec<parquet_schema_index>, reorder_indicies:
+/// Vec<requested_index>). `mask_indicies` is used for generating the mask for reading from the
+
 fn make_arrow_error(s: String) -> Error {
     Error::Arrow(arrow_schema::ArrowError::InvalidArgumentError(s))
 }
@@ -498,6 +531,7 @@ fn get_indices(
 /// Get the indices in `parquet_schema` of the specified columns in `requested_schema`. This returns
 /// a tuple of (mask_indices: Vec<parquet_schema_index>, reorder_indices:
 /// Vec<requested_index>). `mask_indices` is used for generating the mask for reading from the
+
 /// parquet file, and simply contains an entry for each index we wish to select from the parquet
 /// file set to the index of the requested column in the parquet. `reorder_indices` is used for
 /// re-ordering. See the documentation for [`ReorderIndex`] to understand what each element in the

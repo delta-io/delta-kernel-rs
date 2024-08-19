@@ -17,7 +17,7 @@ use tracing::warn;
 
 use super::log_replay::SCAN_ROW_SCHEMA;
 
-/// State that doesn't change beween scans
+/// State that doesn't change between scans
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GlobalScanState {
     pub table_root: String,

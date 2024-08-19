@@ -24,6 +24,7 @@ version = "0.3.0"
 arrow = { version = "^52.0" }
 arrow-arith = { version = "^52.0" }
 arrow-array = { version = "^52.0" }
+arrow-buffer = { version = "^52.0" }
 arrow-cast = { version = "^52.0" }
 arrow-data = { version = "^52.0" }
 arrow-ord = { version = "^52.0" }
