@@ -9,7 +9,9 @@ use arrow_schema::{
 use itertools::Itertools;
 
 use crate::error::Error;
-use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
+use crate::schema::{
+    ArrayType, DataType, MapType, MetadataValue, PrimitiveType, StructField, StructType,
+};
 
 pub(crate) const LIST_ARRAY_ROOT: &str = "element";
 pub(crate) const MAP_ROOT_DEFAULT: &str = "key_value";
@@ -32,7 +34,10 @@ impl TryFrom<&StructField> for ArrowField {
         let metadata = f
             .metadata()
             .iter()
-            .map(|(key, val)| Ok((key.clone(), serde_json::to_string(val)?)))
+            .map(|(key, val)| match &val {
+                &MetadataValue::String(val) => Ok((key.clone(), val.clone())),
+                _ => Ok((key.clone(), serde_json::to_string(val)?)),
+            })
             .collect::<Result<_, serde_json::Error>>()
             .map_err(|err| ArrowError::JsonError(err.to_string()))?;
 
@@ -248,5 +253,32 @@ impl TryFrom<&ArrowDataType> for DataType {
                 "Invalid data type for Delta Lake: {s}"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::arrow_conversion::ArrowField;
+    use crate::{
+        schema::{DataType, StructField},
+        DeltaResult,
+    };
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_metadata_string_conversion() -> DeltaResult<()> {
+        let mut metadata = HashMap::new();
+        metadata.insert("description", "hello world".to_owned());
+        let struct_field =
+            StructField::new("name", DataType::STRING, false).with_metadata(metadata);
+
+        let arrow_field = ArrowField::try_from(&struct_field)?;
+        let new_metadata = arrow_field.metadata();
+
+        assert_eq!(
+            new_metadata.get("description").unwrap(),
+            &"hello world".to_owned()
+        );
+        Ok(())
     }
 }
