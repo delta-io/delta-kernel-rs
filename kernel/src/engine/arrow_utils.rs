@@ -417,7 +417,7 @@ fn get_indices(
                             array_type.contains_null,
                         )]);
                         let (parquet_advance, mut children) = get_indices(
-                            found_fields.len() + parquet_offset,
+                            parquet_index + parquet_offset,
                             &requested_schema,
                             &[list_field.clone()].into(),
                             mask_indices,
@@ -996,6 +996,33 @@ mod tests {
             ReorderIndex::identity(1),
             ReorderIndex::identity(2),
         ];
+        assert_eq!(mask_indices, expect_mask);
+        assert_eq!(reorder_indices, expect_reorder);
+    }
+
+    #[test]
+    fn list_skip_earlier_element() {
+        let requested_schema = Arc::new(StructType::new(vec![StructField::new(
+            "list",
+            ArrayType::new(DataType::INTEGER, false),
+            false,
+        )]));
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", ArrowDataType::Int32, false),
+            ArrowField::new(
+                "list",
+                ArrowDataType::List(Arc::new(ArrowField::new(
+                    "nested",
+                    ArrowDataType::Int32,
+                    false,
+                ))),
+                false,
+            ),
+        ]));
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+        let expect_mask = vec![1];
+        let expect_reorder = vec![ReorderIndex::identity(0)];
         assert_eq!(mask_indices, expect_mask);
         assert_eq!(reorder_indices, expect_reorder);
     }
