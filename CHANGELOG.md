@@ -1,5 +1,26 @@
 # Changelog
 
+## [v0.3.1](https://github.com/delta-incubator/delta-kernel-rs/tree/v0.3.1/) (2024-09-10)
+
+[Full Changelog](https://github.com/delta-incubator/delta-kernel-rs/compare/v0.3.0...v0.3.1)
+
+**API Changes**
+
+*Additions*
+
+1. Two new binary expressions: `In` and `NotIn`, as well as a new `Scalar::Array` variant to represent arrays in the expression framework [\#270](https://github.com/delta-incubator/delta-kernel-rs/pull/270) NOTE: exact API for these expressions is still evolving.
+
+**Implemented enhancements:**
+
+- Enabled more golden table tests [\#301](https://github.com/delta-incubator/delta-kernel-rs/pull/301)
+
+**Fixed bugs:**
+
+- Allow kernel to read tables with invalid `_last_checkpoint` [\#311](https://github.com/delta-incubator/delta-kernel-rs/pull/311)
+- List log files with checkpoint hint when constructing latest snapshot (when version requested is `None`) [\#312](https://github.com/delta-incubator/delta-kernel-rs/pull/312)
+- Fix incorrect offset value when computing list offsets [\#327](https://github.com/delta-incubator/delta-kernel-rs/pull/327)
+- Fix metadata string conversion in default engine arrow conversion [\#328](https://github.com/delta-incubator/delta-kernel-rs/pull/328)
+
 ## [v0.3.0](https://github.com/delta-incubator/delta-kernel-rs/tree/v0.3.0/) (2024-08-07)
 
 [Full Changelog](https://github.com/delta-incubator/delta-kernel-rs/compare/v0.2.0...v0.3.0)
