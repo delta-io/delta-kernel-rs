@@ -102,6 +102,27 @@ pub trait GetData<'a> {
     );
 }
 
+macro_rules! impl_null_get {
+    ( $(($name: ident, $typ: ty)), * ) => {
+        $(
+            fn $name(&'a self, _row_index: usize, _field_name: &str) -> DeltaResult<Option<$typ>> {
+                Ok(None)
+            }
+        )*
+    };
+}
+
+impl<'a> GetData<'a> for () {
+    impl_null_get!(
+        (get_bool, bool),
+        (get_int, i32),
+        (get_long, i64),
+        (get_str, &'a str),
+        (get_list, ListItem<'a>),
+        (get_map, MapItem<'a>)
+    );
+}
+
 // This is a convenience wrapper over `GetData` to allow code like:
 // `let name: Option<String> = getters[1].get_opt(row_index, "metadata.name")?;`
 pub(crate) trait TypedGetData<'a, T> {

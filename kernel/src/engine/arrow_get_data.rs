@@ -77,24 +77,3 @@ impl<'a> GetData<'a> for MapArray {
         }
     }
 }
-
-macro_rules! impl_null_get {
-    ( $(($name: ident, $typ: ty)), * ) => {
-        $(
-            fn $name(&'a self, _row_index: usize, _field_name: &str) -> DeltaResult<Option<$typ>> {
-                Ok(None)
-            }
-        )*
-    };
-}
-
-impl<'a> GetData<'a> for () {
-    impl_null_get!(
-        (get_bool, bool),
-        (get_int, i32),
-        (get_long, i64),
-        (get_str, &'a str),
-        (get_list, ListItem<'a>),
-        (get_map, MapItem<'a>)
-    );
-}
