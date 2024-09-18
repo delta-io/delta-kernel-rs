@@ -3,6 +3,7 @@
 //!
 
 use std::cmp::Ordering;
+use std::ops::Not;
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -71,9 +72,14 @@ impl LogSegment {
 
     fn read_metadata(&self, engine: &dyn Engine) -> DeltaResult<Option<(Metadata, Protocol)>> {
         let schema = get_log_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
+        // filter out log files that do not contain metadata or protocol information
+        use Expression as Expr;
+        let filter = Some(Expr::or(
+            Expr::not(Expr::is_null(Expr::column("metaData.id"))),
+            Expr::not(Expr::is_null(Expr::column("protocol.min_reader_version"))),
+        ));
         // read the same protocol and metadata schema for both commits and checkpoints
-        // TODO add metadata.table_id is not null and protocol.something_required is not null
-        let data_batches = self.replay(engine, schema.clone(), schema, None)?;
+        let data_batches = self.replay(engine, schema.clone(), schema, filter)?;
         let mut metadata_opt: Option<Metadata> = None;
         let mut protocol_opt: Option<Protocol> = None;
         for batch in data_batches {
