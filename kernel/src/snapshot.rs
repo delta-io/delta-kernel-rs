@@ -76,7 +76,7 @@ impl LogSegment {
         use Expression as Expr;
         let filter = Some(Expr::or(
             Expr::not(Expr::is_null(Expr::column("metaData.id"))),
-            Expr::not(Expr::is_null(Expr::column("protocol.min_reader_version"))),
+            Expr::not(Expr::is_null(Expr::column("protocol.minReaderVersion"))),
         ));
         // read the same protocol and metadata schema for both commits and checkpoints
         let data_batches = self.replay(engine, schema.clone(), schema, filter)?;
