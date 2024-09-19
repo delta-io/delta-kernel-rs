@@ -1040,3 +1040,47 @@ fn timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     Ok(())
 }
+
+#[test]
+fn type_widening_basic() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+---------------------+---------------------+--------------------+----------------+----------------+----------------+----------------------------+",
+        "| byte_long           | int_long            | float_double       | byte_double    | short_double   | int_double     | date_timestamp_ntz         |",
+        "+---------------------+---------------------+--------------------+----------------+----------------+----------------+----------------------------+",
+        "| 1                   | 2                   | 3.4000000953674316 | 5.0            | 6.0            | 7.0            | 2024-09-09T00:00:00        |",
+        "| 9223372036854775807 | 9223372036854775807 | 1.234567890123     | 1.234567890123 | 1.234567890123 | 1.234567890123 | 2024-09-09T12:34:56.123456 |",
+        "+---------------------+---------------------+--------------------+----------------+----------------+----------------+----------------------------+",
+   ];
+    let select_cols: Option<&[&str]> = Some(&[
+        "byte_long",
+        "int_long",
+        "float_double",
+        "byte_double",
+        "short_double",
+        "int_double",
+        "date_timestamp_ntz",
+    ]);
+
+    read_table_data_str("./tests/data/type-widening/", select_cols, None, expected)
+}
+
+#[test]
+fn type_widening_decimal() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+----------------------------+-------------------------------+--------------+---------------+--------------+----------------------+",
+        "| decimal_decimal_same_scale | decimal_decimal_greater_scale | byte_decimal | short_decimal | int_decimal  | long_decimal         |",
+        "+----------------------------+-------------------------------+--------------+---------------+--------------+----------------------+",
+        "| 123.45                     | 67.89000                      | 1.0          | 2.0           | 3.0          | 4.0                  |",
+        "| 12345678901234.56          | 12345678901.23456             | 123.4        | 12345.6       | 1234567890.1 | 123456789012345678.9 |",
+        "+----------------------------+-------------------------------+--------------+---------------+--------------+----------------------+",
+    ];
+    let select_cols: Option<&[&str]> = Some(&[
+        "decimal_decimal_same_scale",
+        "decimal_decimal_greater_scale",
+        "byte_decimal",
+        "short_decimal",
+        "int_decimal",
+        "long_decimal",
+    ]);
+    read_table_data_str("./tests/data/type-widening/", select_cols, None, expected)
+}

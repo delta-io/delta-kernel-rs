@@ -73,17 +73,52 @@ fn check_cast_compat(
     target_type: ArrowDataType,
     source_type: &ArrowDataType,
 ) -> DeltaResult<DataTypeCompat> {
+    use ArrowDataType::*;
+
     match (source_type, &target_type) {
         (source_type, target_type) if source_type == target_type => Ok(DataTypeCompat::Identical),
         (&ArrowDataType::Timestamp(_, _), &ArrowDataType::Timestamp(_, _)) => {
             // timestamps are able to be cast between each other
             Ok(DataTypeCompat::NeedsCast(target_type))
         }
+        // Allow up-casting to a larger type if it's safe and can't cause overflow or loss of precision.
+        (Int8, Int16 | Int32 | Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        (Int16, Int32 | Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        (Int32, Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        (Float32, Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
+        (_, Decimal128(p, s)) if can_upcast_to_decimal(source_type, *p, *s) => {
+            Ok(DataTypeCompat::NeedsCast(target_type))
+        }
+        (Date32, Timestamp(_, None)) => Ok(DataTypeCompat::NeedsCast(target_type)),
         _ => Err(make_arrow_error(format!(
             "Incorrect datatype. Expected {}, got {}",
             target_type, source_type
         ))),
     }
+}
+
+// Returns whether the given source type can be safely cast to a decimal with the given precision and scale without
+// loss of information.
+fn can_upcast_to_decimal(
+    source_type: &ArrowDataType,
+    target_precision: u8,
+    target_scale: i8,
+) -> bool {
+    use ArrowDataType::*;
+
+    let (source_precision, source_scale) = match source_type {
+        Decimal128(p, s) => (*p, *s),
+        // Allow converting integers to a decimal that can hold all possible values.
+        Int8 => (3u8, 0i8),
+        Int16 => (5u8, 0i8),
+        Int32 => (10u8, 0i8),
+        Int64 => (20u8, 0i8),
+        _ => return false,
+    };
+
+    target_precision >= source_precision
+        && target_scale >= source_scale
+        && target_precision - source_precision >= (target_scale - source_scale) as u8
 }
 
 /// Ensure a kernel data type matches an arrow data type. This only ensures that the actual "type"
@@ -1426,5 +1461,62 @@ mod tests {
         let expect_reorder = vec![];
         assert_eq!(mask_indices, expect_mask);
         assert_eq!(reorder_indices, expect_reorder);
+    }
+
+    #[test]
+    fn accepts_safe_decimal_casts() {
+        use super::can_upcast_to_decimal;
+        use ArrowDataType::*;
+
+        assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 0i8));
+        assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 1i8));
+        assert!(can_upcast_to_decimal(&Decimal128(5, -2), 6u8, -2i8));
+        assert!(can_upcast_to_decimal(&Decimal128(5, -2), 6u8, -1i8));
+        assert!(can_upcast_to_decimal(&Decimal128(5, 1), 6u8, 1i8));
+        assert!(can_upcast_to_decimal(&Decimal128(5, 1), 6u8, 2i8));
+        assert!(can_upcast_to_decimal(
+            &Decimal128(10, 5),
+            arrow_schema::DECIMAL128_MAX_PRECISION,
+            arrow_schema::DECIMAL128_MAX_SCALE - 5
+        ));
+
+        assert!(can_upcast_to_decimal(&Int8, 3u8, 0i8));
+        assert!(can_upcast_to_decimal(&Int8, 4u8, 0i8));
+        assert!(can_upcast_to_decimal(&Int8, 4u8, 1i8));
+        assert!(can_upcast_to_decimal(&Int8, 7u8, 2i8));
+
+        assert!(can_upcast_to_decimal(&Int16, 5u8, 0i8));
+        assert!(can_upcast_to_decimal(&Int16, 6u8, 0i8));
+        assert!(can_upcast_to_decimal(&Int16, 6u8, 1i8));
+        assert!(can_upcast_to_decimal(&Int16, 9u8, 2i8));
+
+        assert!(can_upcast_to_decimal(&Int32, 10u8, 0i8));
+        assert!(can_upcast_to_decimal(&Int32, 11u8, 0i8));
+        assert!(can_upcast_to_decimal(&Int32, 11u8, 1i8));
+        assert!(can_upcast_to_decimal(&Int32, 14u8, 2i8));
+
+        assert!(can_upcast_to_decimal(&Int64, 20u8, 0i8));
+        assert!(can_upcast_to_decimal(&Int64, 21u8, 0i8));
+        assert!(can_upcast_to_decimal(&Int64, 21u8, 1i8));
+        assert!(can_upcast_to_decimal(&Int64, 24u8, 2i8));
+    }
+
+    #[test]
+    fn rejects_unsafe_decimal_casts() {
+        use super::can_upcast_to_decimal;
+        use ArrowDataType::*;
+
+        assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, 1i8));
+        assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, -1i8));
+        assert!(!can_upcast_to_decimal(&Decimal128(5, 2), 6u8, 4i8));
+
+        assert!(!can_upcast_to_decimal(&Int8, 2u8, 0i8));
+        assert!(!can_upcast_to_decimal(&Int8, 3u8, 1i8));
+        assert!(!can_upcast_to_decimal(&Int16, 4u8, 0i8));
+        assert!(!can_upcast_to_decimal(&Int16, 5u8, 1i8));
+        assert!(!can_upcast_to_decimal(&Int32, 9u8, 0i8));
+        assert!(!can_upcast_to_decimal(&Int32, 10u8, 1i8));
+        assert!(!can_upcast_to_decimal(&Int64, 19u8, 0i8));
+        assert!(!can_upcast_to_decimal(&Int64, 20u8, 1i8));
     }
 }

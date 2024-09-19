@@ -31,6 +31,11 @@ pub enum ReaderFeatures {
     #[strum(serialize = "timestampNtz")]
     #[serde(rename = "timestampNtz")]
     TimestampWithoutTimezone,
+    // Allow columns to change type
+    TypeWidening,
+    #[strum(serialize = "typeWidening-preview")]
+    #[serde(rename = "typeWidening-preview")]
+    TypeWideningPreview,
     /// version 2 of checkpointing
     V2Checkpoint,
 }
@@ -74,6 +79,11 @@ pub enum WriterFeatures {
     #[strum(serialize = "timestampNtz")]
     #[serde(rename = "timestampNtz")]
     TimestampWithoutTimezone,
+    // Allow columns to change type
+    TypeWidening,
+    #[strum(serialize = "typeWidening-preview")]
+    #[serde(rename = "typeWidening-preview")]
+    TypeWideningPreview,
     /// domain specific metadata
     DomainMetadata,
     /// version 2 of checkpointing
@@ -94,6 +104,8 @@ mod tests {
             (ReaderFeatures::ColumnMapping, "columnMapping"),
             (ReaderFeatures::DeletionVectors, "deletionVectors"),
             (ReaderFeatures::TimestampWithoutTimezone, "timestampNtz"),
+            (ReaderFeatures::TypeWidening, "typeWidening"),
+            (ReaderFeatures::TypeWideningPreview, "typeWidening-preview"),
             (ReaderFeatures::V2Checkpoint, "v2Checkpoint"),
         ];
 
@@ -126,6 +138,8 @@ mod tests {
             (WriterFeatures::DeletionVectors, "deletionVectors"),
             (WriterFeatures::RowTracking, "rowTracking"),
             (WriterFeatures::TimestampWithoutTimezone, "timestampNtz"),
+            (WriterFeatures::TypeWidening, "typeWidening"),
+            (WriterFeatures::TypeWideningPreview, "typeWidening-preview"),
             (WriterFeatures::DomainMetadata, "domainMetadata"),
             (WriterFeatures::V2Checkpoint, "v2Checkpoint"),
             (WriterFeatures::IcebergCompatV1, "icebergCompatV1"),
