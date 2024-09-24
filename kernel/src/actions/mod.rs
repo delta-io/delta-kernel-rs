@@ -47,7 +47,7 @@ pub(crate) fn get_log_schema() -> &'static StructType {
 pub struct Format {
     /// Name of the encoding for files in this table
     pub provider: String,
-    /// A map containingconfiguration options for the format
+    /// A map containing configuration options for the format
     pub options: HashMap<String, String>,
 }
 
@@ -140,7 +140,11 @@ pub struct Add {
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
     pub path: String,
 
-    /// A map from partition column to value for this logical file.
+    /// A map from partition column to value for this logical file. This map can contain null in the
+    /// values meaning a partition is null. We drop those values from this map, due to the
+    /// `drop_null_container_values` annotation. This means an engine can assume that if a partition
+    /// is found in [`Metadata`] `partition_columns`, but not in this map, its value is null.
+    #[drop_null_container_values]
     pub partition_values: HashMap<String, String>,
 
     /// The size of this data file in bytes
@@ -290,6 +294,40 @@ mod tests {
                     MapType::new(DataType::STRING, DataType::STRING, false),
                     false,
                 ),
+            ]),
+            true,
+        )]));
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn test_add_schema() {
+        let schema = get_log_schema()
+            .project(&["add"])
+            .expect("Couldn't get add field");
+
+        let expected = Arc::new(StructType::new(vec![StructField::new(
+            "add",
+            StructType::new(vec![
+                StructField::new("path", DataType::STRING, false),
+                StructField::new(
+                    "partitionValues",
+                    MapType::new(DataType::STRING, DataType::STRING, true),
+                    false,
+                ),
+                StructField::new("size", DataType::LONG, false),
+                StructField::new("modificationTime", DataType::LONG, false),
+                StructField::new("dataChange", DataType::BOOLEAN, false),
+                StructField::new("stats", DataType::STRING, true),
+                StructField::new(
+                    "tags",
+                    MapType::new(DataType::STRING, DataType::STRING, false),
+                    true,
+                ),
+                deletion_vector_field(),
+                StructField::new("baseRowId", DataType::LONG, true),
+                StructField::new("defaultRowCommitVersion", DataType::LONG, true),
+                StructField::new("clusteringProvider", DataType::STRING, true),
             ]),
             true,
         )]));
