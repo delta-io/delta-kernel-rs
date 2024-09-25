@@ -15,7 +15,7 @@ use crate::{TestCaseInfo, TestResult};
 pub async fn read_golden(path: &Path, _version: Option<&str>) -> DeltaResult<RecordBatch> {
     let expected_root = path.join("expected").join("latest").join("table_content");
     let store = Arc::new(LocalFileSystem::new_with_prefix(&expected_root)?);
-    let files = store.list(None).try_collect::<Vec<_>>().await?;
+    let files: Vec<_> = store.list(None).try_collect().await?;
     let mut batches = vec![];
     let mut schema = None;
     for meta in files.into_iter() {

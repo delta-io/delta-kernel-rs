@@ -328,6 +328,7 @@ pub enum KernelError {
     InvalidStructDataError,
     InternalError,
     InvalidExpression,
+    InvalidLogPath,
 }
 
 impl From<Error> for KernelError {
@@ -374,6 +375,7 @@ impl From<Error> for KernelError {
                 backtrace: _,
             } => Self::from(*source),
             Error::InvalidExpressionEvaluation(_) => KernelError::InvalidExpression,
+            Error::InvalidLogPath(_) => KernelError::InvalidLogPath,
         }
     }
 }

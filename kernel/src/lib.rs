@@ -63,7 +63,12 @@ pub mod engine_data;
 pub mod error;
 pub mod expressions;
 pub mod features;
+
+#[cfg(feature = "developer-visibility")]
+pub mod path;
+#[cfg(not(feature = "developer-visibility"))]
 pub(crate) mod path;
+
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
