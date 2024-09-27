@@ -8,7 +8,7 @@ use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{get_log_schema, ADD_NAME};
 use crate::error::DeltaResult;
 use crate::expressions::{BinaryOperator, Expression as Expr, UnaryOperator, VariadicOperator};
-use crate::schema::{DataType, PrimitiveType, SchemaRef, StructField, StructType};
+use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::{Engine, EngineData, ExpressionEvaluator, JsonHandler};
 
 /// Get the expression that checks if a col could be null, assuming tight_bounds = true. In this
@@ -216,13 +216,7 @@ impl DataSkippingFilter {
                 StructType::new(
                     data_fields
                         .iter()
-                        .map(|data_field| {
-                            StructField::new(
-                                &data_field.name,
-                                DataType::Primitive(PrimitiveType::Long),
-                                true,
-                            )
-                        })
+                        .map(|data_field| StructField::new(&data_field.name, DataType::LONG, true))
                         .collect(),
                 ),
                 true,

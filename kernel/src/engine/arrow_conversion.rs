@@ -177,22 +177,22 @@ impl TryFrom<&ArrowDataType> for DataType {
 
     fn try_from(arrow_datatype: &ArrowDataType) -> Result<Self, ArrowError> {
         match arrow_datatype {
-            ArrowDataType::Utf8 => Ok(DataType::Primitive(PrimitiveType::String)),
-            ArrowDataType::LargeUtf8 => Ok(DataType::Primitive(PrimitiveType::String)),
-            ArrowDataType::Int64 => Ok(DataType::Primitive(PrimitiveType::Long)), // undocumented type
-            ArrowDataType::Int32 => Ok(DataType::Primitive(PrimitiveType::Integer)),
-            ArrowDataType::Int16 => Ok(DataType::Primitive(PrimitiveType::Short)),
-            ArrowDataType::Int8 => Ok(DataType::Primitive(PrimitiveType::Byte)),
-            ArrowDataType::UInt64 => Ok(DataType::Primitive(PrimitiveType::Long)), // undocumented type
-            ArrowDataType::UInt32 => Ok(DataType::Primitive(PrimitiveType::Integer)),
-            ArrowDataType::UInt16 => Ok(DataType::Primitive(PrimitiveType::Short)),
-            ArrowDataType::UInt8 => Ok(DataType::Primitive(PrimitiveType::Byte)),
-            ArrowDataType::Float32 => Ok(DataType::Primitive(PrimitiveType::Float)),
-            ArrowDataType::Float64 => Ok(DataType::Primitive(PrimitiveType::Double)),
-            ArrowDataType::Boolean => Ok(DataType::Primitive(PrimitiveType::Boolean)),
-            ArrowDataType::Binary => Ok(DataType::Primitive(PrimitiveType::Binary)),
-            ArrowDataType::FixedSizeBinary(_) => Ok(DataType::Primitive(PrimitiveType::Binary)),
-            ArrowDataType::LargeBinary => Ok(DataType::Primitive(PrimitiveType::Binary)),
+            ArrowDataType::Utf8 => Ok(DataType::STRING),
+            ArrowDataType::LargeUtf8 => Ok(DataType::STRING),
+            ArrowDataType::Int64 => Ok(DataType::LONG), // undocumented type
+            ArrowDataType::Int32 => Ok(DataType::INTEGER),
+            ArrowDataType::Int16 => Ok(DataType::SHORT),
+            ArrowDataType::Int8 => Ok(DataType::BYTE),
+            ArrowDataType::UInt64 => Ok(DataType::LONG), // undocumented type
+            ArrowDataType::UInt32 => Ok(DataType::INTEGER),
+            ArrowDataType::UInt16 => Ok(DataType::SHORT),
+            ArrowDataType::UInt8 => Ok(DataType::BYTE),
+            ArrowDataType::Float32 => Ok(DataType::FLOAT),
+            ArrowDataType::Float64 => Ok(DataType::DOUBLE),
+            ArrowDataType::Boolean => Ok(DataType::BOOLEAN),
+            ArrowDataType::Binary => Ok(DataType::BINARY),
+            ArrowDataType::FixedSizeBinary(_) => Ok(DataType::BINARY),
+            ArrowDataType::LargeBinary => Ok(DataType::BINARY),
             ArrowDataType::Decimal128(p, s) => {
                 if *s < 0 {
                     return Err(ArrowError::from_external_error(
@@ -202,15 +202,13 @@ impl TryFrom<&ArrowDataType> for DataType {
                 DataType::decimal(*p, *s as u8)
                     .map_err(|e| ArrowError::from_external_error(e.into()))
             }
-            ArrowDataType::Date32 => Ok(DataType::Primitive(PrimitiveType::Date)),
-            ArrowDataType::Date64 => Ok(DataType::Primitive(PrimitiveType::Date)),
-            ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => {
-                Ok(DataType::Primitive(PrimitiveType::TimestampNtz))
-            }
+            ArrowDataType::Date32 => Ok(DataType::DATE),
+            ArrowDataType::Date64 => Ok(DataType::DATE),
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => Ok(DataType::TIMESTAMP_NTZ),
             ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(tz))
                 if tz.eq_ignore_ascii_case("utc") =>
             {
-                Ok(DataType::Primitive(PrimitiveType::Timestamp))
+                Ok(DataType::TIMESTAMP)
             }
             ArrowDataType::Struct(fields) => {
                 let converted_fields: Result<Vec<StructField>, _> = fields

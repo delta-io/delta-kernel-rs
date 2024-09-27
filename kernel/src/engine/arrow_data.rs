@@ -1,5 +1,5 @@
 use crate::engine_data::{EngineData, EngineList, EngineMap, GetData};
-use crate::schema::{DataType, PrimitiveType, Schema, SchemaRef, StructField};
+use crate::schema::{DataType, Schema, SchemaRef, StructField};
 use crate::utils::require;
 use crate::{DataVisitor, DeltaResult, Error};
 
@@ -222,19 +222,19 @@ impl ArrowEngineData {
                     Some(struct_array),
                 )?;
             }
-            (&ArrowDataType::Boolean, &DataType::Primitive(PrimitiveType::Boolean)) => {
+            (&ArrowDataType::Boolean, &DataType::BOOLEAN) => {
                 debug!("Pushing boolean array for {}", field.name);
                 out_col_array.push(col.as_boolean());
             }
-            (&ArrowDataType::Utf8, &DataType::Primitive(PrimitiveType::String)) => {
+            (&ArrowDataType::Utf8, &DataType::STRING) => {
                 debug!("Pushing string array for {}", field.name);
                 out_col_array.push(col.as_string());
             }
-            (&ArrowDataType::Int32, &DataType::Primitive(PrimitiveType::Integer)) => {
+            (&ArrowDataType::Int32, &DataType::INTEGER) => {
                 debug!("Pushing int32 array for {}", field.name);
                 out_col_array.push(col.as_primitive::<Int32Type>());
             }
-            (&ArrowDataType::Int64, &DataType::Primitive(PrimitiveType::Long)) => {
+            (&ArrowDataType::Int64, &DataType::LONG) => {
                 debug!("Pushing int64 array for {}", field.name);
                 out_col_array.push(col.as_primitive::<Int64Type>());
             }

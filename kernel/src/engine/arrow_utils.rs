@@ -135,9 +135,9 @@ pub(crate) fn ensure_data_types(
         (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
             check_cast_compat(kernel_type.try_into()?, arrow_type)
         }
-        (DataType::Primitive(PrimitiveType::Boolean), ArrowDataType::Boolean)
-        | (DataType::Primitive(PrimitiveType::String), ArrowDataType::Utf8)
-        | (DataType::Primitive(PrimitiveType::Binary), ArrowDataType::Binary) => {
+        (&DataType::BOOLEAN, ArrowDataType::Boolean)
+        | (&DataType::STRING, ArrowDataType::Utf8)
+        | (&DataType::BINARY, ArrowDataType::Binary) => {
             // strings, bools, and binary  aren't primitive in arrow
             Ok(DataTypeCompat::Identical)
         }

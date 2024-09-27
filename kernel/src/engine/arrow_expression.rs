@@ -500,7 +500,7 @@ mod tests {
             BinaryOperator::NotIn,
             Expression::literal(5),
             Expression::literal(Scalar::Array(ArrayData::new(
-                ArrayType::new(DeltaDataTypes::Primitive(PrimitiveType::Integer), false),
+                ArrayType::new(DeltaDataTypes::INTEGER, false),
                 vec![Scalar::Integer(1), Scalar::Integer(2)],
             ))),
         );
