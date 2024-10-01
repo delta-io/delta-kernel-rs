@@ -25,18 +25,38 @@ as a dependency.
 To get started, install Rust via [rustup], clone the repository, and then run:
 
 ```sh
-cargo test
+cargo test --all-features
 ```
 
 This will build the kernel, run all unit tests, fetch the [Delta Acceptance Tests][dat] data and run
 the acceptance tests against it.
 
-As it is a library, in general you will want to depend on `delta-kernel-rs` by adding it as a
-dependency to your `Cargo.toml`. For example:
+In general, you will want to depend on `delta-kernel-rs` by adding it as a dependency to your
+`Cargo.toml`, (that is, for rust projects using cargo) for other projects please see the [FFI]
+module. The core kernel includes facilities for reading delta tables, but requires the consumer
+to implement the `Engine` trait in order to use the table-reading APIs. If there is no need to
+implement the consumer's own `Engine` trait, the kernel has a feature flag to enable a default,
+asynchronous `Engine` implementation built with [Arrow] and [Tokio].
 
 ```toml
+# fewer dependencies, requires consumer to implement Engine trait.
+# allows consumers to implement their own in-memory format
 delta_kernel = "0.3"
+
+# or turn on the default engine, based on arrow
+delta_kernel = { version = "0.3", features = ["default-engine"] }
 ```
+
+### Feature flags
+There are more feature flags in addition to the `default-engine` flag shown above. Relevant flags
+include:
+
+| Feature flag  | Description   |
+| ------------- | ------------- |
+| `default-engine`    | Turn on the 'default' engine: async, arrow-based `Engine` implementation  |
+| `sync-engine`       | Turn on the 'sync' engine: synchronous, arrow-based `Engine` implementation. Only supports local storage! |
+| `arrow-conversion`  | Conversion utilities for arrow/kernel schema interoperation |
+| `arrow-expression`  | Expression system implementation for arrow |
 
 ### Versions and Api Stability
 We intend to follow [Semantic Versioning](https://semver.org/). However, in the `0.x` line, the APIs
@@ -118,3 +138,6 @@ Some design principles which should be considered:
 [derive-macros]: https://doc.rust-lang.org/reference/procedural-macros.html
 [API Docs]: https://docs.rs/delta_kernel/latest/delta_kernel/
 [cargo-llvm-cov]: https://github.com/taiki-e/cargo-llvm-cov
+[FFI]: ffi/
+[Arrow]: https://arrow.apache.org/rust/arrow/index.html
+[Tokio]: https://tokio.rs/

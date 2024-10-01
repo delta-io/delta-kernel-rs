@@ -73,7 +73,7 @@ cloud = [
   "object_store/http",
   "hdfs-native-object-store",
 ]
-default = ["sync-engine"]
+default = []
 default-engine = [
   "arrow-conversion",
   "arrow-expression",
