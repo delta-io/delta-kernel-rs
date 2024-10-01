@@ -5,11 +5,10 @@ pub mod deletion_vector;
 pub(crate) mod schemas;
 pub(crate) mod visitors;
 
-use std::collections::HashMap;
-
 use delta_kernel_derive::Schema;
-use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::LazyLock;
 use visitors::{AddVisitor, MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
@@ -23,21 +22,19 @@ pub(crate) const METADATA_NAME: &str = "metaData";
 pub(crate) const PROTOCOL_NAME: &str = "protocol";
 pub(crate) const TRANSACTION_NAME: &str = "txn";
 
-lazy_static! {
-    static ref LOG_SCHEMA: StructType = StructType::new(
-        vec![
-            Option::<Add>::get_struct_field(ADD_NAME),
-            Option::<Remove>::get_struct_field(REMOVE_NAME),
-            Option::<Metadata>::get_struct_field(METADATA_NAME),
-            Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
-            Option::<Transaction>::get_struct_field(TRANSACTION_NAME),
-            // We don't support the following actions yet
-            //Option<Cdc>::get_field(CDC_NAME),
-            //Option<CommitInfo>::get_field(COMMIT_INFO_NAME),
-            //Option<DomainMetadata>::get_field(DOMAIN_METADATA_NAME),
-        ]
-    );
-}
+static LOG_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
+    StructType::new(vec![
+        Option::<Add>::get_struct_field(ADD_NAME),
+        Option::<Remove>::get_struct_field(REMOVE_NAME),
+        Option::<Metadata>::get_struct_field(METADATA_NAME),
+        Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
+        Option::<Transaction>::get_struct_field(TRANSACTION_NAME),
+        // We don't support the following actions yet
+        //Option<Cdc>::get_field(CDC_NAME),
+        //Option<CommitInfo>::get_field(COMMIT_INFO_NAME),
+        //Option<DomainMetadata>::get_field(DOMAIN_METADATA_NAME),
+    ])
+});
 
 pub(crate) fn get_log_schema() -> &'static StructType {
     &LOG_SCHEMA

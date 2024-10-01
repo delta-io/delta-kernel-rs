@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::ops::Not;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use tracing::debug;
 
@@ -180,13 +180,12 @@ impl DataSkippingFilter {
         table_schema: &SchemaRef,
         predicate: &Option<Expr>,
     ) -> Option<Self> {
-        lazy_static::lazy_static!(
-            static ref PREDICATE_SCHEMA: DataType = StructType::new(vec![
-                StructField::new("predicate", DataType::BOOLEAN, true),
-            ]).into();
-            static ref STATS_EXPR: Expr = Expr::column("add.stats");
-            static ref FILTER_EXPR: Expr = Expr::column("predicate").distinct(Expr::literal(false));
-        );
+        static PREDICATE_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
+            DataType::struct_type(vec![StructField::new("predicate", DataType::BOOLEAN, true)])
+        });
+        static STATS_EXPR: LazyLock<Expr> = LazyLock::new(|| Expr::column("add.stats"));
+        static FILTER_EXPR: LazyLock<Expr> =
+            LazyLock::new(|| Expr::column("predicate").distinct(Expr::literal(false)));
 
         let predicate = match predicate {
             Some(predicate) => predicate,

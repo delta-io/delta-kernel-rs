@@ -21,7 +21,6 @@ either = "1.13"
 fix-hidden-lifetime-bug = "0.2"
 indexmap = "2.5.0"
 itertools = "0.13"
-lazy_static = "1.5"
 roaring = "0.10.6"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"

@@ -1,8 +1,8 @@
+use std::clone::Clone;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use either::Either;
-use lazy_static::lazy_static;
 use tracing::debug;
 
 use super::data_skipping::DataSkippingFilter;
@@ -77,11 +77,11 @@ impl DataVisitor for AddRemoveVisitor {
     }
 }
 
-lazy_static! {
-    // NB: If you update this schema, ensure you update the comment describing it in the doc comment
-    // for `scan_row_schema` in scan/mod.rs! You'll also need to update ScanFileVisitor as the
-    // indexes will be off
-    pub(crate) static ref SCAN_ROW_SCHEMA: Arc<StructType> = Arc::new(StructType::new(vec!(
+// NB: If you update this schema, ensure you update the comment describing it in the doc comment
+// for `scan_row_schema` in scan/mod.rs! You'll also need to update ScanFileVisitor as the
+// indexes will be off
+pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| {
+    Arc::new(StructType::new(vec![
         StructField::new("path", DataType::STRING, false),
         StructField::new("size", DataType::LONG, true),
         StructField::new("modificationTime", DataType::LONG, true),
@@ -95,7 +95,7 @@ lazy_static! {
                 StructField::new("sizeInBytes", DataType::INTEGER, false),
                 StructField::new("cardinality", DataType::LONG, false),
             ]),
-            true
+            true,
         ),
         StructField::new(
             "fileConstantValues",
@@ -104,11 +104,11 @@ lazy_static! {
                 MapType::new(DataType::STRING, DataType::STRING, false),
                 true,
             )]),
-            true
+            true,
         ),
-    )));
-    static ref SCAN_ROW_DATATYPE: DataType = SCAN_ROW_SCHEMA.as_ref().clone().into();
-}
+    ]))
+});
+static SCAN_ROW_DATATYPE: LazyLock<DataType> = LazyLock::new(|| SCAN_ROW_SCHEMA.clone().into());
 
 impl LogReplayScanner {
     /// Create a new [`LogReplayScanner`] instance
