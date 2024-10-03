@@ -110,7 +110,7 @@ fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
     match expr {
         BinaryOperation { op, left, right } => {
             let (op, col, val) = match (left.as_ref(), right.as_ref()) {
-                (Column(col), Literal(val)) => (op.clone(), col, val),
+                (Column(col), Literal(val)) => (*op, col, val),
                 (Literal(val), Column(col)) => (op.commute()?, col, val),
                 _ => return None, // unsupported combination of operands
             };

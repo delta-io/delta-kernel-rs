@@ -345,13 +345,11 @@ pub fn scan_row_schema() -> Schema {
 }
 
 fn parse_partition_value(raw: Option<&String>, data_type: &DataType) -> DeltaResult<Scalar> {
-    match raw {
-        Some(v) => match data_type {
-            DataType::Primitive(primitive) => primitive.parse_scalar(v),
-            _ => Err(Error::generic(format!(
-                "Unexpected partition column type: {data_type:?}"
-            ))),
-        },
+    match (raw, data_type.as_primitive_opt()) {
+        (Some(v), Some(primitive)) => primitive.parse_scalar(v),
+        (Some(_), None) => Err(Error::generic(format!(
+            "Unexpected partition column type: {data_type:?}"
+        ))),
         _ => Ok(Scalar::Null(data_type.clone())),
     }
 }

@@ -214,6 +214,44 @@ impl Display for Scalar {
     }
 }
 
+impl PartialOrd for Scalar {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        use Scalar::*;
+        match (self, other) {
+            // NOTE: We intentionally do two match arms for each variant to avoid a catch-all, so
+            // that new variants trigger compilation failures instead of being silently ignored.
+            (Integer(a), Integer(b)) => a.partial_cmp(b),
+            (Integer(_), _) => None,
+            (Long(a), Long(b)) => a.partial_cmp(b),
+            (Long(_), _) => None,
+            (Short(a), Short(b)) => a.partial_cmp(b),
+            (Short(_), _) => None,
+            (Byte(a), Byte(b)) => a.partial_cmp(b),
+            (Byte(_), _) => None,
+            (Float(a), Float(b)) => a.partial_cmp(b),
+            (Float(_), _) => None,
+            (Double(a), Double(b)) => a.partial_cmp(b),
+            (Double(_), _) => None,
+            (String(a), String(b)) => a.partial_cmp(b),
+            (String(_), _) => None,
+            (Boolean(a), Boolean(b)) => a.partial_cmp(b),
+            (Boolean(_), _) => None,
+            (Timestamp(a), Timestamp(b)) => a.partial_cmp(b),
+            (Timestamp(_), _) => None,
+            (TimestampNtz(a), TimestampNtz(b)) => a.partial_cmp(b),
+            (TimestampNtz(_), _) => None,
+            (Date(a), Date(b)) => a.partial_cmp(b),
+            (Date(_), _) => None,
+            (Binary(a), Binary(b)) => a.partial_cmp(b),
+            (Binary(_), _) => None,
+            (Decimal(_, _, _), _) => None, // TODO: Support Decimal
+            (Null(_), _) => None,          // NOTE: NULL values are incomparable by definition
+            (Struct(_), _) => None,        // TODO: Support Struct?
+            (Array(_), _) => None,         // TODO: Support Array?
+        }
+    }
+}
+
 impl From<i8> for Scalar {
     fn from(i: i8) -> Self {
         Self::Byte(i)
@@ -265,6 +303,18 @@ impl From<&str> for Scalar {
 impl From<String> for Scalar {
     fn from(value: String) -> Self {
         Self::String(value)
+    }
+}
+
+impl<T: Into<Scalar> + Copy> From<&T> for Scalar {
+    fn from(t: &T) -> Self {
+        (*t).into()
+    }
+}
+
+impl From<&[u8]> for Scalar {
+    fn from(b: &[u8]) -> Self {
+        Self::Binary(b.into())
     }
 }
 

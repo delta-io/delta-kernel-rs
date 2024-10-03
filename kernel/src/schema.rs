@@ -510,6 +510,13 @@ impl DataType {
     pub fn array_type(elements: ArrayType) -> Self {
         DataType::Array(Box::new(elements))
     }
+
+    pub fn as_primitive_opt(&self) -> Option<&PrimitiveType> {
+        match self {
+            DataType::Primitive(ptype) => Some(ptype),
+            _ => None,
+        }
+    }
 }
 
 impl Display for DataType {
