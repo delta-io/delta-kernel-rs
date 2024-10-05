@@ -1,7 +1,6 @@
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
-use std::sync::LazyLock;
 
 use crate::schema::{ArrayType, DataType, PrimitiveType, StructField};
 use crate::utils::require;
@@ -346,9 +345,6 @@ impl PrimitiveType {
     pub fn parse_scalar(&self, raw: &str) -> Result<Scalar, Error> {
         use PrimitiveType::*;
 
-        static UNIX_EPOCH: LazyLock<DateTime<Utc>> =
-            LazyLock::new(|| DateTime::from_timestamp(0, 0).unwrap());
-
         if raw.is_empty() {
             return Ok(Scalar::Null(self.data_type()));
         }
@@ -378,7 +374,7 @@ impl PrimitiveType {
                     .and_hms_opt(0, 0, 0)
                     .ok_or(self.parse_error(raw))?;
                 let date = Utc.from_utc_datetime(&date);
-                let days = date.signed_duration_since(*UNIX_EPOCH).num_days() as i32;
+                let days = date.signed_duration_since(DateTime::UNIX_EPOCH).num_days() as i32;
                 Ok(Scalar::Date(days))
             }
             // NOTE: Timestamp and TimestampNtz are parsed in the same way, as microsecond since unix epoch.
@@ -390,7 +386,7 @@ impl PrimitiveType {
                     .map_err(|_| self.parse_error(raw))?;
                 let timestamp = Utc.from_utc_datetime(&timestamp);
                 let micros = timestamp
-                    .signed_duration_since(*UNIX_EPOCH)
+                    .signed_duration_since(DateTime::UNIX_EPOCH)
                     .num_microseconds()
                     .ok_or(self.parse_error(raw))?;
                 match self {
