@@ -13,11 +13,11 @@ use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
 
+use crate::expressions::{unwrap_kernel_expression, EnginePredicate, KernelExpressionVisitorState};
 use crate::{
-    unwrap_kernel_expression, AllocateStringFn, EnginePredicate, ExclusiveEngineData, ExternEngine,
-    ExternResult, IntoExternResult, KernelBoolSlice, KernelExpressionVisitorState,
-    KernelRowIndexArray, KernelStringSlice, NullableCvoid, SharedExternEngine, SharedSnapshot,
-    StringIter, StringSliceIterator, TryFromStringSlice,
+    AllocateStringFn, ExclusiveEngineData, ExternEngine, ExternResult, IntoExternResult,
+    KernelBoolSlice, KernelRowIndexArray, KernelStringSlice, NullableCvoid, SharedExternEngine,
+    SharedSnapshot, StringIter, StringSliceIterator, TryFromStringSlice,
 };
 
 use super::handle::Handle;
