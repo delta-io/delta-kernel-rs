@@ -1,21 +1,26 @@
 //! Some utilities for working with arrow data types
 
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader};
+use std::sync::Arc;
 
 use crate::{
+    engine::arrow_data::ArrowEngineData,
     schema::{DataType, PrimitiveType, Schema, SchemaRef, StructField, StructType},
     utils::require,
-    DeltaResult, Error,
+    DeltaResult, EngineData, Error,
 };
 
 use arrow_array::{
     cast::AsArray, new_null_array, Array as ArrowArray, GenericListArray, OffsetSizeTrait,
-    StructArray,
+    RecordBatch, StringArray, StructArray,
 };
+use arrow_json::ReaderBuilder;
 use arrow_schema::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef, Fields,
     SchemaRef as ArrowSchemaRef,
 };
+use arrow_select::concat::concat_batches;
 use itertools::Itertools;
 use parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 use tracing::debug;
@@ -757,6 +762,57 @@ fn reorder_list<O: OffsetSizeTrait>(
     }
 }
 
+/// Arrow lacks the functionality to json-parse a string column into a struct column -- even tho the
+/// JSON file reader does exactly the same thing. This function is a hack to work around that gap.
+pub(crate) fn parse_json(
+    json_strings: Box<dyn EngineData>,
+    schema: SchemaRef,
+) -> DeltaResult<Box<dyn EngineData>> {
+    let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
+    let json_strings = json_strings
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            Error::generic("Expected json_strings to be a StringArray, found something else")
+        })?;
+    let schema: ArrowSchemaRef = Arc::new(schema.as_ref().try_into()?);
+    let result = parse_json_impl(json_strings, schema)?;
+    Ok(Box::new(ArrowEngineData::new(result)))
+}
+
+// Raw arrow implementation of the json parsing. Separate from the public function for testing.
+//
+// NOTE: This code is really inefficient because arrow lacks the native capability to perform robust
+// StringArray -> StructArray JSON parsing. See https://github.com/apache/arrow-rs/issues/6522. If
+// that shortcoming gets fixed upstream, this method can simplify or hopefully even disappear.
+fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaResult<RecordBatch> {
+    if json_strings.is_empty() {
+        return Ok(RecordBatch::new_empty(schema));
+    }
+
+    // Use batch size of 1 to force one record per string input
+    let mut decoder = ReaderBuilder::new(schema.clone())
+        .with_batch_size(1)
+        .build_decoder()?;
+    let parse_one = |json_string: Option<&str>| -> DeltaResult<RecordBatch> {
+        let mut reader = BufReader::new(json_string.unwrap_or("{}").as_bytes());
+        let buf = reader.fill_buf()?;
+        let read = buf.len();
+        require!(
+            decoder.decode(buf)? == read,
+            Error::missing_data("Incomplete JSON string")
+        );
+        let Some(batch) = decoder.flush()? else {
+            return Err(Error::missing_data("Expected data"));
+        };
+        require!(batch.num_rows() == 1, Error::generic("Expected one row"));
+        Ok(batch)
+    };
+    let output: Vec<_> = json_strings.iter().map(parse_one).try_collect()?;
+    Ok(concat_batches(&schema, output.iter())?)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -775,7 +831,7 @@ mod tests {
 
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
-    use super::{get_requested_indices, reorder_struct_array, ReorderIndex};
+    use super::*;
 
     fn nested_parquet_schema() -> ArrowSchemaRef {
         Arc::new(ArrowSchema::new(vec![
@@ -793,6 +849,53 @@ mod tests {
             ),
             ArrowField::new("j", ArrowDataType::Int32, false),
         ]))
+    }
+
+    #[test]
+    fn test_json_parsing() {
+        let requested_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int32, true),
+            ArrowField::new("b", ArrowDataType::Utf8, true),
+            ArrowField::new("c", ArrowDataType::Int32, true),
+        ]));
+        let input: Vec<&str> = vec![];
+        let result = parse_json_impl(&input.into(), requested_schema.clone()).unwrap();
+        assert_eq!(result.num_rows(), 0);
+
+        let input: Vec<Option<&str>> = vec![Some("")];
+        let result = parse_json_impl(&input.into(), requested_schema.clone());
+        result.expect_err("empty string");
+
+        let input: Vec<Option<&str>> = vec![Some(" \n\t")];
+        let result = parse_json_impl(&input.into(), requested_schema.clone());
+        result.expect_err("empty string");
+
+        let input: Vec<Option<&str>> = vec![Some(r#""a""#)];
+        let result = parse_json_impl(&input.into(), requested_schema.clone());
+        result.expect_err("invalid string");
+
+        let input: Vec<Option<&str>> = vec![Some(r#"{ "a": 1"#)];
+        let result = parse_json_impl(&input.into(), requested_schema.clone());
+        result.expect_err("incomplete object");
+
+        let input: Vec<Option<&str>> = vec![Some("{}{}")];
+        let result = parse_json_impl(&input.into(), requested_schema.clone());
+        result.expect_err("multiple objects (complete)");
+
+        let input: Vec<Option<&str>> = vec![Some(r#"{} { "a": 1"#)];
+        let result = parse_json_impl(&input.into(), requested_schema.clone());
+        result.expect_err("multiple objects (partial)");
+
+        let input: Vec<Option<&str>> = vec![Some(r#"{ "a": 1"#), Some(r#", "b"}"#)];
+        let result = parse_json_impl(&input.into(), requested_schema.clone());
+        result.expect_err("split object");
+
+        let input: Vec<Option<&str>> = vec![None, Some(r#"{"a": 1, "b": "2", "c": 3}"#), None];
+        let result = parse_json_impl(&input.into(), requested_schema.clone()).unwrap();
+        assert_eq!(result.num_rows(), 3);
+        assert_eq!(result.column(0).null_count(), 2);
+        assert_eq!(result.column(1).null_count(), 2);
+        assert_eq!(result.column(2).null_count(), 2);
     }
 
     #[test]

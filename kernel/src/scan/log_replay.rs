@@ -191,6 +191,7 @@ impl LogReplayScanner {
             None => vec![false; actions.length()],
         };
 
+        assert_eq!(selection_vector.len(), actions.length());
         let adds = self.setup_batch_process(filter_vector, actions, is_log_batch)?;
 
         for (add, index) in adds.into_iter() {

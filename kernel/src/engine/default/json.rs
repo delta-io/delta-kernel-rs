@@ -5,19 +5,16 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::task::{ready, Poll};
 
-use arrow_array::{new_null_array, Array, RecordBatch, StringArray, StructArray};
 use arrow_json::ReaderBuilder;
 use arrow_schema::SchemaRef as ArrowSchemaRef;
-use arrow_select::concat::concat_batches;
 use bytes::{Buf, Bytes};
 use futures::{StreamExt, TryStreamExt};
-use itertools::Itertools;
 use object_store::path::Path;
 use object_store::{DynObjectStore, GetResultPayload};
 
 use super::executor::TaskExecutor;
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
-use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::arrow_utils::parse_json as arrow_parse_json;
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, EngineData, Error, Expression, FileDataReadResultIterator, FileMeta, JsonHandler,
@@ -62,57 +59,13 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
     }
 }
 
-fn hack_parse(
-    stats_schema: &ArrowSchemaRef,
-    json_string: Option<&str>,
-) -> DeltaResult<RecordBatch> {
-    match json_string {
-        Some(s) => Ok(ReaderBuilder::new(stats_schema.clone())
-            .build(BufReader::new(s.as_bytes()))?
-            .next()
-            .transpose()?
-            .ok_or(Error::missing_data("Expected data"))?),
-        None => Ok(RecordBatch::try_new(
-            stats_schema.clone(),
-            stats_schema
-                .fields
-                .iter()
-                .map(|field| new_null_array(field.data_type(), 1))
-                .collect(),
-        )?),
-    }
-}
-
 impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     fn parse_json(
         &self,
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
-        // TODO(nick): this is pretty terrible
-        let struct_array: StructArray = json_strings.into();
-        let json_strings = struct_array
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                Error::generic("Expected json_strings to be a StringArray, found something else")
-            })?;
-        let output_schema: ArrowSchemaRef = Arc::new(output_schema.as_ref().try_into()?);
-        if json_strings.is_empty() {
-            return Ok(Box::new(ArrowEngineData::new(RecordBatch::new_empty(
-                output_schema,
-            ))));
-        }
-        let output: Vec<_> = json_strings
-            .iter()
-            .map(|json_string| hack_parse(&output_schema, json_string))
-            .try_collect()?;
-        Ok(Box::new(ArrowEngineData::new(concat_batches(
-            &output_schema,
-            output.iter(),
-        )?)))
+        arrow_parse_json(json_strings, output_schema)
     }
 
     fn read_json_files(
@@ -220,14 +173,15 @@ impl FileOpener for JsonOpener {
 mod tests {
     use std::path::PathBuf;
 
-    use arrow::array::AsArray;
+    use arrow::array::{AsArray, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use itertools::Itertools;
     use object_store::{local::LocalFileSystem, ObjectStore};
 
     use super::*;
     use crate::{
-        actions::get_log_schema, engine::default::executor::tokio::TokioBackgroundExecutor,
+        actions::get_log_schema, engine::arrow_data::ArrowEngineData,
+        engine::default::executor::tokio::TokioBackgroundExecutor,
     };
 
     fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {

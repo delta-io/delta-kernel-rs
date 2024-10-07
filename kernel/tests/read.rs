@@ -523,32 +523,36 @@ fn read_table_data(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from(path))?;
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine = DefaultEngine::try_new(
+    let default_engine = DefaultEngine::try_new(
         &url,
         std::iter::empty::<(&str, &str)>(),
         Arc::new(TokioBackgroundExecutor::new()),
     )?;
+    let sync_engine = delta_kernel::engine::sync::SyncEngine::new();
 
-    let table = Table::new(url);
-    let snapshot = table.snapshot(&engine, None)?;
+    let engines: &[&dyn Engine] = &[&sync_engine, &default_engine];
+    for &engine in engines {
+        let table = Table::new(url.clone());
+        let snapshot = table.snapshot(engine, None)?;
 
-    let read_schema = select_cols.map(|select_cols| {
-        let table_schema = snapshot.schema();
-        let selected_fields = select_cols
-            .iter()
-            .map(|col| table_schema.field(col).cloned().unwrap())
-            .collect();
-        Arc::new(Schema::new(selected_fields))
-    });
-    let scan = snapshot
-        .into_scan_builder()
-        .with_schema_opt(read_schema)
-        .with_predicate_opt(predicate)
-        .build()?;
+        let read_schema = select_cols.map(|select_cols| {
+            let table_schema = snapshot.schema();
+            let selected_fields = select_cols
+                .iter()
+                .map(|col| table_schema.field(col).cloned().unwrap())
+                .collect();
+            Arc::new(Schema::new(selected_fields))
+        });
+        let scan = snapshot
+            .into_scan_builder()
+            .with_schema_opt(read_schema)
+            .with_predicate_opt(predicate.clone())
+            .build()?;
 
-    sort_lines!(expected);
-    read_with_execute(&engine, &scan, &expected)?;
-    read_with_scan_data(table.location(), &engine, &scan, &expected)?;
+        sort_lines!(expected);
+        read_with_execute(engine, &scan, &expected)?;
+        read_with_scan_data(table.location(), engine, &scan, &expected)?;
+    }
     Ok(())
 }
 
