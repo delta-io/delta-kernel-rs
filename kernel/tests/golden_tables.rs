@@ -7,6 +7,7 @@ use arrow::{compute::filter_record_batch, record_batch::RecordBatch};
 use arrow_ord::sort::{lexsort_to_indices, SortColumn};
 use arrow_schema::Schema;
 use arrow_select::{concat::concat_batches, take::take};
+use itertools::Itertools;
 use paste::paste;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -153,37 +154,35 @@ async fn latest_snapshot_test(
     table: Table,
     expected_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = table.snapshot(&engine, None).unwrap();
+    let snapshot = table.snapshot(&engine, None)?;
 
-    let scan = snapshot.into_scan_builder().build().unwrap();
-    let scan_res = scan.execute(&engine).unwrap();
+    let scan = snapshot.into_scan_builder().build()?;
+    let scan_res = scan.execute(&engine)?;
     let batches: Vec<RecordBatch> = scan_res
-        .into_iter()
-        .map(|sr| {
-            let data = sr.raw_data.unwrap();
-            let record_batch = to_arrow(data).unwrap();
-            if let Some(mut mask) = sr.mask {
+        .map(|scan_result| -> DeltaResult<_> {
+            let scan_result = scan_result?;
+            let data = scan_result.raw_data?;
+            let record_batch = to_arrow(data)?;
+            if let Some(mut mask) = scan_result.mask {
                 let extra_rows = record_batch.num_rows() - mask.len();
                 if extra_rows > 0 {
                     // we need to extend the mask here in case it's too short
                     mask.extend(std::iter::repeat(true).take(extra_rows));
                 }
-                filter_record_batch(&record_batch, &mask.into()).unwrap()
+                Ok(filter_record_batch(&record_batch, &mask.into())?)
             } else {
-                record_batch
+                Ok(record_batch)
             }
         })
-        .collect();
+        .try_collect()?;
 
-    let expected = read_expected(&expected_path.expect("expect an expected dir"))
-        .await
-        .unwrap();
+    let expected = read_expected(&expected_path.expect("expect an expected dir")).await?;
 
-    let schema: Arc<Schema> = Arc::new(scan.schema().as_ref().try_into().unwrap());
+    let schema: Arc<Schema> = Arc::new(scan.schema().as_ref().try_into()?);
 
-    let result = concat_batches(&schema, &batches).unwrap();
-    let result = sort_record_batch(result).unwrap();
-    let expected = sort_record_batch(expected).unwrap();
+    let result = concat_batches(&schema, &batches)?;
+    let result = sort_record_batch(result)?;
+    let expected = sort_record_batch(expected)?;
     assert_columns_match(result.columns(), expected.columns());
     assert_schema_fields_match(expected.schema().as_ref(), result.schema().as_ref());
     assert!(

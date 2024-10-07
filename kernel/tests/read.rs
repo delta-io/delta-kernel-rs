@@ -17,7 +17,8 @@ use delta_kernel::expressions::{BinaryOperator, Expression};
 use delta_kernel::scan::state::{visit_scan_files, DvInfo, Stats};
 use delta_kernel::scan::{transform_to_logical, Scan};
 use delta_kernel::schema::Schema;
-use delta_kernel::{Engine, EngineData, FileMeta, Table};
+use delta_kernel::{DeltaResult, Engine, EngineData, FileMeta, Table};
+use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -120,10 +121,10 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let scan = snapshot.into_scan_builder().build()?;
 
     let mut files = 0;
-    let stream = scan.execute(&engine)?.into_iter().zip(expected_data);
+    let stream = scan.execute(&engine)?.zip(expected_data);
 
     for (data, expected) in stream {
-        let raw_data = data.raw_data?;
+        let raw_data = data?.raw_data?;
         files += 1;
         assert_eq!(into_record_batch(raw_data), expected);
     }
@@ -171,10 +172,10 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let scan = snapshot.into_scan_builder().build()?;
 
     let mut files = 0;
-    let stream = scan.execute(&engine)?.into_iter().zip(expected_data);
+    let stream = scan.execute(&engine)?.zip(expected_data);
 
     for (data, expected) in stream {
-        let raw_data = data.raw_data?;
+        let raw_data = data?.raw_data?;
         files += 1;
         assert_eq!(into_record_batch(raw_data), expected);
     }
@@ -225,11 +226,11 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = table.snapshot(&engine, None)?;
     let scan = snapshot.into_scan_builder().build()?;
 
-    let stream = scan.execute(&engine)?.into_iter().zip(expected_data);
+    let stream = scan.execute(&engine)?.zip(expected_data);
 
     let mut files = 0;
     for (data, expected) in stream {
-        let raw_data = data.raw_data?;
+        let raw_data = data?.raw_data?;
         files += 1;
         assert_eq!(into_record_batch(raw_data), expected);
     }
@@ -351,10 +352,10 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
 
         let expected_files = expected_batches.len();
         let mut files_scanned = 0;
-        let stream = scan.execute(&engine)?.into_iter().zip(expected_batches);
+        let stream = scan.execute(&engine)?.zip(expected_batches);
 
         for (batch, expected) in stream {
-            let raw_data = batch.raw_data?;
+            let raw_data = batch?.raw_data?;
             files_scanned += 1;
             assert_eq!(into_record_batch(raw_data), expected.clone());
         }
@@ -398,22 +399,22 @@ fn read_with_execute(
     let result_schema: ArrowSchemaRef = Arc::new(scan.schema().as_ref().try_into()?);
     let scan_results = scan.execute(engine)?;
     let batches: Vec<RecordBatch> = scan_results
-        .into_iter()
-        .map(|sr| {
-            let data = sr.raw_data.unwrap();
-            let record_batch = to_arrow(data).unwrap();
-            if let Some(mut mask) = sr.mask {
+        .map(|scan_result| -> DeltaResult<_> {
+            let scan_result = scan_result?;
+            let data = scan_result.raw_data?;
+            let record_batch = to_arrow(data)?;
+            if let Some(mut mask) = scan_result.mask {
                 let extra_rows = record_batch.num_rows() - mask.len();
                 if extra_rows > 0 {
                     // we need to extend the mask here in case it's too short
                     mask.extend(std::iter::repeat(true).take(extra_rows));
                 }
-                filter_record_batch(&record_batch, &mask.into()).unwrap()
+                Ok(filter_record_batch(&record_batch, &mask.into())?)
             } else {
-                record_batch
+                Ok(record_batch)
             }
         })
-        .collect();
+        .try_collect()?;
 
     if expected.is_empty() {
         assert_eq!(batches.len(), 0);

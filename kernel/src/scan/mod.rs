@@ -227,14 +227,17 @@ impl Scan {
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and
-    /// process all the data for the query. Each [`ScanResult`] in the resultant vector encapsulates
+    /// process all the data for the query. Each [`ScanResult`] in the resultant iterator encapsulates
     /// the raw data and an optional boolean vector built from the deletion vector if it was
     /// present. See the documentation for [`ScanResult`] for more details. Generally
     /// connectors/engines will want to use [`Scan::scan_data`] so they can have more control over
     /// the execution of the scan.
-    // This calls [`Scan::files`] to get a set of `Add` actions for the scan, and then uses the
+    // This calls [`Scan::scan_data`] to get an iterator of `ScanData` actions for the scan, and then uses the
     // `engine`'s [`crate::ParquetHandler`] to read the actual table data.
-    pub fn execute(&self, engine: &dyn Engine) -> DeltaResult<Vec<ScanResult>> {
+    pub fn execute<'a>(
+        &'a self,
+        engine: &'a dyn Engine,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>> + 'a> {
         struct ScanFile {
             path: String,
             size: i64,
@@ -264,15 +267,18 @@ impl Scan {
 
         let global_state = Arc::new(self.global_scan_state());
         let scan_data = self.scan_data(engine)?;
-        let mut scan_files = vec![];
-        for data in scan_data {
-            let (data, vec) = data?;
-            scan_files =
-                state::visit_scan_files(data.as_ref(), &vec, scan_files, scan_data_callback)?;
-        }
-        scan_files
-            .into_iter()
-            .map(|scan_file| -> DeltaResult<_> {
+        let scan_files_iter = scan_data
+            .map(|res| {
+                let (data, vec) = res?;
+                let scan_files = vec![];
+                state::visit_scan_files(data.as_ref(), &vec, scan_files, scan_data_callback)
+            })
+            // Iterator<DeltaResult<Vec<ScanFile>>> to Iterator<DeltaResult<ScanFile>>
+            .flatten_ok();
+
+        let result = scan_files_iter
+            .map(move |scan_file| -> DeltaResult<_> {
+                let scan_file = scan_file?;
                 let file_path = self.snapshot.table_root.join(&scan_file.path)?;
                 let mut selection_vector = scan_file
                     .dv_info
@@ -288,7 +294,7 @@ impl Scan {
                     None,
                 )?;
                 let gs = global_state.clone(); // Arc clone
-                Ok(read_result_iter.into_iter().map(move |read_result| {
+                Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
                     let read_result = read_result?;
                     // to transform the physical data into the correct logical form
                     let logical = transform_to_logical_internal(
@@ -314,8 +320,11 @@ impl Scan {
                     Ok(result)
                 }))
             })
+            // Iterator<DeltaResult<Iterator<DeltaResult<ScanResult>>>> to Iterator<DeltaResult<DeltaResult<ScanResult>>>
             .flatten_ok()
-            .try_collect()?
+            // Iterator<DeltaResult<DeltaResult<ScanResult>>> to Iterator<DeltaResult<ScanResult>>
+            .map(|x| x?);
+        Ok(result)
     }
 }
 
@@ -633,7 +642,7 @@ mod tests {
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine, None).unwrap();
         let scan = snapshot.into_scan_builder().build().unwrap();
-        let files = scan.execute(&engine).unwrap();
+        let files: Vec<ScanResult> = scan.execute(&engine).unwrap().try_collect().unwrap();
 
         assert_eq!(files.len(), 1);
         let num_rows = files[0].raw_data.as_ref().unwrap().length();

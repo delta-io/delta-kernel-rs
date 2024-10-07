@@ -13,6 +13,7 @@ use delta_kernel::schema::Schema;
 use delta_kernel::{DeltaResult, Engine, Table};
 
 use clap::{Parser, ValueEnum};
+use itertools::Itertools;
 
 /// An example program that dumps out the data of a delta table. Struct and Map types are not
 /// supported.
@@ -92,7 +93,6 @@ fn try_main() -> DeltaResult<()> {
     let read_schema_opt = cli
         .columns
         .map(|cols| {
-            use itertools::Itertools;
             let table_schema = snapshot.schema();
             let selected_fields = cols
                 .iter()
@@ -113,26 +113,28 @@ fn try_main() -> DeltaResult<()> {
         .with_schema_opt(read_schema_opt)
         .build()?;
 
-    let mut batches = vec![];
-    for res in scan.execute(engine.as_ref())?.into_iter() {
-        let data = res.raw_data?;
-        let record_batch: RecordBatch = data
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
-            .into();
-        let batch = if let Some(mut mask) = res.mask {
-            let extra_rows = record_batch.num_rows() - mask.len();
-            if extra_rows > 0 {
-                // we need to extend the mask here in case it's too short
-                mask.extend(std::iter::repeat(true).take(extra_rows));
+    let batches: Vec<RecordBatch> = scan
+        .execute(engine.as_ref())?
+        .map(|scan_result| -> DeltaResult<_> {
+            let scan_result = scan_result?;
+            let data = scan_result.raw_data?;
+            let record_batch: RecordBatch = data
+                .into_any()
+                .downcast::<ArrowEngineData>()
+                .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
+                .into();
+            if let Some(mut mask) = scan_result.mask {
+                let extra_rows = record_batch.num_rows() - mask.len();
+                if extra_rows > 0 {
+                    // we need to extend the mask here in case it's too short
+                    mask.extend(std::iter::repeat(true).take(extra_rows));
+                }
+                Ok(filter_record_batch(&record_batch, &mask.into())?)
+            } else {
+                Ok(record_batch)
             }
-            filter_record_batch(&record_batch, &mask.into())?
-        } else {
-            record_batch
-        };
-        batches.push(batch);
-    }
+        })
+        .try_collect()?;
     print_batches(&batches)?;
     Ok(())
 }
