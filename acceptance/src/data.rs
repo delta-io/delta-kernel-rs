@@ -130,6 +130,7 @@ pub async fn assert_scan_data(engine: Arc<dyn Engine>, test_case: &TestCaseInfo)
         .execute(engine)?
         .map(|scan_result| -> DeltaResult<_> {
             let scan_result = scan_result?;
+            let mask = scan_result.full_mask();
             let data = scan_result.raw_data?;
             let record_batch: RecordBatch = data
                 .into_any()
@@ -139,7 +140,7 @@ pub async fn assert_scan_data(engine: Arc<dyn Engine>, test_case: &TestCaseInfo)
             if schema.is_none() {
                 schema = Some(record_batch.schema());
             }
-            if let Some(mask) = scan_result.mask {
+            if let Some(mask) = mask {
                 Ok(filter_record_batch(&record_batch, &mask.into())?)
             } else {
                 Ok(record_batch)

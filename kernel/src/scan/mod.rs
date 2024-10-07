@@ -124,14 +124,35 @@ impl ScanBuilder {
 pub struct ScanResult {
     /// Raw engine data as read from the disk for a particular file included in the query
     pub raw_data: DeltaResult<Box<dyn EngineData>>,
-    /// If an item at mask\[i\] is true, the row at that row index is valid, otherwise if it is
-    /// false, the row at that row index is invalid and should be ignored. If the mask is *shorter*
-    /// than the number of rows returned, missing elements are considered `true`, i.e. included in
-    /// the query. If this is None, all rows are valid. NB: If you are using the default engine and
-    /// plan to call arrow's `filter_record_batch`, you _need_ to extend this vector to the full
-    /// length of the batch or arrow will drop the extra rows
+    /// Raw row mask.
     // TODO(nick) this should be allocated by the engine
-    pub mask: Option<Vec<bool>>,
+    raw_mask: Option<Vec<bool>>,
+}
+
+impl ScanResult {
+    /// Returns the raw row mask. If an item at `raw_mask()[i]` is true, row `i` is
+    /// valid. Otherwise, row `i` is invalid and should be ignored.
+    ///
+    /// The raw mask is dangerous to use because it may be shorter than expected. In particular, if
+    /// you are using the default engine and plan to call arrow's `filter_record_batch`, you _need_
+    /// to extend the mask to the full length of the batch or arrow will drop the extra
+    /// rows. Calling [`full_mask`] instead avoids this risk entirely, at the cost of a copy.
+    pub fn raw_mask(&self) -> Option<&Vec<bool>> {
+        self.raw_mask.as_ref()
+    }
+
+    /// Extends the underlying (raw) mask to match the row count of the accompanying data.
+    ///
+    /// If the raw mask is *shorter* than the number of rows returned, missing elements are
+    /// considered `true`, i.e. included in the query. If the mask is `None`, all rows are valid.
+    ///
+    /// NB: If you are using the default engine and plan to call arrow's `filter_record_batch`, you
+    /// _need_ to extend the mask to the full length of the batch or arrow will drop the extra rows.
+    pub fn full_mask(&self) -> Option<Vec<bool>> {
+        let mut mask = self.raw_mask.clone()?;
+        mask.resize(self.raw_data.as_ref().ok()?.length(), true);
+        Some(mask)
+    }
 }
 
 /// Scan uses this to set up what kinds of columns it is scanning. For `Selected` we just store the
@@ -314,7 +335,7 @@ impl Scan {
                     let rest = split_vector(sv.as_mut(), len, None);
                     let result = ScanResult {
                         raw_data: logical,
-                        mask: sv,
+                        raw_mask: sv,
                     };
                     selection_vector = rest;
                     Ok(result)

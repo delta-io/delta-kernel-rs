@@ -16,12 +16,10 @@ fn count_total_scan_rows(
     scan_result_iter
         .map(|scan_result| {
             let scan_result = scan_result?;
-            let data = scan_result.raw_data?;
             // NOTE: The mask only suppresses rows for which it is both present and false.
-            let deleted_rows = scan_result
-                .mask
-                .as_ref()
-                .map_or(0, |mask| mask.iter().filter(|&&m| !m).count());
+            let mask = scan_result.raw_mask();
+            let deleted_rows = mask.into_iter().flatten().filter(|&&m| !m).count();
+            let data = scan_result.raw_data?;
             Ok(data.length() - deleted_rows)
         })
         .fold_ok(0, Add::add)

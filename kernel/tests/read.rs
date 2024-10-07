@@ -401,14 +401,10 @@ fn read_with_execute(
     let batches: Vec<RecordBatch> = scan_results
         .map(|scan_result| -> DeltaResult<_> {
             let scan_result = scan_result?;
+            let mask = scan_result.full_mask();
             let data = scan_result.raw_data?;
             let record_batch = to_arrow(data)?;
-            if let Some(mut mask) = scan_result.mask {
-                let extra_rows = record_batch.num_rows() - mask.len();
-                if extra_rows > 0 {
-                    // we need to extend the mask here in case it's too short
-                    mask.extend(std::iter::repeat(true).take(extra_rows));
-                }
+            if let Some(mask) = mask {
                 Ok(filter_record_batch(&record_batch, &mask.into())?)
             } else {
                 Ok(record_batch)
