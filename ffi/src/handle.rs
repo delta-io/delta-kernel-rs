@@ -71,10 +71,10 @@ mod private {
     /// An accompanying [`HandleDescriptor`] trait defines the behavior of each handle type:
     ///
     /// * The true underlying ("target") type the handle represents. For safety reasons, target type
-    /// must always be [`Send`].
+    ///   must always be [`Send`].
     ///
     /// * Mutable (`Box`-like) vs. shared (`Arc`-like). For safety reasons, the target type of a
-    /// shared handle must always be [`Send`]+[`Sync`].
+    ///   shared handle must always be [`Send`]+[`Sync`].
     ///
     /// * Sized vs. unsized. Sized types allow handle operations to be implemented more efficiently.
     ///
