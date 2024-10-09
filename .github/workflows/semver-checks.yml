@@ -17,13 +17,14 @@ jobs:
   check_if_pr_breaks_semver:
     runs-on: ubuntu-latest
     permissions:
+      # this job runs with read because it checks out the PR head which could contain malicious code
       contents: read
-      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         name: checkout full rep
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
       - name: Install minimal stable
         uses: actions-rs/toolchain@v1
         with:
@@ -36,16 +37,42 @@ jobs:
         run: |
           cargo install cargo-semver-checks --locked
       - name: Run check
+        id: check
+        continue-on-error: true
         shell: bash
         run: |
           cargo semver-checks --all-features --baseline-rev ${{ github.event.pull_request.base.sha }}
       - name: On Failure
-        if: failure()
+        id: set_failure
+        if: ${{ steps.check.outcome == 'failure' }}
+        run: |
+          echo "Checks failed"
+          echo "check_status=failure" >> $GITHUB_OUTPUT
+      - name: On Success
+        id: set_success
+        if: ${{ steps.check.outcome == 'success' }}
+        run: |
+          echo "Checks succeed"
+          echo "check_status=success" >> $GITHUB_OUTPUT
+    outputs:
+      check_status: ${{ steps.set_failure.outputs.check_status || steps.set_success.outputs.check_status }}
+  add_label_if_needed:
+    needs: check_if_pr_breaks_semver
+    runs-on: ubuntu-latest
+    permissions:
+      # this job only looks at previous output and then sets a label, so malicious code in the PR
+      # isn't a concern
+      pull-requests: write
+    steps:
+      - name: On Failure
+        if: needs.check_if_pr_breaks_semver.outputs.check_status == 'failure'
         uses: actions-ecosystem/action-add-labels@v1
         with:
           labels: breaking-change
       - name: On Success
-        if: success()
-        shell: bash
+        if: needs.check_if_pr_breaks_semver.outputs.check_status == 'success'
         run: |
           echo "Checks succeed"
+      - name: Fail On Incorrect Previous Output
+        if: needs.check_if_pr_breaks_semver.outputs.check_status != 'success' && needs.check_if_pr_breaks_semver.outputs.check_status != 'failure'
+        run: exit 1
