@@ -217,22 +217,27 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanData>>> {
+        Ok(scan_action_iter(
+            engine,
+            self.replay_for_scan_data(engine)?,
+            &self.logical_schema,
+            &self.predicate,
+        ))
+    }
+
+    // Factored out to facilitate testing
+    fn replay_for_scan_data(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
         let commit_read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?;
         let checkpoint_read_schema = get_log_schema().project(&[ADD_NAME])?;
-
-        let log_iter = self.snapshot.log_segment.replay(
+        self.snapshot.log_segment.replay(
             engine,
             commit_read_schema,
             checkpoint_read_schema,
             self.predicate.clone(),
-        )?;
-
-        Ok(scan_action_iter(
-            engine,
-            log_iter,
-            &self.logical_schema,
-            &self.predicate,
-        ))
+        )
     }
 
     /// Get global state that is valid for the entire scan. This is somewhat expensive so should
@@ -312,7 +317,7 @@ impl Scan {
                 let read_result_iter = engine.get_parquet_handler().read_parquet_files(
                     &[meta],
                     global_state.read_schema.clone(),
-                    None,
+                    self.predicate().clone(),
                 )?;
                 let gs = global_state.clone(); // Arc clone
                 Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
@@ -712,6 +717,25 @@ mod tests {
             .unwrap();
             assert_eq!(value, *expected);
         }
+    }
+
+    #[test]
+    fn test_replay_for_scan_data() {
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
+        let url = url::Url::from_directory_path(path.unwrap()).unwrap();
+        let engine = SyncEngine::new();
+
+        let table = Table::new(url);
+        let snapshot = table.snapshot(&engine, None).unwrap();
+        let scan = snapshot.into_scan_builder().build().unwrap();
+        let data: Vec<_> = scan
+            .replay_for_scan_data(&engine)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        // No predicate pushdown attempted, because at most one part of a multi-part checkpoint
+        // could be skipped when looking for adds/removes.
+        assert_eq!(data.len(), 5);
     }
 
     #[test_log::test]

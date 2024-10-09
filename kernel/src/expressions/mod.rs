@@ -280,6 +280,11 @@ impl Expression {
         Self::unary(UnaryOperator::IsNull, self)
     }
 
+    /// Create a new expression `self IS NOT NULL`
+    pub fn is_not_null(self) -> Self {
+        !Self::is_null(self)
+    }
+
     /// Create a new expression `self == other`
     pub fn eq(self, other: Self) -> Self {
         Self::binary(BinaryOperator::Equal, self, other)

@@ -3,7 +3,6 @@
 //!
 
 use std::cmp::Ordering;
-use std::ops::Not;
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -71,15 +70,7 @@ impl LogSegment {
     }
 
     fn read_metadata(&self, engine: &dyn Engine) -> DeltaResult<Option<(Metadata, Protocol)>> {
-        let schema = get_log_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
-        // filter out log files that do not contain metadata or protocol information
-        use Expression as Expr;
-        let filter = Some(Expr::or(
-            Expr::not(Expr::is_null(Expr::column("metaData.id"))),
-            Expr::not(Expr::is_null(Expr::column("protocol.minReaderVersion"))),
-        ));
-        // read the same protocol and metadata schema for both commits and checkpoints
-        let data_batches = self.replay(engine, schema.clone(), schema, filter)?;
+        let data_batches = self.replay_for_metadata(engine)?;
         let mut metadata_opt: Option<Metadata> = None;
         let mut protocol_opt: Option<Protocol> = None;
         for batch in data_batches {
@@ -101,6 +92,22 @@ impl LogSegment {
             (Some(_), None) => Err(Error::MissingProtocol),
             _ => Err(Error::MissingMetadataAndProtocol),
         }
+    }
+
+    // Factored out to facilitate testing
+    fn replay_for_metadata(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
+        let schema = get_log_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
+        // filter out log files that do not contain metadata or protocol information
+        use Expression as Expr;
+        let meta_predicate = Expr::or(
+            Expr::column("metaData.id").is_not_null(),
+            Expr::column("protocol.minReaderVersion").is_not_null(),
+        );
+        // read the same protocol and metadata schema for both commits and checkpoints
+        self.replay(engine, schema.clone(), schema, Some(meta_predicate))
     }
 }
 
@@ -167,6 +174,10 @@ impl Snapshot {
         // remove all files above requested version
         if let Some(version) = version {
             commit_files.retain(|log_path| log_path.version <= version);
+        }
+        // only keep commit files above the checkpoint we found
+        if let Some(checkpoint_file) = checkpoint_files.first() {
+            commit_files.retain(|log_path| checkpoint_file.version < log_path.version);
         }
 
         // get the effective version from chosen files
@@ -445,6 +456,7 @@ mod tests {
     use crate::engine::default::filesystem::ObjectStoreFileSystemClient;
     use crate::engine::sync::SyncEngine;
     use crate::schema::StructType;
+    use crate::Table;
 
     #[test]
     fn test_snapshot_read_metadata() {
@@ -614,6 +626,27 @@ mod tests {
         let invalid = read_last_checkpoint(&client, &url).expect("read last checkpoint");
         assert!(valid.is_some());
         assert!(invalid.is_none())
+    }
+
+    #[test]
+    fn test_replay_for_metadata() {
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
+        let url = url::Url::from_directory_path(path.unwrap()).unwrap();
+        let engine = SyncEngine::new();
+
+        let table = Table::new(url);
+        let snapshot = table.snapshot(&engine, None).unwrap();
+        let data: Vec<_> = snapshot
+            .log_segment
+            .replay_for_metadata(&engine)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+        // The checkpoint has five parts, each containing one action. The P&M come from first and
+        // third parts, respectively. The actual `read_metadata` will also skip the last two parts
+        // because it terminates the iteration immediately after finding both P&M.
+        // TODO: Implement parquet row group skipping so we filter out all but two files.
+        assert_eq!(data.len(), 5);
     }
 
     #[test_log::test]

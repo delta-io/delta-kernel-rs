@@ -47,7 +47,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        _predicate: Option<Expression>,
+        predicate: Option<Expression>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         if files.is_empty() {
             return Ok(Box::new(std::iter::empty()));
@@ -62,10 +62,15 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         //   -> parse to parquet
         // SAFETY: we did is_empty check above, this is ok.
         let file_opener: Box<dyn FileOpener> = match files[0].location.scheme() {
-            "http" | "https" => Box::new(PresignedUrlOpener::new(1024, physical_schema.clone())),
+            "http" | "https" => Box::new(PresignedUrlOpener::new(
+                1024,
+                physical_schema.clone(),
+                predicate,
+            )),
             _ => Box::new(ParquetOpener::new(
                 1024,
                 physical_schema.clone(),
+                predicate,
                 self.store.clone(),
             )),
         };
@@ -83,8 +88,9 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 struct ParquetOpener {
     // projection: Arc<[usize]>,
     batch_size: usize,
-    limit: Option<usize>,
     table_schema: SchemaRef,
+    _predicate: Option<Expression>,
+    limit: Option<usize>,
     store: Arc<DynObjectStore>,
 }
 
@@ -92,11 +98,13 @@ impl ParquetOpener {
     pub(crate) fn new(
         batch_size: usize,
         table_schema: SchemaRef,
+        predicate: Option<Expression>,
         store: Arc<DynObjectStore>,
     ) -> Self {
         Self {
             batch_size,
             table_schema,
+            _predicate: predicate,
             limit: None,
             store,
         }
@@ -153,16 +161,18 @@ impl FileOpener for ParquetOpener {
 /// Implements [`FileOpener`] for a opening a parquet file from a presigned URL
 struct PresignedUrlOpener {
     batch_size: usize,
+    _predicate: Option<Expression>,
     limit: Option<usize>,
     table_schema: SchemaRef,
     client: reqwest::Client,
 }
 
 impl PresignedUrlOpener {
-    pub(crate) fn new(batch_size: usize, schema: SchemaRef) -> Self {
+    pub(crate) fn new(batch_size: usize, schema: SchemaRef, predicate: Option<Expression>) -> Self {
         Self {
             batch_size,
             table_schema: schema,
+            _predicate: predicate,
             limit: None,
             client: reqwest::Client::new(),
         }

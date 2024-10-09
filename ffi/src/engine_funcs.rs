@@ -122,6 +122,7 @@ fn read_parquet_file_impl(
         last_modified: file.last_modified,
         size: file.size,
     };
+    // TODO: Plumb the predicate through the FFI?
     let data = parquet_handler.read_parquet_files(&[delta_fm], physical_schema, None)?;
     let res = Box::new(FileReadResultIterator {
         data,
