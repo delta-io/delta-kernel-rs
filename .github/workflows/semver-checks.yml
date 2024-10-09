@@ -1,6 +1,13 @@
 name: semver-checks
 
-on: [pull_request]
+# Trigger when a PR is opened or changed
+on:
+  pull_request_target:
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
 
 env:
   CARGO_TERM_COLOR: always
@@ -10,6 +17,7 @@ jobs:
   check_if_pr_breaks_semver:
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
