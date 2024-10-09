@@ -1,11 +1,10 @@
 [workspace]
 members = [
-  "acceptance",
-  "derive-macros",
-  "ffi",
-  "kernel",
-  "kernel/examples/read-table-single-threaded", # todo: put back to `examples/*` when inspect-table is fixed
-  "kernel/examples/read-table-multi-threaded",
+    "acceptance",
+    "derive-macros",
+    "ffi",
+    "kernel",
+    "kernel/examples/*",
 ]
 # Only check / build main crates by default (check all with `--workspace`)
 default-members = ["acceptance", "kernel"]

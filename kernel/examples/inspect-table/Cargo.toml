@@ -7,10 +7,11 @@ publish = false
 [dependencies]
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
 delta_kernel = { path = "../../../kernel", features = [
-  "default",
-  "tokio",
+  "cloud",
+  "default-engine",
   "developer-visibility",
 ] }
-clap = { version = "^4.4", features = ["derive"] }
+env_logger = "0.11.3"
 url = "2"

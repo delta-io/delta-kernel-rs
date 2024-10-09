@@ -123,9 +123,9 @@ impl<'a> GetData<'a> for () {
     );
 }
 
-// This is a convenience wrapper over `GetData` to allow code like:
-// `let name: Option<String> = getters[1].get_opt(row_index, "metadata.name")?;`
-pub(crate) trait TypedGetData<'a, T> {
+/// This is a convenience wrapper over `GetData` to allow code like: `let name: Option<String> =
+/// getters[1].get_opt(row_index, "metadata.name")?;`
+pub trait TypedGetData<'a, T> {
     fn get_opt(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<T>>;
     fn get(&'a self, row_index: usize, field_name: &str) -> DeltaResult<T> {
         let val = self.get_opt(row_index, field_name)?;
@@ -187,13 +187,12 @@ impl<'a> TypedGetData<'a, HashMap<String, String>> for dyn GetData<'a> + '_ {
 /// [`DataVisitor::visit`] on the visitor passed to [`EngineData::extract`], engines do
 /// not need to worry about this trait.
 pub trait DataVisitor {
-    // // Receive some data from a call to `extract`. The data in [vals] should not be assumed to live
-    // // beyond the call to this funtion (i.e. it should be copied if needed)
-    // // The row_index parameter must be the index of the found row in the data batch being processed.
-    // fn visit(&mut self, row_index: usize, vals: &[Option<DataItem<'_>>]);
-
-    /// The visitor is passed a slice of `GetDataItem` values, and a row count.
-    // TODO(nick) better comment
+    /// Have the visitor visit the data. This will be called on a visitor passed to
+    /// [`EngineData::extract`]. For each leaf in the schema that was passed to `extract` a "getter"
+    /// of type [`GetData`] will be present. This can be used to actually get at the data for each
+    /// row. You can `use` the `TypedGetData` trait if you want to have a way to extract typed data
+    /// that will fail if the "getter" is for an unexpected type.  The data in `getters` should not
+    /// be assumed to live beyond the call to this funtion (i.e. it should be copied if needed)
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()>;
 }
 
