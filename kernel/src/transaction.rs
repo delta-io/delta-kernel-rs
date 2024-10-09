@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::actions::visitors::TransactionVisitor;
 use crate::actions::{get_log_schema, Transaction, TRANSACTION_NAME};
 use crate::snapshot::Snapshot;
-use crate::{DeltaResult, Engine, EngineData, SchemaRef};
+use crate::{DeltaResult, Engine, EngineData, Expression as Expr, SchemaRef};
 
 pub use crate::actions::visitors::TransactionMap;
 pub struct TransactionScanner {
@@ -48,9 +48,14 @@ impl TransactionScanner {
         engine: &dyn Engine,
         schema: SchemaRef,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
+        // This meta-predicate should be effective because all the app ids end up in a single
+        // checkpoint part when patitioned by `add.path` like the Delta spec requires. There's no
+        // point filtering by a particular app id, even if we have one, because app ids are all in
+        // the a single checkpoint part having large min/max range (because they're usually uuids).
+        let meta_predicate = Expr::column("txn.appId").is_not_null();
         self.snapshot
             .log_segment
-            .replay(engine, schema.clone(), schema, None)
+            .replay(engine, schema.clone(), schema, Some(meta_predicate))
     }
 
     /// Scan the Delta Log for the latest transaction entry of an application
@@ -140,12 +145,11 @@ mod tests {
         let txn_schema = TransactionScanner::get_txn_schema().unwrap();
 
         // The checkpoint has five parts, each containing one action. There are two app ids.
-        // TODO: Implement parquet row group skipping so we only read two files.
         let data: Vec<_> = txn
             .replay_for_app_ids(&engine, txn_schema.clone())
             .unwrap()
             .try_collect()
             .unwrap();
-        assert_eq!(data.len(), 5);
+        assert_eq!(data.len(), 2);
     }
 }

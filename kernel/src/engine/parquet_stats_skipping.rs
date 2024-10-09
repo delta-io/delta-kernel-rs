@@ -18,7 +18,6 @@ mod tests;
 /// a SET of rows -- has different semantics than row-based predicate evaluation. The provided
 /// methods of this class convert various supported expressions into data skipping predicates, and
 /// then return the result of evaluating the translated filter.
-#[allow(unused)] // temporary, until we wire up the parquet reader to actually use this
 pub(crate) trait ParquetStatsSkippingFilter {
     /// Retrieves the minimum value of a column, if it exists and has the requested type.
     fn get_min_stat_value(&self, col: &ColumnPath, data_type: &DataType) -> Option<Scalar>;
@@ -114,10 +113,10 @@ pub(crate) trait ParquetStatsSkippingFilter {
         use UnaryOperator::IsNull;
         // Convert `a {cmp} b` to `AND(a IS NOT NULL, b IS NOT NULL, a {cmp} b)`,
         // and only evaluate the comparison if the null checks don't short circuit.
-        if matches!(self.apply_unary(IsNull, left, true), Some(false)) {
+        if let Some(false) = self.apply_unary(IsNull, left, true) {
             return Some(false);
         }
-        if matches!(self.apply_unary(IsNull, right, true), Some(false)) {
+        if let Some(false) = self.apply_unary(IsNull, right, true) {
             return Some(false);
         }
         self.apply_binary(op, left, right, false)
@@ -334,7 +333,7 @@ pub(crate) trait ParquetStatsSkippingFilter {
         let col = col_name_to_path(col);
         let as_boolean = |get: &dyn Fn(_, _, _) -> _| match get(self, &col, &DataType::BOOLEAN) {
             Some(Scalar::Boolean(value)) => Some(value),
-            Some(other) => {
+            Some(_) => {
                 info!("Ignoring non-boolean column {col}");
                 None
             }

@@ -14,6 +14,7 @@ use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStream
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use crate::engine::arrow_utils::{generate_mask, get_requested_indices, reorder_struct_array};
 use crate::engine::default::executor::TaskExecutor;
+use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, ParquetHandler};
 
@@ -89,7 +90,7 @@ struct ParquetOpener {
     // projection: Arc<[usize]>,
     batch_size: usize,
     table_schema: SchemaRef,
-    _predicate: Option<Expression>,
+    predicate: Option<Expression>,
     limit: Option<usize>,
     store: Arc<DynObjectStore>,
 }
@@ -104,7 +105,7 @@ impl ParquetOpener {
         Self {
             batch_size,
             table_schema,
-            _predicate: predicate,
+            predicate,
             limit: None,
             store,
         }
@@ -119,6 +120,7 @@ impl FileOpener for ParquetOpener {
         let batch_size = self.batch_size;
         // let projection = self.projection.clone();
         let table_schema = self.table_schema.clone();
+        let predicate = self.predicate.clone();
         let limit = self.limit;
 
         Ok(Box::pin(async move {
@@ -141,6 +143,9 @@ impl FileOpener for ParquetOpener {
                 builder = builder.with_projection(mask)
             }
 
+            if let Some(ref predicate) = predicate {
+                builder = builder.with_row_group_filter(predicate);
+            }
             if let Some(limit) = limit {
                 builder = builder.with_limit(limit)
             }
@@ -161,7 +166,7 @@ impl FileOpener for ParquetOpener {
 /// Implements [`FileOpener`] for a opening a parquet file from a presigned URL
 struct PresignedUrlOpener {
     batch_size: usize,
-    _predicate: Option<Expression>,
+    predicate: Option<Expression>,
     limit: Option<usize>,
     table_schema: SchemaRef,
     client: reqwest::Client,
@@ -172,7 +177,7 @@ impl PresignedUrlOpener {
         Self {
             batch_size,
             table_schema: schema,
-            _predicate: predicate,
+            predicate,
             limit: None,
             client: reqwest::Client::new(),
         }
@@ -183,6 +188,7 @@ impl FileOpener for PresignedUrlOpener {
     fn open(&self, file_meta: FileMeta, _range: Option<Range<i64>>) -> DeltaResult<FileOpenFuture> {
         let batch_size = self.batch_size;
         let table_schema = self.table_schema.clone();
+        let predicate = self.predicate.clone();
         let limit = self.limit;
         let client = self.client.clone(); // uses Arc internally according to reqwest docs
 
@@ -206,6 +212,9 @@ impl FileOpener for PresignedUrlOpener {
                 builder = builder.with_projection(mask)
             }
 
+            if let Some(ref predicate) = predicate {
+                builder = builder.with_row_group_filter(predicate);
+            }
             if let Some(limit) = limit {
                 builder = builder.with_limit(limit)
             }

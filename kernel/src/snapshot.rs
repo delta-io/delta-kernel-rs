@@ -42,7 +42,8 @@ impl LogSegment {
     /// `read_schema` is the schema to read the log files with. This can be used
     /// to project the log files to a subset of the columns.
     ///
-    /// `predicate` is an optional expression to filter the log files with.
+    /// `meta_predicate` is an optional expression to filter the log files with. It is _NOT_ the
+    /// query's predicate, but rather a predicate for filtering log files themselves.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
     fn replay(
@@ -50,18 +51,24 @@ impl LogSegment {
         engine: &dyn Engine,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
-        predicate: Option<Expression>,
+        meta_predicate: Option<Expression>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
         let json_client = engine.get_json_handler();
-        // TODO change predicate to: predicate AND add.path not null and remove.path not null
         let commit_stream = json_client
-            .read_json_files(&self.commit_files, commit_read_schema, predicate.clone())?
+            .read_json_files(
+                &self.commit_files,
+                commit_read_schema,
+                meta_predicate.clone(),
+            )?
             .map_ok(|batch| (batch, true));
 
         let parquet_client = engine.get_parquet_handler();
-        // TODO change predicate to: predicate AND add.path not null
         let checkpoint_stream = parquet_client
-            .read_parquet_files(&self.checkpoint_files, checkpoint_read_schema, predicate)?
+            .read_parquet_files(
+                &self.checkpoint_files,
+                checkpoint_read_schema,
+                meta_predicate,
+            )?
             .map_ok(|batch| (batch, false));
 
         let batches = commit_stream.chain(checkpoint_stream);
@@ -628,6 +635,16 @@ mod tests {
         assert!(invalid.is_none())
     }
 
+    // NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
+    // that the parquet reader properly infers nullcount = rowcount for missing columns. The two
+    // checkpoint part files that contain transaction app ids have truncated schemas that would
+    // otherwise fail skipping due to their missing nullcount stat:
+    //
+    // Row group 0:  count: 1  total(compressed): 111 B total(uncompressed):107 B
+    // --------------------------------------------------------------------------------
+    //              type    nulls  min / max
+    // txn.appId    BINARY  0      "3ae45b72-24e1-865a-a211-3..." / "3ae45b72-24e1-865a-a211-3..."
+    // txn.version  INT64   0      "4390" / "4390"
     #[test]
     fn test_replay_for_metadata() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
@@ -642,11 +659,14 @@ mod tests {
             .unwrap()
             .try_collect()
             .unwrap();
+
         // The checkpoint has five parts, each containing one action. The P&M come from first and
-        // third parts, respectively. The actual `read_metadata` will also skip the last two parts
-        // because it terminates the iteration immediately after finding both P&M.
-        // TODO: Implement parquet row group skipping so we filter out all but two files.
-        assert_eq!(data.len(), 5);
+        // third parts, respectively. The parquet reader will skip the other three parts. Note that
+        // the actual `read_metadata` would anyway skip the last two parts because it terminates the
+        // iteration immediately after finding both P&M.
+        //
+        // NOTE: Each checkpoint part is a single-row file -- guaranteed to produce one row group.
+        assert_eq!(data.len(), 2);
     }
 
     #[test_log::test]
