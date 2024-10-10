@@ -180,27 +180,29 @@ pub struct StructType {
 }
 
 impl StructType {
-    pub fn new(fields: Vec<StructField>) -> Self {
+    pub fn new(fields: impl IntoIterator<Item = StructField>) -> Self {
         Self {
             type_name: "struct".into(),
             fields: fields.into_iter().map(|f| (f.name.clone(), f)).collect(),
         }
     }
 
+    pub fn try_new<E>(fields: impl IntoIterator<Item = Result<StructField, E>>) -> Result<Self, E> {
+        let fields: Vec<_> = fields.into_iter().try_collect()?;
+        Ok(Self::new(fields))
+    }
+
     /// Get a [`StructType`] containing [`StructField`]s of the given names. The order of fields in
     /// the returned schema will match the order passed to this function, which can be different
     /// from this order in this schema. Returns an Err if a specified field doesn't exist.
     pub fn project_as_struct(&self, names: &[impl AsRef<str>]) -> DeltaResult<StructType> {
-        let fields = names
-            .iter()
-            .map(|name| {
-                self.fields
-                    .get(name.as_ref())
-                    .cloned()
-                    .ok_or_else(|| Error::missing_column(name.as_ref()))
-            })
-            .try_collect()?;
-        Ok(Self::new(fields))
+        let fields = names.iter().map(|name| {
+            self.fields
+                .get(name.as_ref())
+                .cloned()
+                .ok_or_else(|| Error::missing_column(name.as_ref()))
+        });
+        Self::try_new(fields)
     }
 
     /// Get a [`SchemaRef`] containing [`StructField`]s of the given names. The order of fields in
@@ -335,7 +337,7 @@ impl MapType {
 
     /// Create a schema assuming the map is stored as a struct with the specified key and value field names
     pub fn as_struct_schema(&self, key_name: String, val_name: String) -> Schema {
-        StructType::new(vec![
+        StructType::new([
             StructField::new(key_name, self.key_type.clone(), false),
             StructField::new(val_name, self.value_type.clone(), self.value_contains_null),
         ])
@@ -503,12 +505,13 @@ impl DataType {
         Self::decimal(precision, scale).unwrap()
     }
 
-    pub fn struct_type(fields: Vec<StructField>) -> Self {
-        DataType::Struct(Box::new(StructType::new(fields)))
+    pub fn struct_type(fields: impl IntoIterator<Item = StructField>) -> Self {
+        StructType::new(fields).into()
     }
-
-    pub fn array_type(elements: ArrayType) -> Self {
-        DataType::Array(Box::new(elements))
+    pub fn try_struct_type<E>(
+        fields: impl IntoIterator<Item = Result<StructField, E>>,
+    ) -> Result<Self, E> {
+        Ok(StructType::try_new(fields)?.into())
     }
 
     pub fn as_primitive_opt(&self) -> Option<&PrimitiveType> {

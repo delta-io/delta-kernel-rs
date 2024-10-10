@@ -26,7 +26,7 @@ pub(crate) const PROTOCOL_NAME: &str = "protocol";
 pub(crate) const TRANSACTION_NAME: &str = "txn";
 
 static LOG_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
-    StructType::new(vec![
+    StructType::new([
         Option::<Add>::get_struct_field(ADD_NAME),
         Option::<Remove>::get_struct_field(REMOVE_NAME),
         Option::<Metadata>::get_struct_field(METADATA_NAME),
@@ -268,15 +268,15 @@ mod tests {
             .project(&["metaData"])
             .expect("Couldn't get metaData field");
 
-        let expected = Arc::new(StructType::new(vec![StructField::new(
+        let expected = Arc::new(StructType::new([StructField::new(
             "metaData",
-            StructType::new(vec![
+            StructType::new([
                 StructField::new("id", DataType::STRING, false),
                 StructField::new("name", DataType::STRING, true),
                 StructField::new("description", DataType::STRING, true),
                 StructField::new(
                     "format",
-                    StructType::new(vec![
+                    StructType::new([
                         StructField::new("provider", DataType::STRING, false),
                         StructField::new(
                             "options",
@@ -310,9 +310,9 @@ mod tests {
             .project(&["add"])
             .expect("Couldn't get add field");
 
-        let expected = Arc::new(StructType::new(vec![StructField::new(
+        let expected = Arc::new(StructType::new([StructField::new(
             "add",
-            StructType::new(vec![
+            StructType::new([
                 StructField::new("path", DataType::STRING, false),
                 StructField::new(
                     "partitionValues",
@@ -357,13 +357,13 @@ mod tests {
     fn deletion_vector_field() -> StructField {
         StructField::new(
             "deletionVector",
-            DataType::Struct(Box::new(StructType::new(vec![
+            DataType::struct_type([
                 StructField::new("storageType", DataType::STRING, false),
                 StructField::new("pathOrInlineDv", DataType::STRING, false),
                 StructField::new("offset", DataType::INTEGER, true),
                 StructField::new("sizeInBytes", DataType::INTEGER, false),
                 StructField::new("cardinality", DataType::LONG, false),
-            ]))),
+            ]),
             true,
         )
     }
@@ -373,9 +373,9 @@ mod tests {
         let schema = get_log_schema()
             .project(&["remove"])
             .expect("Couldn't get remove field");
-        let expected = Arc::new(StructType::new(vec![StructField::new(
+        let expected = Arc::new(StructType::new([StructField::new(
             "remove",
-            StructType::new(vec![
+            StructType::new([
                 StructField::new("path", DataType::STRING, false),
                 StructField::new("deletionTimestamp", DataType::LONG, true),
                 StructField::new("dataChange", DataType::BOOLEAN, false),
@@ -398,9 +398,9 @@ mod tests {
             .project(&["txn"])
             .expect("Couldn't get transaction field");
 
-        let expected = Arc::new(StructType::new(vec![StructField::new(
+        let expected = Arc::new(StructType::new([StructField::new(
             "txn",
-            StructType::new(vec![
+            StructType::new([
                 StructField::new("appId", DataType::STRING, false),
                 StructField::new("version", DataType::LONG, false),
                 StructField::new("lastUpdated", DataType::LONG, true),

@@ -81,14 +81,14 @@ impl DataVisitor for AddRemoveVisitor {
 // for `scan_row_schema` in scan/mod.rs! You'll also need to update ScanFileVisitor as the
 // indexes will be off
 pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| {
-    Arc::new(StructType::new(vec![
+    Arc::new(StructType::new([
         StructField::new("path", DataType::STRING, false),
         StructField::new("size", DataType::LONG, true),
         StructField::new("modificationTime", DataType::LONG, true),
         StructField::new("stats", DataType::STRING, true),
         StructField::new(
             "deletionVector",
-            StructType::new(vec![
+            StructType::new([
                 StructField::new("storageType", DataType::STRING, false),
                 StructField::new("pathOrInlineDv", DataType::STRING, false),
                 StructField::new("offset", DataType::INTEGER, true),
@@ -99,7 +99,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
         ),
         StructField::new(
             "fileConstantValues",
-            StructType::new(vec![StructField::new(
+            StructType::new([StructField::new(
                 "partitionValues",
                 MapType::new(DataType::STRING, DataType::STRING, false),
                 true,

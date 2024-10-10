@@ -442,7 +442,7 @@ mod tests {
         let field = Arc::new(Field::new("item", DataType::Int32, true));
         let arr_field = Arc::new(Field::new("item", DataType::List(field.clone()), true));
 
-        let schema = Schema::new(vec![arr_field.clone()]);
+        let schema = Schema::new([arr_field.clone()]);
 
         let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
@@ -472,7 +472,7 @@ mod tests {
     fn test_bad_right_type_array() {
         let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
         let field = Arc::new(Field::new("item", DataType::Int32, true));
-        let schema = Schema::new(vec![field.clone()]);
+        let schema = Schema::new([field.clone()]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
 
         let in_op = Expression::binary(
@@ -493,7 +493,7 @@ mod tests {
     #[test]
     fn test_literal_type_array() {
         let field = Arc::new(Field::new("item", DataType::Int32, true));
-        let schema = Schema::new(vec![field.clone()]);
+        let schema = Schema::new([field.clone()]);
         let batch = RecordBatch::new_empty(Arc::new(schema));
 
         let in_op = Expression::binary(
@@ -517,7 +517,7 @@ mod tests {
         let field = Arc::new(Field::new("item", DataType::Int32, true));
         let arr_field = Arc::new(Field::new("item", DataType::List(field.clone()), true));
 
-        let schema = Schema::new(vec![arr_field.clone()]);
+        let schema = Schema::new([arr_field.clone()]);
 
         let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
@@ -545,7 +545,7 @@ mod tests {
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6, 9]));
         let field = Arc::new(Field::new("item", DataType::Utf8, true));
         let arr_field = Arc::new(Field::new("item", DataType::List(field.clone()), true));
-        let schema = Schema::new(vec![arr_field.clone()]);
+        let schema = Schema::new([arr_field.clone()]);
         let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 

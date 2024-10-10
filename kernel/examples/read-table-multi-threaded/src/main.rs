@@ -154,21 +154,17 @@ fn try_main() -> DeltaResult<()> {
     // process the columns requested and build a schema from them
     let read_schema_opt = cli
         .columns
-        .map(|cols| {
-            use itertools::Itertools;
+        .map(|cols| -> DeltaResult<_> {
             let table_schema = snapshot.schema();
-            let selected_fields = cols
-                .iter()
-                .map(|col| {
-                    table_schema
-                        .field(col)
-                        .cloned()
-                        .ok_or(delta_kernel::Error::Generic(format!(
-                            "Table has no such column: {col}"
-                        )))
-                })
-                .try_collect();
-            selected_fields.map(|selected_fields| Arc::new(Schema::new(selected_fields)))
+            let selected_fields = cols.iter().map(|col| {
+                table_schema
+                    .field(col)
+                    .cloned()
+                    .ok_or(delta_kernel::Error::Generic(format!(
+                        "Table has no such column: {col}"
+                    )))
+            });
+            Schema::try_new(selected_fields).map(Arc::new)
         })
         .transpose()?;
 

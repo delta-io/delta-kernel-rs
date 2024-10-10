@@ -581,7 +581,7 @@ pub(crate) mod test_utils {
     ) {
         let engine = SyncEngine::new();
         // doesn't matter here
-        let table_schema = Arc::new(StructType::new(vec![StructField::new(
+        let table_schema = Arc::new(StructType::new([StructField::new(
             "foo",
             crate::schema::DataType::STRING,
             false,

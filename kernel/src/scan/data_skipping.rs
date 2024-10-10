@@ -181,7 +181,7 @@ impl DataSkippingFilter {
         predicate: &Option<Expr>,
     ) -> Option<Self> {
         static PREDICATE_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
-            DataType::struct_type(vec![StructField::new("predicate", DataType::BOOLEAN, true)])
+            DataType::struct_type([StructField::new("predicate", DataType::BOOLEAN, true)])
         });
         static STATS_EXPR: LazyLock<Expr> = LazyLock::new(|| Expr::column("add.stats"));
         static FILTER_EXPR: LazyLock<Expr> =
@@ -207,22 +207,20 @@ impl DataSkippingFilter {
             return None;
         }
 
-        let stats_schema = Arc::new(StructType::new(vec![
-            StructField::new("numRecords", DataType::LONG, true),
-            StructField::new("tightBounds", DataType::BOOLEAN, true),
-            StructField::new(
-                "nullCount",
-                StructType::new(
-                    data_fields
-                        .iter()
-                        .map(|data_field| StructField::new(&data_field.name, DataType::LONG, true))
-                        .collect(),
+        let stats_schema =
+            Arc::new(StructType::new([
+                StructField::new("numRecords", DataType::LONG, true),
+                StructField::new("tightBounds", DataType::BOOLEAN, true),
+                StructField::new(
+                    "nullCount",
+                    StructType::new(data_fields.iter().map(|data_field| {
+                        StructField::new(&data_field.name, DataType::LONG, true)
+                    })),
+                    true,
                 ),
-                true,
-            ),
-            StructField::new("minValues", StructType::new(data_fields.clone()), true),
-            StructField::new("maxValues", StructType::new(data_fields), true),
-        ]));
+                StructField::new("minValues", StructType::new(data_fields.clone()), true),
+                StructField::new("maxValues", StructType::new(data_fields), true),
+            ]));
 
         // Skipping happens in several steps:
         //
@@ -284,7 +282,7 @@ impl DataSkippingFilter {
 
         // visit the engine's selection vector to produce a Vec<bool>
         let mut visitor = SelectionVectorVisitor::default();
-        let schema = StructType::new(vec![StructField::new("output", DataType::BOOLEAN, false)]);
+        let schema = StructType::new([StructField::new("output", DataType::BOOLEAN, false)]);
         selection_vector
             .as_ref()
             .extract(Arc::new(schema), &mut visitor)?;

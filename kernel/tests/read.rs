@@ -539,8 +539,7 @@ fn read_table_data(
             let table_schema = snapshot.schema();
             let selected_fields = select_cols
                 .iter()
-                .map(|col| table_schema.field(col).cloned().unwrap())
-                .collect();
+                .map(|col| table_schema.field(col).cloned().unwrap());
             Arc::new(Schema::new(selected_fields))
         });
         let scan = snapshot

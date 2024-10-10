@@ -142,12 +142,12 @@ impl TryFrom<&ArrowSchema> for StructType {
     type Error = ArrowError;
 
     fn try_from(arrow_schema: &ArrowSchema) -> Result<Self, ArrowError> {
-        let new_fields: Result<Vec<StructField>, _> = arrow_schema
-            .fields()
-            .iter()
-            .map(|field| field.as_ref().try_into())
-            .collect();
-        Ok(StructType::new(new_fields?))
+        StructType::try_new(
+            arrow_schema
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().try_into()),
+        )
     }
 }
 
@@ -211,13 +211,7 @@ impl TryFrom<&ArrowDataType> for DataType {
                 Ok(DataType::TIMESTAMP)
             }
             ArrowDataType::Struct(fields) => {
-                let converted_fields: Result<Vec<StructField>, _> = fields
-                    .iter()
-                    .map(|field| field.as_ref().try_into())
-                    .collect();
-                Ok(DataType::Struct(Box::new(StructType::new(
-                    converted_fields?,
-                ))))
+                DataType::try_struct_type(fields.iter().map(|field| field.as_ref().try_into()))
             }
             ArrowDataType::List(field) => Ok(DataType::Array(Box::new(ArrayType::new(
                 (*field).data_type().try_into()?,

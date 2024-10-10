@@ -142,7 +142,7 @@ impl Scalar {
             Self::Decimal(_, precision, scale) => DataType::decimal_unchecked(*precision, *scale),
             Self::Null(data_type) => data_type.clone(),
             Self::Struct(data) => DataType::struct_type(data.fields.clone()),
-            Self::Array(data) => DataType::array_type(data.tpe.clone()),
+            Self::Array(data) => data.tpe.clone().into(),
         }
     }
 
