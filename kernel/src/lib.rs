@@ -73,7 +73,6 @@ pub mod scan;
 pub mod schema;
 pub mod snapshot;
 pub mod table;
-pub mod transaction;
 pub(crate) mod utils;
 
 pub use engine_data::{DataVisitor, EngineData};

@@ -1,18 +1,18 @@
 use std::sync::Arc;
 
-use crate::actions::visitors::TransactionVisitor;
-use crate::actions::{get_log_schema, Transaction, TRANSACTION_NAME};
+use crate::actions::visitors::SetTransactionVisitor;
+use crate::actions::{get_log_schema, SetTransaction, SET_TRANSACTION_NAME};
 use crate::snapshot::Snapshot;
 use crate::{DeltaResult, Engine, EngineData, Expression as Expr, SchemaRef};
 
-pub use crate::actions::visitors::TransactionMap;
-pub struct TransactionScanner {
+pub use crate::actions::visitors::SetTransactionMap;
+pub struct SetTransactionScanner {
     snapshot: Arc<Snapshot>,
 }
 
-impl TransactionScanner {
+impl SetTransactionScanner {
     pub fn new(snapshot: Arc<Snapshot>) -> Self {
-        TransactionScanner { snapshot }
+        SetTransactionScanner { snapshot }
     }
 
     /// Scan the entire log for all application ids but terminate early if a specific application id is provided
@@ -20,26 +20,26 @@ impl TransactionScanner {
         &self,
         engine: &dyn Engine,
         application_id: Option<&str>,
-    ) -> DeltaResult<TransactionMap> {
+    ) -> DeltaResult<SetTransactionMap> {
         let schema = Self::get_txn_schema()?;
-        let mut visitor = TransactionVisitor::new(application_id.map(|s| s.to_owned()));
+        let mut visitor = SetTransactionVisitor::new(application_id.map(|s| s.to_owned()));
         // If a specific id is requested then we can terminate log replay early as soon as it was
         // found. If all ids are requested then we are forced to replay the entire log.
         for maybe_data in self.replay_for_app_ids(engine, schema.clone())? {
             let (txns, _) = maybe_data?;
             txns.extract(schema.clone(), &mut visitor)?;
             // if a specific id is requested and a transaction was found, then return
-            if application_id.is_some() && !visitor.transactions.is_empty() {
+            if application_id.is_some() && !visitor.set_transactions.is_empty() {
                 break;
             }
         }
 
-        Ok(visitor.transactions)
+        Ok(visitor.set_transactions)
     }
 
     // Factored out to facilitate testing
     fn get_txn_schema() -> DeltaResult<SchemaRef> {
-        get_log_schema().project(&[TRANSACTION_NAME])
+        get_log_schema().project(&[SET_TRANSACTION_NAME])
     }
 
     // Factored out to facilitate testing
@@ -63,13 +63,13 @@ impl TransactionScanner {
         &self,
         engine: &dyn Engine,
         application_id: &str,
-    ) -> DeltaResult<Option<Transaction>> {
+    ) -> DeltaResult<Option<SetTransaction>> {
         let mut transactions = self.scan_application_transactions(engine, Some(application_id))?;
         Ok(transactions.remove(application_id))
     }
 
     /// Scan the Delta Log to obtain the latest transaction for all applications
-    pub fn application_transactions(&self, engine: &dyn Engine) -> DeltaResult<TransactionMap> {
+    pub fn application_transactions(&self, engine: &dyn Engine) -> DeltaResult<SetTransactionMap> {
         self.scan_application_transactions(engine, None)
     }
 }
@@ -83,14 +83,17 @@ mod tests {
     use crate::Table;
     use itertools::Itertools;
 
-    fn get_latest_transactions(path: &str, app_id: &str) -> (TransactionMap, Option<Transaction>) {
+    fn get_latest_transactions(
+        path: &str,
+        app_id: &str,
+    ) -> (SetTransactionMap, Option<SetTransaction>) {
         let path = std::fs::canonicalize(PathBuf::from(path)).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine, None).unwrap();
-        let txn_scan = TransactionScanner::new(snapshot.into());
+        let txn_scan = SetTransactionScanner::new(snapshot.into());
 
         (
             txn_scan.application_transactions(&engine).unwrap(),
@@ -110,7 +113,7 @@ mod tests {
         assert_eq!(txns.get("my-app"), txn.as_ref());
         assert_eq!(
             txns.get("my-app2"),
-            Some(Transaction {
+            Some(SetTransaction {
                 app_id: "my-app2".to_owned(),
                 version: 2,
                 last_updated: None
@@ -124,7 +127,7 @@ mod tests {
         assert_eq!(txns.get("my-app"), txn.as_ref());
         assert_eq!(
             txns.get("my-app2"),
-            Some(Transaction {
+            Some(SetTransaction {
                 app_id: "my-app2".to_owned(),
                 version: 2,
                 last_updated: None
@@ -141,8 +144,8 @@ mod tests {
 
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine, None).unwrap();
-        let txn = TransactionScanner::new(snapshot.into());
-        let txn_schema = TransactionScanner::get_txn_schema().unwrap();
+        let txn = SetTransactionScanner::new(snapshot.into());
+        let txn_schema = SetTransactionScanner::get_txn_schema().unwrap();
 
         // The checkpoint has five parts, each containing one action. There are two app ids.
         let data: Vec<_> = txn

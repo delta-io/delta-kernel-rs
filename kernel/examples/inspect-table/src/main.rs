@@ -1,6 +1,6 @@
 use delta_kernel::actions::get_log_schema;
 use delta_kernel::actions::visitors::{
-    AddVisitor, MetadataVisitor, ProtocolVisitor, RemoveVisitor, TransactionVisitor,
+    AddVisitor, MetadataVisitor, ProtocolVisitor, RemoveVisitor, SetTransactionVisitor,
 };
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
@@ -62,7 +62,7 @@ enum Action {
     Protocol(delta_kernel::actions::Protocol, usize),
     Remove(delta_kernel::actions::Remove, usize),
     Add(delta_kernel::actions::Add, usize),
-    SetTransaction(delta_kernel::actions::Transaction, usize),
+    SetTransaction(delta_kernel::actions::SetTransaction, usize),
 }
 
 impl Action {
@@ -161,7 +161,7 @@ impl DataVisitor for LogVisitor {
             }
             if let Some(app_id) = getters[self.set_transaction_offset].get_opt(i, "txn.appId")? {
                 self.actions.push(Action::SetTransaction(
-                    TransactionVisitor::visit_txn(
+                    SetTransactionVisitor::visit_txn(
                         i,
                         app_id,
                         &getters[self.set_transaction_offset..],

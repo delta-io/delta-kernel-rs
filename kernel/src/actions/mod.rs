@@ -1,13 +1,6 @@
 //! Provides parsing and manipulation of the various actions defined in the [Delta
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
-pub mod deletion_vector;
-pub(crate) mod schemas;
-#[cfg(feature = "developer-visibility")]
-pub mod visitors;
-#[cfg(not(feature = "developer-visibility"))]
-pub(crate) mod visitors;
-
 use delta_kernel_derive::Schema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -19,11 +12,21 @@ use crate::actions::schemas::GetStructField;
 use crate::features::{ReaderFeatures, WriterFeatures};
 use crate::{schema::StructType, DeltaResult, EngineData};
 
+pub mod deletion_vector;
+pub mod set_transaction;
+
+pub(crate) mod schemas;
+#[cfg(feature = "developer-visibility")]
+pub mod visitors;
+#[cfg(not(feature = "developer-visibility"))]
+pub(crate) mod visitors;
+
 pub(crate) const ADD_NAME: &str = "add";
 pub(crate) const REMOVE_NAME: &str = "remove";
 pub(crate) const METADATA_NAME: &str = "metaData";
 pub(crate) const PROTOCOL_NAME: &str = "protocol";
-pub(crate) const TRANSACTION_NAME: &str = "txn";
+pub(crate) const SET_TRANSACTION_NAME: &str = "txn";
+pub(crate) const COMMIT_INFO_NAME: &str = "commitInfo";
 
 static LOG_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
     StructType::new([
@@ -31,11 +34,11 @@ static LOG_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
         Option::<Remove>::get_struct_field(REMOVE_NAME),
         Option::<Metadata>::get_struct_field(METADATA_NAME),
         Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
-        Option::<Transaction>::get_struct_field(TRANSACTION_NAME),
+        Option::<SetTransaction>::get_struct_field(SET_TRANSACTION_NAME),
+        Option::<CommitInfo>::get_struct_field(COMMIT_INFO_NAME),
         // We don't support the following actions yet
-        //Option<Cdc>::get_field(CDC_NAME),
-        //Option<CommitInfo>::get_field(COMMIT_INFO_NAME),
-        //Option<DomainMetadata>::get_field(DOMAIN_METADATA_NAME),
+        //Option::<Cdc>::get_struct_field(CDC_NAME),
+        //Option::<DomainMetadata>::get_struct_field(DOMAIN_METADATA_NAME),
     ])
 });
 
@@ -131,6 +134,11 @@ impl Protocol {
             .as_ref()
             .is_some_and(|features| features.iter().any(|f| f == feature.as_ref()))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+pub struct CommitInfo {
+    pub kernel_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
@@ -244,7 +252,7 @@ impl Remove {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
-pub struct Transaction {
+pub struct SetTransaction {
     /// A unique identifier for the application performing the transaction.
     pub app_id: String,
 
