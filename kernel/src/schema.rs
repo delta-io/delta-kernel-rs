@@ -168,12 +168,11 @@ impl StructField {
     }
 
     pub fn make_physical(&self, mapping_mode: ColumnMappingMode) -> DeltaResult<Self> {
+        use ColumnMappingMode::*;
         match mapping_mode {
-            ColumnMappingMode::Id => {
-                return Err(Error::generic("Column ID mapping mode not supported"))
-            }
-            ColumnMappingMode::None => return Ok(self.clone()),
-            ColumnMappingMode::Name => {} // fall out
+            Id => return Err(Error::generic("Column ID mapping mode not supported")),
+            None => return Ok(self.clone()),
+            Name => {} // fall out
         }
 
         struct ApplyNameMapping;
@@ -777,7 +776,7 @@ impl SchemaDepthChecker {
         if self.max_depth_seen < self.current_depth {
             self.max_depth_seen = self.current_depth;
             if self.depth_limit < self.current_depth {
-                println!("Max depth {} exceeded by {:?}", self.depth_limit, arg);
+                tracing::warn!("Max schema depth {} exceeded by {arg:?}", self.depth_limit);
             }
         }
         if self.depth_limit < self.max_depth_seen {
