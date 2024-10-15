@@ -226,8 +226,8 @@ impl TryFrom<&ArrowDataType> for DataType {
             ))),
             ArrowDataType::Map(field, _) => {
                 if let ArrowDataType::Struct(struct_fields) = field.data_type() {
-                    let key_type = struct_fields[0].data_type().try_into()?;
-                    let value_type = struct_fields[1].data_type().try_into()?;
+                    let key_type = DataType::try_from(struct_fields[0].data_type())?;
+                    let value_type = DataType::try_from(struct_fields[1].data_type())?;
                     let value_type_nullable = struct_fields[1].is_nullable();
                     Ok(DataType::Map(Box::new(MapType::new(
                         key_type,

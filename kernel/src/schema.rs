@@ -1,5 +1,6 @@
 //! Definitions and functions to create and manipulate kernel schema
 
+use std::borrow::Cow;
 use std::fmt::Formatter;
 use std::sync::Arc;
 use std::{collections::HashMap, fmt::Display};
@@ -165,6 +166,35 @@ impl StructField {
     pub const fn metadata(&self) -> &HashMap<String, MetadataValue> {
         &self.metadata
     }
+
+    pub fn make_physical(&self, mapping_mode: ColumnMappingMode) -> DeltaResult<Self> {
+        match mapping_mode {
+            ColumnMappingMode::Id => {
+                return Err(Error::generic("Column ID mapping mode not supported"))
+            }
+            ColumnMappingMode::None => return Ok(self.clone()),
+            ColumnMappingMode::Name => {} // fall out
+        }
+
+        struct ApplyNameMapping;
+        impl SchemaTransform for ApplyNameMapping {
+            fn transform_struct_field<'a>(
+                &mut self,
+                field: Cow<'a, StructField>,
+            ) -> Option<Cow<'a, StructField>> {
+                let field = self.recurse_into_struct_field(field)?;
+                match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
+                    Some(MetadataValue::String(physical_name)) => {
+                        Some(Cow::Owned(field.with_name(physical_name)))
+                    }
+                    _ => Some(field),
+                }
+            }
+        }
+
+        let field = ApplyNameMapping.transform_struct_field(Cow::Borrowed(self));
+        Ok(field.unwrap().into_owned())
+    }
 }
 
 /// A struct is used to represent both the top-level schema of the table
@@ -311,11 +341,15 @@ pub struct MapType {
 }
 
 impl MapType {
-    pub fn new(key_type: DataType, value_type: DataType, value_contains_null: bool) -> Self {
+    pub fn new(
+        key_type: impl Into<DataType>,
+        value_type: impl Into<DataType>,
+        value_contains_null: bool,
+    ) -> Self {
         Self {
             type_name: "map".into(),
-            key_type,
-            value_type,
+            key_type: key_type.into(),
+            value_type: value_type.into(),
             value_contains_null,
         }
     }
@@ -453,6 +487,11 @@ pub enum DataType {
     Map(Box<MapType>),
 }
 
+impl From<PrimitiveType> for DataType {
+    fn from(ptype: PrimitiveType) -> Self {
+        DataType::Primitive(ptype)
+    }
+}
 impl From<MapType> for DataType {
     fn from(map_type: MapType) -> Self {
         DataType::Map(Box::new(map_type))
@@ -539,6 +578,233 @@ impl Display for DataType {
             }
             DataType::Map(m) => write!(f, "map<{}, {}>", m.key_type, m.value_type),
         }
+    }
+}
+
+/// Generic framework for describing recursive bottom-up schema transforms. Transformations return
+/// `Option<Cow>` with the following semantics:
+/// * `Some(Cow::Owned)` -- The schema element was transformed and should propagate to its parent.
+/// * `Some(Cow::Borrowed)` -- The schema element was not transformed.
+/// * `None` -- The schema element was filtered out and the parent should no longer reference it.
+///
+/// The transform can start from whatever schema element is available
+/// (e.g. [`Self::transform_struct`] to start with [`StructType`]), or it can start from the generic
+/// [`Self::transform`].
+///
+/// The provided `transform_xxx` methods all default to no-op, and implementations should
+/// selectively override specific `transform_xxx` methods as needed for the task at hand.
+///
+/// The provided `recurse_into_xxx` methods encapsulate the boilerplate work of recursing into the
+/// child schema elements of each schema element. Implementations can call these as needed but will
+/// generally not need to override them.
+pub trait SchemaTransform {
+    /// Called for each primitive encountered during the schema traversal.
+    fn transform_primitive<'a>(
+        &mut self,
+        ptype: Cow<'a, PrimitiveType>,
+    ) -> Option<Cow<'a, PrimitiveType>> {
+        Some(ptype)
+    }
+
+    /// Called for each struct encountered during the schema traversal. Implementations can call
+    /// [`Self::recurse_into_struct`] if they wish to recursively transform the struct's fields.
+    fn transform_struct<'a>(&mut self, stype: Cow<'a, StructType>) -> Option<Cow<'a, StructType>> {
+        self.recurse_into_struct(stype)
+    }
+
+    /// Called for each struct field encountered during the schema traversal. Implementations can
+    /// call [`Self::recurse_into_struct_field`] if they wish to recursively transform the field's
+    /// data type.
+    fn transform_struct_field<'a>(
+        &mut self,
+        field: Cow<'a, StructField>,
+    ) -> Option<Cow<'a, StructField>> {
+        self.recurse_into_struct_field(field)
+    }
+
+    /// Called for each array encountered during the schema traversal. Implementations can call
+    /// [`Self::recurse_into_array`] if they wish to recursively transform the array's element type.
+    fn transform_array<'a>(&mut self, atype: Cow<'a, ArrayType>) -> Option<Cow<'a, ArrayType>> {
+        self.recurse_into_array(atype)
+    }
+
+    /// Called for each map encountered during the schema traversal. Implementations can call
+    /// [`Self::recurse_into_map`] if they wish to recursively transform the map's key and/or value
+    /// types.
+    fn transform_map<'a>(&mut self, mtype: Cow<'a, MapType>) -> Option<Cow<'a, MapType>> {
+        self.recurse_into_map(mtype)
+    }
+
+    /// General entry point for a recursive traversal over any data type. Also invoked internally to
+    /// dispatch on nested data types encountered during the traversal.
+    fn transform<'a>(&mut self, data_type: Cow<'a, DataType>) -> Option<Cow<'a, DataType>> {
+        use Cow::*;
+        use DataType::*;
+
+        // quick boilerplate helper
+        macro_rules! apply_transform {
+            ( $transform_fn:ident, $arg:ident ) => {
+                match self.$transform_fn(Borrowed($arg)) {
+                    Some(Borrowed(_)) => Some(data_type),
+                    Some(Owned(inner)) => Some(Owned(inner.into())),
+                    None => None,
+                }
+            };
+        }
+        match data_type.as_ref() {
+            Primitive(ptype) => apply_transform!(transform_primitive, ptype),
+            Array(atype) => apply_transform!(transform_array, atype),
+            Struct(stype) => apply_transform!(transform_struct, stype),
+            Map(mtype) => apply_transform!(transform_map, mtype),
+        }
+    }
+
+    /// Recursively transforms a struct field's data type. If the data type changes, update the
+    /// field to reference it. Otherwise, no-op.
+    fn recurse_into_struct_field<'a>(
+        &mut self,
+        field: Cow<'a, StructField>,
+    ) -> Option<Cow<'a, StructField>> {
+        use Cow::*;
+        let field = match self.transform(Borrowed(&field.data_type))? {
+            Borrowed(_) => field,
+            Owned(new_data_type) => Owned(StructField {
+                name: field.name.clone(),
+                data_type: new_data_type,
+                nullable: field.nullable,
+                metadata: field.metadata.clone(),
+            }),
+        };
+        Some(field)
+    }
+
+    /// Recursively transforms a struct's fields. If one or more fields were changed or removed,
+    /// update the struct to reference all surviving fields. Otherwise, no-op.
+    fn recurse_into_struct<'a>(
+        &mut self,
+        stype: Cow<'a, StructType>,
+    ) -> Option<Cow<'a, StructType>> {
+        use Cow::*;
+        let mut num_borrowed = 0;
+        let fields: Vec<_> = stype
+            .fields()
+            .filter_map(|field| self.transform_struct_field(Borrowed(field)))
+            .inspect(|field| {
+                if matches!(field, Borrowed(_)) {
+                    num_borrowed += 1;
+                }
+            })
+            .collect();
+        let stype = if num_borrowed < stype.fields.len() {
+            // At least one field was changed or filtered out, so make a new struct
+            Owned(StructType::new(fields.into_iter().map(|f| f.into_owned())))
+        } else {
+            stype
+        };
+        Some(stype)
+    }
+
+    /// Recursively transforms an array's element type. If the element type changes, update the
+    /// array to reference it. Otherwise, no-op.
+    fn recurse_into_array<'a>(&mut self, atype: Cow<'a, ArrayType>) -> Option<Cow<'a, ArrayType>> {
+        use Cow::*;
+        let atype = match self.transform(Borrowed(&atype.element_type))? {
+            Borrowed(_) => atype,
+            Owned(element_type) => Owned(ArrayType {
+                type_name: atype.type_name.clone(),
+                element_type,
+                contains_null: atype.contains_null,
+            }),
+        };
+        Some(atype)
+    }
+
+    /// Recursively transforms a map's key and value types. If either one changes, update the map to
+    /// reference them. If either one is removed, remove the map as well. Otherwise, no-op.
+    fn recurse_into_map<'a>(&mut self, mtype: Cow<'a, MapType>) -> Option<Cow<'a, MapType>> {
+        use Cow::*;
+        let key_type = self.transform(Borrowed(&mtype.key_type))?;
+        let value_type = self.transform(Borrowed(&mtype.value_type))?;
+        let mtype = match (&key_type, &value_type) {
+            (Borrowed(_), Borrowed(_)) => mtype,
+            _ => Owned(MapType {
+                type_name: mtype.type_name.clone(),
+                key_type: key_type.into_owned(),
+                value_type: value_type.into_owned(),
+                value_contains_null: mtype.value_contains_null,
+            }),
+        };
+        Some(mtype)
+    }
+}
+
+/// A schema "transform" that doesn't actually change the schema at all. Instead, it measures the
+/// maximum depth of a schema, with a depth limit to prevent stack overflow. Useful for verifying
+/// that a schema has reasonable depth before attempting to work with it.
+pub struct SchemaDepthChecker {
+    depth_limit: usize,
+    max_depth_seen: usize,
+    current_depth: usize,
+    call_count: usize,
+}
+impl SchemaDepthChecker {
+    /// Depth-checks the given data type against a given depth limit. The return value is the
+    /// largest depth seen, which is capped at one more than the depth limit (indicating the
+    /// recursion was terminated).
+    pub fn check(data_type: &DataType, depth_limit: usize) -> usize {
+        Self::check_with_call_count(data_type, depth_limit).0
+    }
+
+    // Exposed for testing
+    fn check_with_call_count(data_type: &DataType, depth_limit: usize) -> (usize, usize) {
+        let mut checker = Self {
+            depth_limit,
+            max_depth_seen: 0,
+            current_depth: 0,
+            call_count: 0,
+        };
+        checker.transform(Cow::Borrowed(data_type));
+        (checker.max_depth_seen, checker.call_count)
+    }
+
+    // Triggers the requested recursion only doing so would not exceed the depth limit.
+    fn depth_limited<T: std::fmt::Debug>(
+        &mut self,
+        recurse: impl FnOnce(&mut Self, T) -> Option<T>,
+        arg: T,
+    ) -> Option<T> {
+        self.call_count += 1;
+        if self.max_depth_seen < self.current_depth {
+            self.max_depth_seen = self.current_depth;
+            if self.depth_limit < self.current_depth {
+                println!("Max depth {} exceeded by {:?}", self.depth_limit, arg);
+            }
+        }
+        if self.depth_limit < self.max_depth_seen {
+            return Some(arg); // back out the recursion, we're done
+        }
+
+        self.current_depth += 1;
+        let result = recurse(self, arg);
+        self.current_depth -= 1;
+        result
+    }
+}
+impl SchemaTransform for SchemaDepthChecker {
+    fn transform_struct<'a>(&mut self, stype: Cow<'a, StructType>) -> Option<Cow<'a, StructType>> {
+        self.depth_limited(Self::recurse_into_struct, stype)
+    }
+    fn transform_struct_field<'a>(
+        &mut self,
+        field: Cow<'a, StructField>,
+    ) -> Option<Cow<'a, StructField>> {
+        self.depth_limited(Self::recurse_into_struct_field, field)
+    }
+    fn transform_array<'a>(&mut self, atype: Cow<'a, ArrayType>) -> Option<Cow<'a, ArrayType>> {
+        self.depth_limited(Self::recurse_into_array, atype)
+    }
+    fn transform_map<'a>(&mut self, mtype: Cow<'a, MapType>) -> Option<Cow<'a, MapType>> {
+        self.depth_limited(Self::recurse_into_map, mtype)
     }
 }
 
@@ -680,11 +946,24 @@ mod tests {
             .get_config_value(&ColumnMetadataKey::ColumnMappingId)
             .unwrap();
         assert!(matches!(col_id, MetadataValue::Number(num) if *num == 4));
-        let physical_name = field
-            .get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName)
-            .unwrap();
-        assert!(
-            matches!(physical_name, MetadataValue::String(name) if *name == "col-5f422f40-de70-45b2-88ab-1d5c90e94db1")
+        assert_eq!(
+            field.physical_name(ColumnMappingMode::Name).unwrap(),
+            "col-5f422f40-de70-45b2-88ab-1d5c90e94db1"
+        );
+        let physical_field = field.make_physical(ColumnMappingMode::Name).unwrap();
+        assert_eq!(
+            physical_field.name,
+            "col-5f422f40-de70-45b2-88ab-1d5c90e94db1"
+        );
+        let DataType::Array(atype) = physical_field.data_type else {
+            panic!("Expected an Array");
+        };
+        let DataType::Struct(stype) = atype.element_type else {
+            panic!("Expected a Struct");
+        };
+        assert_eq!(
+            stype.fields.get_index(0).unwrap().1.name,
+            "col-a7f4159c-53be-4cb0-b81a-f7e5240cfc49"
         );
     }
 
@@ -720,5 +999,97 @@ mod tests {
         }
         "#;
         assert!(serde_json::from_str::<StructField>(data).is_err());
+    }
+
+    #[test]
+    fn test_depth_checker() {
+        let schema = DataType::struct_type([
+            StructField::new(
+                "a",
+                ArrayType::new(
+                    DataType::struct_type([
+                        StructField::new("w", DataType::LONG, true),
+                        StructField::new("x", ArrayType::new(DataType::LONG, true), true),
+                        StructField::new(
+                            "y",
+                            MapType::new(DataType::LONG, DataType::STRING, true),
+                            true,
+                        ),
+                        StructField::new(
+                            "z",
+                            DataType::struct_type([
+                                StructField::new("n", DataType::LONG, true),
+                                StructField::new("m", DataType::STRING, true),
+                            ]),
+                            true,
+                        ),
+                    ]),
+                    true,
+                ),
+                true,
+            ),
+            StructField::new(
+                "b",
+                DataType::struct_type([
+                    StructField::new("o", ArrayType::new(DataType::LONG, true), true),
+                    StructField::new(
+                        "p",
+                        MapType::new(DataType::LONG, DataType::STRING, true),
+                        true,
+                    ),
+                    StructField::new(
+                        "q",
+                        DataType::struct_type([
+                            StructField::new(
+                                "s",
+                                DataType::struct_type([
+                                    StructField::new("u", DataType::LONG, true),
+                                    StructField::new("v", DataType::LONG, true),
+                                ]),
+                                true,
+                            ),
+                            StructField::new("t", DataType::LONG, true),
+                        ]),
+                        true,
+                    ),
+                    StructField::new("r", DataType::LONG, true),
+                ]),
+                true,
+            ),
+            StructField::new(
+                "c",
+                MapType::new(
+                    DataType::LONG,
+                    DataType::struct_type([
+                        StructField::new("f", DataType::LONG, true),
+                        StructField::new("g", DataType::STRING, true),
+                    ]),
+                    true,
+                ),
+                true,
+            ),
+        ]);
+
+        // Similer to SchemaDepthChecker::check, but also returns call count
+        let check_with_call_count =
+            |depth_limit| SchemaDepthChecker::check_with_call_count(&schema, depth_limit);
+
+        // Hit depth limit at "a" but still have to look at "b" "c" "d"
+        assert_eq!(check_with_call_count(1), (2, 5));
+        assert_eq!(check_with_call_count(2), (3, 6));
+
+        // Hit depth limit at "w" but still have to look at "x" "y" "z"
+        assert_eq!(check_with_call_count(3), (4, 10));
+        assert_eq!(check_with_call_count(4), (5, 11));
+
+        // Depth limit hit at "n" but still have to look at "m"
+        assert_eq!(check_with_call_count(5), (6, 15));
+
+        // Depth limit not hit until "u"
+        assert_eq!(check_with_call_count(6), (7, 28));
+
+        // Depth limit not hit (full traversal required)
+        assert_eq!(check_with_call_count(7), (7, 32));
+        assert_eq!(check_with_call_count(8), (7, 32));
     }
 }

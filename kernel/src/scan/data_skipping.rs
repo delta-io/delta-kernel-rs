@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ops::Not;
 use std::sync::{Arc, LazyLock};
@@ -8,7 +9,7 @@ use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{get_log_schema, ADD_NAME};
 use crate::error::DeltaResult;
 use crate::expressions::{BinaryOperator, Expression as Expr, UnaryOperator, VariadicOperator};
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{DataType, PrimitiveType, SchemaRef, SchemaTransform, StructField, StructType};
 use crate::{Engine, EngineData, ExpressionEvaluator, JsonHandler};
 
 /// Get the expression that checks if a col could be null, assuming tight_bounds = true. In this
@@ -206,21 +207,28 @@ impl DataSkippingFilter {
             // The predicate didn't reference any eligible stats columns, so skip it.
             return None;
         }
+        let minmax_schema = StructType::new(data_fields);
 
-        let stats_schema =
-            Arc::new(StructType::new([
-                StructField::new("numRecords", DataType::LONG, true),
-                StructField::new("tightBounds", DataType::BOOLEAN, true),
-                StructField::new(
-                    "nullCount",
-                    StructType::new(data_fields.iter().map(|data_field| {
-                        StructField::new(&data_field.name, DataType::LONG, true)
-                    })),
-                    true,
-                ),
-                StructField::new("minValues", StructType::new(data_fields.clone()), true),
-                StructField::new("maxValues", StructType::new(data_fields), true),
-            ]));
+        // Convert a min/max stats schema into a nullcount schema (all leaf fields are LONG)
+        struct NullCountStatsTransform;
+        impl SchemaTransform for NullCountStatsTransform {
+            fn transform_primitive<'a>(
+                &mut self,
+                _ptype: Cow<'a, PrimitiveType>,
+            ) -> Option<Cow<'a, PrimitiveType>> {
+                Some(Cow::Owned(PrimitiveType::Long))
+            }
+        }
+        let nullcount_schema = NullCountStatsTransform
+            .transform_struct(Cow::Borrowed(&minmax_schema))?
+            .into_owned();
+        let stats_schema = Arc::new(StructType::new([
+            StructField::new("numRecords", DataType::LONG, true),
+            StructField::new("tightBounds", DataType::BOOLEAN, true),
+            StructField::new("nullCount", nullcount_schema, true),
+            StructField::new("minValues", minmax_schema.clone(), true),
+            StructField::new("maxValues", minmax_schema, true),
+        ]));
 
         // Skipping happens in several steps:
         //
