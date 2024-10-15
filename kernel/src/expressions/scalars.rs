@@ -67,7 +67,7 @@ impl StructData {
             require!(
                 f.is_nullable() || !a.is_null(),
                 Error::invalid_struct_data(format!(
-                    "Value for non-nullable field {:?} cannto be null, got {}",
+                    "Value for non-nullable field {:?} cannot be null, got {}",
                     f.name(),
                     a
                 ))

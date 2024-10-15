@@ -205,21 +205,21 @@ fn evaluate_expression(
                     .cloned()
             }
         }
-        (Struct(fields), Some(DataType::Struct(schema))) => {
+        (Struct(fields), Some(DataType::Struct(output_schema))) => {
             let columns = fields
                 .iter()
-                .zip(schema.fields())
+                .zip(output_schema.fields())
                 .map(|(expr, field)| evaluate_expression(expr, batch, Some(field.data_type())));
             let output_cols: Vec<Arc<dyn Array>> = columns.try_collect()?;
             let output_fields: Vec<ArrowField> = output_cols
                 .iter()
-                .zip(schema.fields())
-                .map(|(array, input_field)| -> DeltaResult<_> {
-                    ensure_data_types(input_field.data_type(), array.data_type())?;
+                .zip(output_schema.fields())
+                .map(|(output_col, output_field)| -> DeltaResult<_> {
+                    ensure_data_types(output_field.data_type(), output_col.data_type())?;
                     Ok(ArrowField::new(
-                        input_field.name(),
-                        array.data_type().clone(),
-                        array.is_nullable(),
+                        output_field.name(),
+                        output_col.data_type().clone(),
+                        output_col.is_nullable(),
                     ))
                 })
                 .try_collect()?;

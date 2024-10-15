@@ -167,7 +167,7 @@ impl DeletionVectorDescriptor {
         }
     }
 
-    /// Materialize the row indexes of the deletion vector as a Vec<u64> in which each element
+    /// Materialize the row indexes of the deletion vector as a `Vec<u64>` in which each element
     /// represents a row index that is deleted from the table.
     pub fn row_indexes(
         &self,

@@ -119,10 +119,14 @@ impl ScanBuilder {
 /// A vector of this type is returned from calling [`Scan::execute`]. Each [`ScanResult`] contains
 /// the raw [`EngineData`] as read by the engines [`crate::ParquetHandler`], and a boolean
 /// mask. Rows can be dropped from a scan due to deletion vectors, so we communicate back both
-/// EngineData and information regarding whether a row should be included or not See the docs below
-/// for [`ScanResult::mask`] for details on the mask.
+/// EngineData and information regarding whether a row should be included or not (via an internal
+/// mask). See the docs below for [`ScanResult::full_mask`] for details on the mask.
 pub struct ScanResult {
-    /// Raw engine data as read from the disk for a particular file included in the query
+    /// Raw engine data as read from the disk for a particular file included in the query. Note
+    /// that this data may include data that should be filtered out based on the mask given by
+    /// [`full_mask`].
+    ///
+    /// [`full_mask`]: #method.full_mask
     pub raw_data: DeltaResult<Box<dyn EngineData>>,
     /// Raw row mask.
     // TODO(nick) this should be allocated by the engine
@@ -137,6 +141,8 @@ impl ScanResult {
     /// you are using the default engine and plan to call arrow's `filter_record_batch`, you _need_
     /// to extend the mask to the full length of the batch or arrow will drop the extra
     /// rows. Calling [`full_mask`] instead avoids this risk entirely, at the cost of a copy.
+    ///
+    /// [`full_mask`]: #method.full_mask
     pub fn raw_mask(&self) -> Option<&Vec<bool>> {
         self.raw_mask.as_ref()
     }
