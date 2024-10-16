@@ -35,10 +35,6 @@ delta-rs
 https://github.com/delta-io/delta-rs/
 Licence: Apache-2.0
 
-either
-https://github.com/bluss/either
-Licence: MIT OR Apache-2.0
-
 fix-hidden-lifetime-bug
 https://github.com/danielhenrymantilla/fix-hidden-lifetime-bug.rs
 Licence: Zlib OR MIT OR Apache-2.0

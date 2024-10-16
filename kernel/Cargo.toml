@@ -17,7 +17,6 @@ all-features = true
 [dependencies]
 bytes = "1.7"
 chrono = { version = "0.4" }
-either = "1.13"
 fix-hidden-lifetime-bug = "0.2"
 indexmap = "2.5.0"
 itertools = "0.13"
