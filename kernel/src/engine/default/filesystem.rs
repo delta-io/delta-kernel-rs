@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::stream::StreamExt;
+use itertools::Itertools;
 use object_store::path::Path;
-use object_store::DynObjectStore;
+use object_store::{DynObjectStore, ObjectStore};
 use url::Url;
 
 use crate::engine::default::executor::TaskExecutor;
@@ -12,15 +13,22 @@ use crate::{DeltaResult, Error, FileMeta, FileSlice, FileSystemClient};
 #[derive(Debug)]
 pub struct ObjectStoreFileSystemClient<E: TaskExecutor> {
     inner: Arc<DynObjectStore>,
+    has_ordered_listing: bool,
     table_root: Path,
     task_executor: Arc<E>,
     readahead: usize,
 }
 
 impl<E: TaskExecutor> ObjectStoreFileSystemClient<E> {
-    pub fn new(store: Arc<DynObjectStore>, table_root: Path, task_executor: Arc<E>) -> Self {
+    pub(crate) fn new(
+        store: Arc<DynObjectStore>,
+        has_ordered_listing: bool,
+        table_root: Path,
+        task_executor: Arc<E>,
+    ) -> Self {
         Self {
             inner: store,
+            has_ordered_listing,
             table_root,
             task_executor,
             readahead: 10,
@@ -72,7 +80,14 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
             }
         });
 
-        Ok(Box::new(receiver.into_iter()))
+        if !self.has_ordered_listing {
+            // This FS doesn't return things in the order we require
+            let mut fms: Vec<FileMeta> = receiver.into_iter().try_collect()?;
+            fms.sort_unstable();
+            Ok(Box::new(fms.into_iter().map(Ok)))
+        } else {
+            Ok(Box::new(receiver.into_iter()))
+        }
     }
 
     /// Read data specified by the start and end offset from the file.
@@ -144,6 +159,8 @@ mod tests {
     use object_store::{local::LocalFileSystem, ObjectStore};
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::engine::default::DefaultEngine;
+    use crate::Engine;
 
     use itertools::Itertools;
 
@@ -174,6 +191,7 @@ mod tests {
         let prefix = Path::from(url.path());
         let client = ObjectStoreFileSystemClient::new(
             store,
+            false, // don't have ordered listing
             prefix,
             Arc::new(TokioBackgroundExecutor::new()),
         );
@@ -194,5 +212,43 @@ mod tests {
         assert_eq!(data[0], Bytes::from("kernel"));
         assert_eq!(data[1], Bytes::from("data"));
         assert_eq!(data[2], Bytes::from("el-da"));
+    }
+
+    #[tokio::test]
+    async fn test_default_engine_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_store = LocalFileSystem::new_with_prefix(tmp.path()).unwrap();
+        let data = Bytes::from("kernel-data");
+
+        let expected_names: Vec<String> = (0..10)
+            .map(|i| format!("_delta_log/{:0>20}.json", i))
+            .collect();
+
+        // put them in in reverse order
+        for name in expected_names.iter().rev() {
+            tmp_store
+                .put(&Path::from(name.as_str()), data.clone().into())
+                .await
+                .unwrap();
+        }
+
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let store = Arc::new(LocalFileSystem::new());
+        let prefix = Path::from_url_path(url.path()).expect("Couldn't get path");
+        let engine = DefaultEngine::new(store, prefix, Arc::new(TokioBackgroundExecutor::new()));
+        let client = engine.get_file_system_client();
+
+        let files = client.list_from(&Url::parse("file://").unwrap()).unwrap();
+        let mut len = 0;
+        for (file, expected) in files.zip(expected_names.iter()) {
+            assert!(
+                file.as_ref().unwrap().location.path().ends_with(expected),
+                "{} does not end with {}",
+                file.unwrap().location.path(),
+                expected
+            );
+            len += 1;
+        }
+        assert_eq!(len, 10, "list_from should have returned 10 files");
     }
 }

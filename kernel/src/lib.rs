@@ -50,8 +50,8 @@
     rust_2021_compatibility
 )]
 
-use std::ops::Range;
 use std::sync::Arc;
+use std::{cmp::Ordering, ops::Range};
 
 use bytes::Bytes;
 use url::Url;
@@ -109,6 +109,18 @@ pub struct FileMeta {
     pub last_modified: i64,
     /// The size in bytes of the object
     pub size: usize,
+}
+
+impl Ord for FileMeta {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.location.cmp(&other.location)
+    }
+}
+
+impl PartialOrd for FileMeta {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// Trait for implementing an Expression evaluator.
