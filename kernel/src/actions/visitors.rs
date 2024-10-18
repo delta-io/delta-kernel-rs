@@ -513,7 +513,7 @@ mod tests {
                 app_id: "myApp2".to_string(),
                 version: 4,
                 last_updated: Some(1670892998177),
-            },)
+            })
         );
         assert_eq!(
             actual.remove("myApp"),

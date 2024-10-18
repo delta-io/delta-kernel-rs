@@ -952,11 +952,7 @@ mod tests {
     fn mask_with_map() {
         let requested_schema = Arc::new(StructType::new([StructField::new(
             "map",
-            DataType::Map(Box::new(MapType::new(
-                DataType::INTEGER,
-                DataType::STRING,
-                false,
-            ))),
+            MapType::new(DataType::INTEGER, DataType::STRING, false),
             false,
         )]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new_map(

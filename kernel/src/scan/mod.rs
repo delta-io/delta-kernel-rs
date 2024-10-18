@@ -489,7 +489,7 @@ fn transform_to_logical_internal(
                         partition_values.get(name),
                         field.data_type(),
                     )?;
-                    Ok::<Expression, Error>(Expression::Literal(value_expression))
+                    Ok::<Expression, Error>(value_expression.into())
                 }
                 ColumnType::Selected(field_name) => Ok(Expression::column(field_name)),
             })

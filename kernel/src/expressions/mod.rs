@@ -136,6 +136,13 @@ pub enum Expression {
     Column(String),
     /// A struct computed from a Vec of expressions
     Struct(Vec<Expression>),
+    /// A unary operation.
+    UnaryOperation {
+        /// The operator.
+        op: UnaryOperator,
+        /// The expression.
+        expr: Box<Expression>,
+    },
     /// A binary operation.
     BinaryOperation {
         /// The operator.
@@ -144,13 +151,6 @@ pub enum Expression {
         left: Box<Expression>,
         /// The right-hand side of the operation.
         right: Box<Expression>,
-    },
-    /// A unary operation.
-    UnaryOperation {
-        /// The operator.
-        op: UnaryOperator,
-        /// The expression.
-        expr: Box<Expression>,
     },
     VariadicOperation {
         /// The operator.
@@ -236,7 +236,7 @@ impl Expression {
     }
 
     /// Create a new struct expression
-    pub fn struct_expr(exprs: impl IntoIterator<Item = Self>) -> Self {
+    pub fn struct_from(exprs: impl IntoIterator<Item = Self>) -> Self {
         Self::Struct(exprs.into_iter().collect())
     }
 
@@ -288,57 +288,57 @@ impl Expression {
     }
 
     /// Create a new expression `self == other`
-    pub fn eq(self, other: Self) -> Self {
+    pub fn eq(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::Equal, self, other)
     }
 
     /// Create a new expression `self != other`
-    pub fn ne(self, other: Self) -> Self {
+    pub fn ne(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::NotEqual, self, other)
     }
 
     /// Create a new expression `self <= other`
-    pub fn le(self, other: Self) -> Self {
+    pub fn le(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::LessThanOrEqual, self, other)
     }
 
     /// Create a new expression `self < other`
-    pub fn lt(self, other: Self) -> Self {
+    pub fn lt(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::LessThan, self, other)
     }
 
     /// Create a new expression `self >= other`
-    pub fn ge(self, other: Self) -> Self {
+    pub fn ge(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::GreaterThanOrEqual, self, other)
     }
 
     /// Create a new expression `self > other`
-    pub fn gt(self, other: Self) -> Self {
+    pub fn gt(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::GreaterThan, self, other)
     }
 
     /// Create a new expression `self >= other`
-    pub fn gt_eq(self, other: Self) -> Self {
+    pub fn gt_eq(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::GreaterThanOrEqual, self, other)
     }
 
     /// Create a new expression `self <= other`
-    pub fn lt_eq(self, other: Self) -> Self {
+    pub fn lt_eq(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::LessThanOrEqual, self, other)
     }
 
     /// Create a new expression `self AND other`
-    pub fn and(self, other: Self) -> Self {
-        Self::and_from([self, other])
+    pub fn and(self, other: impl Into<Self>) -> Self {
+        Self::and_from([self, other.into()])
     }
 
     /// Create a new expression `self OR other`
-    pub fn or(self, other: Self) -> Self {
-        Self::or_from([self, other])
+    pub fn or(self, other: impl Into<Self>) -> Self {
+        Self::or_from([self, other.into()])
     }
 
     /// Create a new expression `DISTINCT(self, other)`
-    pub fn distinct(self, other: Self) -> Self {
+    pub fn distinct(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::Distinct, self, other)
     }
 
@@ -376,34 +376,34 @@ impl std::ops::Not for Expression {
     }
 }
 
-impl std::ops::Add<Expression> for Expression {
+impl<R: Into<Expression>> std::ops::Add<R> for Expression {
     type Output = Self;
 
-    fn add(self, rhs: Expression) -> Self::Output {
+    fn add(self, rhs: R) -> Self::Output {
         Self::binary(BinaryOperator::Plus, self, rhs)
     }
 }
 
-impl std::ops::Sub<Expression> for Expression {
+impl<R: Into<Expression>> std::ops::Sub<R> for Expression {
     type Output = Self;
 
-    fn sub(self, rhs: Expression) -> Self {
+    fn sub(self, rhs: R) -> Self {
         Self::binary(BinaryOperator::Minus, self, rhs)
     }
 }
 
-impl std::ops::Mul<Expression> for Expression {
+impl<R: Into<Expression>> std::ops::Mul<R> for Expression {
     type Output = Self;
 
-    fn mul(self, rhs: Expression) -> Self {
+    fn mul(self, rhs: R) -> Self {
         Self::binary(BinaryOperator::Multiply, self, rhs)
     }
 }
 
-impl std::ops::Div<Expression> for Expression {
+impl<R: Into<Expression>> std::ops::Div<R> for Expression {
     type Output = Self;
 
-    fn div(self, rhs: Expression) -> Self {
+    fn div(self, rhs: R) -> Self {
         Self::binary(BinaryOperator::Divide, self, rhs)
     }
 }
@@ -417,38 +417,26 @@ mod tests {
         let col_ref = Expr::column("x");
         let cases = [
             (col_ref.clone(), "Column(x)"),
-            (col_ref.clone().eq(Expr::literal(2)), "Column(x) = 2"),
+            (col_ref.clone().eq(2), "Column(x) = 2"),
+            ((col_ref.clone() - 4).lt(10), "Column(x) - 4 < 10"),
+            ((col_ref.clone() + 4) / 10 * 42, "Column(x) + 4 / 10 * 42"),
             (
-                (col_ref.clone() - Expr::literal(4)).lt(Expr::literal(10)),
-                "Column(x) - 4 < 10",
-            ),
-            (
-                (col_ref.clone() + Expr::literal(4)) / Expr::literal(10) * Expr::literal(42),
-                "Column(x) + 4 / 10 * 42",
-            ),
-            (
-                col_ref
-                    .clone()
-                    .gt_eq(Expr::literal(2))
-                    .and(col_ref.clone().lt_eq(Expr::literal(10))),
+                col_ref.clone().gt_eq(2).and(col_ref.clone().lt_eq(10)),
                 "AND(Column(x) >= 2, Column(x) <= 10)",
             ),
             (
                 Expr::and_from([
-                    col_ref.clone().gt_eq(Expr::literal(2)),
-                    col_ref.clone().lt_eq(Expr::literal(10)),
-                    col_ref.clone().lt_eq(Expr::literal(100)),
+                    col_ref.clone().gt_eq(2),
+                    col_ref.clone().lt_eq(10),
+                    col_ref.clone().lt_eq(100),
                 ]),
                 "AND(Column(x) >= 2, Column(x) <= 10, Column(x) <= 100)",
             ),
             (
-                col_ref
-                    .clone()
-                    .gt(Expr::literal(2))
-                    .or(col_ref.clone().lt(Expr::literal(10))),
+                col_ref.clone().gt(2).or(col_ref.clone().lt(10)),
                 "OR(Column(x) > 2, Column(x) < 10)",
             ),
-            (col_ref.eq(Expr::literal("foo")), "Column(x) = 'foo'"),
+            (col_ref.eq("foo"), "Column(x) = 'foo'"),
         ];
 
         for (expr, expected) in cases {

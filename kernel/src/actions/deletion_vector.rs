@@ -59,7 +59,7 @@ impl DeletionVectorDescriptor {
                 let path_len = self.path_or_inline_dv.len();
                 require!(
                     path_len >= 20,
-                    Error::deletion_vector("Invalid length {path_len}, must be >= 20",)
+                    Error::deletion_vector("Invalid length {path_len}, must be >= 20")
                 );
                 let prefix_len = path_len - 20;
                 let decoded = z85::decode(&self.path_or_inline_dv[prefix_len..])

@@ -213,27 +213,21 @@ impl TryFrom<&ArrowDataType> for DataType {
             ArrowDataType::Struct(fields) => {
                 DataType::try_struct_type(fields.iter().map(|field| field.as_ref().try_into()))
             }
-            ArrowDataType::List(field) => Ok(DataType::Array(Box::new(ArrayType::new(
-                (*field).data_type().try_into()?,
-                (*field).is_nullable(),
-            )))),
-            ArrowDataType::LargeList(field) => Ok(DataType::Array(Box::new(ArrayType::new(
-                (*field).data_type().try_into()?,
-                (*field).is_nullable(),
-            )))),
-            ArrowDataType::FixedSizeList(field, _) => Ok(DataType::Array(Box::new(
-                ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()),
-            ))),
+            ArrowDataType::List(field) => {
+                Ok(ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()).into())
+            }
+            ArrowDataType::LargeList(field) => {
+                Ok(ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()).into())
+            }
+            ArrowDataType::FixedSizeList(field, _) => {
+                Ok(ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()).into())
+            }
             ArrowDataType::Map(field, _) => {
                 if let ArrowDataType::Struct(struct_fields) = field.data_type() {
                     let key_type = DataType::try_from(struct_fields[0].data_type())?;
                     let value_type = DataType::try_from(struct_fields[1].data_type())?;
                     let value_type_nullable = struct_fields[1].is_nullable();
-                    Ok(DataType::Map(Box::new(MapType::new(
-                        key_type,
-                        value_type,
-                        value_type_nullable,
-                    ))))
+                    Ok(MapType::new(key_type, value_type, value_type_nullable).into())
                 } else {
                     panic!("DataType::Map should contain a struct field child");
                 }

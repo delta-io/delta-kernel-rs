@@ -18,8 +18,8 @@ use crate::{Engine, EngineData, ExpressionEvaluator, JsonHandler};
 /// by the default for tightBounds being true, so we have to check if it's EITHER `null` OR `true`
 fn get_tight_null_expr(null_col: String) -> Expr {
     Expr::and(
-        Expr::distinct(Expr::column("tightBounds"), Expr::literal(false)),
-        Expr::gt(Expr::column(null_col), Expr::literal(0i64)),
+        Expr::distinct(Expr::column("tightBounds"), false),
+        Expr::gt(Expr::column(null_col), 0i64),
     )
 }
 
@@ -29,7 +29,7 @@ fn get_tight_null_expr(null_col: String) -> Expr {
 /// doesn't help us)
 fn get_wide_null_expr(null_col: String) -> Expr {
     Expr::and(
-        Expr::eq(Expr::column("tightBounds"), Expr::literal(false)),
+        Expr::eq(Expr::column("tightBounds"), false),
         Expr::eq(Expr::column("numRecords"), Expr::column(null_col)),
     )
 }
@@ -39,7 +39,7 @@ fn get_wide_null_expr(null_col: String) -> Expr {
 /// the default for tightBounds being true, so we have to check if it's EITHER `null` OR `true`
 fn get_tight_not_null_expr(null_col: String) -> Expr {
     Expr::and(
-        Expr::distinct(Expr::column("tightBounds"), Expr::literal(false)),
+        Expr::distinct(Expr::column("tightBounds"), false),
         Expr::lt(Expr::column(null_col), Expr::column("numRecords")),
     )
 }
@@ -50,7 +50,7 @@ fn get_tight_not_null_expr(null_col: String) -> Expr {
 /// there is a possibility of a NOT null
 fn get_wide_not_null_expr(null_col: String) -> Expr {
     Expr::and(
-        Expr::eq(Expr::column("tightBounds"), Expr::literal(false)),
+        Expr::eq(Expr::column("tightBounds"), false),
         Expr::ne(Expr::column("numRecords"), Expr::column(null_col)),
     )
 }
@@ -127,14 +127,14 @@ fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
                 }
                 NotEqual => {
                     return Some(Expr::or(
-                        Expr::gt(Column(format!("minValues.{}", col)), Literal(val.clone())),
-                        Expr::lt(Column(format!("maxValues.{}", col)), Literal(val.clone())),
+                        Expr::gt(Column(format!("minValues.{}", col)), val.clone()),
+                        Expr::lt(Column(format!("maxValues.{}", col)), val.clone()),
                     ));
                 }
                 _ => return None, // unsupported operation
             };
             let col = format!("{}.{}", stats_col, col);
-            Some(Expr::binary(op, Column(col), Literal(val.clone())))
+            Some(Expr::binary(op, Column(col), val.clone()))
         }
         // push down Not by inverting everything below it
         UnaryOperation { op: Not, expr } => as_inverted_data_skipping_predicate(expr),
@@ -187,7 +187,7 @@ impl DataSkippingFilter {
         });
         static STATS_EXPR: LazyLock<Expr> = LazyLock::new(|| Expr::column("add.stats"));
         static FILTER_EXPR: LazyLock<Expr> =
-            LazyLock::new(|| Expr::column("predicate").distinct(Expr::literal(false)));
+            LazyLock::new(|| Expr::column("predicate").distinct(false));
 
         let predicate = predicate.as_deref()?;
         debug!("Creating a data skipping filter for {}", &predicate);
@@ -247,7 +247,7 @@ impl DataSkippingFilter {
 
         let skipping_evaluator = engine.get_expression_handler().get_evaluator(
             stats_schema.clone(),
-            Expr::struct_expr([as_data_skipping_predicate(predicate)?]),
+            Expr::struct_from([as_data_skipping_predicate(predicate)?]),
             PREDICATE_SCHEMA.clone(),
         );
 
