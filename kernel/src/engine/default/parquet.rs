@@ -16,7 +16,9 @@ use crate::engine::arrow_utils::{generate_mask, get_requested_indices, reorder_s
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Error, Expression, FileDataReadResultIterator, FileMeta, ParquetHandler};
+use crate::{
+    DeltaResult, Error, ExpressionRef, FileDataReadResultIterator, FileMeta, ParquetHandler,
+};
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -48,7 +50,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        predicate: Option<Expression>,
+        predicate: Option<ExpressionRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         if files.is_empty() {
             return Ok(Box::new(std::iter::empty()));
@@ -90,7 +92,7 @@ struct ParquetOpener {
     // projection: Arc<[usize]>,
     batch_size: usize,
     table_schema: SchemaRef,
-    predicate: Option<Expression>,
+    predicate: Option<ExpressionRef>,
     limit: Option<usize>,
     store: Arc<DynObjectStore>,
 }
@@ -99,7 +101,7 @@ impl ParquetOpener {
     pub(crate) fn new(
         batch_size: usize,
         table_schema: SchemaRef,
-        predicate: Option<Expression>,
+        predicate: Option<ExpressionRef>,
         store: Arc<DynObjectStore>,
     ) -> Self {
         Self {
@@ -166,14 +168,18 @@ impl FileOpener for ParquetOpener {
 /// Implements [`FileOpener`] for a opening a parquet file from a presigned URL
 struct PresignedUrlOpener {
     batch_size: usize,
-    predicate: Option<Expression>,
+    predicate: Option<ExpressionRef>,
     limit: Option<usize>,
     table_schema: SchemaRef,
     client: reqwest::Client,
 }
 
 impl PresignedUrlOpener {
-    pub(crate) fn new(batch_size: usize, schema: SchemaRef, predicate: Option<Expression>) -> Self {
+    pub(crate) fn new(
+        batch_size: usize,
+        schema: SchemaRef,
+        predicate: Option<ExpressionRef>,
+    ) -> Self {
         Self {
             batch_size,
             table_schema: schema,

@@ -135,10 +135,9 @@ fn scan_impl(
     if let Some(predicate) = predicate {
         let mut visitor_state = KernelExpressionVisitorState::new();
         let exprid = (predicate.visitor)(predicate.predicate, &mut visitor_state);
-        if let Some(predicate) = unwrap_kernel_expression(&mut visitor_state, exprid) {
-            debug!("Got predicate: {}", predicate);
-            scan_builder = scan_builder.with_predicate(predicate);
-        }
+        let predicate = unwrap_kernel_expression(&mut visitor_state, exprid);
+        debug!("Got predicate: {:#?}", predicate);
+        scan_builder = scan_builder.with_predicate(predicate.map(Arc::new));
     }
     Ok(Arc::new(scan_builder.build()?).into())
 }

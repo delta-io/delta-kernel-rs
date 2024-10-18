@@ -3,7 +3,7 @@
 //!
 
 use std::cmp::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ use crate::scan::ScanBuilder;
 use crate::schema::{Schema, SchemaRef};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, FileSystemClient, Version};
-use crate::{EngineData, Expression};
+use crate::{EngineData, Expression, ExpressionRef};
 
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 
@@ -51,7 +51,7 @@ impl LogSegment {
         engine: &dyn Engine,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
-        meta_predicate: Option<Expression>,
+        meta_predicate: Option<ExpressionRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
         let json_client = engine.get_json_handler();
         let commit_stream = json_client
@@ -109,12 +109,14 @@ impl LogSegment {
         let schema = get_log_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
         // filter out log files that do not contain metadata or protocol information
         use Expression as Expr;
-        let meta_predicate = Expr::or(
-            Expr::column("metaData.id").is_not_null(),
-            Expr::column("protocol.minReaderVersion").is_not_null(),
-        );
+        static META_PREDICATE: LazyLock<Option<ExpressionRef>> = LazyLock::new(|| {
+            Some(Arc::new(Expr::or(
+                Expr::column("metaData.id").is_not_null(),
+                Expr::column("protocol.minReaderVersion").is_not_null(),
+            )))
+        });
         // read the same protocol and metadata schema for both commits and checkpoints
-        self.replay(engine, schema.clone(), schema, Some(meta_predicate))
+        self.replay(engine, schema.clone(), schema, META_PREDICATE.clone())
     }
 }
 

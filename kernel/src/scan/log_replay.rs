@@ -9,7 +9,7 @@ use super::ScanData;
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME};
 use crate::actions::{visitors::AddVisitor, visitors::RemoveVisitor, Add, Remove};
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::Expression;
+use crate::expressions::{Expression, ExpressionRef};
 use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType};
 use crate::{DataVisitor, DeltaResult, Engine, EngineData, ExpressionHandler};
 
@@ -111,7 +111,11 @@ static SCAN_ROW_DATATYPE: LazyLock<DataType> = LazyLock::new(|| SCAN_ROW_SCHEMA.
 
 impl LogReplayScanner {
     /// Create a new [`LogReplayScanner`] instance
-    fn new(engine: &dyn Engine, table_schema: &SchemaRef, predicate: &Option<Expression>) -> Self {
+    fn new(
+        engine: &dyn Engine,
+        table_schema: &SchemaRef,
+        predicate: Option<ExpressionRef>,
+    ) -> Self {
         Self {
             filter: DataSkippingFilter::new(engine, table_schema, predicate),
             seen: Default::default(),
@@ -228,7 +232,7 @@ pub fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
     table_schema: &SchemaRef,
-    predicate: &Option<Expression>,
+    predicate: Option<ExpressionRef>,
 ) -> impl Iterator<Item = DeltaResult<ScanData>> {
     let mut log_scanner = LogReplayScanner::new(engine, table_schema, predicate);
     let expression_handler = engine.get_expression_handler();

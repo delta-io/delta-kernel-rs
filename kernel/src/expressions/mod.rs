@@ -121,6 +121,8 @@ pub enum UnaryOperator {
     IsNull,
 }
 
+pub type ExpressionRef = std::sync::Arc<Expression>;
+
 /// A SQL expression.
 ///
 /// These expressions do not track or validate data types, other than the type

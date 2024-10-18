@@ -347,7 +347,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         let scan = snapshot
             .clone()
             .scan_builder()
-            .with_predicate(predicate)
+            .with_predicate(Arc::new(predicate))
             .build()?;
 
         let expected_files = expected_batches.len();
@@ -522,6 +522,7 @@ fn read_table_data(
     mut expected: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from(path))?;
+    let predicate = predicate.map(Arc::new);
     let url = url::Url::from_directory_path(path).unwrap();
     let default_engine = DefaultEngine::try_new(
         &url,
@@ -545,7 +546,7 @@ fn read_table_data(
         let scan = snapshot
             .into_scan_builder()
             .with_schema_opt(read_schema)
-            .with_predicate_opt(predicate.clone())
+            .with_predicate(predicate.clone())
             .build()?;
 
         sort_lines!(expected);

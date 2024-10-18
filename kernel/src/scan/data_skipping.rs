@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::ops::Not;
 use std::sync::{Arc, LazyLock};
 
 use tracing::debug;
@@ -8,7 +7,9 @@ use tracing::debug;
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::actions::{get_log_schema, ADD_NAME};
 use crate::error::DeltaResult;
-use crate::expressions::{BinaryOperator, Expression as Expr, UnaryOperator, VariadicOperator};
+use crate::expressions::{
+    BinaryOperator, Expression as Expr, ExpressionRef, UnaryOperator, VariadicOperator,
+};
 use crate::schema::{DataType, PrimitiveType, SchemaRef, SchemaTransform, StructField, StructType};
 use crate::{Engine, EngineData, ExpressionEvaluator, JsonHandler};
 
@@ -80,7 +81,7 @@ fn as_inverted_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
             as_data_skipping_predicate(&expr)
         }
         VariadicOperation { op, exprs } => {
-            let expr = Expr::variadic(op.invert(), exprs.iter().cloned().map(Expr::not));
+            let expr = Expr::variadic(op.invert(), exprs.iter().cloned().map(|e| !e));
             as_data_skipping_predicate(&expr)
         }
         _ => None,
@@ -179,7 +180,7 @@ impl DataSkippingFilter {
     pub(crate) fn new(
         engine: &dyn Engine,
         table_schema: &SchemaRef,
-        predicate: &Option<Expr>,
+        predicate: Option<ExpressionRef>,
     ) -> Option<Self> {
         static PREDICATE_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
             DataType::struct_type([StructField::new("predicate", DataType::BOOLEAN, true)])
@@ -188,11 +189,7 @@ impl DataSkippingFilter {
         static FILTER_EXPR: LazyLock<Expr> =
             LazyLock::new(|| Expr::column("predicate").distinct(Expr::literal(false)));
 
-        let predicate = match predicate {
-            Some(predicate) => predicate,
-            None => return None,
-        };
-
+        let predicate = predicate.as_deref()?;
         debug!("Creating a data skipping filter for {}", &predicate);
         let field_names: HashSet<_> = predicate.references();
 
