@@ -175,7 +175,7 @@ impl Error {
         Self::FileNotFound(path.to_string())
     }
     pub fn missing_column(name: impl ToString) -> Self {
-        Self::MissingColumn(name.to_string())
+        Self::MissingColumn(name.to_string()).with_backtrace()
     }
     pub fn unexpected_column_type(name: impl ToString) -> Self {
         Self::UnexpectedColumnType(name.to_string())

@@ -41,6 +41,10 @@ struct Cli {
     /// to the aws metadata server, which will fail unless you're on an ec2 instance.
     #[arg(long)]
     public: bool,
+
+    /// Only print the schema of the table
+    #[arg(long)]
+    schema_only: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -89,6 +93,11 @@ fn try_main() -> DeltaResult<()> {
     };
 
     let snapshot = table.snapshot(engine.as_ref(), None)?;
+
+    if cli.schema_only {
+        println!("{:#?}", snapshot.schema());
+        return Ok(());
+    }
 
     let read_schema_opt = cli
         .columns

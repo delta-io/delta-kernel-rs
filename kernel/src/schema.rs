@@ -29,6 +29,17 @@ pub enum MetadataValue {
     Other(serde_json::Value),
 }
 
+impl std::fmt::Display for MetadataValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetadataValue::Number(n) => write!(f, "{n}"),
+            MetadataValue::String(s) => write!(f, "{s}"),
+            MetadataValue::Boolean(b) => write!(f, "{b}"),
+            MetadataValue::Other(v) => write!(f, "{v}"), // just write the json back
+        }
+    }
+}
+
 impl From<String> for MetadataValue {
     fn from(value: String) -> Self {
         Self::String(value)
@@ -165,6 +176,15 @@ impl StructField {
     #[inline]
     pub const fn metadata(&self) -> &HashMap<String, MetadataValue> {
         &self.metadata
+    }
+
+    /// Convert our metadata into a HashMap<String, String>. Note this copies all the data so can be
+    /// expensive for large metadata
+    pub fn metadata_with_string_values(&self) -> HashMap<String, String> {
+        self.metadata
+            .iter()
+            .map(|(key, val)| (key.clone(), val.to_string()))
+            .collect()
     }
 
     pub fn make_physical(&self, mapping_mode: ColumnMappingMode) -> DeltaResult<Self> {
@@ -1090,5 +1110,26 @@ mod tests {
         // Depth limit not hit (full traversal required)
         assert_eq!(check_with_call_count(7), (7, 32));
         assert_eq!(check_with_call_count(8), (7, 32));
+    }
+
+    #[test]
+    fn test_metadata_value_to_string() {
+        assert_eq!(MetadataValue::Number(0).to_string(), "0");
+        assert_eq!(
+            MetadataValue::String("hello".to_string()).to_string(),
+            "hello"
+        );
+        assert_eq!(MetadataValue::Boolean(true).to_string(), "true");
+        assert_eq!(MetadataValue::Boolean(false).to_string(), "false");
+        let object_json = serde_json::json!({ "an": "object" });
+        assert_eq!(
+            MetadataValue::Other(object_json).to_string(),
+            "{\"an\":\"object\"}"
+        );
+        let array_json = serde_json::json!(["an", "array"]);
+        assert_eq!(
+            MetadataValue::Other(array_json).to_string(),
+            "[\"an\",\"array\"]"
+        );
     }
 }

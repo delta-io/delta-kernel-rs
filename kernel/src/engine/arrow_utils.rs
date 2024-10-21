@@ -4,9 +4,10 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
+use crate::engine::ensure_data_types::DataTypeCompat;
 use crate::{
     engine::arrow_data::ArrowEngineData,
-    schema::{DataType, PrimitiveType, Schema, SchemaRef, StructField, StructType},
+    schema::{DataType, Schema, SchemaRef, StructField, StructType},
     utils::require,
     DeltaResult, EngineData, Error,
 };
@@ -58,169 +59,8 @@ pub(crate) use prim_array_cmp;
 /// returns a tuples of (mask_indicies: Vec<parquet_schema_index>, reorder_indicies:
 /// Vec<requested_index>). `mask_indicies` is used for generating the mask for reading from the
 
-fn make_arrow_error(s: String) -> Error {
-    Error::Arrow(arrow_schema::ArrowError::InvalidArgumentError(s))
-}
-
-/// Capture the compatibility between two data-types, as passed to [`ensure_data_types`]
-pub(crate) enum DataTypeCompat {
-    /// The two types are the same
-    Identical,
-    /// What is read from parquet needs to be cast to the associated type
-    NeedsCast(ArrowDataType),
-    /// Types are compatible, but are nested types. This is used when comparing types where casting
-    /// is not desired (i.e. in the expression evaluator)
-    Nested,
-}
-
-// Check if two types can be cast
-fn check_cast_compat(
-    target_type: ArrowDataType,
-    source_type: &ArrowDataType,
-) -> DeltaResult<DataTypeCompat> {
-    use ArrowDataType::*;
-
-    match (source_type, &target_type) {
-        (source_type, target_type) if source_type == target_type => Ok(DataTypeCompat::Identical),
-        (&ArrowDataType::Timestamp(_, _), &ArrowDataType::Timestamp(_, _)) => {
-            // timestamps are able to be cast between each other
-            Ok(DataTypeCompat::NeedsCast(target_type))
-        }
-        // Allow up-casting to a larger type if it's safe and can't cause overflow or loss of precision.
-        (Int8, Int16 | Int32 | Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (Int16, Int32 | Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (Int32, Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (Float32, Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (_, Decimal128(p, s)) if can_upcast_to_decimal(source_type, *p, *s) => {
-            Ok(DataTypeCompat::NeedsCast(target_type))
-        }
-        (Date32, Timestamp(_, None)) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        _ => Err(make_arrow_error(format!(
-            "Incorrect datatype. Expected {}, got {}",
-            target_type, source_type
-        ))),
-    }
-}
-
-// Returns whether the given source type can be safely cast to a decimal with the given precision and scale without
-// loss of information.
-fn can_upcast_to_decimal(
-    source_type: &ArrowDataType,
-    target_precision: u8,
-    target_scale: i8,
-) -> bool {
-    use ArrowDataType::*;
-
-    let (source_precision, source_scale) = match source_type {
-        Decimal128(p, s) => (*p, *s),
-        // Allow converting integers to a decimal that can hold all possible values.
-        Int8 => (3u8, 0i8),
-        Int16 => (5u8, 0i8),
-        Int32 => (10u8, 0i8),
-        Int64 => (20u8, 0i8),
-        _ => return false,
-    };
-
-    target_precision >= source_precision
-        && target_scale >= source_scale
-        && target_precision - source_precision >= (target_scale - source_scale) as u8
-}
-
-/// Ensure a kernel data type matches an arrow data type. This only ensures that the actual "type"
-/// is the same, but does so recursively into structs, and ensures lists and maps have the correct
-/// associated types as well. This returns an `Ok(DataTypeCompat)` if the types are compatible, and
-/// will indicate what kind of compatibility they have, or an error if the types do not match. If
-/// there is a `struct` type included, we only ensure that the named fields that the kernel is
-/// asking for exist, and that for those fields the types match. Un-selected fields are ignored.
-pub(crate) fn ensure_data_types(
-    kernel_type: &DataType,
-    arrow_type: &ArrowDataType,
-) -> DeltaResult<DataTypeCompat> {
-    match (kernel_type, arrow_type) {
-        (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
-            check_cast_compat(kernel_type.try_into()?, arrow_type)
-        }
-        (&DataType::BOOLEAN, ArrowDataType::Boolean)
-        | (&DataType::STRING, ArrowDataType::Utf8)
-        | (&DataType::BINARY, ArrowDataType::Binary) => {
-            // strings, bools, and binary  aren't primitive in arrow
-            Ok(DataTypeCompat::Identical)
-        }
-        (
-            DataType::Primitive(PrimitiveType::Decimal(kernel_prec, kernel_scale)),
-            ArrowDataType::Decimal128(arrow_prec, arrow_scale),
-        ) if arrow_prec == kernel_prec && *arrow_scale == *kernel_scale as i8 => {
-            // decimal isn't primitive in arrow. cast above is okay as we limit range
-            Ok(DataTypeCompat::Identical)
-        }
-        (DataType::Array(inner_type), ArrowDataType::List(arrow_list_type)) => {
-            let kernel_array_type = &inner_type.element_type;
-            let arrow_list_type = arrow_list_type.data_type();
-            ensure_data_types(kernel_array_type, arrow_list_type)
-        }
-        (DataType::Map(kernel_map_type), ArrowDataType::Map(arrow_map_type, _)) => {
-            if let ArrowDataType::Struct(fields) = arrow_map_type.data_type() {
-                let mut fields = fields.iter();
-                if let Some(key_type) = fields.next() {
-                    ensure_data_types(&kernel_map_type.key_type, key_type.data_type())?;
-                } else {
-                    return Err(make_arrow_error(
-                        "Arrow map struct didn't have a key type".to_string(),
-                    ));
-                }
-                if let Some(value_type) = fields.next() {
-                    ensure_data_types(&kernel_map_type.value_type, value_type.data_type())?;
-                } else {
-                    return Err(make_arrow_error(
-                        "Arrow map struct didn't have a value type".to_string(),
-                    ));
-                }
-                if fields.next().is_some() {
-                    return Err(Error::generic("map fields had more than 2 members"));
-                }
-                Ok(DataTypeCompat::Nested)
-            } else {
-                Err(make_arrow_error(
-                    "Arrow map type wasn't a struct.".to_string(),
-                ))
-            }
-        }
-        (DataType::Struct(kernel_fields), ArrowDataType::Struct(arrow_fields)) => {
-            // build a list of kernel fields that matches the order of the arrow fields
-            let mapped_fields = arrow_fields
-                .iter()
-                .filter_map(|f| kernel_fields.fields.get(f.name()));
-
-            // keep track of how many fields we matched up
-            let mut found_fields = 0;
-            // ensure that for the fields that we found, the types match
-            for (kernel_field, arrow_field) in mapped_fields.zip(arrow_fields) {
-                ensure_data_types(&kernel_field.data_type, arrow_field.data_type())?;
-                found_fields += 1;
-            }
-
-            // require that we found the number of fields that we requested.
-            require!(kernel_fields.fields.len() == found_fields, {
-                let arrow_field_map: HashSet<&String> =
-                    HashSet::from_iter(arrow_fields.iter().map(|f| f.name()));
-                let missing_field_names = kernel_fields
-                    .fields
-                    .keys()
-                    .filter(|kernel_field| !arrow_field_map.contains(kernel_field))
-                    .take(5)
-                    .join(", ");
-                make_arrow_error(format!(
-                    "Missing Struct fields {} (Up to five missing fields shown)",
-                    missing_field_names
-                ))
-            });
-            Ok(DataTypeCompat::Nested)
-        }
-        _ => Err(make_arrow_error(format!(
-            "Incorrect datatype. Expected {}, got {}",
-            kernel_type, arrow_type
-        ))),
-    }
+pub(crate) fn make_arrow_error(s: impl Into<String>) -> Error {
+    Error::Arrow(arrow_schema::ArrowError::InvalidArgumentError(s.into())).with_backtrace()
 }
 
 /*
@@ -516,7 +356,15 @@ fn get_indices(
                     }
                 }
                 _ => {
-                    match ensure_data_types(&requested_field.data_type, field.data_type())? {
+                    // we don't care about matching on nullability or metadata here so pass `false`
+                    // as the final argument. These can differ between the delta schema and the
+                    // parquet schema without causing issues in reading the data. We fix them up in
+                    // expression evaluation later.
+                    match super::ensure_data_types::ensure_data_types(
+                        &requested_field.data_type,
+                        field.data_type(),
+                        false,
+                    )? {
                         DataTypeCompat::Identical => {
                             reorder_indices.push(ReorderIndex::identity(index))
                         }
@@ -636,6 +484,7 @@ pub(crate) fn reorder_struct_array(
     input_data: StructArray,
     requested_ordering: &[ReorderIndex],
 ) -> DeltaResult<StructArray> {
+    debug!("Reordering {input_data:?} with ordering: {requested_ordering:?}");
     if !ordering_needs_transform(requested_ordering) {
         // indices is already sorted, meaning we requested in the order that the columns were
         // stored in the parquet
@@ -944,7 +793,6 @@ mod tests {
             ArrowField::new("s", ArrowDataType::Int32, true),
         ]));
         let res = get_requested_indices(&requested_schema, &parquet_schema);
-        println!("{res:#?}");
         assert!(res.is_err());
     }
 
@@ -1559,62 +1407,5 @@ mod tests {
         let expect_reorder = vec![];
         assert_eq!(mask_indices, expect_mask);
         assert_eq!(reorder_indices, expect_reorder);
-    }
-
-    #[test]
-    fn accepts_safe_decimal_casts() {
-        use super::can_upcast_to_decimal;
-        use ArrowDataType::*;
-
-        assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 0i8));
-        assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 1i8));
-        assert!(can_upcast_to_decimal(&Decimal128(5, -2), 6u8, -2i8));
-        assert!(can_upcast_to_decimal(&Decimal128(5, -2), 6u8, -1i8));
-        assert!(can_upcast_to_decimal(&Decimal128(5, 1), 6u8, 1i8));
-        assert!(can_upcast_to_decimal(&Decimal128(5, 1), 6u8, 2i8));
-        assert!(can_upcast_to_decimal(
-            &Decimal128(10, 5),
-            arrow_schema::DECIMAL128_MAX_PRECISION,
-            arrow_schema::DECIMAL128_MAX_SCALE - 5
-        ));
-
-        assert!(can_upcast_to_decimal(&Int8, 3u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int8, 4u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int8, 4u8, 1i8));
-        assert!(can_upcast_to_decimal(&Int8, 7u8, 2i8));
-
-        assert!(can_upcast_to_decimal(&Int16, 5u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int16, 6u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int16, 6u8, 1i8));
-        assert!(can_upcast_to_decimal(&Int16, 9u8, 2i8));
-
-        assert!(can_upcast_to_decimal(&Int32, 10u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int32, 11u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int32, 11u8, 1i8));
-        assert!(can_upcast_to_decimal(&Int32, 14u8, 2i8));
-
-        assert!(can_upcast_to_decimal(&Int64, 20u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int64, 21u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int64, 21u8, 1i8));
-        assert!(can_upcast_to_decimal(&Int64, 24u8, 2i8));
-    }
-
-    #[test]
-    fn rejects_unsafe_decimal_casts() {
-        use super::can_upcast_to_decimal;
-        use ArrowDataType::*;
-
-        assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, 1i8));
-        assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, -1i8));
-        assert!(!can_upcast_to_decimal(&Decimal128(5, 2), 6u8, 4i8));
-
-        assert!(!can_upcast_to_decimal(&Int8, 2u8, 0i8));
-        assert!(!can_upcast_to_decimal(&Int8, 3u8, 1i8));
-        assert!(!can_upcast_to_decimal(&Int16, 4u8, 0i8));
-        assert!(!can_upcast_to_decimal(&Int16, 5u8, 1i8));
-        assert!(!can_upcast_to_decimal(&Int32, 9u8, 0i8));
-        assert!(!can_upcast_to_decimal(&Int32, 10u8, 1i8));
-        assert!(!can_upcast_to_decimal(&Int64, 19u8, 0i8));
-        assert!(!can_upcast_to_decimal(&Int64, 20u8, 1i8));
     }
 }

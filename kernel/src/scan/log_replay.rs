@@ -80,19 +80,20 @@ impl DataVisitor for AddRemoveVisitor {
 // for `scan_row_schema` in scan/mod.rs! You'll also need to update ScanFileVisitor as the
 // indexes will be off
 pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| {
+    // Note that fields projected out of a nullable struct must be nullable
     Arc::new(StructType::new([
-        StructField::new("path", DataType::STRING, false),
+        StructField::new("path", DataType::STRING, true),
         StructField::new("size", DataType::LONG, true),
         StructField::new("modificationTime", DataType::LONG, true),
         StructField::new("stats", DataType::STRING, true),
         StructField::new(
             "deletionVector",
             StructType::new([
-                StructField::new("storageType", DataType::STRING, false),
-                StructField::new("pathOrInlineDv", DataType::STRING, false),
+                StructField::new("storageType", DataType::STRING, true),
+                StructField::new("pathOrInlineDv", DataType::STRING, true),
                 StructField::new("offset", DataType::INTEGER, true),
-                StructField::new("sizeInBytes", DataType::INTEGER, false),
-                StructField::new("cardinality", DataType::LONG, false),
+                StructField::new("sizeInBytes", DataType::INTEGER, true),
+                StructField::new("cardinality", DataType::LONG, true),
             ]),
             true,
         ),
@@ -100,7 +101,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
             "fileConstantValues",
             StructType::new([StructField::new(
                 "partitionValues",
-                MapType::new(DataType::STRING, DataType::STRING, false),
+                MapType::new(DataType::STRING, DataType::STRING, true),
                 true,
             )]),
             true,

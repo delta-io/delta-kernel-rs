@@ -418,6 +418,7 @@ fn get_state_info(
                 // Add to read schema, store field so we can build a `Column` expression later
                 // if needed (i.e. if we have partition columns)
                 let physical_field = logical_field.make_physical(column_mapping_mode)?;
+                debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                 let physical_name = physical_field.name.clone();
                 read_fields.push(physical_field);
                 Ok(ColumnType::Selected(physical_name))

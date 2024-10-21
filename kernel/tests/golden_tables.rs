@@ -3,9 +3,10 @@
 //! Data (golden tables) are stored in tests/golden_data/<table_name>.tar.zst
 //! Each table directory has a table/ and expected/ subdirectory with the input/output respectively
 
+use arrow::array::AsArray;
 use arrow::{compute::filter_record_batch, record_batch::RecordBatch};
 use arrow_ord::sort::{lexsort_to_indices, SortColumn};
-use arrow_schema::Schema;
+use arrow_schema::{FieldRef, Schema};
 use arrow_select::{concat::concat_batches, take::take};
 use itertools::Itertools;
 use paste::paste;
@@ -17,7 +18,7 @@ use futures::{stream::TryStreamExt, StreamExt};
 use object_store::{local::LocalFileSystem, ObjectStore};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 
-use arrow_array::Array;
+use arrow_array::{Array, StructArray};
 use arrow_schema::DataType;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
@@ -99,52 +100,76 @@ fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
-// copied from DAT
-// Ensure that two schema have the same field names, and dict_id/ordering.
+// Ensure that two sets of  fields have the same names, and dict_id/ordering.
 // We ignore:
 //  - data type: This is checked already in `assert_columns_match`
 //  - nullability: parquet marks many things as nullable that we don't in our schema
 //  - metadata: because that diverges from the real data to the golden tabled data
-fn assert_schema_fields_match(schema: &Schema, golden: &Schema) {
-    for (schema_field, golden_field) in schema.fields.iter().zip(golden.fields.iter()) {
+fn assert_fields_match<'a>(
+    actual: impl Iterator<Item = &'a FieldRef>,
+    expected: impl Iterator<Item = &'a FieldRef>,
+) {
+    for (actual_field, expected_field) in actual.zip(expected) {
         assert!(
-            schema_field.name() == golden_field.name(),
+            actual_field.name() == expected_field.name(),
             "Field names don't match"
         );
         assert!(
-            schema_field.dict_id() == golden_field.dict_id(),
+            actual_field.dict_id() == expected_field.dict_id(),
             "Field dict_id doesn't match"
         );
         assert!(
-            schema_field.dict_is_ordered() == golden_field.dict_is_ordered(),
+            actual_field.dict_is_ordered() == expected_field.dict_is_ordered(),
             "Field dict_is_ordered doesn't match"
         );
     }
 }
 
-// copied from DAT
-// some things are equivalent, but don't show up as equivalent for `==`, so we normalize here
-fn normalize_col(col: Arc<dyn Array>) -> Arc<dyn Array> {
-    if let DataType::Timestamp(unit, Some(zone)) = col.data_type() {
-        if **zone == *"+00:00" {
-            arrow_cast::cast::cast(&col, &DataType::Timestamp(*unit, Some("UTC".into())))
-                .expect("Could not cast to UTC")
-        } else {
-            col
+fn assert_cols_eq(actual: &dyn Array, expected: &dyn Array) {
+    // Our testing only exercises these nested types so far. In the future we may need to expand
+    // this to more types. Any `DataType` with a nested `Field` is a candidate for needing to be
+    // compared this way.
+    match actual.data_type() {
+        DataType::Struct(_) => {
+            let actual_sa = actual.as_struct();
+            let expected_sa = expected.as_struct();
+            assert_eq(actual_sa, expected_sa);
         }
-    } else {
-        col
+        DataType::List(_) => {
+            let actual_la = actual.as_list::<i32>();
+            let expected_la = expected.as_list::<i32>();
+            assert_cols_eq(actual_la.values(), expected_la.values());
+        }
+        DataType::Map(_, _) => {
+            let actual_ma = actual.as_map();
+            let expected_ma = expected.as_map();
+            assert_cols_eq(actual_ma.keys(), expected_ma.keys());
+            assert_cols_eq(actual_ma.values(), expected_ma.values());
+        }
+        _ => {
+            assert_eq!(actual, expected, "Column data didn't match.");
+        }
     }
 }
 
-// copied from DAT
-fn assert_columns_match(actual: &[Arc<dyn Array>], expected: &[Arc<dyn Array>]) {
-    for (actual, expected) in actual.iter().zip(expected) {
-        let actual = normalize_col(actual.clone());
-        let expected = normalize_col(expected.clone());
-        // note that array equality includes data_type equality
-        // See: https://arrow.apache.org/rust/arrow_data/equal/fn.equal.html
-        assert_eq!(&actual, &expected, "Column data didn't match.");
+fn assert_eq(actual: &StructArray, expected: &StructArray) {
+    let actual_fields = actual.fields();
+    let expected_fields = expected.fields();
+    assert_eq!(
+        actual_fields.len(),
+        expected_fields.len(),
+        "Number of fields differed"
+    );
+    assert_fields_match(actual_fields.iter(), expected_fields.iter());
+    let actual_cols = actual.columns();
+    let expected_cols = expected.columns();
+    assert_eq!(
+        actual_cols.len(),
+        expected_cols.len(),
+        "Number of columns differed"
+    );
+    for (actual_col, expected_col) in actual_cols.iter().zip(expected_cols) {
+        assert_cols_eq(actual_col, expected_col);
     }
 }
 
@@ -175,16 +200,14 @@ async fn latest_snapshot_test(
     let expected = read_expected(&expected_path.expect("expect an expected dir")).await?;
 
     let schema: Arc<Schema> = Arc::new(scan.schema().as_ref().try_into()?);
-
     let result = concat_batches(&schema, &batches)?;
     let result = sort_record_batch(result)?;
     let expected = sort_record_batch(expected)?;
-    assert_columns_match(result.columns(), expected.columns());
-    assert_schema_fields_match(expected.schema().as_ref(), result.schema().as_ref());
     assert!(
         expected.num_rows() == result.num_rows(),
         "Didn't have same number of rows"
     );
+    assert_eq(&result.into(), &expected.into());
     Ok(())
 }
 
@@ -389,10 +412,9 @@ golden_test!("snapshot-data3", latest_snapshot_test);
 golden_test!("snapshot-repartitioned", latest_snapshot_test);
 golden_test!("snapshot-vacuumed", latest_snapshot_test);
 
+golden_test!("table-with-columnmapping-mode-name", latest_snapshot_test);
 // TODO fix column mapping
 skip_test!("table-with-columnmapping-mode-id": "id column mapping mode not supported");
-skip_test!("table-with-columnmapping-mode-name":
-  "BUG: Parquet(General('partial projection of MapArray is not supported'))");
 
 // TODO scan at different versions
 golden_test!("time-travel-partition-changes-a", latest_snapshot_test);
