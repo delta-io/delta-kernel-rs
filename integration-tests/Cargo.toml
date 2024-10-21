@@ -1,0 +1,23 @@
+[package]
+name = "integration-tests"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+arrow = "=52.1.0"
+delta_kernel = { path = "../kernel", features = ["arrow-conversion"] }
+
+[patch.'file:///../kernel']
+arrow = "=52.1.0"
+arrow-arith = "=52.1.0"
+arrow-array = "=52.1.0"
+arrow-buffer = "=52.1.0"
+arrow-cast = "=52.1.0"
+arrow-data = "=52.1.0"
+arrow-ord = "=52.1.0"
+arrow-json = "=52.1.0"
+arrow-select = "=52.1.0"
+arrow-schema = "=52.1.0"
+parquet = "=52.1.0"

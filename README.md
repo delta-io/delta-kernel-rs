@@ -63,6 +63,42 @@ We intend to follow [Semantic Versioning](https://semver.org/). However, in the 
 are still unstable. We therefore may break APIs within minor releases (that is, `0.1` -> `0.2`), but
 we will not break APIs in patch releases (`0.1.0` -> `0.1.1`).
 
+## Arrow versioning
+If you enable the `default-engine` or `sync-engine` features, you get an implemenation of the
+`Engine` trait that uses [Arrow] as its data format.
+
+The [`arrow crate`](https://docs.rs/arrow/latest/arrow/) tends to release new major versions rather
+quickly. To enable engines that already integrate arrow to also integrate kernel and not force them
+to track a specific version of arrow that kernel depends on, we take as broad dependecy on arrow
+versions as we can.
+
+This means you can force kernel to rely on the specific arrow version that your engine already uses,
+as long as it falls in that range. You can see the range in the `Cargo.toml` in the same folder as
+this `README.md`.
+
+For example, although arrow 53.x has been released, you can force kernel to compile on 52.2.0 by
+putting the following in your project's `Cargo.toml`:
+
+```toml
+[patch.crates-io]
+arrow = "52.2"
+arrow-arith = "52.2"
+arrow-array = "52.2"
+arrow-buffer = "52.2"
+arrow-cast = "52.2"
+arrow-data = "52.2"
+arrow-ord = "52.2"
+arrow-json = "52.2"
+arrow-select = "52.2"
+arrow-schema = "52.2"
+parquet = "52.2"
+```
+
+Note that unfortunatly patching in `cargo` requires that _exactly one_ version matches your
+specification. If only arrow "52.2.0" has been released the above will work, but if "52.2.1" is
+released, the specification will break and you will need to provide a more restrictive
+specification.
+
 ## Documentation
 
 - [API Docs](https://docs.rs/delta_kernel/latest/delta_kernel/)

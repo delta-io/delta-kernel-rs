@@ -11,6 +11,7 @@
 .cargo/
 target/
 /Cargo.lock
+integration-tests/Cargo.lock
 
 # Project
 acceptance/tests/dat/
