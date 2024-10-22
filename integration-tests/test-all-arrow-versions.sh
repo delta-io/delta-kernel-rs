@@ -27,7 +27,7 @@ test_arrow_version() {
   cargo run
 }
 
-MIN_ARROW_VER="52.0.0"
+MIN_ARROW_VER="53.0.0"
 MAX_ARROW_VER="54.0.0"
 
 for ARROW_VERSION in $(curl -s https://crates.io/api/v1/crates/arrow | jq -r '.versions[].num' | tr -d '\r')

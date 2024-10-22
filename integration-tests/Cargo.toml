@@ -6,18 +6,19 @@ edition = "2021"
 [workspace]
 
 [dependencies]
-arrow = "=52.1.0"
-delta_kernel = { path = "../kernel", features = ["arrow-conversion"] }
+arrow = "=53.0.0"
+delta_kernel = { path = "../kernel", features = ["arrow-conversion", "arrow-expression", "default-engine", "sync-engine"] }
 
 [patch.'file:///../kernel']
-arrow = "=52.1.0"
-arrow-arith = "=52.1.0"
-arrow-array = "=52.1.0"
-arrow-buffer = "=52.1.0"
-arrow-cast = "=52.1.0"
-arrow-data = "=52.1.0"
-arrow-ord = "=52.1.0"
-arrow-json = "=52.1.0"
-arrow-select = "=52.1.0"
-arrow-schema = "=52.1.0"
-parquet = "=52.1.0"
+arrow = "=53.0.0"
+arrow-arith = "=53.0.0"
+arrow-array = "=53.0.0"
+arrow-buffer = "=53.0.0"
+arrow-cast = "=53.0.0"
+arrow-data = "=53.0.0"
+arrow-ord = "=53.0.0"
+arrow-json = "=53.0.0"
+arrow-select = "=53.0.0"
+arrow-schema = "=53.0.0"
+parquet = "=53.0.0"
+object_store = "=0.11.1"

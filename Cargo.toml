@@ -20,18 +20,18 @@ readme = "README.md"
 version = "0.3.1"
 
 [workspace.dependencies]
-arrow = { version = ">=52, <54" }
-arrow-arith = { version = ">=52, <54" }
-arrow-array = { version = ">=52, <54" }
-arrow-buffer = { version = ">=52, <54" }
-arrow-cast = { version = ">=52, <54" }
-arrow-data = { version = ">=52, <54" }
-arrow-ord = { version = ">=52, <54" }
-arrow-json = { version = ">=52, <54" }
-arrow-select = { version = ">=52, <54" }
-arrow-schema = { version = ">=52, <54" }
-parquet = { version = ">=52, <54", features = ["object_store"] }
-object_store = "0.11.0"
+arrow = { version = ">=53, <54" }
+arrow-arith = { version = ">=53, <54" }
+arrow-array = { version = ">=53, <54" }
+arrow-buffer = { version = ">=53, <54" }
+arrow-cast = { version = ">=53, <54" }
+arrow-data = { version = ">=53, <54" }
+arrow-ord = { version = ">=53, <54" }
+arrow-json = { version = ">=53, <54" }
+arrow-select = { version = ">=53, <54" }
+arrow-schema = { version = ">=53, <54" }
+parquet = { version = ">=53, <54", features = ["object_store"] }
+object_store = { version = ">=0.11, <0.12" }
 hdfs-native-object-store = "0.12.0"
 hdfs-native = "0.10.0"
 walkdir = "2.5.0"

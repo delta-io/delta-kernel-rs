@@ -76,28 +76,35 @@ This means you can force kernel to rely on the specific arrow version that your 
 as long as it falls in that range. You can see the range in the `Cargo.toml` in the same folder as
 this `README.md`.
 
-For example, although arrow 53.x has been released, you can force kernel to compile on 52.2.0 by
+For example, although arrow 53.1.0 has been released, you can force kernel to compile on 53.0 by
 putting the following in your project's `Cargo.toml`:
 
 ```toml
 [patch.crates-io]
-arrow = "52.2"
-arrow-arith = "52.2"
-arrow-array = "52.2"
-arrow-buffer = "52.2"
-arrow-cast = "52.2"
-arrow-data = "52.2"
-arrow-ord = "52.2"
-arrow-json = "52.2"
-arrow-select = "52.2"
-arrow-schema = "52.2"
-parquet = "52.2"
+arrow = "53.0"
+arrow-arith = "53.0"
+arrow-array = "53.0"
+arrow-buffer = "53.0"
+arrow-cast = "53.0"
+arrow-data = "53.0"
+arrow-ord = "53.0"
+arrow-json = "53.0"
+arrow-select = "53.0"
+arrow-schema = "53.0"
+parquet = "53.0"
 ```
 
 Note that unfortunatly patching in `cargo` requires that _exactly one_ version matches your
-specification. If only arrow "52.2.0" has been released the above will work, but if "52.2.1" is
-released, the specification will break and you will need to provide a more restrictive
-specification.
+specification. If only arrow "53.0.0" had been released the above will work, but if "53.0.1" where
+to be released, the specification will break and you will need to provide a more restrictive
+specification like `"=53.0.0"`.
+
+### Object Store
+You may also need to patch the `object_store` version used if the version of `parquet` you depend on
+depends on a different version of `object_store`. This can be done by including `object_store` in
+the patch list with the required version. You can find this out by checking the `parquet` [docs.rs
+page](https://docs.rs/parquet/52.2.0/parquet/index.html), switching to the version you want to use,
+and then checking what version of `object_store` it depends on.
 
 ## Documentation
 
