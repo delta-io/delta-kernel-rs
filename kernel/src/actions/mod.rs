@@ -10,7 +10,8 @@ use visitors::{AddVisitor, MetadataVisitor, ProtocolVisitor};
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::schemas::GetStructField;
 use crate::features::{ReaderFeatures, WriterFeatures};
-use crate::{schema::StructType, DeltaResult, EngineData};
+use crate::schema::{SchemaRef, StructType};
+use crate::{DeltaResult, EngineData};
 
 pub mod deletion_vector;
 pub mod set_transaction;
@@ -28,7 +29,9 @@ pub(crate) const PROTOCOL_NAME: &str = "protocol";
 pub(crate) const SET_TRANSACTION_NAME: &str = "txn";
 pub(crate) const COMMIT_INFO_NAME: &str = "commitInfo";
 
-static LOG_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
+static LOG_ADD_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| StructType::new([Option::<Add>::get_struct_field(ADD_NAME)]).into());
+static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     StructType::new([
         Option::<Add>::get_struct_field(ADD_NAME),
         Option::<Remove>::get_struct_field(REMOVE_NAME),
@@ -40,12 +43,19 @@ static LOG_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
         //Option::<Cdc>::get_struct_field(CDC_NAME),
         //Option::<DomainMetadata>::get_struct_field(DOMAIN_METADATA_NAME),
     ])
+    .into()
 });
 
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-fn get_log_schema() -> &'static StructType {
+fn get_log_schema() -> &'static SchemaRef {
     &LOG_SCHEMA
+}
+
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
+fn get_log_add_schema() -> &'static SchemaRef {
+    &LOG_ADD_SCHEMA
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
@@ -194,7 +204,7 @@ impl Add {
     /// Since we always want to parse multiple adds from data, we return a `Vec<Add>`
     pub fn parse_from_data(data: &dyn EngineData) -> DeltaResult<Vec<Add>> {
         let mut visitor = AddVisitor::default();
-        data.extract(get_log_schema().project(&[ADD_NAME])?, &mut visitor)?;
+        data.extract(get_log_add_schema().clone(), &mut visitor)?;
         Ok(visitor.adds)
     }
 

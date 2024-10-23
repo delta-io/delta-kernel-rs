@@ -238,7 +238,7 @@ fn try_main() -> DeltaResult<()> {
             }
         }
         Commands::Actions { forward } => {
-            let log_schema = Arc::new(get_log_schema().clone());
+            let log_schema = get_log_schema();
             let actions = snapshot._log_segment().replay(
                 &engine,
                 log_schema.clone(),
@@ -246,7 +246,7 @@ fn try_main() -> DeltaResult<()> {
                 None,
             )?;
 
-            let mut visitor = LogVisitor::new(&log_schema);
+            let mut visitor = LogVisitor::new(log_schema);
             for action in actions {
                 action?.0.extract(log_schema.clone(), &mut visitor)?;
             }

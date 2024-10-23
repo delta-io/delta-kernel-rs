@@ -346,7 +346,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        actions::{get_log_schema, ADD_NAME, SET_TRANSACTION_NAME},
+        actions::{get_log_add_schema, get_log_schema, SET_TRANSACTION_NAME},
         engine::arrow_data::ArrowEngineData,
         engine::sync::{json::SyncJsonHandler, SyncEngine},
         Engine, EngineData, JsonHandler,
@@ -370,7 +370,7 @@ mod tests {
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
         ]
         .into();
-        let output_schema = Arc::new(get_log_schema().clone());
+        let output_schema = get_log_schema().clone();
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
@@ -433,13 +433,11 @@ mod tests {
             r#"{"add":{"path":"c1=6/c2=a/part-00011-10619b10-b691-4fd0-acc4-2a9608499d7c.c000.snappy.parquet","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":4},\"maxValues\":{\"c3\":4},\"nullCount\":{\"c3\":0}}"}}"#,
         ]
         .into();
-        let output_schema = Arc::new(get_log_schema().clone());
+        let output_schema = get_log_schema().clone();
         let batch = json_handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
-        let add_schema = get_log_schema()
-            .project(&[ADD_NAME])
-            .expect("Can't get add schema");
+        let add_schema = get_log_add_schema().clone();
         let mut add_visitor = AddVisitor::default();
         batch.extract(add_schema, &mut add_visitor).unwrap();
         let add1 = Add {
@@ -497,7 +495,7 @@ mod tests {
             r#"{"txn":{"appId":"myApp2","version": 4, "lastUpdated": 1670892998177}}"#,
         ]
         .into();
-        let output_schema = Arc::new(get_log_schema().clone());
+        let output_schema = get_log_schema().clone();
         let batch = json_handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
