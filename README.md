@@ -41,10 +41,10 @@ asynchronous `Engine` implementation built with [Arrow] and [Tokio].
 ```toml
 # fewer dependencies, requires consumer to implement Engine trait.
 # allows consumers to implement their own in-memory format
-delta_kernel = "0.3"
+delta_kernel = "0.4"
 
 # or turn on the default engine, based on arrow
-delta_kernel = { version = "0.3", features = ["default-engine"] }
+delta_kernel = { version = "0.4", features = ["default-engine"] }
 ```
 
 ### Feature flags

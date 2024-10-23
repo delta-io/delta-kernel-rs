@@ -17,7 +17,7 @@ keywords = ["deltalake", "delta", "datalake"]
 license = "Apache-2.0"
 repository = "https://github.com/delta-incubator/delta-kernel-rs"
 readme = "README.md"
-version = "0.3.1"
+version = "0.4.0"
 
 [workspace.dependencies]
 arrow = { version = ">=53, <54" }
