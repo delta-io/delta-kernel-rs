@@ -5,9 +5,13 @@ use std::fmt::{Display, Formatter};
 
 use itertools::Itertools;
 
+pub use self::column_names::{
+    column_expr, column_name, joined_column_expr, joined_column_name, ColumnName,
+};
 pub use self::scalars::{ArrayData, Scalar, StructData};
 use crate::DataType;
 
+mod column_names;
 mod scalars;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -133,7 +137,7 @@ pub enum Expression {
     /// A literal value.
     Literal(Scalar),
     /// A column reference by name.
-    Column(String),
+    Column(ColumnName),
     /// A struct computed from a Vec of expressions
     Struct(Vec<Expression>),
     /// A unary operation.
@@ -167,11 +171,17 @@ impl<T: Into<Scalar>> From<T> for Expression {
     }
 }
 
+impl From<ColumnName> for Expression {
+    fn from(value: ColumnName) -> Self {
+        Self::Column(value)
+    }
+}
+
 impl Display for Expression {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Literal(l) => write!(f, "{}", l),
-            Self::Column(name) => write!(f, "Column({})", name),
+            Self::Literal(l) => write!(f, "{l}"),
+            Self::Column(name) => write!(f, "Column({name})"),
             Self::Struct(exprs) => write!(
                 f,
                 "Struct({})",
@@ -181,11 +191,11 @@ impl Display for Expression {
                 op: BinaryOperator::Distinct,
                 left,
                 right,
-            } => write!(f, "DISTINCT({}, {})", left, right),
-            Self::BinaryOperation { op, left, right } => write!(f, "{} {} {}", left, op, right),
+            } => write!(f, "DISTINCT({left}, {right})"),
+            Self::BinaryOperation { op, left, right } => write!(f, "{left} {op} {right}"),
             Self::UnaryOperation { op, expr } => match op {
-                UnaryOperator::Not => write!(f, "NOT {}", expr),
-                UnaryOperator::IsNull => write!(f, "{} IS NULL", expr),
+                UnaryOperator::Not => write!(f, "NOT {expr}"),
+                UnaryOperator::IsNull => write!(f, "{expr} IS NULL"),
             },
             Self::VariadicOperation { op, exprs } => match op {
                 VariadicOperator::And => {
@@ -209,21 +219,16 @@ impl Display for Expression {
 
 impl Expression {
     /// Returns a set of columns referenced by this expression.
-    pub fn references(&self) -> HashSet<&str> {
+    pub fn references(&self) -> HashSet<&ColumnName> {
         let mut set = HashSet::new();
 
         for expr in self.walk() {
             if let Self::Column(name) = expr {
-                set.insert(name.as_str());
+                set.insert(name);
             }
         }
 
         set
-    }
-
-    /// Create an new expression for a column reference
-    pub fn column(name: impl ToString) -> Self {
-        Self::Column(name.to_string())
     }
 
     /// Create a new expression for a literal value
@@ -410,11 +415,11 @@ impl<R: Into<Expression>> std::ops::Div<R> for Expression {
 
 #[cfg(test)]
 mod tests {
-    use super::Expression as Expr;
+    use super::{column_expr, Expression as Expr};
 
     #[test]
     fn test_expression_format() {
-        let col_ref = Expr::column("x");
+        let col_ref = column_expr!("x");
         let cases = [
             (col_ref.clone(), "Column(x)"),
             (col_ref.clone().eq(2), "Column(x) = 2"),

@@ -9,7 +9,7 @@ use url::Url;
 
 use crate::actions::deletion_vector::{split_vector, treemap_to_bools, DeletionVectorDescriptor};
 use crate::actions::{get_log_add_schema, get_log_schema, ADD_NAME, REMOVE_NAME};
-use crate::expressions::{Expression, ExpressionRef, Scalar};
+use crate::expressions::{ColumnName, Expression, ExpressionRef, Scalar};
 use crate::features::ColumnMappingMode;
 use crate::scan::state::{DvInfo, Stats};
 use crate::schema::{DataType, Schema, SchemaRef, StructField, StructType};
@@ -160,7 +160,7 @@ impl ScanResult {
 /// to materialize the partition column.
 pub enum ColumnType {
     // A column, selected from the data, as is
-    Selected(String),
+    Selected(ColumnName),
     // A partition column that needs to be added back in
     Partition(usize),
 }
@@ -421,7 +421,8 @@ fn get_state_info(
                 debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                 let physical_name = physical_field.name.clone();
                 read_fields.push(physical_field);
-                Ok(ColumnType::Selected(physical_name))
+                // TODO: Support nested columns!
+                Ok(ColumnType::Selected(ColumnName::new([physical_name])))
             }
         })
         .try_collect()?;
@@ -492,7 +493,7 @@ fn transform_to_logical_internal(
                     )?;
                     Ok::<Expression, Error>(value_expression.into())
                 }
-                ColumnType::Selected(field_name) => Ok(Expression::column(field_name)),
+                ColumnType::Selected(field_name) => Ok(field_name.clone().into()),
             })
             .try_collect()?;
         let read_expression = Expression::Struct(all_fields);
@@ -614,6 +615,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::engine::sync::SyncEngine;
+    use crate::expressions::column_expr;
     use crate::schema::PrimitiveType;
     use crate::Table;
 
@@ -757,7 +759,7 @@ mod tests {
         assert_eq!(data.len(), 1);
 
         // Ineffective predicate pushdown attempted, so the one data file should be returned.
-        let int_col = Expression::column("numeric.ints.int32");
+        let int_col = column_expr!("numeric.ints.int32");
         let value = Expression::literal(1000i32);
         let predicate = Arc::new(int_col.clone().gt(value.clone()));
         let scan = snapshot

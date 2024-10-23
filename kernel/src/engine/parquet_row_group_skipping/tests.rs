@@ -1,4 +1,5 @@
 use super::*;
+use crate::expressions::column_expr;
 use crate::Expression;
 use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use std::fs::File;
@@ -39,21 +40,21 @@ fn test_get_stat_values() {
 
     // The expression doesn't matter -- it just needs to mention all the columns we care about.
     let columns = Expression::and_from(vec![
-        Expression::column("varlen.utf8"),
-        Expression::column("numeric.ints.int64"),
-        Expression::column("numeric.ints.int32"),
-        Expression::column("numeric.ints.int16"),
-        Expression::column("numeric.ints.int8"),
-        Expression::column("numeric.floats.float32"),
-        Expression::column("numeric.floats.float64"),
-        Expression::column("bool"),
-        Expression::column("varlen.binary"),
-        Expression::column("numeric.decimals.decimal32"),
-        Expression::column("numeric.decimals.decimal64"),
-        Expression::column("numeric.decimals.decimal128"),
-        Expression::column("chrono.date32"),
-        Expression::column("chrono.timestamp"),
-        Expression::column("chrono.timestamp_ntz"),
+        column_expr!("varlen.utf8"),
+        column_expr!("numeric.ints.int64"),
+        column_expr!("numeric.ints.int32"),
+        column_expr!("numeric.ints.int16"),
+        column_expr!("numeric.ints.int8"),
+        column_expr!("numeric.floats.float32"),
+        column_expr!("numeric.floats.float64"),
+        column_expr!("bool"),
+        column_expr!("varlen.binary"),
+        column_expr!("numeric.decimals.decimal32"),
+        column_expr!("numeric.decimals.decimal64"),
+        column_expr!("numeric.decimals.decimal128"),
+        column_expr!("chrono.date32"),
+        column_expr!("chrono.timestamp"),
+        column_expr!("chrono.timestamp_ntz"),
     ]);
     let filter = RowGroupFilter::new(metadata.metadata().row_group(0), &columns);
 

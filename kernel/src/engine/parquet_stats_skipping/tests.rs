@@ -1,5 +1,5 @@
 use super::*;
-use crate::expressions::{ArrayData, StructData};
+use crate::expressions::{column_expr, ArrayData, StructData};
 use crate::schema::ArrayType;
 use crate::DataType;
 
@@ -337,7 +337,7 @@ fn test_binary_eq_ne() {
     const LO: Scalar = Scalar::Long(1);
     const MID: Scalar = Scalar::Long(10);
     const HI: Scalar = Scalar::Long(100);
-    let col = &Expression::column("x");
+    let col = &column_expr!("x");
 
     for inverted in [false, true] {
         // negative test -- mismatched column type
@@ -485,7 +485,7 @@ fn test_binary_lt_ge() {
     const LO: Scalar = Scalar::Long(1);
     const MID: Scalar = Scalar::Long(10);
     const HI: Scalar = Scalar::Long(100);
-    let col = &Expression::column("x");
+    let col = &column_expr!("x");
 
     for inverted in [false, true] {
         expect_eq!(
@@ -585,7 +585,7 @@ fn test_binary_le_gt() {
     const LO: Scalar = Scalar::Long(1);
     const MID: Scalar = Scalar::Long(10);
     const HI: Scalar = Scalar::Long(100);
-    let col = &Expression::column("x");
+    let col = &column_expr!("x");
 
     for inverted in [false, true] {
         // negative test -- mismatched column type
@@ -736,7 +736,7 @@ impl ParquetStatsSkippingFilter for NullCountTestFilter {
 fn test_not_null() {
     use UnaryOperator::IsNull;
 
-    let col = &Expression::column("x");
+    let col = &column_expr!("x");
     for inverted in [false, true] {
         expect_eq!(
             NullCountTestFilter::new(None, 10).apply_unary(IsNull, col, inverted),
@@ -809,7 +809,7 @@ impl ParquetStatsSkippingFilter for AllNullTestFilter {
 
 #[test]
 fn test_sql_where() {
-    let col = &Expression::column("x");
+    let col = &column_expr!("x");
     let val = &Expression::literal(1);
     const NULL: Expression = Expression::Literal(Scalar::Null(DataType::BOOLEAN));
     const FALSE: Expression = Expression::Literal(Scalar::Boolean(false));

@@ -8,7 +8,8 @@ use crate::actions::get_log_add_schema;
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
 use crate::expressions::{
-    BinaryOperator, Expression as Expr, ExpressionRef, UnaryOperator, VariadicOperator,
+    column_expr, column_name, joined_column_expr, BinaryOperator, Expression as Expr,
+    ExpressionRef, UnaryOperator, VariadicOperator,
 };
 use crate::schema::{DataType, PrimitiveType, SchemaRef, SchemaTransform, StructField, StructType};
 use crate::{Engine, EngineData, ExpressionEvaluator, JsonHandler};
@@ -16,10 +17,10 @@ use crate::{Engine, EngineData, ExpressionEvaluator, JsonHandler};
 /// Get the expression that checks if a col could be null, assuming tight_bounds = true. In this
 /// case a column can contain null if any value > 0 is in the nullCount. This is further complicated
 /// by the default for tightBounds being true, so we have to check if it's EITHER `null` OR `true`
-fn get_tight_null_expr(null_col: String) -> Expr {
+fn get_tight_null_expr(null_col: Expr) -> Expr {
     Expr::and(
-        Expr::distinct(Expr::column("tightBounds"), false),
-        Expr::gt(Expr::column(null_col), 0i64),
+        Expr::distinct(column_expr!("tightBounds"), false),
+        Expr::gt(null_col, 0i64),
     )
 }
 
@@ -27,20 +28,20 @@ fn get_tight_null_expr(null_col: String) -> Expr {
 /// case, we can only check if the WHOLE column is null, by checking if the number of records is
 /// equal to the null count, since all other values of nullCount must be ignored (except 0, which
 /// doesn't help us)
-fn get_wide_null_expr(null_col: String) -> Expr {
+fn get_wide_null_expr(null_col: Expr) -> Expr {
     Expr::and(
-        Expr::eq(Expr::column("tightBounds"), false),
-        Expr::eq(Expr::column("numRecords"), Expr::column(null_col)),
+        Expr::eq(column_expr!("tightBounds"), false),
+        Expr::eq(column_expr!("numRecords"), null_col),
     )
 }
 
 /// Get the expression that checks if a col could NOT be null, assuming tight_bounds = true. In this
 /// case a column has a NOT NULL record if nullCount < numRecords. This is further complicated by
 /// the default for tightBounds being true, so we have to check if it's EITHER `null` OR `true`
-fn get_tight_not_null_expr(null_col: String) -> Expr {
+fn get_tight_not_null_expr(null_col: Expr) -> Expr {
     Expr::and(
-        Expr::distinct(Expr::column("tightBounds"), false),
-        Expr::lt(Expr::column(null_col), Expr::column("numRecords")),
+        Expr::distinct(column_expr!("tightBounds"), false),
+        Expr::lt(null_col, column_expr!("numRecords")),
     )
 }
 
@@ -48,10 +49,10 @@ fn get_tight_not_null_expr(null_col: String) -> Expr {
 /// this case, we can only check if the WHOLE column null, by checking if the nullCount ==
 /// numRecords. So by inverting that check and seeing if nullCount != numRecords, we can check if
 /// there is a possibility of a NOT null
-fn get_wide_not_null_expr(null_col: String) -> Expr {
+fn get_wide_not_null_expr(null_col: Expr) -> Expr {
     Expr::and(
-        Expr::eq(Expr::column("tightBounds"), false),
-        Expr::ne(Expr::column("numRecords"), Expr::column(null_col)),
+        Expr::eq(column_expr!("tightBounds"), false),
+        Expr::ne(column_expr!("numRecords"), null_col),
     )
 }
 
@@ -65,7 +66,7 @@ fn as_inverted_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
                 // to check if a column could NOT have a null, we need two different checks, to see
                 // if the bounds are tight and then to actually do the check
                 if let Column(col) = expr.as_ref() {
-                    let null_col = format!("nullCount.{col}");
+                    let null_col = joined_column_expr!("nullCount", col);
                     Some(Expr::or(
                         get_tight_not_null_expr(null_col.clone()),
                         get_wide_not_null_expr(null_col),
@@ -117,8 +118,8 @@ fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
                 _ => return None, // unsupported combination of operands
             };
             let stats_col = match op {
-                LessThan | LessThanOrEqual => "minValues",
-                GreaterThan | GreaterThanOrEqual => "maxValues",
+                LessThan | LessThanOrEqual => column_name!("minValues"),
+                GreaterThan | GreaterThanOrEqual => column_name!("maxValues"),
                 Equal => {
                     return as_data_skipping_predicate(&Expr::and(
                         Expr::le(Column(col.clone()), Literal(val.clone())),
@@ -127,14 +128,13 @@ fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
                 }
                 NotEqual => {
                     return Some(Expr::or(
-                        Expr::gt(Column(format!("minValues.{}", col)), val.clone()),
-                        Expr::lt(Column(format!("maxValues.{}", col)), val.clone()),
+                        Expr::gt(joined_column_expr!("minValues", col), val.clone()),
+                        Expr::lt(joined_column_expr!("maxValues", col), val.clone()),
                     ));
                 }
                 _ => return None, // unsupported operation
             };
-            let col = format!("{}.{}", stats_col, col);
-            Some(Expr::binary(op, Column(col), val.clone()))
+            Some(Expr::binary(op, stats_col.join(col), val.clone()))
         }
         // push down Not by inverting everything below it
         UnaryOperation { op: Not, expr } => as_inverted_data_skipping_predicate(expr),
@@ -142,7 +142,7 @@ fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
             // to check if a column could have a null, we need two different checks, to see if
             // the bounds are tight and then to actually do the check
             if let Column(col) = expr.as_ref() {
-                let null_col = format!("nullCount.{col}");
+                let null_col = joined_column_expr!("nullCount", col);
                 Some(Expr::or(
                     get_tight_null_expr(null_col.clone()),
                     get_wide_null_expr(null_col),
@@ -185,9 +185,9 @@ impl DataSkippingFilter {
         static PREDICATE_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
             DataType::struct_type([StructField::new("predicate", DataType::BOOLEAN, true)])
         });
-        static STATS_EXPR: LazyLock<Expr> = LazyLock::new(|| Expr::column("add.stats"));
+        static STATS_EXPR: LazyLock<Expr> = LazyLock::new(|| column_expr!("add.stats"));
         static FILTER_EXPR: LazyLock<Expr> =
-            LazyLock::new(|| Expr::column("predicate").distinct(false));
+            LazyLock::new(|| column_expr!("predicate").distinct(false));
 
         let predicate = predicate.as_deref()?;
         debug!("Creating a data skipping filter for {}", &predicate);
@@ -197,7 +197,7 @@ impl DataSkippingFilter {
         // extracting the corresponding field from the table schema, and inserting that field.
         let data_fields: Vec<_> = table_schema
             .fields()
-            .filter(|field| field_names.contains(&field.name.as_str()))
+            .filter(|field| field_names.contains(&field.name))
             .cloned()
             .collect();
         if data_fields.is_empty() {
@@ -308,10 +308,10 @@ mod tests {
 
     #[test]
     fn test_rewrite_basic_comparison() {
-        let column = Expr::column("a");
+        let column = column_expr!("a");
         let lit_int = Expr::literal(1_i32);
-        let min_col = Expr::column("minValues.a");
-        let max_col = Expr::column("maxValues.a");
+        let min_col = column_expr!("minValues.a");
+        let max_col = column_expr!("maxValues.a");
 
         let cases = [
             (
