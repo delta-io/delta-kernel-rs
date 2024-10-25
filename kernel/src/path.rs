@@ -73,6 +73,12 @@ impl AsUrl for FileMeta {
     }
 }
 
+impl AsUrl for Url {
+    fn as_url(&self) -> &Url {
+        self
+    }
+}
+
 impl<Location: AsUrl> ParsedLogPath<Location> {
     // NOTE: We can't actually impl TryFrom because Option<T> is a foreign struct even if T is local.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
@@ -176,18 +182,30 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     }
 }
 
+impl ParsedLogPath<Url> {
+    /// Create a new ParsedCommitPath<Url> for a new json commit file at the specified version
+    pub(crate) fn new_commit(
+        table_root: &Url,
+        version: Version,
+    ) -> DeltaResult<ParsedLogPath<Url>> {
+        let filename = format!("{:020}.json", version);
+        let location = table_root.join("_delta_log/")?.join(&filename)?;
+        let path = Self::try_from(location)?
+            .ok_or_else(|| Error::internal_error("attempted to create invalid commit path"))?;
+        if !path.is_commit() {
+            return Err(Error::internal_error(
+                "ParsedLogPath::new_commit created a non-commit path",
+            ));
+        }
+        Ok(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use super::*;
-
-    // Easier to test directly with Url instead of FileMeta!
-    impl AsUrl for Url {
-        fn as_url(&self) -> &Url {
-            self
-        }
-    }
 
     fn table_log_dir_url() -> Url {
         let path = PathBuf::from("./tests/data/table-with-dv-small/_delta_log/");
@@ -517,5 +535,16 @@ mod tests {
             .join("00000000000000000008.00000000000000000a15.compacted.json")
             .unwrap();
         ParsedLogPath::try_from(log_path).expect_err("non-numeric hi");
+    }
+
+    #[test]
+    fn test_new_commit() {
+        let table_log_dir = table_log_dir_url();
+        let log_path = ParsedLogPath::new_commit(&table_log_dir, 10).unwrap();
+        assert_eq!(log_path.version, 10);
+        assert!(log_path.is_commit());
+        assert_eq!(log_path.extension, "json");
+        assert!(matches!(log_path.file_type, LogPathFileType::Commit));
+        assert_eq!(log_path.filename, "00000000000000000010.json");
     }
 }

@@ -36,6 +36,8 @@ delta_kernel_derive = { path = "../derive-macros", version = "0.4.0" }
 # used for developer-visibility
 visibility = "0.1.1"
 
+# Used in the sync engine
+tempfile = { version = "3", optional = true }
 # Used in default engine
 arrow-buffer = { workspace = true, optional = true }
 arrow-array = { workspace = true, optional = true, features = ["chrono-tz"] }
@@ -99,6 +101,7 @@ sync-engine = [
   "arrow-json",
   "arrow-select",
   "parquet",
+  "tempfile",
 ]
 integration-test = [
   "hdfs-native-object-store/integration-test",

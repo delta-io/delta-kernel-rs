@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use url::Url;
 
 use crate::snapshot::Snapshot;
+use crate::transaction::Transaction;
 use crate::{DeltaResult, Engine, Error, Version};
 
 /// In-memory representation of a Delta table, which acts as an immutable root entity for reading
@@ -75,6 +76,11 @@ impl Table {
     /// If no version is supplied, a snapshot for the latest version will be created.
     pub fn snapshot(&self, engine: &dyn Engine, version: Option<Version>) -> DeltaResult<Snapshot> {
         Snapshot::try_new(self.location.clone(), engine, version)
+    }
+
+    /// Create a new write transaction for this table.
+    pub fn new_transaction(&self, engine: &dyn Engine) -> DeltaResult<Transaction> {
+        Ok(Transaction::new(self.snapshot(engine, None)?))
     }
 }
 

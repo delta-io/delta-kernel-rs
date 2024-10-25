@@ -46,6 +46,10 @@ static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     .into()
 });
 
+static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    StructType::new([Option::<CommitInfo>::get_struct_field(COMMIT_INFO_NAME)]).into()
+});
+
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
 fn get_log_schema() -> &'static SchemaRef {
@@ -56,6 +60,10 @@ fn get_log_schema() -> &'static SchemaRef {
 #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
 fn get_log_add_schema() -> &'static SchemaRef {
     &LOG_ADD_SCHEMA
+}
+
+pub(crate) fn get_log_commit_info_schema() -> &'static SchemaRef {
+    &LOG_COMMIT_INFO_SCHEMA
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
@@ -147,8 +155,26 @@ impl Protocol {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
-pub struct CommitInfo {
-    pub kernel_version: Option<String>,
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
+struct CommitInfo {
+    /// The time this logical file was created, as milliseconds since the epoch.
+    /// Read: optional, write: required (that is, kernel always writes).
+    /// If in-commit timestamps are enabled, this is always required.
+    pub(crate) timestamp: Option<i64>,
+    /// An arbitrary string that identifies the operation associated with this commit. This is
+    /// specified by the engine. Read: optional, write: required (that is, kernel alwarys writes).
+    pub(crate) operation: Option<String>,
+    /// Map of arbitrary string key-value pairs that provide additional information about the
+    /// operation. This is specified by the engine. For now this is always empty on write.
+    pub(crate) operation_parameters: Option<HashMap<String, String>>,
+    /// The version of the delta_kernel crate used to write this commit. The kernel will always
+    /// write this field, but it is optional since many tables will not have this field (i.e. any
+    /// tables not written by kernel).
+    pub(crate) kernel_version: Option<String>,
+    /// A place for the engine to store additional metadata associated with this commit encoded as
+    /// a map of strings.
+    pub(crate) engine_commit_info: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
@@ -422,6 +448,34 @@ mod tests {
                 StructField::new("appId", DataType::STRING, false),
                 StructField::new("version", DataType::LONG, false),
                 StructField::new("lastUpdated", DataType::LONG, true),
+            ]),
+            true,
+        )]));
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn test_commit_info_schema() {
+        let schema = get_log_schema()
+            .project(&["commitInfo"])
+            .expect("Couldn't get commitInfo field");
+
+        let expected = Arc::new(StructType::new(vec![StructField::new(
+            "commitInfo",
+            StructType::new(vec![
+                StructField::new("timestamp", DataType::LONG, true),
+                StructField::new("operation", DataType::STRING, true),
+                StructField::new(
+                    "operationParameters",
+                    MapType::new(DataType::STRING, DataType::STRING, false),
+                    true,
+                ),
+                StructField::new("kernelVersion", DataType::STRING, true),
+                StructField::new(
+                    "engineCommitInfo",
+                    MapType::new(DataType::STRING, DataType::STRING, false),
+                    true,
+                ),
             ]),
             true,
         )]));
