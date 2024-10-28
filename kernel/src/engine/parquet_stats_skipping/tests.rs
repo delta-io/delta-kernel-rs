@@ -164,7 +164,7 @@ fn test_binary_scalars() {
         Struct(StructData::try_new(vec![], vec![]).unwrap()),
         Array(ArrayData::new(
             ArrayType::new(DataType::LONG, false),
-            vec![],
+            Vec::<Scalar>::new(),
         )),
     ];
     let larger_values = &[
@@ -185,7 +185,7 @@ fn test_binary_scalars() {
         Struct(StructData::try_new(vec![], vec![]).unwrap()),
         Array(ArrayData::new(
             ArrayType::new(DataType::LONG, false),
-            vec![],
+            Vec::<Scalar>::new(),
         )),
     ];
 

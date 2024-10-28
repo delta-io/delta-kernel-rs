@@ -47,3 +47,4 @@ default-engine = [
 ]
 sync-engine = ["delta_kernel/sync-engine"]
 developer-visibility = []
+test-ffi = []

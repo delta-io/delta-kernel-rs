@@ -33,6 +33,8 @@ pub mod engine_funcs;
 pub mod expressions;
 pub mod scan;
 pub mod schema;
+#[cfg(feature = "test-ffi")]
+pub mod test_ffi;
 
 pub(crate) type NullableCvoid = Option<NonNull<c_void>>;
 

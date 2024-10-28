@@ -135,7 +135,7 @@ impl Hash for ColumnName {
 #[doc(hidden)]
 macro_rules! __column_name {
     ( $($name:tt)* ) => {
-        $crate::expressions::ColumnName::new(delta_kernel_derive::parse_column_name!($($name)*))
+        $crate::expressions::ColumnName::new($crate::delta_kernel_derive::parse_column_name!($($name)*))
     };
 }
 #[doc(inline)]

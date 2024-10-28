@@ -1,3 +1,5 @@
+//! Defines [`KernelExpressionVisitorState`]. This is a visitor  that can be used by an [`EnginePredicate`]
+//! to convert engine expressions into kernel expressions.
 use std::ffi::c_void;
 
 use crate::{
