@@ -1,5 +1,22 @@
 # Changelog
 
+## [v0.4.1](https://github.com/delta-incubator/delta-kernel-rs/tree/v0.4.1/) (2024-10-28)
+
+[Full Changelog](https://github.com/delta-incubator/delta-kernel-rs/compare/v0.4.0...v0.4.1)
+
+**API Changes**
+
+None.
+
+**Fixed bugs:**
+
+- **Disabled missing-column row group skipping**: The optimization to treat a physically missing
+column as all-null is unsound, if the schema was not already verified to prove that the table's
+logical schema actually includes the missing column. We disable it until we can add the necessary
+validation. [\#435]
+
+[\#435]: https://github.com/delta-incubator/delta-kernel-rs/pull/435
+
 ## [v0.4.0](https://github.com/delta-incubator/delta-kernel-rs/tree/v0.4.0/) (2024-10-23)
 
 [Full Changelog](https://github.com/delta-incubator/delta-kernel-rs/compare/v0.3.1...v0.4.0)
