@@ -782,6 +782,43 @@ mod tests {
         assert_eq!(data.len(), 0);
     }
 
+    #[test]
+    fn test_missing_column_row_group_skipping() {
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
+        let url = url::Url::from_directory_path(path.unwrap()).unwrap();
+        let engine = SyncEngine::new();
+
+        let table = Table::new(url);
+        let snapshot = Arc::new(table.snapshot(&engine, None).unwrap());
+
+        // Predicate over a logically valid but physically missing column. No data files should be
+        // returned because the column is inferred to be all-null.
+        //
+        // WARNING: https://github.com/delta-incubator/delta-kernel-rs/issues/434 - This
+        // optimization is currently disabled, so the one data file is still returned.
+        let predicate = Arc::new(column_expr!("missing").lt(1000i64));
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .with_predicate(predicate)
+            .build()
+            .unwrap();
+        let data: Vec<_> = scan.execute(&engine).unwrap().try_collect().unwrap();
+        assert_eq!(data.len(), 1);
+
+        // Predicate over a logically missing column, so the one data file should be returned.
+        //
+        // TODO: This should ideally trigger an error instead?
+        let predicate = Arc::new(column_expr!("numeric.ints.invalid").lt(1000));
+        let scan = snapshot
+            .scan_builder()
+            .with_predicate(predicate)
+            .build()
+            .unwrap();
+        let data: Vec<_> = scan.execute(&engine).unwrap().try_collect().unwrap();
+        assert_eq!(data.len(), 1);
+    }
+
     #[test_log::test]
     fn test_scan_with_checkpoint() -> DeltaResult<()> {
         let path = std::fs::canonicalize(PathBuf::from(

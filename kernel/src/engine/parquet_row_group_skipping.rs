@@ -180,8 +180,14 @@ impl<'a> ParquetStatsSkippingFilter for RowGroupFilter<'a> {
     fn get_nullcount_stat_value(&self, col: &ColumnPath) -> Option<i64> {
         // NOTE: Stats for any given column are optional, which may produce a NULL nullcount. But if
         // the column itself is missing, then we know all values are implied to be NULL.
+        //
         let Some(stats) = self.get_stats(col) else {
-            return Some(self.get_rowcount_stat_value());
+            // WARNING: This optimization is only sound if the caller has verified that the column
+            // actually exists in the table's logical schema, and that any necessary logical to
+            // physical name mapping has been performed. Because we currently lack both the
+            // validation and the name mapping support, we must disable this optimization for the
+            // time being. See https://github.com/delta-incubator/delta-kernel-rs/issues/434.
+            return Some(self.get_rowcount_stat_value()).filter(|_| false);
         };
 
         // WARNING: [`Statistics::null_count_opt`] returns Some(0) when the underlying stat is

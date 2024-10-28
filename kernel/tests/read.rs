@@ -1070,3 +1070,60 @@ fn type_widening_decimal() -> Result<(), Box<dyn std::error::Error>> {
     ]);
     read_table_data_str("./tests/data/type-widening/", select_cols, None, expected)
 }
+
+// Verify that predicates over invalid/missing columns do not cause skipping.
+#[test]
+fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::error::Error>> {
+    // Attempted skipping over a logically valid but physically missing column. We should be able to
+    // skip the data file because the missing column is inferred to be all-null.
+    //
+    // WARNING: https://github.com/delta-incubator/delta-kernel-rs/issues/434 -- currently disabled.
+    //
+    //let expected = vec![
+    //    "+--------+",
+    //    "| chrono |",
+    //    "+--------+",
+    //    "+--------+",
+    //];
+    let columns = &["chrono"];
+    let expected = vec![
+        "+-------------------------------------------------------------------------------------------+",
+        "| chrono                                                                                    |",
+        "+-------------------------------------------------------------------------------------------+",
+        "| {date32: 1971-01-01, timestamp: 1970-02-01T08:00:00Z, timestamp_ntz: 1970-01-02T00:00:00} |",
+        "| {date32: 1971-01-02, timestamp: 1970-02-01T09:00:00Z, timestamp_ntz: 1970-01-02T00:01:00} |",
+        "| {date32: 1971-01-03, timestamp: 1970-02-01T10:00:00Z, timestamp_ntz: 1970-01-02T00:02:00} |",
+        "| {date32: 1971-01-04, timestamp: 1970-02-01T11:00:00Z, timestamp_ntz: 1970-01-02T00:03:00} |",
+        "| {date32: 1971-01-05, timestamp: 1970-02-01T12:00:00Z, timestamp_ntz: 1970-01-02T00:04:00} |",
+        "+-------------------------------------------------------------------------------------------+",
+    ];
+    let predicate = column_expr!("missing").lt(10i64);
+    read_table_data_str(
+        "./tests/data/parquet_row_group_skipping/",
+        Some(columns),
+        Some(predicate),
+        expected,
+    )?;
+
+    // Attempted skipping over an invalid (logically missing) column. Ideally this should throw a
+    // query error, but at a minimum it should not cause incorrect data skipping.
+    let expected = vec![
+        "+-------------------------------------------------------------------------------------------+",
+        "| chrono                                                                                    |",
+        "+-------------------------------------------------------------------------------------------+",
+        "| {date32: 1971-01-01, timestamp: 1970-02-01T08:00:00Z, timestamp_ntz: 1970-01-02T00:00:00} |",
+        "| {date32: 1971-01-02, timestamp: 1970-02-01T09:00:00Z, timestamp_ntz: 1970-01-02T00:01:00} |",
+        "| {date32: 1971-01-03, timestamp: 1970-02-01T10:00:00Z, timestamp_ntz: 1970-01-02T00:02:00} |",
+        "| {date32: 1971-01-04, timestamp: 1970-02-01T11:00:00Z, timestamp_ntz: 1970-01-02T00:03:00} |",
+        "| {date32: 1971-01-05, timestamp: 1970-02-01T12:00:00Z, timestamp_ntz: 1970-01-02T00:04:00} |",
+        "+-------------------------------------------------------------------------------------------+",
+    ];
+    let predicate = column_expr!("invalid").lt(10);
+    read_table_data_str(
+        "./tests/data/parquet_row_group_skipping/",
+        Some(columns),
+        Some(predicate),
+        expected,
+    )?;
+    Ok(())
+}

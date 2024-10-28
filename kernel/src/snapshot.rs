@@ -681,13 +681,22 @@ mod tests {
             .try_collect()
             .unwrap();
 
-        // The checkpoint has five parts, each containing one action. The P&M come from first and
-        // third parts, respectively. The parquet reader will skip the other three parts. Note that
-        // the actual `read_metadata` would anyway skip the last two parts because it terminates the
-        // iteration immediately after finding both P&M.
+        // The checkpoint has five parts, each containing one action:
+        // 1. txn (physically missing P&M columns)
+        // 2. metaData
+        // 3. protocol
+        // 4. add
+        // 5. txn (physically missing P&M columns)
+        //
+        // The parquet reader should skip parts 1, 3, and 5. Note that the actual `read_metadata`
+        // always skips parts 4 and 5 because it terminates the iteration after finding both P&M.
         //
         // NOTE: Each checkpoint part is a single-row file -- guaranteed to produce one row group.
-        assert_eq!(data.len(), 2);
+        //
+        // WARNING: https://github.com/delta-incubator/delta-kernel-rs/issues/434 -- We currently
+        // read parts 1 and 5 (4 in all instead of 2) because row group skipping is disabled for
+        // missing columns, but can still skip part 3 because has valid nullcount stats for P&M.
+        assert_eq!(data.len(), 4);
     }
 
     #[test_log::test]
