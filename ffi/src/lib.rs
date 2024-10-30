@@ -73,53 +73,100 @@ impl Iterator for EngineIterator {
 /// Intentionally not Copy, Clone, Send, nor Sync.
 ///
 /// Whoever instantiates the struct must ensure it does not outlive the data it points to. The
-/// compiler cannot help us here, because raw pointers don't have lifetimes. To reduce the risk of
-/// accidental misuse, it is recommended to only instantiate this struct as a function arg, by
-/// converting a string slice `Into` a `KernelStringSlice`. That way, the borrowed reference at call
-/// site protects the `KernelStringSlice` until the function returns. Meanwhile, the callee should
-/// assume that the slice is only valid until the function returns, and must not retain any
-/// references to the slice or its data that could outlive the function call.
+/// compiler cannot help us here, because raw pointers don't have lifetimes. A good rule of thumb is
+/// to always use the [`kernel_string_slice`] macro to create string slices, and to avoid returning
+/// a string slice from a code block or function (since the move risks over-extending its lifetime):
 ///
+/// ```ignore
+/// # // Ignored because this code is pub(crate) and doc tests cannot compile it
+/// let dangling_slice = {
+///     let tmp = String::from("tmp");
+///     kernel_string_slice!(tmp)
+/// }
 /// ```
-/// # use delta_kernel_ffi::KernelStringSlice;
-/// fn wants_slice(slice: KernelStringSlice) { }
-/// let msg = String::from("hello");
-/// wants_slice(msg.into());
-/// ```
+///
+/// Meanwhile, the callee must assume that the slice is only valid until the function returns, and
+/// must not retain any references to the slice or its data that might outlive the function call.
 #[repr(C)]
 pub struct KernelStringSlice {
     ptr: *const c_char,
     len: usize,
 }
-
-// We can construct a `KernelStringSlice` from anything that acts like a Rust string slice. The user
-// of this trait is still responsible to ensure the result doesn't outlive the input data tho --
-// especially if it crosses an FFI boundary to or from external code.
-impl<T: AsRef<[u8]>> From<T> for KernelStringSlice {
-    fn from(s: T) -> Self {
-        let s = s.as_ref();
-        KernelStringSlice {
-            ptr: s.as_ptr().cast(),
-            len: s.len(),
+impl KernelStringSlice {
+    /// Creates a new string slice from a source string. This method is dangerous and can easily
+    /// lead to use-after-free scenarios. The [`kernel_string_slice`] macro should be preferred as a
+    /// much safer alternative.
+    ///
+    /// # Safety
+    ///
+    /// Caller affirms that the source will outlive the statement that creates this slice. The
+    /// compiler cannot help as raw pointers do not have lifetimes that the compiler can
+    /// verify. Thus, e.g., the following incorrect code would compile and leave `s` dangling,
+    /// because the unnamed string arg is dropped as soon as the statement finishes executing.
+    ///
+    /// ```ignore
+    /// # // Ignored because this code is pub(crate) and doc tests cannot compile it
+    /// let s = KernelStringSlice::new_unsafe(String::from("bad").as_str());
+    /// ```
+    pub(crate) unsafe fn new_unsafe(source: &str) -> Self {
+        let source = source.as_bytes();
+        Self {
+            ptr: source.as_ptr().cast(),
+            len: source.len(),
         }
     }
 }
 
-trait TryFromStringSlice: Sized {
-    unsafe fn try_from_slice(slice: &KernelStringSlice) -> DeltaResult<Self>;
+/// Creates a new [`KernelStringSlice`] from a string reference (which must be an identifier, to
+/// ensure it is not immediately dropped). This is the safest way to create a kernel string slice.
+///
+/// NOTE: It is still possible to misuse the resulting kernel string slice in unsafe ways, such as
+/// returning it from the function or code block that owns the string reference.
+macro_rules! kernel_string_slice {
+    ( $source:ident ) => {{
+        // Safety: A named source cannot immediately go out of scope, so the resulting slice must
+        // remain valid at least that long. Any dangerous situations will arise from the subsequent
+        // misuse of this string slice, not from its creation.
+        //
+        // NOTE: The `do_it` wrapper avoids an "unnecessary `unsafe` block" clippy warning in case
+        // the invocation site of this macro is already in an `unsafe` block. We can't just disable
+        // the warning with #[allow(unused_unsafe)] because expression annotation is unstable rust.
+        fn do_it(s: &str) -> $crate::KernelStringSlice {
+            unsafe { $crate::KernelStringSlice::new_unsafe(s) }
+        }
+        do_it(&$source)
+    }};
+}
+pub(crate) use kernel_string_slice;
+
+trait TryFromStringSlice<'a>: Sized {
+    unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> DeltaResult<Self>;
 }
 
-impl TryFromStringSlice for String {
-    /// Converts a slice into a `String`. The slice remains valid after this call.
+impl<'a> TryFromStringSlice<'a> for String {
+    /// Converts a kernel string slice into a `String`.
     ///
     /// # Safety
     ///
     /// The slice must be a valid (non-null) pointer, and must point to the indicated number of
     /// valid utf8 bytes.
-    unsafe fn try_from_slice(slice: &KernelStringSlice) -> DeltaResult<String> {
-        let slice = unsafe { std::slice::from_raw_parts(slice.ptr.cast(), slice.len) };
-        let slice = std::str::from_utf8(slice)?;
+    unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> DeltaResult<Self> {
+        let slice: &str = unsafe { TryFromStringSlice::try_from_slice(slice) }?;
         Ok(slice.into())
+    }
+}
+
+impl<'a> TryFromStringSlice<'a> for &'a str {
+    /// Converts a kernel string slice into a borrowed `str`. The result does not outlive the kernel
+    /// string slice it came from.
+    ///
+    /// # Safety
+    ///
+    /// The slice must be a valid (non-null) pointer, and must point to the indicated number of
+    /// valid utf8 bytes.
+    unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> DeltaResult<Self> {
+        let slice = unsafe { std::slice::from_raw_parts(slice.ptr.cast(), slice.len) };
+        Ok(std::str::from_utf8(slice)?)
     }
 }
 
@@ -477,7 +524,7 @@ impl<T> IntoExternResult<T> for DeltaResult<T> {
             Ok(ok) => ExternResult::Ok(ok),
             Err(err) => {
                 let msg = format!("{}", err);
-                let err = unsafe { alloc.allocate_error(err.into(), msg.as_str().into()) };
+                let err = unsafe { alloc.allocate_error(err.into(), kernel_string_slice!(msg)) };
                 ExternResult::Err(err)
             }
         }
@@ -535,7 +582,7 @@ impl ExternEngine for ExternEngineVtable {
 ///
 /// Caller is responsible for passing a valid path pointer.
 unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<Url> {
-    let path = unsafe { String::try_from_slice(&path) }?;
+    let path: &str = unsafe { TryFromStringSlice::try_from_slice(&path) }?;
     let table = Table::try_from_uri(path)?;
     Ok(table.location().clone())
 }
@@ -755,7 +802,8 @@ pub unsafe extern "C" fn snapshot_table_root(
     allocate_fn: AllocateStringFn,
 ) -> NullableCvoid {
     let snapshot = unsafe { snapshot.as_ref() };
-    allocate_fn(snapshot.table_root().to_string().as_str().into())
+    let table_root = snapshot.table_root().to_string();
+    allocate_fn(kernel_string_slice!(table_root))
 }
 
 type StringIter = dyn Iterator<Item = String> + Send;
@@ -783,7 +831,7 @@ fn string_slice_next_impl(
 ) -> bool {
     let data = unsafe { data.as_mut() };
     if let Some(data) = data.next() {
-        (engine_visitor)(engine_context, data.as_str().into());
+        (engine_visitor)(engine_context, kernel_string_slice!(data));
         true
     } else {
         false

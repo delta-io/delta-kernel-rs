@@ -221,7 +221,8 @@ void c_read_parquet_file(
     read_parquet_file(context->engine, &meta, context->read_schema);
   free(full_path);
   if (read_res.tag != OkHandleExclusiveFileReadResultIterator) {
-    printf("Couldn't read data\n");
+    print_error("Couldn't read data.", (Error*) read_res.err);
+    free_error((Error*)read_res.err);
     return;
   }
   if (selection_vector.len > 0) {

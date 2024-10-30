@@ -17,9 +17,9 @@ use crate::expressions::engine::{
     unwrap_kernel_expression, EnginePredicate, KernelExpressionVisitorState,
 };
 use crate::{
-    AllocateStringFn, ExclusiveEngineData, ExternEngine, ExternResult, IntoExternResult,
-    KernelBoolSlice, KernelRowIndexArray, KernelStringSlice, NullableCvoid, SharedExternEngine,
-    SharedSnapshot, StringIter, StringSliceIterator, TryFromStringSlice,
+    kernel_string_slice, AllocateStringFn, ExclusiveEngineData, ExternEngine, ExternResult,
+    IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice, NullableCvoid,
+    SharedExternEngine, SharedSnapshot, StringIter, StringSliceIterator, TryFromStringSlice,
 };
 
 use super::handle::Handle;
@@ -366,10 +366,10 @@ pub unsafe extern "C" fn get_from_map(
     allocate_fn: AllocateStringFn,
 ) -> NullableCvoid {
     // TODO: Return ExternResult to caller instead of panicking?
-    let string_key = unsafe { String::try_from_slice(&key) };
+    let string_key = unsafe { TryFromStringSlice::try_from_slice(&key) };
     map.values
-        .get(&string_key.unwrap())
-        .and_then(|v| allocate_fn(v.into()))
+        .get(string_key.unwrap())
+        .and_then(|v| allocate_fn(kernel_string_slice!(v)))
 }
 
 /// Get a selection vector out of a [`DvInfo`] struct
@@ -444,7 +444,7 @@ fn rust_callback(
     });
     (context.callback)(
         context.engine_context,
-        path.into(),
+        kernel_string_slice!(path),
         size,
         stats.as_ref(),
         &dv_info,

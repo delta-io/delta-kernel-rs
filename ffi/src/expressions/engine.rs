@@ -141,12 +141,12 @@ pub unsafe extern "C" fn visit_expression_column(
     name: KernelStringSlice,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    let name = unsafe { String::try_from_slice(&name) };
+    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
     visit_expression_column_impl(state, name).into_extern_result(&allocate_error)
 }
 fn visit_expression_column_impl(
     state: &mut KernelExpressionVisitorState,
-    name: DeltaResult<String>,
+    name: DeltaResult<&str>,
 ) -> DeltaResult<usize> {
     // TODO: FIXME: This is incorrect if any field name in the column path contains a period.
     let name = ColumnName::new(name?.split('.')).into();

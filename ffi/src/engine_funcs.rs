@@ -103,20 +103,20 @@ pub unsafe extern "C" fn read_parquet_file(
 ) -> ExternResult<Handle<ExclusiveFileReadResultIterator>> {
     let engine = unsafe { engine.clone_as_arc() };
     let physical_schema = unsafe { physical_schema.clone_as_arc() };
-    let path = unsafe { String::try_from_slice(&file.path) };
+    let path = unsafe { TryFromStringSlice::try_from_slice(&file.path) };
     let res = read_parquet_file_impl(engine.clone(), path, file, physical_schema);
     res.into_extern_result(&engine.as_ref())
 }
 
 fn read_parquet_file_impl(
     extern_engine: Arc<dyn ExternEngine>,
-    path: DeltaResult<String>,
+    path: DeltaResult<&str>,
     file: &FileMeta,
     physical_schema: Arc<Schema>,
 ) -> DeltaResult<Handle<ExclusiveFileReadResultIterator>> {
     let engine = extern_engine.engine();
     let parquet_handler = engine.get_parquet_handler();
-    let location = Url::parse(&path?)?;
+    let location = Url::parse(path?)?;
     let delta_fm = delta_kernel::FileMeta {
         location,
         last_modified: file.last_modified,
