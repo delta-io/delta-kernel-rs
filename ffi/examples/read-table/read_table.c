@@ -6,10 +6,6 @@
 #include "read_table.h"
 #include "schema.h"
 
-// TODO - We cannot enable leak detection until existing leaks are fixed.
-// See https://github.com/delta-incubator/delta-kernel-rs/issues/448
-const char* __asan_default_options() { return "detect_leaks=0"; }
-
 // some diagnostic functions
 void print_diag(char* fmt, ...)
 {
@@ -151,6 +147,7 @@ void do_visit_scan_data(
   print_diag("Asking kernel to call us back for each scan row (file to read)\n");
   visit_scan_data(engine_data, selection_vec, engine_context, scan_row_callback);
   free_bool_slice(selection_vec);
+  free_engine_data(engine_data);
 }
 
 // Called for each element of the partition StringSliceIterator. We just turn the slice into a
@@ -195,6 +192,14 @@ PartitionList* get_partition_list(SharedGlobalScanState* state)
   }
   free_string_slice_data(part_iter);
   return list;
+}
+
+void free_partition_list(PartitionList* list) {
+  for (int i = 0; i < list->len; i++) {
+    free(list->cols[i]);
+  }
+  free(list->cols);
+  free(list);
 }
 
 int main(int argc, char* argv[])
@@ -310,11 +315,13 @@ int main(int argc, char* argv[])
 #endif
 
   free_kernel_scan_data(data_iter);
+  free_scan(scan);
   free_global_read_schema(read_schema);
   free_global_scan_state(global_state);
   free_snapshot(snapshot);
   free_engine(engine);
   free(context.table_root);
+  free_partition_list(context.partition_cols);
 
   return 0;
 }
