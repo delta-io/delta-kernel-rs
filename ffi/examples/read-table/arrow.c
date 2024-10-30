@@ -211,6 +211,7 @@ void c_read_parquet_file(
   };
   ExternResultHandleExclusiveFileReadResultIterator read_res =
     read_parquet_file(context->engine, &meta, context->read_schema);
+  free(full_path);
   if (read_res.tag != OkHandleExclusiveFileReadResultIterator) {
     printf("Couldn't read data\n");
     return;

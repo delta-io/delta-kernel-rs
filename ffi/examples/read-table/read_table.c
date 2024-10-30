@@ -6,6 +6,10 @@
 #include "read_table.h"
 #include "schema.h"
 
+// TODO - We cannot enable leak detection until existing leaks are fixed.
+// See https://github.com/delta-incubator/delta-kernel-rs/issues/448
+const char* __asan_default_options() { return "detect_leaks=0"; }
+
 // some diagnostic functions
 void print_diag(char* fmt, ...)
 {
