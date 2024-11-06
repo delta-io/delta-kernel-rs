@@ -8,7 +8,7 @@
 // A list of partition column names
 typedef struct PartitionList
 {
-  int len;
+  uintptr_t len;
   char** cols;
 } PartitionList;
 

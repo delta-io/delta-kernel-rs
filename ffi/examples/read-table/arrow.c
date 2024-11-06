@@ -61,7 +61,7 @@ static GArrowRecordBatch* add_partition_columns(
   gint64 cols = garrow_record_batch_get_n_columns(record_batch);
   GArrowRecordBatch* cur_record_batch = record_batch;
   GError* error = NULL;
-  for (int i = 0; i < partition_cols->len; i++) {
+  for (uintptr_t i = 0; i < partition_cols->len; i++) {
     char* col = partition_cols->cols[i];
     guint pos = cols + i;
     KernelStringSlice key = { col, strlen(col) };

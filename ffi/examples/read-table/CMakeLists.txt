@@ -18,11 +18,11 @@ add_test(NAME read_and_print_basic_partitioned COMMAND ${TestRunner} ${DatPath}/
 
 if(WIN32)
   set(CMAKE_C_FLAGS_DEBUG "/MT")
-  target_link_libraries(read_table PUBLIC ws2_32 userenv bcrypt ntdll)
+  target_link_libraries(read_table PUBLIC ws2_32 userenv bcrypt ncrypt crypt32 secur32 ntdll RuntimeObject)
 endif(WIN32)
 
 if(MSVC)
-  target_compile_options(read_table PRIVATE /W4 /WX)
+  target_compile_options(read_table PRIVATE /W3 /WX)
 else()
   # no-strict-prototypes because arrow headers have fn defs without prototypes
   target_compile_options(read_table PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-strict-prototypes -g -fsanitize=address)
