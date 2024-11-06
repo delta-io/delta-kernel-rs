@@ -165,10 +165,8 @@ impl ProvidesColumnByName for StructArray {
 // }
 // ```
 // The path ["b", "d", "f"] would retrieve the int64 column while ["a", "b"] would produce an error.
-fn extract_column<'a>(
-    mut parent: &dyn ProvidesColumnByName,
-    mut field_names: impl Iterator<Item = &'a str>,
-) -> DeltaResult<ArrayRef> {
+fn extract_column(mut parent: &dyn ProvidesColumnByName, col: &[String]) -> DeltaResult<ArrayRef> {
+    let mut field_names = col.iter();
     let Some(mut field_name) = field_names.next() else {
         return Err(ArrowError::SchemaError("Empty column path".to_string()))?;
     };
@@ -196,9 +194,7 @@ fn evaluate_expression(
     use Expression::*;
     match (expression, result_type) {
         (Literal(scalar), _) => Ok(scalar.to_array(batch.num_rows())?),
-        // TODO properly handle nested columns
-        // https://github.com/delta-incubator/delta-kernel-rs/issues/86
-        (Column(name), _) => extract_column(batch, name.split('.')),
+        (Column(name), _) => extract_column(batch, name),
         (Struct(fields), Some(DataType::Struct(output_schema))) => {
             let columns = fields
                 .iter()

@@ -323,7 +323,7 @@ pub unsafe extern "C" fn visit_expression(
                 visit_expression_scalar(visitor, scalar, sibling_list_id)
             }
             Expression::Column(name) => {
-                let name = name.as_str();
+                let name = name.to_string();
                 let name = kernel_string_slice!(name);
                 call!(visitor, visit_column, sibling_list_id, name)
             }

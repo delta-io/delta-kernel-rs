@@ -1,12 +1,12 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer stats.
-use crate::engine::parquet_stats_skipping::{col_name_to_path, ParquetStatsSkippingFilter};
-use crate::expressions::{Expression, Scalar};
+use crate::engine::parquet_stats_skipping::ParquetStatsSkippingFilter;
+use crate::expressions::{ColumnName, Expression, Scalar};
 use crate::schema::{DataType, PrimitiveType};
 use chrono::{DateTime, Days};
 use parquet::arrow::arrow_reader::ArrowReaderBuilder;
 use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::statistics::Statistics;
-use parquet::schema::types::{ColumnDescPtr, ColumnPath};
+use parquet::schema::types::ColumnDescPtr;
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
@@ -41,7 +41,7 @@ impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
 /// corresponding field index, for O(1) stats lookups.
 struct RowGroupFilter<'a> {
     row_group: &'a RowGroupMetaData,
-    field_indices: HashMap<ColumnPath, usize>,
+    field_indices: HashMap<ColumnName, usize>,
 }
 
 impl<'a> RowGroupFilter<'a> {
@@ -59,7 +59,7 @@ impl<'a> RowGroupFilter<'a> {
     }
 
     /// Returns `None` if the column doesn't exist and `Some(None)` if the column has no stats.
-    fn get_stats(&self, col: &ColumnPath) -> Option<Option<&Statistics>> {
+    fn get_stats(&self, col: &ColumnName) -> Option<Option<&Statistics>> {
         self.field_indices
             .get(col)
             .map(|&i| self.row_group.column(i).statistics())
@@ -93,7 +93,7 @@ impl<'a> ParquetStatsSkippingFilter for RowGroupFilter<'a> {
     // NOTE: This code is highly redundant with [`get_max_stat_value`] below, but parquet
     // ValueStatistics<T> requires T to impl a private trait, so we can't factor out any kind of
     // helper method. And macros are hard enough to read that it's not worth defining one.
-    fn get_min_stat_value(&self, col: &ColumnPath, data_type: &DataType) -> Option<Scalar> {
+    fn get_min_stat_value(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
         use PrimitiveType::*;
         let value = match (data_type.as_primitive_opt()?, self.get_stats(col)??) {
             (String, Statistics::ByteArray(s)) => s.min_opt()?.as_utf8().ok()?.into(),
@@ -135,7 +135,7 @@ impl<'a> ParquetStatsSkippingFilter for RowGroupFilter<'a> {
         Some(value)
     }
 
-    fn get_max_stat_value(&self, col: &ColumnPath, data_type: &DataType) -> Option<Scalar> {
+    fn get_max_stat_value(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
         use PrimitiveType::*;
         let value = match (data_type.as_primitive_opt()?, self.get_stats(col)??) {
             (String, Statistics::ByteArray(s)) => s.max_opt()?.as_utf8().ok()?.into(),
@@ -177,7 +177,7 @@ impl<'a> ParquetStatsSkippingFilter for RowGroupFilter<'a> {
         Some(value)
     }
 
-    fn get_nullcount_stat_value(&self, col: &ColumnPath) -> Option<i64> {
+    fn get_nullcount_stat_value(&self, col: &ColumnName) -> Option<i64> {
         // NOTE: Stats for any given column are optional, which may produce a NULL nullcount. But if
         // the column itself is missing, then we know all values are implied to be NULL.
         //
@@ -221,13 +221,13 @@ impl<'a> ParquetStatsSkippingFilter for RowGroupFilter<'a> {
 pub(crate) fn compute_field_indices(
     fields: &[ColumnDescPtr],
     expression: &Expression,
-) -> HashMap<ColumnPath, usize> {
-    fn do_recurse(expression: &Expression, cols: &mut HashSet<ColumnPath>) {
+) -> HashMap<ColumnName, usize> {
+    fn do_recurse(expression: &Expression, cols: &mut HashSet<ColumnName>) {
         use Expression::*;
         let mut recurse = |expr| do_recurse(expr, cols); // simplifies the call sites below
         match expression {
             Literal(_) => {}
-            Column(name) => cols.extend([col_name_to_path(name)]), // returns `()`, unlike `insert`
+            Column(name) => cols.extend([name.clone()]), // returns `()`, unlike `insert`
             Struct(fields) => fields.iter().for_each(recurse),
             UnaryOperation { expr, .. } => recurse(expr),
             BinaryOperation { left, right, .. } => [left, right].iter().for_each(|e| recurse(e)),
@@ -245,6 +245,10 @@ pub(crate) fn compute_field_indices(
     fields
         .iter()
         .enumerate()
-        .filter_map(|(i, f)| requested_columns.take(f.path()).map(|path| (path, i)))
+        .filter_map(|(i, f)| {
+            requested_columns
+                .take(f.path().parts())
+                .map(|path| (path, i))
+        })
         .collect()
 }

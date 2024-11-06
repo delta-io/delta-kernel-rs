@@ -154,13 +154,13 @@ impl ScanResult {
     }
 }
 
-/// Scan uses this to set up what kinds of columns it is scanning. For `Selected` we just store the
-/// name of the column, as that's all that's needed during the actual query. For `Partition` we
-/// store an index into the logical schema for this query since later we need the data type as well
-/// to materialize the partition column.
+/// Scan uses this to set up what kinds of top-level columns it is scanning. For `Selected` we just
+/// store the name of the column, as that's all that's needed during the actual query. For
+/// `Partition` we store an index into the logical schema for this query since later we need the
+/// data type as well to materialize the partition column.
 pub enum ColumnType {
     // A column, selected from the data, as is
-    Selected(ColumnName),
+    Selected(String),
     // A partition column that needs to be added back in
     Partition(usize),
 }
@@ -421,8 +421,7 @@ fn get_state_info(
                 debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                 let physical_name = physical_field.name.clone();
                 read_fields.push(physical_field);
-                // TODO: Support nested columns!
-                Ok(ColumnType::Selected(ColumnName::new([physical_name])))
+                Ok(ColumnType::Selected(physical_name))
             }
         })
         .try_collect()?;
@@ -493,7 +492,7 @@ fn transform_to_logical_internal(
                     )?;
                     Ok::<Expression, Error>(value_expression.into())
                 }
-                ColumnType::Selected(field_name) => Ok(field_name.clone().into()),
+                ColumnType::Selected(field_name) => Ok(ColumnName::new([field_name]).into()),
             })
             .try_collect()?;
         let read_expression = Expression::Struct(all_fields);

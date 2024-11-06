@@ -2,9 +2,8 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{get_log_schema, SetTransaction, SET_TRANSACTION_NAME};
-use crate::expressions::column_expr;
 use crate::snapshot::Snapshot;
-use crate::{DeltaResult, Engine, EngineData, ExpressionRef, SchemaRef};
+use crate::{DeltaResult, Engine, EngineData, Expression as Expr, ExpressionRef, SchemaRef};
 
 pub use crate::actions::visitors::SetTransactionMap;
 pub struct SetTransactionScanner {
@@ -53,8 +52,11 @@ impl SetTransactionScanner {
         // checkpoint part when patitioned by `add.path` like the Delta spec requires. There's no
         // point filtering by a particular app id, even if we have one, because app ids are all in
         // the a single checkpoint part having large min/max range (because they're usually uuids).
-        static META_PREDICATE: LazyLock<Option<ExpressionRef>> =
-            LazyLock::new(|| Some(Arc::new(column_expr!("txn.appId").is_not_null())));
+        static META_PREDICATE: LazyLock<Option<ExpressionRef>> = LazyLock::new(|| {
+            Some(Arc::new(
+                Expr::column([SET_TRANSACTION_NAME, "appId"]).is_not_null(),
+            ))
+        });
         self.snapshot
             .log_segment
             .replay(engine, schema.clone(), schema, META_PREDICATE.clone())

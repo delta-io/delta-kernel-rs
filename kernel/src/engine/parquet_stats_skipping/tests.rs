@@ -1,19 +1,19 @@
 use super::*;
-use crate::expressions::{column_expr, ArrayData, StructData};
+use crate::expressions::{column_expr, column_name, ArrayData, StructData};
 use crate::schema::ArrayType;
 use crate::DataType;
 
 struct UnimplementedTestFilter;
 impl ParquetStatsSkippingFilter for UnimplementedTestFilter {
-    fn get_min_stat_value(&self, _col: &ColumnPath, _data_type: &DataType) -> Option<Scalar> {
+    fn get_min_stat_value(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
         unimplemented!()
     }
 
-    fn get_max_stat_value(&self, _col: &ColumnPath, _data_type: &DataType) -> Option<Scalar> {
+    fn get_max_stat_value(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
         unimplemented!()
     }
 
-    fn get_nullcount_stat_value(&self, _col: &ColumnPath) -> Option<i64> {
+    fn get_nullcount_stat_value(&self, _col: &ColumnName) -> Option<i64> {
         unimplemented!()
     }
 
@@ -313,15 +313,15 @@ impl MinMaxTestFilter {
     }
 }
 impl ParquetStatsSkippingFilter for MinMaxTestFilter {
-    fn get_min_stat_value(&self, _col: &ColumnPath, data_type: &DataType) -> Option<Scalar> {
+    fn get_min_stat_value(&self, _col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
         Self::get_stat_value(&self.min, data_type)
     }
 
-    fn get_max_stat_value(&self, _col: &ColumnPath, data_type: &DataType) -> Option<Scalar> {
+    fn get_max_stat_value(&self, _col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
         Self::get_stat_value(&self.max, data_type)
     }
 
-    fn get_nullcount_stat_value(&self, _col: &ColumnPath) -> Option<i64> {
+    fn get_nullcount_stat_value(&self, _col: &ColumnName) -> Option<i64> {
         unimplemented!()
     }
 
@@ -715,15 +715,15 @@ impl NullCountTestFilter {
     }
 }
 impl ParquetStatsSkippingFilter for NullCountTestFilter {
-    fn get_min_stat_value(&self, _col: &ColumnPath, _data_type: &DataType) -> Option<Scalar> {
+    fn get_min_stat_value(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
         unimplemented!()
     }
 
-    fn get_max_stat_value(&self, _col: &ColumnPath, _data_type: &DataType) -> Option<Scalar> {
+    fn get_max_stat_value(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
         unimplemented!()
     }
 
-    fn get_nullcount_stat_value(&self, _col: &ColumnPath) -> Option<i64> {
+    fn get_nullcount_stat_value(&self, _col: &ColumnName) -> Option<i64> {
         self.nullcount
     }
 
@@ -771,17 +771,20 @@ fn test_bool_col() {
     const FALSE: Scalar = Boolean(false);
     for inverted in [false, true] {
         expect_eq!(
-            MinMaxTestFilter::new(TRUE.into(), TRUE.into()).apply_column("x", inverted),
+            MinMaxTestFilter::new(TRUE.into(), TRUE.into())
+                .apply_column(&column_name!("x"), inverted),
             Some(!inverted),
             "x as boolean (min: TRUE, max: TRUE, inverted: {inverted})"
         );
         expect_eq!(
-            MinMaxTestFilter::new(FALSE.into(), TRUE.into()).apply_column("x", inverted),
+            MinMaxTestFilter::new(FALSE.into(), TRUE.into())
+                .apply_column(&column_name!("x"), inverted),
             Some(true),
             "x as boolean (min: FALSE, max: TRUE, inverted: {inverted})"
         );
         expect_eq!(
-            MinMaxTestFilter::new(FALSE.into(), FALSE.into()).apply_column("x", inverted),
+            MinMaxTestFilter::new(FALSE.into(), FALSE.into())
+                .apply_column(&column_name!("x"), inverted),
             Some(inverted),
             "x as boolean (min: FALSE, max: FALSE, inverted: {inverted})"
         );
@@ -790,15 +793,15 @@ fn test_bool_col() {
 
 struct AllNullTestFilter;
 impl ParquetStatsSkippingFilter for AllNullTestFilter {
-    fn get_min_stat_value(&self, _col: &ColumnPath, _data_type: &DataType) -> Option<Scalar> {
+    fn get_min_stat_value(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
         None
     }
 
-    fn get_max_stat_value(&self, _col: &ColumnPath, _data_type: &DataType) -> Option<Scalar> {
+    fn get_max_stat_value(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
         None
     }
 
-    fn get_nullcount_stat_value(&self, _col: &ColumnPath) -> Option<i64> {
+    fn get_nullcount_stat_value(&self, _col: &ColumnName) -> Option<i64> {
         Some(self.get_rowcount_stat_value())
     }
 

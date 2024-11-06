@@ -1,9 +1,8 @@
 //! An implementation of data skipping that leverages parquet stats from the file footer.
-use crate::expressions::{BinaryOperator, Expression, Scalar, UnaryOperator, VariadicOperator};
+use crate::expressions::{
+    BinaryOperator, ColumnName, Expression, Scalar, UnaryOperator, VariadicOperator,
+};
 use crate::schema::DataType;
-// TODO: This struct is this module's only dependency on arrow-parquet. Once kernel has proper
-// support for nested paths, convert this code to use that instead.
-use parquet::schema::types::ColumnPath;
 use std::cmp::Ordering;
 use tracing::info;
 
@@ -20,13 +19,13 @@ mod tests;
 /// then return the result of evaluating the translated filter.
 pub(crate) trait ParquetStatsSkippingFilter {
     /// Retrieves the minimum value of a column, if it exists and has the requested type.
-    fn get_min_stat_value(&self, col: &ColumnPath, data_type: &DataType) -> Option<Scalar>;
+    fn get_min_stat_value(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar>;
 
     /// Retrieves the maximum value of a column, if it exists and has the requested type.
-    fn get_max_stat_value(&self, col: &ColumnPath, data_type: &DataType) -> Option<Scalar>;
+    fn get_max_stat_value(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar>;
 
     /// Retrieves the null count of a column, if it exists.
-    fn get_nullcount_stat_value(&self, col: &ColumnPath) -> Option<i64>;
+    fn get_nullcount_stat_value(&self, col: &ColumnName) -> Option<i64>;
 
     /// Retrieves the row count of a column (parquet footers always include this stat).
     fn get_rowcount_stat_value(&self) -> i64;
@@ -221,10 +220,9 @@ pub(crate) trait ParquetStatsSkippingFilter {
                 return None;
             }
         };
-        let col = col_name_to_path(col);
         let min_max_disjunct = |min_ord, max_ord, inverted| -> Option<bool> {
-            let skip_lo = self.partial_cmp_min_stat(&col, val, min_ord, false)?;
-            let skip_hi = self.partial_cmp_max_stat(&col, val, max_ord, false)?;
+            let skip_lo = self.partial_cmp_min_stat(col, val, min_ord, false)?;
+            let skip_hi = self.partial_cmp_max_stat(col, val, max_ord, false)?;
             let skip = skip_lo || skip_hi;
             Some(skip != inverted)
         };
@@ -252,14 +250,14 @@ pub(crate) trait ParquetStatsSkippingFilter {
             // Keep if `NOT(val <= min)` implies
             // Keep if `val > min` implies
             // Keep if `min < val`
-            LessThan => self.partial_cmp_min_stat(&col, val, Ordering::Less, false),
+            LessThan => self.partial_cmp_min_stat(col, val, Ordering::Less, false),
             // Given `col <= val`:
             // Skip if `val` is less than _all_ values in [min, max], implies
             // Skip if `val < min AND val < max` implies
             // Skip if `val < min` implies
             // Keep if `NOT(val < min)` implies
             // Keep if `NOT(min > val)`
-            LessThanOrEqual => self.partial_cmp_min_stat(&col, val, Ordering::Greater, true),
+            LessThanOrEqual => self.partial_cmp_min_stat(col, val, Ordering::Greater, true),
             // Given `col > val`:
             // Skip if `val` is not less than _all_ values in [min, max], implies
             // Skip if `val >= min AND val >= max` implies
@@ -267,14 +265,14 @@ pub(crate) trait ParquetStatsSkippingFilter {
             // Keep if `NOT(val >= max)` implies
             // Keep if `NOT(max <= val)` implies
             // Keep if `max > val`
-            GreaterThan => self.partial_cmp_max_stat(&col, val, Ordering::Greater, false),
+            GreaterThan => self.partial_cmp_max_stat(col, val, Ordering::Greater, false),
             // Given `col >= val`:
             // Skip if `val is greater than _every_ value in [min, max], implies
             // Skip if `val > min AND val > max` implies
             // Skip if `val > max` implies
             // Keep if `NOT(val > max)` implies
             // Keep if `NOT(max < val)`
-            GreaterThanOrEqual => self.partial_cmp_max_stat(&col, val, Ordering::Less, true),
+            GreaterThanOrEqual => self.partial_cmp_max_stat(col, val, Ordering::Less, true),
             _ => {
                 info!("Unsupported binary operator: {left:?} {op:?} {right:?}");
                 None
@@ -316,8 +314,7 @@ pub(crate) trait ParquetStatsSkippingFilter {
                         // IS NULL - skip if no-null
                         false => 0,
                     };
-                    let col = col_name_to_path(col);
-                    Some(self.get_nullcount_stat_value(&col)? != skip)
+                    Some(self.get_nullcount_stat_value(col)? != skip)
                 }
                 _ => {
                     info!("Unsupported unary operation: {op:?}({expr:?})");
@@ -329,9 +326,8 @@ pub(crate) trait ParquetStatsSkippingFilter {
 
     /// Propagates a boolean-typed column, allowing e.g. `flag OR ...`.
     /// Columns of other types are ignored (NULL result).
-    fn apply_column(&self, col: &str, inverted: bool) -> Option<bool> {
-        let col = col_name_to_path(col);
-        let as_boolean = |get: &dyn Fn(_, _, _) -> _| match get(self, &col, &DataType::BOOLEAN) {
+    fn apply_column(&self, col: &ColumnName, inverted: bool) -> Option<bool> {
+        let as_boolean = |get: &dyn Fn(_, _, _) -> _| match get(self, col, &DataType::BOOLEAN) {
             Some(Scalar::Boolean(value)) => Some(value),
             Some(_) => {
                 info!("Ignoring non-boolean column {col}");
@@ -360,7 +356,7 @@ pub(crate) trait ParquetStatsSkippingFilter {
     /// details of the comparison semantics.
     fn partial_cmp_min_stat(
         &self,
-        col: &ColumnPath,
+        col: &ColumnName,
         val: &Scalar,
         ord: Ordering,
         inverted: bool,
@@ -373,7 +369,7 @@ pub(crate) trait ParquetStatsSkippingFilter {
     /// details of the comparison semantics.
     fn partial_cmp_max_stat(
         &self,
-        col: &ColumnPath,
+        col: &ColumnName,
         val: &Scalar,
         ord: Ordering,
         inverted: bool,
@@ -396,10 +392,4 @@ pub(crate) fn partial_cmp_scalars(
 ) -> Option<bool> {
     let result = a.partial_cmp(b)? == ord;
     Some(result != inverted)
-}
-
-pub(crate) fn col_name_to_path(col: &str) -> ColumnPath {
-    // TODO: properly handle nested columns
-    // https://github.com/delta-incubator/delta-kernel-rs/issues/86
-    ColumnPath::new(col.split('.').map(|s| s.to_string()).collect())
 }

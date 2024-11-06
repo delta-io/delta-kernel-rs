@@ -1,5 +1,5 @@
 use super::*;
-use crate::expressions::column_expr;
+use crate::expressions::{column_name, column_expr};
 use crate::Expression;
 use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use std::fs::File;
@@ -62,57 +62,57 @@ fn test_get_stat_values() {
 
     // Only the BOOL column has any nulls
     assert_eq!(
-        filter.get_nullcount_stat_value(&col_name_to_path("bool")),
+        filter.get_nullcount_stat_value(&column_name!("bool")),
         Some(3)
     );
     assert_eq!(
-        filter.get_nullcount_stat_value(&col_name_to_path("varlen.utf8")),
+        filter.get_nullcount_stat_value(&column_name!("varlen.utf8")),
         Some(0)
     );
 
     assert_eq!(
-        filter.get_min_stat_value(&col_name_to_path("varlen.utf8"), &DataType::STRING),
+        filter.get_min_stat_value(&column_name!("varlen.utf8"), &DataType::STRING),
         Some("a".into())
     );
 
     // CHEAT: Interpret the decimal128 column's fixed-length binary as a string
     assert_eq!(
         filter.get_min_stat_value(
-            &col_name_to_path("numeric.decimals.decimal128"),
+            &column_name!("numeric.decimals.decimal128"),
             &DataType::STRING
         ),
         Some("\0\0\0\0\0\0\0\0\0\0\0\0+x".into())
     );
 
     assert_eq!(
-        filter.get_min_stat_value(&col_name_to_path("numeric.ints.int64"), &DataType::LONG),
+        filter.get_min_stat_value(&column_name!("numeric.ints.int64"), &DataType::LONG),
         Some(1000000000i64.into())
     );
 
     // type widening!
     assert_eq!(
-        filter.get_min_stat_value(&col_name_to_path("numeric.ints.int32"), &DataType::LONG),
+        filter.get_min_stat_value(&column_name!("numeric.ints.int32"), &DataType::LONG),
         Some(1000000i64.into())
     );
 
     assert_eq!(
-        filter.get_min_stat_value(&col_name_to_path("numeric.ints.int32"), &DataType::INTEGER),
+        filter.get_min_stat_value(&column_name!("numeric.ints.int32"), &DataType::INTEGER),
         Some(1000000i32.into())
     );
 
     assert_eq!(
-        filter.get_min_stat_value(&col_name_to_path("numeric.ints.int16"), &DataType::SHORT),
+        filter.get_min_stat_value(&column_name!("numeric.ints.int16"), &DataType::SHORT),
         Some(1000i16.into())
     );
 
     assert_eq!(
-        filter.get_min_stat_value(&col_name_to_path("numeric.ints.int8"), &DataType::BYTE),
+        filter.get_min_stat_value(&column_name!("numeric.ints.int8"), &DataType::BYTE),
         Some(0i8.into())
     );
 
     assert_eq!(
         filter.get_min_stat_value(
-            &col_name_to_path("numeric.floats.float64"),
+            &column_name!("numeric.floats.float64"),
             &DataType::DOUBLE
         ),
         Some(1147f64.into())
@@ -121,7 +121,7 @@ fn test_get_stat_values() {
     // type widening!
     assert_eq!(
         filter.get_min_stat_value(
-            &col_name_to_path("numeric.floats.float32"),
+            &column_name!("numeric.floats.float32"),
             &DataType::DOUBLE
         ),
         Some(139f64.into())
@@ -129,26 +129,26 @@ fn test_get_stat_values() {
 
     assert_eq!(
         filter.get_min_stat_value(
-            &col_name_to_path("numeric.floats.float32"),
+            &column_name!("numeric.floats.float32"),
             &DataType::FLOAT
         ),
         Some(139f32.into())
     );
 
     assert_eq!(
-        filter.get_min_stat_value(&col_name_to_path("bool"), &DataType::BOOLEAN),
+        filter.get_min_stat_value(&column_name!("bool"), &DataType::BOOLEAN),
         Some(false.into())
     );
 
     assert_eq!(
-        filter.get_min_stat_value(&col_name_to_path("varlen.binary"), &DataType::BINARY),
+        filter.get_min_stat_value(&column_name!("varlen.binary"), &DataType::BINARY),
         Some([].as_slice().into())
     );
 
     // CHEAT: Interpret the decimal128 column's fixed-len array as binary
     assert_eq!(
         filter.get_min_stat_value(
-            &col_name_to_path("numeric.decimals.decimal128"),
+            &column_name!("numeric.decimals.decimal128"),
             &DataType::BINARY
         ),
         Some(
@@ -160,7 +160,7 @@ fn test_get_stat_values() {
 
     assert_eq!(
         filter.get_min_stat_value(
-            &col_name_to_path("numeric.decimals.decimal32"),
+            &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(8, 3).unwrap()
         ),
         Some(Scalar::Decimal(11032, 8, 3))
@@ -168,7 +168,7 @@ fn test_get_stat_values() {
 
     assert_eq!(
         filter.get_min_stat_value(
-            &col_name_to_path("numeric.decimals.decimal64"),
+            &column_name!("numeric.decimals.decimal64"),
             &DataType::decimal(16, 3).unwrap()
         ),
         Some(Scalar::Decimal(11064, 16, 3))
@@ -177,7 +177,7 @@ fn test_get_stat_values() {
     // type widening!
     assert_eq!(
         filter.get_min_stat_value(
-            &col_name_to_path("numeric.decimals.decimal32"),
+            &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(16, 3).unwrap()
         ),
         Some(Scalar::Decimal(11032, 16, 3))
@@ -185,7 +185,7 @@ fn test_get_stat_values() {
 
     assert_eq!(
         filter.get_min_stat_value(
-            &col_name_to_path("numeric.decimals.decimal128"),
+            &column_name!("numeric.decimals.decimal128"),
             &DataType::decimal(32, 3).unwrap()
         ),
         Some(Scalar::Decimal(11128, 32, 3))
@@ -194,7 +194,7 @@ fn test_get_stat_values() {
     // type widening!
     assert_eq!(
         filter.get_min_stat_value(
-            &col_name_to_path("numeric.decimals.decimal64"),
+            &column_name!("numeric.decimals.decimal64"),
             &DataType::decimal(32, 3).unwrap()
         ),
         Some(Scalar::Decimal(11064, 32, 3))
@@ -203,26 +203,26 @@ fn test_get_stat_values() {
     // type widening!
     assert_eq!(
         filter.get_min_stat_value(
-            &col_name_to_path("numeric.decimals.decimal32"),
+            &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(32, 3).unwrap()
         ),
         Some(Scalar::Decimal(11032, 32, 3))
     );
 
     assert_eq!(
-        filter.get_min_stat_value(&col_name_to_path("chrono.date32"), &DataType::DATE),
+        filter.get_min_stat_value(&column_name!("chrono.date32"), &DataType::DATE),
         Some(PrimitiveType::Date.parse_scalar("1971-01-01").unwrap())
     );
 
     assert_eq!(
-        filter.get_min_stat_value(&col_name_to_path("chrono.timestamp"), &DataType::TIMESTAMP),
+        filter.get_min_stat_value(&column_name!("chrono.timestamp"), &DataType::TIMESTAMP),
         None // Timestamp defaults to 96-bit, which doesn't get stats
     );
 
     // CHEAT: Interpret the timestamp_ntz column as a normal timestamp
     assert_eq!(
         filter.get_min_stat_value(
-            &col_name_to_path("chrono.timestamp_ntz"),
+            &column_name!("chrono.timestamp_ntz"),
             &DataType::TIMESTAMP
         ),
         Some(
@@ -234,7 +234,7 @@ fn test_get_stat_values() {
 
     assert_eq!(
         filter.get_min_stat_value(
-            &col_name_to_path("chrono.timestamp_ntz"),
+            &column_name!("chrono.timestamp_ntz"),
             &DataType::TIMESTAMP_NTZ
         ),
         Some(
@@ -246,7 +246,10 @@ fn test_get_stat_values() {
 
     // type widening!
     assert_eq!(
-        filter.get_min_stat_value(&col_name_to_path("chrono.date32"), &DataType::TIMESTAMP_NTZ),
+        filter.get_min_stat_value(
+            &column_name!("chrono.date32"),
+            &DataType::TIMESTAMP_NTZ
+        ),
         Some(
             PrimitiveType::TimestampNtz
                 .parse_scalar("1971-01-01 00:00:00.000000")
@@ -255,48 +258,48 @@ fn test_get_stat_values() {
     );
 
     assert_eq!(
-        filter.get_max_stat_value(&col_name_to_path("varlen.utf8"), &DataType::STRING),
+        filter.get_max_stat_value(&column_name!("varlen.utf8"), &DataType::STRING),
         Some("e".into())
     );
 
     // CHEAT: Interpret the decimal128 column's fixed-length binary as a string
     assert_eq!(
         filter.get_max_stat_value(
-            &col_name_to_path("numeric.decimals.decimal128"),
+            &column_name!("numeric.decimals.decimal128"),
             &DataType::STRING
         ),
         Some("\0\0\0\0\0\0\0\0\0\0\0\0;\u{18}".into())
     );
 
     assert_eq!(
-        filter.get_max_stat_value(&col_name_to_path("numeric.ints.int64"), &DataType::LONG),
+        filter.get_max_stat_value(&column_name!("numeric.ints.int64"), &DataType::LONG),
         Some(1000000004i64.into())
     );
 
     // type widening!
     assert_eq!(
-        filter.get_max_stat_value(&col_name_to_path("numeric.ints.int32"), &DataType::LONG),
+        filter.get_max_stat_value(&column_name!("numeric.ints.int32"), &DataType::LONG),
         Some(1000004i64.into())
     );
 
     assert_eq!(
-        filter.get_max_stat_value(&col_name_to_path("numeric.ints.int32"), &DataType::INTEGER),
+        filter.get_max_stat_value(&column_name!("numeric.ints.int32"), &DataType::INTEGER),
         Some(1000004.into())
     );
 
     assert_eq!(
-        filter.get_max_stat_value(&col_name_to_path("numeric.ints.int16"), &DataType::SHORT),
+        filter.get_max_stat_value(&column_name!("numeric.ints.int16"), &DataType::SHORT),
         Some(1004i16.into())
     );
 
     assert_eq!(
-        filter.get_max_stat_value(&col_name_to_path("numeric.ints.int8"), &DataType::BYTE),
+        filter.get_max_stat_value(&column_name!("numeric.ints.int8"), &DataType::BYTE),
         Some(4i8.into())
     );
 
     assert_eq!(
         filter.get_max_stat_value(
-            &col_name_to_path("numeric.floats.float64"),
+            &column_name!("numeric.floats.float64"),
             &DataType::DOUBLE
         ),
         Some(1125899906842747f64.into())
@@ -305,7 +308,7 @@ fn test_get_stat_values() {
     // type widening!
     assert_eq!(
         filter.get_max_stat_value(
-            &col_name_to_path("numeric.floats.float32"),
+            &column_name!("numeric.floats.float32"),
             &DataType::DOUBLE
         ),
         Some(1048699f64.into())
@@ -313,26 +316,26 @@ fn test_get_stat_values() {
 
     assert_eq!(
         filter.get_max_stat_value(
-            &col_name_to_path("numeric.floats.float32"),
+            &column_name!("numeric.floats.float32"),
             &DataType::FLOAT
         ),
         Some(1048699f32.into())
     );
 
     assert_eq!(
-        filter.get_max_stat_value(&col_name_to_path("bool"), &DataType::BOOLEAN),
+        filter.get_max_stat_value(&column_name!("bool"), &DataType::BOOLEAN),
         Some(true.into())
     );
 
     assert_eq!(
-        filter.get_max_stat_value(&col_name_to_path("varlen.binary"), &DataType::BINARY),
+        filter.get_max_stat_value(&column_name!("varlen.binary"), &DataType::BINARY),
         Some([0, 0, 0, 0].as_slice().into())
     );
 
     // CHEAT: Interpret the decimal128 columns' fixed-len array as binary
     assert_eq!(
         filter.get_max_stat_value(
-            &col_name_to_path("numeric.decimals.decimal128"),
+            &column_name!("numeric.decimals.decimal128"),
             &DataType::BINARY
         ),
         Some(
@@ -344,7 +347,7 @@ fn test_get_stat_values() {
 
     assert_eq!(
         filter.get_max_stat_value(
-            &col_name_to_path("numeric.decimals.decimal32"),
+            &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(8, 3).unwrap()
         ),
         Some(Scalar::Decimal(15032, 8, 3))
@@ -352,7 +355,7 @@ fn test_get_stat_values() {
 
     assert_eq!(
         filter.get_max_stat_value(
-            &col_name_to_path("numeric.decimals.decimal64"),
+            &column_name!("numeric.decimals.decimal64"),
             &DataType::decimal(16, 3).unwrap()
         ),
         Some(Scalar::Decimal(15064, 16, 3))
@@ -361,7 +364,7 @@ fn test_get_stat_values() {
     // type widening!
     assert_eq!(
         filter.get_max_stat_value(
-            &col_name_to_path("numeric.decimals.decimal32"),
+            &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(16, 3).unwrap()
         ),
         Some(Scalar::Decimal(15032, 16, 3))
@@ -369,7 +372,7 @@ fn test_get_stat_values() {
 
     assert_eq!(
         filter.get_max_stat_value(
-            &col_name_to_path("numeric.decimals.decimal128"),
+            &column_name!("numeric.decimals.decimal128"),
             &DataType::decimal(32, 3).unwrap()
         ),
         Some(Scalar::Decimal(15128, 32, 3))
@@ -378,7 +381,7 @@ fn test_get_stat_values() {
     // type widening!
     assert_eq!(
         filter.get_max_stat_value(
-            &col_name_to_path("numeric.decimals.decimal64"),
+            &column_name!("numeric.decimals.decimal64"),
             &DataType::decimal(32, 3).unwrap()
         ),
         Some(Scalar::Decimal(15064, 32, 3))
@@ -387,26 +390,26 @@ fn test_get_stat_values() {
     // type widening!
     assert_eq!(
         filter.get_max_stat_value(
-            &col_name_to_path("numeric.decimals.decimal32"),
+            &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(32, 3).unwrap()
         ),
         Some(Scalar::Decimal(15032, 32, 3))
     );
 
     assert_eq!(
-        filter.get_max_stat_value(&col_name_to_path("chrono.date32"), &DataType::DATE),
+        filter.get_max_stat_value(&column_name!("chrono.date32"), &DataType::DATE),
         Some(PrimitiveType::Date.parse_scalar("1971-01-05").unwrap())
     );
 
     assert_eq!(
-        filter.get_max_stat_value(&col_name_to_path("chrono.timestamp"), &DataType::TIMESTAMP),
+        filter.get_max_stat_value(&column_name!("chrono.timestamp"), &DataType::TIMESTAMP),
         None // Timestamp defaults to 96-bit, which doesn't get stats
     );
 
     // CHEAT: Interpret the timestamp_ntz column as a normal timestamp
     assert_eq!(
         filter.get_max_stat_value(
-            &col_name_to_path("chrono.timestamp_ntz"),
+            &column_name!("chrono.timestamp_ntz"),
             &DataType::TIMESTAMP
         ),
         Some(
@@ -418,7 +421,7 @@ fn test_get_stat_values() {
 
     assert_eq!(
         filter.get_max_stat_value(
-            &col_name_to_path("chrono.timestamp_ntz"),
+            &column_name!("chrono.timestamp_ntz"),
             &DataType::TIMESTAMP_NTZ
         ),
         Some(
@@ -430,7 +433,10 @@ fn test_get_stat_values() {
 
     // type widening!
     assert_eq!(
-        filter.get_max_stat_value(&col_name_to_path("chrono.date32"), &DataType::TIMESTAMP_NTZ),
+        filter.get_max_stat_value(
+            &column_name!("chrono.date32"),
+            &DataType::TIMESTAMP_NTZ
+        ),
         Some(
             PrimitiveType::TimestampNtz
                 .parse_scalar("1971-01-05 00:00:00.000000")

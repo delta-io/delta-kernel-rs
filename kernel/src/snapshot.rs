@@ -11,7 +11,6 @@ use tracing::{debug, warn};
 use url::Url;
 
 use crate::actions::{get_log_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
-use crate::expressions::column_expr;
 use crate::features::{ColumnMappingMode, COLUMN_MAPPING_MODE_KEY};
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
@@ -112,8 +111,8 @@ impl LogSegment {
         use Expression as Expr;
         static META_PREDICATE: LazyLock<Option<ExpressionRef>> = LazyLock::new(|| {
             Some(Arc::new(Expr::or(
-                column_expr!("metaData.id").is_not_null(),
-                column_expr!("protocol.minReaderVersion").is_not_null(),
+                Expr::column([METADATA_NAME, "id"]).is_not_null(),
+                Expr::column([PROTOCOL_NAME, "minReaderVersion"]).is_not_null(),
             )))
         });
         // read the same protocol and metadata schema for both commits and checkpoints

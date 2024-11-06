@@ -195,9 +195,11 @@ impl DataSkippingFilter {
 
         // Build the stats read schema by extracting the column names referenced by the predicate,
         // extracting the corresponding field from the table schema, and inserting that field.
+        //
+        // TODO: Support nested column names!
         let data_fields: Vec<_> = table_schema
             .fields()
-            .filter(|field| field_names.contains(&field.name))
+            .filter(|field| field_names.contains([field.name.clone()].as_slice()))
             .cloned()
             .collect();
         if data_fields.is_empty() {

@@ -41,8 +41,8 @@ pub struct EnginePredicate {
         extern "C" fn(predicate: *mut c_void, state: &mut KernelExpressionVisitorState) -> usize,
 }
 
-fn wrap_expression(state: &mut KernelExpressionVisitorState, expr: Expression) -> usize {
-    state.inflight_expressions.insert(expr)
+fn wrap_expression(state: &mut KernelExpressionVisitorState, expr: impl Into<Expression>) -> usize {
+    state.inflight_expressions.insert(expr.into())
 }
 
 pub fn unwrap_kernel_expression(
@@ -149,7 +149,7 @@ fn visit_expression_column_impl(
     name: DeltaResult<&str>,
 ) -> DeltaResult<usize> {
     // TODO: FIXME: This is incorrect if any field name in the column path contains a period.
-    let name = ColumnName::new(name?.split('.')).into();
+    let name = ColumnName::from_naive_str_split(name?);
     Ok(wrap_expression(state, name))
 }
 
@@ -184,7 +184,7 @@ fn visit_expression_literal_string_impl(
     state: &mut KernelExpressionVisitorState,
     value: DeltaResult<String>,
 ) -> DeltaResult<usize> {
-    Ok(wrap_expression(state, Expression::literal(value?)))
+    Ok(wrap_expression(state, value?))
 }
 
 // We need to get parse.expand working to be able to macro everything below, see issue #255
@@ -194,7 +194,7 @@ pub extern "C" fn visit_expression_literal_int(
     state: &mut KernelExpressionVisitorState,
     value: i32,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, value)
 }
 
 #[no_mangle]
@@ -202,7 +202,7 @@ pub extern "C" fn visit_expression_literal_long(
     state: &mut KernelExpressionVisitorState,
     value: i64,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, value)
 }
 
 #[no_mangle]
@@ -210,7 +210,7 @@ pub extern "C" fn visit_expression_literal_short(
     state: &mut KernelExpressionVisitorState,
     value: i16,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, value)
 }
 
 #[no_mangle]
@@ -218,7 +218,7 @@ pub extern "C" fn visit_expression_literal_byte(
     state: &mut KernelExpressionVisitorState,
     value: i8,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, value)
 }
 
 #[no_mangle]
@@ -226,7 +226,7 @@ pub extern "C" fn visit_expression_literal_float(
     state: &mut KernelExpressionVisitorState,
     value: f32,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, value)
 }
 
 #[no_mangle]
@@ -234,7 +234,7 @@ pub extern "C" fn visit_expression_literal_double(
     state: &mut KernelExpressionVisitorState,
     value: f64,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, value)
 }
 
 #[no_mangle]
@@ -242,5 +242,5 @@ pub extern "C" fn visit_expression_literal_bool(
     state: &mut KernelExpressionVisitorState,
     value: bool,
 ) -> usize {
-    wrap_expression(state, Expression::literal(value))
+    wrap_expression(state, value)
 }
