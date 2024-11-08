@@ -1,18 +1,40 @@
+use std::collections::HashMap;
 use std::iter;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::actions::get_log_commit_info_schema;
+use crate::actions::schemas::{GetNullableContainerStructField, GetStructField};
 use crate::actions::COMMIT_INFO_NAME;
+use crate::actions::{get_log_add_schema, get_log_commit_info_schema};
 use crate::error::Error;
-use crate::expressions::{column_expr, Scalar, StructData};
+use crate::expressions::{column_expr, ColumnName, Scalar, StructData};
 use crate::path::ParsedLogPath;
-use crate::schema::{StructField, StructType};
+use crate::schema::{SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::{DataType, DeltaResult, Engine, EngineData, Expression, Version};
 
+use itertools::chain;
+use url::Url;
+
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
+
+pub(crate) static WRITE_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new(vec![
+        <String>::get_struct_field("path"),
+        <HashMap<String, String>>::get_nullable_container_struct_field("partitionValues"),
+        <i64>::get_struct_field("size"),
+        <i64>::get_struct_field("modificationTime"),
+        <bool>::get_struct_field("dataChange"),
+    ]))
+});
+
+/// Get the expected schema for [`write_metadata`].
+///
+/// [`write_metadata`]: crate::transaction::Transaction::write_metadata
+pub fn get_write_metadata_schema() -> &'static SchemaRef {
+    &WRITE_METADATA_SCHEMA
+}
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
@@ -32,6 +54,7 @@ pub struct Transaction {
     read_snapshot: Arc<Snapshot>,
     operation: Option<String>,
     commit_info: Option<Arc<dyn EngineData>>,
+    write_metadata: Vec<Box<dyn EngineData>>,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -56,6 +79,7 @@ impl Transaction {
             read_snapshot: snapshot.into(),
             operation: None,
             commit_info: None,
+            write_metadata: vec![],
         }
     }
 
@@ -63,16 +87,17 @@ impl Transaction {
     /// will include the failed transaction in case of a conflict so the user can retry.
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
         // step one: construct the iterator of actions we want to commit
-        // note: only support commit_info right now (and it's required)
         let engine_commit_info = self
             .commit_info
             .as_ref()
             .ok_or_else(|| Error::MissingCommitInfo)?;
-        let actions = Box::new(iter::once(generate_commit_info(
+        let commit_info = generate_commit_info(
             engine,
             self.operation.as_deref(),
             engine_commit_info.as_ref(),
-        )?));
+        );
+        let adds = generate_adds(engine, self.write_metadata.iter().map(|a| a.as_ref()));
+        let actions = chain(iter::once(commit_info), adds);
 
         // step two: set new commit version (current_version + 1) and path to write
         let commit_version = self.read_snapshot.version() + 1;
@@ -111,6 +136,104 @@ impl Transaction {
     pub fn with_commit_info(mut self, commit_info: Box<dyn EngineData>) -> Self {
         self.commit_info = Some(commit_info.into());
         self
+    }
+
+    // Generate the logical-to-physical transform expression which must be evaluated on every data
+    // chunk before writing. At the moment, this is a transaction-wide expression.
+    fn generate_logical_to_physical(&self) -> Expression {
+        // for now, we just pass through all the columns except partition columns.
+        // note this is _incorrect_ if table config deems we need partition columns.
+        let partition_columns = self.read_snapshot.metadata().partition_columns.clone();
+        let fields = self.read_snapshot.schema().fields();
+        let fields = fields.filter_map(|f| {
+            if partition_columns.contains(f.name()) {
+                None
+            } else {
+                Some(ColumnName::new([f.name()]).into())
+            }
+        });
+        Expression::struct_from(fields)
+    }
+
+    /// Get the write context for this transaction. At the moment, this is constant for the whole
+    /// transaction.
+    // Note: after we introduce metadata updates (modify table schema, etc.), we need to make sure
+    // that engines cannot call this method after a metadata change, since the write context could
+    // have invalid metadata.
+    pub fn get_write_context(&self) -> WriteContext {
+        let target_dir = self.read_snapshot.table_root();
+        let snapshot_schema = self.read_snapshot.schema();
+        let logical_to_physical = self.generate_logical_to_physical();
+        WriteContext::new(
+            target_dir.clone(),
+            Arc::new(snapshot_schema.clone()),
+            logical_to_physical,
+        )
+    }
+
+    /// Add write metadata about files to include in the transaction. This API can be called
+    /// multiple times to add multiple batches.
+    ///
+    /// The expected schema for `write_metadata` is given by [`get_write_metadata_schema`].
+    pub fn add_write_metadata(&mut self, write_metadata: Box<dyn EngineData>) {
+        self.write_metadata.push(write_metadata);
+    }
+}
+
+// convert write_metadata into add actions using an expression to transform the data in a single
+// pass
+fn generate_adds<'a>(
+    engine: &dyn Engine,
+    write_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
+) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a {
+    let expression_handler = engine.get_expression_handler();
+    let write_metadata_schema = get_write_metadata_schema();
+    let log_schema = get_log_add_schema();
+
+    write_metadata.map(move |write_metadata_batch| {
+        let adds_expr = Expression::struct_from([Expression::struct_from(
+            write_metadata_schema
+                .fields()
+                .map(|f| ColumnName::new([f.name()]).into()),
+        )]);
+        let adds_evaluator = expression_handler.get_evaluator(
+            write_metadata_schema.clone(),
+            adds_expr,
+            log_schema.clone().into(),
+        );
+        adds_evaluator.evaluate(write_metadata_batch)
+    })
+}
+
+/// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
+/// write table data.
+///
+/// [`Transaction`]: struct.Transaction.html
+pub struct WriteContext {
+    target_dir: Url,
+    schema: SchemaRef,
+    logical_to_physical: Expression,
+}
+
+impl WriteContext {
+    fn new(target_dir: Url, schema: SchemaRef, logical_to_physical: Expression) -> Self {
+        WriteContext {
+            target_dir,
+            schema,
+            logical_to_physical,
+        }
+    }
+
+    pub fn target_dir(&self) -> &Url {
+        &self.target_dir
+    }
+
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    pub fn logical_to_physical(&self) -> &Expression {
+        &self.logical_to_physical
     }
 }
 
@@ -208,6 +331,7 @@ mod tests {
 
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowExpressionHandler;
+    use crate::schema::MapType;
     use crate::{ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler};
 
     use arrow::json::writer::LineDelimitedWriter;
@@ -540,5 +664,22 @@ mod tests {
             assert_empty_commit_info(actions, is_null)?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_write_metadata_schema() {
+        let schema = get_write_metadata_schema();
+        let expected = StructType::new(vec![
+            StructField::new("path", DataType::STRING, false),
+            StructField::new(
+                "partitionValues",
+                MapType::new(DataType::STRING, DataType::STRING, true),
+                false,
+            ),
+            StructField::new("size", DataType::LONG, false),
+            StructField::new("modificationTime", DataType::LONG, false),
+            StructField::new("dataChange", DataType::BOOLEAN, false),
+        ]);
+        assert_eq!(*schema, expected.into());
     }
 }

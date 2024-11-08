@@ -96,7 +96,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = Box<dyn EngineData>> + Send>,
+        data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + '_>,
         _overwrite: bool,
     ) -> DeltaResult<()> {
         let buffer = to_json_bytes(data)?;

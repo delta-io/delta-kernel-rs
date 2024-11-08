@@ -17,15 +17,14 @@ use delta_kernel::expressions::{column_expr, BinaryOperator, Expression};
 use delta_kernel::scan::state::{visit_scan_files, DvInfo, Stats};
 use delta_kernel::scan::{transform_to_logical, Scan};
 use delta_kernel::schema::Schema;
-use delta_kernel::{DeltaResult, Engine, EngineData, FileMeta, Table};
-use itertools::Itertools;
+use delta_kernel::{Engine, EngineData, FileMeta, Table};
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use url::Url;
 
 mod common;
-use common::to_arrow;
+use common::{read_scan, to_arrow};
 
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
 const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c000.snappy.parquet";
@@ -393,20 +392,7 @@ fn read_with_execute(
     expected: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let result_schema: ArrowSchemaRef = Arc::new(scan.schema().as_ref().try_into()?);
-    let scan_results = scan.execute(engine)?;
-    let batches: Vec<RecordBatch> = scan_results
-        .map(|scan_result| -> DeltaResult<_> {
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch = to_arrow(data)?;
-            if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
-            } else {
-                Ok(record_batch)
-            }
-        })
-        .try_collect()?;
+    let batches = read_scan(scan, engine)?;
 
     if expected.is_empty() {
         assert_eq!(batches.len(), 0);

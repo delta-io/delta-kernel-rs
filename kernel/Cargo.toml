@@ -90,6 +90,8 @@ default-engine = [
   "parquet/object_store",
   "reqwest",
   "tokio",
+  "uuid/v4",
+  "uuid/fast-rng",
 ]
 
 developer-visibility = []

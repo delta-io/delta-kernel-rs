@@ -665,11 +665,11 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
 /// serialize an arrow RecordBatch to a JSON string by appending to a buffer.
 // TODO (zach): this should stream data to the JSON writer and output an iterator.
 pub(crate) fn to_json_bytes(
-    data: impl Iterator<Item = Box<dyn EngineData>> + Send,
+    data: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send,
 ) -> DeltaResult<Vec<u8>> {
     let mut writer = LineDelimitedWriter::new(Vec::new());
     for chunk in data.into_iter() {
-        let arrow_data = ArrowEngineData::try_from_engine_data(chunk)?;
+        let arrow_data = ArrowEngineData::try_from_engine_data(chunk?)?;
         let record_batch = arrow_data.record_batch();
         writer.write(record_batch)?;
     }
@@ -1436,7 +1436,7 @@ mod tests {
             vec![Arc::new(StringArray::from(vec!["string1", "string2"]))],
         )?;
         let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(data));
-        let json = to_json_bytes(Box::new(std::iter::once(data)))?;
+        let json = to_json_bytes(Box::new(std::iter::once(Ok(data))))?;
         assert_eq!(
             json,
             "{\"string\":\"string1\"}\n{\"string\":\"string2\"}\n".as_bytes()

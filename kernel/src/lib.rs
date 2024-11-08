@@ -107,7 +107,7 @@ pub type FileDataReadResultIterator =
 pub struct FileMeta {
     /// The fully qualified path to the object
     pub location: Url,
-    /// The last modified time
+    /// The last modified time as milliseconds since unix epoch
     pub last_modified: i64,
     /// The size in bytes of the object
     pub size: usize,
@@ -122,6 +122,17 @@ impl Ord for FileMeta {
 impl PartialOrd for FileMeta {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+impl FileMeta {
+    /// Create a new instance of `FileMeta`
+    pub fn new(location: Url, last_modified: i64, size: usize) -> Self {
+        Self {
+            location,
+            last_modified,
+            size,
+        }
     }
 }
 
@@ -234,7 +245,7 @@ pub trait JsonHandler: Send + Sync {
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = Box<dyn EngineData>> + Send>,
+        data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + '_>,
         overwrite: bool,
     ) -> DeltaResult<()>;
 }

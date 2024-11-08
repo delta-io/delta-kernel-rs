@@ -52,7 +52,7 @@ impl JsonHandler for SyncJsonHandler {
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = Box<dyn EngineData>> + Send>,
+        data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + '_>,
         _overwrite: bool,
     ) -> DeltaResult<()> {
         let path = path
@@ -120,10 +120,10 @@ mod tests {
 
         let url = Url::from_file_path(path.clone()).unwrap();
         handler
-            .write_json_file(&url, Box::new(std::iter::once(data)), false)
+            .write_json_file(&url, Box::new(std::iter::once(Ok(data))), false)
             .expect("write json file");
         assert!(matches!(
-            handler.write_json_file(&url, Box::new(std::iter::once(empty)), false),
+            handler.write_json_file(&url, Box::new(std::iter::once(Ok(empty))), false),
             Err(Error::FileAlreadyExists(_))
         ));
 
