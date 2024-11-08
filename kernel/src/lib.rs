@@ -69,6 +69,11 @@ pub mod path;
 #[cfg(not(feature = "developer-visibility"))]
 pub(crate) mod path;
 
+#[cfg(feature = "developer-visibility")]
+pub mod log_segment;
+#[cfg(not(feature = "developer-visibility"))]
+pub(crate) mod log_segment;
+
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
