@@ -22,14 +22,58 @@ impl ColumnName {
         iter.into_iter().collect()
     }
 
+    // Convenience for testing etc. Intentionally not public.
+    fn empty() -> Self {
+        Self::new(&[] as &[String])
+    }
+
     /// Naively splits a string at dots to create a column name.
     ///
     /// This method is _NOT_ recommended for production use, as it does not attempt to interpret
     /// special characters in field names. For example, many systems would interpret the field name
-    /// `"a.b".c` as equivalent to `ColumnName::new(["\"a.b\"", "c"])` (two fields), but this method
-    /// would return the equivalent of `ColumnName::new(["\"a", "b\"", "c"])` (three fields).
+    /// `"a.b" . c ` as equivalent to `ColumnName::new(["\"a.b\"", "c"])` (two fields, whitespace
+    /// padding ignored), but this method would return three fields, including whitespace:
+    ///
+    /// ```
+    /// # use delta_kernel::expressions::ColumnName;
+    /// assert_eq!(
+    ///     ColumnName::from_naive_str_split(" \"a.b\" . c "),
+    ///     ColumnName::new([" \"a", "b\" ", " c "])
+    /// );
+    /// ```
     pub fn from_naive_str_split(name: impl AsRef<str>) -> Self {
         Self::new(name.as_ref().split('.'))
+    }
+
+    /// Parses a comma-separated list of column names, properly accounting for escapes and special
+    /// characters, e.g.:
+    ///
+    /// ```
+    /// # use delta_kernel::expressions::ColumnName;
+    /// assert_eq!(
+    ///     &ColumnName::parse_column_name_list("a.b , c.`d , e` . f").unwrap(),
+    ///     &[ColumnName::new(["a", "b"]), ColumnName::new(["c", "d , e", "f"])]
+    /// );
+    /// ```
+    pub fn parse_column_name_list(names: impl AsRef<str>) -> DeltaResult<Vec<ColumnName>> {
+        let names = names.as_ref();
+        let chars = &mut names.chars().peekable();
+
+        // Ambiguous case: The empty string `""` could reasonably parse as `[ColumnName::new([])]`
+        // or `[]`. Prefer the latter as more intuitive and compatible with e.g. `str::join(',')`.
+        drop_leading_whitespace(chars);
+        if chars.peek().is_none() {
+            return Ok(vec![]);
+        }
+
+        let mut cols = vec![];
+        loop {
+            let (col, ending) = parse_column_name(chars)?;
+            cols.push(col);
+            if ending != FieldEnding::NextColumn {
+                return Ok(cols);
+            }
+        }
     }
 
     /// Joins this column with another, concatenating their fields into a single nested column path.
@@ -204,43 +248,63 @@ impl std::str::FromStr for ColumnName {
     type Err = Error;
 
     fn from_str(s: &str) -> DeltaResult<Self> {
-        // Ambiguous case: The empty string `""`could reasonably parse as either `ColumnName::new([""])`
-        // or `ColumnName::new([])`. However, `ColumnName::new([""]).to_string()` is `"[]"` and
-        // `ColumnName::new([]).to_string()` is `""`, so we choose the latter because it produces a
-        // lossless round trip from `ColumnName` to  `String` and back.
-        let mut chars = s.chars().peekable();
-        drop_leading_whitespace(&mut chars);
-        if chars.peek().is_none() {
-            return Ok(ColumnName::new(&[] as &[String]));
-        }
-
-        let mut path = vec![];
-        loop {
-            drop_leading_whitespace(&mut chars);
-            let (field_name, done) = if chars.next_if_eq(&'`').is_none() {
-                parse_simple(&mut chars)?
-            } else {
-                parse_escaped(&mut chars)?
-            };
-            path.push(field_name);
-            if done {
-                return Ok(ColumnName::new(path));
-            }
+        let (col, ending) = parse_column_name(&mut s.chars().peekable())?;
+        if ending == FieldEnding::NextColumn {
+            Err(Error::generic("Trailing comma in column name"))
+        } else {
+            Ok(col)
         }
     }
 }
 
 type Chars<'a> = Peekable<std::str::Chars<'a>>;
 
-/// Helper for `impl FromStr for ColumnName`. Returns the parsed field name and a boolean value that
-/// indicates whether parsing reached EOF.
-fn parse_simple(chars: &mut Chars<'_>) -> DeltaResult<(String, bool)> {
+fn parse_column_name(chars: &mut Chars<'_>) -> DeltaResult<(ColumnName, FieldEnding)> {
+    // Ambiguous case: The empty string `""`could reasonably parse as either `ColumnName::new([""])`
+    // or `ColumnName::new([])`. However, `ColumnName::new([""]).to_string()` is `"[]"` and
+    // `ColumnName::new([]).to_string()` is `""`, so we choose the latter because it produces a
+    // lossless round trip from `ColumnName` to `String` and back. We also swallow a leading comma
+    // to produce an empty column, so that the string "," parses as two empty columns.
+    drop_leading_whitespace(chars);
+    if chars.peek().is_none() {
+        return Ok((ColumnName::empty(), FieldEnding::InputExhausted));
+    }
+    if chars.next_if_eq(&',').is_some() {
+        return Ok((ColumnName::empty(), FieldEnding::NextColumn));
+    }
+
+    let mut path = vec![];
+    loop {
+        drop_leading_whitespace(chars);
+        let (field_name, ending) = if chars.next_if_eq(&'`').is_none() {
+            parse_simple(chars)?
+        } else {
+            parse_escaped(chars)?
+        };
+        path.push(field_name);
+        if ending != FieldEnding::NextField {
+            return Ok((ColumnName::new(path), ending));
+        }
+    }
+}
+
+// What comes after the end of the field we just parsed?
+#[derive(PartialEq)]
+enum FieldEnding {
+    InputExhausted,
+    NextField,
+    NextColumn,
+}
+
+/// Helper for `impl FromStr for ColumnName`. Returns the parsed field name and how the field ended.
+fn parse_simple(chars: &mut Chars<'_>) -> DeltaResult<(String, FieldEnding)> {
     let mut name = String::new();
     let mut allow_digits = false; // first character cannot be a digit
     let mut field_finished = false;
     for c in chars {
         match c {
-            '.' => return Ok((name, false)),
+            '.' => return Ok((name, FieldEnding::NextField)),
+            ',' => return Ok((name, FieldEnding::NextColumn)),
             c if c.is_whitespace() => {
                 field_finished = true;
             }
@@ -267,13 +331,12 @@ fn parse_simple(chars: &mut Chars<'_>) -> DeltaResult<(String, bool)> {
         };
         allow_digits = true;
     }
-    Ok((name, true)) // EOF
+    Ok((name, FieldEnding::InputExhausted))
 }
 
 /// Helper `impl FromStr for ColumnName` for parsing complex field names escaped with backticks,
-/// e.g. "`ab``c``d`". Returns the parsed field name and a boolean value where true indicates this
-/// was the last field name (i.e. parsing is complete).
-fn parse_escaped(chars: &mut Chars<'_>) -> DeltaResult<(String, bool)> {
+/// e.g. "`ab``c``d`". Returns the parsed field name and a boolean how the field ended.
+fn parse_escaped(chars: &mut Chars<'_>) -> DeltaResult<(String, FieldEnding)> {
     let mut name = String::new();
     while let Some(c) = chars.next() {
         match c {
@@ -284,15 +347,17 @@ fn parse_escaped(chars: &mut Chars<'_>) -> DeltaResult<(String, bool)> {
                     while other.is_some_and(char::is_whitespace) {
                         other = chars.next();
                     }
-                    match other {
-                        None => return Ok((name, true)),       // no more fields
-                        Some('.') => return Ok((name, false)), // another field follows
+                    let ending = match other {
+                        None => FieldEnding::InputExhausted,
+                        Some('.') => FieldEnding::NextField,
+                        Some(',') => FieldEnding::NextColumn,
                         Some(other) => {
                             return Err(Error::generic(format!(
                                 "Invalid character '{other}' after escaped field name",
                             )))
                         }
-                    }
+                    };
+                    return Ok((name, ending));
                 }
             },
             _ => name.push(c),
@@ -479,10 +544,10 @@ mod test {
     #[test]
     fn test_column_name_from_str() {
         let cases = [
-            ("", Some(ColumnName::new(&[] as &[String]))), // the ambiguous case!
+            ("", Some(ColumnName::empty())), // the ambiguous case!
             (".", Some(ColumnName::new(["", ""]))),
             ("  .  ", Some(ColumnName::new(["", ""]))),
-            (" ", Some(ColumnName::new(&[] as &[String]))),
+            (" ", Some(ColumnName::empty())),
             ("0", None),
             (".a", Some(ColumnName::new(["", "a"]))),
             ("a.", Some(ColumnName::new(["a", ""]))),
@@ -534,7 +599,7 @@ mod test {
     #[test]
     fn test_column_name_to_string() {
         let cases = [
-            ("", ColumnName::new(&[] as &[String])), // the ambiguous case!
+            ("", ColumnName::empty()), // the ambiguous case!
             ("``.``", ColumnName::new(["", ""])),
             ("``.a", ColumnName::new(["", "a"])),
             ("a.``", ColumnName::new(["a", ""])),
@@ -570,6 +635,47 @@ mod test {
             let parsed: ColumnName = input.parse().unwrap();
             assert_eq!(parsed, expected_parsed);
             assert_eq!(parsed.to_string(), expected_output);
+        }
+    }
+
+    #[test]
+    fn test_parse_column_name_list() {
+        let cases = [
+            ("", Some(vec![])),
+            (
+                "  ,  ",
+                Some(vec![ColumnName::empty(), ColumnName::empty()]),
+            ),
+            ("  a  ", Some(vec![column_name!("a")])),
+            (
+                "  ,  a  ",
+                Some(vec![ColumnName::empty(), column_name!("a")]),
+            ),
+            (
+                "  a  ,  ",
+                Some(vec![column_name!("a"), ColumnName::empty()]),
+            ),
+            ("a  ,  b", Some(vec![column_name!("a"), column_name!("b")])),
+            ("`a, b`", Some(vec![ColumnName::new(["a, b"])])),
+            ("a.b, c", Some(vec![column_name!("a.b"), column_name!("c")])),
+            (
+                "`a.b`, c",
+                Some(vec![ColumnName::new(["a.b"]), column_name!("c")]),
+            ),
+            (
+                "`a.b`, c",
+                Some(vec![ColumnName::new(["a.b"]), column_name!("c")]),
+            ),
+        ];
+        for (input, expected_output) in cases {
+            let output = ColumnName::parse_column_name_list(input);
+            match (&output, &expected_output) {
+                (Ok(output), Some(expected_output)) => {
+                    assert_eq!(output, expected_output, "from \"{input}\"")
+                }
+                (Err(_), None) => {}
+                _ => panic!("Expected {input} to parse as {expected_output:?}, got {output:?}"),
+            }
         }
     }
 }
