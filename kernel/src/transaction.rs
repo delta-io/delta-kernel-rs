@@ -7,7 +7,7 @@ use crate::actions::schemas::{GetNullableContainerStructField, GetStructField};
 use crate::actions::COMMIT_INFO_NAME;
 use crate::actions::{get_log_add_schema, get_log_commit_info_schema};
 use crate::error::Error;
-use crate::expressions::{column_expr, ColumnName, Scalar, StructData};
+use crate::expressions::{column_expr, Scalar, StructData};
 use crate::path::ParsedLogPath;
 use crate::schema::{SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
@@ -143,15 +143,11 @@ impl Transaction {
     fn generate_logical_to_physical(&self) -> Expression {
         // for now, we just pass through all the columns except partition columns.
         // note this is _incorrect_ if table config deems we need partition columns.
-        let partition_columns = self.read_snapshot.metadata().partition_columns.clone();
+        let partition_columns = &self.read_snapshot.metadata().partition_columns;
         let fields = self.read_snapshot.schema().fields();
-        let fields = fields.filter_map(|f| {
-            if partition_columns.contains(f.name()) {
-                None
-            } else {
-                Some(ColumnName::new([f.name()]).into())
-            }
-        });
+        let fields = fields
+            .filter(|f| !partition_columns.contains(f.name()))
+            .map(|f| Expression::column([f.name()]));
         Expression::struct_from(fields)
     }
 
@@ -194,7 +190,7 @@ fn generate_adds<'a>(
         let adds_expr = Expression::struct_from([Expression::struct_from(
             write_metadata_schema
                 .fields()
-                .map(|f| ColumnName::new([f.name()]).into()),
+                .map(|f| Expression::column([f.name()])),
         )]);
         let adds_evaluator = expression_handler.get_evaluator(
             write_metadata_schema.clone(),
