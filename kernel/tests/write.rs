@@ -308,6 +308,26 @@ fn set_value(
     Ok(())
 }
 
+// list all the files at `path` and check that all parquet files have the same size, and return
+// that size
+async fn get_and_check_all_parquet_sizes(store: Arc<dyn ObjectStore>, path: &str) -> u64 {
+    use futures::stream::StreamExt;
+    let files: Vec<_> = store.list(Some(&Path::from(path))).collect().await;
+    let parquet_files = files
+        .into_iter()
+        .filter(|f| match f {
+            Ok(f) => f.location.extension() == Some("parquet"),
+            Err(_) => false,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(parquet_files.len(), 2);
+    let size = parquet_files.first().unwrap().as_ref().unwrap().size;
+    assert!(parquet_files
+        .iter()
+        .all(|f| f.as_ref().unwrap().size == size));
+    size.try_into().unwrap()
+}
+
 #[tokio::test]
 async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
@@ -375,6 +395,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter::<serde_json::Value>()
         .try_collect()?;
 
+    let size = get_and_check_all_parquet_sizes(store.clone(), "/test_table/").await;
     // check that the timestamps in commit_info and add actions are within 10s of SystemTime::now()
     // before we clear them for comparison
     check_action_timestamps(parsed_commits.iter())?;
@@ -403,7 +424,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
             "add": {
                 "path": "first.parquet",
                 "partitionValues": {},
-                "size": 483,
+                "size": size,
                 "modificationTime": 0,
                 "dataChange": true
             }
@@ -412,7 +433,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
             "add": {
                 "path": "second.parquet",
                 "partitionValues": {},
-                "size": 483,
+                "size": size,
                 "modificationTime": 0,
                 "dataChange": true
             }
@@ -517,6 +538,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter::<serde_json::Value>()
         .try_collect()?;
 
+    let size = get_and_check_all_parquet_sizes(store.clone(), "/test_table/").await;
     // check that the timestamps in commit_info and add actions are within 10s of SystemTime::now()
     // before we clear them for comparison
     check_action_timestamps(parsed_commits.iter())?;
@@ -547,7 +569,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                 "partitionValues": {
                     "partition": "a"
                 },
-                "size": 483,
+                "size": size,
                 "modificationTime": 0,
                 "dataChange": true
             }
@@ -558,7 +580,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                 "partitionValues": {
                     "partition": "b"
                 },
-                "size": 483,
+                "size": size,
                 "modificationTime": 0,
                 "dataChange": true
             }
