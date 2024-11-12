@@ -273,19 +273,19 @@ impl DataSkippingFilter {
     pub(crate) fn apply(&self, actions: &dyn EngineData) -> DeltaResult<Vec<bool>> {
         // retrieve and parse stats from actions data
         let stats = self.select_stats_evaluator.evaluate(actions)?;
-        assert_eq!(stats.length(), actions.length());
+        assert_eq!(stats.len(), actions.len());
         let parsed_stats = self
             .json_handler
             .parse_json(stats, self.stats_schema.clone())?;
-        assert_eq!(parsed_stats.length(), actions.length());
+        assert_eq!(parsed_stats.len(), actions.len());
 
         // evaluate the predicate on the parsed stats, then convert to selection vector
         let skipping_predicate = self.skipping_evaluator.evaluate(&*parsed_stats)?;
-        assert_eq!(skipping_predicate.length(), actions.length());
+        assert_eq!(skipping_predicate.len(), actions.len());
         let selection_vector = self
             .filter_evaluator
             .evaluate(skipping_predicate.as_ref())?;
-        assert_eq!(selection_vector.length(), actions.length());
+        assert_eq!(selection_vector.len(), actions.len());
 
         // visit the engine's selection vector to produce a Vec<bool>
         let mut visitor = SelectionVectorVisitor::default();

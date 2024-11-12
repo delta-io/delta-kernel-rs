@@ -42,10 +42,10 @@ impl EngineData for ArrowEngineData {
     fn extract(&self, schema: SchemaRef, visitor: &mut dyn DataVisitor) -> DeltaResult<()> {
         let mut col_array = vec![];
         self.extract_columns(&mut col_array, &schema)?;
-        visitor.visit(self.length(), &col_array)
+        visitor.visit(self.len(), &col_array)
     }
 
-    fn length(&self) -> usize {
+    fn len(&self) -> usize {
         self.data.num_rows()
     }
 

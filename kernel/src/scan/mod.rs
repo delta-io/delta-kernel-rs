@@ -149,7 +149,7 @@ impl ScanResult {
     /// _need_ to extend the mask to the full length of the batch or arrow will drop the extra rows.
     pub fn full_mask(&self) -> Option<Vec<bool>> {
         let mut mask = self.raw_mask.clone()?;
-        mask.resize(self.raw_data.as_ref().ok()?.length(), true);
+        mask.resize(self.raw_data.as_ref().ok()?.len(), true);
         Some(mask)
     }
 }
@@ -330,7 +330,7 @@ impl Scan {
                         &self.all_fields,
                         self.have_partition_cols,
                     );
-                    let len = logical.as_ref().map_or(0, |res| res.length());
+                    let len = logical.as_ref().map_or(0, |res| res.len());
                     // need to split the dv_mask. what's left in dv_mask covers this result, and rest
                     // will cover the following results. we `take()` out of `selection_vector` to avoid
                     // trying to return a captured variable. We're going to reassign `selection_vector`
@@ -668,7 +668,7 @@ mod tests {
         let files: Vec<ScanResult> = scan.execute(&engine).unwrap().try_collect().unwrap();
 
         assert_eq!(files.len(), 1);
-        let num_rows = files[0].raw_data.as_ref().unwrap().length();
+        let num_rows = files[0].raw_data.as_ref().unwrap().len();
         assert_eq!(num_rows, 10)
     }
 

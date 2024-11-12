@@ -20,7 +20,7 @@ fn count_total_scan_rows(
             let mask = scan_result.raw_mask();
             let deleted_rows = mask.into_iter().flatten().filter(|&&m| !m).count();
             let data = scan_result.raw_data?;
-            Ok(data.length() - deleted_rows)
+            Ok(data.len() - deleted_rows)
         })
         .fold_ok(0, Add::add)
 }

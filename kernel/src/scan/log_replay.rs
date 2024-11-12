@@ -152,10 +152,10 @@ impl LogReplayScanner {
         // below if a file has been removed
         let mut selection_vector = match filter_vector {
             Some(ref filter_vector) => filter_vector.clone(),
-            None => vec![false; actions.length()],
+            None => vec![false; actions.len()],
         };
 
-        assert_eq!(selection_vector.len(), actions.length());
+        assert_eq!(selection_vector.len(), actions.len());
         let adds = self.setup_batch_process(filter_vector, actions, is_log_batch)?;
 
         for (add, index) in adds.into_iter() {

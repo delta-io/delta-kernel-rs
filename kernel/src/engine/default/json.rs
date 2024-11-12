@@ -236,7 +236,7 @@ mod tests {
         let batch = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
-        assert_eq!(batch.length(), 4);
+        assert_eq!(batch.len(), 4);
     }
 
     #[test]

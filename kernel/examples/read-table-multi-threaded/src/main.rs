@@ -292,7 +292,7 @@ fn do_work(
 
         for read_result in read_results {
             let read_result = read_result.unwrap();
-            let len = read_result.length();
+            let len = read_result.len();
 
             // ask the kernel to transform the physical data into the correct logical form
             let logical = transform_to_logical(

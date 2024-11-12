@@ -31,7 +31,7 @@ use super::handle::Handle;
 #[no_mangle]
 pub unsafe extern "C" fn engine_data_length(data: &mut Handle<ExclusiveEngineData>) -> usize {
     let data = unsafe { data.as_mut() };
-    data.length()
+    data.len()
 }
 
 /// Allow an engine to "unwrap" an [`ExclusiveEngineData`] into the raw pointer for the case it wants
