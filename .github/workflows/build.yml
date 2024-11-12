@@ -128,6 +128,21 @@ jobs:
           make
           make test
 
+  miri:
+    name: "Miri"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Miri
+        run: |
+          rustup toolchain install nightly --component miri
+          rustup override set nightly
+          cargo miri setup
+      - name: Test with Miri
+        run: |
+          pushd ffi
+          MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --features sync-engine
+
   coverage:
     runs-on: ubuntu-latest
     env:

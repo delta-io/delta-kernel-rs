@@ -897,3 +897,60 @@ impl<T> Default for ReferenceSet<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[no_mangle]
+    extern "C" fn allocate_err(etype: KernelError, _: KernelStringSlice) -> *mut EngineError {
+        let boxed = Box::new(EngineError { etype });
+        Box::leak(boxed)
+    }
+
+    fn ok_or_panic<T>(result: ExternResult<T>) -> T {
+        match result {
+            ExternResult::Ok(t) => t,
+            ExternResult::Err(e) => unsafe {
+                panic!("Got engine error with type {:?}", (*e).etype);
+            },
+        }
+    }
+
+    #[test]
+    fn string_slice() {
+        let s = "foo";
+        let _ = kernel_string_slice!(s);
+    }
+
+    #[test]
+    fn bool_slice() {
+        let bools = vec![true, false, true];
+        let bool_slice = KernelBoolSlice::from(bools);
+        unsafe {
+            free_bool_slice(bool_slice);
+        }
+    }
+
+    #[test]
+    fn engine_builder() {
+        let path = "s3://doesntmatter/foo";
+        let path = kernel_string_slice!(path);
+        let builder = unsafe { ok_or_panic(get_engine_builder(path, allocate_err)) };
+        // TODO: When miri supports epoll_wait
+        // let engine = unsafe { builder_build(builder) };
+
+        // for now just rebox so it gets dropped and miri doesn't complain
+        let _box = unsafe { Box::from_raw(builder) };
+    }
+
+    #[test]
+    #[cfg(feature = "sync-engine")]
+    fn sync_engine() {
+        let engine = unsafe { get_sync_engine(allocate_err) };
+        let engine = ok_or_panic(engine);
+        unsafe {
+            free_engine(engine);
+        }
+    }
+}

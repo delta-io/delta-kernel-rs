@@ -59,7 +59,6 @@ pub trait HandleDescriptor {
 
 mod private {
 
-    use std::mem::ManuallyDrop;
     use std::ptr::NonNull;
     use std::sync::Arc;
 
@@ -338,8 +337,7 @@ mod private {
         type Raw = T;
 
         fn into_handle_ptr(val: Box<T>) -> NonNull<T> {
-            let val = ManuallyDrop::new(val);
-            val.as_ref().into()
+            Box::leak(val).into()
         }
         unsafe fn as_ref<'a>(ptr: *const T) -> &'a T {
             &*ptr
@@ -367,8 +365,10 @@ mod private {
         type Raw = T;
 
         fn into_handle_ptr(val: Arc<T>) -> NonNull<T> {
-            let val = ManuallyDrop::new(val);
-            val.as_ref().into()
+            let ptr = Arc::into_raw(val);
+            // Note: casting ptr as `*mut T` is needed for NonNull, and actually Arc::into_raw
+            // _does_ create a mutable pointer (via `Arc::as_ptr`), so this is an 'okay' cast.
+            unsafe { NonNull::new_unchecked(ptr as *mut T) } // into_raw guarantees non-null
         }
         unsafe fn as_ref<'a>(ptr: *const T) -> &'a T {
             &*ptr
@@ -400,8 +400,7 @@ mod private {
 
         fn into_handle_ptr(val: Box<T>) -> NonNull<Box<T>> {
             // Double-boxing needed in order to obtain a thin pointer
-            let val = ManuallyDrop::new(Box::new(val));
-            val.as_ref().into()
+            Box::leak(Box::new(val)).into()
         }
         unsafe fn as_ref<'a>(ptr: *const Box<T>) -> &'a T {
             let boxed = unsafe { &*ptr };
@@ -434,8 +433,7 @@ mod private {
 
         fn into_handle_ptr(val: Arc<T>) -> NonNull<Arc<T>> {
             // Double-boxing needed in order to obtain a thin pointer
-            let val = ManuallyDrop::new(Box::new(val));
-            val.as_ref().into()
+            Box::leak(Box::new(val)).into()
         }
         unsafe fn as_ref<'a>(ptr: *const Arc<T>) -> &'a T {
             let arc = unsafe { &*ptr };
