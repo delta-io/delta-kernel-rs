@@ -144,11 +144,11 @@ void print_tree_helper(ExpressionItem ref, int depth) {
         }
         case Decimal: {
           struct Decimal* dec = &lit->value.decimal;
-          printf("Decimal(%lld,%lld, %d, %d)\n",
+          printf("Decimal(%lld,%lld,%d,%d)\n",
                  (long long)dec->value[0],
                  (long long)dec->value[1],
-                 dec->scale,
-                 dec->precision);
+                 dec->precision,
+                 dec->scale);
           break;
         }
         case Null:

@@ -106,7 +106,7 @@ pub struct EngineExpressionVisitor {
     pub visit_literal_struct: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
-        child_field_list_value: usize,
+        child_field_list_id: usize,
         child_value_list_id: usize,
     ),
     /// Visit an array literal belonging to the list identified by `sibling_list_id`.

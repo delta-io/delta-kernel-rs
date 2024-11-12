@@ -61,7 +61,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         Scalar::Date(32).into(),
         Scalar::Binary(0x0000deadbeefcafeu64.to_be_bytes().to_vec()).into(),
         // Both the most and least significant u64 of the Decimal value will be 1
-        Scalar::Decimal((1 << 64) + 1, 2, 3).into(),
+        Scalar::Decimal((1 << 64) + 1, 5, 3).into(),
         Expr::null_literal(DataType::SHORT),
         Scalar::Struct(top_level_struct).into(),
         Scalar::Array(array_data).into(),
