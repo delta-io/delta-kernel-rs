@@ -1,11 +1,11 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of  checkpoint and commit
 //! files.
 
-use crate::{
-    actions::{get_log_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME},
-    schema::SchemaRef,
-    DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, FileMeta,
-};
+use crate::actions::{get_log_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
+use crate::path::ParsedLogPath;
+use crate::schema::SchemaRef;
+use crate::{DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, FileMeta};
+
 use itertools::Itertools;
 use std::sync::{Arc, LazyLock};
 use url::Url;
@@ -15,9 +15,9 @@ use url::Url;
 pub(crate) struct LogSegment {
     pub log_root: Url,
     /// Reverse order sorted commit files in the log segment
-    pub commit_files: Vec<FileMeta>,
+    pub commit_files: Vec<ParsedLogPath>,
     /// checkpoint files in the log segment.
-    pub checkpoint_files: Vec<FileMeta>,
+    pub checkpoint_files: Vec<ParsedLogPath>,
 }
 
 impl LogSegment {
@@ -43,7 +43,11 @@ impl LogSegment {
         let commit_stream = engine
             .get_json_handler()
             .read_json_files(
-                &self.commit_files,
+                &self
+                    .commit_files
+                    .iter()
+                    .map(|f| f.location.clone())
+                    .collect::<Vec<FileMeta>>(),
                 commit_read_schema,
                 meta_predicate.clone(),
             )?
@@ -52,7 +56,11 @@ impl LogSegment {
         let checkpoint_stream = engine
             .get_parquet_handler()
             .read_parquet_files(
-                &self.checkpoint_files,
+                &self
+                    .checkpoint_files
+                    .iter()
+                    .map(|f| f.location.clone())
+                    .collect::<Vec<FileMeta>>(),
                 checkpoint_read_schema,
                 meta_predicate,
             )?
