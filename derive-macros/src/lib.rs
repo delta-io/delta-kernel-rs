@@ -6,7 +6,7 @@ use syn::{
 };
 
 /// Parses a dot-delimited column name into an array of field names. See
-/// [`delta_kernel::expressions::column_name::column_name`] macro for details.
+/// `delta_kernel::expressions::column_name::column_name` macro for details.
 #[proc_macro]
 pub fn parse_column_name(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let is_valid = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.';

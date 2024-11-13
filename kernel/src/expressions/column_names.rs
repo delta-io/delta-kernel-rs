@@ -187,6 +187,8 @@ impl Hash for ColumnName {
 /// let parsed: ColumnName = colname.to_string().parse().unwrap();
 /// assert_eq!(colname, parsed);
 /// ```
+///
+/// [`FromStr`]: std::str::FromStr
 impl Display for ColumnName {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut delim = None;

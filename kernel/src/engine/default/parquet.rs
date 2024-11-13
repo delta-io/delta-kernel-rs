@@ -109,8 +109,8 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         self
     }
 
-    // Write `data` to `path`/<uuid>.parquet as parquet using ArrowWriter and return the parquet
-    // metadata (where <uuid> is a generated UUIDv4).
+    // Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
+    // metadata (where `<uuid>` is a generated UUIDv4).
     //
     // Note: after encoding the data as parquet, this issues a PUT followed by a HEAD to storage in
     // order to obtain metadata about the object just written.
@@ -155,8 +155,8 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         Ok(DataFileMetadata::new(file_meta))
     }
 
-    /// Write `data` to `path`/<uuid>.parquet as parquet using ArrowWriter and return the parquet
-    /// metadata as an EngineData batch which matches the [write metadata] schema (where <uuid> is
+    /// Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
+    /// metadata as an EngineData batch which matches the [write metadata] schema (where `<uuid>` is
     /// a generated UUIDv4).
     ///
     /// [write metadata]: crate::transaction::get_write_metadata_schema
