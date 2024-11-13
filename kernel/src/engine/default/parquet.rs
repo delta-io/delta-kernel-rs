@@ -506,7 +506,10 @@ mod tests {
                 },
         } = write_metadata;
         let expected_location = Url::parse("memory:///data/").unwrap();
-        let expected_size = 497;
+
+        // head the object to get metadata
+        let meta = store.head(&Path::from(location.path())).await.unwrap();
+        let expected_size = meta.size;
 
         // check that last_modified is within 10s of now
         let now: i64 = SystemTime::now()
