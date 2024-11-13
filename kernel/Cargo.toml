@@ -117,6 +117,7 @@ rustc_version = "0.4.1"
 [dev-dependencies]
 arrow = { workspace = true, features = ["json", "prettyprint"] }
 delta_kernel = { path = ".", features = ["default-engine", "sync-engine"] }
+test_utils = { path = "../test-utils" }
 paste = "1.0"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 tempfile = "3"

@@ -158,6 +158,8 @@ mod tests {
 
     use object_store::{local::LocalFileSystem, ObjectStore};
 
+    use test_utils::delta_path_for_version;
+
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngine;
     use crate::Engine;
@@ -220,16 +222,12 @@ mod tests {
         let tmp_store = LocalFileSystem::new_with_prefix(tmp.path()).unwrap();
         let data = Bytes::from("kernel-data");
 
-        let expected_names: Vec<String> = (0..10)
-            .map(|i| format!("_delta_log/{:0>20}.json", i))
-            .collect();
+        let expected_names: Vec<Path> =
+            (0..10).map(|i| delta_path_for_version(i, "json")).collect();
 
         // put them in in reverse order
         for name in expected_names.iter().rev() {
-            tmp_store
-                .put(&Path::from(name.as_str()), data.clone().into())
-                .await
-                .unwrap();
+            tmp_store.put(name, data.clone().into()).await.unwrap();
         }
 
         let url = Url::from_directory_path(tmp.path()).unwrap();
@@ -242,7 +240,11 @@ mod tests {
         let mut len = 0;
         for (file, expected) in files.zip(expected_names.iter()) {
             assert!(
-                file.as_ref().unwrap().location.path().ends_with(expected),
+                file.as_ref()
+                    .unwrap()
+                    .location
+                    .path()
+                    .ends_with(expected.as_ref()),
                 "{} does not end with {}",
                 file.unwrap().location.path(),
                 expected

@@ -1,0 +1,17 @@
+[package]
+name = "test_utils"
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow-array = { workspace = true, features = ["chrono-tz"] }
+arrow-schema = { workspace = true }
+delta_kernel = { path = "../kernel", features = [ "default-engine" ] }
+itertools = "0.13.0"
+object_store = { workspace = true }
+parquet = { workspace = true }

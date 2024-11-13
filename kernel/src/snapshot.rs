@@ -366,6 +366,7 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::ObjectStore;
+    use test_utils::delta_path_for_version;
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::filesystem::ObjectStoreFileSystemClient;
@@ -440,10 +441,6 @@ mod tests {
     fn test_read_log_with_out_of_date_last_checkpoint() {
         let store = Arc::new(InMemory::new());
 
-        fn get_path(index: usize, suffix: &str) -> Path {
-            let path = format!("_delta_log/{index:020}.{suffix}");
-            Path::from(path.as_str())
-        }
         let data = bytes::Bytes::from("kernel-data");
 
         let checkpoint_metadata = CheckpointMetadata {
@@ -461,14 +458,14 @@ mod tests {
             .expect("create tokio runtime")
             .block_on(async {
                 for path in [
-                    get_path(0, "json"),
-                    get_path(1, "checkpoint.parquet"),
-                    get_path(2, "json"),
-                    get_path(3, "checkpoint.parquet"),
-                    get_path(4, "json"),
-                    get_path(5, "checkpoint.parquet"),
-                    get_path(6, "json"),
-                    get_path(7, "json"),
+                    delta_path_for_version(0, "json"),
+                    delta_path_for_version(1, "checkpoint.parquet"),
+                    delta_path_for_version(2, "json"),
+                    delta_path_for_version(3, "checkpoint.parquet"),
+                    delta_path_for_version(4, "json"),
+                    delta_path_for_version(5, "checkpoint.parquet"),
+                    delta_path_for_version(6, "json"),
+                    delta_path_for_version(7, "json"),
                 ] {
                     store
                         .put(&path, data.clone().into())

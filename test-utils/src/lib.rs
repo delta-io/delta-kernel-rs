@@ -1,0 +1,108 @@
+//! A number of utilities useful for testing that we want to use in multiple crates
+
+use std::sync::Arc;
+
+use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use arrow_schema::ArrowError;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::EngineData;
+use itertools::Itertools;
+use object_store::{path::Path, ObjectStore};
+use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::file::properties::WriterProperties;
+
+/// A common useful initial metadata and protocol. Also includes a single commitInfo
+pub const METADATA: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
+{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
+{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+
+pub enum TestAction {
+    Add(String),
+    Remove(String),
+    Metadata,
+}
+
+/// Convert a vector of actions into a newline delimited json string
+pub fn actions_to_string(actions: Vec<TestAction>) -> String {
+    actions
+            .into_iter()
+            .map(|test_action| match test_action {
+                TestAction::Add(path) => format!(r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 1}},\"maxValues\":{{\"id\":3}}}}"}}}}"#),
+                TestAction::Remove(path) => format!(r#"{{"remove":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true}}}}"#),
+                TestAction::Metadata => METADATA.into(),
+            })
+            .join("\n")
+}
+
+/// convert a RecordBatch into a vector of bytes. We can't use `From` since these are both foreign
+/// types
+pub fn record_batch_to_bytes(batch: &RecordBatch) -> Vec<u8> {
+    let mut data: Vec<u8> = Vec::new();
+    let props = WriterProperties::builder().build();
+    let mut writer = ArrowWriter::try_new(&mut data, batch.schema(), Some(props)).unwrap();
+    writer.write(batch).expect("Writing batch");
+    // writer must be closed to write footer
+    writer.close().unwrap();
+    data
+}
+
+/// Anything that implements `IntoArray` can turn itself into a reference to an arrow array
+pub trait IntoArray {
+    fn into_array(self) -> ArrayRef;
+}
+
+impl IntoArray for Vec<i32> {
+    fn into_array(self) -> ArrayRef {
+        Arc::new(Int32Array::from(self))
+    }
+}
+
+impl IntoArray for Vec<&'static str> {
+    fn into_array(self) -> ArrayRef {
+        Arc::new(StringArray::from(self))
+    }
+}
+
+/// Generate a record batch from an iterator over (name, array) pairs. Each pair specifies a column
+/// name and the array to associate with it
+pub fn generate_batch<I, F>(items: I) -> Result<RecordBatch, ArrowError>
+where
+    I: IntoIterator<Item = (F, ArrayRef)>,
+    F: AsRef<str>,
+{
+    RecordBatch::try_from_iter(items)
+}
+
+/// Generate a RecordBatch with two columns (id: int, val: str), with values "1,2,3" and "a,b,c"
+/// respectively
+pub fn generate_simple_batch() -> Result<RecordBatch, ArrowError> {
+    generate_batch(vec![
+        ("id", vec![1, 2, 3].into_array()),
+        ("val", vec!["a", "b", "c"].into_array()),
+    ])
+}
+
+/// get an ObjectStore path for a delta file, based on the version
+pub fn delta_path_for_version(version: u64, suffix: &str) -> Path {
+    let path = format!("_delta_log/{version:020}.{suffix}");
+    Path::from(path.as_str())
+}
+
+/// put a commit file into the specified object store.
+pub async fn add_commit(
+    store: &dyn ObjectStore,
+    version: u64,
+    data: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = delta_path_for_version(version, "json");
+    store.put(&path, data.into()).await?;
+    Ok(())
+}
+
+/// Try to convert an `EngineData` into a `RecordBatch`. Panics if not using `ArrowEngineData` from
+/// the default module
+pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
+    ArrowEngineData::try_from_engine_data(engine_data)
+        .unwrap()
+        .into()
+}
