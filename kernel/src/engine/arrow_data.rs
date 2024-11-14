@@ -9,7 +9,6 @@ use arrow_array::{Array, GenericListArray, MapArray, OffsetSizeTrait, RecordBatc
 use arrow_schema::{ArrowError, DataType as ArrowDataType};
 use tracing::{debug, warn};
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -47,14 +46,6 @@ impl EngineData for ArrowEngineData {
 
     fn len(&self) -> usize {
         self.data.num_rows()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn into_any(self: Box<Self>) -> Box<dyn Any> {
-        self
     }
 }
 

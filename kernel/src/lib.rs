@@ -50,6 +50,7 @@
     rust_2021_compatibility
 )]
 
+use std::any::Any;
 use std::sync::Arc;
 use std::{cmp::Ordering, ops::Range};
 
@@ -141,12 +142,130 @@ impl FileMeta {
     }
 }
 
+/// Extension trait that makes it easier to work with traits objects that implement [`Any`],
+/// implemented automatically for any type that satisfies `Any`, `Send`, and `Sync`. In particular,
+/// given some `trait T: Any + Send + Sync`, it allows upcasting `T` to `dyn Any + Send + Sync`,
+/// which in turn allows downcasting the result to a concrete type. For example:
+///
+/// ```
+/// # use delta_kernel::AsAny;
+/// # use std::any::Any;
+/// # use std::sync::Arc;
+/// trait Foo : AsAny {}
+/// struct Bar;
+/// impl Foo for Bar {}
+///
+/// let f: Arc<dyn Foo> = Arc::new(Bar);
+/// let a: Arc<dyn Any + Send + Sync> = f.as_any();
+/// let b: Arc<Bar> = a.downcast().unwrap();
+/// ```
+///
+/// In contrast, very similer code that relies only on `Any` would fail to compile:
+///
+/// ```fail_compile
+/// # use std::any::Any;
+/// # use std::sync::Arc;
+/// trait Foo: Any + Send + Sync {}
+///
+/// struct Bar;
+/// impl Foo for Bar {}
+///
+/// let f: Arc<dyn Foo> = Arc::new(Bar);
+/// let b: Arc<Bar> = f.downcast().unwrap(); // `Arc::downcast` method not found
+/// ```
+///
+/// As would this:
+///
+/// ```fail_compile
+/// # use std::any::Any;
+/// # use std::sync::Arc;
+/// trait Foo: Any + Send + Sync {}
+///
+/// struct Bar;
+/// impl Foo for Bar {}
+///
+/// let f: Arc<dyn Foo> = Arc::new(Bar);
+/// let a: Arc<dyn Any + Send + Sync> = f; // trait upcasting coercion is not stable rust
+/// let f: Arc<Bar> = a.downcast().unwrap();
+/// ```
+///
+/// NOTE: `AsAny` inherits the `Send + Sync` constraint from [`Arc::downcast`].
+pub trait AsAny: Any + Send + Sync {
+    /// Obtains a `dyn Any` reference to the object:
+    ///
+    /// ```
+    /// # use delta_kernel::AsAny;
+    /// # use std::any::Any;
+    /// # use std::sync::Arc;
+    /// trait Foo : AsAny {}
+    /// struct Bar;
+    /// impl Foo for Bar {}
+    ///
+    /// let f: &dyn Foo = &Bar;
+    /// let a: &dyn Any = f.any_ref();
+    /// let b: &Bar = a.downcast_ref().unwrap();
+    /// ```
+    fn any_ref(&self) -> &(dyn Any + Send + Sync);
+
+    /// Obtains an `Arc<dyn Any>` reference to the object:
+    ///
+    /// ```
+    /// # use delta_kernel::AsAny;
+    /// # use std::any::Any;
+    /// # use std::sync::Arc;
+    /// trait Foo : AsAny {}
+    /// struct Bar;
+    /// impl Foo for Bar {}
+    ///
+    /// let f: Arc<dyn Foo> = Arc::new(Bar);
+    /// let a: Arc<dyn Any + Send + Sync> = f.as_any();
+    /// let b: Arc<Bar> = a.downcast().unwrap();
+    /// ```
+    fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
+
+    /// Converts the object to `Box<dyn Any>`:
+    ///
+    /// ```
+    /// # use delta_kernel::AsAny;
+    /// # use std::any::Any;
+    /// # use std::sync::Arc;
+    /// trait Foo : AsAny {}
+    /// struct Bar;
+    /// impl Foo for Bar {}
+    ///
+    /// let f: Box<dyn Foo> = Box::new(Bar);
+    /// let a: Box<dyn Any> = f.into_any();
+    /// let b: Box<Bar> = a.downcast().unwrap();
+    /// ```
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync>;
+
+    /// Convenient wrapper for [`std::any::type_name`], since [`Any`] does not provide it and
+    /// [`Any::type_id`] is useless as a debugging aid (its `Debug` is just a mess of hex digits).
+    fn type_name(&self) -> &'static str;
+}
+
+// Blanket implementation for all eligible types
+impl<T: Any + Send + Sync> AsAny for T {
+    fn any_ref(&self) -> &(dyn Any + Send + Sync) {
+        self
+    }
+    fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
+    }
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync> {
+        self
+    }
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+}
+
 /// Trait for implementing an Expression evaluator.
 ///
 /// It contains one Expression which can be evaluated on multiple ColumnarBatches.
 /// Connectors can implement this trait to optimize the evaluation using the
 /// connector specific capabilities.
-pub trait ExpressionEvaluator: Send + Sync {
+pub trait ExpressionEvaluator: AsAny {
     /// Evaluate the expression on a given EngineData.
     ///
     /// Contains one value for each row of the input.
@@ -158,7 +277,7 @@ pub trait ExpressionEvaluator: Send + Sync {
 ///
 /// Delta Kernel can use this handler to evaluate predicate on partition filters,
 /// fill up partition column values and any computation on data using Expressions.
-pub trait ExpressionHandler: Send + Sync {
+pub trait ExpressionHandler: AsAny {
     /// Create an [`ExpressionEvaluator`] that can evaluate the given [`Expression`]
     /// on columnar batches with the given [`Schema`] to produce data of [`DataType`].
     ///
@@ -183,7 +302,7 @@ pub trait ExpressionHandler: Send + Sync {
 /// Delta Kernel uses this client whenever it needs to access the underlying
 /// file system where the Delta table is present. Connector implementation of
 /// this trait can hide filesystem specific details from Delta Kernel.
-pub trait FileSystemClient: Send + Sync {
+pub trait FileSystemClient: AsAny {
     /// List the paths in the same directory that are lexicographically greater or equal to
     /// (UTF-8 sorting) the given `path`. The result should also be sorted by the file name.
     fn list_from(&self, path: &Url)
@@ -201,7 +320,7 @@ pub trait FileSystemClient: Send + Sync {
 /// Delta Kernel can use this client to parse JSON strings into Row or read content from JSON files.
 /// Connectors can leverage this trait to provide their best implementation of the JSON parsing
 /// capability to Delta Kernel.
-pub trait JsonHandler: Send + Sync {
+pub trait JsonHandler: AsAny {
     /// Parse the given json strings and return the fields requested by output schema as columns in [`EngineData`].
     /// json_strings MUST be a single column batch of engine data, and the column type must be string
     fn parse_json(
@@ -259,7 +378,7 @@ pub trait JsonHandler: Send + Sync {
 ///
 /// Connectors can leverage this trait to provide their own custom
 /// implementation of Parquet data file functionalities to Delta Kernel.
-pub trait ParquetHandler: Send + Sync {
+pub trait ParquetHandler: AsAny {
     /// Read and parse the Parquet file at given locations and return the data as EngineData with
     /// the columns requested by physical schema . The ParquetHandler _must_ return exactly the
     /// columns specified in `physical_schema`, and they _must_ be in schema order.
@@ -282,7 +401,7 @@ pub trait ParquetHandler: Send + Sync {
 ///
 /// Engines/Connectors are expected to pass an implementation of this trait when reading a Delta
 /// table.
-pub trait Engine: Send + Sync {
+pub trait Engine: AsAny {
     /// Get the connector provided [`ExpressionHandler`].
     fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler>;
 

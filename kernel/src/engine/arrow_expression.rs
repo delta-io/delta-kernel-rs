@@ -534,7 +534,7 @@ pub struct DefaultExpressionEvaluator {
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         let batch = batch
-            .as_any()
+            .any_ref()
             .downcast_ref::<ArrowEngineData>()
             .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))?
             .record_batch();
