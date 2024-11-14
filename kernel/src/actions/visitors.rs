@@ -3,10 +3,8 @@
 
 use std::collections::HashMap;
 
-use crate::{
-    engine_data::{GetData, TypedGetData},
-    DataVisitor, DeltaResult,
-};
+use crate::engine_data::{GetData, TypedGetData};
+use crate::{DataVisitor, DeltaResult};
 
 use super::{
     deletion_vector::DeletionVectorDescriptor, Add, Format, Metadata, Protocol, Remove,
@@ -103,12 +101,12 @@ impl ProtocolVisitor {
         let writer_features: Option<Vec<_>> =
             getters[3].get_opt(row_index, "protocol.writer_features")?;
 
-        Ok(Protocol {
+        Protocol::try_new(
             min_reader_version,
             min_writer_version,
             reader_features,
             writer_features,
-        })
+        )
     }
 }
 

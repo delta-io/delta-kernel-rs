@@ -8,8 +8,8 @@ use crate::{
         visitors::visit_deletion_vector_at,
     },
     engine_data::{GetData, TypedGetData},
-    features::ColumnMappingMode,
     schema::SchemaRef,
+    table_features::ColumnMappingMode,
     DataVisitor, DeltaResult, Engine, EngineData, Error,
 };
 use serde::{Deserialize, Serialize};

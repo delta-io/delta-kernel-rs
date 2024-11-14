@@ -9,7 +9,7 @@ use indexmap::IndexMap;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::features::ColumnMappingMode;
+use crate::table_features::ColumnMappingMode;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 

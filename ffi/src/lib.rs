@@ -366,6 +366,7 @@ pub enum KernelError {
     MalformedJsonError,
     MissingMetadataError,
     MissingProtocolError,
+    InvalidProtocolError,
     MissingMetadataAndProtocolError,
     ParseError,
     JoinFailureError,
@@ -381,6 +382,7 @@ pub enum KernelError {
     InvalidCommitInfo,
     FileAlreadyExists,
     MissingCommitInfo,
+    UnsupportedError,
 }
 
 impl From<Error> for KernelError {
@@ -412,6 +414,7 @@ impl From<Error> for KernelError {
             Error::MalformedJson(_) => KernelError::MalformedJsonError,
             Error::MissingMetadata => KernelError::MissingMetadataError,
             Error::MissingProtocol => KernelError::MissingProtocolError,
+            Error::InvalidProtocol(_) => KernelError::InvalidProtocolError,
             Error::MissingMetadataAndProtocol => KernelError::MissingMetadataAndProtocolError,
             Error::ParseError(..) => KernelError::ParseError,
             Error::JoinFailure(_) => KernelError::JoinFailureError,
@@ -431,6 +434,7 @@ impl From<Error> for KernelError {
             Error::InvalidCommitInfo(_) => KernelError::InvalidCommitInfo,
             Error::FileAlreadyExists(_) => KernelError::FileAlreadyExists,
             Error::MissingCommitInfo => KernelError::MissingCommitInfo,
+            Error::Unsupported(_) => KernelError::UnsupportedError,
         }
     }
 }

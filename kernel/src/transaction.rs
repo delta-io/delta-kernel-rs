@@ -74,13 +74,18 @@ impl Transaction {
     /// Instead of using this API, the more typical (user-facing) API is
     /// [Table::new_transaction](crate::table::Table::new_transaction) to create a transaction from
     /// a table automatically backed by the latest snapshot.
-    pub(crate) fn new(snapshot: impl Into<Arc<Snapshot>>) -> Self {
-        Transaction {
-            read_snapshot: snapshot.into(),
+    pub(crate) fn try_new(snapshot: impl Into<Arc<Snapshot>>) -> DeltaResult<Self> {
+        let read_snapshot = snapshot.into();
+
+        // important! before a read/write to the table we must check it is supported
+        read_snapshot.protocol().ensure_write_supported()?;
+
+        Ok(Transaction {
+            read_snapshot,
             operation: None,
             commit_info: None,
             write_metadata: vec![],
-        }
+        })
     }
 
     /// Consume the transaction and commit it to the table. The result is a [CommitResult] which

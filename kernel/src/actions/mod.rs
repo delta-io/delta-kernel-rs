@@ -1,17 +1,25 @@
 //! Provides parsing and manipulation of the various actions defined in the [Delta
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
-use delta_kernel_derive::Schema;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::any::type_name;
+use std::collections::{HashMap, HashSet};
+use std::fmt::{Debug, Display};
+use std::hash::Hash;
+use std::str::FromStr;
 use std::sync::LazyLock;
-use visitors::{AddVisitor, MetadataVisitor, ProtocolVisitor};
 
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::schemas::GetStructField;
-use crate::features::{ReaderFeatures, WriterFeatures};
 use crate::schema::{SchemaRef, StructType};
-use crate::{DeltaResult, EngineData};
+use crate::table_features::{
+    ReaderFeatures, WriterFeatures, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
+};
+use crate::utils::require;
+use crate::{DeltaResult, EngineData, Error};
+use visitors::{AddVisitor, MetadataVisitor, ProtocolVisitor};
+
+use delta_kernel_derive::Schema;
+use serde::{Deserialize, Serialize};
 
 pub mod deletion_vector;
 pub mod set_transaction;
@@ -117,28 +125,72 @@ impl Metadata {
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Schema, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+// TODO move to another module so that we disallow constructing this struct without using the
+// try_new function.
 pub struct Protocol {
     /// The minimum version of the Delta read protocol that a client must implement
     /// in order to correctly read this table
-    pub min_reader_version: i32,
+    min_reader_version: i32,
     /// The minimum version of the Delta write protocol that a client must implement
     /// in order to correctly write this table
-    pub min_writer_version: i32,
+    min_writer_version: i32,
     /// A collection of features that a client must implement in order to correctly
     /// read this table (exist only when minReaderVersion is set to 3)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reader_features: Option<Vec<String>>,
+    reader_features: Option<Vec<String>>,
     /// A collection of features that a client must implement in order to correctly
     /// write this table (exist only when minWriterVersion is set to 7)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub writer_features: Option<Vec<String>>,
+    writer_features: Option<Vec<String>>,
 }
 
 impl Protocol {
+    /// Try to create a new Protocol instance from reader/writer versions and table features. This
+    /// can fail if the protocol is invalid.
+    pub fn try_new(
+        min_reader_version: i32,
+        min_writer_version: i32,
+        reader_features: Option<impl IntoIterator<Item = impl Into<String>>>,
+        writer_features: Option<impl IntoIterator<Item = impl Into<String>>>,
+    ) -> DeltaResult<Self> {
+        if min_reader_version == 3 {
+            require!(
+                reader_features.is_some(),
+                Error::invalid_protocol(
+                    "Reader features must be present when minimum reader version = 3"
+                )
+            );
+        }
+        if min_writer_version == 7 {
+            require!(
+                writer_features.is_some(),
+                Error::invalid_protocol(
+                    "Writer features must be present when minimum writer version = 7"
+                )
+            );
+        }
+        let reader_features = reader_features.map(|f| f.into_iter().map(Into::into).collect());
+        let writer_features = writer_features.map(|f| f.into_iter().map(Into::into).collect());
+        Ok(Protocol {
+            min_reader_version,
+            min_writer_version,
+            reader_features,
+            writer_features,
+        })
+    }
+
     pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
         let mut visitor = ProtocolVisitor::default();
         data.extract(get_log_schema().project(&[PROTOCOL_NAME])?, &mut visitor)?;
         Ok(visitor.protocol)
+    }
+
+    pub fn min_reader_version(&self) -> i32 {
+        self.min_reader_version
+    }
+
+    pub fn min_writer_version(&self) -> i32 {
+        self.min_writer_version
     }
 
     pub fn has_reader_feature(&self, feature: &ReaderFeatures) -> bool {
@@ -152,6 +204,91 @@ impl Protocol {
             .as_ref()
             .is_some_and(|features| features.iter().any(|f| f == feature.as_ref()))
     }
+
+    /// Check if reading a table with this protocol is supported. That is: does the kernel support
+    /// the specified protocol reader version and all enabled reader features? If yes, returns unit
+    /// type, otherwise will return an error.
+    pub fn ensure_read_supported(&self) -> DeltaResult<()> {
+        match &self.reader_features {
+            // if min_reader_version = 3 and all reader features are subset of supported => OK
+            Some(reader_features) if self.min_reader_version == 3 => {
+                ensure_supported_features(reader_features, &SUPPORTED_READER_FEATURES)
+            }
+            // if min_reader_version = 3 and no reader features => ERROR
+            // NOTE this is caught by the protocol parsing.
+            None if self.min_reader_version == 3 => Err(Error::internal_error(
+                "Reader features must be present when minimum reader version = 3",
+            )),
+            // if min_reader_version = 1,2 and there are no reader features => OK
+            None if self.min_reader_version == 1 || self.min_reader_version == 2 => Ok(()),
+            // if min_reader_version = 1,2 and there are reader features => ERROR
+            // NOTE this is caught by the protocol parsing.
+            Some(_) if self.min_reader_version == 1 || self.min_reader_version == 2 => {
+                Err(Error::internal_error(
+                    "Reader features must not be present when minimum reader version = 1 or 2",
+                ))
+            }
+            // any other min_reader_version is not supported
+            _ => Err(Error::Unsupported(format!(
+                "Unsupported minimum reader version {}",
+                self.min_reader_version
+            ))),
+        }
+    }
+
+    /// Check if writing to a table with this protocol is supported. That is: does the kernel
+    /// support the specified protocol writer version and all enabled writer features?
+    pub fn ensure_write_supported(&self) -> DeltaResult<()> {
+        match &self.writer_features {
+            // if min_reader_version = 3 and min_writer_version = 7 and all writer features are
+            // supported => OK
+            Some(writer_features)
+                if self.min_reader_version == 3 && self.min_writer_version == 7 =>
+            {
+                ensure_supported_features(writer_features, &SUPPORTED_WRITER_FEATURES)
+            }
+            // otherwise not supported
+            _ => Err(Error::unsupported(
+                "Only tables with min reader version 3 and min writer version 7 with no table features are supported."
+            )),
+        }
+    }
+}
+
+// given unparsed `table_features`, parse and check if they are subset of `supported_features`
+fn ensure_supported_features<T>(
+    table_features: &[String],
+    supported_features: &HashSet<T>,
+) -> DeltaResult<()>
+where
+    <T as FromStr>::Err: Display,
+    T: Debug + FromStr + Hash + Eq,
+{
+    let error = |unsupported, unsupported_or_unknown| {
+        let supported = supported_features.iter().collect::<Vec<_>>();
+        let features_type = type_name::<T>()
+            .rsplit("::")
+            .next()
+            .unwrap_or("table features");
+        Error::Unsupported(format!(
+            "{} {} {:?}. Supported {} are {:?}",
+            unsupported_or_unknown, features_type, unsupported, features_type, supported
+        ))
+    };
+    let parsed_features: HashSet<T> = table_features
+        .iter()
+        .map(|s| T::from_str(s).map_err(|_| error(vec![s.to_string()], "Unknown")))
+        .collect::<Result<_, Error>>()?;
+    parsed_features
+        .is_subset(supported_features)
+        .then_some(())
+        .ok_or_else(|| {
+            let unsupported = parsed_features
+                .difference(supported_features)
+                .map(|f| format!("{:?}", f))
+                .collect::<Vec<_>>();
+            error(unsupported, "Unsupported")
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
@@ -480,5 +617,167 @@ mod tests {
             true,
         )]));
         assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn test_validate_protocol() {
+        let invalid_protocols = [
+            Protocol {
+                min_reader_version: 3,
+                min_writer_version: 7,
+                reader_features: None,
+                writer_features: Some(vec![]),
+            },
+            Protocol {
+                min_reader_version: 3,
+                min_writer_version: 7,
+                reader_features: Some(vec![]),
+                writer_features: None,
+            },
+            Protocol {
+                min_reader_version: 3,
+                min_writer_version: 7,
+                reader_features: None,
+                writer_features: None,
+            },
+        ];
+        for Protocol {
+            min_reader_version,
+            min_writer_version,
+            reader_features,
+            writer_features,
+        } in invalid_protocols
+        {
+            assert!(matches!(
+                Protocol::try_new(
+                    min_reader_version,
+                    min_writer_version,
+                    reader_features,
+                    writer_features
+                ),
+                Err(Error::InvalidProtocol(_)),
+            ));
+        }
+    }
+
+    #[test]
+    fn test_v2_checkpoint_unsupported() {
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeatures::V2Checkpoint]),
+            Some([ReaderFeatures::V2Checkpoint]),
+        )
+        .unwrap();
+        assert!(protocol.ensure_read_supported().is_err());
+
+        let protocol = Protocol::try_new(
+            4,
+            7,
+            Some([ReaderFeatures::V2Checkpoint]),
+            Some([ReaderFeatures::V2Checkpoint]),
+        )
+        .unwrap();
+        assert!(protocol.ensure_read_supported().is_err());
+    }
+
+    #[test]
+    fn test_ensure_read_supported() {
+        let protocol = Protocol {
+            min_reader_version: 3,
+            min_writer_version: 7,
+            reader_features: Some(vec![]),
+            writer_features: Some(vec![]),
+        };
+        assert!(protocol.ensure_read_supported().is_ok());
+
+        let empty_features: [String; 0] = [];
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeatures::V2Checkpoint]),
+            Some(&empty_features),
+        )
+        .unwrap();
+        assert!(protocol.ensure_read_supported().is_err());
+
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some(&empty_features),
+            Some([WriterFeatures::V2Checkpoint]),
+        )
+        .unwrap();
+        assert!(protocol.ensure_read_supported().is_ok());
+
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeatures::V2Checkpoint]),
+            Some([WriterFeatures::V2Checkpoint]),
+        )
+        .unwrap();
+        assert!(protocol.ensure_read_supported().is_err());
+
+        let protocol = Protocol {
+            min_reader_version: 1,
+            min_writer_version: 7,
+            reader_features: None,
+            writer_features: None,
+        };
+        assert!(protocol.ensure_read_supported().is_ok());
+
+        let protocol = Protocol {
+            min_reader_version: 2,
+            min_writer_version: 7,
+            reader_features: None,
+            writer_features: None,
+        };
+        assert!(protocol.ensure_read_supported().is_ok());
+    }
+
+    #[test]
+    fn test_ensure_write_supported() {
+        let protocol = Protocol {
+            min_reader_version: 3,
+            min_writer_version: 7,
+            reader_features: Some(vec![]),
+            writer_features: Some(vec![]),
+        };
+        assert!(protocol.ensure_write_supported().is_ok());
+
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeatures::DeletionVectors]),
+            Some([WriterFeatures::DeletionVectors]),
+        )
+        .unwrap();
+        assert!(protocol.ensure_write_supported().is_err());
+    }
+
+    #[test]
+    fn test_ensure_supported_features() {
+        let supported_features = [
+            ReaderFeatures::ColumnMapping,
+            ReaderFeatures::DeletionVectors,
+        ]
+        .into_iter()
+        .collect();
+        let table_features = vec![ReaderFeatures::ColumnMapping.to_string()];
+        ensure_supported_features(&table_features, &supported_features).unwrap();
+
+        // test unknown features
+        let table_features = vec![ReaderFeatures::ColumnMapping.to_string(), "idk".to_string()];
+        let error = ensure_supported_features(&table_features, &supported_features).unwrap_err();
+        match error {
+            Error::Unsupported(e) if e ==
+                "Unknown ReaderFeatures [\"idk\"]. Supported ReaderFeatures are [ColumnMapping, DeletionVectors]"
+            => {},
+            Error::Unsupported(e) if e ==
+                "Unknown ReaderFeatures [\"idk\"]. Supported ReaderFeatures are [DeletionVectors, ColumnMapping]"
+            => {},
+            _ => panic!("Expected unsupported error"),
+        }
     }
 }

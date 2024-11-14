@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::sync::LazyLock;
+
 use serde::{Deserialize, Serialize};
 
 pub use column_mapping::ColumnMappingMode;
@@ -6,8 +9,12 @@ use strum::{AsRefStr, Display as StrumDisplay, EnumString, VariantNames};
 
 mod column_mapping;
 
-/// Features table readers can support as well as let users know
-/// what is supported
+/// Reader features communicate capabilities that must be implemented in order to correctly read a
+/// given table. That is, readers must implement and respect all features listed in a table's
+/// `ReaderFeatures`. Note that any feature listed as a `ReaderFeature` must also have a
+/// corresponding `WriterFeature`.
+///
+/// The kernel currently supports all reader features except for V2Checkpoints.
 #[derive(
     Serialize,
     Deserialize,
@@ -19,6 +26,7 @@ mod column_mapping;
     StrumDisplay,
     AsRefStr,
     VariantNames,
+    Hash,
 )]
 #[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
@@ -38,10 +46,16 @@ pub enum ReaderFeatures {
     TypeWideningPreview,
     /// version 2 of checkpointing
     V2Checkpoint,
+    /// vacuumProtocolCheck ReaderWriter feature ensures consistent application of reader and writer
+    /// protocol checks during VACUUM operations
+    VacuumProtocolCheck,
 }
 
-/// Features table writers can support as well as let users know
-/// what is supported
+/// Similar to reader features, writer features communicate capabilities that must be implemented
+/// in order to correctly write to a given table. That is, writers must implement and respect all
+/// features listed in a table's `WriterFeatures`.
+///
+/// Kernel write support is currently in progress and as such these are not supported.
 #[derive(
     Serialize,
     Deserialize,
@@ -53,6 +67,7 @@ pub enum ReaderFeatures {
     StrumDisplay,
     AsRefStr,
     VariantNames,
+    Hash,
 )]
 #[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
@@ -92,7 +107,39 @@ pub enum WriterFeatures {
     IcebergCompatV1,
     /// Iceberg compatibility support
     IcebergCompatV2,
+    /// vacuumProtocolCheck ReaderWriter feature ensures consistent application of reader and writer
+    /// protocol checks during VACUUM operations
+    VacuumProtocolCheck,
 }
+
+impl From<ReaderFeatures> for String {
+    fn from(feature: ReaderFeatures) -> Self {
+        feature.to_string()
+    }
+}
+
+impl From<WriterFeatures> for String {
+    fn from(feature: WriterFeatures) -> Self {
+        feature.to_string()
+    }
+}
+
+// we support everything except V2 checkpoints
+pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeatures>> =
+    LazyLock::new(|| {
+        HashSet::from([
+            ReaderFeatures::ColumnMapping,
+            ReaderFeatures::DeletionVectors,
+            ReaderFeatures::TimestampWithoutTimezone,
+            ReaderFeatures::TypeWidening,
+            ReaderFeatures::TypeWideningPreview,
+            ReaderFeatures::VacuumProtocolCheck,
+        ])
+    });
+
+// write support wip: no table features are supported yet
+pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<HashSet<WriterFeatures>> =
+    LazyLock::new(|| HashSet::from([]));
 
 #[cfg(test)]
 mod tests {
@@ -107,6 +154,7 @@ mod tests {
             (ReaderFeatures::TypeWidening, "typeWidening"),
             (ReaderFeatures::TypeWideningPreview, "typeWidening-preview"),
             (ReaderFeatures::V2Checkpoint, "v2Checkpoint"),
+            (ReaderFeatures::VacuumProtocolCheck, "vacuumProtocolCheck"),
         ];
 
         assert_eq!(ReaderFeatures::VARIANTS.len(), cases.len());
@@ -144,6 +192,7 @@ mod tests {
             (WriterFeatures::V2Checkpoint, "v2Checkpoint"),
             (WriterFeatures::IcebergCompatV1, "icebergCompatV1"),
             (WriterFeatures::IcebergCompatV2, "icebergCompatV2"),
+            (WriterFeatures::VacuumProtocolCheck, "vacuumProtocolCheck"),
         ];
 
         assert_eq!(WriterFeatures::VARIANTS.len(), cases.len());

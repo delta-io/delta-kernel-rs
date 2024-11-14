@@ -82,7 +82,7 @@ impl Table {
 
     /// Create a new write transaction for this table.
     pub fn new_transaction(&self, engine: &dyn Engine) -> DeltaResult<Transaction> {
-        Ok(Transaction::new(self.snapshot(engine, None)?))
+        Transaction::try_new(self.snapshot(engine, None)?)
     }
 }
 
