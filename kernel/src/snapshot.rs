@@ -2,20 +2,16 @@
 //! has schema etc.)
 //!
 
-use std::cmp::Ordering;
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::{debug, warn};
 use url::Url;
 
 use crate::actions::{Metadata, Protocol};
 use crate::log_segment::LogSegment;
-use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::Schema;
 use crate::table_features::{ColumnMappingMode, COLUMN_MAPPING_MODE_KEY};
-use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileSystemClient, Version};
 
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
@@ -27,7 +23,6 @@ const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 pub struct Snapshot {
     pub(crate) table_root: Url,
     pub(crate) log_segment: LogSegment,
-    version: Version,
     metadata: Metadata,
     protocol: Protocol,
     schema: Schema,
@@ -44,7 +39,7 @@ impl std::fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Snapshot")
             .field("path", &self.log_segment.log_root.as_str())
-            .field("version", &self.version)
+            .field("version", &self.version())
             .field("metadata", &self.metadata)
             .finish()
     }
@@ -64,57 +59,20 @@ impl Snapshot {
         version: Option<Version>,
     ) -> DeltaResult<Self> {
         let fs_client = engine.get_file_system_client();
-        let log_url = table_root.join("_delta_log/").unwrap();
+        let log_root = table_root.join("_delta_log/")?;
 
-        // List relevant files from log
-        let (mut commit_files, checkpoint_files) =
-            match (read_last_checkpoint(fs_client.as_ref(), &log_url)?, version) {
-                (Some(cp), None) => {
-                    list_log_files_with_checkpoint(&cp, fs_client.as_ref(), &log_url)?
-                }
-                (Some(cp), Some(version)) if cp.version >= version => {
-                    list_log_files_with_checkpoint(&cp, fs_client.as_ref(), &log_url)?
-                }
-                _ => list_log_files(fs_client.as_ref(), &log_url)?,
-            };
+        let checkpoint_hint = read_last_checkpoint(fs_client.as_ref(), &log_root)?;
 
-        // remove all files above requested version
-        if let Some(version) = version {
-            commit_files.retain(|log_path| log_path.version <= version);
-        }
-        // only keep commit files above the checkpoint we found
-        if let Some(checkpoint_file) = checkpoint_files.first() {
-            commit_files.retain(|log_path| checkpoint_file.version < log_path.version);
-        }
+        let log_segment =
+            LogSegment::for_snapshot(fs_client.as_ref(), log_root, checkpoint_hint, version)?;
 
-        // get the effective version from chosen files
-        let version_eff = commit_files
-            .first()
-            .or(checkpoint_files.first())
-            .ok_or(Error::MissingVersion)? // TODO: A more descriptive error
-            .version;
-
-        if let Some(v) = version {
-            require!(
-                version_eff == v,
-                Error::MissingVersion // TODO more descriptive error
-            );
-        }
-
-        let log_segment = LogSegment {
-            log_root: log_url,
-            commit_files,
-            checkpoint_files,
-        };
-
-        Self::try_new_from_log_segment(table_root, log_segment, version_eff, engine)
+        Self::try_new_from_log_segment(table_root, log_segment, engine)
     }
 
     /// Create a new [`Snapshot`] instance.
     pub(crate) fn try_new_from_log_segment(
         location: Url,
         log_segment: LogSegment,
-        version: Version,
         engine: &dyn Engine,
     ) -> DeltaResult<Self> {
         let (metadata, protocol) = log_segment.read_metadata(engine)?;
@@ -126,7 +84,6 @@ impl Snapshot {
         Ok(Self {
             table_root: location,
             log_segment,
-            version,
             metadata,
             protocol,
             schema,
@@ -146,7 +103,7 @@ impl Snapshot {
 
     /// Version of this `Snapshot` in the table.
     pub fn version(&self) -> Version {
-        self.version
+        self.log_segment.end_version
     }
 
     /// Table [`Schema`] at this `Snapshot`s version.
@@ -229,131 +186,6 @@ fn read_last_checkpoint(
     }
 }
 
-/// List all log files after a given checkpoint.
-fn list_log_files_with_checkpoint(
-    checkpoint_metadata: &CheckpointMetadata,
-    fs_client: &dyn FileSystemClient,
-    log_root: &Url,
-) -> DeltaResult<(Vec<ParsedLogPath>, Vec<ParsedLogPath>)> {
-    let version_prefix = format!("{:020}", checkpoint_metadata.version);
-    let start_from = log_root.join(&version_prefix)?;
-
-    let mut max_checkpoint_version = checkpoint_metadata.version;
-    let mut checkpoint_files = vec![];
-    // We expect 10 commit files per checkpoint, so start with that size. We could adjust this based
-    // on config at some point
-    let mut commit_files = Vec::with_capacity(10);
-
-    for meta_res in fs_client.list_from(&start_from)? {
-        let meta = meta_res?;
-        let parsed_path = ParsedLogPath::try_from(meta)?;
-        // TODO this filters out .crc files etc which start with "." - how do we want to use these kind of files?
-        if let Some(parsed_path) = parsed_path {
-            if parsed_path.is_commit() {
-                commit_files.push(parsed_path);
-            } else if parsed_path.is_checkpoint() {
-                match parsed_path.version.cmp(&max_checkpoint_version) {
-                    Ordering::Greater => {
-                        max_checkpoint_version = parsed_path.version;
-                        checkpoint_files.clear();
-                        checkpoint_files.push(parsed_path);
-                    }
-                    Ordering::Equal => checkpoint_files.push(parsed_path),
-                    Ordering::Less => {}
-                }
-            }
-        }
-    }
-
-    if checkpoint_files.is_empty() {
-        // TODO: We could potentially recover here
-        return Err(Error::generic(
-            "Had a _last_checkpoint hint but didn't find any checkpoints",
-        ));
-    }
-
-    if max_checkpoint_version != checkpoint_metadata.version {
-        warn!(
-            "_last_checkpoint hint is out of date. _last_checkpoint version: {}. Using actual most recent: {}",
-            checkpoint_metadata.version,
-            max_checkpoint_version
-        );
-        // we (may) need to drop commits that are before the _actual_ last checkpoint (that
-        // is, commits between a stale _last_checkpoint and the _actual_ last checkpoint)
-        commit_files.retain(|parsed_path| parsed_path.version > max_checkpoint_version);
-    } else if checkpoint_files.len() != checkpoint_metadata.parts.unwrap_or(1) {
-        return Err(Error::Generic(format!(
-            "_last_checkpoint indicated that checkpoint should have {} parts, but it has {}",
-            checkpoint_metadata.parts.unwrap_or(1),
-            checkpoint_files.len()
-        )));
-    }
-
-    debug_assert!(
-        commit_files
-            .windows(2)
-            .all(|cfs| cfs[0].version <= cfs[1].version),
-        "fs_client.list_from() didn't return a sorted listing! {:?}",
-        commit_files
-    );
-    // We assume listing returned ordered, we want reverse order
-    let commit_files = commit_files.into_iter().rev().collect();
-
-    Ok((commit_files, checkpoint_files))
-}
-
-/// List relevant log files.
-///
-/// Relevant files are the max checkpoint found and all subsequent commits.
-fn list_log_files(
-    fs_client: &dyn FileSystemClient,
-    log_root: &Url,
-) -> DeltaResult<(Vec<ParsedLogPath>, Vec<ParsedLogPath>)> {
-    let version_prefix = format!("{:020}", 0);
-    let start_from = log_root.join(&version_prefix)?;
-
-    let mut max_checkpoint_version = -1_i64;
-    let mut commit_files = Vec::new();
-    let mut checkpoint_files = Vec::with_capacity(10);
-
-    let log_paths = fs_client
-        .list_from(&start_from)?
-        .flat_map(|file| file.and_then(ParsedLogPath::try_from).transpose());
-    for log_path in log_paths {
-        let log_path = log_path?;
-        if log_path.is_checkpoint() {
-            let version = log_path.version as i64;
-            match version.cmp(&max_checkpoint_version) {
-                Ordering::Greater => {
-                    max_checkpoint_version = version;
-                    checkpoint_files.clear();
-                    checkpoint_files.push(log_path);
-                }
-                Ordering::Equal => {
-                    checkpoint_files.push(log_path);
-                }
-                _ => {}
-            }
-        } else if log_path.is_commit() {
-            commit_files.push(log_path);
-        }
-    }
-
-    commit_files.retain(|f| f.version as i64 > max_checkpoint_version);
-
-    debug_assert!(
-        commit_files
-            .windows(2)
-            .all(|cfs| cfs[0].version <= cfs[1].version),
-        "fs_client.list_from() didn't return a sorted listing! {:?}",
-        commit_files
-    );
-    // We assume listing returned ordered, we want reverse order
-    let commit_files = commit_files.into_iter().rev().collect();
-
-    Ok((commit_files, checkpoint_files))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,11 +197,11 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::ObjectStore;
-    use test_utils::delta_path_for_version;
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::filesystem::ObjectStoreFileSystemClient;
     use crate::engine::sync::SyncEngine;
+    use crate::path::ParsedLogPath;
     use crate::schema::StructType;
 
     #[test]
@@ -428,69 +260,6 @@ mod tests {
         assert!(cp.is_none())
     }
 
-    #[test]
-    fn test_read_log_with_out_of_date_last_checkpoint() {
-        let store = Arc::new(InMemory::new());
-
-        let data = bytes::Bytes::from("kernel-data");
-
-        let checkpoint_metadata = CheckpointMetadata {
-            version: 3,
-            size: 10,
-            parts: None,
-            size_in_bytes: None,
-            num_of_add_files: None,
-            checkpoint_schema: None,
-            checksum: None,
-        };
-
-        // add log files to store
-        tokio::runtime::Runtime::new()
-            .expect("create tokio runtime")
-            .block_on(async {
-                for path in [
-                    delta_path_for_version(0, "json"),
-                    delta_path_for_version(1, "checkpoint.parquet"),
-                    delta_path_for_version(2, "json"),
-                    delta_path_for_version(3, "checkpoint.parquet"),
-                    delta_path_for_version(4, "json"),
-                    delta_path_for_version(5, "checkpoint.parquet"),
-                    delta_path_for_version(6, "json"),
-                    delta_path_for_version(7, "json"),
-                ] {
-                    store
-                        .put(&path, data.clone().into())
-                        .await
-                        .expect("put log file in store");
-                }
-                let checkpoint_str =
-                    serde_json::to_string(&checkpoint_metadata).expect("Serialize checkpoint");
-                store
-                    .put(
-                        &Path::from("_delta_log/_last_checkpoint"),
-                        checkpoint_str.into(),
-                    )
-                    .await
-                    .expect("Write _last_checkpoint");
-            });
-
-        let client = ObjectStoreFileSystemClient::new(
-            store,
-            false, // don't have ordered listing
-            Path::from("/"),
-            Arc::new(TokioBackgroundExecutor::new()),
-        );
-
-        let url = Url::parse("memory:///_delta_log/").expect("valid url");
-        let (commit_files, checkpoint_files) =
-            list_log_files_with_checkpoint(&checkpoint_metadata, &client, &url).unwrap();
-        assert_eq!(checkpoint_files.len(), 1);
-        assert_eq!(commit_files.len(), 2);
-        assert_eq!(checkpoint_files[0].version, 5);
-        assert_eq!(commit_files[0].version, 7);
-        assert_eq!(commit_files[1].version, 6);
-    }
-
     fn valid_last_checkpoint() -> Vec<u8> {
         r#"{"size":8,"size_in_bytes":21857,"version":1}"#.as_bytes().to_vec()
     }
@@ -543,20 +312,24 @@ mod tests {
         let engine = SyncEngine::new();
         let snapshot = Snapshot::try_new(location, &engine, None).unwrap();
 
-        assert_eq!(snapshot.log_segment.checkpoint_files.len(), 1);
+        assert_eq!(snapshot.log_segment.checkpoint_parts.len(), 1);
         assert_eq!(
-            ParsedLogPath::try_from(snapshot.log_segment.checkpoint_files[0].location.clone())
+            ParsedLogPath::try_from(snapshot.log_segment.checkpoint_parts[0].location.clone())
                 .unwrap()
                 .unwrap()
                 .version,
             2,
         );
-        assert_eq!(snapshot.log_segment.commit_files.len(), 1);
+        assert_eq!(snapshot.log_segment.ascending_commit_files.len(), 1);
         assert_eq!(
-            ParsedLogPath::try_from(snapshot.log_segment.commit_files[0].location.clone())
-                .unwrap()
-                .unwrap()
-                .version,
+            ParsedLogPath::try_from(
+                snapshot.log_segment.ascending_commit_files[0]
+                    .location
+                    .clone()
+            )
+            .unwrap()
+            .unwrap()
+            .version,
             3,
         );
     }
