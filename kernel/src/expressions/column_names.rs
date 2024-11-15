@@ -22,11 +22,6 @@ impl ColumnName {
         iter.into_iter().collect()
     }
 
-    // Convenience for testing etc. Intentionally not public.
-    fn empty() -> Self {
-        Self::new(&[] as &[String])
-    }
-
     /// Naively splits a string at dots to create a column name.
     ///
     /// This method is _NOT_ recommended for production use, as it does not attempt to interpret
@@ -42,7 +37,7 @@ impl ColumnName {
     /// );
     /// ```
     pub fn from_naive_str_split(name: impl AsRef<str>) -> Self {
-        Self::new(name.as_ref().split('.'))
+        Self::new(name.as_ref().split(FIELD_SEPARATOR))
     }
 
     /// Parses a comma-separated list of column names, properly accounting for escapes and special
@@ -62,18 +57,18 @@ impl ColumnName {
         // Ambiguous case: The empty string `""` could reasonably parse as `[ColumnName::new([])]`
         // or `[]`. Prefer the latter as more intuitive and compatible with e.g. `str::join(',')`.
         drop_leading_whitespace(chars);
-        if chars.peek().is_none() {
-            return Ok(vec![]);
-        }
+        let mut ending = match chars.peek() {
+            Some(_) => FieldEnding::NextColumn,
+            None => FieldEnding::InputExhausted,
+        };
 
         let mut cols = vec![];
-        loop {
-            let (col, ending) = parse_column_name(chars)?;
+        while ending == FieldEnding::NextColumn {
+            let (col, new_ending) = parse_column_name(chars)?;
             cols.push(col);
-            if ending != FieldEnding::NextColumn {
-                return Ok(cols);
-            }
+            ending = new_ending;
         }
+        Ok(cols)
     }
 
     /// Joins this column with another, concatenating their fields into a single nested column path.
@@ -191,37 +186,38 @@ impl Hash for ColumnName {
 /// [`FromStr`]: std::str::FromStr
 impl Display for ColumnName {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let mut delim = None;
-        for s in self.iter() {
+        for (i, s) in self.iter().enumerate() {
             use std::fmt::Write as _;
 
-            // Only emit the period delimiter after the first iteration
-            if let Some(d) = delim {
-                f.write_char(d)?;
-            } else {
-                delim = Some('.');
+            // Don't emit a field separator before the first field
+            if i > 0 {
+                f.write_char(FIELD_SEPARATOR)?;
             }
 
             let digit_char = |c: char| c.is_ascii_digit();
-            let special_char = |c: char| !c.is_ascii_alphanumeric() && c != '_';
-            if s.is_empty() || s.starts_with(digit_char) || s.contains(special_char) {
+            if s.is_empty() || s.starts_with(digit_char) || s.contains(|c| !is_simple_char(c)) {
                 // Special situation detected. For safety, surround the field name with backticks
                 // (with proper escaping if the field name itself contains backticks).
-                f.write_char('`')?;
+                f.write_char(FIELD_ESCAPE_CHAR)?;
                 for c in s.chars() {
-                    match c {
-                        '`' => f.write_str("``")?,
-                        _ => f.write_char(c)?,
+                    f.write_char(c)?;
+                    if c == FIELD_ESCAPE_CHAR {
+                        f.write_char(c)?; // escape the escape by doubling
                     }
                 }
-                f.write_char('`')?;
+                f.write_char(FIELD_ESCAPE_CHAR)?;
             } else {
-                // The fild name contains no special characters, so emit it as-is.
+                // Simple field name -- emit it as-is
                 f.write_str(s)?;
             }
         }
         Ok(())
     }
+}
+
+// Simple column names contain only simple chars, and do not need to be wrapped in backticks.
+fn is_simple_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
 }
 
 fn drop_leading_whitespace(iter: &mut Peekable<impl Iterator<Item = char>>) {
@@ -250,45 +246,14 @@ impl std::str::FromStr for ColumnName {
     type Err = Error;
 
     fn from_str(s: &str) -> DeltaResult<Self> {
-        let (col, ending) = parse_column_name(&mut s.chars().peekable())?;
-        if ending == FieldEnding::NextColumn {
-            Err(Error::generic("Trailing comma in column name"))
-        } else {
-            Ok(col)
+        match parse_column_name(&mut s.chars().peekable())? {
+            (_, FieldEnding::NextColumn) => Err(Error::generic("Trailing comma in column name")),
+            (col, _) => Ok(col),
         }
     }
 }
 
 type Chars<'a> = Peekable<std::str::Chars<'a>>;
-
-fn parse_column_name(chars: &mut Chars<'_>) -> DeltaResult<(ColumnName, FieldEnding)> {
-    // Ambiguous case: The empty string `""`could reasonably parse as either `ColumnName::new([""])`
-    // or `ColumnName::new([])`. However, `ColumnName::new([""]).to_string()` is `"[]"` and
-    // `ColumnName::new([]).to_string()` is `""`, so we choose the latter because it produces a
-    // lossless round trip from `ColumnName` to `String` and back. We also swallow a leading comma
-    // to produce an empty column, so that the string "," parses as two empty columns.
-    drop_leading_whitespace(chars);
-    if chars.peek().is_none() {
-        return Ok((ColumnName::empty(), FieldEnding::InputExhausted));
-    }
-    if chars.next_if_eq(&',').is_some() {
-        return Ok((ColumnName::empty(), FieldEnding::NextColumn));
-    }
-
-    let mut path = vec![];
-    loop {
-        drop_leading_whitespace(chars);
-        let (field_name, ending) = if chars.next_if_eq(&'`').is_none() {
-            parse_simple(chars)?
-        } else {
-            parse_escaped(chars)?
-        };
-        path.push(field_name);
-        if ending != FieldEnding::NextField {
-            return Ok((ColumnName::new(path), ending));
-        }
-    }
-}
 
 // What comes after the end of the field we just parsed?
 #[derive(PartialEq)]
@@ -298,76 +263,81 @@ enum FieldEnding {
     NextColumn,
 }
 
-/// Helper for `impl FromStr for ColumnName`. Returns the parsed field name and how the field ended.
-fn parse_simple(chars: &mut Chars<'_>) -> DeltaResult<(String, FieldEnding)> {
-    let mut name = String::new();
-    let mut allow_digits = false; // first character cannot be a digit
-    let mut field_finished = false;
-    for c in chars {
-        match c {
-            '.' => return Ok((name, FieldEnding::NextField)),
-            ',' => return Ok((name, FieldEnding::NextColumn)),
-            c if c.is_whitespace() => {
-                field_finished = true;
-            }
-            c if field_finished => {
+// These characters are remarkably hard to read. Names are a lot less bug-prone.
+const FIELD_ESCAPE_CHAR: char = '`';
+const FIELD_SEPARATOR: char = '.';
+const COLUMN_SEPARATOR: char = ',';
+
+fn parse_column_name(chars: &mut Chars<'_>) -> DeltaResult<(ColumnName, FieldEnding)> {
+    // Ambiguous case: The empty string `""`could reasonably parse as either `ColumnName::new([""])`
+    // or `ColumnName::new([])`. However, `ColumnName::new([""]).to_string()` is `"[]"` and
+    // `ColumnName::new([]).to_string()` is `""`, so we choose the latter because it produces a
+    // lossless round trip from `ColumnName` to `String` and back. We also swallow a leading comma
+    // to produce an empty column, so that the string "," parses as two empty columns.
+    drop_leading_whitespace(chars);
+    let mut ending = if chars.peek().is_none() {
+        FieldEnding::InputExhausted
+    } else if chars.next_if_eq(&COLUMN_SEPARATOR).is_some() {
+        FieldEnding::NextColumn
+    } else {
+        FieldEnding::NextField
+    };
+
+    let mut path = vec![];
+    while ending == FieldEnding::NextField {
+        drop_leading_whitespace(chars);
+        let field_name = match chars.next_if_eq(&FIELD_ESCAPE_CHAR) {
+            Some(_) => parse_escaped_field_name(chars)?,
+            None => parse_simple_field_name(chars)?,
+        };
+
+        // Figure out what's next (ignoring leading whitespace)
+        ending = match chars.find(|c| !c.is_whitespace()) {
+            None => FieldEnding::InputExhausted,
+            Some(FIELD_SEPARATOR) => FieldEnding::NextField,
+            Some(COLUMN_SEPARATOR) => FieldEnding::NextColumn,
+            Some(other) => {
                 return Err(Error::generic(format!(
-                    "Invalid character '{c}' after field name"
-                )))
-            }
-            '_' | 'a'..='z' | 'A'..='Z' => name.push(c),
-            '0'..='9' => {
-                if allow_digits {
-                    name.push(c);
-                } else {
-                    return Err(Error::generic(format!(
-                        "Unescaped field name cannot start with a digit '{c}'"
-                    )));
-                }
-            }
-            c => {
-                return Err(Error::generic(format!(
-                    "Invalid character '{c}' in unescaped field name"
+                    "Invalid character {other:?} after field {field_name:?}",
                 )))
             }
         };
-        allow_digits = true;
+        path.push(field_name);
     }
-    Ok((name, FieldEnding::InputExhausted))
+    Ok((ColumnName::new(path), ending))
 }
 
-/// Helper `impl FromStr for ColumnName` for parsing complex field names escaped with backticks,
-/// e.g. "`ab``c``d`". Returns the parsed field name and a boolean how the field ended.
-fn parse_escaped(chars: &mut Chars<'_>) -> DeltaResult<(String, FieldEnding)> {
+/// Parses a simple field name, e.g. 'a.b.c'.
+fn parse_simple_field_name(chars: &mut Chars<'_>) -> DeltaResult<String> {
     let mut name = String::new();
-    while let Some(c) = chars.next() {
-        match c {
-            '`' => match chars.next() {
-                Some('`') => name.push('`'), // escaped delimiter (keep going)
-                mut other => {
-                    // End of field. Drop leading whitespace before a potential dot.
-                    while other.is_some_and(char::is_whitespace) {
-                        other = chars.next();
-                    }
-                    let ending = match other {
-                        None => FieldEnding::InputExhausted,
-                        Some('.') => FieldEnding::NextField,
-                        Some(',') => FieldEnding::NextColumn,
-                        Some(other) => {
-                            return Err(Error::generic(format!(
-                                "Invalid character '{other}' after escaped field name",
-                            )))
-                        }
-                    };
-                    return Ok((name, ending));
-                }
-            },
-            _ => name.push(c),
+    let mut first = true;
+    while let Some(c) = chars.next_if(|c| is_simple_char(*c)) {
+        if first && c.is_ascii_digit() {
+            return Err(Error::generic(format!(
+                "Unescaped field name cannot start with a digit {c:?}"
+            )));
+        }
+        name.push(c);
+        first = false;
+    }
+    Ok(name)
+}
+
+/// Parses a field name escaped with backticks, e.g. "`ab``c``d`".
+fn parse_escaped_field_name(chars: &mut Chars<'_>) -> DeltaResult<String> {
+    let mut name = String::new();
+    loop {
+        match chars.next() {
+            Some(FIELD_ESCAPE_CHAR) if chars.next_if_eq(&FIELD_ESCAPE_CHAR).is_none() => break,
+            Some(c) => name.push(c),
+            None => {
+                return Err(Error::generic(format!(
+                    "No closing {FIELD_ESCAPE_CHAR:?} after field {name:?}"
+                )));
+            }
         }
     }
-    Err(Error::generic(format!(
-        "Escaped field name starting with '{name}' lacks a closing '`' delimiter",
-    )))
+    Ok(name)
 }
 
 /// Creates a nested column name whose field names are all simple column names (containing only
@@ -464,6 +434,12 @@ pub use __joined_column_expr as joined_column_expr;
 mod test {
     use super::*;
     use delta_kernel_derive::parse_column_name;
+
+    impl ColumnName {
+        fn empty() -> Self {
+            Self::new(&[] as &[String])
+        }
+    }
 
     #[test]
     fn test_parse_column_name_macros() {
