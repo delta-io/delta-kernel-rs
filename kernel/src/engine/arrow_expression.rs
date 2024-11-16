@@ -317,7 +317,8 @@ fn evaluate_expression(
                 Equal => |l, r| eq(l, r).map(wrap_comparison_result),
                 NotEqual => |l, r| neq(l, r).map(wrap_comparison_result),
                 Distinct => |l, r| distinct(l, r).map(wrap_comparison_result),
-                _ => return Err(Error::generic("Invalid expression given")),
+                // NOTE: [Not]In was already covered above
+                In | NotIn => return Err(Error::generic("Invalid expression given")),
             };
 
             eval(&left_arr, &right_arr).map_err(Error::generic_err)

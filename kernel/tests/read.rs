@@ -13,7 +13,7 @@ use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{column_expr, BinaryOperator, Expression};
 use delta_kernel::scan::state::{visit_scan_files, DvInfo, Stats};
 use delta_kernel::scan::{transform_to_logical, Scan};
-use delta_kernel::schema::Schema;
+use delta_kernel::schema::{DataType, Schema};
 use delta_kernel::{Engine, FileMeta, Table};
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use test_utils::{
@@ -289,11 +289,11 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         (GreaterThanOrEqual, 7, vec![&batch2]),
         (GreaterThanOrEqual, 8, vec![]),
         (NotEqual, 0, vec![&batch2, &batch1]),
-        (NotEqual, 1, vec![&batch2]),
-        (NotEqual, 3, vec![&batch2]),
+        (NotEqual, 1, vec![&batch2, &batch1]),
+        (NotEqual, 3, vec![&batch2, &batch1]),
         (NotEqual, 4, vec![&batch2, &batch1]),
-        (NotEqual, 5, vec![&batch1]),
-        (NotEqual, 7, vec![&batch1]),
+        (NotEqual, 5, vec![&batch2, &batch1]),
+        (NotEqual, 7, vec![&batch2, &batch1]),
         (NotEqual, 8, vec![&batch2, &batch1]),
     ];
     for (op, value, expected_batches) in test_cases {
@@ -301,7 +301,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         let scan = snapshot
             .clone()
             .scan_builder()
-            .with_predicate(Arc::new(predicate))
+            .with_predicate(Arc::new(predicate.clone()))
             .build()?;
 
         let expected_files = expected_batches.len();
@@ -313,7 +313,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
             files_scanned += 1;
             assert_eq!(into_record_batch(raw_data), expected.clone());
         }
-        assert_eq!(expected_files, files_scanned);
+        assert_eq!(expected_files, files_scanned, "{predicate:?}");
     }
     Ok(())
 }
@@ -850,28 +850,39 @@ fn not_and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
 fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
     let empty_struct = Expression::struct_from(vec![]);
     let cases = vec![
+        (Expression::literal(false), table_for_numbers(vec![])),
+        (
+            Expression::literal(true),
+            table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
+        ),
         (
             Expression::literal(3i64),
             table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
         ),
         (
             column_expr!("number").distinct(3i64),
+            table_for_numbers(vec![1, 2, 4, 5, 6]),
+        ),
+        (
+            column_expr!("number").distinct(Expression::null_literal(DataType::LONG)),
             table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
+        ),
+        (
+            Expression::not(column_expr!("number").distinct(3i64)),
+            table_for_numbers(vec![3]),
+        ),
+        (
+            Expression::not(
+                column_expr!("number").distinct(Expression::null_literal(DataType::LONG)),
+            ),
+            table_for_numbers(vec![]),
         ),
         (
             column_expr!("number").gt(empty_struct.clone()),
             table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
         ),
         (
-            column_expr!("number").and(empty_struct.clone().is_null()),
-            table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
-        ),
-        (
             Expression::not(column_expr!("number").gt(empty_struct.clone())),
-            table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
-        ),
-        (
-            Expression::not(column_expr!("number").and(empty_struct.clone().is_null())),
             table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
         ),
     ];

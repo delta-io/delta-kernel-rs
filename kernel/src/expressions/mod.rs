@@ -54,25 +54,8 @@ impl BinaryOperator {
             GreaterThanOrEqual => Some(LessThanOrEqual),
             LessThan => Some(GreaterThan),
             LessThanOrEqual => Some(GreaterThanOrEqual),
-            Equal | NotEqual | Plus | Multiply => Some(*self),
-            _ => None,
-        }
-    }
-
-    /// invert an operator. Returns Some<InvertedOp> if the operator supports inversion, None if it
-    /// cannot be inverted
-    pub(crate) fn invert(&self) -> Option<BinaryOperator> {
-        use BinaryOperator::*;
-        match self {
-            LessThan => Some(GreaterThanOrEqual),
-            LessThanOrEqual => Some(GreaterThan),
-            GreaterThan => Some(LessThanOrEqual),
-            GreaterThanOrEqual => Some(LessThan),
-            Equal => Some(NotEqual),
-            NotEqual => Some(Equal),
-            In => Some(NotIn),
-            NotIn => Some(In),
-            _ => None,
+            Equal | NotEqual | Distinct | Plus | Multiply => Some(*self),
+            In | NotIn | Minus | Divide => None, // not commutative
         }
     }
 }
@@ -197,22 +180,14 @@ impl Display for Expression {
                 UnaryOperator::Not => write!(f, "NOT {expr}"),
                 UnaryOperator::IsNull => write!(f, "{expr} IS NULL"),
             },
-            Self::VariadicOperation { op, exprs } => match op {
-                VariadicOperator::And => {
-                    write!(
-                        f,
-                        "AND({})",
-                        &exprs.iter().map(|e| format!("{e}")).join(", ")
-                    )
-                }
-                VariadicOperator::Or => {
-                    write!(
-                        f,
-                        "OR({})",
-                        &exprs.iter().map(|e| format!("{e}")).join(", ")
-                    )
-                }
-            },
+            Self::VariadicOperation { op, exprs } => {
+                let exprs = &exprs.iter().map(|e| format!("{e}")).join(", ");
+                let op = match op {
+                    VariadicOperator::And => "AND",
+                    VariadicOperator::Or => "OR",
+                };
+                write!(f, "{op}({exprs})")
+            }
         }
     }
 }
@@ -356,25 +331,20 @@ impl Expression {
     }
 
     fn walk(&self) -> impl Iterator<Item = &Self> + '_ {
+        use Expression::*;
         let mut stack = vec![self];
         std::iter::from_fn(move || {
             let expr = stack.pop()?;
             match expr {
-                Self::Literal(_) => {}
-                Self::Column { .. } => {}
-                Self::Struct(exprs) => {
-                    stack.extend(exprs.iter());
-                }
-                Self::BinaryOperation { left, right, .. } => {
+                Literal(_) => {}
+                Column { .. } => {}
+                Struct(exprs) => stack.extend(exprs),
+                UnaryOperation { expr, .. } => stack.push(expr),
+                BinaryOperation { left, right, .. } => {
                     stack.push(left);
                     stack.push(right);
                 }
-                Self::UnaryOperation { expr, .. } => {
-                    stack.push(expr);
-                }
-                Self::VariadicOperation { exprs, .. } => {
-                    stack.extend(exprs.iter());
-                }
+                VariadicOperation { exprs, .. } => stack.extend(exprs),
             }
             Some(expr)
         })

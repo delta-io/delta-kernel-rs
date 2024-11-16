@@ -1,32 +1,11 @@
 use super::*;
-use crate::expressions::{column_expr, column_name, ArrayData, StructData};
-use crate::schema::ArrayType;
+use crate::expressions::{column_expr, Expression as Expr};
+use crate::predicates::PredicateEvaluator;
 use crate::DataType;
 
-struct UnimplementedTestFilter;
-impl ParquetStatsSkippingFilter for UnimplementedTestFilter {
-    fn get_min_stat_value(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
-        unimplemented!()
-    }
-
-    fn get_max_stat_value(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
-        unimplemented!()
-    }
-
-    fn get_nullcount_stat_value(&self, _col: &ColumnName) -> Option<i64> {
-        unimplemented!()
-    }
-
-    fn get_rowcount_stat_value(&self) -> i64 {
-        unimplemented!()
-    }
-}
-
-struct JunctionTest {
-    inputs: &'static [Option<bool>],
-    expect_and: Option<bool>,
-    expect_or: Option<bool>,
-}
+const TRUE: Option<bool> = Some(true);
+const FALSE: Option<bool> = Some(false);
+const NULL: Option<bool> = None;
 
 macro_rules! expect_eq {
     ( $expr: expr, $expect: expr, $fmt: literal ) => {
@@ -41,259 +20,104 @@ macro_rules! expect_eq {
         );
     };
 }
-impl JunctionTest {
-    fn new(
-        inputs: &'static [Option<bool>],
-        expect_and: Option<bool>,
-        expect_or: Option<bool>,
-    ) -> Self {
-        Self {
-            inputs,
-            expect_and,
-            expect_or,
-        }
-    }
-    fn do_test(&self) {
-        use VariadicOperator::*;
-        let filter = UnimplementedTestFilter;
-        let inputs: Vec<_> = self
-            .inputs
-            .iter()
-            .map(|val| match val {
-                Some(v) => Expression::literal(v),
-                None => Expression::null_literal(DataType::BOOLEAN),
-            })
-            .collect();
 
-        expect_eq!(
-            filter.apply_variadic(And, &inputs, false),
-            self.expect_and,
-            "AND({inputs:?})"
-        );
-        expect_eq!(
-            filter.apply_variadic(Or, &inputs, false),
-            self.expect_or,
-            "OR({inputs:?})"
-        );
-        expect_eq!(
-            filter.apply_variadic(And, &inputs, true),
-            self.expect_and.map(|val| !val),
-            "NOT(AND({inputs:?}))"
-        );
-        expect_eq!(
-            filter.apply_variadic(Or, &inputs, true),
-            self.expect_or.map(|val| !val),
-            "NOT(OR({inputs:?}))"
-        );
+struct UnimplementedTestFilter;
+impl ParquetStatsProvider for UnimplementedTestFilter {
+    fn get_parquet_min_stat(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
+        unimplemented!()
+    }
+
+    fn get_parquet_max_stat(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
+        unimplemented!()
+    }
+
+    fn get_parquet_nullcount_stat(&self, _col: &ColumnName) -> Option<i64> {
+        unimplemented!()
+    }
+
+    fn get_parquet_rowcount_stat(&self) -> i64 {
+        unimplemented!()
     }
 }
 
 /// Tests apply_variadic and apply_scalar
 #[test]
 fn test_junctions() {
-    let test_case = JunctionTest::new;
-    const TRUE: Option<bool> = Some(true);
-    const FALSE: Option<bool> = Some(false);
-    const NULL: Option<bool> = None;
+    use VariadicOperator::*;
+
+
     let test_cases = &[
         // Every combo of 0, 1 and 2 inputs
-        test_case(&[], TRUE, FALSE),
-        test_case(&[TRUE], TRUE, TRUE),
-        test_case(&[FALSE], FALSE, FALSE),
-        test_case(&[NULL], NULL, NULL),
-        test_case(&[TRUE, TRUE], TRUE, TRUE),
-        test_case(&[TRUE, FALSE], FALSE, TRUE),
-        test_case(&[TRUE, NULL], NULL, TRUE),
-        test_case(&[FALSE, TRUE], FALSE, TRUE),
-        test_case(&[FALSE, FALSE], FALSE, FALSE),
-        test_case(&[FALSE, NULL], FALSE, NULL),
-        test_case(&[NULL, TRUE], NULL, TRUE),
-        test_case(&[NULL, FALSE], FALSE, NULL),
-        test_case(&[NULL, NULL], NULL, NULL),
+        (&[] as &[Option<bool>], TRUE, FALSE),
+        (&[TRUE], TRUE, TRUE),
+        (&[FALSE], FALSE, FALSE),
+        (&[NULL], NULL, NULL),
+        (&[TRUE, TRUE], TRUE, TRUE),
+        (&[TRUE, FALSE], FALSE, TRUE),
+        (&[TRUE, NULL], NULL, TRUE),
+        (&[FALSE, TRUE], FALSE, TRUE),
+        (&[FALSE, FALSE], FALSE, FALSE),
+        (&[FALSE, NULL], FALSE, NULL),
+        (&[NULL, TRUE], NULL, TRUE),
+        (&[NULL, FALSE], FALSE, NULL),
+        (&[NULL, NULL], NULL, NULL),
         // Every combo of 1:2
-        test_case(&[TRUE, FALSE, FALSE], FALSE, TRUE),
-        test_case(&[FALSE, TRUE, FALSE], FALSE, TRUE),
-        test_case(&[FALSE, FALSE, TRUE], FALSE, TRUE),
-        test_case(&[TRUE, NULL, NULL], NULL, TRUE),
-        test_case(&[NULL, TRUE, NULL], NULL, TRUE),
-        test_case(&[NULL, NULL, TRUE], NULL, TRUE),
-        test_case(&[FALSE, TRUE, TRUE], FALSE, TRUE),
-        test_case(&[TRUE, FALSE, TRUE], FALSE, TRUE),
-        test_case(&[TRUE, TRUE, FALSE], FALSE, TRUE),
-        test_case(&[FALSE, NULL, NULL], FALSE, NULL),
-        test_case(&[NULL, FALSE, NULL], FALSE, NULL),
-        test_case(&[NULL, NULL, FALSE], FALSE, NULL),
-        test_case(&[NULL, TRUE, TRUE], NULL, TRUE),
-        test_case(&[TRUE, NULL, TRUE], NULL, TRUE),
-        test_case(&[TRUE, TRUE, NULL], NULL, TRUE),
-        test_case(&[NULL, FALSE, FALSE], FALSE, NULL),
-        test_case(&[FALSE, NULL, FALSE], FALSE, NULL),
-        test_case(&[FALSE, FALSE, NULL], FALSE, NULL),
+        (&[TRUE, FALSE, FALSE], FALSE, TRUE),
+        (&[FALSE, TRUE, FALSE], FALSE, TRUE),
+        (&[FALSE, FALSE, TRUE], FALSE, TRUE),
+        (&[TRUE, NULL, NULL], NULL, TRUE),
+        (&[NULL, TRUE, NULL], NULL, TRUE),
+        (&[NULL, NULL, TRUE], NULL, TRUE),
+        (&[FALSE, TRUE, TRUE], FALSE, TRUE),
+        (&[TRUE, FALSE, TRUE], FALSE, TRUE),
+        (&[TRUE, TRUE, FALSE], FALSE, TRUE),
+        (&[FALSE, NULL, NULL], FALSE, NULL),
+        (&[NULL, FALSE, NULL], FALSE, NULL),
+        (&[NULL, NULL, FALSE], FALSE, NULL),
+        (&[NULL, TRUE, TRUE], NULL, TRUE),
+        (&[TRUE, NULL, TRUE], NULL, TRUE),
+        (&[TRUE, TRUE, NULL], NULL, TRUE),
+        (&[NULL, FALSE, FALSE], FALSE, NULL),
+        (&[FALSE, NULL, FALSE], FALSE, NULL),
+        (&[FALSE, FALSE, NULL], FALSE, NULL),
         // Every unique ordering of 3
-        test_case(&[TRUE, FALSE, NULL], FALSE, TRUE),
-        test_case(&[TRUE, NULL, FALSE], FALSE, TRUE),
-        test_case(&[FALSE, TRUE, NULL], FALSE, TRUE),
-        test_case(&[FALSE, NULL, TRUE], FALSE, TRUE),
-        test_case(&[NULL, TRUE, FALSE], FALSE, TRUE),
-        test_case(&[NULL, FALSE, TRUE], FALSE, TRUE),
-    ];
-    for test_case in test_cases {
-        test_case.do_test();
-    }
-}
-
-// tests apply_binary_scalars
-#[test]
-fn test_binary_scalars() {
-    use Scalar::*;
-    let smaller_values = &[
-        Integer(1),
-        Long(1),
-        Short(1),
-        Byte(1),
-        Float(1.0),
-        Double(1.0),
-        String("1".into()),
-        Boolean(false),
-        Timestamp(1),
-        TimestampNtz(1),
-        Date(1),
-        Binary(vec![1]),
-        Decimal(1, 10, 10), // invalid value,
-        Null(DataType::LONG),
-        Struct(StructData::try_new(vec![], vec![]).unwrap()),
-        Array(ArrayData::new(
-            ArrayType::new(DataType::LONG, false),
-            Vec::<Scalar>::new(),
-        )),
-    ];
-    let larger_values = &[
-        Integer(10),
-        Long(10),
-        Short(10),
-        Byte(10),
-        Float(10.0),
-        Double(10.0),
-        String("10".into()),
-        Boolean(true),
-        Timestamp(10),
-        TimestampNtz(10),
-        Date(10),
-        Binary(vec![10]),
-        Decimal(10, 10, 10), // invalid value
-        Null(DataType::LONG),
-        Struct(StructData::try_new(vec![], vec![]).unwrap()),
-        Array(ArrayData::new(
-            ArrayType::new(DataType::LONG, false),
-            Vec::<Scalar>::new(),
-        )),
+        (&[TRUE, FALSE, NULL], FALSE, TRUE),
+        (&[TRUE, NULL, FALSE], FALSE, TRUE),
+        (&[FALSE, TRUE, NULL], FALSE, TRUE),
+        (&[FALSE, NULL, TRUE], FALSE, TRUE),
+        (&[NULL, TRUE, FALSE], FALSE, TRUE),
+        (&[NULL, FALSE, TRUE], FALSE, TRUE),
     ];
 
-    // scalars of different types are always incomparable
-    use BinaryOperator::*;
-    let binary_ops = [
-        Equal,
-        NotEqual,
-        LessThan,
-        LessThanOrEqual,
-        GreaterThan,
-        GreaterThanOrEqual,
-    ];
-    let compare = UnimplementedTestFilter::apply_binary_scalars;
-    for (i, a) in smaller_values.iter().enumerate() {
-        for b in smaller_values.iter().skip(i + 1) {
-            for op in binary_ops {
-                let result = compare(op, a, b);
-                let a_type = a.data_type();
-                let b_type = b.data_type();
-                assert!(
-                    result.is_none(),
-                    "{a_type:?} should not be comparable to {b_type:?}"
-                );
-            }
-        }
-    }
+    let filter = UnimplementedTestFilter;
+    for (inputs, expect_and, expect_or) in test_cases {
+        let inputs: Vec<_> = inputs
+            .iter()
+            .map(|val| match val {
+                Some(v) => Expr::literal(v),
+                None => Expr::null_literal(DataType::BOOLEAN),
+            })
+            .collect();
 
-    let expect_if_comparable_type = |s: &_, expect| match s {
-        Null(_) | Decimal(..) | Struct(_) | Array(_) => None,
-        _ => Some(expect),
-    };
-
-    // Test same-type comparisons where a == b
-    for (a, b) in smaller_values.iter().zip(smaller_values.iter()) {
         expect_eq!(
-            compare(Equal, a, b),
-            expect_if_comparable_type(a, true),
-            "{a:?} == {b:?}"
+            filter.eval_variadic(And, &inputs, false),
+            *expect_and,
+            "AND({inputs:?})"
         );
-
         expect_eq!(
-            compare(NotEqual, a, b),
-            expect_if_comparable_type(a, false),
-            "{a:?} != {b:?}"
+            filter.eval_variadic(Or, &inputs, false),
+            *expect_or,
+            "OR({inputs:?})"
         );
-
         expect_eq!(
-            compare(LessThan, a, b),
-            expect_if_comparable_type(a, false),
-            "{a:?} < {b:?}"
+            filter.eval_variadic(And, &inputs, true),
+            expect_and.map(|val| !val),
+            "NOT(AND({inputs:?}))"
         );
-
         expect_eq!(
-            compare(GreaterThan, a, b),
-            expect_if_comparable_type(a, false),
-            "{a:?} > {b:?}"
-        );
-
-        expect_eq!(
-            compare(LessThanOrEqual, a, b),
-            expect_if_comparable_type(a, true),
-            "{a:?} <= {b:?}"
-        );
-
-        expect_eq!(
-            compare(GreaterThanOrEqual, a, b),
-            expect_if_comparable_type(a, true),
-            "{a:?} >= {b:?}"
-        );
-    }
-
-    // Test same-type comparisons where a < b
-    for (a, b) in smaller_values.iter().zip(larger_values.iter()) {
-        expect_eq!(
-            compare(Equal, a, b),
-            expect_if_comparable_type(a, false),
-            "{a:?} == {b:?}"
-        );
-
-        expect_eq!(
-            compare(NotEqual, a, b),
-            expect_if_comparable_type(a, true),
-            "{a:?} != {b:?}"
-        );
-
-        expect_eq!(
-            compare(LessThan, a, b),
-            expect_if_comparable_type(a, true),
-            "{a:?} < {b:?}"
-        );
-
-        expect_eq!(
-            compare(GreaterThan, a, b),
-            expect_if_comparable_type(a, false),
-            "{a:?} > {b:?}"
-        );
-
-        expect_eq!(
-            compare(LessThanOrEqual, a, b),
-            expect_if_comparable_type(a, true),
-            "{a:?} <= {b:?}"
-        );
-
-        expect_eq!(
-            compare(GreaterThanOrEqual, a, b),
-            expect_if_comparable_type(a, false),
-            "{a:?} >= {b:?}"
+            filter.eval_variadic(Or, &inputs, true),
+            expect_or.map(|val| !val),
+            "NOT(OR({inputs:?}))"
         );
     }
 }
@@ -312,394 +136,70 @@ impl MinMaxTestFilter {
             .cloned()
     }
 }
-impl ParquetStatsSkippingFilter for MinMaxTestFilter {
-    fn get_min_stat_value(&self, _col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
+impl ParquetStatsProvider for MinMaxTestFilter {
+    fn get_parquet_min_stat(&self, _col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
         Self::get_stat_value(&self.min, data_type)
     }
 
-    fn get_max_stat_value(&self, _col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
+    fn get_parquet_max_stat(&self, _col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
         Self::get_stat_value(&self.max, data_type)
     }
 
-    fn get_nullcount_stat_value(&self, _col: &ColumnName) -> Option<i64> {
+    fn get_parquet_nullcount_stat(&self, _col: &ColumnName) -> Option<i64> {
         unimplemented!()
     }
 
-    fn get_rowcount_stat_value(&self) -> i64 {
+    fn get_parquet_rowcount_stat(&self) -> i64 {
         unimplemented!()
     }
 }
 
-#[test]
-fn test_binary_eq_ne() {
-    use BinaryOperator::*;
-
-    const LO: Scalar = Scalar::Long(1);
-    const MID: Scalar = Scalar::Long(10);
-    const HI: Scalar = Scalar::Long(100);
-    let col = &column_expr!("x");
-
-    for inverted in [false, true] {
-        // negative test -- mismatched column type
-        expect_eq!(
-            MinMaxTestFilter::new(MID.into(), MID.into()).apply_binary(
-                Equal,
-                col,
-                &Expression::literal("10"),
-                inverted,
-            ),
-            None,
-            "{col} == '10' (min: {MID}, max: {MID}, inverted: {inverted})"
-        );
-
-        // quick test for literal-literal comparisons
-        expect_eq!(
-            MinMaxTestFilter::new(MID.into(), MID.into()).apply_binary(
-                Equal,
-                &MID.into(),
-                &MID.into(),
-                inverted,
-            ),
-            Some(!inverted),
-            "{MID} == {MID} (min: {MID}, max: {MID}, inverted: {inverted})"
-        );
-
-        // quick test for literal-column comparisons
-        expect_eq!(
-            MinMaxTestFilter::new(MID.into(), MID.into()).apply_binary(
-                Equal,
-                &MID.into(),
-                col,
-                inverted,
-            ),
-            Some(!inverted),
-            "{MID} == {col} (min: {MID}, max: {MID}, inverted: {inverted})"
-        );
-
-        expect_eq!(
-            MinMaxTestFilter::new(MID.into(), MID.into()).apply_binary(
-                Equal,
-                col,
-                &MID.into(),
-                inverted,
-            ),
-            Some(!inverted),
-            "{col} == {MID} (min: {MID}, max: {MID}, inverted: {inverted})"
-        );
-
-        expect_eq!(
-            MinMaxTestFilter::new(LO.into(), HI.into()).apply_binary(
-                Equal,
-                col,
-                &MID.into(),
-                inverted,
-            ),
-            Some(true), // min..max range includes both EQ and NE
-            "{col} == {MID} (min: {LO}, max: {HI}, inverted: {inverted})"
-        );
-
-        expect_eq!(
-            MinMaxTestFilter::new(LO.into(), MID.into()).apply_binary(
-                Equal,
-                col,
-                &HI.into(),
-                inverted,
-            ),
-            Some(inverted),
-            "{col} == {HI} (min: {LO}, max: {MID}, inverted: {inverted})"
-        );
-
-        expect_eq!(
-            MinMaxTestFilter::new(MID.into(), HI.into()).apply_binary(
-                Equal,
-                col,
-                &LO.into(),
-                inverted,
-            ),
-            Some(inverted),
-            "{col} == {LO} (min: {MID}, max: {HI}, inverted: {inverted})"
-        );
-
-        // negative test -- mismatched column type
-        expect_eq!(
-            MinMaxTestFilter::new(MID.into(), MID.into()).apply_binary(
-                NotEqual,
-                col,
-                &Expression::literal("10"),
-                inverted,
-            ),
-            None,
-            "{col} != '10' (min: {MID}, max: {MID}, inverted: {inverted})"
-        );
-
-        expect_eq!(
-            MinMaxTestFilter::new(MID.into(), MID.into()).apply_binary(
-                NotEqual,
-                col,
-                &MID.into(),
-                inverted,
-            ),
-            Some(inverted),
-            "{col} != {MID} (min: {MID}, max: {MID}, inverted: {inverted})"
-        );
-
-        expect_eq!(
-            MinMaxTestFilter::new(LO.into(), HI.into()).apply_binary(
-                NotEqual,
-                col,
-                &MID.into(),
-                inverted,
-            ),
-            Some(true), // min..max range includes both EQ and NE
-            "{col} != {MID} (min: {LO}, max: {HI}, inverted: {inverted})"
-        );
-
-        expect_eq!(
-            MinMaxTestFilter::new(LO.into(), MID.into()).apply_binary(
-                NotEqual,
-                col,
-                &HI.into(),
-                inverted,
-            ),
-            Some(!inverted),
-            "{col} != {HI} (min: {LO}, max: {MID}, inverted: {inverted})"
-        );
-
-        expect_eq!(
-            MinMaxTestFilter::new(MID.into(), HI.into()).apply_binary(
-                NotEqual,
-                col,
-                &LO.into(),
-                inverted,
-            ),
-            Some(!inverted),
-            "{col} != {LO} (min: {MID}, max: {HI}, inverted: {inverted})"
-        );
-    }
-}
 
 #[test]
-fn test_binary_lt_ge() {
-    use BinaryOperator::*;
+fn test_eval_binary_comparisons() {
+    const FIVE: Scalar = Scalar::Integer(5);
+    const TEN: Scalar = Scalar::Integer(10);
+    const FIFTEEN: Scalar = Scalar::Integer(15);
+    const NULL_VAL: Scalar = Scalar::Null(DataType::INTEGER);
 
-    const LO: Scalar = Scalar::Long(1);
-    const MID: Scalar = Scalar::Long(10);
-    const HI: Scalar = Scalar::Long(100);
-    let col = &column_expr!("x");
+    let expressions = [
+        Expr::lt(column_expr!("x"), 10),
+        Expr::le(column_expr!("x"), 10),
+        Expr::eq(column_expr!("x"), 10),
+        Expr::ne(column_expr!("x"), 10),
+        Expr::gt(column_expr!("x"), 10),
+        Expr::ge(column_expr!("x"), 10),
+    ];
 
-    for inverted in [false, true] {
-        expect_eq!(
-            MinMaxTestFilter::new(MID.into(), MID.into()).apply_binary(
-                LessThan,
-                col,
-                &MID.into(),
-                inverted,
-            ),
-            Some(inverted),
-            "{col} < {MID} (min: {MID}, max: {MID}, inverted: {inverted})"
-        );
+    let do_test = |min: Scalar, max: Scalar, expected: &[Option<bool>]| {
+        let filter = MinMaxTestFilter::new(Some(min.clone()), Some(max.clone()));
+        for (expr, expect) in expressions.iter().zip(expected.iter()) {
+            expect_eq!(
+                filter.eval_expr(expr, false),
+                *expect,
+                "{expr:#?} with [{min}..{max}]"
+            );
+        }
+    };
 
-        expect_eq!(
-            MinMaxTestFilter::new(LO.into(), HI.into()).apply_binary(
-                LessThan,
-                col,
-                &MID.into(),
-                inverted,
-            ),
-            Some(true), // min..max range includes both LT and GE
-            "{col} < {MID} (min: {LO}, max: {HI}, inverted: {inverted})"
-        );
+    // value < min = max (15..15 = 10, 15..15 <= 10, etc)
+    do_test(FIFTEEN, FIFTEEN, &[FALSE, FALSE, FALSE, TRUE, TRUE, TRUE]);
 
-        expect_eq!(
-            MinMaxTestFilter::new(LO.into(), MID.into()).apply_binary(
-                LessThan,
-                col,
-                &HI.into(),
-                inverted,
-            ),
-            Some(!inverted),
-            "{col} < {HI} (min: {LO}, max: {MID}, inverted: {inverted})"
-        );
+    // min = max = value (10..10 = 10, 10..10 <= 10, etc)
+    //
+    // NOTE: missing min or max stat produces NULL output if the expression needed it.
+    do_test(TEN, TEN, &[FALSE, TRUE, TRUE, FALSE, FALSE, TRUE]);
+    do_test(NULL_VAL, TEN, &[NULL, NULL, NULL, NULL, FALSE, TRUE]);
+    do_test(TEN, NULL_VAL, &[FALSE, TRUE, NULL, NULL, NULL, NULL]);
 
-        expect_eq!(
-            MinMaxTestFilter::new(MID.into(), HI.into()).apply_binary(
-                LessThan,
-                col,
-                &LO.into(),
-                inverted,
-            ),
-            Some(inverted),
-            "{col} < {LO} (min: {MID}, max: {HI}, inverted: {inverted})"
-        );
+    // min = max < value (5..5 = 10, 5..5 <= 10, etc)
+    do_test(FIVE, FIVE, &[TRUE, TRUE, FALSE, TRUE, FALSE, FALSE]);
 
-        expect_eq!(
-            MinMaxTestFilter::new(MID.into(), MID.into()).apply_binary(
-                GreaterThanOrEqual,
-                col,
-                &MID.into(),
-                inverted,
-            ),
-            Some(!inverted),
-            "{col} >= {MID} (min: {MID}, max: {MID}, inverted: {inverted})"
-        );
+    // value = min < max (5..15 = 10, 5..15 <= 10, etc)
+    do_test(TEN, FIFTEEN, &[FALSE, TRUE, TRUE, TRUE, TRUE, TRUE]);
 
-        expect_eq!(
-            MinMaxTestFilter::new(LO.into(), HI.into()).apply_binary(
-                GreaterThanOrEqual,
-                col,
-                &MID.into(),
-                inverted,
-            ),
-            Some(true), // min..max range includes both EQ and NE
-            "{col} >= {MID} (min: {LO}, max: {HI}, inverted: {inverted})"
-        );
-
-        expect_eq!(
-            MinMaxTestFilter::new(LO.into(), MID.into()).apply_binary(
-                GreaterThanOrEqual,
-                col,
-                &HI.into(),
-                inverted,
-            ),
-            Some(inverted),
-            "{col} >= {HI} (min: {LO}, max: {MID}, inverted: {inverted})"
-        );
-
-        expect_eq!(
-            MinMaxTestFilter::new(MID.into(), HI.into()).apply_binary(
-                GreaterThanOrEqual,
-                col,
-                &LO.into(),
-                inverted,
-            ),
-            Some(!inverted),
-            "{col} >= {LO} (min: {MID}, max: {HI}, inverted: {inverted})"
-        );
-    }
-}
-
-#[test]
-fn test_binary_le_gt() {
-    use BinaryOperator::*;
-
-    const LO: Scalar = Scalar::Long(1);
-    const MID: Scalar = Scalar::Long(10);
-    const HI: Scalar = Scalar::Long(100);
-    let col = &column_expr!("x");
-
-    for inverted in [false, true] {
-        // negative test -- mismatched column type
-        expect_eq!(
-            MinMaxTestFilter::new(MID.into(), MID.into()).apply_binary(
-                LessThanOrEqual,
-                col,
-                &Expression::literal("10"),
-                inverted,
-            ),
-            None,
-            "{col} <= '10' (min: {MID}, max: {MID}, inverted: {inverted})"
-        );
-
-        expect_eq!(
-            MinMaxTestFilter::new(MID.into(), MID.into()).apply_binary(
-                LessThanOrEqual,
-                col,
-                &MID.into(),
-                inverted,
-            ),
-            Some(!inverted),
-            "{col} <= {MID} (min: {MID}, max: {MID}, inverted: {inverted})"
-        );
-
-        expect_eq!(
-            MinMaxTestFilter::new(LO.into(), HI.into()).apply_binary(
-                LessThanOrEqual,
-                col,
-                &MID.into(),
-                inverted,
-            ),
-            Some(true), // min..max range includes both LT and GE
-            "{col} <= {MID} (min: {LO}, max: {HI}, inverted: {inverted})"
-        );
-
-        expect_eq!(
-            MinMaxTestFilter::new(LO.into(), MID.into()).apply_binary(
-                LessThanOrEqual,
-                col,
-                &HI.into(),
-                inverted,
-            ),
-            Some(!inverted),
-            "{col} <= {HI} (min: {LO}, max: {MID}, inverted: {inverted})"
-        );
-
-        expect_eq!(
-            MinMaxTestFilter::new(MID.into(), HI.into()).apply_binary(
-                LessThanOrEqual,
-                col,
-                &LO.into(),
-                inverted,
-            ),
-            Some(inverted),
-            "{col} <= {LO} (min: {MID}, max: {HI}, inverted: {inverted})"
-        );
-
-        // negative test -- mismatched column type
-        expect_eq!(
-            MinMaxTestFilter::new(MID.into(), MID.into()).apply_binary(
-                GreaterThan,
-                col,
-                &Expression::literal("10"),
-                inverted,
-            ),
-            None,
-            "{col} > '10' (min: {MID}, max: {MID}, inverted: {inverted})"
-        );
-
-        expect_eq!(
-            MinMaxTestFilter::new(MID.into(), MID.into()).apply_binary(
-                GreaterThan,
-                col,
-                &MID.into(),
-                inverted,
-            ),
-            Some(inverted),
-            "{col} > {MID} (min: {MID}, max: {MID}, inverted: {inverted})"
-        );
-
-        expect_eq!(
-            MinMaxTestFilter::new(LO.into(), HI.into()).apply_binary(
-                GreaterThan,
-                col,
-                &MID.into(),
-                inverted,
-            ),
-            Some(true), // min..max range includes both EQ and NE
-            "{col} > {MID} (min: {LO}, max: {HI}, inverted: {inverted})"
-        );
-
-        expect_eq!(
-            MinMaxTestFilter::new(LO.into(), MID.into()).apply_binary(
-                GreaterThan,
-                col,
-                &HI.into(),
-                inverted,
-            ),
-            Some(inverted),
-            "{col} > {HI} (min: {LO}, max: {MID}, inverted: {inverted})"
-        );
-
-        expect_eq!(
-            MinMaxTestFilter::new(MID.into(), HI.into()).apply_binary(
-                GreaterThan,
-                col,
-                &LO.into(),
-                inverted,
-            ),
-            Some(!inverted),
-            "{col} > {LO} (min: {MID}, max: {HI}, inverted: {inverted})"
-        );
-    }
+    // min < value < max (5..15 = 10, 5..15 <= 10, etc)
+    do_test(FIVE, FIFTEEN, &[TRUE, TRUE, TRUE, TRUE, TRUE, TRUE]);
 }
 
 struct NullCountTestFilter {
@@ -714,98 +214,67 @@ impl NullCountTestFilter {
         }
     }
 }
-impl ParquetStatsSkippingFilter for NullCountTestFilter {
-    fn get_min_stat_value(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
+impl ParquetStatsProvider for NullCountTestFilter {
+    fn get_parquet_min_stat(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
         unimplemented!()
     }
 
-    fn get_max_stat_value(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
+    fn get_parquet_max_stat(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
         unimplemented!()
     }
 
-    fn get_nullcount_stat_value(&self, _col: &ColumnName) -> Option<i64> {
+    fn get_parquet_nullcount_stat(&self, _col: &ColumnName) -> Option<i64> {
         self.nullcount
     }
 
-    fn get_rowcount_stat_value(&self) -> i64 {
+    fn get_parquet_rowcount_stat(&self) -> i64 {
         self.rowcount
     }
 }
 
 #[test]
-fn test_not_null() {
-    use UnaryOperator::IsNull;
+fn test_eval_is_null() {
+    let expressions = [
+        Expr::is_null(column_expr!("x")),
+        !Expr::is_null(column_expr!("x"))
+    ];
 
-    let col = &column_expr!("x");
-    for inverted in [false, true] {
-        expect_eq!(
-            NullCountTestFilter::new(None, 10).apply_unary(IsNull, col, inverted),
-            None,
-            "{col} IS NULL (nullcount: None, rowcount: 10, inverted: {inverted})"
-        );
+    let do_test = |nullcount: i64, expected: &[Option<bool>]| {
+        let filter = NullCountTestFilter::new(Some(nullcount), 2);
+        for (expr, expect) in expressions.iter().zip(expected) {
+            expect_eq!(
+                filter.eval_expr(expr, false),
+                *expect,
+                "{expr:#?} ({nullcount} nulls)"
+            );
+        }
+    };
 
-        expect_eq!(
-            NullCountTestFilter::new(Some(0), 10).apply_unary(IsNull, col, inverted),
-            Some(inverted),
-            "{col} IS NULL (nullcount: 0, rowcount: 10, inverted: {inverted})"
-        );
+    // no nulls
+    do_test(0, &[FALSE, TRUE]);
 
-        expect_eq!(
-            NullCountTestFilter::new(Some(5), 10).apply_unary(IsNull, col, inverted),
-            Some(true),
-            "{col} IS NULL (nullcount: 5, rowcount: 10, inverted: {inverted})"
-        );
+    // some nulls
+    do_test(1, &[TRUE, TRUE]);
 
-        expect_eq!(
-            NullCountTestFilter::new(Some(10), 10).apply_unary(IsNull, col, inverted),
-            Some(!inverted),
-            "{col} IS NULL (nullcount: 10, rowcount: 10, inverted: {inverted})"
-        );
-    }
-}
-
-#[test]
-fn test_bool_col() {
-    use Scalar::Boolean;
-    const TRUE: Scalar = Boolean(true);
-    const FALSE: Scalar = Boolean(false);
-    for inverted in [false, true] {
-        expect_eq!(
-            MinMaxTestFilter::new(TRUE.into(), TRUE.into())
-                .apply_column(&column_name!("x"), inverted),
-            Some(!inverted),
-            "x as boolean (min: TRUE, max: TRUE, inverted: {inverted})"
-        );
-        expect_eq!(
-            MinMaxTestFilter::new(FALSE.into(), TRUE.into())
-                .apply_column(&column_name!("x"), inverted),
-            Some(true),
-            "x as boolean (min: FALSE, max: TRUE, inverted: {inverted})"
-        );
-        expect_eq!(
-            MinMaxTestFilter::new(FALSE.into(), FALSE.into())
-                .apply_column(&column_name!("x"), inverted),
-            Some(inverted),
-            "x as boolean (min: FALSE, max: FALSE, inverted: {inverted})"
-        );
-    }
+    // all nulls
+    do_test(2, &[TRUE, FALSE]);
 }
 
 struct AllNullTestFilter;
-impl ParquetStatsSkippingFilter for AllNullTestFilter {
-    fn get_min_stat_value(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
+impl ParquetStatsProvider for AllNullTestFilter {
+    fn get_parquet_min_stat(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
         None
     }
 
-    fn get_max_stat_value(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
+    fn get_parquet_max_stat(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
         None
     }
 
-    fn get_nullcount_stat_value(&self, _col: &ColumnName) -> Option<i64> {
-        Some(self.get_rowcount_stat_value())
+    fn get_parquet_nullcount_stat(&self, _col: &ColumnName) -> Option<i64> {
+        Some(self.get_parquet_rowcount_stat())
     }
 
-    fn get_rowcount_stat_value(&self) -> i64 {
+    fn get_parquet_rowcount_stat(&self) -> i64 {
         10
     }
 }
@@ -813,121 +282,121 @@ impl ParquetStatsSkippingFilter for AllNullTestFilter {
 #[test]
 fn test_sql_where() {
     let col = &column_expr!("x");
-    let val = &Expression::literal(1);
-    const NULL: Expression = Expression::Literal(Scalar::Null(DataType::BOOLEAN));
-    const FALSE: Expression = Expression::Literal(Scalar::Boolean(false));
-    const TRUE: Expression = Expression::Literal(Scalar::Boolean(true));
+    const VAL: Expr = Expr::Literal(Scalar::Integer(1));
+    const NULL: Expr = Expr::Literal(Scalar::Null(DataType::BOOLEAN));
+    const FALSE: Expr = Expr::Literal(Scalar::Boolean(false));
+    const TRUE: Expr = Expr::Literal(Scalar::Boolean(true));
 
     // Basic sanity checks
-    expect_eq!(AllNullTestFilter.apply_sql_where(val), None, "WHERE {val}");
-    expect_eq!(AllNullTestFilter.apply_sql_where(col), None, "WHERE {col}");
+    expect_eq!(AllNullTestFilter.eval_sql_where(&VAL), None, "WHERE {VAL}");
+    expect_eq!(AllNullTestFilter.eval_sql_where(col), None, "WHERE {col}");
     expect_eq!(
-        AllNullTestFilter.apply_sql_where(&Expression::is_null(col.clone())),
+        AllNullTestFilter.eval_sql_where(&Expr::is_null(col.clone())),
         Some(true), // No injected NULL checks
         "WHERE {col} IS NULL"
     );
     expect_eq!(
-        AllNullTestFilter.apply_sql_where(&Expression::lt(TRUE, FALSE)),
+        AllNullTestFilter.eval_sql_where(&Expr::lt(TRUE, FALSE)),
         Some(false), // Injected NULL checks don't short circuit when inputs are NOT NULL
         "WHERE {TRUE} < {FALSE}"
     );
 
     // Constrast normal vs SQL WHERE semantics - comparison
     expect_eq!(
-        AllNullTestFilter.apply_expr(&Expression::lt(col.clone(), val.clone()), false),
+        AllNullTestFilter.eval_expr(&Expr::lt(col.clone(), VAL), false),
         None,
-        "{col} < {val}"
+        "{col} < {VAL}"
     );
     expect_eq!(
-        AllNullTestFilter.apply_sql_where(&Expression::lt(col.clone(), val.clone())),
+        AllNullTestFilter.eval_sql_where(&Expr::lt(col.clone(), VAL)),
         Some(false),
-        "WHERE {col} < {val}"
+        "WHERE {col} < {VAL}"
     );
     expect_eq!(
-        AllNullTestFilter.apply_expr(&Expression::lt(val.clone(), col.clone()), false),
+        AllNullTestFilter.eval_expr(&Expr::lt(VAL, col.clone()), false),
         None,
-        "{val} < {col}"
+        "{VAL} < {col}"
     );
     expect_eq!(
-        AllNullTestFilter.apply_sql_where(&Expression::lt(val.clone(), col.clone())),
+        AllNullTestFilter.eval_sql_where(&Expr::lt(VAL, col.clone())),
         Some(false),
-        "WHERE {val} < {col}"
+        "WHERE {VAL} < {col}"
     );
 
     // Constrast normal vs SQL WHERE semantics - comparison inside AND
     expect_eq!(
-        AllNullTestFilter.apply_expr(
-            &Expression::and(NULL, Expression::lt(col.clone(), val.clone())),
+        AllNullTestFilter.eval_expr(
+            &Expr::and(NULL, Expr::lt(col.clone(), VAL)),
             false
         ),
         None,
-        "{NULL} AND {col} < {val}"
+        "{NULL} AND {col} < {VAL}"
     );
     expect_eq!(
-        AllNullTestFilter.apply_sql_where(&Expression::and(
+        AllNullTestFilter.eval_sql_where(&Expr::and(
             NULL,
-            Expression::lt(col.clone(), val.clone()),
+            Expr::lt(col.clone(), VAL),
         )),
         Some(false),
-        "WHERE {NULL} AND {col} < {val}"
+        "WHERE {NULL} AND {col} < {VAL}"
     );
 
     expect_eq!(
-        AllNullTestFilter.apply_expr(
-            &Expression::and(TRUE, Expression::lt(col.clone(), val.clone())),
+        AllNullTestFilter.eval_expr(
+            &Expr::and(TRUE, Expr::lt(col.clone(), VAL)),
             false
         ),
         None, // NULL (from the NULL check) is stronger than TRUE
-        "{TRUE} AND {col} < {val}"
+        "{TRUE} AND {col} < {VAL}"
     );
     expect_eq!(
-        AllNullTestFilter.apply_sql_where(&Expression::and(
+        AllNullTestFilter.eval_sql_where(&Expr::and(
             TRUE,
-            Expression::lt(col.clone(), val.clone()),
+            Expr::lt(col.clone(), VAL),
         )),
         Some(false), // FALSE (from the NULL check) is stronger than TRUE
-        "WHERE {TRUE} AND {col} < {val}"
+        "WHERE {TRUE} AND {col} < {VAL}"
     );
 
     // Contrast normal vs. SQL WHERE semantics - comparison inside AND inside AND
     expect_eq!(
-        AllNullTestFilter.apply_expr(
-            &Expression::and(
+        AllNullTestFilter.eval_expr(
+            &Expr::and(
                 TRUE,
-                Expression::and(NULL, Expression::lt(col.clone(), val.clone())),
+                Expr::and(NULL, Expr::lt(col.clone(), VAL)),
             ),
             false,
         ),
         None,
-        "{TRUE} AND ({NULL} AND {col} < {val})"
+        "{TRUE} AND ({NULL} AND {col} < {VAL})"
     );
     expect_eq!(
-        AllNullTestFilter.apply_sql_where(&Expression::and(
+        AllNullTestFilter.eval_sql_where(&Expr::and(
             TRUE,
-            Expression::and(NULL, Expression::lt(col.clone(), val.clone())),
+            Expr::and(NULL, Expr::lt(col.clone(), VAL)),
         )),
         Some(false),
-        "WHERE {TRUE} AND ({NULL} AND {col} < {val})"
+        "WHERE {TRUE} AND ({NULL} AND {col} < {VAL})"
     );
 
     // Semantics are the same for comparison inside OR inside AND
     expect_eq!(
-        AllNullTestFilter.apply_expr(
-            &Expression::or(
+        AllNullTestFilter.eval_expr(
+            &Expr::or(
                 FALSE,
-                Expression::and(NULL, Expression::lt(col.clone(), val.clone())),
+                Expr::and(NULL, Expr::lt(col.clone(), VAL)),
             ),
             false,
         ),
         None,
-        "{FALSE} OR ({NULL} AND {col} < {val})"
+        "{FALSE} OR ({NULL} AND {col} < {VAL})"
     );
     expect_eq!(
-        AllNullTestFilter.apply_sql_where(&Expression::or(
+        AllNullTestFilter.eval_sql_where(&Expr::or(
             FALSE,
-            Expression::and(NULL, Expression::lt(col.clone(), val.clone())),
+            Expr::and(NULL, Expr::lt(col.clone(), VAL)),
         )),
         None,
-        "WHERE {FALSE} OR ({NULL} AND {col} < {val})"
+        "WHERE {FALSE} OR ({NULL} AND {col} < {VAL})"
     );
 }

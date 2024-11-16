@@ -1,13 +1,100 @@
 //! An implementation of data skipping that leverages parquet stats from the file footer.
 use crate::expressions::{
-    BinaryOperator, ColumnName, Expression, Scalar, UnaryOperator, VariadicOperator,
+    BinaryOperator, ColumnName, Expression as Expr, Scalar, UnaryOperator, VariadicOperator,
+};
+use crate::predicates::{
+    DataSkippingPredicateEvaluator, PredicateEvaluator, PredicateEvaluatorDefaults,
 };
 use crate::schema::DataType;
 use std::cmp::Ordering;
-use tracing::info;
 
 #[cfg(test)]
 mod tests;
+
+/// A helper trait (mostly exposed for testing). It provides the four stats getters needed by
+/// [`DataSkippingStatsProvider`]. From there, we can automatically derive a
+/// [`DataSkippingPredicateEvaluator`].
+pub(crate) trait ParquetStatsProvider {
+    /// The min-value stat for this column, if the column exists in this file, has the expected
+    /// type, and the parquet footer provides stats for it.
+    fn get_parquet_min_stat(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar>;
+
+    /// The max-value stat for this column, if the column exists in this file, has the expected
+    /// type, and the parquet footer provides stats for it.
+    fn get_parquet_max_stat(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar>;
+
+    /// The nullcount stat for this column, if the column exists in this file, has the expected
+    /// type, and the parquet footer provides stats for it.
+    fn get_parquet_nullcount_stat(&self, _col: &ColumnName) -> Option<i64>;
+
+    /// The rowcount stat for this row group. It is always available in the parquet footer.
+    fn get_parquet_rowcount_stat(&self) -> i64;
+}
+
+/// Blanket implementation that converts a [`ParquetStatsProvider`] into a
+/// [`DataSkippingPredicateEvaluator`].
+impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
+    type Output = bool;
+    type TypedStat = Scalar;
+    type IntStat = i64;
+
+    fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
+        self.get_parquet_min_stat(col, data_type)
+    }
+
+    fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
+        self.get_parquet_max_stat(col, data_type)
+    }
+
+    fn get_nullcount_stat(&self, col: &ColumnName) -> Option<i64> {
+        self.get_parquet_nullcount_stat(col)
+    }
+
+    fn get_rowcount_stat(&self) -> Option<i64> {
+        Some(self.get_parquet_rowcount_stat())
+    }
+
+    fn eval_partial_cmp(
+        &self,
+        ord: Ordering,
+        col: Scalar,
+        val: &Scalar,
+        inverted: bool,
+    ) -> Option<bool> {
+        PredicateEvaluatorDefaults::partial_cmp_scalars(ord, &col, val, inverted)
+    }
+
+    fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<bool> {
+        PredicateEvaluatorDefaults::eval_scalar(val, inverted)
+    }
+
+    fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<bool> {
+        let safe_to_skip = match inverted {
+            true => self.get_rowcount_stat()?, // all-null
+            false => 0i64,                     // no-null
+        };
+        Some(self.get_nullcount_stat(col)? != safe_to_skip)
+    }
+
+    fn eval_binary_scalars(
+        &self,
+        op: BinaryOperator,
+        left: &Scalar,
+        right: &Scalar,
+        inverted: bool,
+    ) -> Option<bool> {
+        PredicateEvaluatorDefaults::eval_binary_scalars(op, left, right, inverted)
+    }
+
+    fn finish_eval_variadic(
+        &self,
+        op: VariadicOperator,
+        exprs: impl IntoIterator<Item = Option<bool>>,
+        inverted: bool,
+    ) -> Option<bool> {
+        PredicateEvaluatorDefaults::finish_eval_variadic(op, exprs, inverted)
+    }
+}
 
 /// Data skipping based on parquet footer stats (e.g. row group skipping). The required methods
 /// fetch stats values for requested columns (if available and with compatible types), and the
@@ -18,18 +105,6 @@ mod tests;
 /// methods of this class convert various supported expressions into data skipping predicates, and
 /// then return the result of evaluating the translated filter.
 pub(crate) trait ParquetStatsSkippingFilter {
-    /// Retrieves the minimum value of a column, if it exists and has the requested type.
-    fn get_min_stat_value(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar>;
-
-    /// Retrieves the maximum value of a column, if it exists and has the requested type.
-    fn get_max_stat_value(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar>;
-
-    /// Retrieves the null count of a column, if it exists.
-    fn get_nullcount_stat_value(&self, col: &ColumnName) -> Option<i64>;
-
-    /// Retrieves the row count of a column (parquet footers always include this stat).
-    fn get_rowcount_stat_value(&self) -> i64;
-
     /// Attempts to filter using SQL WHERE semantics.
     ///
     /// By default, [`apply_expr`] can produce unwelcome behavior for comparisons involving all-NULL
@@ -73,23 +148,28 @@ pub(crate) trait ParquetStatsSkippingFilter {
     /// If the result was FALSE, it forces both inner and outer AND to FALSE, as desired. If the
     /// result was TRUE or NULL, then it does not contribute to data skipping but also does not
     /// block it if other legs of the AND evaluate to FALSE.
-    fn apply_sql_where(&self, filter: &Expression) -> Option<bool> {
-        use Expression::*;
-        use VariadicOperator::And;
+    // TODO: If these are generally useful, we may want to move them into PredicateEvaluator?
+    fn eval_sql_where(&self, filter: &Expr) -> Option<bool>;
+    fn eval_binary_nullsafe(&self, op: BinaryOperator, left: &Expr, right: &Expr) -> Option<bool>;
+}
+
+impl<T: DataSkippingPredicateEvaluator<Output = bool>> ParquetStatsSkippingFilter for T {
+    fn eval_sql_where(&self, filter: &Expr) -> Option<bool> {
+        use Expr::{BinaryOperation, VariadicOperation};
         match filter {
-            VariadicOperation { op: And, exprs } => {
+            VariadicOperation { op: VariadicOperator::And, exprs } => {
                 let exprs: Vec<_> = exprs
                     .iter()
-                    .map(|expr| self.apply_sql_where(expr))
+                    .map(|expr| self.eval_sql_where(expr))
                     .map(|result| match result {
-                        Some(value) => Expression::literal(value),
-                        None => Expression::null_literal(DataType::BOOLEAN),
+                        Some(value) => Expr::literal(value),
+                        None => Expr::null_literal(DataType::BOOLEAN),
                     })
                     .collect();
-                self.apply_variadic(And, &exprs, false)
+                self.eval_variadic(VariadicOperator::And, &exprs, false)
             }
-            BinaryOperation { op, left, right } => self.apply_binary_nullsafe(*op, left, right),
-            _ => self.apply_expr(filter, false),
+            BinaryOperation { op, left, right } => self.eval_binary_nullsafe(*op, left, right),
+            _ => self.eval_expr(filter, false),
         }
     }
 
@@ -103,293 +183,16 @@ pub(crate) trait ParquetStatsSkippingFilter {
     /// fails (producing FALSE), it short-circuits the entire AND without ever evaluating the
     /// comparison. Otherwise, the original comparison will run and -- if FALSE -- can cause data
     /// skipping as usual.
-    fn apply_binary_nullsafe(
-        &self,
-        op: BinaryOperator,
-        left: &Expression,
-        right: &Expression,
-    ) -> Option<bool> {
+    fn eval_binary_nullsafe(&self, op: BinaryOperator, left: &Expr, right: &Expr) -> Option<bool> {
         use UnaryOperator::IsNull;
         // Convert `a {cmp} b` to `AND(a IS NOT NULL, b IS NOT NULL, a {cmp} b)`,
         // and only evaluate the comparison if the null checks don't short circuit.
-        if let Some(false) = self.apply_unary(IsNull, left, true) {
+        if let Some(false) = self.eval_unary(IsNull, left, true) {
             return Some(false);
         }
-        if let Some(false) = self.apply_unary(IsNull, right, true) {
+        if let Some(false) = self.eval_unary(IsNull, right, true) {
             return Some(false);
         }
-        self.apply_binary(op, left, right, false)
+        self.eval_binary(op, left, right, false)
     }
-
-    /// Evaluates a predicate over stats instead of rows. Evaluation is a depth-first traversal over
-    /// all supported subexpressions; unsupported expressions (or expressions that rely on missing
-    /// stats) are replaced with NULL (`None`) values, which then propagate upward following the
-    /// NULL semantics of their parent expressions. If stats prove the filter would eliminate ALL
-    /// rows from the result, then this method returns `Some(false)` and those rows can be skipped
-    /// without inspecting them individually. A return value of `Some(true)` means the filter does
-    /// not reliably eliminate all rows, and `None` indicates the needed stats were not available.
-    ///
-    /// If `inverted`, the caller requests to evaluate `NOT(expression)` instead of evaluating
-    /// `expression` directly. This is important because `NOT(data_skipping(expr))` is NOT
-    /// `equivalent to data_skipping(NOT(expr))`, so we need to "push down" the NOT in order to
-    /// ensure correct semantics. For example, given the expression `x == 10`, and min-max stats
-    /// 1..100, `NOT(x == 10)` and `x == 10` both evaluate to TRUE (because neither filter can
-    /// provably eliminate all rows).
-    fn apply_expr(&self, expression: &Expression, inverted: bool) -> Option<bool> {
-        use Expression::*;
-        match expression {
-            VariadicOperation { op, exprs } => self.apply_variadic(*op, exprs, inverted),
-            BinaryOperation { op, left, right } => self.apply_binary(*op, left, right, inverted),
-            UnaryOperation { op, expr } => self.apply_unary(*op, expr, inverted),
-            Literal(value) => Self::apply_scalar(value, inverted),
-            Column(col) => self.apply_column(col, inverted),
-            Struct(_) => None, // not supported
-        }
-    }
-
-    /// Evaluates AND/OR expressions with Kleene semantics and short circuit behavior.
-    ///
-    /// Short circuiting is based on the observation that each operator has a "dominant" boolean
-    /// value that forces the output to match regardless of any other input. For example, a single
-    /// FALSE input forces AND to FALSE, and a single TRUE input forces OR to TRUE.
-    ///
-    /// Kleene semantics mean that -- in the absence of any dominant input -- a single NULL input
-    /// forces the output to NULL. If no NULL nor dominant input is seen, then the operator's output
-    /// "defaults" to the non-dominant value (and we can actually just ignore non-dominant inputs).
-    ///
-    /// If the filter is inverted, use de Morgan's laws to push the inversion down into the inputs
-    /// (e.g. `NOT(AND(a, b))` becomes `OR(NOT(a), NOT(b))`).
-    fn apply_variadic(
-        &self,
-        op: VariadicOperator,
-        exprs: &[Expression],
-        inverted: bool,
-    ) -> Option<bool> {
-        // With AND (OR), any FALSE (TRUE) input forces FALSE (TRUE) output.  If there was no
-        // dominating input, then any NULL input forces NULL output.  Otherwise, return the
-        // non-dominant value. Inverting the operation also inverts the dominant value.
-        let dominator = match op {
-            VariadicOperator::And => inverted,
-            VariadicOperator::Or => !inverted,
-        };
-
-        // Evaluate the input expressions, inverting each as needed and tracking whether we've seen
-        // any NULL result. Stop immediately (short circuit) if we see a dominant value.
-        let result = exprs.iter().try_fold(false, |found_null, expr| {
-            match self.apply_expr(expr, inverted) {
-                Some(v) if v == dominator => None, // (1) short circuit, dominant found
-                Some(_) => Some(found_null),
-                None => Some(true), // (2) null found (but keep looking for a dominant value)
-            }
-        });
-
-        match result {
-            None => Some(dominator), // (1) short circuit, dominant found
-            Some(false) => Some(!dominator),
-            Some(true) => None, // (2) null found, dominant not found
-        }
-    }
-
-    /// Evaluates binary comparisons. Any NULL input produces a NULL output. If `inverted`, the
-    /// opposite operation is performed, e.g. `<` evaluates as if `>=` had been requested instead.
-    fn apply_binary(
-        &self,
-        op: BinaryOperator,
-        left: &Expression,
-        right: &Expression,
-        inverted: bool,
-    ) -> Option<bool> {
-        use BinaryOperator::*;
-        use Expression::{Column, Literal};
-
-        // Min/Max stats don't allow us to push inversion down into the comparison. Instead, we
-        // invert the comparison itself when needed and compute normally after that.
-        let op = match inverted {
-            true => op.invert()?,
-            false => op,
-        };
-
-        // NOTE: We rely on the literal values to provide logical type hints. That means we cannot
-        // perform column-column comparisons, because we cannot infer the logical type to use.
-        let (op, col, val) = match (left, right) {
-            (Column(col), Literal(val)) => (op, col, val),
-            (Literal(val), Column(col)) => (op.commute()?, col, val),
-            (Literal(a), Literal(b)) => return Self::apply_binary_scalars(op, a, b),
-            _ => {
-                info!("Unsupported binary operand(s): {left:?} {op:?} {right:?}");
-                return None;
-            }
-        };
-        let min_max_disjunct = |min_ord, max_ord, inverted| -> Option<bool> {
-            let skip_lo = self.partial_cmp_min_stat(col, val, min_ord, false)?;
-            let skip_hi = self.partial_cmp_max_stat(col, val, max_ord, false)?;
-            let skip = skip_lo || skip_hi;
-            Some(skip != inverted)
-        };
-        match op {
-            // Given `col == val`:
-            // skip if `val` cannot equal _any_ value in [min, max], implies
-            // skip if `NOT(val BETWEEN min AND max)` implies
-            // skip if `NOT(min <= val AND val <= max)` implies
-            // skip if `min > val OR max < val`
-            // keep if `NOT(min > val OR max < val)`
-            Equal => min_max_disjunct(Ordering::Greater, Ordering::Less, true),
-            // Given `col != val`:
-            // skip if `val` equals _every_ value in [min, max], implies
-            // skip if `val == min AND val == max` implies
-            // skip if `val <= min AND min <= val AND val <= max AND max <= val` implies
-            // skip if `val <= min AND max <= val` implies
-            // keep if `NOT(val <= min AND max <= val)` implies
-            // keep if `val > min OR max > val` implies
-            // keep if `min < val OR max > val`
-            NotEqual => min_max_disjunct(Ordering::Less, Ordering::Greater, false),
-            // Given `col < val`:
-            // Skip if `val` is not greater than _all_ values in [min, max], implies
-            // Skip if `val <= min AND val <= max` implies
-            // Skip if `val <= min` implies
-            // Keep if `NOT(val <= min)` implies
-            // Keep if `val > min` implies
-            // Keep if `min < val`
-            LessThan => self.partial_cmp_min_stat(col, val, Ordering::Less, false),
-            // Given `col <= val`:
-            // Skip if `val` is less than _all_ values in [min, max], implies
-            // Skip if `val < min AND val < max` implies
-            // Skip if `val < min` implies
-            // Keep if `NOT(val < min)` implies
-            // Keep if `NOT(min > val)`
-            LessThanOrEqual => self.partial_cmp_min_stat(col, val, Ordering::Greater, true),
-            // Given `col > val`:
-            // Skip if `val` is not less than _all_ values in [min, max], implies
-            // Skip if `val >= min AND val >= max` implies
-            // Skip if `val >= max` implies
-            // Keep if `NOT(val >= max)` implies
-            // Keep if `NOT(max <= val)` implies
-            // Keep if `max > val`
-            GreaterThan => self.partial_cmp_max_stat(col, val, Ordering::Greater, false),
-            // Given `col >= val`:
-            // Skip if `val is greater than _every_ value in [min, max], implies
-            // Skip if `val > min AND val > max` implies
-            // Skip if `val > max` implies
-            // Keep if `NOT(val > max)` implies
-            // Keep if `NOT(max < val)`
-            GreaterThanOrEqual => self.partial_cmp_max_stat(col, val, Ordering::Less, true),
-            _ => {
-                info!("Unsupported binary operator: {left:?} {op:?} {right:?}");
-                None
-            }
-        }
-    }
-
-    /// Helper method, invoked by [`apply_binary`], for constant comparisons. Query planner constant
-    /// folding optimizationss SHOULD eliminate such patterns, but we implement the support anyway
-    /// because propagating a NULL in its place could disable skipping entirely, e.g. an expression
-    /// such as `OR(10 == 20, <false expression>)`.
-    fn apply_binary_scalars(op: BinaryOperator, left: &Scalar, right: &Scalar) -> Option<bool> {
-        use BinaryOperator::*;
-        match op {
-            Equal => partial_cmp_scalars(left, right, Ordering::Equal, false),
-            NotEqual => partial_cmp_scalars(left, right, Ordering::Equal, true),
-            LessThan => partial_cmp_scalars(left, right, Ordering::Less, false),
-            LessThanOrEqual => partial_cmp_scalars(left, right, Ordering::Greater, true),
-            GreaterThan => partial_cmp_scalars(left, right, Ordering::Greater, false),
-            GreaterThanOrEqual => partial_cmp_scalars(left, right, Ordering::Less, true),
-            _ => {
-                info!("Unsupported binary operator: {left:?} {op:?} {right:?}");
-                None
-            }
-        }
-    }
-
-    /// Applies unary NOT and IS [NOT] NULL. Null inputs to NOT produce NULL output. The null checks
-    /// are only defined for columns (not expressions), and they ony produce NULL output if the
-    /// necessary nullcount stats are missing.
-    fn apply_unary(&self, op: UnaryOperator, expr: &Expression, inverted: bool) -> Option<bool> {
-        match op {
-            UnaryOperator::Not => self.apply_expr(expr, !inverted),
-            UnaryOperator::IsNull => match expr {
-                Expression::Column(col) => {
-                    let skip = match inverted {
-                        // IS NOT NULL - skip if all-null
-                        true => self.get_rowcount_stat_value(),
-                        // IS NULL - skip if no-null
-                        false => 0,
-                    };
-                    Some(self.get_nullcount_stat_value(col)? != skip)
-                }
-                _ => {
-                    info!("Unsupported unary operation: {op:?}({expr:?})");
-                    None
-                }
-            },
-        }
-    }
-
-    /// Propagates a boolean-typed column, allowing e.g. `flag OR ...`.
-    /// Columns of other types are ignored (NULL result).
-    fn apply_column(&self, col: &ColumnName, inverted: bool) -> Option<bool> {
-        let as_boolean = |get: &dyn Fn(_, _, _) -> _| match get(self, col, &DataType::BOOLEAN) {
-            Some(Scalar::Boolean(value)) => Some(value),
-            Some(_) => {
-                info!("Ignoring non-boolean column {col}");
-                None
-            }
-            _ => None,
-        };
-        let min = as_boolean(&Self::get_min_stat_value)?;
-        let max = as_boolean(&Self::get_max_stat_value)?;
-        Some(min != inverted || max != inverted)
-    }
-
-    /// Propagates a boolean literal, allowing e.g. `FALSE OR ...`.
-    /// Literals of other types are ignored (NULL result).
-    fn apply_scalar(value: &Scalar, inverted: bool) -> Option<bool> {
-        match value {
-            Scalar::Boolean(value) => Some(*value != inverted),
-            _ => {
-                info!("Ignoring non-boolean literal {value}");
-                None
-            }
-        }
-    }
-
-    /// Performs a partial comparison against a column min-stat. See [`partial_cmp_scalars`] for
-    /// details of the comparison semantics.
-    fn partial_cmp_min_stat(
-        &self,
-        col: &ColumnName,
-        val: &Scalar,
-        ord: Ordering,
-        inverted: bool,
-    ) -> Option<bool> {
-        let min = self.get_min_stat_value(col, &val.data_type())?;
-        partial_cmp_scalars(&min, val, ord, inverted)
-    }
-
-    /// Performs a partial comparison against a column max-stat. See [`partial_cmp_scalars`] for
-    /// details of the comparison semantics.
-    fn partial_cmp_max_stat(
-        &self,
-        col: &ColumnName,
-        val: &Scalar,
-        ord: Ordering,
-        inverted: bool,
-    ) -> Option<bool> {
-        let max = self.get_max_stat_value(col, &val.data_type())?;
-        partial_cmp_scalars(&max, val, ord, inverted)
-    }
-}
-
-/// Compares two scalar values, returning Some(true) if the result matches the target `Ordering`. If
-/// an inverted comparison is requested, then return Some(false) on match instead. For example,
-/// requesting an inverted `Ordering::Less` matches both `Ordering::Greater` and `Ordering::Equal`,
-/// corresponding to a logical `>=` comparison. Returns `None` if the values are incomparable, which
-/// can occur because the types differ or because the type itself is incomparable.
-pub(crate) fn partial_cmp_scalars(
-    a: &Scalar,
-    b: &Scalar,
-    ord: Ordering,
-    inverted: bool,
-) -> Option<bool> {
-    let result = a.partial_cmp(b)? == ord;
-    Some(result != inverted)
 }

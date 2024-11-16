@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
@@ -8,86 +9,17 @@ use crate::actions::get_log_add_schema;
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
 use crate::expressions::{
-    column_expr, column_name, joined_column_expr, BinaryOperator, Expression as Expr,
-    ExpressionRef, UnaryOperator, VariadicOperator,
+    column_expr, joined_column_expr, BinaryOperator, ColumnName, Expression as Expr, ExpressionRef,
+    Scalar, VariadicOperator,
+};
+use crate::predicates::{
+    DataSkippingPredicateEvaluator, PredicateEvaluator, PredicateEvaluatorDefaults,
 };
 use crate::schema::{DataType, PrimitiveType, SchemaRef, SchemaTransform, StructField, StructType};
 use crate::{Engine, EngineData, ExpressionEvaluator, JsonHandler};
 
-/// Get the expression that checks if a col could be null, assuming tight_bounds = true. In this
-/// case a column can contain null if any value > 0 is in the nullCount. This is further complicated
-/// by the default for tightBounds being true, so we have to check if it's EITHER `null` OR `true`
-fn get_tight_null_expr(null_col: Expr) -> Expr {
-    Expr::and(
-        Expr::distinct(column_expr!("tightBounds"), false),
-        Expr::gt(null_col, 0i64),
-    )
-}
-
-/// Get the expression that checks if a col could be null, assuming tight_bounds = false. In this
-/// case, we can only check if the WHOLE column is null, by checking if the number of records is
-/// equal to the null count, since all other values of nullCount must be ignored (except 0, which
-/// doesn't help us)
-fn get_wide_null_expr(null_col: Expr) -> Expr {
-    Expr::and(
-        Expr::eq(column_expr!("tightBounds"), false),
-        Expr::eq(column_expr!("numRecords"), null_col),
-    )
-}
-
-/// Get the expression that checks if a col could NOT be null, assuming tight_bounds = true. In this
-/// case a column has a NOT NULL record if nullCount < numRecords. This is further complicated by
-/// the default for tightBounds being true, so we have to check if it's EITHER `null` OR `true`
-fn get_tight_not_null_expr(null_col: Expr) -> Expr {
-    Expr::and(
-        Expr::distinct(column_expr!("tightBounds"), false),
-        Expr::lt(null_col, column_expr!("numRecords")),
-    )
-}
-
-/// Get the expression that checks if a col could NOT be null, assuming tight_bounds = false. In
-/// this case, we can only check if the WHOLE column null, by checking if the nullCount ==
-/// numRecords. So by inverting that check and seeing if nullCount != numRecords, we can check if
-/// there is a possibility of a NOT null
-fn get_wide_not_null_expr(null_col: Expr) -> Expr {
-    Expr::and(
-        Expr::eq(column_expr!("tightBounds"), false),
-        Expr::ne(column_expr!("numRecords"), null_col),
-    )
-}
-
-/// Use De Morgan's Laws to push a NOT expression down the tree
-fn as_inverted_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
-    use Expr::*;
-    match expr {
-        UnaryOperation { op, expr } => match op {
-            UnaryOperator::Not => as_data_skipping_predicate(expr),
-            UnaryOperator::IsNull => {
-                // to check if a column could NOT have a null, we need two different checks, to see
-                // if the bounds are tight and then to actually do the check
-                if let Column(col) = expr.as_ref() {
-                    let null_col = joined_column_expr!("nullCount", col);
-                    Some(Expr::or(
-                        get_tight_not_null_expr(null_col.clone()),
-                        get_wide_not_null_expr(null_col),
-                    ))
-                } else {
-                    // can't check anything other than a col for null
-                    None
-                }
-            }
-        },
-        BinaryOperation { op, left, right } => {
-            let expr = Expr::binary(op.invert()?, left.as_ref().clone(), right.as_ref().clone());
-            as_data_skipping_predicate(&expr)
-        }
-        VariadicOperation { op, exprs } => {
-            let expr = Expr::variadic(op.invert(), exprs.iter().cloned().map(|e| !e));
-            as_data_skipping_predicate(&expr)
-        }
-        _ => None,
-    }
-}
+#[cfg(test)]
+mod tests;
 
 /// Rewrites a predicate to a predicate that can be used to skip files based on their stats.
 /// Returns `None` if the predicate is not eligible for data skipping.
@@ -105,62 +37,8 @@ fn as_inverted_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
 ///         are not eligible for data skipping.
 /// - `OR` is rewritten only if all operands are eligible for data skipping. Otherwise, the whole OR
 ///        expression is dropped.
-fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
-    use BinaryOperator::*;
-    use Expr::*;
-    use UnaryOperator::*;
-
-    match expr {
-        BinaryOperation { op, left, right } => {
-            let (op, col, val) = match (left.as_ref(), right.as_ref()) {
-                (Column(col), Literal(val)) => (*op, col, val),
-                (Literal(val), Column(col)) => (op.commute()?, col, val),
-                _ => return None, // unsupported combination of operands
-            };
-            let stats_col = match op {
-                LessThan | LessThanOrEqual => column_name!("minValues"),
-                GreaterThan | GreaterThanOrEqual => column_name!("maxValues"),
-                Equal => {
-                    return as_data_skipping_predicate(&Expr::and(
-                        Expr::le(Column(col.clone()), Literal(val.clone())),
-                        Expr::le(Literal(val.clone()), Column(col.clone())),
-                    ));
-                }
-                NotEqual => {
-                    return Some(Expr::or(
-                        Expr::gt(joined_column_expr!("minValues", col), val.clone()),
-                        Expr::lt(joined_column_expr!("maxValues", col), val.clone()),
-                    ));
-                }
-                _ => return None, // unsupported operation
-            };
-            Some(Expr::binary(op, stats_col.join(col), val.clone()))
-        }
-        // push down Not by inverting everything below it
-        UnaryOperation { op: Not, expr } => as_inverted_data_skipping_predicate(expr),
-        UnaryOperation { op: IsNull, expr } => {
-            // to check if a column could have a null, we need two different checks, to see if
-            // the bounds are tight and then to actually do the check
-            if let Column(col) = expr.as_ref() {
-                let null_col = joined_column_expr!("nullCount", col);
-                Some(Expr::or(
-                    get_tight_null_expr(null_col.clone()),
-                    get_wide_null_expr(null_col),
-                ))
-            } else {
-                // can't check anything other than a col for null
-                None
-            }
-        }
-        VariadicOperation { op, exprs } => {
-            let exprs = exprs.iter().map(as_data_skipping_predicate);
-            match op {
-                VariadicOperator::And => Some(Expr::and_from(exprs.flatten())),
-                VariadicOperator::Or => Some(Expr::or_from(exprs.collect::<Option<Vec<_>>>()?)),
-            }
-        }
-        _ => None,
-    }
+fn as_data_skipping_predicate(expr: &Expr, inverted: bool) -> Option<Expr> {
+    DataSkippingPredicateCreator.eval_expr(expr, inverted)
 }
 
 pub(crate) struct DataSkippingFilter {
@@ -223,7 +101,6 @@ impl DataSkippingFilter {
             .into_owned();
         let stats_schema = Arc::new(StructType::new([
             StructField::new("numRecords", DataType::LONG, true),
-            StructField::new("tightBounds", DataType::BOOLEAN, true),
             StructField::new("nullCount", nullcount_schema, true),
             StructField::new("minValues", minmax_schema.clone(), true),
             StructField::new("maxValues", minmax_schema, true),
@@ -249,7 +126,7 @@ impl DataSkippingFilter {
 
         let skipping_evaluator = engine.get_expression_handler().get_evaluator(
             stats_schema.clone(),
-            Expr::struct_from([as_data_skipping_predicate(predicate)?]),
+            Expr::struct_from([as_data_skipping_predicate(predicate, false)?]),
             PREDICATE_SCHEMA.clone(),
         );
 
@@ -304,83 +181,100 @@ impl DataSkippingFilter {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+struct DataSkippingPredicateCreator;
 
-    #[test]
-    fn test_rewrite_basic_comparison() {
-        let column = column_expr!("a");
-        let lit_int = Expr::literal(1_i32);
-        let min_col = column_expr!("minValues.a");
-        let max_col = column_expr!("maxValues.a");
+impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
+    type Output = Expr;
+    type TypedStat = Expr;
+    type IntStat = Expr;
 
-        let cases = [
-            (
-                column.clone().lt(lit_int.clone()),
-                Expr::lt(min_col.clone(), lit_int.clone()),
-            ),
-            (
-                lit_int.clone().lt(column.clone()),
-                Expr::gt(max_col.clone(), lit_int.clone()),
-            ),
-            (
-                column.clone().gt(lit_int.clone()),
-                Expr::gt(max_col.clone(), lit_int.clone()),
-            ),
-            (
-                lit_int.clone().gt(column.clone()),
-                Expr::lt(min_col.clone(), lit_int.clone()),
-            ),
-            (
-                column.clone().lt_eq(lit_int.clone()),
-                Expr::le(min_col.clone(), lit_int.clone()),
-            ),
-            (
-                lit_int.clone().lt_eq(column.clone()),
-                Expr::ge(max_col.clone(), lit_int.clone()),
-            ),
-            (
-                column.clone().gt_eq(lit_int.clone()),
-                Expr::ge(max_col.clone(), lit_int.clone()),
-            ),
-            (
-                lit_int.clone().gt_eq(column.clone()),
-                Expr::le(min_col.clone(), lit_int.clone()),
-            ),
-            (
-                column.clone().eq(lit_int.clone()),
-                Expr::and_from([
-                    Expr::le(min_col.clone(), lit_int.clone()),
-                    Expr::ge(max_col.clone(), lit_int.clone()),
-                ]),
-            ),
-            (
-                lit_int.clone().eq(column.clone()),
-                Expr::and_from([
-                    Expr::le(min_col.clone(), lit_int.clone()),
-                    Expr::ge(max_col.clone(), lit_int.clone()),
-                ]),
-            ),
-            (
-                column.clone().ne(lit_int.clone()),
-                Expr::or_from([
-                    Expr::gt(min_col.clone(), lit_int.clone()),
-                    Expr::lt(max_col.clone(), lit_int.clone()),
-                ]),
-            ),
-            (
-                lit_int.clone().ne(column.clone()),
-                Expr::or_from([
-                    Expr::gt(min_col.clone(), lit_int.clone()),
-                    Expr::lt(max_col.clone(), lit_int.clone()),
-                ]),
-            ),
-        ];
+    /// Retrieves the minimum value of a column, if it exists and has the requested type.
+    fn get_min_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
+        Some(joined_column_expr!("minValues", col))
+    }
 
-        for (input, expected) in cases {
-            let rewritten = as_data_skipping_predicate(&input).unwrap();
-            assert_eq!(rewritten, expected)
+    /// Retrieves the maximum value of a column, if it exists and has the requested type.
+    fn get_max_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
+        Some(joined_column_expr!("maxValues", col))
+    }
+
+    /// Retrieves the null count of a column, if it exists.
+    fn get_nullcount_stat(&self, col: &ColumnName) -> Option<Expr> {
+        Some(joined_column_expr!("nullCount", col))
+    }
+
+    /// Retrieves the row count of a column (parquet footers always include this stat).
+    fn get_rowcount_stat(&self) -> Option<Expr> {
+        Some(column_expr!("numRecords"))
+    }
+
+    fn eval_partial_cmp(
+        &self,
+        ord: Ordering,
+        col: Expr,
+        val: &Scalar,
+        inverted: bool,
+    ) -> Option<Expr> {
+        let op = match (ord, inverted) {
+            (Ordering::Less, false) => BinaryOperator::LessThan,
+            (Ordering::Less, true) => BinaryOperator::GreaterThanOrEqual,
+            (Ordering::Equal, false) => BinaryOperator::Equal,
+            (Ordering::Equal, true) => BinaryOperator::NotEqual,
+            (Ordering::Greater, false) => BinaryOperator::GreaterThan,
+            (Ordering::Greater, true) => BinaryOperator::LessThanOrEqual,
+        };
+        Some(Expr::binary(op, col, val.clone()))
+    }
+
+    fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
+        PredicateEvaluatorDefaults::eval_scalar(val, inverted).map(Expr::literal)
+    }
+
+    fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Expr> {
+        let safe_to_skip = match inverted {
+            true => self.get_rowcount_stat()?, // all-null
+            false => Expr::literal(0i64),      // no-null
+        };
+        Some(Expr::ne(self.get_nullcount_stat(col)?, safe_to_skip))
+    }
+
+    fn eval_binary_scalars(
+        &self,
+        op: BinaryOperator,
+        left: &Scalar,
+        right: &Scalar,
+        inverted: bool,
+    ) -> Option<Expr> {
+        PredicateEvaluatorDefaults::eval_binary_scalars(op, left, right, inverted)
+            .map(Expr::literal)
+    }
+
+    fn finish_eval_variadic(
+        &self,
+        mut op: VariadicOperator,
+        exprs: impl IntoIterator<Item = Option<Expr>>,
+        inverted: bool,
+    ) -> Option<Expr> {
+        if inverted {
+            op = op.invert();
         }
+        // NOTE: We can potentially see a LOT of NULL inputs in a big WHERE clause with lots of
+        // unsupported data skipping operations. We can't "just" flatten them all away for AND,
+        // because that could produce TRUE where NULL would otherwise be expected. Similarly, we
+        // don't want to "just" try_collect inputs for OR, because that can cause OR to produce NULL
+        // where FALSE would otherwise be expected. So, we filter out all nulls except the first,
+        // observing that one NULL is enough to produce the correct behavior during predicate eval.
+        let mut keep_null = true;
+        let exprs: Vec<_> = exprs
+            .into_iter()
+            .flat_map(|e| match e {
+                Some(expr) => Some(expr),
+                None => keep_null.then(|| {
+                    keep_null = false;
+                    Expr::null_literal(DataType::BOOLEAN)
+                }),
+            })
+            .collect();
+        Some(Expr::variadic(op, exprs))
     }
 }
