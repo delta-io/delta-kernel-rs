@@ -234,8 +234,26 @@ mod tests {
 
         // ignored - no extension
         let log_path = table_log_dir.join("00000000000000000010").unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
-        assert!(log_path.is_none());
+        let result = ParsedLogPath::try_from(log_path);
+        assert!(
+            matches!(result, Ok(None)),
+            "Expected Ok(None) for missing file extension"
+        );
+
+        // empty extension - should be treated as unknown file type
+        let log_path = table_log_dir.join("00000000000000000011.").unwrap();
+        let result = ParsedLogPath::try_from(log_path);
+        assert!(
+            matches!(
+                result,
+                Ok(Some(ParsedLogPath {
+                    file_type: LogPathFileType::Unknown,
+                    ..
+                }))
+            ),
+            "Expected Unknown file type, got {:?}",
+            result
+        );
 
         // ignored - version fails to parse
         let log_path = table_log_dir.join("abc.json").unwrap();
@@ -394,6 +412,16 @@ mod tests {
         assert!(!log_path.is_commit());
         assert!(!log_path.is_checkpoint());
         assert!(log_path.is_unknown());
+
+        // Boundary test - UUID with exactly 35 characters (one too short)
+        let log_path = table_log_dir
+            .join("00000000000000000010.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e.parquet")
+            .unwrap();
+        let result = ParsedLogPath::try_from(log_path);
+        assert!(
+            matches!(result, Err(Error::InvalidLogPath(_))),
+            "Expected an error for UUID with exactly 35 characters"
+        );
     }
 
     #[test]
