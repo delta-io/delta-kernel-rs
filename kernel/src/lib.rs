@@ -11,8 +11,8 @@
 //! [read-table-single-threaded] example (and for a more complex multi-threaded reader see the
 //! [read-table-multi-threaded] example).
 //!
-//! [read-table-single-threaded]: https://github.com/delta-incubator/delta-kernel-rs/tree/main/kernel/examples/read-table-single-threaded
-//! [read-table-multi-threaded]: https://github.com/delta-incubator/delta-kernel-rs/tree/main/kernel/examples/read-table-multi-threaded
+//! [read-table-single-threaded]: https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/examples/read-table-single-threaded
+//! [read-table-multi-threaded]: https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/examples/read-table-multi-threaded
 //!
 //! # Engine traits
 //!

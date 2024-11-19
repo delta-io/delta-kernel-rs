@@ -49,7 +49,7 @@ fn test_replay_for_metadata() {
     //
     // NOTE: Each checkpoint part is a single-row file -- guaranteed to produce one row group.
     //
-    // WARNING: https://github.com/delta-incubator/delta-kernel-rs/issues/434 -- We currently
+    // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 -- We currently
     // read parts 1 and 5 (4 in all instead of 2) because row group skipping is disabled for
     // missing columns, but can still skip part 3 because has valid nullcount stats for P&M.
     assert_eq!(data.len(), 4);
@@ -260,7 +260,7 @@ fn build_snapshot_with_bad_checkpoint_hint_fails() {
 #[ignore]
 #[test]
 fn build_snapshot_with_missing_checkpoint_part_no_hint() {
-    // TODO: Handle checkpoints correctly so that this test passes: https://github.com/delta-incubator/delta-kernel-rs/issues/497
+    // TODO: Handle checkpoints correctly so that this test passes: https://github.com/delta-io/delta-kernel-rs/issues/497
 
     // Part 2 of 3 is missing from checkpoint 5. The Snapshot should be made of checkpoint
     // number 3 and commit files 4 to 7.

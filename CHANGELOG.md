@@ -1,8 +1,8 @@
 # Changelog
 
-## [v0.4.1](https://github.com/delta-incubator/delta-kernel-rs/tree/v0.4.1/) (2024-10-28)
+## [v0.4.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.4.1/) (2024-10-28)
 
-[Full Changelog](https://github.com/delta-incubator/delta-kernel-rs/compare/v0.4.0...v0.4.1)
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.4.0...v0.4.1)
 
 **API Changes**
 
@@ -15,11 +15,11 @@ column as all-null is unsound, if the schema was not already verified to prove t
 logical schema actually includes the missing column. We disable it until we can add the necessary
 validation. [\#435]
 
-[\#435]: https://github.com/delta-incubator/delta-kernel-rs/pull/435
+[\#435]: https://github.com/delta-io/delta-kernel-rs/pull/435
 
-## [v0.4.0](https://github.com/delta-incubator/delta-kernel-rs/tree/v0.4.0/) (2024-10-23)
+## [v0.4.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.4.0/) (2024-10-23)
 
-[Full Changelog](https://github.com/delta-incubator/delta-kernel-rs/compare/v0.3.1...v0.4.0)
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.3.1...v0.4.0)
 
 **API Changes**
 
@@ -70,96 +70,96 @@ validation. [\#435]
 - fixed broken sync engine json parsing and harmonized sync/async json parsing [\#373]
 - filesystem client now always returns a sorted list [\#344]
 
-[\#331]: https://github.com/delta-incubator/delta-kernel-rs/pull/331
-[\#332]: https://github.com/delta-incubator/delta-kernel-rs/pull/332
-[\#334]: https://github.com/delta-incubator/delta-kernel-rs/pull/334
-[\#335]: https://github.com/delta-incubator/delta-kernel-rs/pull/335
-[\#336]: https://github.com/delta-incubator/delta-kernel-rs/pull/336
-[\#337]: https://github.com/delta-incubator/delta-kernel-rs/pull/337
-[\#339]: https://github.com/delta-incubator/delta-kernel-rs/pull/339
-[\#340]: https://github.com/delta-incubator/delta-kernel-rs/pull/340
-[\#342]: https://github.com/delta-incubator/delta-kernel-rs/pull/342
-[\#343]: https://github.com/delta-incubator/delta-kernel-rs/pull/343
-[\#344]: https://github.com/delta-incubator/delta-kernel-rs/pull/344
-[\#347]: https://github.com/delta-incubator/delta-kernel-rs/pull/347
-[\#354]: https://github.com/delta-incubator/delta-kernel-rs/pull/354
-[\#357]: https://github.com/delta-incubator/delta-kernel-rs/pull/357
-[\#360]: https://github.com/delta-incubator/delta-kernel-rs/pull/360
-[\#362]: https://github.com/delta-incubator/delta-kernel-rs/pull/362
-[\#364]: https://github.com/delta-incubator/delta-kernel-rs/pull/364
-[\#366]: https://github.com/delta-incubator/delta-kernel-rs/pull/366
-[\#369]: https://github.com/delta-incubator/delta-kernel-rs/pull/369
-[\#373]: https://github.com/delta-incubator/delta-kernel-rs/pull/373
-[\#374]: https://github.com/delta-incubator/delta-kernel-rs/pull/374
-[\#381]: https://github.com/delta-incubator/delta-kernel-rs/pull/381
-[\#383]: https://github.com/delta-incubator/delta-kernel-rs/pull/383
-[\#384]: https://github.com/delta-incubator/delta-kernel-rs/pull/384
-[\#385]: https://github.com/delta-incubator/delta-kernel-rs/pull/385
-[\#386]: https://github.com/delta-incubator/delta-kernel-rs/pull/386
-[\#395]: https://github.com/delta-incubator/delta-kernel-rs/pull/395
-[\#398]: https://github.com/delta-incubator/delta-kernel-rs/pull/398
-[\#399]: https://github.com/delta-incubator/delta-kernel-rs/pull/399
-[\#401]: https://github.com/delta-incubator/delta-kernel-rs/pull/401
-[\#402]: https://github.com/delta-incubator/delta-kernel-rs/pull/402
-[\#409]: https://github.com/delta-incubator/delta-kernel-rs/pull/409
-[\#413]: https://github.com/delta-incubator/delta-kernel-rs/pull/413
+[\#331]: https://github.com/delta-io/delta-kernel-rs/pull/331
+[\#332]: https://github.com/delta-io/delta-kernel-rs/pull/332
+[\#334]: https://github.com/delta-io/delta-kernel-rs/pull/334
+[\#335]: https://github.com/delta-io/delta-kernel-rs/pull/335
+[\#336]: https://github.com/delta-io/delta-kernel-rs/pull/336
+[\#337]: https://github.com/delta-io/delta-kernel-rs/pull/337
+[\#339]: https://github.com/delta-io/delta-kernel-rs/pull/339
+[\#340]: https://github.com/delta-io/delta-kernel-rs/pull/340
+[\#342]: https://github.com/delta-io/delta-kernel-rs/pull/342
+[\#343]: https://github.com/delta-io/delta-kernel-rs/pull/343
+[\#344]: https://github.com/delta-io/delta-kernel-rs/pull/344
+[\#347]: https://github.com/delta-io/delta-kernel-rs/pull/347
+[\#354]: https://github.com/delta-io/delta-kernel-rs/pull/354
+[\#357]: https://github.com/delta-io/delta-kernel-rs/pull/357
+[\#360]: https://github.com/delta-io/delta-kernel-rs/pull/360
+[\#362]: https://github.com/delta-io/delta-kernel-rs/pull/362
+[\#364]: https://github.com/delta-io/delta-kernel-rs/pull/364
+[\#366]: https://github.com/delta-io/delta-kernel-rs/pull/366
+[\#369]: https://github.com/delta-io/delta-kernel-rs/pull/369
+[\#373]: https://github.com/delta-io/delta-kernel-rs/pull/373
+[\#374]: https://github.com/delta-io/delta-kernel-rs/pull/374
+[\#381]: https://github.com/delta-io/delta-kernel-rs/pull/381
+[\#383]: https://github.com/delta-io/delta-kernel-rs/pull/383
+[\#384]: https://github.com/delta-io/delta-kernel-rs/pull/384
+[\#385]: https://github.com/delta-io/delta-kernel-rs/pull/385
+[\#386]: https://github.com/delta-io/delta-kernel-rs/pull/386
+[\#395]: https://github.com/delta-io/delta-kernel-rs/pull/395
+[\#398]: https://github.com/delta-io/delta-kernel-rs/pull/398
+[\#399]: https://github.com/delta-io/delta-kernel-rs/pull/399
+[\#401]: https://github.com/delta-io/delta-kernel-rs/pull/401
+[\#402]: https://github.com/delta-io/delta-kernel-rs/pull/402
+[\#409]: https://github.com/delta-io/delta-kernel-rs/pull/409
+[\#413]: https://github.com/delta-io/delta-kernel-rs/pull/413
 
 
-## [v0.3.1](https://github.com/delta-incubator/delta-kernel-rs/tree/v0.3.1/) (2024-09-10)
+## [v0.3.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.3.1/) (2024-09-10)
 
-[Full Changelog](https://github.com/delta-incubator/delta-kernel-rs/compare/v0.3.0...v0.3.1)
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.3.0...v0.3.1)
 
 **API Changes**
 
 *Additions*
 
-1. Two new binary expressions: `In` and `NotIn`, as well as a new `Scalar::Array` variant to represent arrays in the expression framework [\#270](https://github.com/delta-incubator/delta-kernel-rs/pull/270) NOTE: exact API for these expressions is still evolving.
+1. Two new binary expressions: `In` and `NotIn`, as well as a new `Scalar::Array` variant to represent arrays in the expression framework [\#270](https://github.com/delta-io/delta-kernel-rs/pull/270) NOTE: exact API for these expressions is still evolving.
 
 **Implemented enhancements:**
 
-- Enabled more golden table tests [\#301](https://github.com/delta-incubator/delta-kernel-rs/pull/301)
+- Enabled more golden table tests [\#301](https://github.com/delta-io/delta-kernel-rs/pull/301)
 
 **Fixed bugs:**
 
-- Allow kernel to read tables with invalid `_last_checkpoint` [\#311](https://github.com/delta-incubator/delta-kernel-rs/pull/311)
-- List log files with checkpoint hint when constructing latest snapshot (when version requested is `None`) [\#312](https://github.com/delta-incubator/delta-kernel-rs/pull/312)
-- Fix incorrect offset value when computing list offsets [\#327](https://github.com/delta-incubator/delta-kernel-rs/pull/327)
-- Fix metadata string conversion in default engine arrow conversion [\#328](https://github.com/delta-incubator/delta-kernel-rs/pull/328)
+- Allow kernel to read tables with invalid `_last_checkpoint` [\#311](https://github.com/delta-io/delta-kernel-rs/pull/311)
+- List log files with checkpoint hint when constructing latest snapshot (when version requested is `None`) [\#312](https://github.com/delta-io/delta-kernel-rs/pull/312)
+- Fix incorrect offset value when computing list offsets [\#327](https://github.com/delta-io/delta-kernel-rs/pull/327)
+- Fix metadata string conversion in default engine arrow conversion [\#328](https://github.com/delta-io/delta-kernel-rs/pull/328)
 
-## [v0.3.0](https://github.com/delta-incubator/delta-kernel-rs/tree/v0.3.0/) (2024-08-07)
+## [v0.3.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.3.0/) (2024-08-07)
 
-[Full Changelog](https://github.com/delta-incubator/delta-kernel-rs/compare/v0.2.0...v0.3.0)
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.2.0...v0.3.0)
 
 **API Changes**
 
 *Breaking*
 
-1. `delta_kernel::column_mapping` module moved to `delta_kernel::features::column_mapping` [\#222](https://github.com/delta-incubator/delta-kernel-rs/pull/297)
+1. `delta_kernel::column_mapping` module moved to `delta_kernel::features::column_mapping` [\#222](https://github.com/delta-io/delta-kernel-rs/pull/297)
 
 
 *Additions*
 
-1. New deletion vector API `row_indexes` (and accompanying FFI) to get row indexes instead of seletion vector of deleted rows. This can be more efficient for sparse DVs. [\#215](https://github.com/delta-incubator/delta-kernel-rs/pull/215)
-2. Typed table features: `ReaderFeatures`, `WriterFeatures` enums and `has_reader_feature`/`has_writer_feature` API [\#222](https://github.com/delta-incubator/delta-kernel-rs/pull/297)
+1. New deletion vector API `row_indexes` (and accompanying FFI) to get row indexes instead of seletion vector of deleted rows. This can be more efficient for sparse DVs. [\#215](https://github.com/delta-io/delta-kernel-rs/pull/215)
+2. Typed table features: `ReaderFeatures`, `WriterFeatures` enums and `has_reader_feature`/`has_writer_feature` API [\#222](https://github.com/delta-io/delta-kernel-rs/pull/297)
 
 **Implemented enhancements:**
 
-- Add `--limit` option to example `read-table-multi-threaded` [\#297](https://github.com/delta-incubator/delta-kernel-rs/pull/297)
-- FFI now built with cmake. Move to using the read-test example as an ffi-test. And building on macos. [\#288](https://github.com/delta-incubator/delta-kernel-rs/pull/288)
-- Golden table tests migrated from delta-spark/delta-kernel java [\#295](https://github.com/delta-incubator/delta-kernel-rs/pull/295)
-- Code coverage implemented via [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) and reported with [codecov](https://app.codecov.io/github/delta-incubator/delta-kernel-rs) [\#287](https://github.com/delta-incubator/delta-kernel-rs/pull/287)
-- All tests enabled to run in CI [\#284](https://github.com/delta-incubator/delta-kernel-rs/pull/284)
-- Updated DAT to 0.3 [\#290](https://github.com/delta-incubator/delta-kernel-rs/pull/290)
+- Add `--limit` option to example `read-table-multi-threaded` [\#297](https://github.com/delta-io/delta-kernel-rs/pull/297)
+- FFI now built with cmake. Move to using the read-test example as an ffi-test. And building on macos. [\#288](https://github.com/delta-io/delta-kernel-rs/pull/288)
+- Golden table tests migrated from delta-spark/delta-kernel java [\#295](https://github.com/delta-io/delta-kernel-rs/pull/295)
+- Code coverage implemented via [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) and reported with [codecov](https://app.codecov.io/github/delta-io/delta-kernel-rs) [\#287](https://github.com/delta-io/delta-kernel-rs/pull/287)
+- All tests enabled to run in CI [\#284](https://github.com/delta-io/delta-kernel-rs/pull/284)
+- Updated DAT to 0.3 [\#290](https://github.com/delta-io/delta-kernel-rs/pull/290)
 
 **Fixed bugs:**
 
-- Evaluate timestamps as "UTC" instead of "+00:00" for timezone [\#295](https://github.com/delta-incubator/delta-kernel-rs/pull/295)
-- Make Map arrow type field naming consistent with parquet field naming [\#299](https://github.com/delta-incubator/delta-kernel-rs/pull/299)
+- Evaluate timestamps as "UTC" instead of "+00:00" for timezone [\#295](https://github.com/delta-io/delta-kernel-rs/pull/295)
+- Make Map arrow type field naming consistent with parquet field naming [\#299](https://github.com/delta-io/delta-kernel-rs/pull/299)
 
 
-## [v0.2.0](https://github.com/delta-incubator/delta-kernel-rs/tree/v0.2.0/) (2024-07-17)
+## [v0.2.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.2.0/) (2024-07-17)
 
-[Full Changelog](https://github.com/delta-incubator/delta-kernel-rs/compare/v0.1.1...v0.2.0)
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.1.1...v0.2.0)
 
 **API Changes**
 
@@ -178,32 +178,32 @@ validation. [\#435]
 
 **Implemented enhancements:**
 
-- Handle nested structs in `schemaString` (allows reading iceberg compat tables) [\#257](https://github.com/delta-incubator/delta-kernel-rs/pull/257)
-- Expose top level stats in scans [\#227](https://github.com/delta-incubator/delta-kernel-rs/pull/227)
-- Hugely expanded C-FFI example [\#203](https://github.com/delta-incubator/delta-kernel-rs/pull/203)
-- Add `scan_builder` function to `Snapshot` [\#273](https://github.com/delta-incubator/delta-kernel-rs/pull/273)
-- Add `hdfs_native_store` support [\#273](https://github.com/delta-incubator/delta-kernel-rs/pull/274)
-- Proper reading of Parquet files, including only reading requested leaves, type casting, and reordering [\#271](https://github.com/delta-incubator/delta-kernel-rs/pull/271)
-- Allow building the package if you are behind an https proxy [\#282](https://github.com/delta-incubator/delta-kernel-rs/pull/282)
+- Handle nested structs in `schemaString` (allows reading iceberg compat tables) [\#257](https://github.com/delta-io/delta-kernel-rs/pull/257)
+- Expose top level stats in scans [\#227](https://github.com/delta-io/delta-kernel-rs/pull/227)
+- Hugely expanded C-FFI example [\#203](https://github.com/delta-io/delta-kernel-rs/pull/203)
+- Add `scan_builder` function to `Snapshot` [\#273](https://github.com/delta-io/delta-kernel-rs/pull/273)
+- Add `hdfs_native_store` support [\#273](https://github.com/delta-io/delta-kernel-rs/pull/274)
+- Proper reading of Parquet files, including only reading requested leaves, type casting, and reordering [\#271](https://github.com/delta-io/delta-kernel-rs/pull/271)
+- Allow building the package if you are behind an https proxy [\#282](https://github.com/delta-io/delta-kernel-rs/pull/282)
 
 **Fixed bugs:**
 
-- Don't error if more fields exist than expected in a struct expression [\#267](https://github.com/delta-incubator/delta-kernel-rs/pull/267)
-- Handle cases where the deletion vector length is less than the total number of rows in the chunk [\#276](https://github.com/delta-incubator/delta-kernel-rs/pull/276)
-- Fix partition map indexing if column mapping is in effect [\#278](https://github.com/delta-incubator/delta-kernel-rs/pull/278)
+- Don't error if more fields exist than expected in a struct expression [\#267](https://github.com/delta-io/delta-kernel-rs/pull/267)
+- Handle cases where the deletion vector length is less than the total number of rows in the chunk [\#276](https://github.com/delta-io/delta-kernel-rs/pull/276)
+- Fix partition map indexing if column mapping is in effect [\#278](https://github.com/delta-io/delta-kernel-rs/pull/278)
 
 
-## [v0.1.1](https://github.com/delta-incubator/delta-kernel-rs/tree/v0.1.0/) (2024-06-03)
+## [v0.1.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.1.0/) (2024-06-03)
 
-[Full Changelog](https://github.com/delta-incubator/delta-kernel-rs/compare/v0.1.0...v0.1.1)
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.1.0...v0.1.1)
 
 **Implemented enhancements:**
 
-- Support unary `NOT` and `IsNull` for data skipping [\#231](https://github.com/delta-incubator/delta-kernel-rs/pull/231)
-- Add unary visitors to c ffi [\#247](https://github.com/delta-incubator/delta-kernel-rs/pull/247)
+- Support unary `NOT` and `IsNull` for data skipping [\#231](https://github.com/delta-io/delta-kernel-rs/pull/231)
+- Add unary visitors to c ffi [\#247](https://github.com/delta-io/delta-kernel-rs/pull/247)
 - Minor other QOL improvements
 
 
-## [v0.1.0](https://github.com/delta-incubator/delta-kernel-rs/tree/v0.1.0/) (2024-06-12)
+## [v0.1.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.1.0/) (2024-06-12)
 
 Initial public release

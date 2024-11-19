@@ -30,7 +30,7 @@ impl ArrayData {
     }
 
     #[deprecated(
-        note = "These fields will be removed eventually and are unstable. See https://github.com/delta-incubator/delta-kernel-rs/issues/291"
+        note = "These fields will be removed eventually and are unstable. See https://github.com/delta-io/delta-kernel-rs/issues/291"
     )]
     pub fn array_elements(&self) -> &[Scalar] {
         &self.elements

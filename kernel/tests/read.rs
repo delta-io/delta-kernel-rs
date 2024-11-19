@@ -1033,7 +1033,7 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
     // Attempted skipping over a logically valid but physically missing column. We should be able to
     // skip the data file because the missing column is inferred to be all-null.
     //
-    // WARNING: https://github.com/delta-incubator/delta-kernel-rs/issues/434 -- currently disabled.
+    // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 -- currently disabled.
     //
     //let expected = vec![
     //    "+--------+",

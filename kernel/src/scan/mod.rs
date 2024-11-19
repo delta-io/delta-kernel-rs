@@ -793,7 +793,7 @@ mod tests {
         // Predicate over a logically valid but physically missing column. No data files should be
         // returned because the column is inferred to be all-null.
         //
-        // WARNING: https://github.com/delta-incubator/delta-kernel-rs/issues/434 - This
+        // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 - This
         // optimization is currently disabled, so the one data file is still returned.
         let predicate = Arc::new(column_expr!("missing").lt(1000i64));
         let scan = snapshot
