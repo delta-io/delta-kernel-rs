@@ -20,6 +20,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: format
         run: cargo fmt -- --check
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install minimal stable and cargo msrv
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: default
+          toolchain: stable
+          override: true
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-msrv
+        shell: bash
+        run: |
+          cargo install cargo-msrv --locked
+      - name: verify-msrv
+        run: |
+          cargo msrv --path kernel/ verify --all-features
+          cargo msrv --path derive-macros/ verify --all-features
+          cargo msrv --path ffi/ verify --all-features
+          cargo msrv --path ffi-proc-macros/ verify --all-features
   docs:
     runs-on: ubuntu-latest
     env:

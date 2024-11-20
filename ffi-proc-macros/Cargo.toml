@@ -7,6 +7,7 @@ keywords.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
+rust-version.workspace = true
 version.workspace = true
 
 [lib]
@@ -14,5 +15,5 @@ proc-macro = true
 
 [dependencies]
 proc-macro2 = "1"
-syn = { version = "2.0", features = ["extra-traits"] }
+syn = { version = "2.0", features = ["extra-traits", "full"] }
 quote = "1.0"
