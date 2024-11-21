@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::{DataVisitor, DeltaResult};
 
+use super::Cdc;
 use super::{
     deletion_vector::DeletionVectorDescriptor, Add, Format, Metadata, Protocol, Remove,
     SetTransaction,
@@ -243,6 +244,43 @@ impl DataVisitor for RemoveVisitor {
     }
 }
 
+#[derive(Default)]
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
+struct CdcVisitor {
+    pub(crate) cdcs: Vec<Cdc>,
+}
+
+impl CdcVisitor {
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
+    fn visit_cdc<'a>(
+        row_index: usize,
+        path: String,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<Cdc> {
+        Ok(Cdc {
+            path,
+            partition_values: getters[1].get(row_index, "cdc.partitionValues")?,
+            size: getters[2].get(row_index, "cdc.size")?,
+            data_change: getters[3].get(row_index, "cdc.dataChange")?,
+            tags: getters[4].get_opt(row_index, "cdc.tags")?,
+        })
+    }
+}
+
+impl DataVisitor for CdcVisitor {
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for i in 0..row_count {
+            // Since path column is required, use it to detect presence of an Add action
+            if let Some(path) = getters[0].get_opt(i, "cdc.path")? {
+                self.cdcs.push(Self::visit_cdc(i, path, getters)?);
+            }
+        }
+        Ok(())
+    }
+}
+
 pub type SetTransactionMap = HashMap<String, SetTransaction>;
 
 /// Extact application transaction actions from the log into a map
@@ -344,9 +382,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        actions::{get_log_add_schema, get_log_schema, SET_TRANSACTION_NAME},
-        engine::arrow_data::ArrowEngineData,
-        engine::sync::{json::SyncJsonHandler, SyncEngine},
+        actions::{get_log_add_schema, get_log_schema, CDC_NAME, SET_TRANSACTION_NAME},
+        engine::{
+            arrow_data::ArrowEngineData,
+            sync::{json::SyncJsonHandler, SyncEngine},
+        },
         Engine, EngineData, JsonHandler,
     };
 
@@ -365,7 +405,8 @@ mod tests {
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
             r#"{"commitInfo":{"timestamp":1677811178585,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isolationLevel":"WriteSerializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"10","numOutputBytes":"635"},"engineInfo":"Databricks-Runtime/<unknown>","txnId":"a6a94671-55ef-450e-9546-b8465b9147de"}}"#,
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
-            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
+            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none", "delta.enableChangeDataFeed":"true"},"createdTime":1677811175819}}"#,
+            r#"{"cdc":{"path":"_change_data/age=21/cdc-00000-93f7fceb-281a-446a-b221-07b88132d203.c000.snappy.parquet","partitionValues":{"age":"21"},"size":1033,"dataChange":false}}"#
         ]
         .into();
         let output_schema = get_log_schema().clone();
@@ -390,6 +431,25 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_cdc() -> DeltaResult<()> {
+        let data = action_batch();
+        let mut visitor = CdcVisitor::default();
+        data.extract(get_log_schema().project(&[CDC_NAME])?, &mut visitor)?;
+        let expected = Cdc {
+            path: "_change_data/age=21/cdc-00000-93f7fceb-281a-446a-b221-07b88132d203.c000.snappy.parquet".into(),
+            partition_values: HashMap::from([
+                ("age".to_string(), "21".to_string()),
+            ]),
+            size: 1033,
+            data_change: false,
+            tags: None
+        };
+
+        assert_eq!(&visitor.cdcs, &[expected]);
+        Ok(())
+    }
+
+    #[test]
     fn test_parse_metadata() -> DeltaResult<()> {
         let data = action_batch();
         let parsed = Metadata::try_new_from_data(data.as_ref())?.unwrap();
@@ -400,6 +460,7 @@ mod tests {
                 "true".to_string(),
             ),
             ("delta.columnMapping.mode".to_string(), "none".to_string()),
+            ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
         ]);
         let expected = Metadata {
             id: "testId".into(),
