@@ -1,6 +1,12 @@
 name: build
 
-on: [push, pull_request]
+on:
+  push:
+    paths-ignore:
+      - 'CHANGELOG.md'
+  pull_request:
+    paths-ignore:
+      - 'CHANGELOG.md'
 
 env:
   CARGO_TERM_COLOR: always
