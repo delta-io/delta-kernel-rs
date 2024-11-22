@@ -383,6 +383,7 @@ pub enum KernelError {
     FileAlreadyExists,
     MissingCommitInfo,
     UnsupportedError,
+    ChangeDataFeedUnsupported,
 }
 
 impl From<Error> for KernelError {
@@ -435,6 +436,7 @@ impl From<Error> for KernelError {
             Error::FileAlreadyExists(_) => KernelError::FileAlreadyExists,
             Error::MissingCommitInfo => KernelError::MissingCommitInfo,
             Error::Unsupported(_) => KernelError::UnsupportedError,
+            Error::ChangeDataFeedUnsupported(_) => KernelError::ChangeDataFeedUnsupported,
         }
     }
 }

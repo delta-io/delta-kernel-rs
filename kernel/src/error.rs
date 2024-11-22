@@ -7,6 +7,7 @@ use std::{
 };
 
 use crate::schema::DataType;
+use crate::Version;
 
 /// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
@@ -179,6 +180,9 @@ pub enum Error {
     /// Some functionality is currently unsupported
     #[error("Unsupported: {0}")]
     Unsupported(String),
+
+    #[error("Change data feed is unsupported for the table at version {0}")]
+    ChangeDataFeedUnsupported(Version),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -241,6 +245,9 @@ impl Error {
 
     pub fn unsupported(msg: impl ToString) -> Self {
         Self::Unsupported(msg.to_string())
+    }
+    pub fn change_data_feed_unsupported(version: impl Into<Version>) -> Self {
+        Self::ChangeDataFeedUnsupported(version.into())
     }
 
     // Capture a backtrace when the error is constructed.

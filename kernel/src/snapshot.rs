@@ -50,7 +50,7 @@ impl Snapshot {
     ///
     /// # Parameters
     ///
-    /// - `location`: url pointing at the table root (where `_delta_log` folder is located)
+    /// - `table_root`: url pointing at the table root (where `_delta_log` folder is located)
     /// - `engine`: Implementation of [`Engine`] apis.
     /// - `version`: target version of the [`Snapshot`]
     pub fn try_new(

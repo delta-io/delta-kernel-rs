@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use url::Url;
 
 use crate::snapshot::Snapshot;
+use crate::table_changes::TableChanges;
 use crate::transaction::Transaction;
 use crate::{DeltaResult, Engine, Error, Version};
 
@@ -78,6 +79,23 @@ impl Table {
     /// If no version is supplied, a snapshot for the latest version will be created.
     pub fn snapshot(&self, engine: &dyn Engine, version: Option<Version>) -> DeltaResult<Snapshot> {
         Snapshot::try_new(self.location.clone(), engine, version)
+    }
+
+    /// Create a [`TableChanges`] to get a change data feed for the table between `start_version`,
+    /// and `end_version`. If no `end_version` is supplied, the latest version will be used as the
+    /// `end_version`.
+    pub fn table_changes(
+        &self,
+        engine: &dyn Engine,
+        start_version: Version,
+        end_version: impl Into<Option<Version>>,
+    ) -> DeltaResult<TableChanges> {
+        TableChanges::try_new(
+            self.location.clone(),
+            engine,
+            start_version,
+            end_version.into(),
+        )
     }
 
     /// Create a new write transaction for this table.
