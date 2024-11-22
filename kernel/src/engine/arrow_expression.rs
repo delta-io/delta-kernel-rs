@@ -28,7 +28,10 @@ use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::prim_array_cmp;
 use crate::engine::ensure_data_types::ensure_data_types;
 use crate::error::{DeltaResult, Error};
-use crate::expressions::{BinaryOperator, Expression, Scalar, UnaryOperator, VariadicOperator};
+use crate::expressions::{
+    BinaryExpression, BinaryOperator, Expression, Scalar, UnaryExpression, UnaryOperator,
+    VariadicExpression, VariadicOperator,
+};
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField};
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
 
@@ -218,7 +221,7 @@ fn evaluate_expression(
         (Struct(_), _) => Err(Error::generic(
             "Data type is required to evaluate struct expressions",
         )),
-        (UnaryOperation { op, expr }, _) => {
+        (Unary(UnaryExpression { op, expr }), _) => {
             let arr = evaluate_expression(expr.as_ref(), batch, None)?;
             Ok(match op {
                 UnaryOperator::Not => Arc::new(not(downcast_to_bool(&arr)?)?),
@@ -226,11 +229,11 @@ fn evaluate_expression(
             })
         }
         (
-            BinaryOperation {
+            Binary(BinaryExpression {
                 op: In,
                 left,
                 right,
-            },
+            }),
             _,
         ) => match (left.as_ref(), right.as_ref()) {
             (Literal(_), Column(_)) => {
@@ -287,11 +290,11 @@ fn evaluate_expression(
             ))),
         },
         (
-            BinaryOperation {
+            Binary(BinaryExpression {
                 op: NotIn,
                 left,
                 right,
-            },
+            }),
             _,
         ) => {
             let reverse_op = Expression::binary(In, *left.clone(), *right.clone());
@@ -300,7 +303,7 @@ fn evaluate_expression(
                 .map(wrap_comparison_result)
                 .map_err(Error::generic_err)
         }
-        (BinaryOperation { op, left, right }, _) => {
+        (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
 
@@ -323,7 +326,7 @@ fn evaluate_expression(
 
             eval(&left_arr, &right_arr).map_err(Error::generic_err)
         }
-        (VariadicOperation { op, exprs }, None | Some(&DataType::BOOLEAN)) => {
+        (Variadic(VariadicExpression { op, exprs }), None | Some(&DataType::BOOLEAN)) => {
             type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
             let (reducer, default): (Operation, _) = match op {
                 VariadicOperator::And => (and_kleene, true),
@@ -340,7 +343,7 @@ fn evaluate_expression(
                     evaluate_expression(&Expression::literal(default), batch, result_type)
                 })
         }
-        (VariadicOperation { .. }, _) => {
+        (Variadic(_), _) => {
             // NOTE: Update this error message if we add support for variadic operations on other types
             Err(Error::Generic(format!(
                 "Variadic {expression:?} is expected to return boolean results, got {result_type:?}"

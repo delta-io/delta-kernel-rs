@@ -2,7 +2,7 @@
 use crate::engine::parquet_stats_skipping::{
     ParquetStatsProvider, ParquetStatsSkippingFilter as _,
 };
-use crate::expressions::{ColumnName, Expression, Scalar};
+use crate::expressions::{ColumnName, Expression, Scalar, UnaryExpression, BinaryExpression, VariadicExpression};
 use crate::schema::{DataType, PrimitiveType};
 use chrono::{DateTime, Days};
 use parquet::arrow::arrow_reader::ArrowReaderBuilder;
@@ -231,9 +231,9 @@ pub(crate) fn compute_field_indices(
             Literal(_) => {}
             Column(name) => cols.extend([name.clone()]), // returns `()`, unlike `insert`
             Struct(fields) => fields.iter().for_each(recurse),
-            UnaryOperation { expr, .. } => recurse(expr),
-            BinaryOperation { left, right, .. } => [left, right].iter().for_each(|e| recurse(e)),
-            VariadicOperation { exprs, .. } => exprs.iter().for_each(recurse),
+            Unary(UnaryExpression { expr, .. }) => recurse(expr),
+            Binary(BinaryExpression { left, right, .. }) => [left, right].iter().for_each(|e| recurse(e)),
+            Variadic(VariadicExpression { exprs, .. }) => exprs.iter().for_each(recurse),
         }
     }
 
