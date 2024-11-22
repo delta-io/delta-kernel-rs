@@ -1,16 +1,19 @@
 //! This module encapsulates the state of a scan
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
+use crate::expressions::ColumnName;
+use crate::utils::require;
 use crate::{
     actions::{
         deletion_vector::{treemap_to_bools, DeletionVectorDescriptor},
         visitors::visit_deletion_vector_at,
     },
-    engine_data::{GetData, TypedGetData},
-    schema::SchemaRef,
+    engine_data::{GetData, RowVisitor, TypedGetData as _},
+    schema::{ColumnNamesAndTypes, DataType, SchemaRef},
     table_features::ColumnMappingMode,
-    DataVisitor, DeltaResult, Engine, EngineData, Error,
+    DeltaResult, Engine, EngineData, Error,
 };
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -131,7 +134,7 @@ pub fn visit_scan_files<T>(
         selection_vector,
         context,
     };
-    data.extract(super::log_replay::SCAN_ROW_SCHEMA.clone(), &mut visitor)?;
+    visitor.visit_rows_of(data)?;
     Ok(visitor.context)
 }
 
@@ -141,9 +144,20 @@ struct ScanFileVisitor<'a, T> {
     selection_vector: &'a [bool],
     context: T,
 }
-
-impl<T> DataVisitor for ScanFileVisitor<'_, T> {
+impl<T> RowVisitor for ScanFileVisitor<'_, T> {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| SCAN_ROW_SCHEMA.leaves(None));
+        NAMES_AND_TYPES.as_ref()
+    }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 10,
+            Error::InternalError(format!(
+                "Wrong number of ScanFileVisitor getters: {}",
+                getters.len()
+            ))
+        );
         for row_index in 0..row_count {
             if !self.selection_vector[row_index] {
                 // skip skipped rows

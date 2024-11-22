@@ -7,15 +7,16 @@ use delta_kernel::actions::{
 };
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::engine_data::{GetData, TypedGetData};
+use delta_kernel::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use delta_kernel::expressions::ColumnName;
 use delta_kernel::scan::state::{DvInfo, Stats};
 use delta_kernel::scan::ScanBuilder;
-use delta_kernel::schema::{DataType, SchemaRef, StructField};
-use delta_kernel::{DataVisitor, DeltaResult, Error, Table};
+use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
+use delta_kernel::{DeltaResult, Error, Table};
 
 use std::collections::HashMap;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use clap::{Parser, Subcommand};
 
@@ -69,13 +70,8 @@ enum Action {
     Cdc(delta_kernel::actions::Cdc),
 }
 
-fn fields_in(field: &StructField) -> usize {
-    if let DataType::Struct(ref inner) = field.data_type {
-        inner.fields().map(fields_in).sum()
-    } else {
-        1
-    }
-}
+static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+    LazyLock::new(|| get_log_schema().leaves(None));
 
 struct LogVisitor {
     actions: Vec<(Action, usize)>,
@@ -84,15 +80,17 @@ struct LogVisitor {
 }
 
 impl LogVisitor {
-    fn new(log_schema: &SchemaRef) -> LogVisitor {
+    fn new() -> LogVisitor {
         // Grab the start offset for each top-level column name, then compute the end offset by
         // skipping the rest of the leaves for that column.
-        let mut start = 0;
         let mut offsets = HashMap::new();
-        for field in log_schema.fields() {
-            let end = start + fields_in(field);
-            offsets.insert(field.name.clone(), (start, end));
-            start = end;
+        let mut it = NAMES_AND_TYPES.as_ref().0.iter().enumerate().peekable();
+        while let Some((start, col)) = it.next() {
+            let mut end = start + 1;
+            while it.next_if(|(_, other)| col[0] == other[0]).is_some() {
+                end += 1;
+            }
+            offsets.insert(col[0].clone(), (start, end));
         }
         LogVisitor {
             actions: vec![],
@@ -102,7 +100,10 @@ impl LogVisitor {
     }
 }
 
-impl DataVisitor for LogVisitor {
+impl RowVisitor for LogVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        NAMES_AND_TYPES.as_ref()
+    }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         if getters.len() != 55 {
             return Err(Error::InternalError(format!(
@@ -226,9 +227,9 @@ fn try_main() -> DeltaResult<()> {
                 None,
             )?;
 
-            let mut visitor = LogVisitor::new(log_schema);
+            let mut visitor = LogVisitor::new();
             for action in actions {
-                action?.0.extract(log_schema.clone(), &mut visitor)?;
+                visitor.visit_rows_of(action?.0.as_ref())?;
             }
 
             if oldest_first {

@@ -3,7 +3,9 @@ use std::sync::{Arc, LazyLock};
 use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{get_log_schema, SetTransaction, SET_TRANSACTION_NAME};
 use crate::snapshot::Snapshot;
-use crate::{DeltaResult, Engine, EngineData, Expression as Expr, ExpressionRef, SchemaRef};
+use crate::{
+    DeltaResult, Engine, EngineData, Expression as Expr, ExpressionRef, RowVisitor as _, SchemaRef,
+};
 
 pub use crate::actions::visitors::SetTransactionMap;
 pub struct SetTransactionScanner {
@@ -27,7 +29,7 @@ impl SetTransactionScanner {
         // found. If all ids are requested then we are forced to replay the entire log.
         for maybe_data in self.replay_for_app_ids(engine, schema.clone())? {
             let (txns, _) = maybe_data?;
-            txns.extract(schema.clone(), &mut visitor)?;
+            visitor.visit_rows_of(txns.as_ref())?;
             // if a specific id is requested and a transaction was found, then return
             if application_id.is_some() && !visitor.set_transactions.is_empty() {
                 break;

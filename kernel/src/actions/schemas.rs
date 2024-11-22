@@ -2,10 +2,20 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::schema::{ArrayType, DataType, MapType, StructField};
+use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
+
+pub(crate) trait ToSchema {
+    fn to_schema() -> StructType;
+}
 
 pub(crate) trait ToDataType {
     fn to_data_type() -> DataType;
+}
+
+impl<T: ToSchema> ToDataType for T {
+    fn to_data_type() -> DataType {
+        T::to_schema().into()
+    }
 }
 
 pub(crate) trait ToNullableContainerType {

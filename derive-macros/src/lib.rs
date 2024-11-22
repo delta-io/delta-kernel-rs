@@ -25,7 +25,7 @@ pub fn parse_column_name(input: proc_macro::TokenStream) -> proc_macro::TokenStr
     err.into_compile_error().into()
 }
 
-/// Derive a `delta_kernel::schemas::ToDataType` implementation for the annotated struct. The actual
+/// Derive a `delta_kernel::schemas::ToSchema` implementation for the annotated struct. The actual
 /// field names in the schema (and therefore of the struct members) are all mandated by the Delta
 /// spec, and so the user of this macro is responsible for ensuring that
 /// e.g. `Metadata::schema_string` is the snake_case-ified version of `schemaString` from [Delta's
@@ -45,10 +45,10 @@ pub fn derive_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream 
     let schema_fields = gen_schema_fields(&input.data);
     let output = quote! {
         #[automatically_derived]
-        impl crate::actions::schemas::ToDataType for #struct_ident {
-            fn to_data_type() -> crate::schema::DataType {
+        impl crate::actions::schemas::ToSchema for #struct_ident {
+            fn to_schema() -> crate::schema::StructType {
                 use crate::actions::schemas::{ToDataType, GetStructField, GetNullableContainerStructField};
-                crate::schema::DataType::struct_type([
+                crate::schema::StructType::new([
                     #schema_fields
                 ])
             }

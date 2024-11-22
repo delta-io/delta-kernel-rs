@@ -6,12 +6,27 @@ use tracing::debug;
 
 use super::data_skipping::DataSkippingFilter;
 use super::ScanData;
-use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME};
-use crate::actions::{visitors::AddVisitor, visitors::RemoveVisitor, Add, Remove};
-use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{column_expr, Expression, ExpressionRef};
-use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType};
-use crate::{DataVisitor, DeltaResult, Engine, EngineData, ExpressionHandler};
+use crate::actions::visitors::{AddVisitor, RemoveVisitor};
+use crate::actions::{get_log_schema, Add, Remove, ADD_NAME};
+use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::expressions::{column_expr, ColumnName, Expression, ExpressionRef};
+use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
+use crate::utils::require;
+use crate::{DeltaResult, Engine, EngineData, Error, ExpressionHandler};
+
+/// The subset of file action fields that uniquely identifies it in the log, used for deduplication
+/// of adds and removes during log replay.
+#[derive(Debug, Hash, Eq, PartialEq)]
+struct FileActionKey {
+    path: String,
+    dv_unique_id: Option<String>,
+}
+impl FileActionKey {
+    fn new(path: impl Into<String>, dv_unique_id: Option<String>) -> Self {
+        let path = path.into();
+        Self { path, dv_unique_id }
+    }
+}
 
 struct LogReplayScanner {
     filter: Option<DataSkippingFilter>,
@@ -19,7 +34,7 @@ struct LogReplayScanner {
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
-    seen: HashSet<(String, Option<String>)>,
+    seen: HashSet<FileActionKey>,
 }
 
 #[derive(Default)]
@@ -43,8 +58,34 @@ impl AddRemoveVisitor {
     }
 }
 
-impl DataVisitor for AddRemoveVisitor {
+impl RowVisitor for AddRemoveVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        // NOTE: The visitor assumes adds always come first, with removes optionally afterward
+        static ALL_NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            let (add_names, add_fields) = AddVisitor::names_and_types();
+            let (remove_names, remove_fields) = RemoveVisitor::names_and_types();
+            let names = add_names.iter().chain(remove_names).cloned().collect();
+            let fields = add_fields.iter().chain(remove_fields).cloned().collect();
+            (names, fields).into()
+        });
+        if self.is_log_batch {
+            ALL_NAMES_AND_TYPES.as_ref()
+        } else {
+            // All checkpoint actions are already reconciled and Remove actions in checkpoint files
+            // only serve as tombstones for vacuum jobs. So no need to load them here.
+            AddVisitor::names_and_types()
+        }
+    }
+
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        let expected_getters = if self.is_log_batch { 29 } else { 15 };
+        require!(
+            getters.len() == expected_getters,
+            Error::InternalError(format!(
+                "Wrong number of AddRemoveVisitor getters: {}",
+                getters.len()
+            ))
+        );
         for i in 0..row_count {
             // Add will have a path at index 0 if it is valid
             if let Some(path) = getters[0].get_opt(i, "add.path")? {
@@ -108,6 +149,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
         ),
     ]))
 });
+
 static SCAN_ROW_DATATYPE: LazyLock<DataType> = LazyLock::new(|| SCAN_ROW_SCHEMA.clone().into());
 
 impl LogReplayScanner {
@@ -162,7 +204,8 @@ impl LogReplayScanner {
             // Note: each (add.path + add.dv_unique_id()) pair has a
             // unique Add + Remove pair in the log. For example:
             // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
-            if !self.seen.contains(&(add.path.clone(), add.dv_unique_id())) {
+            let key = FileActionKey::new(&add.path, add.dv_unique_id());
+            if !self.seen.contains(&key) {
                 debug!(
                     "Including file in scan: ({}, {:?}), is log {is_log_batch}",
                     add.path,
@@ -173,7 +216,7 @@ impl LogReplayScanner {
                     // as we process batches from older commit and/or checkpoint files. We
                     // don't need to track checkpoint batches because they are already the
                     // oldest actions and can never replace anything.
-                    self.seen.insert((add.path.clone(), add.dv_unique_id()));
+                    self.seen.insert(key);
                 }
                 selection_vector[index] = true;
             } else {
@@ -203,22 +246,12 @@ impl LogReplayScanner {
         actions: &dyn EngineData,
         is_log_batch: bool,
     ) -> DeltaResult<Vec<(Add, usize)>> {
-        let schema_to_use = if is_log_batch {
-            // NB: We _must_ pass these in the order `ADD_NAME, REMOVE_NAME` as the visitor assumes
-            // the Add action comes first. The [`project`] method honors this order, so this works
-            // as long as we keep this order here.
-            get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?
-        } else {
-            // All checkpoint actions are already reconciled and Remove actions in checkpoint files
-            // only serve as tombstones for vacuum jobs. So no need to load them here.
-            get_log_schema().project(&[ADD_NAME])?
-        };
         let mut visitor = AddRemoveVisitor::new(selection_vector, is_log_batch);
-        actions.extract(schema_to_use, &mut visitor)?;
+        visitor.visit_rows_of(actions)?;
 
         for remove in visitor.removes.into_iter() {
             let dv_id = remove.dv_unique_id();
-            self.seen.insert((remove.path, dv_id));
+            self.seen.insert(FileActionKey::new(remove.path, dv_id));
         }
 
         Ok(visitor.adds)
