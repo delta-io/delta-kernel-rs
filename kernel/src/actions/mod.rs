@@ -30,12 +30,19 @@ pub mod visitors;
 #[cfg(not(feature = "developer-visibility"))]
 pub(crate) mod visitors;
 
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) const ADD_NAME: &str = "add";
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) const REMOVE_NAME: &str = "remove";
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) const METADATA_NAME: &str = "metaData";
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) const PROTOCOL_NAME: &str = "protocol";
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) const SET_TRANSACTION_NAME: &str = "txn";
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) const COMMIT_INFO_NAME: &str = "commitInfo";
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) const CDC_NAME: &str = "cdc";
 
 static LOG_ADD_SCHEMA: LazyLock<SchemaRef> =
