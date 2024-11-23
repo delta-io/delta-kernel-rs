@@ -1,6 +1,7 @@
 //! Provides an API to read the table's change data feed between two versions.
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
+use scan::TableChangesScanBuilder;
 use url::Url;
 
 use crate::log_segment::LogSegment;
@@ -9,6 +10,8 @@ use crate::schema::{DataType, Schema, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Engine, Error, Version};
+
+pub mod scan;
 
 static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
     [
@@ -19,7 +22,7 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 });
 
 /// Represents a call to read the Change Data Feed (CDF) between two versions of a table. The schema of
-/// `TableChanges` will be the schema of the table at the end verios with three additional columns:
+/// `TableChanges` will be the schema of the table at the end version with three additional columns:
 /// - `_change_type`: String representing the type of change that for that commit. This may be one
 ///   of `delete`, `insert`, `update_preimage`, or `update_postimage`.
 /// - `_commit_version`: Long representing the commit the change occurred in.
@@ -109,7 +112,6 @@ impl TableChanges {
         // compatibility for each schema update in the CDF range.
         // Note: Schema compatibility check will be changed in the future to be more flexible.
         // See issue [#523](https://github.com/delta-io/delta-kernel-rs/issues/523)
-
         if start_snapshot.schema() != end_snapshot.schema() {
             return Err(Error::generic(format!(
                 "Failed to build TableChanges: Start and end version schemas are different. Found start version schema {:?} and end version schema {:?}", start_snapshot.schema(), end_snapshot.schema(),
@@ -168,6 +170,16 @@ impl TableChanges {
     #[allow(unused)]
     pub(crate) fn column_mapping_mode(&self) -> &ColumnMappingMode {
         &self.end_snapshot.column_mapping_mode
+    }
+
+    /// Create a [`TableChangesScanBuilder`] for an `Arc<TableChanges>`.
+    pub fn scan_builder(self: Arc<Self>) -> TableChangesScanBuilder {
+        TableChangesScanBuilder::new(self)
+    }
+
+    /// Consume this `TableChanges` to create a [`TableChangesScanBuilder`]
+    pub fn into_scan_builder(self) -> TableChangesScanBuilder {
+        TableChangesScanBuilder::new(self)
     }
 }
 
