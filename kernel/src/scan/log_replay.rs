@@ -154,13 +154,9 @@ static SCAN_ROW_DATATYPE: LazyLock<DataType> = LazyLock::new(|| SCAN_ROW_SCHEMA.
 
 impl LogReplayScanner {
     /// Create a new [`LogReplayScanner`] instance
-    fn new(
-        engine: &dyn Engine,
-        table_schema: &SchemaRef,
-        predicate: Option<ExpressionRef>,
-    ) -> Self {
+    fn new(engine: &dyn Engine, physical_predicate: Option<(ExpressionRef, SchemaRef)>) -> Self {
         Self {
-            filter: DataSkippingFilter::new(engine, table_schema, predicate),
+            filter: DataSkippingFilter::new(engine, physical_predicate),
             seen: Default::default(),
         }
     }
@@ -265,10 +261,9 @@ impl LogReplayScanner {
 pub fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
-    table_schema: &SchemaRef,
-    predicate: Option<ExpressionRef>,
+    physical_predicate: Option<(ExpressionRef, SchemaRef)>,
 ) -> impl Iterator<Item = DeltaResult<ScanData>> {
-    let mut log_scanner = LogReplayScanner::new(engine, table_schema, predicate);
+    let mut log_scanner = LogReplayScanner::new(engine, physical_predicate);
     let expression_handler = engine.get_expression_handler();
     action_iter
         .map(move |action_res| {

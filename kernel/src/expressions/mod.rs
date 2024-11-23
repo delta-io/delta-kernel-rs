@@ -1,5 +1,6 @@
 //! Definitions and functions to create and manipulate kernel expressions
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 
@@ -110,6 +111,50 @@ pub enum UnaryOperator {
 
 pub type ExpressionRef = std::sync::Arc<Expression>;
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnaryExpression {
+    /// The operator.
+    pub op: UnaryOperator,
+    /// The expression.
+    pub expr: Box<Expression>,
+}
+impl UnaryExpression {
+    fn new(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
+        let expr = Box::new(expr.into());
+        Self { op, expr }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BinaryExpression {
+    /// The operator.
+    pub op: BinaryOperator,
+    /// The left-hand side of the operation.
+    pub left: Box<Expression>,
+    /// The right-hand side of the operation.
+    pub right: Box<Expression>,
+}
+impl BinaryExpression {
+    fn new(op: BinaryOperator, left: impl Into<Expression>, right: impl Into<Expression>) -> Self {
+        let left = Box::new(left.into());
+        let right = Box::new(right.into());
+        Self { op, left, right }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VariadicExpression {
+    /// The operator.
+    pub op: VariadicOperator,
+    /// The expressions.
+    pub exprs: Vec<Expression>,
+}
+impl VariadicExpression {
+    fn new(op: VariadicOperator, exprs: Vec<Expression>) -> Self {
+        Self { op, exprs }
+    }
+}
+
 /// A SQL expression.
 ///
 /// These expressions do not track or validate data types, other than the type
@@ -124,27 +169,11 @@ pub enum Expression {
     /// A struct computed from a Vec of expressions
     Struct(Vec<Expression>),
     /// A unary operation.
-    UnaryOperation {
-        /// The operator.
-        op: UnaryOperator,
-        /// The expression.
-        expr: Box<Expression>,
-    },
+    Unary(UnaryExpression),
     /// A binary operation.
-    BinaryOperation {
-        /// The operator.
-        op: BinaryOperator,
-        /// The left-hand side of the operation.
-        left: Box<Expression>,
-        /// The right-hand side of the operation.
-        right: Box<Expression>,
-    },
-    VariadicOperation {
-        /// The operator.
-        op: VariadicOperator,
-        /// The expressions.
-        exprs: Vec<Expression>,
-    },
+    Binary(BinaryExpression),
+    /// A variadic operation.
+    Variadic(VariadicExpression),
     // TODO: support more expressions, such as IS IN, LIKE, etc.
 }
 
@@ -170,17 +199,17 @@ impl Display for Expression {
                 "Struct({})",
                 &exprs.iter().map(|e| format!("{e}")).join(", ")
             ),
-            Self::BinaryOperation {
+            Self::Binary(BinaryExpression {
                 op: BinaryOperator::Distinct,
                 left,
                 right,
-            } => write!(f, "DISTINCT({left}, {right})"),
-            Self::BinaryOperation { op, left, right } => write!(f, "{left} {op} {right}"),
-            Self::UnaryOperation { op, expr } => match op {
+            }) => write!(f, "DISTINCT({left}, {right})"),
+            Self::Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
+            Self::Unary(UnaryExpression { op, expr }) => match op {
                 UnaryOperator::Not => write!(f, "NOT {expr}"),
                 UnaryOperator::IsNull => write!(f, "{expr} IS NULL"),
             },
-            Self::VariadicOperation { op, exprs } => {
+            Self::Variadic(VariadicExpression { op, exprs }) => {
                 let exprs = &exprs.iter().map(|e| format!("{e}")).join(", ");
                 let op = match op {
                     VariadicOperator::And => "AND",
@@ -230,10 +259,10 @@ impl Expression {
 
     /// Creates a new unary expression OP expr
     pub fn unary(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
-        Self::UnaryOperation {
+        Self::Unary(UnaryExpression {
             op,
             expr: Box::new(expr.into()),
-        }
+        })
     }
 
     /// Creates a new binary expression lhs OP rhs
@@ -242,17 +271,17 @@ impl Expression {
         lhs: impl Into<Expression>,
         rhs: impl Into<Expression>,
     ) -> Self {
-        Self::BinaryOperation {
+        Self::Binary(BinaryExpression {
             op,
             left: Box::new(lhs.into()),
             right: Box::new(rhs.into()),
-        }
+        })
     }
 
     /// Creates a new variadic expression OP(exprs...)
     pub fn variadic(op: VariadicOperator, exprs: impl IntoIterator<Item = Self>) -> Self {
         let exprs = exprs.into_iter().collect::<Vec<_>>();
-        Self::VariadicOperation { op, exprs }
+        Self::Variadic(VariadicExpression { op, exprs })
     }
 
     /// Creates a new expression AND(exprs...)
@@ -339,15 +368,188 @@ impl Expression {
                 Literal(_) => {}
                 Column { .. } => {}
                 Struct(exprs) => stack.extend(exprs),
-                UnaryOperation { expr, .. } => stack.push(expr),
-                BinaryOperation { left, right, .. } => {
+                Unary(UnaryExpression { expr, .. }) => stack.push(expr),
+                Binary(BinaryExpression { left, right, .. }) => {
                     stack.push(left);
                     stack.push(right);
                 }
-                VariadicOperation { exprs, .. } => stack.extend(exprs),
+                Variadic(VariadicExpression { exprs, .. }) => stack.extend(exprs),
             }
             Some(expr)
         })
+    }
+}
+
+/// Generic framework for recursive bottom-up expression transforms. Transformations return
+/// `Option<Cow>` with the following semantics:
+///
+/// * `Some(Cow::Owned)` -- The input was transformed and the parent should be updated with it.
+/// * `Some(Cow::Borrowed)` -- The input was not transformed.
+/// * `None` -- The input was filtered out and the parent should be updated to not reference it.
+///
+/// The transform can start from the generic [`Self::transform`], or directly from a specific
+/// expression variant (e.g. [`Self::transform_binary`] to start with [`BinaryExpression`]).
+///
+/// The provided `transform_xxx` methods all default to no-op (returning their input as
+/// `Some(Cow::Borrowed)`), and implementations should selectively override specific `transform_xxx`
+/// methods as needed for the task at hand.
+///
+/// The provided `recurse_into_xxx` methods encapsulate the boilerplate work of recursing into the
+/// children of each expression variant. Implementations can call these as needed but will generally
+/// not need to override them.
+pub trait ExpressionTransform<'a> {
+    /// Called for each literal encountered during the expression traversal.
+    fn transform_literal(&mut self, value: &'a Scalar) -> Option<Cow<'a, Scalar>> {
+        Some(Cow::Borrowed(value))
+    }
+
+    /// Called for each column reference encountered during the expression traversal.
+    fn transform_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+        Some(Cow::Borrowed(name))
+    }
+
+    /// Called for the expression list of each [`Expression::Struct`] encountered during the
+    /// traversal. Implementations can call [`Self::recurse_into_struct`] if they wish to
+    /// recursively transform child expressions.
+    fn transform_struct(
+        &mut self,
+        fields: &'a Vec<Expression>,
+    ) -> Option<Cow<'a, Vec<Expression>>> {
+        self.recurse_into_struct(fields)
+    }
+
+    /// Called for each [`UnaryExpression`] encountered during the traversal. Implementations can
+    /// call [`Self::recurse_into_unary`] if they wish to recursively transform the child.
+    fn transform_unary(&mut self, expr: &'a UnaryExpression) -> Option<Cow<'a, UnaryExpression>> {
+        self.recurse_into_unary(expr)
+    }
+
+    /// Called for each [`BinaryExpression`] encountered during the traversal. Implementations can
+    /// call [`Self::recurse_into_binary`] if they wish to recursively transform the children.
+    fn transform_binary(
+        &mut self,
+        expr: &'a BinaryExpression,
+    ) -> Option<Cow<'a, BinaryExpression>> {
+        self.recurse_into_binary(expr)
+    }
+
+    /// Called for each [`VariadicExpression`] encountered during the traversal. Implementations can
+    /// call [`Self::recurse_into_variadic`] if they wish to recursively transform the children.
+    fn transform_variadic(
+        &mut self,
+        expr: &'a VariadicExpression,
+    ) -> Option<Cow<'a, VariadicExpression>> {
+        self.recurse_into_variadic(expr)
+    }
+
+    /// General entry point for transforming an expression. This method will dispatch to the
+    /// specific transform for each expression variant. Also invoked internally in order to recurse
+    /// on the child(ren) of non-leaf variants.
+    fn transform(&mut self, expr: &'a Expression) -> Option<Cow<'a, Expression>> {
+        use Cow::*;
+        let expr = match expr {
+            Expression::Literal(s) => match self.transform_literal(s)? {
+                Owned(s) => Owned(Expression::Literal(s)),
+                Borrowed(_) => Borrowed(expr),
+            },
+            Expression::Column(c) => match self.transform_column(c)? {
+                Owned(c) => Owned(Expression::Column(c)),
+                Borrowed(_) => Borrowed(expr),
+            },
+            Expression::Struct(s) => match self.transform_struct(s)? {
+                Owned(s) => Owned(Expression::Struct(s)),
+                Borrowed(_) => Borrowed(expr),
+            },
+            Expression::Unary(u) => match self.transform_unary(u)? {
+                Owned(u) => Owned(Expression::Unary(u)),
+                Borrowed(_) => Borrowed(expr),
+            },
+            Expression::Binary(b) => match self.transform_binary(b)? {
+                Owned(b) => Owned(Expression::Binary(b)),
+                Borrowed(_) => Borrowed(expr),
+            },
+            Expression::Variadic(v) => match self.transform_variadic(v)? {
+                Owned(v) => Owned(Expression::Variadic(v)),
+                Borrowed(_) => Borrowed(expr),
+            },
+        };
+        Some(expr)
+    }
+
+    /// Recursively transforms a struct's child expressions. Returns `None` if all children were
+    /// removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
+    /// `Some(Cow::Borrowed)` otherwise.
+    fn recurse_into_struct(
+        &mut self,
+        fields: &'a Vec<Expression>,
+    ) -> Option<Cow<'a, Vec<Expression>>> {
+        let mut num_borrowed = 0;
+        let new_fields: Vec<_> = fields
+            .iter()
+            .filter_map(|f| self.transform(f))
+            .inspect(|f| {
+                if matches!(f, Cow::Borrowed(_)) {
+                    num_borrowed += 1;
+                }
+            })
+            .collect();
+
+        if new_fields.is_empty() {
+            None // all fields filtered out
+        } else if num_borrowed < fields.len() {
+            // At least one field was changed or filtered out, so make a new field list
+            let fields = new_fields.into_iter().map(|f| f.into_owned()).collect();
+            Some(Cow::Owned(fields))
+        } else {
+            Some(Cow::Borrowed(fields))
+        }
+    }
+
+    /// Recursively transforms a unary expression's child. Returns `None` if the child was removed,
+    /// `Some(Cow::Owned)` if the child was changed, and `Some(Cow::Borrowed)` otherwise.
+    fn recurse_into_unary(&mut self, u: &'a UnaryExpression) -> Option<Cow<'a, UnaryExpression>> {
+        use Cow::*;
+        let u = match self.transform(&u.expr)? {
+            Owned(expr) => Owned(UnaryExpression::new(u.op, expr)),
+            Borrowed(_) => Borrowed(u),
+        };
+        Some(u)
+    }
+
+    /// Recursively transforms a binary expression's children. Returns `None` if at least one child
+    /// was removed, `Some(Cow::Owned)` if at least one child changed, and `Some(Cow::Borrowed)`
+    /// otherwise.
+    fn recurse_into_binary(
+        &mut self,
+        b: &'a BinaryExpression,
+    ) -> Option<Cow<'a, BinaryExpression>> {
+        use Cow::*;
+        let left = self.transform(&b.left)?;
+        let right = self.transform(&b.right)?;
+        let b = match (&left, &right) {
+            (Borrowed(_), Borrowed(_)) => Borrowed(b),
+            _ => Owned(BinaryExpression::new(
+                b.op,
+                left.into_owned(),
+                right.into_owned(),
+            )),
+        };
+        Some(b)
+    }
+
+    /// Recursively transforms a variadic expression's children. Returns `None` if all children were
+    /// removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
+    /// `Some(Cow::Borrowed)` otherwise.
+    fn recurse_into_variadic(
+        &mut self,
+        v: &'a VariadicExpression,
+    ) -> Option<Cow<'a, VariadicExpression>> {
+        use Cow::*;
+        let v = match self.recurse_into_struct(&v.exprs)? {
+            Owned(exprs) => Owned(VariadicExpression::new(v.op, exprs)),
+            Borrowed(_) => Borrowed(v),
+        };
+        Some(v)
     }
 }
 

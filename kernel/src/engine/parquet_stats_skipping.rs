@@ -1,6 +1,6 @@
 //! An implementation of data skipping that leverages parquet stats from the file footer.
 use crate::expressions::{
-    BinaryOperator, ColumnName, Expression as Expr, Scalar, UnaryOperator, VariadicOperator,
+    BinaryOperator, ColumnName, Expression as Expr, Scalar, UnaryOperator, VariadicOperator, VariadicExpression, BinaryExpression,
 };
 use crate::predicates::{
     DataSkippingPredicateEvaluator, PredicateEvaluator, PredicateEvaluatorDefaults,
@@ -17,15 +17,15 @@ mod tests;
 pub(crate) trait ParquetStatsProvider {
     /// The min-value stat for this column, if the column exists in this file, has the expected
     /// type, and the parquet footer provides stats for it.
-    fn get_parquet_min_stat(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar>;
+    fn get_parquet_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar>;
 
     /// The max-value stat for this column, if the column exists in this file, has the expected
     /// type, and the parquet footer provides stats for it.
-    fn get_parquet_max_stat(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar>;
+    fn get_parquet_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar>;
 
     /// The nullcount stat for this column, if the column exists in this file, has the expected
     /// type, and the parquet footer provides stats for it.
-    fn get_parquet_nullcount_stat(&self, _col: &ColumnName) -> Option<i64>;
+    fn get_parquet_nullcount_stat(&self, col: &ColumnName) -> Option<i64>;
 
     /// The rowcount stat for this row group. It is always available in the parquet footer.
     fn get_parquet_rowcount_stat(&self) -> i64;
@@ -155,9 +155,9 @@ pub(crate) trait ParquetStatsSkippingFilter {
 
 impl<T: DataSkippingPredicateEvaluator<Output = bool>> ParquetStatsSkippingFilter for T {
     fn eval_sql_where(&self, filter: &Expr) -> Option<bool> {
-        use Expr::{BinaryOperation, VariadicOperation};
+        use Expr::{Binary, Variadic};
         match filter {
-            VariadicOperation { op: VariadicOperator::And, exprs } => {
+            Variadic(VariadicExpression { op: VariadicOperator::And, exprs }) => {
                 let exprs: Vec<_> = exprs
                     .iter()
                     .map(|expr| self.eval_sql_where(expr))
@@ -168,7 +168,7 @@ impl<T: DataSkippingPredicateEvaluator<Output = bool>> ParquetStatsSkippingFilte
                     .collect();
                 self.eval_variadic(VariadicOperator::And, &exprs, false)
             }
-            BinaryOperation { op, left, right } => self.eval_binary_nullsafe(*op, left, right),
+            Binary(BinaryExpression { op, left, right }) => self.eval_binary_nullsafe(*op, left, right),
             _ => self.eval_expr(filter, false),
         }
     }

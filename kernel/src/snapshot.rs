@@ -11,7 +11,7 @@ use crate::actions::{Metadata, Protocol};
 use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
 use crate::schema::Schema;
-use crate::table_features::{ColumnMappingMode, COLUMN_MAPPING_MODE_KEY};
+use crate::table_features::{get_validated_column_mapping_schema, ColumnMappingMode};
 use crate::{DeltaResult, Engine, Error, FileSystemClient, Version};
 
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
@@ -81,11 +81,9 @@ impl Snapshot {
         // important! before a read/write to the table we must check it is supported
         protocol.ensure_read_supported()?;
 
-        let schema = metadata.schema()?;
-        let column_mapping_mode = match metadata.configuration.get(COLUMN_MAPPING_MODE_KEY) {
-            Some(mode) if protocol.min_reader_version() >= 2 => mode.as_str().try_into(),
-            _ => Ok(ColumnMappingMode::None),
-        }?;
+        // validate column mapping mode as well -- make sure all fields are correctly (un)annotated
+        let (schema, column_mapping_mode) =
+            get_validated_column_mapping_schema(&metadata, &protocol)?;
         Ok(Self {
             table_root: location,
             log_segment,

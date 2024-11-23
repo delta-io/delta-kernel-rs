@@ -1,5 +1,6 @@
 use crate::expressions::{
-    BinaryOperator, ColumnName, Expression as Expr, Scalar, UnaryOperator, VariadicOperator,
+    BinaryExpression, BinaryOperator, ColumnName, Expression as Expr, Scalar, UnaryExpression,
+    UnaryOperator, VariadicExpression, VariadicOperator,
 };
 use crate::schema::DataType;
 
@@ -219,9 +220,11 @@ pub(crate) trait PredicateEvaluator {
             Literal(val) => self.eval_scalar(val, inverted),
             Column(col) => self.eval_column(col, inverted),
             Struct(_) => None, // not supported
-            UnaryOperation { op, expr } => self.eval_unary(*op, expr, inverted),
-            BinaryOperation { op, left, right } => self.eval_binary(*op, left, right, inverted),
-            VariadicOperation { op, exprs } => self.eval_variadic(*op, exprs, inverted),
+            Unary(UnaryExpression { op, expr }) => self.eval_unary(*op, expr, inverted),
+            Binary(BinaryExpression { op, left, right }) => {
+                self.eval_binary(*op, left, right, inverted)
+            }
+            Variadic(VariadicExpression { op, exprs }) => self.eval_variadic(*op, exprs, inverted),
         }
     }
 }

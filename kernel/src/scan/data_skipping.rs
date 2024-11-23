@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use tracing::debug;
@@ -57,8 +56,7 @@ impl DataSkippingFilter {
     /// but using an Option lets the engine easily avoid the overhead of applying trivial filters.
     pub(crate) fn new(
         engine: &dyn Engine,
-        table_schema: &SchemaRef,
-        predicate: Option<ExpressionRef>,
+        physical_predicate: Option<(ExpressionRef, SchemaRef)>,
     ) -> Option<Self> {
         static PREDICATE_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
             DataType::struct_type([StructField::new("predicate", DataType::BOOLEAN, true)])
@@ -67,43 +65,27 @@ impl DataSkippingFilter {
         static FILTER_EXPR: LazyLock<Expr> =
             LazyLock::new(|| column_expr!("predicate").distinct(false));
 
-        let predicate = predicate.as_deref()?;
-        debug!("Creating a data skipping filter for {}", &predicate);
-        let field_names: HashSet<_> = predicate.references();
-
-        // Build the stats read schema by extracting the column names referenced by the predicate,
-        // extracting the corresponding field from the table schema, and inserting that field.
-        //
-        // TODO: Support nested column names!
-        let data_fields: Vec<_> = table_schema
-            .fields()
-            .filter(|field| field_names.contains([field.name.clone()].as_slice()))
-            .cloned()
-            .collect();
-        if data_fields.is_empty() {
-            // The predicate didn't reference any eligible stats columns, so skip it.
-            return None;
-        }
-        let minmax_schema = StructType::new(data_fields);
+        let (predicate, referenced_schema) = physical_predicate?;
+        debug!("Creating a data skipping filter for {:#?}", predicate);
 
         // Convert a min/max stats schema into a nullcount schema (all leaf fields are LONG)
         struct NullCountStatsTransform;
-        impl SchemaTransform for NullCountStatsTransform {
-            fn transform_primitive<'a>(
+        impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
+            fn transform_primitive(
                 &mut self,
-                _ptype: Cow<'a, PrimitiveType>,
+                _ptype: &'a PrimitiveType,
             ) -> Option<Cow<'a, PrimitiveType>> {
                 Some(Cow::Owned(PrimitiveType::Long))
             }
         }
         let nullcount_schema = NullCountStatsTransform
-            .transform_struct(Cow::Borrowed(&minmax_schema))?
+            .transform_struct(&referenced_schema)?
             .into_owned();
         let stats_schema = Arc::new(StructType::new([
             StructField::new("numRecords", DataType::LONG, true),
             StructField::new("nullCount", nullcount_schema, true),
-            StructField::new("minValues", minmax_schema.clone(), true),
-            StructField::new("maxValues", minmax_schema, true),
+            StructField::new("minValues", referenced_schema.clone(), true),
+            StructField::new("maxValues", referenced_schema, true),
         ]));
 
         // Skipping happens in several steps:
@@ -124,9 +106,10 @@ impl DataSkippingFilter {
             DataType::STRING,
         );
 
+        let predicate = as_data_skipping_predicate(&predicate, false)?;
         let skipping_evaluator = engine.get_expression_handler().get_evaluator(
             stats_schema.clone(),
-            Expr::struct_from([as_data_skipping_predicate(predicate, false)?]),
+            Expr::struct_from([predicate]),
             PREDICATE_SCHEMA.clone(),
         );
 

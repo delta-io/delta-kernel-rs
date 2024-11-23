@@ -417,7 +417,7 @@ fn read_with_scan_data(
             .read_parquet_files(
                 &[meta],
                 global_state.read_schema.clone(),
-                scan.predicate().clone(),
+                scan.physical_predicate().clone(),
             )
             .unwrap();
 
@@ -484,6 +484,7 @@ fn read_table_data(
                 .map(|col| table_schema.field(col).cloned().unwrap());
             Arc::new(Schema::new(selected_fields))
         });
+        println!("Read {url:?} with schema {read_schema:#?} and predicate {predicate:#?}");
         let scan = snapshot
             .into_scan_builder()
             .with_schema_opt(read_schema)
@@ -852,6 +853,10 @@ fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (Expression::literal(false), table_for_numbers(vec![])),
         (
+            Expression::and(column_expr!("number"), false),
+            table_for_numbers(vec![]),
+        ),
+        (
             Expression::literal(true),
             table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
         ),
@@ -1041,17 +1046,17 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
     //    "+--------+",
     //    "+--------+",
     //];
-    let columns = &["chrono"];
+    let columns = &["chrono", "missing"];
     let expected = vec![
-        "+-------------------------------------------------------------------------------------------+",
-        "| chrono                                                                                    |",
-        "+-------------------------------------------------------------------------------------------+",
-        "| {date32: 1971-01-01, timestamp: 1970-02-01T08:00:00Z, timestamp_ntz: 1970-01-02T00:00:00} |",
-        "| {date32: 1971-01-02, timestamp: 1970-02-01T09:00:00Z, timestamp_ntz: 1970-01-02T00:01:00} |",
-        "| {date32: 1971-01-03, timestamp: 1970-02-01T10:00:00Z, timestamp_ntz: 1970-01-02T00:02:00} |",
-        "| {date32: 1971-01-04, timestamp: 1970-02-01T11:00:00Z, timestamp_ntz: 1970-01-02T00:03:00} |",
-        "| {date32: 1971-01-05, timestamp: 1970-02-01T12:00:00Z, timestamp_ntz: 1970-01-02T00:04:00} |",
-        "+-------------------------------------------------------------------------------------------+",
+        "+-------------------------------------------------------------------------------------------+---------+",
+        "| chrono                                                                                    | missing |",
+        "+-------------------------------------------------------------------------------------------+---------+",
+        "| {date32: 1971-01-01, timestamp: 1970-02-01T08:00:00Z, timestamp_ntz: 1970-01-02T00:00:00} |         |",
+        "| {date32: 1971-01-02, timestamp: 1970-02-01T09:00:00Z, timestamp_ntz: 1970-01-02T00:01:00} |         |",
+        "| {date32: 1971-01-03, timestamp: 1970-02-01T10:00:00Z, timestamp_ntz: 1970-01-02T00:02:00} |         |",
+        "| {date32: 1971-01-04, timestamp: 1970-02-01T11:00:00Z, timestamp_ntz: 1970-01-02T00:03:00} |         |",
+        "| {date32: 1971-01-05, timestamp: 1970-02-01T12:00:00Z, timestamp_ntz: 1970-01-02T00:04:00} |         |",
+        "+-------------------------------------------------------------------------------------------+---------+",
     ];
     let predicate = column_expr!("missing").lt(10i64);
     read_table_data_str(
@@ -1080,6 +1085,7 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
         Some(columns),
         Some(predicate),
         expected,
-    )?;
+    )
+    .expect_err("unknown column");
     Ok(())
 }
