@@ -61,7 +61,8 @@ pub fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
-static SKIPPED_TESTS: &[&str; 0] = &[];
+// TODO(zach): skip iceberg_compat_v1 test until DAT is fixed
+static SKIPPED_TESTS: &[&str; 1] = &["iceberg_compat_v1"];
 
 // Ensure that two schema have the same field names, and dict_id/ordering.
 // We ignore:

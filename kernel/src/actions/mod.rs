@@ -14,6 +14,7 @@ use crate::schema::{SchemaRef, StructType};
 use crate::table_features::{
     ReaderFeatures, WriterFeatures, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
 };
+use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, EngineData, Error, RowVisitor as _};
 use visitors::{MetadataVisitor, ProtocolVisitor};
@@ -116,7 +117,7 @@ pub struct Metadata {
     pub partition_columns: Vec<String>,
     /// The time when this metadata action is created, in milliseconds since the Unix epoch
     pub created_time: Option<i64>,
-    /// Configuration options for the metadata action
+    /// Configuration options for the metadata action. These are parsed into [`TableProperties`].
     pub configuration: HashMap<String, String>,
 }
 
@@ -129,6 +130,13 @@ impl Metadata {
 
     pub fn schema(&self) -> DeltaResult<StructType> {
         Ok(serde_json::from_str(&self.schema_string)?)
+    }
+
+    /// Parse the metadata configuration HashMap<String, String> into a TableProperties struct.
+    /// Note that parsing is infallible -- any items that fail to parse are simply propagated
+    /// through to the `TableProperties.unknown_properties` field.
+    pub fn parse_table_properties(&self) -> TableProperties {
+        TableProperties::from(self.configuration.iter())
     }
 }
 
