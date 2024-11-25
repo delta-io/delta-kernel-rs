@@ -3,11 +3,11 @@ name: semver-checks
 # Trigger when a PR is opened or changed
 on:
   pull_request_target:
-    types:
-      - opened
-      - edited
-      - synchronize
-      - reopened
+    paths-ignore:
+      - 'CHANGELOG.md'
+  push:
+    paths-ignore:
+      - 'CHANGELOG.md'
 
 env:
   CARGO_TERM_COLOR: always

@@ -1,6 +1,15 @@
 name: Run tests to ensure we can compile across arrow versions
 
-on: [workflow_dispatch, push, pull_request]
+on:
+  push:
+    paths-ignore:
+      - 'CHANGELOG.md'
+  pull_request:
+    paths-ignore:
+      - 'CHANGELOG.md'
+  workflow_dispatch:
+    paths-ignore:
+      - 'CHANGELOG.md'
 
 jobs:
   arrow_integration_test:
