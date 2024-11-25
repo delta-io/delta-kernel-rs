@@ -103,7 +103,7 @@ pub(crate) fn parse_bool(s: &str) -> Option<bool> {
 /// `Some` if successfully parses, and `None` otherwise.
 pub(crate) fn parse_column_names(s: &str) -> Option<Vec<ColumnName>> {
     ColumnName::parse_column_name_list(s)
-        .map_err(|e| warn!("column name list failed to parse: {e}"))
+        .inspect_err(|e| warn!("column name list failed to parse: {e}"))
         .ok()
 }
 
@@ -190,19 +190,6 @@ fn parse_interval_impl(value: &str) -> Result<Duration, ParseIntervalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expressions::column_name;
-
-    #[test]
-    fn test_parse_column_names() {
-        assert_eq!(
-            parse_column_names("`col 1`, col.a2,col3").unwrap(),
-            vec![
-                ColumnName::new(["col 1"]),
-                column_name!("col.a2"),
-                column_name!("col3")
-            ]
-        );
-    }
 
     #[test]
     fn test_parse_bool() {

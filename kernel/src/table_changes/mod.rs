@@ -95,12 +95,10 @@ impl TableChanges {
         // Verify CDF is enabled at the beginning and end of the interval to fail early. We must
         // still check that CDF is enabled for every metadata action in the CDF range.
         let is_cdf_enabled = |snapshot: &Snapshot| {
-            static ENABLE_CDF_FLAG: &str = "delta.enableChangeDataFeed";
             snapshot
-                .metadata()
-                .configuration
-                .get(ENABLE_CDF_FLAG)
-                .is_some_and(|val| val == "true")
+                .table_properties()
+                .enable_change_data_feed
+                .unwrap_or(false)
         };
         if !is_cdf_enabled(&start_snapshot) {
             return Err(Error::change_data_feed_unsupported(start_version));
