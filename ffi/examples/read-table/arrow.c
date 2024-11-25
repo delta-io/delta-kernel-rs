@@ -1,4 +1,5 @@
 #include "arrow.h"
+#include "kernel_utils.h"
 #include <stdio.h>
 #include <string.h>
 

@@ -25,6 +25,14 @@ make
 ./read_table ../../../../kernel/tests/data/table-with-dv-small
 ```
 
+Note there are two configurations that can currently be configured in cmake:
+```bash
+# turn on VERBOSE mode (default is off) - print more diagnostics
+$ cmake -DVERBOSE=yes ..
+# turn off PRINT_DATA (default is on) - see below
+$ cmake -DPRINT_DATA=no ..
+```
+
 By default this has a dependency on
 [`arrow-glib`](https://github.com/apache/arrow/blob/main/c_glib/README.md). You can read install
 instructions for your platform [here](https://arrow.apache.org/install/).

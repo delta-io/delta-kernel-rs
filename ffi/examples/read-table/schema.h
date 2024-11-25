@@ -1,5 +1,6 @@
 #include "delta_kernel_ffi.h"
 #include "read_table.h"
+#include "kernel_utils.h"
 #include <stdint.h>
 
 /**
