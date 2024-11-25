@@ -1,12 +1,14 @@
 //! Code to handle column mapping, including modes and schema transforms
-use std::str::FromStr;
+use super::ReaderFeatures;
+use crate::actions::Protocol;
+use crate::table_properties::TableProperties;
 
 use serde::{Deserialize, Serialize};
-
-use crate::{DeltaResult, Error};
+use strum::EnumString;
 
 /// Modes of column mapping a table can be in
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Default, EnumString, Serialize, Deserialize, Copy, Clone, PartialEq, Eq)]
+#[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub enum ColumnMappingMode {
     /// No column mapping is applied
@@ -14,45 +16,64 @@ pub enum ColumnMappingMode {
     /// Columns are mapped by their field_id in parquet
     Id,
     /// Columns are mapped to a physical name
+    #[default]
     Name,
 }
 
-// key to look in metadata.configuration for to get column mapping mode
-pub(crate) const COLUMN_MAPPING_MODE_KEY: &str = "delta.columnMapping.mode";
-
-impl TryFrom<&str> for ColumnMappingMode {
-    type Error = Error;
-
-    fn try_from(s: &str) -> DeltaResult<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "none" => Ok(Self::None),
-            "id" => Ok(Self::Id),
-            "name" => Ok(Self::Name),
-            _ => Err(Error::invalid_column_mapping_mode(s)),
+/// Determine the column mapping mode for a table based on the [`Protocol`] and [`TableProperties`]
+pub(crate) fn column_mapping_mode(
+    protocol: &Protocol,
+    table_properties: &TableProperties,
+) -> ColumnMappingMode {
+    match table_properties.column_mapping_mode {
+        Some(mode) if protocol.min_reader_version() == 2 => mode,
+        Some(mode)
+            if protocol.min_reader_version() == 3
+                && protocol.has_reader_feature(&ReaderFeatures::ColumnMapping) =>
+        {
+            mode
         }
+        _ => ColumnMappingMode::None,
     }
 }
 
-impl FromStr for ColumnMappingMode {
-    type Err = Error;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        s.try_into()
-    }
-}
+    #[test]
+    fn test_column_mapping_mode() {
+        let table_properties: HashMap<_, _> =
+            [("delta.columnMapping.mode".to_string(), "id".to_string())]
+                .into_iter()
+                .collect();
+        let table_properties = TableProperties::from(table_properties.iter());
 
-impl Default for ColumnMappingMode {
-    fn default() -> Self {
-        Self::None
-    }
-}
+        let protocol = Protocol::try_new(2, 5, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        assert_eq!(
+            column_mapping_mode(&protocol, &table_properties),
+            ColumnMappingMode::Id
+        );
 
-impl AsRef<str> for ColumnMappingMode {
-    fn as_ref(&self) -> &str {
-        match self {
-            Self::None => "none",
-            Self::Id => "id",
-            Self::Name => "name",
-        }
+        let empty_features = Some::<[String; 0]>([]);
+        let protocol =
+            Protocol::try_new(3, 7, empty_features.clone(), empty_features.clone()).unwrap();
+        assert_eq!(
+            column_mapping_mode(&protocol, &table_properties),
+            ColumnMappingMode::None
+        );
+
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeatures::DeletionVectors]),
+            empty_features,
+        )
+        .unwrap();
+        assert_eq!(
+            column_mapping_mode(&protocol, &table_properties),
+            ColumnMappingMode::None
+        );
     }
 }

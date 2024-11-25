@@ -63,9 +63,17 @@ pub mod actions;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
-pub(crate) mod predicates;
+pub mod scan;
+pub mod schema;
+pub mod snapshot;
+pub mod table;
 pub mod table_changes;
 pub mod table_features;
+pub mod table_properties;
+pub mod transaction;
+
+pub(crate) mod predicates;
+pub(crate) mod utils;
 
 #[cfg(feature = "developer-visibility")]
 pub mod path;
@@ -76,13 +84,6 @@ pub(crate) mod path;
 pub mod log_segment;
 #[cfg(not(feature = "developer-visibility"))]
 pub(crate) mod log_segment;
-
-pub mod scan;
-pub mod schema;
-pub mod snapshot;
-pub mod table;
-pub mod transaction;
-pub(crate) mod utils;
 
 pub use delta_kernel_derive;
 pub use engine_data::{EngineData, RowVisitor};

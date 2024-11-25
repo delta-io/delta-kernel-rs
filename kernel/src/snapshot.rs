@@ -1,6 +1,5 @@
 //! In-memory representation of snapshots of tables (snapshot is a table at given point in time, it
 //! has schema etc.)
-//!
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -11,7 +10,8 @@ use crate::actions::{Metadata, Protocol};
 use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
 use crate::schema::Schema;
-use crate::table_features::{ColumnMappingMode, COLUMN_MAPPING_MODE_KEY};
+use crate::table_features::{column_mapping_mode, ColumnMappingMode};
+use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, Error, FileSystemClient, Version};
 
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
@@ -26,6 +26,7 @@ pub struct Snapshot {
     metadata: Metadata,
     protocol: Protocol,
     schema: Schema,
+    table_properties: TableProperties,
     pub(crate) column_mapping_mode: ColumnMappingMode,
 }
 
@@ -82,16 +83,15 @@ impl Snapshot {
         protocol.ensure_read_supported()?;
 
         let schema = metadata.schema()?;
-        let column_mapping_mode = match metadata.configuration.get(COLUMN_MAPPING_MODE_KEY) {
-            Some(mode) if protocol.min_reader_version() >= 2 => mode.as_str().try_into(),
-            _ => Ok(ColumnMappingMode::None),
-        }?;
+        let table_properties = metadata.parse_table_properties();
+        let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
         Ok(Self {
             table_root: location,
             log_segment,
             metadata,
             protocol,
             schema,
+            table_properties,
             column_mapping_mode,
         })
     }
@@ -124,6 +124,11 @@ impl Snapshot {
     /// Table [`Protocol`] at this `Snapshot`s version.
     pub fn protocol(&self) -> &Protocol {
         &self.protocol
+    }
+
+    /// Get the [`TableProperties`] for this [`Snapshot`].
+    pub fn table_properties(&self) -> &TableProperties {
+        &self.table_properties
     }
 
     /// Get the [column mapping
