@@ -167,10 +167,10 @@ impl RowVisitor for ProtocolVisitor {
     }
 }
 
+#[allow(unused)]
 #[derive(Default)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-struct AddVisitor {
+pub(crate) struct AddVisitor {
     pub(crate) adds: Vec<Add>,
 }
 
@@ -241,17 +241,16 @@ impl RowVisitor for AddVisitor {
     }
 }
 
+#[allow(unused)]
 #[derive(Default)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-struct RemoveVisitor {
+pub(crate) struct RemoveVisitor {
     pub(crate) removes: Vec<Remove>,
 }
 
 impl RemoveVisitor {
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-    fn visit_remove<'a>(
+    pub(crate) fn visit_remove<'a>(
         row_index: usize,
         path: String,
         getters: &[&'a dyn GetData<'a>],
