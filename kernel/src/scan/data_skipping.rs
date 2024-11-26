@@ -88,16 +88,16 @@ impl DataSkippingFilter {
 
         // Convert a min/max stats schema into a nullcount schema (all leaf fields are LONG)
         struct NullCountStatsTransform;
-        impl SchemaTransform for NullCountStatsTransform {
-            fn transform_primitive<'a>(
+        impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
+            fn transform_primitive(
                 &mut self,
-                _ptype: Cow<'a, PrimitiveType>,
+                _ptype: &'a PrimitiveType,
             ) -> Option<Cow<'a, PrimitiveType>> {
                 Some(Cow::Owned(PrimitiveType::Long))
             }
         }
         let nullcount_schema = NullCountStatsTransform
-            .transform_struct(Cow::Borrowed(&minmax_schema))?
+            .transform_struct(&minmax_schema)?
             .into_owned();
         let stats_schema = Arc::new(StructType::new([
             StructField::new("numRecords", DataType::LONG, true),
