@@ -442,12 +442,6 @@ struct Remove {
     pub(crate) default_row_commit_version: Option<i64>,
 }
 
-impl Remove {
-    pub(crate) fn dv_unique_id(&self) -> Option<String> {
-        self.deletion_vector.as_ref().map(|dv| dv.unique_id())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
