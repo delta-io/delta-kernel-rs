@@ -35,11 +35,16 @@ cbindgen = "0.27.0"
 libc = "0.2.158"
 
 [dev-dependencies]
+delta_kernel = { path = "../kernel", features = ["default-engine", "sync-engine"] }
+object_store = { workspace = true }
 rand = "0.8.5"
+test_utils = { path = "../test-utils" }
+tokio = { version = "1.40" }
 trybuild = "1.0"
 
 [features]
 default = ["default-engine"]
+cloud = ["delta_kernel/cloud"]
 default-engine = [
   "delta_kernel/default-engine",
   "arrow-array",
