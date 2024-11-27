@@ -90,7 +90,7 @@ impl TableChanges {
         // supported for every protocol action in the CDF range.
         let start_snapshot =
             Snapshot::try_new(table_root.as_url().clone(), engine, Some(start_version))?;
-        let end_snapshot = Snapshot::try_new(table_root.as_url().clone(), engine, end_version)?;
+        let end_snapshot = Snapshot::new_from(&start_snapshot, engine, end_version)?;
 
         // Verify CDF is enabled at the beginning and end of the interval to fail early. We must
         // still check that CDF is enabled for every metadata action in the CDF range.
