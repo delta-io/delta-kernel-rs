@@ -19,7 +19,7 @@ url = "2"
 delta_kernel = { path = "../kernel", default-features = false, features = [
   "developer-visibility",
 ] }
-delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.4.0" }
+delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.5.0" }
 
 # used if we use the default engine to be able to move arrow data into the c-ffi format
 arrow-schema = { version = "53.0", default-features = false, features = [

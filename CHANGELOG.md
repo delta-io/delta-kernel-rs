@@ -2,7 +2,22 @@
 
 ## unreleased
 
-[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.4.0...HEAD)
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.5.0...HEAD)
+
+**API Changes**
+
+*Breaking*
+
+*Additions*
+
+**Implemented enhancements:**
+
+**Fixed bugs:**
+
+
+## [v0.5.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.5.0/) (2024-11-26)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.4.0...0.5.0)
 
 **API Changes**
 
