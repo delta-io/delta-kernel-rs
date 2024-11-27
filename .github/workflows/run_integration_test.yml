@@ -13,6 +13,8 @@ jobs:
           - macOS-latest
           - ubuntu-latest
           - windows-latest
+    # skip running windows tests on every PR since they are slow
+    if: ${{ !(github.event_name == 'pull_request' && matrix.os == 'windows-latest') }}
     steps:
       - uses: actions/checkout@v3
       - name: Install minimal stable rust
