@@ -4,9 +4,10 @@ use itertools::Itertools;
 use tracing::debug;
 
 use crate::scan::ColumnType;
-use crate::schema::SchemaRef;
-use crate::{DeltaResult, ExpressionRef};
+use crate::schema::{SchemaRef, StructType};
+use crate::{DeltaResult, Engine, ExpressionRef};
 
+use super::log_replay::{table_changes_action_iter, TableChangesScanData};
 use super::{TableChanges, CDF_FIELDS};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get a change
@@ -19,6 +20,8 @@ pub struct TableChangesScan {
     predicate: Option<ExpressionRef>,
     all_fields: Vec<ColumnType>,
     have_partition_cols: bool,
+    physical_schema: StructType,
+    table_schema: SchemaRef,
 }
 
 /// This builder constructs a [`TableChangesScan`] that can be used to read the [`TableChanges`]
@@ -148,15 +151,38 @@ impl TableChangesScanBuilder {
                 }
             })
             .try_collect()?;
+        let table_schema = self.table_changes.end_snapshot.schema().clone().into();
         Ok(TableChangesScan {
             table_changes: self.table_changes,
             logical_schema,
             predicate: self.predicate,
             all_fields,
             have_partition_cols,
+            physical_schema: StructType::new(read_fields),
+            table_schema,
         })
     }
 }
+
+impl TableChangesScan {
+    pub fn scan_data(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanData>>> {
+        let commits = self
+            .table_changes
+            .log_segment
+            .ascending_commit_files
+            .clone();
+        table_changes_action_iter(
+            engine,
+            commits,
+            self.table_schema.clone(),
+            self.predicate.clone(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
