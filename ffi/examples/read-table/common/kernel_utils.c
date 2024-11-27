@@ -1,6 +1,7 @@
-#include <delta_kernel_ffi.h>
 #include <stdio.h>
 #include <string.h>
+
+#include "delta_kernel_ffi.h"
 #include "kernel_utils.h"
 
 // some diagnostic functions
@@ -61,7 +62,7 @@ void* allocate_string(const KernelStringSlice slice)
 }
 
 // utility function to convert key/val into slices and set them on a builder
-void set_builder_opt(EngineBuilder* engine_builder, char* key, char* val)
+void set_builder_opt(struct EngineBuilder* engine_builder, char* key, char* val)
 {
   KernelStringSlice key_slice = { key, strlen(key) };
   KernelStringSlice val_slice = { val, strlen(val) };

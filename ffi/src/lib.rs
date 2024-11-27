@@ -12,6 +12,7 @@ use tracing::debug;
 use url::Url;
 
 use delta_kernel::snapshot::Snapshot;
+use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{DeltaResult, Engine, EngineData, Table};
 use delta_kernel_ffi_macros::handle_descriptor;
 
@@ -654,6 +655,136 @@ fn string_slice_next_impl(
 #[no_mangle]
 pub unsafe extern "C" fn free_string_slice_data(data: Handle<StringSliceIterator>) {
     data.drop_handle();
+}
+
+#[handle_descriptor(target=Transaction, mutable=true, sized=true)]
+pub struct ExclusiveTransaction;
+
+/// Start a transaction on the latest snapshot of the table.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles and path pointer.
+#[no_mangle]
+pub unsafe extern "C" fn transaction(
+    path: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let url = unsafe { unwrap_and_parse_path_as_url(path) };
+    let engine = unsafe { engine.as_ref() };
+    transaction_impl(url, engine).into_extern_result(&engine)
+}
+
+fn transaction_impl(
+    url: DeltaResult<Url>,
+    extern_engine: &dyn ExternEngine,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    let table = Table::try_from_uri(url?)?;
+    let transaction = table.new_transaction(extern_engine.engine().as_ref())?;
+    Ok(Box::new(transaction).into())
+}
+
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_transaction(txn: Handle<ExclusiveTransaction>) {
+    debug!("engine released transaction");
+    txn.drop_handle();
+}
+
+/// TODO
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle. CONSUMES TRANSACTION
+#[no_mangle]
+pub unsafe extern "C" fn with_commit_info(
+    txn: Handle<ExclusiveTransaction>,
+    commit_info: *mut c_void,
+) -> Handle<ExclusiveTransaction> {
+    let txn = unsafe { txn.into_inner() };
+    let commit_info = unsafe { Box::from_raw(commit_info as *mut ArrowEngineData) };
+    Box::new(txn.with_commit_info(commit_info)).into()
+}
+
+/// TODO
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle. And MUST NOT USE transaction after this
+/// method is called.
+#[no_mangle]
+pub unsafe extern "C" fn commit(
+    txn: Handle<ExclusiveTransaction>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<u64> {
+    let txn = unsafe { txn.into_inner() };
+    let extern_engine = unsafe { engine.as_ref() };
+    let engine = extern_engine.engine();
+    // FIXME for now just erasing the enum
+    match txn.commit(engine.as_ref()) {
+        Ok(CommitResult::Committed(v)) => Ok(v),
+        Ok(CommitResult::Conflict(_, v)) => Err(delta_kernel::Error::Generic(format!(
+            "commit conflict at version {v}"
+        ))),
+        Err(e) => Err(e),
+    }
+    .into_extern_result(&extern_engine)
+}
+
+// HACK FIXME
+use arrow_array::RecordBatch;
+use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{DataType as ArrowDataType, Field};
+use delta_kernel::engine::arrow_data::ArrowEngineData;
+#[no_mangle]
+pub unsafe extern "C" fn new_commit_info(
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<*mut c_void> {
+    new_commit_info_impl()
+        .map(|commit| Box::into_raw(commit) as *mut c_void)
+        .into_extern_result(&allocate_error)
+}
+// create commit info in arrow of the form {engineInfo: "default engine C FFI"}
+fn new_commit_info_impl() -> DeltaResult<Box<ArrowEngineData>> {
+    // create commit info of the form {engineCommitInfo: Map { "engineInfo": "default engine" } }
+    let commit_info_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "engineCommitInfo",
+        ArrowDataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                ArrowDataType::Struct(
+                    vec![
+                        Field::new("key", ArrowDataType::Utf8, false),
+                        Field::new("value", ArrowDataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        ),
+        false,
+    )]));
+
+    use arrow_array::builder::StringBuilder;
+    let key_builder = StringBuilder::new();
+    let val_builder = StringBuilder::new();
+    let names = arrow_array::builder::MapFieldNames {
+        entry: "entries".to_string(),
+        key: "key".to_string(),
+        value: "value".to_string(),
+    };
+    let mut builder = arrow_array::builder::MapBuilder::new(Some(names), key_builder, val_builder);
+    builder.keys().append_value("engineInfo");
+    builder.values().append_value("default engine C FFI");
+    builder.append(true).unwrap();
+    let array = builder.finish();
+
+    let commit_info_batch =
+        RecordBatch::try_new(commit_info_schema.clone(), vec![Arc::new(array)])?;
+    Ok(Box::new(ArrowEngineData::new(commit_info_batch)))
 }
 
 // A set that can identify its contents by address
