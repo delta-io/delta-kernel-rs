@@ -1,5 +1,126 @@
 # Changelog
 
+## unreleased
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.4.0...HEAD)
+
+**API Changes**
+
+*Breaking*
+
+1. `Expression::Column(String)` is now `Expression::Column(ColumnName)` [\#400]
+2. delta_kernel_ffi::expressions moved into two modules:
+   `delta_kernel_ffi::expressions::engine` and `delta_kernel_ffi::expressions::kernel` [\#363]
+3. FFI: removed (hazardous) `impl From` for `KernelStringSlize` and added `unsafe` constructor
+   instead [\#441]
+4. Moved `LogSegment` into its own module (`log_segment::LogSegment`) [\#438]
+5. Renamed `EngineData::length` as `EngineData::len` [\#471]
+6. New `AsAny` trait: `AsAny: Any + Send + Sync` required bound on all engine traits [\#450]
+7. Rename `mod features` to `mod table_features` [\#454]
+8. LogSegment fields renamed: `commit_files` -> `ascending_commit_files` and `checkpoint_files` ->
+    `checkpoint_parts` [\#495]
+9. Added minimum-supported rust version: currenly rust 1.80 [\#504]
+10. Improved row visitor API: renamed `EngineData::extract` as `EngineData::visit_rows`, and
+    `DataVisitor` trait renamed as `RowVisitor` [\#481]
+11. FFI: New `mod engine_data` and `mod error` (moved `Error` to `error::Error`) [\#537]
+12. new error types: `InvalidProtocol`, `InvalidCommitInfo`, `MissingCommitInfo`,
+    `FileAlreadyExists`, `Unsupported`, `ParseIntervalError`, `ChangeDataFeedUnsupported`
+
+*Additions*
+
+1. New `ColumnName`, `column_name!`, `column_expr!` for structured column name parsing. [\#400]
+   [\#467]
+2. New `Engine` API `write_json_file()` for atomically writing JSON [\#370]
+3. New `Transaction` API for creating transactions, adding commit info and write metadata, and
+   commiting the transaction to the table. Includes `Table.new_transaction()`,
+   `Transaction.write_context()`, `Transaction.with_commit_info`, `Transaction.with_operation()`,
+   `Transaction.with_write_metadata()`, and `Transaction.commit()` [\#370] [\#393]
+4. FFI: Visitor for converting kernel expressions to engine expressions. See the new example at
+   `ffi/examples/visit-expression/` [\#363]
+5. FFI: New `TryFromStringSlice` trait and `kernel_string_slice` macro [\#441]
+6. New `DefaultEngine` engine implementation for writing parquet: `write_parquet_file()` [\#393]
+7. Added support for parsing comma-separated column name lists:
+   `ColumnName::parse_column_name_list()` [\#458]
+9. New `VacuumProtocolCheck` table feature [\#454]
+10. `DvInfo` now implements `Clone`, `PartialEq`, and `Eq` [\#468]
+11. `Stats` now implements `Debug`, `Clone`, `PartialEq`, and `Eq` [\#468]
+12. Added `Cdc` action support [\#506]
+13. (early CDF read support) New `TableChanges` type to read CDF from a table between versions
+    [\#505]
+14. (early CDF read support) Builder for scans on `TableChanges` [\#521]
+15. New `TableProperties` struct which can parse tables' `metadata.configuration` [\#453] [\#536]
+
+**Implemented enhancements:**
+- FFI examples now use AddressSanitizer [\#447]
+- `ColumnName` now tracks a path of field names instead of a simple string [\#445]
+- use `ParsedLogPaths` for files in `LogSegment` [\#472]
+- FFI: added Miri support for tests [\#470]
+- check table URI has trailing slash [\#432]
+- build `cargo docs` in CI [\#479]
+- new `test-utils` crate [\#477]
+- added proper protocol validation (both parsing correctness and semantic correctness) [\#454]
+  [\#493]
+- harmonize predicate evaluation between delta stats and parquet footer stats [\#420]
+- more log path tests [\#485]
+- `ensure_read_supported` and `ensure_write_supported` APIs [\#518]
+- include NOTICE and LICENSE in published crates [\#520]
+- FFI: factored out read_table kernel utils into `kernel_utils.h/c` [\#539]
+- simplified log replay visitor and avoid materializing Add/Remove actions [\#494]
+- simplified schema transform API [\#531]
+- support arrow view types in conversion from `ArrowDataType` to kernel's `DataType` [\#533]
+
+**Fixed bugs:**
+
+- **Disabled missing-column row group skipping**: The optimization to treat a physically missing
+  column as all-null is unsound, if the schema was not already verified to prove that the table's
+  logical schema actually includes the missing column. We disable it until we can add the necessary
+  validation. [\#435]
+- fixed leaks in read_table FFI example [\#449]
+- fixed read_table compilation on windows [\#455]
+- fixed various predicate eval bugs [\#420]
+
+[\#400]: https://github.com/delta-io/delta-kernel-rs/pull/400
+[\#370]: https://github.com/delta-io/delta-kernel-rs/pull/370
+[\#363]: https://github.com/delta-io/delta-kernel-rs/pull/363
+[\#435]: https://github.com/delta-io/delta-kernel-rs/pull/435
+[\#447]: https://github.com/delta-io/delta-kernel-rs/pull/447
+[\#449]: https://github.com/delta-io/delta-kernel-rs/pull/449
+[\#441]: https://github.com/delta-io/delta-kernel-rs/pull/441
+[\#455]: https://github.com/delta-io/delta-kernel-rs/pull/455
+[\#445]: https://github.com/delta-io/delta-kernel-rs/pull/445
+[\#393]: https://github.com/delta-io/delta-kernel-rs/pull/393
+[\#458]: https://github.com/delta-io/delta-kernel-rs/pull/458
+[\#438]: https://github.com/delta-io/delta-kernel-rs/pull/438
+[\#468]: https://github.com/delta-io/delta-kernel-rs/pull/468
+[\#472]: https://github.com/delta-io/delta-kernel-rs/pull/472
+[\#470]: https://github.com/delta-io/delta-kernel-rs/pull/470
+[\#471]: https://github.com/delta-io/delta-kernel-rs/pull/471
+[\#432]: https://github.com/delta-io/delta-kernel-rs/pull/432
+[\#479]: https://github.com/delta-io/delta-kernel-rs/pull/479
+[\#477]: https://github.com/delta-io/delta-kernel-rs/pull/477
+[\#450]: https://github.com/delta-io/delta-kernel-rs/pull/450
+[\#454]: https://github.com/delta-io/delta-kernel-rs/pull/454
+[\#467]: https://github.com/delta-io/delta-kernel-rs/pull/467
+[\#493]: https://github.com/delta-io/delta-kernel-rs/pull/493
+[\#495]: https://github.com/delta-io/delta-kernel-rs/pull/495
+[\#420]: https://github.com/delta-io/delta-kernel-rs/pull/420
+[\#485]: https://github.com/delta-io/delta-kernel-rs/pull/485
+[\#504]: https://github.com/delta-io/delta-kernel-rs/pull/504
+[\#506]: https://github.com/delta-io/delta-kernel-rs/pull/506
+[\#518]: https://github.com/delta-io/delta-kernel-rs/pull/518
+[\#520]: https://github.com/delta-io/delta-kernel-rs/pull/520
+[\#505]: https://github.com/delta-io/delta-kernel-rs/pull/505
+[\#481]: https://github.com/delta-io/delta-kernel-rs/pull/481
+[\#521]: https://github.com/delta-io/delta-kernel-rs/pull/521
+[\#453]: https://github.com/delta-io/delta-kernel-rs/pull/453
+[\#536]: https://github.com/delta-io/delta-kernel-rs/pull/536
+[\#539]: https://github.com/delta-io/delta-kernel-rs/pull/539
+[\#537]: https://github.com/delta-io/delta-kernel-rs/pull/537
+[\#494]: https://github.com/delta-io/delta-kernel-rs/pull/494
+[\#533]: https://github.com/delta-io/delta-kernel-rs/pull/533
+[\#531]: https://github.com/delta-io/delta-kernel-rs/pull/531
+
+
 ## [v0.4.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.4.1/) (2024-10-28)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.4.0...v0.4.1)
