@@ -1,6 +1,5 @@
 use crate::engine_data::{EngineData, EngineList, EngineMap, GetData, RowVisitor};
-use crate::expressions::ColumnName;
-use crate::schema::{DataType};
+use crate::schema::{ColumnName, DataType};
 use crate::{DeltaResult, Error};
 
 use arrow_array::cast::AsArray;

@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use crate::expressions::ColumnName;
 use crate::utils::require;
 use crate::{
     actions::{
@@ -11,7 +10,7 @@ use crate::{
         visitors::visit_deletion_vector_at,
     },
     engine_data::{GetData, RowVisitor, TypedGetData as _},
-    schema::{ColumnNamesAndTypes, DataType, SchemaRef},
+    schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef},
     table_features::ColumnMappingMode,
     DeltaResult, Engine, EngineData, Error,
 };

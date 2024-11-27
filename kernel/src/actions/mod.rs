@@ -128,7 +128,7 @@ impl Metadata {
         Ok(visitor.metadata)
     }
 
-    pub fn schema(&self) -> DeltaResult<StructType> {
+    pub fn parse_schema(&self) -> DeltaResult<StructType> {
         Ok(serde_json::from_str(&self.schema_string)?)
     }
 

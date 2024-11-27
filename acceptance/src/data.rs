@@ -61,9 +61,6 @@ pub fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
-// TODO(zach): skip iceberg_compat_v1 test until DAT is fixed
-static SKIPPED_TESTS: &[&str; 1] = &["iceberg_compat_v1"];
-
 // Ensure that two schema have the same field names, and dict_id/ordering.
 // We ignore:
 //  - data type: This is checked already in `assert_columns_match`
@@ -114,13 +111,6 @@ fn assert_columns_match(actual: &[Arc<dyn Array>], expected: &[Arc<dyn Array>]) 
 }
 
 pub async fn assert_scan_data(engine: Arc<dyn Engine>, test_case: &TestCaseInfo) -> TestResult<()> {
-    let root_dir = test_case.root_dir();
-    for skipped in SKIPPED_TESTS {
-        if root_dir.ends_with(skipped) {
-            return Ok(());
-        }
-    }
-
     let engine = engine.as_ref();
     let table_root = test_case.table_root()?;
     let table = Table::new(table_root);
