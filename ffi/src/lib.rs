@@ -35,6 +35,8 @@ pub mod engine_funcs;
 pub mod error;
 use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
 pub mod expressions;
+#[cfg(feature = "tracing")]
+pub mod ffi_tracing;
 pub mod scan;
 pub mod schema;
 #[cfg(feature = "test-ffi")]
