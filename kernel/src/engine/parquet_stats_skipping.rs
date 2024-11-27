@@ -1,6 +1,6 @@
 //! An implementation of data skipping that leverages parquet stats from the file footer.
 use crate::expressions::{
-    BinaryOperator, ColumnName, Expression as Expr, Scalar, UnaryOperator, VariadicOperator,
+    BinaryOperator, ColumnName, Expression as Expr, Scalar, UnaryOperator, VariadicOperator, VariadicExpression, BinaryExpression,
 };
 use crate::predicates::{
     DataSkippingPredicateEvaluator, PredicateEvaluator, PredicateEvaluatorDefaults,
@@ -155,9 +155,9 @@ pub(crate) trait ParquetStatsSkippingFilter {
 
 impl<T: DataSkippingPredicateEvaluator<Output = bool>> ParquetStatsSkippingFilter for T {
     fn eval_sql_where(&self, filter: &Expr) -> Option<bool> {
-        use Expr::{BinaryOperation, VariadicOperation};
+        use Expr::{Binary, Variadic};
         match filter {
-            VariadicOperation { op: VariadicOperator::And, exprs } => {
+            Variadic(VariadicExpression { op: VariadicOperator::And, exprs }) => {
                 let exprs: Vec<_> = exprs
                     .iter()
                     .map(|expr| self.eval_sql_where(expr))
@@ -168,7 +168,7 @@ impl<T: DataSkippingPredicateEvaluator<Output = bool>> ParquetStatsSkippingFilte
                     .collect();
                 self.eval_variadic(VariadicOperator::And, &exprs, false)
             }
-            BinaryOperation { op, left, right } => self.eval_binary_nullsafe(*op, left, right),
+            Binary(BinaryExpression { op, left, right }) => self.eval_binary_nullsafe(*op, left, right),
             _ => self.eval_expr(filter, false),
         }
     }
