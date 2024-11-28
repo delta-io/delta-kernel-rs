@@ -6,7 +6,7 @@ use std::{
     str::Utf8Error,
 };
 
-use crate::schema::{DataType, StructType};
+use crate::schema::{compare::SchemaComparisonError, DataType};
 use crate::table_properties::ParseIntervalError;
 use crate::Version;
 
@@ -192,8 +192,8 @@ pub enum Error {
     #[error("Change data feed is unsupported for the table at version {0}")]
     ChangeDataFeedUnsupported(Version),
 
-    #[error("Change data feed encountered incompatible schema. Expected {0}, got {1}")]
-    ChangeDataFeedIncompatibleSchema(String, String),
+    #[error("Change data feed encountered incompatible schema at version {0}: {1}")]
+    ChangeDataFeedIncompatibleSchema(Version, #[source] SchemaComparisonError),
 
     /// Invalid checkpoint files
     #[error("Invalid Checkpoint: {0}")]
@@ -271,10 +271,10 @@ impl Error {
         Self::ChangeDataFeedUnsupported(version.into())
     }
     pub(crate) fn change_data_feed_incompatible_schema(
-        expected: &StructType,
-        actual: &StructType,
+        version: Version,
+        schema_error: SchemaComparisonError,
     ) -> Self {
-        Self::ChangeDataFeedIncompatibleSchema(format!("{expected:?}"), format!("{actual:?}"))
+        Self::ChangeDataFeedIncompatibleSchema(version, schema_error)
     }
 
     pub fn invalid_checkpoint(msg: impl ToString) -> Self {

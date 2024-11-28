@@ -28,13 +28,12 @@ use super::{DataType, StructField, StructType};
 
 /// The nullability flag of a schema's field. This can be compared with a read schema field's
 /// nullability flag using [`Nullable::can_read_as`].
-#[allow(unused)]
 #[derive(Clone, Copy)]
 pub(crate) struct Nullable(bool);
 
 /// Represents the ways a schema comparison can fail.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum Error {
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum SchemaComparisonError {
     #[error("The nullability was tightened for a field")]
     NullabilityTightening,
     #[error("Field names do not match")]
@@ -49,15 +48,11 @@ pub(crate) enum Error {
     TypeMismatch,
 }
 
-/// A [`std::result::Result`] that has the schema comparison [`Error`] as the error variant.
-#[allow(unused)]
-pub(crate) type SchemaComparisonResult = Result<(), Error>;
+/// A [`std::result::Result`] that has the schema comparison [`SchemaComparisonError`] as the error variant.
+pub(crate) type SchemaComparisonResult = Result<(), SchemaComparisonError>;
 
 /// Represents a schema compatibility check for the type. If `self` can be read as `read_type`,
 /// this function returns `Ok(())`. Otherwise, this function returns `Err`.
-///
-/// TODO (Oussama): Remove the `allow(unused)` once this is used in CDF.
-#[allow(unused)]
 pub(crate) trait SchemaComparison {
     fn can_read_as(&self, read_type: &Self) -> SchemaComparisonResult;
 }
@@ -70,7 +65,10 @@ impl SchemaComparison for Nullable {
         // column as non-nullable. So we avoid the case where !read_nullable && nullable
         // Hence we check that !(!read_nullable && existing_nullable)
         // == read_nullable || !existing_nullable
-        require!(read_nullable.0 || !self.0, Error::NullabilityTightening);
+        require!(
+            read_nullable.0 || !self.0,
+            SchemaComparisonError::NullabilityTightening
+        );
         Ok(())
     }
 }
@@ -83,7 +81,10 @@ impl SchemaComparison for StructField {
     ///     3. You can read this data type as the `read_field`'s data type.
     fn can_read_as(&self, read_field: &Self) -> SchemaComparisonResult {
         Nullable(self.nullable).can_read_as(&Nullable(read_field.nullable))?;
-        require!(self.name() == read_field.name(), Error::FieldNameMismatch);
+        require!(
+            self.name() == read_field.name(),
+            SchemaComparisonError::FieldNameMismatch
+        );
         self.data_type().can_read_as(read_field.data_type())?;
         Ok(())
     }
@@ -105,14 +106,14 @@ impl SchemaComparison for StructType {
             .collect();
         require!(
             lowercase_field_map.len() == self.fields.len(),
-            Error::InvalidSchema
+            SchemaComparisonError::InvalidSchema
         );
 
         let lowercase_read_field_names: HashSet<String> =
             read_type.fields.keys().map(|x| x.to_lowercase()).collect();
         require!(
             lowercase_read_field_names.len() == read_type.fields.len(),
-            Error::InvalidSchema
+            SchemaComparisonError::InvalidSchema
         );
 
         // Check that the field names are a subset of the read fields.
@@ -120,7 +121,7 @@ impl SchemaComparison for StructType {
             .keys()
             .any(|name| !lowercase_read_field_names.contains(name))
         {
-            return Err(Error::MissingColumn);
+            return Err(SchemaComparisonError::MissingColumn);
         }
         for read_field in read_type.fields() {
             match lowercase_field_map.get(&read_field.name().to_lowercase()) {
@@ -128,7 +129,10 @@ impl SchemaComparison for StructType {
                 None => {
                     // Note: Delta spark does not perform the following check. Hence it ignores
                     // non-null fields that exist in the read schema that aren't in this schema.
-                    require!(read_field.is_nullable(), Error::NewNonNullableColumn);
+                    require!(
+                        read_field.is_nullable(),
+                        SchemaComparisonError::NewNonNullableColumn
+                    );
                 }
             }
         }
@@ -166,7 +170,7 @@ impl SchemaComparison for DataType {
             (a, b) => {
                 // TODO: In the future, we will change this to support type widening.
                 // See: #623
-                require!(a == b, Error::TypeMismatch);
+                require!(a == b, SchemaComparisonError::TypeMismatch);
             }
         };
         Ok(())
@@ -175,7 +179,7 @@ impl SchemaComparison for DataType {
 
 #[cfg(test)]
 mod tests {
-    use crate::schema::compare::{Error, SchemaComparison};
+    use crate::schema::compare::{SchemaComparison, SchemaComparisonError};
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
     #[test]
@@ -257,7 +261,7 @@ mod tests {
 
         assert!(matches!(
             existing_schema.can_read_as(&read_schema),
-            Err(Error::NullabilityTightening)
+            Err(SchemaComparisonError::NullabilityTightening)
         ));
     }
     #[test]
@@ -275,7 +279,7 @@ mod tests {
         ]);
         assert!(matches!(
             existing_schema.can_read_as(&read_schema),
-            Err(Error::FieldNameMismatch)
+            Err(SchemaComparisonError::FieldNameMismatch)
         ));
     }
     #[test]
@@ -292,7 +296,7 @@ mod tests {
         ]);
         assert!(matches!(
             existing_schema.can_read_as(&read_schema),
-            Err(Error::TypeMismatch)
+            Err(SchemaComparisonError::TypeMismatch)
         ));
     }
     #[test]
@@ -323,7 +327,7 @@ mod tests {
         ]);
         assert!(matches!(
             existing_schema.can_read_as(&read_schema),
-            Err(Error::NullabilityTightening)
+            Err(SchemaComparisonError::NullabilityTightening)
         ));
     }
     #[test]
@@ -345,7 +349,10 @@ mod tests {
         assert!(a.can_read_as(&b).is_ok());
 
         // Read `b` as `a`. `a` is missing a column that is present in `b`.
-        assert!(matches!(b.can_read_as(&a), Err(Error::MissingColumn)));
+        assert!(matches!(
+            b.can_read_as(&a),
+            Err(SchemaComparisonError::MissingColumn)
+        ));
     }
     #[test]
     fn differ_by_non_nullable_column() {
@@ -365,11 +372,14 @@ mod tests {
         // Read `a` as `b`. `b` has an extra non-nullable column.
         assert!(matches!(
             a.can_read_as(&b),
-            Err(Error::NewNonNullableColumn)
+            Err(SchemaComparisonError::NewNonNullableColumn)
         ));
 
         // Read `b` as `a`. `a` is missing a column that is present in `b`.
-        assert!(matches!(b.can_read_as(&a), Err(Error::MissingColumn)));
+        assert!(matches!(
+            b.can_read_as(&a),
+            Err(SchemaComparisonError::MissingColumn)
+        ));
     }
 
     #[test]
@@ -389,13 +399,13 @@ mod tests {
         ]);
         assert!(matches!(
             existing_schema.can_read_as(&read_schema),
-            Err(Error::InvalidSchema)
+            Err(SchemaComparisonError::InvalidSchema)
         ));
 
         // Checks in the inverse order
         assert!(matches!(
             read_schema.can_read_as(&existing_schema),
-            Err(Error::InvalidSchema)
+            Err(SchemaComparisonError::InvalidSchema)
         ));
     }
 }
