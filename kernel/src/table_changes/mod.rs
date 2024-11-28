@@ -52,6 +52,7 @@ mod physical_to_logical;
 mod resolve_dvs;
 pub mod scan;
 mod scan_file;
+mod schema_compat;
 
 static CHANGE_TYPE_COL_NAME: &str = "_change_type";
 static COMMIT_VERSION_COL_NAME: &str = "_commit_version";
