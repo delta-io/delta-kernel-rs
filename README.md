@@ -1,11 +1,11 @@
 # delta-kernel-rs
 
 Delta-kernel-rs is an experimental [Delta][delta] implementation focused on
-interoperability with a wide range of query engines. It currently only supports
-reads.
+interoperability with a wide range of query engines. It currently supports
+reads and (experimental) writes.
 
-The Delta Kernel project is a Rust and C library for building Delta connectors that can read (and
-soon, write) Delta tables without needing to understand the Delta [protocol
+The Delta Kernel project is a Rust and C library for building Delta connectors that can read and
+write Delta tables without needing to understand the Delta [protocol
 details][delta-protocol]. This is the Rust/C equivalent of [Java Delta Kernel][java-kernel].
 
 ## Crates
