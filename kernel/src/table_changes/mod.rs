@@ -11,7 +11,10 @@ use crate::snapshot::Snapshot;
 use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Engine, Error, Version};
 
+mod data_read;
+mod log_replay;
 pub mod scan;
+mod scan_file;
 
 static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
     [

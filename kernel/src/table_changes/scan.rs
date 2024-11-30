@@ -3,10 +3,14 @@ use std::sync::Arc;
 use itertools::Itertools;
 use tracing::debug;
 
-use crate::scan::ColumnType;
-use crate::schema::SchemaRef;
-use crate::{DeltaResult, ExpressionRef};
+use crate::scan::{ColumnType, ScanResult};
+use crate::schema::{SchemaRef, StructType};
+use crate::table_features::ColumnMappingMode;
+use crate::{DeltaResult, Engine, ExpressionRef};
 
+use super::data_read::{resolve_scan_file_dv, ScanFileReader};
+use super::log_replay::{table_changes_action_iter, TableChangesScanData};
+use super::scan_file::scan_data_to_scan_file;
 use super::{TableChanges, CDF_FIELDS};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get a change
@@ -19,6 +23,8 @@ pub struct TableChangesScan {
     predicate: Option<ExpressionRef>,
     all_fields: Vec<ColumnType>,
     have_partition_cols: bool,
+    physical_schema: StructType,
+    table_schema: SchemaRef,
 }
 
 /// This builder constructs a [`TableChangesScan`] that can be used to read the [`TableChanges`]
@@ -148,15 +154,96 @@ impl TableChangesScanBuilder {
                 }
             })
             .try_collect()?;
+        let table_schema = self.table_changes.end_snapshot.schema().clone().into();
         Ok(TableChangesScan {
             table_changes: self.table_changes,
             logical_schema,
             predicate: self.predicate,
             all_fields,
             have_partition_cols,
+            physical_schema: StructType::new(read_fields),
+            table_schema,
         })
     }
 }
+
+/// State that doesn't change between scans
+/// TODO: make serializable/deserializable again
+#[derive(Clone, Debug)]
+pub struct GlobalScanState {
+    pub table_root: String,
+    pub partition_columns: Vec<String>,
+    pub logical_schema: SchemaRef,
+    pub read_schema: SchemaRef,
+    pub column_mapping_mode: ColumnMappingMode,
+    pub have_partition_cols: bool,
+    pub all_fields: Vec<ColumnType>,
+}
+impl TableChangesScan {
+    /// Get global state that is valid for the entire scan. This is somewhat expensive so should
+    /// only be called once per scan.
+    pub(crate) fn global_scan_state(&self) -> GlobalScanState {
+        GlobalScanState {
+            table_root: self.table_changes.table_root.to_string(),
+            partition_columns: self.table_changes.partition_columns().clone(),
+            logical_schema: self.logical_schema.clone(),
+            read_schema: self.physical_schema.clone().into(),
+            column_mapping_mode: *self.table_changes.column_mapping_mode(),
+            have_partition_cols: self.have_partition_cols,
+            all_fields: self.all_fields.clone(),
+        }
+    }
+
+    pub fn scan_data(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanData>>> {
+        let commits = self
+            .table_changes
+            .log_segment
+            .ascending_commit_files
+            .clone();
+        table_changes_action_iter(
+            engine,
+            commits,
+            self.table_schema.clone(),
+            self.predicate.clone(),
+        )
+    }
+    pub fn execute(
+        &self,
+        engine: Arc<dyn Engine>,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>> + '_> {
+        let scan_data = self.scan_data(engine.as_ref())?;
+        let scan_files = scan_data_to_scan_file(scan_data);
+        let global_scan_state = self.global_scan_state();
+
+        let dv_engine_ref = engine.clone();
+        let result = scan_files
+            .map(move |scan_file| {
+                let (scan_file, rm_dv) = scan_file?;
+                resolve_scan_file_dv(
+                    dv_engine_ref.as_ref(),
+                    self.table_changes.table_root(),
+                    scan_file,
+                    rm_dv,
+                )
+            })
+            .flatten_ok()
+            .map(move |x| -> DeltaResult<_> {
+                let (scan_file, selection_vector) = x?;
+                let engine = engine.clone();
+                let reader =
+                    ScanFileReader::new(global_scan_state.clone(), scan_file, selection_vector);
+                reader.into_data(engine.as_ref())
+            })
+            .flatten_ok()
+            .map(|x| x?);
+
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
