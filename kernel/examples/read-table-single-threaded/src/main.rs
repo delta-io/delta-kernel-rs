@@ -73,7 +73,7 @@ fn try_main() -> DeltaResult<()> {
     let table = Table::try_from_uri(&cli.path)?;
     println!("Reading {}", table.location());
 
-    let engine: Box<dyn Engine> = match cli.engine {
+    let engine: Arc<dyn Engine> = match cli.engine {
         EngineType::Default => {
             let mut options = if let Some(region) = cli.region {
                 HashMap::from([("region", region)])
@@ -83,13 +83,13 @@ fn try_main() -> DeltaResult<()> {
             if cli.public {
                 options.insert("skip_signature", "true".to_string());
             }
-            Box::new(DefaultEngine::try_new(
+            Arc::new(DefaultEngine::try_new(
                 table.location(),
                 options,
                 Arc::new(TokioBackgroundExecutor::new()),
             )?)
         }
-        EngineType::Sync => Box::new(SyncEngine::new()),
+        EngineType::Sync => Arc::new(SyncEngine::new()),
     };
 
     let snapshot = table.snapshot(engine.as_ref(), None)?;
@@ -120,7 +120,7 @@ fn try_main() -> DeltaResult<()> {
         .build()?;
 
     let batches: Vec<RecordBatch> = scan
-        .execute(engine.as_ref())?
+        .execute(engine)?
         .map(|scan_result| -> DeltaResult<_> {
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();

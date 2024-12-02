@@ -450,7 +450,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
             ]))],
         )?),
         &table,
-        engine.as_ref(),
+        engine,
     )?;
     Ok(())
 }
@@ -598,7 +598,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
             ],
         )?),
         &table,
-        engine.as_ref(),
+        engine,
     )?;
     Ok(())
 }

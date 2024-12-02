@@ -56,20 +56,20 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine = DefaultEngine::new(
+    let engine = Arc::new(DefaultEngine::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
-    );
+    ));
 
     let table = Table::new(location);
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.snapshot(&engine, None)?;
+    let snapshot = table.snapshot(engine.as_ref(), None)?;
     let scan = snapshot.into_scan_builder().build()?;
 
     let mut files = 0;
-    let stream = scan.execute(&engine)?.zip(expected_data);
+    let stream = scan.execute(engine)?.zip(expected_data);
 
     for (data, expected) in stream {
         let raw_data = data?.raw_data?;
@@ -126,7 +126,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let scan = snapshot.into_scan_builder().build()?;
 
     let mut files = 0;
-    let stream = scan.execute(&engine)?.zip(expected_data);
+    let stream = scan.execute(Arc::new(engine))?.zip(expected_data);
 
     for (data, expected) in stream {
         let raw_data = data?.raw_data?;
@@ -183,7 +183,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = table.snapshot(&engine, None)?;
     let scan = snapshot.into_scan_builder().build()?;
 
-    let stream = scan.execute(&engine)?.zip(expected_data);
+    let stream = scan.execute(Arc::new(engine))?.zip(expected_data);
 
     let mut files = 0;
     for (data, expected) in stream {
@@ -247,14 +247,14 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine = DefaultEngine::new(
+    let engine = Arc::new(DefaultEngine::new(
         storage.clone(),
         Path::from(""),
         Arc::new(TokioBackgroundExecutor::new()),
-    );
+    ));
 
     let table = Table::new(location);
-    let snapshot = Arc::new(table.snapshot(&engine, None)?);
+    let snapshot = Arc::new(table.snapshot(engine.as_ref(), None)?);
 
     // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
     // we validate the boundary values where we expect the set of matched files to change.
@@ -306,7 +306,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
 
         let expected_files = expected_batches.len();
         let mut files_scanned = 0;
-        let stream = scan.execute(&engine)?.zip(expected_batches);
+        let stream = scan.execute(engine.clone())?.zip(expected_batches);
 
         for (batch, expected) in stream {
             let raw_data = batch?.raw_data?;
@@ -346,7 +346,7 @@ macro_rules! assert_batches_sorted_eq {
 }
 
 fn read_with_execute(
-    engine: &dyn Engine,
+    engine: Arc<dyn Engine>,
     scan: &Scan,
     expected: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -472,10 +472,10 @@ fn read_table_data(
     )?;
     let sync_engine = delta_kernel::engine::sync::SyncEngine::new();
 
-    let engines: &[&dyn Engine] = &[&sync_engine, &default_engine];
-    for &engine in engines {
+    let engines: Vec<Arc<dyn Engine>> = vec![Arc::new(sync_engine), Arc::new(default_engine)];
+    for engine in engines {
         let table = Table::new(url.clone());
-        let snapshot = table.snapshot(engine, None)?;
+        let snapshot = table.snapshot(engine.as_ref(), None)?;
 
         let read_schema = select_cols.map(|select_cols| {
             let table_schema = snapshot.schema();
@@ -491,8 +491,8 @@ fn read_table_data(
             .build()?;
 
         sort_lines!(expected);
+        read_with_scan_data(table.location(), engine.as_ref(), &scan, &expected)?;
         read_with_execute(engine, &scan, &expected)?;
-        read_with_scan_data(table.location(), engine, &scan, &expected)?;
     }
     Ok(())
 }

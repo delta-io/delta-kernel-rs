@@ -2,6 +2,7 @@
 //! Must run at the root of the crate
 use std::ops::Add;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use delta_kernel::engine::sync::SyncEngine;
 use delta_kernel::scan::ScanResult;
@@ -29,13 +30,13 @@ fn count_total_scan_rows(
 fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/"))?;
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine = SyncEngine::new();
+    let engine = Arc::new(SyncEngine::new());
 
     let table = Table::new(url);
-    let snapshot = table.snapshot(&engine, None)?;
+    let snapshot = table.snapshot(engine.as_ref(), None)?;
     let scan = snapshot.into_scan_builder().build()?;
 
-    let stream = scan.execute(&engine)?;
+    let stream = scan.execute(engine)?;
     let total_rows = count_total_scan_rows(stream)?;
     assert_eq!(total_rows, 8);
     Ok(())
@@ -45,13 +46,13 @@ fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
 fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/"))?;
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine = SyncEngine::new();
+    let engine = Arc::new(SyncEngine::new());
 
     let table = Table::new(url);
-    let snapshot = table.snapshot(&engine, None)?;
+    let snapshot = table.snapshot(engine.as_ref(), None)?;
     let scan = snapshot.into_scan_builder().build()?;
 
-    let stream = scan.execute(&engine)?;
+    let stream = scan.execute(engine)?;
     let total_rows = count_total_scan_rows(stream)?;
     assert_eq!(total_rows, 10);
     Ok(())

@@ -7,6 +7,8 @@ use crate::ArrowEngineData;
 use delta_kernel::scan::Scan;
 use delta_kernel::{DeltaResult, Engine, EngineData, Table};
 
+use std::sync::Arc;
+
 pub(crate) fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
     Ok(data
         .into_any()
@@ -20,9 +22,9 @@ pub(crate) fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
 pub(crate) fn test_read(
     expected: &ArrowEngineData,
     table: &Table,
-    engine: &impl Engine,
+    engine: Arc<dyn Engine>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = table.snapshot(engine, None)?;
+    let snapshot = table.snapshot(engine.as_ref(), None)?;
     let scan = snapshot.into_scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;
     let formatted = pretty_format_batches(&batches).unwrap().to_string();
@@ -40,7 +42,7 @@ pub(crate) fn test_read(
 
 // TODO (zach): this is listed as unused for acceptance crate
 #[allow(unused)]
-pub(crate) fn read_scan(scan: &Scan, engine: &dyn Engine) -> DeltaResult<Vec<RecordBatch>> {
+pub(crate) fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<RecordBatch>> {
     let scan_results = scan.execute(engine)?;
     scan_results
         .map(|scan_result| -> DeltaResult<_> {

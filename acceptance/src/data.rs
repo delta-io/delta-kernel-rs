@@ -120,11 +120,9 @@ pub async fn assert_scan_data(engine: Arc<dyn Engine>, test_case: &TestCaseInfo)
             return Ok(());
         }
     }
-
-    let engine = engine.as_ref();
     let table_root = test_case.table_root()?;
     let table = Table::new(table_root);
-    let snapshot = table.snapshot(engine, None)?;
+    let snapshot = table.snapshot(engine.as_ref(), None)?;
     let scan = snapshot.into_scan_builder().build()?;
     let mut schema = None;
     let batches: Vec<RecordBatch> = scan

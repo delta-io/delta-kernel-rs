@@ -180,9 +180,8 @@ async fn latest_snapshot_test(
     expected_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = table.snapshot(&engine, None)?;
-
     let scan = snapshot.into_scan_builder().build()?;
-    let scan_res = scan.execute(&engine)?;
+    let scan_res = scan.execute(Arc::new(engine))?;
     let batches: Vec<RecordBatch> = scan_res
         .map(|scan_result| -> DeltaResult<_> {
             let scan_result = scan_result?;
