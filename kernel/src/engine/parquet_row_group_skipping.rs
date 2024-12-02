@@ -89,7 +89,7 @@ impl<'a> RowGroupFilter<'a> {
     }
 }
 
-impl<'a> ParquetStatsProvider for RowGroupFilter<'a> {
+impl ParquetStatsProvider for RowGroupFilter<'_> {
     // Extracts a stat value, converting from its physical type to the requested logical type.
     //
     // NOTE: This code is highly redundant with [`get_max_stat_value`] below, but parquet

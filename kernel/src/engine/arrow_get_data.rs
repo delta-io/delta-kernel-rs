@@ -11,7 +11,7 @@ use crate::{
 
 // actual impls (todo: could macro these)
 
-impl<'a> GetData<'a> for BooleanArray {
+impl GetData<'_> for BooleanArray {
     fn get_bool(&self, row_index: usize, _field_name: &str) -> DeltaResult<Option<bool>> {
         if self.is_valid(row_index) {
             Ok(Some(self.value(row_index)))
@@ -21,7 +21,7 @@ impl<'a> GetData<'a> for BooleanArray {
     }
 }
 
-impl<'a> GetData<'a> for PrimitiveArray<Int32Type> {
+impl GetData<'_> for PrimitiveArray<Int32Type> {
     fn get_int(&self, row_index: usize, _field_name: &str) -> DeltaResult<Option<i32>> {
         if self.is_valid(row_index) {
             Ok(Some(self.value(row_index)))
@@ -31,7 +31,7 @@ impl<'a> GetData<'a> for PrimitiveArray<Int32Type> {
     }
 }
 
-impl<'a> GetData<'a> for PrimitiveArray<Int64Type> {
+impl GetData<'_> for PrimitiveArray<Int64Type> {
     fn get_long(&self, row_index: usize, _field_name: &str) -> DeltaResult<Option<i64>> {
         if self.is_valid(row_index) {
             Ok(Some(self.value(row_index)))

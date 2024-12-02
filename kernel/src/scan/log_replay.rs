@@ -47,7 +47,7 @@ struct AddRemoveDedupVisitor<'seen> {
     is_log_batch: bool,
 }
 
-impl<'seen> AddRemoveDedupVisitor<'seen> {
+impl AddRemoveDedupVisitor<'_> {
     /// Checks if log replay already processed this logical file (in which case the current action
     /// should be ignored). If not already seen, register it so we can recognize future duplicates.
     fn check_and_record_seen(&mut self, key: FileActionKey) -> bool {
@@ -107,7 +107,7 @@ impl<'seen> AddRemoveDedupVisitor<'seen> {
     }
 }
 
-impl<'seen> RowVisitor for AddRemoveDedupVisitor<'seen> {
+impl RowVisitor for AddRemoveDedupVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         // NOTE: The visitor assumes a schema with adds first and removes optionally afterward.
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
