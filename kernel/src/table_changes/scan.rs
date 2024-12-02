@@ -15,13 +15,24 @@ use super::{TableChanges, CDF_FIELDS};
 #[allow(unused)]
 #[derive(Debug)]
 pub struct TableChangesScan {
+    // The [`TableChanges`] that specifies this scan's start and end versions
     table_changes: Arc<TableChanges>,
+    // The logical schema of the Change Data Feed. By default, this is the schema from
+    // [`TableChanges::schema`]. The schema may be projected to a subset of those columns. See
+    // [`TableChangesScanBuilder::with_schema`]
     logical_schema: SchemaRef,
-    predicate: Option<ExpressionRef>,
-    all_fields: Vec<ColumnType>,
-    have_partition_cols: bool,
+    // The physical schema. This schema omits partition columns and columns generated for Change
+    // Data Feed
     physical_schema: StructType,
+    // The schema of the table at the `end_version`. This schema is used to validate schema
+    // compatibility in the CDF range
     table_schema: SchemaRef,
+    // The predicate to filter the data
+    predicate: Option<ExpressionRef>,
+    // The [`ColumnType`] of all the fields in the `logical_schema`
+    all_fields: Vec<ColumnType>,
+    // `true` if any column in the `logical_schema` is a partition column
+    have_partition_cols: bool,
 }
 
 /// This builder constructs a [`TableChangesScan`] that can be used to read the [`TableChanges`]

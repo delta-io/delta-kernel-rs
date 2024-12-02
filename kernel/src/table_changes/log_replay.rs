@@ -26,7 +26,9 @@ use itertools::Itertools;
 
 pub struct TableChangesScanData {
     pub data: Box<dyn EngineData>,
+    // The selection vector used to filter log actions.
     pub selection_vector: Vec<bool>,
+    // An optional map from a remove action's path to its deletion vector
     pub remove_dv: Option<Arc<HashMap<String, DvInfo>>>,
 }
 
@@ -117,7 +119,7 @@ struct LogReplayScanner {
     // in-commit timestamps, that timestamp will be used instead.
     timestamp: i64,
     // The schema of the table
-    schema: SchemaRef,
+    table_schema: SchemaRef,
     json_handler: Arc<dyn JsonHandler>,
     filter: Option<DataSkippingFilter>,
     expression_handler: Arc<dyn ExpressionHandler>,
@@ -129,7 +131,7 @@ impl LogReplayScanner {
         json_handler: Arc<dyn JsonHandler>,
         filter: Option<DataSkippingFilter>,
         expression_handler: Arc<dyn ExpressionHandler>,
-        schema: SchemaRef,
+        table_schema: SchemaRef,
     ) -> Self {
         Self {
             timestamp: commit_file.location.last_modified,
@@ -139,14 +141,14 @@ impl LogReplayScanner {
             has_cdc_action: Default::default(),
             remove_dvs: Default::default(),
             expression_handler,
-            schema,
+            table_schema,
         }
     }
     fn prepare_phase(&mut self) -> DeltaResult<()> {
-        let schema = PreparePhaseVisitor::schema()?;
+        let visitor_schema = PreparePhaseVisitor::schema()?;
         let action_iter = self.json_handler.read_json_files(
             &[self.commit_file.location.clone()],
-            schema,
+            visitor_schema,
             None,
         )?;
 
@@ -171,8 +173,8 @@ impl LogReplayScanner {
             if let Some((schema, configuration)) = visitor.metadata_info {
                 let schema: StructType = serde_json::from_str(&schema)?;
                 require!(
-                    self.schema.as_ref() == &schema,
-                    Error::change_data_feed_incompatible_schema(&self.schema, &schema)
+                    self.table_schema.as_ref() == &schema,
+                    Error::change_data_feed_incompatible_schema(&self.table_schema, &schema)
                 );
 
                 let table_properties = TableProperties::from(configuration);
@@ -206,7 +208,7 @@ impl LogReplayScanner {
             timestamp: _,
             filter,
             expression_handler,
-            schema: _,
+            table_schema: _,
         } = self;
         let remove_dvs = Arc::new(remove_dvs);
 
