@@ -261,7 +261,7 @@ impl Error {
         expected: &StructType,
         actual: &StructType,
     ) -> Self {
-        Self::ChangeDataFeedIncompatibleSchema(format!("{:?}", expected), format!("{:?}", actual))
+        Self::ChangeDataFeedIncompatibleSchema(format!("{expected:?}"), format!("{actual:?}"))
     }
 
     // Capture a backtrace when the error is constructed.

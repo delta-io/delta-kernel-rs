@@ -18,10 +18,7 @@ use crate::scan::state::DvInfo;
 use crate::schema::{ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructType};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{
-    DeltaResult, Engine, EngineData, Error, ExpressionHandler, ExpressionRef, JsonHandler,
-    RowVisitor,
-};
+use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef, RowVisitor};
 use itertools::Itertools;
 
 pub struct TableChangesScanData {
@@ -37,27 +34,20 @@ pub struct TableChangesScanData {
 /// `engine_data` _must_ be processed to complete the scan. Non-selected rows
 /// _must_ be ignored.
 pub(crate) fn table_changes_action_iter(
-    engine: &dyn Engine,
+    engine: Arc<dyn Engine>,
     commit_files: impl IntoIterator<Item = ParsedLogPath>,
     table_schema: SchemaRef,
     predicate: Option<ExpressionRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanData>>> {
-    let json_handler = engine.get_json_handler();
-    let filter = DataSkippingFilter::new(engine, &table_schema, predicate);
+    let filter = DataSkippingFilter::new(engine.as_ref(), &table_schema, predicate);
 
-    let expression_handler = engine.get_expression_handler();
     let result = commit_files
         .into_iter()
         .map(move |commit_file| -> DeltaResult<_> {
-            let mut scanner = LogReplayScanner::new(
-                commit_file,
-                json_handler.clone(),
-                filter.clone(),
-                expression_handler.clone(),
-                table_schema.clone(),
-            );
-            scanner.prepare_phase()?;
-            scanner.into_scan_batches()
+            let mut scanner =
+                LogReplayScanner::new(commit_file, filter.clone(), table_schema.clone());
+            scanner.prepare_phase(engine.as_ref())?;
+            scanner.into_scan_batches(engine.clone())
         })
         .flatten_ok()
         .map(|x| x?);
@@ -120,33 +110,27 @@ struct LogReplayScanner {
     timestamp: i64,
     // The schema of the table
     table_schema: SchemaRef,
-    json_handler: Arc<dyn JsonHandler>,
     filter: Option<DataSkippingFilter>,
-    expression_handler: Arc<dyn ExpressionHandler>,
 }
 
 impl LogReplayScanner {
     fn new(
         commit_file: ParsedLogPath,
-        json_handler: Arc<dyn JsonHandler>,
         filter: Option<DataSkippingFilter>,
-        expression_handler: Arc<dyn ExpressionHandler>,
         table_schema: SchemaRef,
     ) -> Self {
         Self {
             timestamp: commit_file.location.last_modified,
             commit_file,
-            json_handler,
             filter,
             has_cdc_action: Default::default(),
             remove_dvs: Default::default(),
-            expression_handler,
             table_schema,
         }
     }
-    fn prepare_phase(&mut self) -> DeltaResult<()> {
+    fn prepare_phase(&mut self, engine: &dyn Engine) -> DeltaResult<()> {
         let visitor_schema = PreparePhaseVisitor::schema()?;
-        let action_iter = self.json_handler.read_json_files(
+        let action_iter = engine.get_json_handler().read_json_files(
             &[self.commit_file.location.clone()],
             visitor_schema,
             None,
@@ -199,22 +183,24 @@ impl LogReplayScanner {
 
     fn into_scan_batches(
         self,
+        engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanData>>> {
         let Self {
             has_cdc_action,
             remove_dvs,
             commit_file,
-            json_handler,
             timestamp: _,
             filter,
-            expression_handler,
             table_schema: _,
         } = self;
         let remove_dvs = Arc::new(remove_dvs);
 
         let schema = FileActionSelectionVisitor::schema()?;
-        let action_iter =
-            json_handler.read_json_files(&[commit_file.location.clone()], schema, None)?;
+        let action_iter = engine.get_json_handler().read_json_files(
+            &[commit_file.location.clone()],
+            schema,
+            None,
+        )?;
 
         let result = action_iter.map(move |actions| -> DeltaResult<_> {
             let actions = actions?;
@@ -231,7 +217,8 @@ impl LogReplayScanner {
                 FileActionSelectionVisitor::new(&remove_dvs, selection_vector, has_cdc_action);
             visitor.visit_rows_of(actions.as_ref())?;
 
-            let data = expression_handler
+            let data = engine
+                .get_expression_handler()
                 .get_evaluator(
                     get_log_add_schema().clone(),
                     get_add_transform_expr(),
@@ -464,6 +451,7 @@ mod tests {
     use itertools::Itertools;
     use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::Arc;
 
     fn get_schema() -> StructType {
         StructType::new([
@@ -489,15 +477,8 @@ mod tests {
         Ok(log_segment.ascending_commit_files)
     }
 
-    fn get_commit_log_scanner(engine: &dyn Engine, commit: ParsedLogPath) -> LogReplayScanner {
-        let expression_handler = engine.get_expression_handler();
-        LogReplayScanner::new(
-            commit,
-            engine.get_json_handler(),
-            None,
-            expression_handler.clone(),
-            get_schema().into(),
-        )
+    fn get_commit_log_scanner(commit: ParsedLogPath) -> LogReplayScanner {
+        LogReplayScanner::new(commit, None, get_schema().into())
     }
     fn result_to_sv(iter: impl Iterator<Item = DeltaResult<TableChangesScanData>>) -> Vec<bool> {
         iter.map_ok(|scan_data| scan_data.selection_vector.into_iter())
@@ -508,7 +489,7 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_protocol() {
-        let engine = SyncEngine::new();
+        let engine = Arc::new(SyncEngine::new());
         let mut mock_table = MockTable::new();
         let schema_string = serde_json::to_string(&get_schema()).unwrap();
         mock_table
@@ -531,24 +512,24 @@ mod tests {
             ])
             .await;
 
-        let mut commits = get_segment(&engine, mock_table.table_root(), 0, None)
+        let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
             .unwrap()
             .into_iter();
 
-        let mut scanner = get_commit_log_scanner(&engine, commits.next().unwrap());
+        let mut scanner = get_commit_log_scanner(commits.next().unwrap());
 
-        scanner.prepare_phase().unwrap();
+        scanner.prepare_phase(engine.as_ref()).unwrap();
         assert!(!scanner.has_cdc_action);
         assert!(scanner.remove_dvs.is_empty());
 
         assert_eq!(
-            result_to_sv(scanner.into_scan_batches().unwrap()),
+            result_to_sv(scanner.into_scan_batches(engine.clone()).unwrap()),
             &[false, false]
         );
     }
     #[tokio::test]
     async fn configuration_fails() {
-        let engine = SyncEngine::new();
+        let engine = Arc::new(SyncEngine::new());
         let mut mock_table = MockTable::new();
         let schema_string = serde_json::to_string(&get_schema()).unwrap();
         mock_table
@@ -563,14 +544,14 @@ mod tests {
             .into()])
             .await;
 
-        let mut commits = get_segment(&engine, mock_table.table_root(), 0, None)
+        let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
             .unwrap()
             .into_iter();
 
-        let mut scanner = get_commit_log_scanner(&engine, commits.next().unwrap());
+        let mut scanner = get_commit_log_scanner(commits.next().unwrap());
 
         assert!(matches!(
-            scanner.prepare_phase(),
+            scanner.prepare_phase(engine.as_ref()),
             Err(Error::ChangeDataFeedUnsupported(_))
         ));
     }
@@ -602,17 +583,17 @@ mod tests {
             .unwrap()
             .into_iter();
 
-        let mut scanner = get_commit_log_scanner(&engine, commits.next().unwrap());
+        let mut scanner = get_commit_log_scanner(commits.next().unwrap());
 
         assert!(matches!(
-            scanner.prepare_phase(),
+            scanner.prepare_phase(&engine),
             Err(Error::ChangeDataFeedIncompatibleSchema(_, _))
         ));
     }
 
     #[tokio::test]
     async fn add_remove() {
-        let engine = SyncEngine::new();
+        let engine = Arc::new(SyncEngine::new());
         let mut mock_table = MockTable::new();
         mock_table
             .commit(&[
@@ -629,26 +610,26 @@ mod tests {
             ])
             .await;
 
-        let mut commits = get_segment(&engine, mock_table.table_root(), 0, None)
+        let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
             .unwrap()
             .into_iter();
 
         let commit = commits.next().unwrap();
-        let mut scanner = get_commit_log_scanner(&engine, commit);
+        let mut scanner = get_commit_log_scanner(commit);
 
-        scanner.prepare_phase().unwrap();
+        scanner.prepare_phase(engine.as_ref()).unwrap();
         assert!(!scanner.has_cdc_action);
         assert_eq!(scanner.remove_dvs, HashMap::new());
 
         assert_eq!(
-            result_to_sv(scanner.into_scan_batches().unwrap()),
+            result_to_sv(scanner.into_scan_batches(engine).unwrap()),
             &[true, true]
         );
     }
 
     #[tokio::test]
     async fn cdc_selection() {
-        let engine = SyncEngine::new();
+        let engine = Arc::new(SyncEngine::new());
         let mut mock_table = MockTable::new();
         mock_table
             .commit(&[
@@ -670,26 +651,26 @@ mod tests {
             ])
             .await;
 
-        let mut commits = get_segment(&engine, mock_table.table_root(), 0, None)
+        let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
             .unwrap()
             .into_iter();
 
         let commit = commits.next().unwrap();
-        let mut scanner = get_commit_log_scanner(&engine, commit);
+        let mut scanner = get_commit_log_scanner(commit);
 
-        scanner.prepare_phase().unwrap();
+        scanner.prepare_phase(engine.as_ref()).unwrap();
         assert!(scanner.has_cdc_action);
         assert_eq!(scanner.remove_dvs, HashMap::new());
 
         assert_eq!(
-            result_to_sv(scanner.into_scan_batches().unwrap()),
+            result_to_sv(scanner.into_scan_batches(engine).unwrap()),
             &[false, false, true]
         );
     }
 
     #[tokio::test]
     async fn dv() {
-        let engine = SyncEngine::new();
+        let engine = Arc::new(SyncEngine::new());
         let mut mock_table = MockTable::new();
 
         let deletion_vector1 = DeletionVectorDescriptor {
@@ -728,14 +709,14 @@ mod tests {
             ])
             .await;
 
-        let mut commits = get_segment(&engine, mock_table.table_root(), 0, None)
+        let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
             .unwrap()
             .into_iter();
 
         let commit = commits.next().unwrap();
-        let mut scanner = get_commit_log_scanner(&engine, commit);
+        let mut scanner = get_commit_log_scanner(commit);
 
-        scanner.prepare_phase().unwrap();
+        scanner.prepare_phase(engine.as_ref()).unwrap();
         assert!(!scanner.has_cdc_action);
         assert_eq!(
             scanner.remove_dvs,
@@ -748,7 +729,7 @@ mod tests {
         );
 
         assert_eq!(
-            result_to_sv(scanner.into_scan_batches().unwrap()),
+            result_to_sv(scanner.into_scan_batches(engine).unwrap()),
             &[true, false, true]
         );
     }
@@ -786,9 +767,9 @@ mod tests {
             .into_iter();
 
         let commit = commits.next().unwrap();
-        let mut scanner = get_commit_log_scanner(&engine, commit);
+        let mut scanner = get_commit_log_scanner(commit);
 
-        assert!(scanner.prepare_phase().is_err());
+        assert!(scanner.prepare_phase(&engine).is_err());
     }
     #[tokio::test]
     async fn in_commit_timestamp() {
@@ -816,9 +797,9 @@ mod tests {
             .into_iter();
 
         let commit = commits.next().unwrap();
-        let mut scanner = get_commit_log_scanner(&engine, commit);
+        let mut scanner = get_commit_log_scanner(commit);
 
-        scanner.prepare_phase().unwrap();
+        scanner.prepare_phase(&engine).unwrap();
         assert_eq!(scanner.timestamp, timestamp);
     }
 
@@ -841,9 +822,9 @@ mod tests {
 
         let commit = commits.next().unwrap();
         let file_meta_ts = commit.location.last_modified;
-        let mut scanner = get_commit_log_scanner(&engine, commit);
+        let mut scanner = get_commit_log_scanner(commit);
 
-        scanner.prepare_phase().unwrap();
+        scanner.prepare_phase(&engine).unwrap();
         assert_eq!(scanner.timestamp, file_meta_ts);
     }
 }

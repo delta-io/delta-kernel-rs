@@ -178,7 +178,7 @@ impl TableChangesScanBuilder {
 impl TableChangesScan {
     pub fn scan_data(
         &self,
-        engine: &dyn Engine,
+        engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanData>>> {
         let commits = self
             .table_changes
