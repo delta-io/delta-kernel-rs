@@ -9,7 +9,7 @@ use crate::actions::{
     get_log_add_schema, get_log_schema, Protocol, ADD_NAME, CDC_NAME, COMMIT_INFO_NAME,
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
-use crate::engine_data::TypedGetData;
+use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_expr, column_name, ColumnName, Expression};
 use crate::path::ParsedLogPath;
 use crate::scan::data_skipping::DataSkippingFilter;
@@ -42,20 +42,22 @@ pub(crate) fn table_changes_action_iter(
     table_schema: SchemaRef,
     predicate: Option<ExpressionRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanData>>> {
-    let filter = DataSkippingFilter::new(engine.as_ref(), &table_schema, predicate);
-
     let result = commit_files
         .into_iter()
         .map(move |commit_file| -> DeltaResult<_> {
             let scanner = prepare_table_changes(
                 commit_file,
                 engine.as_ref(),
-                filter.clone(),
-                table_schema.clone(),
+                &table_schema,
+                predicate.clone(),
             )?;
             scanner.into_scan_batches(engine.clone())
         })
+        // Iterator<DeltaResult<Iterator<DeltaResult<TableChangesScanData>>>> to
+        // Iterator<DeltaResult<DeltaResult<TableChangesScanData>>>
         .flatten_ok()
+        // Iterator<DeltaResult<DeltaResult<TableChangesScanData>>> to
+        // Iterator<DeltaResult<TableChangesScanData>>
         .map(|x| x?);
     Ok(result)
 }
@@ -101,7 +103,7 @@ fn get_add_transform_expr() -> Expression {
 ///
 /// Note: As a consequence of the two phases, LogReplayScanner will iterate over each action in the
 /// commit twice. It also may use an unbounded amount of memory, proportional to the number of
-/// `add` + `remove` actions in the commit.
+/// `add` + `remove` actions in the _single_ commit.
 struct LogReplayScanner {
     // True if a `cdc` action was found after running [`LogReplayScanner::prepare_table_changes`]
     has_cdc_action: bool,
@@ -125,9 +127,10 @@ struct LogReplayScanner {
 fn prepare_table_changes(
     commit_file: ParsedLogPath,
     engine: &dyn Engine,
-    filter: Option<DataSkippingFilter>,
-    table_schema: SchemaRef,
+    table_schema: &SchemaRef,
+    physical_predicate: Option<ExpressionRef>,
 ) -> DeltaResult<LogReplayScanner> {
+    let filter = DataSkippingFilter::new(engine, table_schema, physical_predicate);
     let visitor_schema = PreparePhaseVisitor::schema()?;
     let action_iter = engine.get_json_handler().read_json_files(
         &[commit_file.location.clone()],
@@ -141,7 +144,6 @@ fn prepare_table_changes(
     let mut timestamp = commit_file.location.last_modified;
     for actions in action_iter {
         let actions = actions?;
-
         let selection_vector = match &filter {
             Some(filter) => filter.apply(actions.as_ref())?,
             None => vec![true; actions.len()],
@@ -163,9 +165,8 @@ fn prepare_table_changes(
             let schema: StructType = serde_json::from_str(&schema)?;
             require!(
                 table_schema.as_ref() == &schema,
-                Error::change_data_feed_incompatible_schema(&table_schema, &schema)
+                Error::change_data_feed_incompatible_schema(table_schema, &schema)
             );
-
             let table_properties = TableProperties::from(configuration);
             require!(
                 table_properties.enable_change_data_feed.unwrap_or(false),
@@ -173,7 +174,6 @@ fn prepare_table_changes(
             )
         }
     }
-
     // We resolve the remove deletion vector map after visiting the entire commit.
     if has_cdc_action {
         remove_dvs.clear();
@@ -199,6 +199,7 @@ impl LogReplayScanner {
             has_cdc_action,
             remove_dvs,
             commit_file,
+            // TODO: Add the timestamp as a column with an expression
             timestamp: _,
             filter,
         } = self;
@@ -317,11 +318,7 @@ impl<'a> RowVisitor for PreparePhaseVisitor<'a> {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'b>(
-        &mut self,
-        row_count: usize,
-        getters: &[&'b dyn crate::engine_data::GetData<'b>],
-    ) -> DeltaResult<()> {
+    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
         require!(
             getters.len() == 15,
             Error::InternalError(format!(
@@ -347,11 +344,7 @@ impl<'a> RowVisitor for PreparePhaseVisitor<'a> {
             } else if let Some(schema) = getters[9].get_str(i, "metaData.schemaString")? {
                 let configuration_map_opt: Option<HashMap<_, _>> =
                     getters[10].get_opt(i, "metadata.configuration")?;
-
-                // A null configuration here means that we found an empty configuration. This is
-                // different from not finding any metadata action, where self.metadata = None
                 let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
-
                 self.metadata_info = Some((schema.to_string(), configuration));
             } else if let Some(min_reader_version) =
                 getters[11].get_int(i, "protocol.min_reader_version")?
@@ -391,12 +384,7 @@ impl<'a> FileActionSelectionVisitor<'a> {
 }
 
 impl<'a> RowVisitor for FileActionSelectionVisitor<'a> {
-    fn selected_column_names_and_types(
-        &self,
-    ) -> (
-        &'static [crate::expressions::ColumnName],
-        &'static [crate::schema::DataType],
-    ) {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         // Note: The order of the names and types is based on [`FileActionSelectionVisitor::schema`]
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             const STRING: DataType = DataType::STRING;
@@ -411,14 +399,9 @@ impl<'a> RowVisitor for FileActionSelectionVisitor<'a> {
         NAMES_AND_TYPES.as_ref()
     }
 
-    fn visit<'b>(
-        &mut self,
-        row_count: usize,
-        getters: &[&'b dyn crate::engine_data::GetData<'b>],
-    ) -> DeltaResult<()> {
-        let expected_getters = 3;
+    fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
         require!(
-            getters.len() == expected_getters,
+            getters.len() == 3,
             Error::InternalError(format!(
                 "Wrong number of AddRemoveDedupVisitor getters: {}",
                 getters.len()

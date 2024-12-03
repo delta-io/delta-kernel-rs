@@ -78,8 +78,8 @@ async fn metadata_protocol() {
     let scanner = prepare_table_changes(
         commits.next().unwrap(),
         engine.as_ref(),
+        &get_schema().into(),
         None,
-        get_schema().into(),
     )
     .unwrap();
     assert!(!scanner.has_cdc_action);
@@ -114,8 +114,8 @@ async fn configuration_fails() {
     let res = prepare_table_changes(
         commits.next().unwrap(),
         engine.as_ref(),
+        &get_schema().into(),
         None,
-        get_schema().into(),
     );
 
     assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))));
@@ -151,8 +151,8 @@ async fn incompatible_schema() {
     let res = prepare_table_changes(
         commits.next().unwrap(),
         engine.as_ref(),
+        &get_schema().into(),
         None,
-        get_schema().into(),
     );
 
     assert!(matches!(
@@ -187,8 +187,8 @@ async fn add_remove() {
     let scanner = prepare_table_changes(
         commits.next().unwrap(),
         engine.as_ref(),
+        &get_schema().into(),
         None,
-        get_schema().into(),
     )
     .unwrap();
     assert!(!scanner.has_cdc_action);
@@ -231,8 +231,8 @@ async fn cdc_selection() {
     let scanner = prepare_table_changes(
         commits.next().unwrap(),
         engine.as_ref(),
+        &get_schema().into(),
         None,
-        get_schema().into(),
     )
     .unwrap();
     assert!(scanner.has_cdc_action);
@@ -292,8 +292,8 @@ async fn dv() {
     let scanner = prepare_table_changes(
         commits.next().unwrap(),
         engine.as_ref(),
+        &get_schema().into(),
         None,
-        get_schema().into(),
     )
     .unwrap();
     assert!(!scanner.has_cdc_action);
@@ -348,8 +348,8 @@ async fn failing_protocol() {
     let res = prepare_table_changes(
         commits.next().unwrap(),
         engine.as_ref(),
+        &get_schema().into(),
         None,
-        get_schema().into(),
     );
 
     assert!(res.is_err());
@@ -382,8 +382,8 @@ async fn in_commit_timestamp() {
     let scanner = prepare_table_changes(
         commits.next().unwrap(),
         engine.as_ref(),
+        &get_schema().into(),
         None,
-        get_schema().into(),
     )
     .unwrap();
     assert_eq!(scanner.timestamp, timestamp);
@@ -409,6 +409,6 @@ async fn file_meta_timestamp() {
     let commit = commits.next().unwrap();
     let file_meta_ts = commit.location.last_modified;
     let scanner =
-        prepare_table_changes(commit, engine.as_ref(), None, get_schema().into()).unwrap();
+        prepare_table_changes(commit, engine.as_ref(), &get_schema().into(), None).unwrap();
     assert_eq!(scanner.timestamp, file_meta_ts);
 }
