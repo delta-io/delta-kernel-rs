@@ -79,7 +79,7 @@ fn get_add_transform_expr() -> Expression {
 
 /// Processes a single commit file from the log to generate an iterator of [`TableChangesScanData`].
 /// The scanner operates in two phases that _must_ be performed in the following order:
-/// 1. Prepare phase [`LogReplayScanner::prepare_table_changes`]: This performs one iteration over every
+/// 1. Prepare phase [`prepare_table_changes`]: This performs one iteration over every
 ///    action in the commit. In this phase, we do the following:
 ///     - Find the timestamp from a `CommitInfo` action if it exists. These are generated when
 ///       In-commit timestamps is enabled.
@@ -229,7 +229,6 @@ impl LogReplayScanner {
             let mut visitor =
                 FileActionSelectionVisitor::new(&remove_dvs, selection_vector, has_cdc_action);
             visitor.visit_rows_of(actions.as_ref())?;
-
             let data = engine
                 .get_expression_handler()
                 .get_evaluator(
@@ -329,7 +328,6 @@ impl<'a> RowVisitor for PreparePhaseVisitor<'a> {
                 getters.len()
             ))
         );
-
         for i in 0..row_count {
             if !self.selection_vector[i] {
                 continue;
@@ -345,8 +343,7 @@ impl<'a> RowVisitor for PreparePhaseVisitor<'a> {
             } else if let Some(timestamp) = getters[8].get_long(i, "commitInfo.timestamp")? {
                 *self.timestamp = timestamp;
             } else if let Some(schema) = getters[9].get_str(i, "metaData.schemaString")? {
-                let configuration_map_opt: Option<HashMap<_, _>> =
-                    getters[10].get_opt(i, "metadata.configuration")?;
+                let configuration_map_opt = getters[10].get_opt(i, "metadata.configuration")?;
                 let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
                 self.metadata_info = Some((schema.to_string(), configuration));
             } else if let Some(min_reader_version) =
