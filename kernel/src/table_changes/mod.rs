@@ -10,7 +10,9 @@ use crate::schema::{DataType, Schema, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::{DeltaResult, Engine, Error, Version};
 
+mod log_replay;
 pub mod scan;
+mod scan_file;
 
 static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
     [
