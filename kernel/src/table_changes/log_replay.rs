@@ -24,13 +24,18 @@ use itertools::Itertools;
 #[cfg(test)]
 mod tests;
 
+/// Scan data for a Change Data Feed query. This holds metadata that is needed to read data rows.
 #[allow(unused)]
 pub(crate) struct TableChangesScanData {
-    // Engine data
+    /// Engine data with the schema defined in [`scan_row_schema`]. Each row is a transformed
+    /// action from the delta log.
+    ///
+    /// Note: The schema of the engine data will be updated in the future columns used by
+    /// Change Data Feed.
     pub(crate) data: Box<dyn EngineData>,
-    // The selection vector used to filter log actions.
+    /// The selection vector used to filter log actions in the engine data.
     pub(crate) selection_vector: Vec<bool>,
-    // An optional map from a remove action's path to its deletion vector
+    /// An optional map from a remove action's path to its deletion vector
     pub(crate) remove_dv: Option<Arc<HashMap<String, DvInfo>>>,
 }
 
@@ -47,7 +52,7 @@ pub(crate) fn table_changes_action_iter(
     let result = commit_files
         .into_iter()
         .map(move |commit_file| -> DeltaResult<_> {
-            let scanner = prepare_table_changes(
+            let scanner = LogReplayScanner::prepare_table_changes(
                 commit_file,
                 engine.as_ref(),
                 &table_schema,
@@ -126,76 +131,76 @@ struct LogReplayScanner {
     filter: Option<DataSkippingFilter>,
 }
 
-fn prepare_table_changes(
-    commit_file: ParsedLogPath,
-    engine: &dyn Engine,
-    table_schema: &SchemaRef,
-    physical_predicate: Option<ExpressionRef>,
-) -> DeltaResult<LogReplayScanner> {
-    let filter = DataSkippingFilter::new(engine, table_schema, physical_predicate);
-    let visitor_schema = PreparePhaseVisitor::schema()?;
-    let action_iter = engine.get_json_handler().read_json_files(
-        &[commit_file.location.clone()],
-        visitor_schema,
-        None,
-    )?;
-
-    let mut remove_dvs = HashMap::default();
-    let mut add_paths = HashSet::new();
-    let mut has_cdc_action = false;
-    let mut timestamp = commit_file.location.last_modified;
-    for actions in action_iter {
-        let actions = actions?;
-        let selection_vector = match &filter {
-            Some(filter) => filter.apply(actions.as_ref())?,
-            None => vec![true; actions.len()],
-        };
-
-        let mut visitor = PreparePhaseVisitor::new(
-            selection_vector,
-            &mut add_paths,
-            &mut remove_dvs,
-            &mut has_cdc_action,
-            &mut timestamp,
-        );
-        visitor.visit_rows_of(actions.as_ref())?;
-
-        if let Some(protocol) = visitor.protocol {
-            protocol.ensure_read_supported()?;
-        }
-        if let Some((schema, configuration)) = visitor.metadata_info {
-            let schema: StructType = serde_json::from_str(&schema)?;
-            // Currently, schema compatibility is defined as having equal schema types. In the
-            // future, more permisive schema evolution will be supported.
-            // See: https://github.com/delta-io/delta-kernel-rs/issues/523
-            require!(
-                table_schema.as_ref() == &schema,
-                Error::change_data_feed_incompatible_schema(table_schema, &schema)
-            );
-            let table_properties = TableProperties::from(configuration);
-            require!(
-                table_properties.enable_change_data_feed.unwrap_or(false),
-                Error::change_data_feed_unsupported(commit_file.version)
-            )
-        }
-    }
-    // We resolve the remove deletion vector map after visiting the entire commit.
-    if has_cdc_action {
-        remove_dvs.clear();
-    } else {
-        // The only (path, deletion_vector) pairs we must track are ones whose path is the
-        // same as an `add` action.
-        remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
-    }
-    Ok(LogReplayScanner {
-        timestamp,
-        commit_file,
-        has_cdc_action,
-        remove_dvs,
-        filter,
-    })
-}
 impl LogReplayScanner {
+    fn prepare_table_changes(
+        commit_file: ParsedLogPath,
+        engine: &dyn Engine,
+        table_schema: &SchemaRef,
+        physical_predicate: Option<ExpressionRef>,
+    ) -> DeltaResult<Self> {
+        let filter = DataSkippingFilter::new(engine, table_schema, physical_predicate);
+        let visitor_schema = PreparePhaseVisitor::schema()?;
+        let action_iter = engine.get_json_handler().read_json_files(
+            &[commit_file.location.clone()],
+            visitor_schema,
+            None,
+        )?;
+
+        let mut remove_dvs = HashMap::default();
+        let mut add_paths = HashSet::new();
+        let mut has_cdc_action = false;
+        let mut timestamp = commit_file.location.last_modified;
+        for actions in action_iter {
+            let actions = actions?;
+            let selection_vector = match &filter {
+                Some(filter) => filter.apply(actions.as_ref())?,
+                None => vec![true; actions.len()],
+            };
+
+            let mut visitor = PreparePhaseVisitor::new(
+                selection_vector,
+                &mut add_paths,
+                &mut remove_dvs,
+                &mut has_cdc_action,
+                &mut timestamp,
+            );
+            visitor.visit_rows_of(actions.as_ref())?;
+
+            if let Some(protocol) = visitor.protocol {
+                protocol.ensure_read_supported()?;
+            }
+            if let Some((schema, configuration)) = visitor.metadata_info {
+                let schema: StructType = serde_json::from_str(&schema)?;
+                // Currently, schema compatibility is defined as having equal schema types. In the
+                // future, more permisive schema evolution will be supported.
+                // See: https://github.com/delta-io/delta-kernel-rs/issues/523
+                require!(
+                    table_schema.as_ref() == &schema,
+                    Error::change_data_feed_incompatible_schema(table_schema, &schema)
+                );
+                let table_properties = TableProperties::from(configuration);
+                require!(
+                    table_properties.enable_change_data_feed.unwrap_or(false),
+                    Error::change_data_feed_unsupported(commit_file.version)
+                )
+            }
+        }
+        // We resolve the remove deletion vector map after visiting the entire commit.
+        if has_cdc_action {
+            remove_dvs.clear();
+        } else {
+            // The only (path, deletion_vector) pairs we must track are ones whose path is the
+            // same as an `add` action.
+            remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
+        }
+        Ok(LogReplayScanner {
+            timestamp,
+            commit_file,
+            has_cdc_action,
+            remove_dvs,
+            filter,
+        })
+    }
     fn into_scan_batches(
         self,
         engine: Arc<dyn Engine>,

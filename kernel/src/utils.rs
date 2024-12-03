@@ -70,13 +70,15 @@ pub(crate) mod test_utils {
         }
     }
 
-    pub(crate) struct MockTable {
+    // A mock table that writes commits to a local temporary delta log. This can be used to
+    // construct a delta log used for testing.
+    pub(crate) struct LocalMockTable {
         commit_num: u64,
         store: Arc<LocalFileSystem>,
         dir: TempDir,
     }
 
-    impl MockTable {
+    impl LocalMockTable {
         pub(crate) fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());

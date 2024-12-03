@@ -6,8 +6,8 @@ use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::scan::state::DvInfo;
 use crate::schema::{DataType, StructField, StructType};
-use crate::table_changes::log_replay::prepare_table_changes;
-use crate::utils::test_utils::MockTable;
+use crate::table_changes::log_replay::LogReplayScanner;
+use crate::utils::test_utils::LocalMockTable;
 use crate::{DeltaResult, Engine, Error, Version};
 
 use itertools::Itertools;
@@ -49,7 +49,7 @@ fn result_to_sv(iter: impl Iterator<Item = DeltaResult<TableChangesScanData>>) -
 #[tokio::test]
 async fn metadata_protocol() {
     let engine = Arc::new(SyncEngine::new());
-    let mut mock_table = MockTable::new();
+    let mut mock_table = LocalMockTable::new();
     let schema_string = serde_json::to_string(&get_schema()).unwrap();
     mock_table
         .commit(
@@ -78,7 +78,7 @@ async fn metadata_protocol() {
         .unwrap()
         .into_iter();
 
-    let scanner = prepare_table_changes(
+    let scanner = LogReplayScanner::prepare_table_changes(
         commits.next().unwrap(),
         engine.as_ref(),
         &get_schema().into(),
@@ -96,7 +96,7 @@ async fn metadata_protocol() {
 #[tokio::test]
 async fn configuration_fails() {
     let engine = Arc::new(SyncEngine::new());
-    let mut mock_table = MockTable::new();
+    let mut mock_table = LocalMockTable::new();
     let schema_string = serde_json::to_string(&get_schema()).unwrap();
     mock_table
         .commit(
@@ -117,7 +117,7 @@ async fn configuration_fails() {
         .unwrap()
         .into_iter();
 
-    let res = prepare_table_changes(
+    let res = LogReplayScanner::prepare_table_changes(
         commits.next().unwrap(),
         engine.as_ref(),
         &get_schema().into(),
@@ -130,7 +130,7 @@ async fn configuration_fails() {
 #[tokio::test]
 async fn incompatible_schema() {
     let engine = Arc::new(SyncEngine::new());
-    let mut mock_table = MockTable::new();
+    let mut mock_table = LocalMockTable::new();
 
     // The original schema has two fields: `id` and value.
     let schema = get_schema().project(&["id"]).unwrap();
@@ -157,7 +157,7 @@ async fn incompatible_schema() {
         .unwrap()
         .into_iter();
 
-    let res = prepare_table_changes(
+    let res = LogReplayScanner::prepare_table_changes(
         commits.next().unwrap(),
         engine.as_ref(),
         &get_schema().into(),
@@ -173,7 +173,7 @@ async fn incompatible_schema() {
 #[tokio::test]
 async fn add_remove() {
     let engine = Arc::new(SyncEngine::new());
-    let mut mock_table = MockTable::new();
+    let mut mock_table = LocalMockTable::new();
     mock_table
         .commit(
             [
@@ -196,7 +196,7 @@ async fn add_remove() {
         .unwrap()
         .into_iter();
 
-    let scanner = prepare_table_changes(
+    let scanner = LogReplayScanner::prepare_table_changes(
         commits.next().unwrap(),
         engine.as_ref(),
         &get_schema().into(),
@@ -215,7 +215,7 @@ async fn add_remove() {
 #[tokio::test]
 async fn cdc_selection() {
     let engine = Arc::new(SyncEngine::new());
-    let mut mock_table = MockTable::new();
+    let mut mock_table = LocalMockTable::new();
     mock_table
         .commit(
             [
@@ -243,7 +243,7 @@ async fn cdc_selection() {
         .unwrap()
         .into_iter();
 
-    let scanner = prepare_table_changes(
+    let scanner = LogReplayScanner::prepare_table_changes(
         commits.next().unwrap(),
         engine.as_ref(),
         &get_schema().into(),
@@ -262,7 +262,7 @@ async fn cdc_selection() {
 #[tokio::test]
 async fn dv() {
     let engine = Arc::new(SyncEngine::new());
-    let mut mock_table = MockTable::new();
+    let mut mock_table = LocalMockTable::new();
 
     let deletion_vector1 = DeletionVectorDescriptor {
         storage_type: "u".to_string(),
@@ -307,7 +307,7 @@ async fn dv() {
         .unwrap()
         .into_iter();
 
-    let scanner = prepare_table_changes(
+    let scanner = LogReplayScanner::prepare_table_changes(
         commits.next().unwrap(),
         engine.as_ref(),
         &get_schema().into(),
@@ -333,7 +333,7 @@ async fn dv() {
 #[tokio::test]
 async fn failing_protocol() {
     let engine = Arc::new(SyncEngine::new());
-    let mut mock_table = MockTable::new();
+    let mut mock_table = LocalMockTable::new();
 
     let protocol = Protocol::try_new(
         3,
@@ -366,7 +366,7 @@ async fn failing_protocol() {
         .unwrap()
         .into_iter();
 
-    let res = prepare_table_changes(
+    let res = LogReplayScanner::prepare_table_changes(
         commits.next().unwrap(),
         engine.as_ref(),
         &get_schema().into(),
@@ -378,7 +378,7 @@ async fn failing_protocol() {
 #[tokio::test]
 async fn in_commit_timestamp() {
     let engine = Arc::new(SyncEngine::new());
-    let mut mock_table = MockTable::new();
+    let mut mock_table = LocalMockTable::new();
 
     let timestamp = 123456;
     mock_table
@@ -403,7 +403,7 @@ async fn in_commit_timestamp() {
         .unwrap()
         .into_iter();
 
-    let scanner = prepare_table_changes(
+    let scanner = LogReplayScanner::prepare_table_changes(
         commits.next().unwrap(),
         engine.as_ref(),
         &get_schema().into(),
@@ -416,7 +416,7 @@ async fn in_commit_timestamp() {
 #[tokio::test]
 async fn file_meta_timestamp() {
     let engine = Arc::new(SyncEngine::new());
-    let mut mock_table = MockTable::new();
+    let mut mock_table = LocalMockTable::new();
 
     mock_table
         .commit(
@@ -435,7 +435,12 @@ async fn file_meta_timestamp() {
 
     let commit = commits.next().unwrap();
     let file_meta_ts = commit.location.last_modified;
-    let scanner =
-        prepare_table_changes(commit, engine.as_ref(), &get_schema().into(), None).unwrap();
+    let scanner = LogReplayScanner::prepare_table_changes(
+        commit,
+        engine.as_ref(),
+        &get_schema().into(),
+        None,
+    )
+    .unwrap();
     assert_eq!(scanner.timestamp, file_meta_ts);
 }
