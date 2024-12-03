@@ -1,7 +1,6 @@
 //! Traits that engines need to implement in order to pass data between themselves and kernel.
 
-use crate::expressions::ColumnName;
-use crate::schema::DataType;
+use crate::schema::{ColumnName, DataType};
 use crate::{AsAny, DeltaResult, Error};
 
 use tracing::debug;

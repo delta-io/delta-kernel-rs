@@ -8,7 +8,6 @@ use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::{DataType, Schema, StructField, StructType};
 use crate::snapshot::Snapshot;
-use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Engine, Error, Version};
 
 pub mod scan;
@@ -163,11 +162,6 @@ impl TableChanges {
     #[allow(unused)]
     pub(crate) fn partition_columns(&self) -> &Vec<String> {
         &self.end_snapshot.metadata().partition_columns
-    }
-    /// The column mapping mode at the end schema.
-    #[allow(unused)]
-    pub(crate) fn column_mapping_mode(&self) -> &ColumnMappingMode {
-        &self.end_snapshot.column_mapping_mode
     }
 
     /// Create a [`TableChangesScanBuilder`] for an `Arc<TableChanges>`.

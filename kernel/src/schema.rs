@@ -9,8 +9,8 @@ use indexmap::IndexMap;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::expressions::ColumnName;
-use crate::table_features::ColumnMappingMode;
+// re-export because many call sites that use schemas do not necessarily use expressions
+pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
@@ -131,20 +131,18 @@ impl StructField {
         self.metadata.get(key.as_ref())
     }
 
-    /// Get the physical name for this field as it should be read from parquet, based on the
-    /// specified column mapping mode.
-    pub fn physical_name(&self, mapping_mode: ColumnMappingMode) -> DeltaResult<&str> {
-        let physical_name_key = ColumnMetadataKey::ColumnMappingPhysicalName.as_ref();
-        let name_mapped_name = self.metadata.get(physical_name_key);
-        match (mapping_mode, name_mapped_name) {
-            (ColumnMappingMode::None, _) => Ok(self.name.as_str()),
-            (ColumnMappingMode::Name, Some(MetadataValue::String(name))) => Ok(name),
-            (ColumnMappingMode::Name, invalid) => Err(Error::generic(format!(
-                "Missing or invalid {physical_name_key}: {invalid:?}"
-            ))),
-            (ColumnMappingMode::Id, _) => {
-                Err(Error::generic("Don't support id column mapping yet"))
-            }
+    /// Get the physical name for this field as it should be read from parquet.
+    ///
+    /// NOTE: Caller affirms that the schema was already validated by
+    /// [`crate::table_features::validate_schema_column_mapping`], to ensure that
+    /// annotations are always and only present when column mapping mode is enabled.
+    pub fn physical_name(&self) -> &str {
+        match self
+            .metadata
+            .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+        {
+            Some(MetadataValue::String(physical_name)) => physical_name,
+            _ => &self.name,
         }
     }
 
@@ -188,32 +186,27 @@ impl StructField {
             .collect()
     }
 
-    pub fn make_physical(&self, mapping_mode: ColumnMappingMode) -> DeltaResult<Self> {
-        use ColumnMappingMode::*;
-        match mapping_mode {
-            Id => return Err(Error::generic("Column ID mapping mode not supported")),
-            None => return Ok(self.clone()),
-            Name => {} // fall out
-        }
-
-        struct ApplyNameMapping;
-        impl<'a> SchemaTransform<'a> for ApplyNameMapping {
+    /// Applies physical name mappings to this field
+    ///
+    /// NOTE: Caller affirms that the schema was already validated by
+    /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
+    /// always and only present when column mapping mode is enabled.
+    pub fn make_physical(&self) -> Self {
+        struct MakePhysical;
+        impl<'a> SchemaTransform<'a> for MakePhysical {
             fn transform_struct_field(
                 &mut self,
                 field: &'a StructField,
             ) -> Option<Cow<'a, StructField>> {
                 let field = self.recurse_into_struct_field(field)?;
-                match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
-                    Some(MetadataValue::String(physical_name)) => {
-                        Some(Cow::Owned(field.with_name(physical_name)))
-                    }
-                    _ => Some(field),
-                }
+                Some(Cow::Owned(field.with_name(field.physical_name())))
             }
         }
-
-        let field = ApplyNameMapping.transform_struct_field(self);
-        Ok(field.unwrap().into_owned())
+        // NOTE: unwrap is safe because the transformer is incapable of returning None
+        MakePhysical
+            .transform_struct_field(self)
+            .unwrap()
+            .into_owned()
     }
 }
 
@@ -1034,10 +1027,10 @@ mod tests {
             .unwrap();
         assert!(matches!(col_id, MetadataValue::Number(num) if *num == 4));
         assert_eq!(
-            field.physical_name(ColumnMappingMode::Name).unwrap(),
+            field.physical_name(),
             "col-5f422f40-de70-45b2-88ab-1d5c90e94db1"
         );
-        let physical_field = field.make_physical(ColumnMappingMode::Name).unwrap();
+        let physical_field = field.make_physical();
         assert_eq!(
             physical_field.name,
             "col-5f422f40-de70-45b2-88ab-1d5c90e94db1"

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumString, VariantNames};
 
 pub(crate) use column_mapping::column_mapping_mode;
-pub use column_mapping::ColumnMappingMode;
+pub use column_mapping::{validate_schema_column_mapping, ColumnMappingMode};
 mod column_mapping;
 
 /// Reader features communicate capabilities that must be implemented in order to correctly read a

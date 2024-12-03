@@ -10,7 +10,9 @@ use crate::actions::{Metadata, Protocol};
 use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
 use crate::schema::Schema;
-use crate::table_features::{column_mapping_mode, ColumnMappingMode};
+use crate::table_features::{
+    column_mapping_mode, validate_schema_column_mapping, ColumnMappingMode,
+};
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, Error, FileSystemClient, Version};
 
@@ -82,9 +84,12 @@ impl Snapshot {
         // important! before a read/write to the table we must check it is supported
         protocol.ensure_read_supported()?;
 
-        let schema = metadata.schema()?;
+        // validate column mapping mode -- all schema fields should be correctly (un)annotated
+        let schema = metadata.parse_schema()?;
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
+        validate_schema_column_mapping(&schema, column_mapping_mode)?;
+
         Ok(Self {
             table_root: location,
             log_segment,

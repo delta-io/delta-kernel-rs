@@ -95,7 +95,6 @@ impl ScanBuilder {
         let (all_fields, read_fields, have_partition_cols) = get_state_info(
             logical_schema.as_ref(),
             &self.snapshot.metadata().partition_columns,
-            self.snapshot.column_mapping_mode,
         )?;
         let physical_schema = Arc::new(StructType::new(read_fields));
 
@@ -402,7 +401,6 @@ fn parse_partition_value(raw: Option<&String>, data_type: &DataType) -> DeltaRes
 fn get_state_info(
     logical_schema: &Schema,
     partition_columns: &[String],
-    column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<(Vec<ColumnType>, Vec<StructField>, bool)> {
     let mut have_partition_cols = false;
     let mut read_fields = Vec::with_capacity(logical_schema.fields.len());
@@ -422,7 +420,7 @@ fn get_state_info(
             } else {
                 // Add to read schema, store field so we can build a `Column` expression later
                 // if needed (i.e. if we have partition columns)
-                let physical_field = logical_field.make_physical(column_mapping_mode)?;
+                let physical_field = logical_field.make_physical();
                 debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                 let physical_name = physical_field.name.clone();
                 read_fields.push(physical_field);
@@ -454,7 +452,6 @@ pub fn transform_to_logical(
     let (all_fields, _read_fields, have_partition_cols) = get_state_info(
         &global_state.logical_schema,
         &global_state.partition_columns,
-        global_state.column_mapping_mode,
     )?;
     transform_to_logical_internal(
         engine,
@@ -491,7 +488,7 @@ fn transform_to_logical_internal(
                         "logical schema did not contain expected field, can't transform data",
                     ));
                 };
-                let name = field.physical_name(global_state.column_mapping_mode)?;
+                let name = field.physical_name();
                 let value_expression =
                     parse_partition_value(partition_values.get(name), field.data_type())?;
                 Ok(value_expression.into())
