@@ -6,7 +6,7 @@ use std::{
     str::Utf8Error,
 };
 
-use crate::schema::DataType;
+use crate::schema::{DataType, StructType};
 use crate::table_properties::ParseIntervalError;
 use crate::Version;
 
@@ -188,6 +188,9 @@ pub enum Error {
 
     #[error("Change data feed is unsupported for the table at version {0}")]
     ChangeDataFeedUnsupported(Version),
+
+    #[error("Change data feed encountered incompatible schema. Expected {0}, got {1}")]
+    ChangeDataFeedIncompatibleSchema(String, String),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -253,6 +256,12 @@ impl Error {
     }
     pub fn change_data_feed_unsupported(version: impl Into<Version>) -> Self {
         Self::ChangeDataFeedUnsupported(version.into())
+    }
+    pub(crate) fn change_data_feed_incompatible_schema(
+        expected: &StructType,
+        actual: &StructType,
+    ) -> Self {
+        Self::ChangeDataFeedIncompatibleSchema(format!("{expected:?}"), format!("{actual:?}"))
     }
 
     // Capture a backtrace when the error is constructed.

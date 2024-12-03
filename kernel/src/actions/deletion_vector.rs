@@ -1,10 +1,9 @@
 //! Code relating to parsing and using deletion vectors
 
-use std::io::{Cursor, Read};
-use std::sync::Arc;
-
 use bytes::Bytes;
 use roaring::RoaringTreemap;
+use std::io::{Cursor, Read};
+use std::sync::Arc;
 use url::Url;
 
 use delta_kernel_derive::Schema;
@@ -13,6 +12,7 @@ use crate::utils::require;
 use crate::{DeltaResult, Error, FileSystemClient};
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[cfg_attr(test, derive(serde::Serialize), serde(rename_all = "camelCase"))]
 pub struct DeletionVectorDescriptor {
     /// A single character to indicate how to access the DV. Legal options are: ['u', 'i', 'p'].
     pub storage_type: String,

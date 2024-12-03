@@ -121,7 +121,7 @@ struct ProtocolVisitor {
 
 impl ProtocolVisitor {
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    fn visit_protocol<'a>(
+    pub(crate) fn visit_protocol<'a>(
         row_index: usize,
         min_reader_version: i32,
         getters: &[&'a dyn GetData<'a>],
