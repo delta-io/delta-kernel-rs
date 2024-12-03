@@ -134,8 +134,8 @@ impl StructField {
     /// Get the physical name for this field as it should be read from parquet.
     ///
     /// NOTE: Caller affirms that the schema was already validated by
-    /// [`crate::table_features::validate_schema_column_mapping`], to ensure that
-    /// annotations are always and only present when column mapping mode is enabled.
+    /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
+    /// always and only present when column mapping mode is enabled.
     pub fn physical_name(&self) -> &str {
         match self
             .metadata
