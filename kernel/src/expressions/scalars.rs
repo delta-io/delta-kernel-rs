@@ -151,6 +151,13 @@ impl Scalar {
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null(_))
     }
+
+    pub fn timestamp_from_millis(millis: i64) -> DeltaResult<Self> {
+        let Some(timestamp) = DateTime::from_timestamp_millis(millis) else {
+            return Err(Error::generic("Failed to convert timestamp"));
+        };
+        Ok(Self::Timestamp(timestamp.timestamp_micros()))
+    }
 }
 
 impl Display for Scalar {
