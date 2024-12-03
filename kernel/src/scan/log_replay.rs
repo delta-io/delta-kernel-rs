@@ -180,7 +180,8 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
     ]))
 });
 
-pub static SCAN_ROW_DATATYPE: LazyLock<DataType> = LazyLock::new(|| SCAN_ROW_SCHEMA.clone().into());
+pub(crate) static SCAN_ROW_DATATYPE: LazyLock<DataType> =
+    LazyLock::new(|| SCAN_ROW_SCHEMA.clone().into());
 
 fn get_add_transform_expr() -> Expression {
     Expression::Struct(vec![

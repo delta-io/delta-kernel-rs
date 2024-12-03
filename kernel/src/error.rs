@@ -257,7 +257,7 @@ impl Error {
     pub fn change_data_feed_unsupported(version: impl Into<Version>) -> Self {
         Self::ChangeDataFeedUnsupported(version.into())
     }
-    pub fn change_data_feed_incompatible_schema(
+    pub(crate) fn change_data_feed_incompatible_schema(
         expected: &StructType,
         actual: &StructType,
     ) -> Self {

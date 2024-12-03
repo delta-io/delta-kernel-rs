@@ -52,23 +52,26 @@ async fn metadata_protocol() {
     let mut mock_table = MockTable::new();
     let schema_string = serde_json::to_string(&get_schema()).unwrap();
     mock_table
-        .commit(&[
-            Metadata {
-                schema_string,
-                configuration: HashMap::from([
-                    ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
-                    (
-                        "delta.enableDeletionVectors".to_string(),
-                        "true".to_string(),
-                    ),
-                ]),
-                ..Default::default()
-            }
-            .into(),
-            Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"]))
-                .unwrap()
+        .commit(
+            [
+                Metadata {
+                    schema_string,
+                    configuration: HashMap::from([
+                        ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+                        (
+                            "delta.enableDeletionVectors".to_string(),
+                            "true".to_string(),
+                        ),
+                    ]),
+                    ..Default::default()
+                }
                 .into(),
-        ])
+                Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"]))
+                    .unwrap()
+                    .into(),
+            ]
+            .into_iter(),
+        )
         .await;
 
     let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
@@ -96,15 +99,18 @@ async fn configuration_fails() {
     let mut mock_table = MockTable::new();
     let schema_string = serde_json::to_string(&get_schema()).unwrap();
     mock_table
-        .commit(&[Metadata {
-            schema_string,
-            configuration: HashMap::from([(
-                "delta.enableDeletionVectors".to_string(),
-                "true".to_string(),
-            )]),
-            ..Default::default()
-        }
-        .into()])
+        .commit(
+            [Metadata {
+                schema_string,
+                configuration: HashMap::from([(
+                    "delta.enableDeletionVectors".to_string(),
+                    "true".to_string(),
+                )]),
+                ..Default::default()
+            }
+            .into()]
+            .into_iter(),
+        )
         .await;
 
     let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
@@ -130,18 +136,21 @@ async fn incompatible_schema() {
     let schema = get_schema().project(&["id"]).unwrap();
     let schema_string = serde_json::to_string(&schema).unwrap();
     mock_table
-        .commit(&[Metadata {
-            schema_string,
-            configuration: HashMap::from([
-                ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
-                (
-                    "delta.enableDeletionVectors".to_string(),
-                    "true".to_string(),
-                ),
-            ]),
-            ..Default::default()
-        }
-        .into()])
+        .commit(
+            [Metadata {
+                schema_string,
+                configuration: HashMap::from([
+                    ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+                    (
+                        "delta.enableDeletionVectors".to_string(),
+                        "true".to_string(),
+                    ),
+                ]),
+                ..Default::default()
+            }
+            .into()]
+            .into_iter(),
+        )
         .await;
 
     let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
@@ -166,18 +175,21 @@ async fn add_remove() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = MockTable::new();
     mock_table
-        .commit(&[
-            Add {
-                path: "fake_path_1".into(),
-                ..Default::default()
-            }
-            .into(),
-            Remove {
-                path: "fake_path_2".into(),
-                ..Default::default()
-            }
-            .into(),
-        ])
+        .commit(
+            [
+                Add {
+                    path: "fake_path_1".into(),
+                    ..Default::default()
+                }
+                .into(),
+                Remove {
+                    path: "fake_path_2".into(),
+                    ..Default::default()
+                }
+                .into(),
+            ]
+            .into_iter(),
+        )
         .await;
 
     let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
@@ -205,23 +217,26 @@ async fn cdc_selection() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = MockTable::new();
     mock_table
-        .commit(&[
-            Add {
-                path: "fake_path_1".into(),
-                ..Default::default()
-            }
-            .into(),
-            Remove {
-                path: "fake_path_2".into(),
-                ..Default::default()
-            }
-            .into(),
-            Cdc {
-                path: "fake_path_3".into(),
-                ..Default::default()
-            }
-            .into(),
-        ])
+        .commit(
+            [
+                Add {
+                    path: "fake_path_1".into(),
+                    ..Default::default()
+                }
+                .into(),
+                Remove {
+                    path: "fake_path_2".into(),
+                    ..Default::default()
+                }
+                .into(),
+                Cdc {
+                    path: "fake_path_3".into(),
+                    ..Default::default()
+                }
+                .into(),
+            ]
+            .into_iter(),
+        )
         .await;
 
     let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
@@ -264,25 +279,28 @@ async fn dv() {
         cardinality: 3,
     };
     mock_table
-        .commit(&[
-            Add {
-                path: "fake_path_1".into(),
-                ..Default::default()
-            }
-            .into(),
-            Remove {
-                path: "fake_path_1".into(),
-                deletion_vector: Some(deletion_vector1.clone()),
-                ..Default::default()
-            }
-            .into(),
-            Remove {
-                path: "fake_path_2".into(),
-                deletion_vector: Some(deletion_vector2.clone()),
-                ..Default::default()
-            }
-            .into(),
-        ])
+        .commit(
+            [
+                Add {
+                    path: "fake_path_1".into(),
+                    ..Default::default()
+                }
+                .into(),
+                Remove {
+                    path: "fake_path_1".into(),
+                    deletion_vector: Some(deletion_vector1.clone()),
+                    ..Default::default()
+                }
+                .into(),
+                Remove {
+                    path: "fake_path_2".into(),
+                    deletion_vector: Some(deletion_vector2.clone()),
+                    ..Default::default()
+                }
+                .into(),
+            ]
+            .into_iter(),
+        )
         .await;
 
     let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
@@ -326,19 +344,22 @@ async fn failing_protocol() {
     .unwrap();
 
     mock_table
-        .commit(&[
-            Add {
-                path: "fake_path_1".into(),
-                ..Default::default()
-            }
-            .into(),
-            Remove {
-                path: "fake_path_2".into(),
-                ..Default::default()
-            }
-            .into(),
-            protocol.into(),
-        ])
+        .commit(
+            [
+                Add {
+                    path: "fake_path_1".into(),
+                    ..Default::default()
+                }
+                .into(),
+                Remove {
+                    path: "fake_path_2".into(),
+                    ..Default::default()
+                }
+                .into(),
+                protocol.into(),
+            ]
+            .into_iter(),
+        )
         .await;
 
     let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
@@ -361,18 +382,21 @@ async fn in_commit_timestamp() {
 
     let timestamp = 123456;
     mock_table
-        .commit(&[
-            Add {
-                path: "fake_path_1".into(),
-                ..Default::default()
-            }
-            .into(),
-            CommitInfo {
-                timestamp: Some(timestamp),
-                ..Default::default()
-            }
-            .into(),
-        ])
+        .commit(
+            [
+                Add {
+                    path: "fake_path_1".into(),
+                    ..Default::default()
+                }
+                .into(),
+                CommitInfo {
+                    timestamp: Some(timestamp),
+                    ..Default::default()
+                }
+                .into(),
+            ]
+            .into_iter(),
+        )
         .await;
 
     let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
@@ -395,11 +419,14 @@ async fn file_meta_timestamp() {
     let mut mock_table = MockTable::new();
 
     mock_table
-        .commit(&[Add {
-            path: "fake_path_1".into(),
-            ..Default::default()
-        }
-        .into()])
+        .commit(
+            [Add {
+                path: "fake_path_1".into(),
+                ..Default::default()
+            }
+            .into()]
+            .into_iter(),
+        )
         .await;
 
     let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)

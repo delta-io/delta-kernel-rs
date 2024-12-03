@@ -24,21 +24,23 @@ use itertools::Itertools;
 #[cfg(test)]
 mod tests;
 
-pub struct TableChangesScanData {
-    pub data: Box<dyn EngineData>,
+#[allow(unused)]
+pub(crate) struct TableChangesScanData {
+    // Engine data
+    pub(crate) data: Box<dyn EngineData>,
     // The selection vector used to filter log actions.
-    pub selection_vector: Vec<bool>,
+    pub(crate) selection_vector: Vec<bool>,
     // An optional map from a remove action's path to its deletion vector
-    pub remove_dv: Option<Arc<HashMap<String, DvInfo>>>,
+    pub(crate) remove_dv: Option<Arc<HashMap<String, DvInfo>>>,
 }
 
-/// Given an iterator of ParsedLogPath and a predicate, returns an iterator of
-/// [`TableChangesScanData`]  Each row that is selected in the returned
+/// Given an iterator of [`ParsedLogPath`] and a predicate, returns an iterator of
+/// [`TableChangesScanData`].  Each row that is selected in the returned
 /// `engine_data` _must_ be processed to complete the scan. Non-selected rows
 /// _must_ be ignored.
 pub(crate) fn table_changes_action_iter(
     engine: Arc<dyn Engine>,
-    commit_files: impl IntoIterator<Item = ParsedLogPath>,
+    commit_files: impl Iterator<Item = ParsedLogPath>,
     table_schema: SchemaRef,
     predicate: Option<ExpressionRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanData>>> {

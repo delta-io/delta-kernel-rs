@@ -23,7 +23,7 @@ pub struct TableChangesScan {
     logical_schema: SchemaRef,
     // The physical schema. This schema omits partition columns and columns generated for Change
     // Data Feed
-    physical_schema: StructType,
+    physical_schema: SchemaRef,
     // The schema of the table at the `end_version`. This schema is used to validate schema
     // compatibility in the CDF range
     table_schema: SchemaRef,
@@ -169,14 +169,15 @@ impl TableChangesScanBuilder {
             predicate: self.predicate,
             all_fields,
             have_partition_cols,
-            physical_schema: StructType::new(read_fields),
+            physical_schema: StructType::new(read_fields).into(),
             table_schema,
         })
     }
 }
 
 impl TableChangesScan {
-    pub fn scan_data(
+    #[allow(unused)]
+    pub(crate) fn scan_data(
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanData>>> {
@@ -187,7 +188,7 @@ impl TableChangesScan {
             .clone();
         table_changes_action_iter(
             engine,
-            commits,
+            commits.into_iter(),
             self.table_schema.clone(),
             self.predicate.clone(),
         )

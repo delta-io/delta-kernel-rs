@@ -86,9 +86,8 @@ pub(crate) mod test_utils {
                 dir,
             }
         }
-        pub(crate) async fn commit(&mut self, actions: &[Action]) {
+        pub(crate) async fn commit(&mut self, actions: impl Iterator<Item = Action>) {
             let data = actions
-                .iter()
                 .map(|action| serde_json::to_string(&action).unwrap())
                 .join("\n");
 
