@@ -35,6 +35,8 @@ pub mod engine_funcs;
 pub mod error;
 use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
 pub mod expressions;
+#[cfg(feature = "tracing")]
+pub mod ffi_tracing;
 pub mod scan;
 pub mod schema;
 #[cfg(feature = "test-ffi")]
@@ -117,6 +119,14 @@ impl KernelStringSlice {
         Self {
             ptr: source.as_ptr().cast(),
             len: source.len(),
+        }
+    }
+
+    /// Create a new empty `KernelStringSlice`. `len` will be 0, and `ptr` will be `null`.
+    pub(crate) fn empty() -> Self {
+        Self {
+            ptr: std::ptr::null(),
+            len: 0,
         }
     }
 }
