@@ -11,6 +11,7 @@ use crate::snapshot::Snapshot;
 use crate::{DeltaResult, Engine, Error, Version};
 
 pub mod scan;
+mod schema_compat;
 
 static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
     [
