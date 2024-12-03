@@ -163,6 +163,9 @@ fn prepare_table_changes(
         }
         if let Some((schema, configuration)) = visitor.metadata_info {
             let schema: StructType = serde_json::from_str(&schema)?;
+            // Currently, schema compatibility is defined as having equal schema types. In the
+            // future, more permisive schema evolution will be supported.
+            // See: https://github.com/delta-io/delta-kernel-rs/issues/523
             require!(
                 table_schema.as_ref() == &schema,
                 Error::change_data_feed_incompatible_schema(table_schema, &schema)
