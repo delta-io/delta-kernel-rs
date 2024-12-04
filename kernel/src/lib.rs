@@ -1,45 +1,53 @@
 //! # Delta Kernel
 //!
 //! Delta-kernel-rs is an experimental [Delta](https://github.com/delta-io/delta/) implementation
-//! focused on interoperability with a wide range of query engines. It currently only supports
-//! reads. This library defines a number of traits which must be implemented to provide a
-//! working "delta reader". They are detailed below. There is a provided "default engine" that
-//! implements all these traits and can be used to ease integration work. See
-//! [`DefaultEngine`](engine/default/index.html) for more information.
+//! focused on interoperability with a wide range of query engines. It supports reads and
+//! (experimental) writes (only blind appends in the write path currently). This library defines a
+//! number of traits which must be implemented to provide a working delta implementation. They are
+//! detailed below. There is a provided "default engine" that implements all these traits and can
+//! be used to ease integration work. See [`DefaultEngine`](engine/default/index.html) for more
+//! information.
 //!
 //! A full `rust` example for reading table data using the default engine can be found in the
 //! [read-table-single-threaded] example (and for a more complex multi-threaded reader see the
 //! [read-table-multi-threaded] example).
 //!
-//! [read-table-single-threaded]: https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/examples/read-table-single-threaded
-//! [read-table-multi-threaded]: https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/examples/read-table-multi-threaded
+//! [read-table-single-threaded]:
+//! https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/examples/read-table-single-threaded
+//! [read-table-multi-threaded]:
+//! https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/examples/read-table-multi-threaded
+//!
+//! Simple write examples can be found in the [`write.rs`] integration tests. Standalone write
+//! examples are coming soon!
+//!
+//! [`write.rs`]: https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/tests/write.rs
 //!
 //! # Engine traits
 //!
-//! The [`Engine`] trait allow connectors to bring their own implementation of functionality such as
-//! reading parquet files, listing files in a file system, parsing a JSON string etc.  This trait
-//! exposes methods to get sub-engines which expose the core functionalities customizable by
+//! The [`Engine`] trait allow connectors to bring their own implementation of functionality such
+//! as reading parquet files, listing files in a file system, parsing a JSON string etc.  This
+//! trait exposes methods to get sub-engines which expose the core functionalities customizable by
 //! connectors.
 //!
 //! ## Expression handling
 //!
-//! Expression handling is done via the [`ExpressionHandler`], which in turn allows the creation
-//! of [`ExpressionEvaluator`]s. These evaluators are created for a specific predicate [`Expression`]
+//! Expression handling is done via the [`ExpressionHandler`], which in turn allows the creation of
+//! [`ExpressionEvaluator`]s. These evaluators are created for a specific predicate [`Expression`]
 //! and allow evaluation of that predicate for a specific batches of data.
 //!
 //! ## File system interactions
 //!
-//! Delta Kernel needs to perform some basic operations against file systems like listing and reading files.
-//! These interactions are encapsulated in the [`FileSystemClient`] trait. Implementors must take
-//! care that all assumptions on the behavior if the functions - like sorted results - are respected.
+//! Delta Kernel needs to perform some basic operations against file systems like listing and
+//! reading files. These interactions are encapsulated in the [`FileSystemClient`] trait.
+//! Implementors must take care that all assumptions on the behavior if the functions - like sorted
+//! results - are respected.
 //!
 //! ## Reading log and data files
 //!
-//! Delta Kernel requires the capability to read json and parquet files, which is exposed via the
-//! [`JsonHandler`] and [`ParquetHandler`] respectively. When reading files, connectors are asked to
-//! provide the context information it requires to execute the actual read. This is done by invoking
-//! methods on the [`FileSystemClient`] trait.
-//!
+//! Delta Kernel requires the capability to read and write json files and read parquet files, which
+//! is exposed via the [`JsonHandler`] and [`ParquetHandler`] respectively. When reading files,
+//! connectors are asked to provide the context information it requires to execute the actual
+//! operation. This is done by invoking methods on the [`FileSystemClient`] trait.
 
 #![cfg_attr(all(doc, NIGHTLY_CHANNEL), feature(doc_auto_cfg))]
 #![warn(
