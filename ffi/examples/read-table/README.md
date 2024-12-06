@@ -10,9 +10,9 @@ This example is built with [cmake]. Instructions below assume you start in the d
 Note that prior to building these examples you must build `delta_kernel_ffi` (see [the FFI readme] for details). TLDR:
 ```bash
 # from repo root
-$ cargo build -p delta_kernel_ffi [--release] [--features default-engine]
+$ cargo build -p delta_kernel_ffi [--release] [--features default-engine, tracing]
 # from ffi/ dir
-$ cargo build [--release] [--features default-engine]
+$ cargo build [--release] [--features default-engine, tracing]
 ```
 
 There are two configurations that can currently be configured in cmake:

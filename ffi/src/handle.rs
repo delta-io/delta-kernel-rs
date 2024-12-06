@@ -184,7 +184,6 @@ mod private {
     {
         /// Obtains a mutable reference to the handle's underlying object. Unsafe equivalent to
         /// [`AsMut::as_mut`].
-
         ///
         /// # Safety
         ///

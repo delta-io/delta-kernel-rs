@@ -1,6 +1,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
 
 #include "arrow.h"
 #include "read_table.h"
@@ -150,12 +151,67 @@ void free_partition_list(PartitionList* list) {
   free(list);
 }
 
+static const char *LEVEL_STRING[] = {
+  "ERROR", "WARN", "INFO", "DEBUG", "TRACE"
+};
+
+// define some ansi color escapes so we can have nice colored output in our logs
+#define RED   "\x1b[31m"
+#define BLUE  "\x1b[34m"
+#define DIM   "\x1b[2m"
+#define RESET "\x1b[0m"
+
+void tracing_callback(struct Event event) {
+  struct timeval tv;
+  char buffer[32];
+  gettimeofday(&tv, NULL);
+  struct tm *tm_info = gmtime(&tv.tv_sec);
+  strftime(buffer, 26, "%Y-%m-%dT%H:%M:%S", tm_info);
+  char* level_color = event.level < 3 ? RED : BLUE;
+  printf(
+    "%s%s.%06dZ%s [%sKernel %s%s] %s%.*s%s: %.*s\n",
+    DIM,
+    buffer,
+    (int)tv.tv_usec, // safe, microseconds are in int range
+    RESET,
+    level_color,
+    LEVEL_STRING[event.level],
+    RESET,
+    DIM,
+    (int)event.target.len,
+    event.target.ptr,
+    RESET,
+    (int)event.message.len,
+    event.message.ptr);
+  if (event.file.ptr) {
+    printf(
+      "  %sat%s %.*s:%i\n",
+      DIM,
+      RESET,
+      (int)event.file.len,
+      event.file.ptr,
+      event.line);
+  }
+}
+
+void log_line_callback(KernelStringSlice line) {
+  printf("%.*s", (int)line.len, line.ptr);
+}
+
 int main(int argc, char* argv[])
 {
   if (argc < 2) {
     printf("Usage: %s table/path\n", argv[0]);
     return -1;
   }
+
+#ifdef VERBOSE
+  enable_event_tracing(tracing_callback, TRACE);
+  // we could also do something like this if we want less control over formatting
+  // enable_formatted_log_line_tracing(log_line_callback, TRACE, FULL, true, true, false, false);
+#else
+  enable_event_tracing(tracing_callback, INFO);
+#endif
 
   char* table_path = argv[1];
   printf("Reading table at %s\n", table_path);
