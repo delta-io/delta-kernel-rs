@@ -4,47 +4,47 @@ use itertools::Either;
 use roaring::RoaringTreemap;
 use url::Url;
 
-use super::scan_file::{CDFScanFileType, ResolvedCDFScanFile, UnresolvedCDFScanFile};
+use super::scan_file::{CdfScanFileType, ResolvedCdfScanFile, UnresolvedCdfScanFile};
 use crate::actions::deletion_vector::selection_treemap_to_bools;
-use crate::table_changes::scan_file::CDFScanFile;
+use crate::table_changes::scan_file::CdfScanFile;
 use crate::{DeltaResult, Engine, Error};
 
-/// Resolves the deletion vectors for an [`UnresolvedCDFScanFile`]. This function handles two
-/// types of `CDFScanFile`s:
-/// 1. The first case is a [`CDFScanFile`] paired with a remove deletion vector. The `scan_type`
-///    must be [`CDFScanFileType::Add`]. In this case, both the add and remove deletion vectors are
+/// Resolves the deletion vectors for an [`UnresolvedCdfScanFile`]. This function handles two
+/// types of `CdfScanFile`s:
+/// 1. The first case is a [`CdfScanFile`] paired with a remove deletion vector. The `scan_type`
+///    must be [`CdfScanFileType::Add`]. In this case, both the add and remove deletion vectors are
 ///    read if they exist. Then, we find the set of rows in the scan file that have been added, and
 ///    the set of rows that have been removed. The set of removed rows (if any) will be represented
-///    by a [`ResolvedCDFScanFile`] with `scan_type` = [`CDFScanFileType::Remove`]. The set of
-///    added rows (if any) will be represented by a [`ResolvedCDFScanFile`] with `scan_type` =
-///    [`CDFScanFileType::Add`].
+///    by a [`ResolvedCdfScanFile`] with `scan_type` = [`CdfScanFileType::Remove`]. The set of
+///    added rows (if any) will be represented by a [`ResolvedCdfScanFile`] with `scan_type` =
+///    [`CdfScanFileType::Add`].
 ///
 ///    Note: We allow the possibility for there to be both added rows, and removed rows for a
 ///    single add/remove pair.
-/// 2. The second case handles all other add, remove, and cdc [`CDFScanFile`]s. These will simply
-///    have the deletion vector read (if present), and each is converted into a [`ResolvedCDFScanFile`].
+/// 2. The second case handles all other add, remove, and cdc [`CdfScanFile`]s. These will simply
+///    have the deletion vector read (if present), and each is converted into a [`ResolvedCdfScanFile`].
 ///    No changes are made to the `scan_type`.
 #[allow(unused)]
 pub(crate) fn resolve_scan_file_dv(
     engine: &dyn Engine,
     table_root: &Url,
-    scan_file: UnresolvedCDFScanFile,
-) -> DeltaResult<impl Iterator<Item = ResolvedCDFScanFile>> {
-    let UnresolvedCDFScanFile {
+    scan_file: UnresolvedCdfScanFile,
+) -> DeltaResult<impl Iterator<Item = ResolvedCdfScanFile>> {
+    let UnresolvedCdfScanFile {
         scan_file,
         remove_dvs,
     } = scan_file;
     let paired_rm_dv = remove_dvs.get(&scan_file.path);
     match (&scan_file.scan_type, paired_rm_dv) {
-        (CDFScanFileType::Add, Some(rm_dv)) => {
-            // Helper function to convert a treemap to a [`ResolvedCDFScanFile`]. The `scan_type`
-            // of the [`ResolvedCDFScanFile`] is set to `out_type` This returns an empty iterator
+        (CdfScanFileType::Add, Some(rm_dv)) => {
+            // Helper function to convert a treemap to a [`ResolvedCdfScanFile`]. The `scan_type`
+            // of the [`ResolvedCdfScanFile`] is set to `out_type` This returns an empty iterator
             // if nothing is selected.
             fn treemap_to_iter(
                 selection_treemap: RoaringTreemap,
-                mut scan_file: CDFScanFile,
-                out_type: CDFScanFileType,
-            ) -> impl Iterator<Item = ResolvedCDFScanFile> {
+                mut scan_file: CdfScanFile,
+                out_type: CdfScanFileType,
+            ) -> impl Iterator<Item = ResolvedCdfScanFile> {
                 if selection_treemap.is_empty() {
                     // Nothing has been selected, we do not read this data file
                     Either::Left(iter::empty())
@@ -52,7 +52,7 @@ pub(crate) fn resolve_scan_file_dv(
                     let added_dv = selection_treemap_to_bools(selection_treemap);
                     scan_file.scan_type = out_type;
 
-                    Either::Right(iter::once(ResolvedCDFScanFile {
+                    Either::Right(iter::once(ResolvedCdfScanFile {
                         scan_file,
                         selection_vector: Some(added_dv),
                     }))
@@ -80,15 +80,15 @@ pub(crate) fn resolve_scan_file_dv(
             let added_selection_treemap = &rm_dv - &add_dv;
             let removed_selection_treemap = add_dv - rm_dv;
 
-            // Generate the [`ResolvedCDFScanFile`] for remove if there are rows selected
+            // Generate the [`ResolvedCdfScanFile`] for remove if there are rows selected
             let removed = treemap_to_iter(
                 removed_selection_treemap,
                 scan_file.clone(),
-                CDFScanFileType::Remove,
+                CdfScanFileType::Remove,
             );
 
-            // Generate the [`ResolvedCDFScanFile`] for add if there are rows selected
-            let added = treemap_to_iter(added_selection_treemap, scan_file, CDFScanFileType::Add);
+            // Generate the [`ResolvedCdfScanFile`] for add if there are rows selected
+            let added = treemap_to_iter(added_selection_treemap, scan_file, CdfScanFileType::Add);
 
             Ok(Either::Right(added.chain(removed)))
         }
@@ -97,7 +97,7 @@ pub(crate) fn resolve_scan_file_dv(
         )),
         (_, None) => {
             let selection_vector = scan_file.dv_info.get_selection_vector(engine, table_root)?;
-            Ok(Either::Left(iter::once(ResolvedCDFScanFile {
+            Ok(Either::Left(iter::once(ResolvedCdfScanFile {
                 scan_file,
                 selection_vector,
             })))
@@ -115,7 +115,7 @@ mod tests {
         actions::deletion_vector::DeletionVectorDescriptor,
         engine::sync::SyncEngine,
         scan::state::DvInfo,
-        table_changes::scan_file::{CDFScanFile, CDFScanFileType, UnresolvedCDFScanFile},
+        table_changes::scan_file::{CdfScanFile, CdfScanFileType, UnresolvedCdfScanFile},
     };
 
     use super::resolve_scan_file_dv;
@@ -138,8 +138,8 @@ mod tests {
         });
         let path = "fake_path".to_string();
         let dv_info = DvInfo { deletion_vector };
-        let scan_file = CDFScanFile {
-            scan_type: CDFScanFileType::Add,
+        let scan_file = CdfScanFile {
+            scan_type: CdfScanFileType::Add,
             path: path.clone(),
             dv_info,
             partition_values: HashMap::new(),
@@ -150,7 +150,7 @@ mod tests {
         let rm_dv = DvInfo {
             deletion_vector: None,
         };
-        let input = UnresolvedCDFScanFile {
+        let input = UnresolvedCdfScanFile {
             scan_file,
             remove_dvs: Arc::new(HashMap::from([(path.clone(), rm_dv)])),
         };
@@ -164,7 +164,7 @@ mod tests {
             .unwrap()
             .map(|file| (file.scan_file.scan_type, file.selection_vector))
             .collect_vec();
-        assert_eq!(resolved, vec![(CDFScanFileType::Remove, Some(expected_sv))]);
+        assert_eq!(resolved, vec![(CdfScanFileType::Remove, Some(expected_sv))]);
     }
 
     #[test]
@@ -181,8 +181,8 @@ mod tests {
         let dv_info = DvInfo {
             deletion_vector: None,
         };
-        let scan_file = CDFScanFile {
-            scan_type: CDFScanFileType::Add,
+        let scan_file = CdfScanFile {
+            scan_type: CdfScanFileType::Add,
             path: path.clone(),
             dv_info,
             partition_values: HashMap::new(),
@@ -198,7 +198,7 @@ mod tests {
             cardinality: 2,
         });
         let rm_dv = DvInfo { deletion_vector };
-        let input = UnresolvedCDFScanFile {
+        let input = UnresolvedCdfScanFile {
             scan_file,
             remove_dvs: Arc::new(HashMap::from([(path.clone(), rm_dv)])),
         };
@@ -212,6 +212,6 @@ mod tests {
             .unwrap()
             .map(|file| (file.scan_file.scan_type, file.selection_vector))
             .collect_vec();
-        assert_eq!(resolved, vec![(CDFScanFileType::Add, Some(expected_sv))]);
+        assert_eq!(resolved, vec![(CdfScanFileType::Add, Some(expected_sv))]);
     }
 }
