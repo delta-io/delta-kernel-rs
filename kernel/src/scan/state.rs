@@ -3,12 +3,10 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use crate::actions::deletion_vector::deletion_treemap_to_bools;
 use crate::utils::require;
 use crate::{
-    actions::{
-        deletion_vector::{treemap_to_bools, DeletionVectorDescriptor},
-        visitors::visit_deletion_vector_at,
-    },
+    actions::{deletion_vector::DeletionVectorDescriptor, visitors::visit_deletion_vector_at},
     engine_data::{GetData, RowVisitor, TypedGetData as _},
     schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef},
     table_features::ColumnMappingMode,
@@ -74,7 +72,7 @@ impl DvInfo {
         table_root: &url::Url,
     ) -> DeltaResult<Option<Vec<bool>>> {
         let dv_treemap = self.get_treemap(engine, table_root)?;
-        Ok(dv_treemap.map(treemap_to_bools))
+        Ok(dv_treemap.map(deletion_treemap_to_bools))
     }
 
     /// Returns a vector of row indexes that should be *removed* from the result set
