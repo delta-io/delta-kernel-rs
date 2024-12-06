@@ -21,6 +21,7 @@ use crate::table_changes::{check_cdf_table_properties, ensure_cdf_read_supported
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef, RowVisitor};
+
 use itertools::Itertools;
 
 #[cfg(test)]
