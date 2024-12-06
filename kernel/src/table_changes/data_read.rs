@@ -68,10 +68,10 @@ pub(crate) fn resolve_scan_file_dv(
             let add_dv = scan_file
                 .dv_info
                 .get_treemap(engine, table_root)?
-                .unwrap_or(Default::default());
+                .unwrap_or_else(Default::default);
             let rm_dv = rm_dv
                 .get_treemap(engine, table_root)?
-                .unwrap_or(Default::default());
+                .unwrap_or_else(Default::default);
 
             // We calculate the deletion vectors as follows. Note that logically the `rm_dv` is the
             // beginning state of the commit, and `add_dv` is the final state of the commit. In
