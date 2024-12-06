@@ -513,6 +513,18 @@ pub unsafe extern "C" fn get_sync_engine(
     get_sync_engine_impl(allocate_error).into_extern_result(&allocate_error)
 }
 
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+fn engine_to_handle(
+    engine: Arc<dyn Engine>,
+    allocate_error: AllocateErrorFn,
+) -> Handle<SharedExternEngine> {
+    let engine: Arc<dyn ExternEngine> = Arc::new(ExternEngineVtable {
+        engine,
+        allocate_error,
+    });
+    engine.into()
+}
+
 #[cfg(feature = "default-engine")]
 fn get_default_engine_impl(
     url: Url,
@@ -526,11 +538,7 @@ fn get_default_engine_impl(
         options,
         Arc::new(TokioBackgroundExecutor::new()),
     );
-    let engine: Arc<dyn ExternEngine> = Arc::new(ExternEngineVtable {
-        engine: Arc::new(engine?),
-        allocate_error,
-    });
-    Ok(engine.into())
+    Ok(engine_to_handle(Arc::new(engine?), allocate_error))
 }
 
 #[cfg(feature = "sync-engine")]
@@ -538,11 +546,7 @@ fn get_sync_engine_impl(
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     let engine = delta_kernel::engine::sync::SyncEngine::new();
-    let engine: Arc<dyn ExternEngine> = Arc::new(ExternEngineVtable {
-        engine: Arc::new(engine),
-        allocate_error,
-    });
-    Ok(engine.into())
+    Ok(engine_to_handle(Arc::new(engine), allocate_error))
 }
 
 /// # Safety
@@ -710,6 +714,10 @@ impl<T> Default for ReferenceSet<T> {
 
 #[cfg(test)]
 mod tests {
+    use delta_kernel::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
+    use object_store::{memory::InMemory, path::Path};
+    use test_utils::{actions_to_string, add_commit, TestAction};
+
     use super::*;
     use crate::error::{EngineError, KernelError};
 
@@ -717,6 +725,20 @@ mod tests {
     extern "C" fn allocate_err(etype: KernelError, _: KernelStringSlice) -> *mut EngineError {
         let boxed = Box::new(EngineError { etype });
         Box::leak(boxed)
+    }
+
+    #[no_mangle]
+    extern "C" fn allocate_str(kernel_str: KernelStringSlice) -> NullableCvoid {
+        let s = unsafe { String::try_from_slice(&kernel_str) };
+        let ptr = Box::into_raw(Box::new(s.unwrap())).cast(); // never null
+        let ptr = unsafe { NonNull::new_unchecked(ptr) };
+        Some(ptr)
+    }
+
+    // helper to recover a string from the above
+    fn recover_string(ptr: NonNull<c_void>) -> String {
+        let ptr = ptr.as_ptr().cast();
+        *unsafe { Box::from_raw(ptr) }
     }
 
     fn ok_or_panic<T>(result: ExternResult<T>) -> T {
@@ -743,16 +765,52 @@ mod tests {
         }
     }
 
-    #[test]
-    fn engine_builder() {
-        let path = "s3://doesntmatter/foo";
+    fn get_default_engine() -> Handle<SharedExternEngine> {
+        let path = "memory:///doesntmatter/foo";
         let path = kernel_string_slice!(path);
         let builder = unsafe { ok_or_panic(get_engine_builder(path, allocate_err)) };
-        // TODO: When miri supports epoll_wait
-        // let engine = unsafe { builder_build(builder) };
+        unsafe { ok_or_panic(builder_build(builder)) }
+    }
 
-        // for now just rebox so it gets dropped and miri doesn't complain
-        let _box = unsafe { Box::from_raw(builder) };
+    #[test]
+    fn engine_builder() {
+        let engine = get_default_engine();
+        unsafe {
+            free_engine(engine);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            storage.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
+        let engine = DefaultEngine::new(
+            storage.clone(),
+            Path::from("/"),
+            Arc::new(TokioBackgroundExecutor::new()),
+        );
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let path = "memory:///";
+
+        let snapshot =
+            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+
+        let version = unsafe { version(snapshot.shallow_copy()) };
+        assert_eq!(version, 0);
+
+        let table_root = unsafe { snapshot_table_root(snapshot.shallow_copy(), allocate_str) };
+        assert!(table_root.is_some());
+        let s = recover_string(table_root.unwrap());
+        assert_eq!(&s, path);
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
     }
 
     #[test]
