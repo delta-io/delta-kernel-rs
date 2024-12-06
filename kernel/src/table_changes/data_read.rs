@@ -68,15 +68,37 @@ pub(crate) fn resolve_scan_file_dv(
                 .get_treemap(engine, table_root)?
                 .unwrap_or_else(Default::default);
 
-            // We calculate the deletion vectors as follows. Note that logically the `rm_dv` is the
+            // Here we show how deletion vectors are resolved. Note that logically the `rm_dv` is the
             // beginning state of the commit, and `add_dv` is the final state of the commit. In
-            // other words the dv went from being `rm_dv` to become `add_dv`.
+            // other words the dv went from being `rm_dv` to become `add_dv`. We use a motivating
+            // example to explain the cases:
+            //  rm_dv  = [1, 1, 0]
+            // - add_dv = [0, 1, 1]
             //
+            // The result of this commit is:
+            // - row 0 is restored
+            // - row 1 is unchanged
+            // - row 2 is deleted
+            //
+            //  # Insertion Selection Vector
             //  The selection vector of add rows is calculated using `rm_dv - add_dv`. These rows went
             //  from 1 (deleted) in `rm_dv` to 0 (restored) in the `add_dv`. All unchanged rows will remain 0.
+            //  Applying this to our deletion vectors:
+            //  rm_dv - add_dv =
+            //      [1, 1, 0]
+            //    - [0, 1, 1]
+            //    = [1, 0, 0]
+            //  The selection vector shows that row 0 was inserted
             //
+            //  # Deletion Selection Vector
             //  The selection vector of deleted rows is calculated using `add_dv - rm_dv`. These rows went
             //  from 0 (present) in `rm_dv` to 1 (deleted) in the `add_dv`. All unchanged rows will remain 0.
+            //  Applying this to our deletion vectors:
+            //  add_dv - rm_dv =
+            //      [0, 1, 1]
+            //    - [1, 1, 0]
+            //    = [0, 0, 1]
+            //  The selection vector shows that row 2 was deleted
             let added_selection_treemap = &rm_dv - &add_dv;
             let removed_selection_treemap = add_dv - rm_dv;
 
