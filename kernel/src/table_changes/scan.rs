@@ -4,9 +4,10 @@ use itertools::Itertools;
 use tracing::debug;
 
 use crate::scan::ColumnType;
-use crate::schema::SchemaRef;
-use crate::{DeltaResult, ExpressionRef};
+use crate::schema::{SchemaRef, StructType};
+use crate::{DeltaResult, Engine, ExpressionRef};
 
+use super::log_replay::{table_changes_action_iter, TableChangesScanData};
 use super::{TableChanges, CDF_FIELDS};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get a change
@@ -14,10 +15,20 @@ use super::{TableChanges, CDF_FIELDS};
 #[allow(unused)]
 #[derive(Debug)]
 pub struct TableChangesScan {
+    // The [`TableChanges`] that specifies this scan's start and end versions
     table_changes: Arc<TableChanges>,
+    // The logical schema of the Change Data Feed. By default, this is the schema from
+    // [`TableChanges::schema`]. The schema may be projected to a subset of those columns. See
+    // [`TableChangesScanBuilder::with_schema`]
     logical_schema: SchemaRef,
+    // The physical schema. This schema omits partition columns and columns generated for Change
+    // Data Feed
+    physical_schema: SchemaRef,
+    // The predicate to filter the data
     predicate: Option<ExpressionRef>,
+    // The [`ColumnType`] of all the fields in the `logical_schema`
     all_fields: Vec<ColumnType>,
+    // `true` if any column in the `logical_schema` is a partition column
     have_partition_cols: bool,
 }
 
@@ -153,12 +164,34 @@ impl TableChangesScanBuilder {
             predicate: self.predicate,
             all_fields,
             have_partition_cols,
+            physical_schema: StructType::new(read_fields).into(),
         })
     }
 }
+
+impl TableChangesScan {
+    /// Returns an iterator of [`TableChangesScanData`] necessary to read CDF. Each row
+    /// represents an action in the delta log. These rows are filtered to yield only the actions
+    /// necessary to read CDF. Additionally, [`TableChangesScanData`] holds metadata on the
+    /// deletion vectors present in the commit. The engine data in each scan data is guaranteed
+    /// to belong to the same commit. Several [`TableChangesScanData`] may belong to the same commit.
+    #[allow(unused)]
+    fn scan_data(
+        &self,
+        engine: Arc<dyn Engine>,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanData>>> {
+        let commits = self
+            .table_changes
+            .log_segment
+            .ascending_commit_files
+            .clone();
+        let schema = self.table_changes.end_snapshot.schema().clone().into();
+        table_changes_action_iter(engine, commits, schema, self.predicate.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-
     use std::sync::Arc;
 
     use crate::engine::sync::SyncEngine;
