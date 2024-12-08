@@ -16,7 +16,9 @@ use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, Version};
 
 mod log_replay;
+mod physical_to_logical;
 pub mod scan;
+mod scan_file;
 
 static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
     [

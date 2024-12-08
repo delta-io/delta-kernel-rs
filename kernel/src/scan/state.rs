@@ -3,17 +3,16 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use crate::actions::deletion_vector::deletion_treemap_to_bools;
 use crate::utils::require;
 use crate::{
-    actions::{
-        deletion_vector::{treemap_to_bools, DeletionVectorDescriptor},
-        visitors::visit_deletion_vector_at,
-    },
+    actions::{deletion_vector::DeletionVectorDescriptor, visitors::visit_deletion_vector_at},
     engine_data::{GetData, RowVisitor, TypedGetData as _},
     schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef},
     table_features::ColumnMappingMode,
     DeltaResult, Engine, EngineData, Error,
 };
+use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -30,9 +29,17 @@ pub struct GlobalScanState {
 }
 
 /// this struct can be used by an engine to materialize a selection vector
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct DvInfo {
     pub(crate) deletion_vector: Option<DeletionVectorDescriptor>,
+}
+
+impl From<DeletionVectorDescriptor> for DvInfo {
+    fn from(deletion_vector: DeletionVectorDescriptor) -> Self {
+        DvInfo {
+            deletion_vector: Some(deletion_vector),
+        }
+    }
 }
 
 /// Give engines an easy way to consume stats
@@ -53,20 +60,27 @@ impl DvInfo {
         self.deletion_vector.is_some()
     }
 
-    pub fn get_selection_vector(
+    pub(crate) fn get_treemap(
         &self,
         engine: &dyn Engine,
         table_root: &url::Url,
-    ) -> DeltaResult<Option<Vec<bool>>> {
-        let dv_treemap = self
-            .deletion_vector
+    ) -> DeltaResult<Option<RoaringTreemap>> {
+        self.deletion_vector
             .as_ref()
             .map(|dv_descriptor| {
                 let fs_client = engine.get_file_system_client();
                 dv_descriptor.read(fs_client, table_root)
             })
-            .transpose()?;
-        Ok(dv_treemap.map(treemap_to_bools))
+            .transpose()
+    }
+
+    pub fn get_selection_vector(
+        &self,
+        engine: &dyn Engine,
+        table_root: &url::Url,
+    ) -> DeltaResult<Option<Vec<bool>>> {
+        let dv_treemap = self.get_treemap(engine, table_root)?;
+        Ok(dv_treemap.map(deletion_treemap_to_bools))
     }
 
     /// Returns a vector of row indexes that should be *removed* from the result set
@@ -112,11 +126,11 @@ pub type ScanCallback<T> = fn(
 /// ## Example
 /// ```ignore
 /// let mut context = [my context];
-/// for res in scan_data { // scan data from scan.get_scan_data()
+/// for res in scan_data { // scan data from scan.scan_data()
 ///     let (data, vector) = res?;
 ///     context = delta_kernel::scan::state::visit_scan_files(
 ///        data.as_ref(),
-///        vector,
+///        selection_vector,
 ///        context,
 ///        my_callback,
 ///     )?;

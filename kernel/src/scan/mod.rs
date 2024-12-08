@@ -7,7 +7,9 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
-use crate::actions::deletion_vector::{split_vector, treemap_to_bools, DeletionVectorDescriptor};
+use crate::actions::deletion_vector::{
+    deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
+};
 use crate::actions::{get_log_add_schema, get_log_schema, ADD_NAME, REMOVE_NAME};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, Scalar};
 use crate::scan::state::{DvInfo, Stats};
@@ -438,7 +440,7 @@ pub fn selection_vector(
 ) -> DeltaResult<Vec<bool>> {
     let fs_client = engine.get_file_system_client();
     let dv_treemap = descriptor.read(fs_client, table_root)?;
-    Ok(treemap_to_bools(dv_treemap))
+    Ok(deletion_treemap_to_bools(dv_treemap))
 }
 
 /// Transform the raw data read from parquet into the correct logical form, based on the provided
