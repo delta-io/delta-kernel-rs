@@ -11,16 +11,17 @@ use crate::actions::{
     PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
-use crate::expressions::{column_expr, column_name, ColumnName, Expression};
+use crate::expressions::{column_name, ColumnName};
 use crate::path::ParsedLogPath;
 use crate::scan::data_skipping::DataSkippingFilter;
-use crate::scan::scan_row_schema;
 use crate::scan::state::DvInfo;
 use crate::schema::{ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructType};
+use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_changes::{check_cdf_table_properties, ensure_cdf_read_supported};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef, RowVisitor};
+
 use itertools::Itertools;
 
 #[cfg(test)]
@@ -36,7 +37,7 @@ pub(crate) struct TableChangesScanData {
     pub(crate) scan_data: Box<dyn EngineData>,
     /// The selection vector used to filter the `scan_data`.
     pub(crate) selection_vector: Vec<bool>,
-    /// An map from a remove action's path to its deletion vector
+    /// A map from a remove action's path to its deletion vector
     pub(crate) remove_dvs: Arc<HashMap<String, DvInfo>>,
 }
 
@@ -63,21 +64,6 @@ pub(crate) fn table_changes_action_iter(
         .flatten_ok() // Iterator-Result-Result
         .map(|x| x?); // Iterator-Result
     Ok(result)
-}
-
-// Gets the expression for generating the engine data in [`TableChangesScanData`].
-//
-// TODO: This expression is temporary. In the future it will also select `cdc` and `remove` actions
-// fields.
-fn add_transform_expr() -> Expression {
-    Expression::Struct(vec![
-        column_expr!("add.path"),
-        column_expr!("add.size"),
-        column_expr!("add.modificationTime"),
-        column_expr!("add.stats"),
-        column_expr!("add.deletionVector"),
-        Expression::Struct(vec![column_expr!("add.partitionValues")]),
-    ])
 }
 
 /// Processes a single commit file from the log to generate an iterator of [`TableChangesScanData`].
@@ -237,7 +223,7 @@ impl LogReplayScanner {
             remove_dvs,
             commit_file,
             // TODO: Add the timestamp as a column with an expression
-            timestamp: _,
+            timestamp,
         } = self;
         let remove_dvs = Arc::new(remove_dvs);
 
@@ -247,10 +233,14 @@ impl LogReplayScanner {
             schema,
             None,
         )?;
+        let commit_version = commit_file
+            .version
+            .try_into()
+            .map_err(|_| Error::generic("Failed to convert commit version to i64"))?;
         let evaluator = engine.get_expression_handler().get_evaluator(
             get_log_add_schema().clone(),
-            add_transform_expr(),
-            scan_row_schema().into(),
+            cdf_scan_row_expression(timestamp, commit_version),
+            cdf_scan_row_schema().into(),
         );
 
         let result = action_iter.map(move |actions| -> DeltaResult<_> {
