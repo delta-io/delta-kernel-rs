@@ -78,6 +78,11 @@ pub(crate) fn table_changes_action_iter(
 ///       Deletion vector resolution affects whether a remove action is selected in the second
 ///       phase, so we must perform it ahead of time in phase 1.
 ///     - Ensure that reading is supported on any protocol updates.
+///     - Extract the timestamp from [`CommitInfo`] actions if they are present. These are
+///       generated when in-commit timestamps is enabled. This must be done in the first phase
+///       because the second phase lazily transforms engine data with an extra timestamp column,
+///       so the timestamp must be known ahead of time.
+///       See: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#in-commit-timestamps
 ///     - Ensure that Change Data Feed is enabled for any metadata update. See  [`TableProperties`]
 ///     - Ensure that any schema update is compatible with the provided `schema`. Currently, schema
 ///       compatibility is checked through schema equality. This will be expanded in the future to
@@ -92,12 +97,6 @@ pub(crate) fn table_changes_action_iter(
 /// to check the table property for deletion vector enablement.
 ///
 /// See https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors
-///
-/// TODO: When the kernel supports in-commit timestamps, we will also have to inspect CommitInfo
-/// actions to find the timestamp. These are generated when incommit timestamps is enabled.
-/// This must be done in the first phase because the second phase lazily transforms engine data with
-/// an extra timestamp column. Thus, the timestamp must be known ahead of time.
-/// See https://github.com/delta-io/delta-kernel-rs/issues/559
 ///
 /// 2. Scan file generation phase [`LogReplayScanner::into_scan_batches`]: This iterates over every
 ///    action in the commit, and generates [`TableChangesScanData`]. It does so by transforming the
@@ -136,6 +135,7 @@ impl LogReplayScanner {
     /// 2. Construct a map from path to deletion vector of remove actions that share the same path
     ///    as an add action.
     /// 3. Perform validation on each protocol and metadata action in the commit.
+    /// 4. Extract the in-commit timestamp from [`CommitInfo`] if it is present.
     ///
     /// For more details, see the documentation for [`LogReplayScanner`].
     fn try_new(
