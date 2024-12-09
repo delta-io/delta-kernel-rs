@@ -638,4 +638,8 @@ async fn table_changes_in_commit_timestamp() {
     let commit = commits.next().unwrap();
     let scanner = LogReplayScanner::try_new(engine.as_ref(), commit, &get_schema().into()).unwrap();
     assert_eq!(scanner.timestamp, timestamp);
+
+    let iter = scanner.into_scan_batches(engine, None).unwrap();
+    let sv = result_to_sv(iter);
+    assert_eq!(sv, vec![false, true]);
 }
