@@ -1,6 +1,7 @@
 use super::TableChangesScanMetadata;
 use super::{table_changes_action_iter, ProcessedCdfCommit};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
+use crate::actions::CommitInfo;
 use crate::actions::{Add, Cdc, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
 use crate::expressions::Scalar;
@@ -39,6 +40,10 @@ fn table_config_for_testing(path: &Path) -> TableConfiguration {
                 "delta.enableDeletionVectors".to_string(),
                 "true".to_string(),
             ),
+            (
+                "delta.enableInCommitTimestamps".to_string(),
+                "true".to_string(),
+            ),
             ("delta.columnMapping.mode".to_string(), "none".to_string()),
         ]),
         ..Default::default()
@@ -47,7 +52,10 @@ fn table_config_for_testing(path: &Path) -> TableConfiguration {
         3,
         7,
         Some([ReaderFeature::DeletionVectors]),
-        Some([WriterFeature::ColumnMapping]),
+        Some([
+            WriterFeature::ColumnMapping,
+            WriterFeature::InCommitTimestamp,
+        ]),
     )
     .unwrap();
     TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
@@ -653,4 +661,45 @@ async fn file_meta_timestamp() {
     )
     .unwrap();
     assert_eq!(processed_commit.timestamp, file_meta_ts);
+}
+
+#[tokio::test]
+async fn table_changes_in_commit_timestamp() {
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+
+    let timestamp = 12345678;
+
+    mock_table
+        .commit([
+            Action::CommitInfo(CommitInfo {
+                in_commit_timestamp: Some(timestamp),
+                ..Default::default()
+            }),
+            Action::Add(Add {
+                path: "fake_path_1".into(),
+                data_change: true,
+                ..Default::default()
+            }),
+        ])
+        .await;
+
+    let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+        .unwrap()
+        .into_iter();
+
+    let commit = commits.next().unwrap();
+    let mut table_config = table_config_for_testing(mock_table.table_root());
+    let scanner = ProcessedCdfCommit::try_new(
+        engine.as_ref(),
+        commit,
+        &get_schema().into(),
+        &mut table_config,
+    )
+    .unwrap();
+    assert_eq!(scanner.timestamp, timestamp);
+
+    let iter = scanner.into_scan_batches(engine, None).unwrap();
+    let sv = result_to_sv(iter);
+    assert_eq!(sv, vec![false, true]);
 }

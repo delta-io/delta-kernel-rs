@@ -11,15 +11,17 @@ use std::sync::{Arc, LazyLock};
 use crate::actions::schemas::GetStructField;
 use crate::actions::visitors::{visit_deletion_vector_at, ProtocolVisitor};
 use crate::actions::{
-    get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, METADATA_NAME,
-    PROTOCOL_NAME, REMOVE_NAME,
+    get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, COMMIT_INFO_NAME,
+    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
 use crate::path::ParsedLogPath;
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
-use crate::schema::{ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructType};
+use crate::schema::{
+    ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType,
+};
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
@@ -141,8 +143,6 @@ impl ProcessedCdfCommit {
         table_schema: &SchemaRef,
         table_configuration: &mut TableConfiguration,
     ) -> DeltaResult<Self> {
-        let visitor_schema = ProcessedCdfCommitVisitor::schema();
-
         // Note: We do not perform data skipping yet because we need to visit all add and
         // remove actions for deletion vector resolution to be correct.
         //
@@ -154,22 +154,25 @@ impl ProcessedCdfCommit {
         // vectors are resolved so that we can skip both actions in the pair.
         let action_iter = engine.json_handler().read_json_files(
             &[commit_file.location.clone()],
-            visitor_schema,
+            ProcessedCdfCommitVisitor::schema(),
             None, // not safe to apply data skipping yet
         )?;
 
         let mut remove_dvs = HashMap::default();
         let mut add_paths = HashSet::default();
         let mut has_cdc_action = false;
-        for actions in action_iter {
+        let mut timestamp = commit_file.location.last_modified;
+        for (i, actions) in action_iter.enumerate() {
             let actions = actions?;
 
             let mut visitor = ProcessedCdfCommitVisitor {
                 add_paths: &mut add_paths,
                 remove_dvs: &mut remove_dvs,
                 has_cdc_action: &mut has_cdc_action,
+                commit_timestamp: None,
                 protocol: None,
                 metadata: None,
+                is_first_batch: i == 0,
             };
 
             visitor.visit_rows_of(actions.as_ref())?;
@@ -201,6 +204,12 @@ impl ProcessedCdfCommit {
                     )
                 );
             }
+            if let Some(in_commit_timestamp) = visitor.commit_timestamp {
+                // Only take the in-commit timestamp if the table feature is enabled
+                if table_configuration.is_in_commit_timestamps_enabled() {
+                    timestamp = in_commit_timestamp;
+                }
+            }
         }
         // We resolve the remove deletion vector map after visiting the entire commit.
         if has_cdc_action {
@@ -211,7 +220,7 @@ impl ProcessedCdfCommit {
             remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
         }
         Ok(ProcessedCdfCommit {
-            timestamp: commit_file.location.last_modified,
+            timestamp,
             commit_file,
             has_cdc_action,
             remove_dvs,
@@ -233,7 +242,6 @@ impl ProcessedCdfCommit {
             has_cdc_action,
             remove_dvs,
             commit_file,
-            // TODO: Add the timestamp as a column with an expression
             timestamp,
         } = self;
         let remove_dvs = Arc::new(remove_dvs);
@@ -285,16 +293,20 @@ struct ProcessedCdfCommitVisitor<'a> {
     has_cdc_action: &'a mut bool,
     add_paths: &'a mut HashSet<String>,
     remove_dvs: &'a mut HashMap<String, DvInfo>,
+    commit_timestamp: Option<i64>,
+    is_first_batch: bool,
 }
 impl ProcessedCdfCommitVisitor<'_> {
     fn schema() -> SchemaRef {
         static PREPARE_PHASE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+            let ict_type = StructField::new("inCommitTimestamp", DataType::LONG, true);
             Arc::new(StructType::new(vec![
                 Option::<Add>::get_struct_field(ADD_NAME),
                 Option::<Remove>::get_struct_field(REMOVE_NAME),
                 Option::<Cdc>::get_struct_field(CDC_NAME),
                 Option::<Metadata>::get_struct_field(METADATA_NAME),
                 Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
+                StructField::new(COMMIT_INFO_NAME, StructType::new([ict_type]), true),
             ]))
         });
         PREPARE_PHASE_SCHEMA.clone()
@@ -330,6 +342,7 @@ impl RowVisitor for ProcessedCdfCommitVisitor<'_> {
                 (INTEGER, column_name!("protocol.minWriterVersion")),
                 (str_list.clone(), column_name!("protocol.readerFeatures")),
                 (str_list, column_name!("protocol.writerFeatures")),
+                (LONG, column_name!("commitInfo.inCommitTimestamp")),
             ];
             let (types, names) = types_and_names.into_iter().unzip();
             (names, types).into()
@@ -339,7 +352,7 @@ impl RowVisitor for ProcessedCdfCommitVisitor<'_> {
 
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 18,
+            getters.len() == 19,
             Error::InternalError(format!(
                 "Wrong number of ProcessedCdfCommitVisitor getters: {}",
                 getters.len()
@@ -375,6 +388,17 @@ impl RowVisitor for ProcessedCdfCommitVisitor<'_> {
                 let protocol =
                     ProtocolVisitor::visit_protocol(i, min_reader_version, &getters[14..=17])?;
                 self.protocol = Some(protocol);
+            } else if let Some(in_commit_timestamp) =
+                getters[18].get_long(i, "commitInfo.inCommitTimestamp")?
+            {
+                require!(
+                    self.is_first_batch && i == 0,
+                    Error::InvalidCommitInfo(
+                        "When in-commit timestamps is enabled, CommitInfo must be the first action in a commit, \
+                        but found it in position {i} of the batch.".to_string()
+                    )
+                );
+                self.commit_timestamp = Some(in_commit_timestamp);
             }
         }
         Ok(())
