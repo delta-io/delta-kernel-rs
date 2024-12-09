@@ -112,11 +112,11 @@ pub type ScanCallback<T> = fn(
 /// ## Example
 /// ```ignore
 /// let mut context = [my context];
-/// for res in scan_data { // scan data from scan.get_scan_data()
+/// for res in scan_data { // scan data from scan.scan_data()
 ///     let (data, vector) = res?;
 ///     context = delta_kernel::scan::state::visit_scan_files(
 ///        data.as_ref(),
-///        vector,
+///        selection_vector,
 ///        context,
 ///        my_callback,
 ///     )?;
