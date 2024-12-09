@@ -59,7 +59,9 @@
 )]
 
 use std::any::Any;
+use std::fs::DirEntry;
 use std::sync::Arc;
+use std::time::SystemTime;
 use std::{cmp::Ordering, ops::Range};
 
 use bytes::Bytes;
@@ -139,6 +141,31 @@ impl Ord for FileMeta {
 impl PartialOrd for FileMeta {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+impl TryFrom<DirEntry> for FileMeta {
+    type Error = Error;
+
+    fn try_from(ent: DirEntry) -> DeltaResult<FileMeta> {
+        let metadata = ent.metadata()?;
+        let last_modified = metadata
+            .modified()?
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|_| Error::generic("Failed to convert file timestamp to milliseconds"))?;
+        let location = Url::from_file_path(ent.path())
+            .map_err(|_| Error::generic(format!("Invalid path: {:?}", ent.path())))?;
+        let last_modified = last_modified.as_millis().try_into().map_err(|_| {
+            Error::generic(format!(
+                "Failed to convert file modification time {:?} into i64",
+                last_modified.as_millis()
+            ))
+        })?;
+        Ok(FileMeta {
+            location,
+            last_modified,
+            size: metadata.len() as usize,
+        })
     }
 }
 
