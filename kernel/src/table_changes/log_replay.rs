@@ -7,8 +7,8 @@ use std::sync::{Arc, LazyLock};
 use crate::actions::schemas::GetStructField;
 use crate::actions::visitors::{visit_deletion_vector_at, ProtocolVisitor};
 use crate::actions::{
-    get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, METADATA_NAME,
-    PROTOCOL_NAME, REMOVE_NAME,
+    get_log_add_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME,
+    COMMIT_INFO_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
@@ -163,6 +163,7 @@ impl LogReplayScanner {
         let mut remove_dvs = HashMap::default();
         let mut add_paths = HashSet::default();
         let mut has_cdc_action = false;
+        let mut timestamp = commit_file.location.last_modified;
         for actions in action_iter {
             let actions = actions?;
 
@@ -170,6 +171,7 @@ impl LogReplayScanner {
                 add_paths: &mut add_paths,
                 remove_dvs: &mut remove_dvs,
                 has_cdc_action: &mut has_cdc_action,
+                timestamp: &mut timestamp,
                 protocol: None,
                 metadata_info: None,
             };
@@ -202,7 +204,7 @@ impl LogReplayScanner {
             remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
         }
         Ok(LogReplayScanner {
-            timestamp: commit_file.location.last_modified,
+            timestamp,
             commit_file,
             has_cdc_action,
             remove_dvs,
@@ -220,7 +222,6 @@ impl LogReplayScanner {
             has_cdc_action,
             remove_dvs,
             commit_file,
-            // TODO: Add the timestamp as a column with an expression
             timestamp,
         } = self;
         let remove_dvs = Arc::new(remove_dvs);
@@ -274,6 +275,7 @@ struct PreparePhaseVisitor<'a> {
     has_cdc_action: &'a mut bool,
     add_paths: &'a mut HashSet<String>,
     remove_dvs: &'a mut HashMap<String, DvInfo>,
+    timestamp: &'a mut i64,
 }
 impl PreparePhaseVisitor<'_> {
     fn schema() -> Arc<StructType> {
@@ -283,6 +285,7 @@ impl PreparePhaseVisitor<'_> {
             Option::<Cdc>::get_struct_field(CDC_NAME),
             Option::<Metadata>::get_struct_field(METADATA_NAME),
             Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
+            Option::<CommitInfo>::get_struct_field(COMMIT_INFO_NAME),
         ]))
     }
 }
@@ -314,6 +317,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 (INTEGER, column_name!("protocol.minWriterVersion")),
                 (string_list.clone(), column_name!("protocol.readerFeatures")),
                 (string_list, column_name!("protocol.writerFeatures")),
+                (LONG, column_name!("commitInfo.timestamp")),
             ];
             let (types, names) = types_and_names.into_iter().unzip();
             (names, types).into()
@@ -323,7 +327,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
 
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 16,
+            getters.len() == 17,
             Error::InternalError(format!(
                 "Wrong number of PreparePhaseVisitor getters: {}",
                 getters.len()
@@ -354,6 +358,8 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 let protocol =
                     ProtocolVisitor::visit_protocol(i, min_reader_version, &getters[12..=15])?;
                 self.protocol = Some(protocol);
+            } else if let Some(timestamp) = getters[16].get_long(i, "commitInfo.timestamp")? {
+                *self.timestamp = timestamp;
             }
         }
         Ok(())
