@@ -333,6 +333,7 @@ struct CommitInfo {
     /// Read: optional, write: required (that is, kernel always writes).
     /// If in-commit timestamps are enabled, this is always required.
     pub(crate) timestamp: Option<i64>,
+    pub(crate) in_commit_timestamp: Option<i64>,
     /// An arbitrary string that identifies the operation associated with this commit. This is
     /// specified by the engine. Read: optional, write: required (that is, kernel alwarys writes).
     pub(crate) operation: Option<String>,

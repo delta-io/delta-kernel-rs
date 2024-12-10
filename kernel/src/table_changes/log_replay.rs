@@ -317,7 +317,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 (INTEGER, column_name!("protocol.minWriterVersion")),
                 (string_list.clone(), column_name!("protocol.readerFeatures")),
                 (string_list, column_name!("protocol.writerFeatures")),
-                (LONG, column_name!("commitInfo.timestamp")),
+                (LONG, column_name!("commitInfo.inCommitTimestamp")),
             ];
             let (types, names) = types_and_names.into_iter().unzip();
             (names, types).into()
@@ -358,7 +358,9 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 let protocol =
                     ProtocolVisitor::visit_protocol(i, min_reader_version, &getters[12..=15])?;
                 self.protocol = Some(protocol);
-            } else if let Some(timestamp) = getters[16].get_long(i, "commitInfo.timestamp")? {
+            } else if let Some(timestamp) =
+                getters[16].get_long(i, "commitInfo.inCommitTimestamp")?
+            {
                 *self.timestamp = timestamp;
             }
         }
