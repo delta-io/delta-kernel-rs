@@ -8,6 +8,7 @@ use crate::expressions::{column_expr, BinaryOperator};
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::scan::state::DvInfo;
+use crate::scan::PhysicalPredicate;
 use crate::schema::{DataType, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_features::ReaderFeatures;
@@ -523,18 +524,22 @@ async fn data_skipping_filter() {
         column_expr!("id"),
         Scalar::from(4),
     );
+    let logical_schema = get_schema();
+    let predicate = match PhysicalPredicate::try_new(&predicate, &logical_schema) {
+        Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
+        other => panic!("Unexpected result: {:?}", other),
+    };
     let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
         .unwrap()
         .into_iter();
 
-    let sv =
-        table_changes_action_iter(engine, commits, get_schema().into(), Some(predicate.into()))
-            .unwrap()
-            .flat_map(|scan_data| {
-                let scan_data = scan_data.unwrap();
-                scan_data.selection_vector
-            })
-            .collect_vec();
+    let sv = table_changes_action_iter(engine, commits, logical_schema.into(), predicate)
+        .unwrap()
+        .flat_map(|scan_data| {
+            let scan_data = scan_data.unwrap();
+            scan_data.selection_vector
+        })
+        .collect_vec();
 
     // Note: since the first pair is a dv operation, remove action will always be filtered
     assert_eq!(sv, &[false, true, false, false, true]);

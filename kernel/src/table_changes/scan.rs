@@ -4,7 +4,7 @@ use itertools::Itertools;
 use tracing::debug;
 
 use crate::scan::state::GlobalScanState;
-use crate::scan::ColumnType;
+use crate::scan::{ColumnType, PhysicalPredicate};
 use crate::schema::{SchemaRef, StructType};
 use crate::{DeltaResult, Engine, ExpressionRef};
 
@@ -26,7 +26,7 @@ pub struct TableChangesScan {
     // Data Feed
     physical_schema: SchemaRef,
     // The predicate to filter the data
-    predicate: Option<ExpressionRef>,
+    physical_predicate: PhysicalPredicate,
     // The [`ColumnType`] of all the fields in the `logical_schema`
     all_fields: Vec<ColumnType>,
     // `true` if any column in the `logical_schema` is a partition column
@@ -159,10 +159,15 @@ impl TableChangesScanBuilder {
                 }
             })
             .try_collect()?;
+        let physical_predicate = match self.predicate {
+            Some(predicate) => PhysicalPredicate::try_new(&predicate, &logical_schema)?,
+            None => PhysicalPredicate::None,
+        };
+
         Ok(TableChangesScan {
             table_changes: self.table_changes,
             logical_schema,
-            predicate: self.predicate,
+            physical_predicate,
             all_fields,
             have_partition_cols,
             physical_schema: StructType::new(read_fields).into(),
@@ -186,8 +191,15 @@ impl TableChangesScan {
             .log_segment
             .ascending_commit_files
             .clone();
+        // NOTE: This is a cheap arc clone
+        let physical_predicate = match self.physical_predicate.clone() {
+            PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),
+            PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
+            PhysicalPredicate::None => None,
+        };
         let schema = self.table_changes.end_snapshot.schema().clone().into();
-        table_changes_action_iter(engine, commits, schema, self.predicate.clone())
+        let it = table_changes_action_iter(engine, commits, schema, physical_predicate)?;
+        Ok(Some(it).into_iter().flatten())
     }
 
     /// Get global state that is valid for the entire scan. This is somewhat expensive so should
@@ -211,7 +223,7 @@ mod tests {
 
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, Scalar};
-    use crate::scan::ColumnType;
+    use crate::scan::{ColumnType, PhysicalPredicate};
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::COMMIT_VERSION_COL_NAME;
     use crate::{Expression, Table};
@@ -237,7 +249,7 @@ mod tests {
                 ColumnType::Selected("_commit_timestamp".to_string()),
             ]
         );
-        assert_eq!(scan.predicate, None);
+        assert_eq!(scan.physical_predicate, PhysicalPredicate::None);
         assert!(!scan.have_partition_cols);
     }
 
@@ -277,6 +289,12 @@ mod tests {
             .into()
         );
         assert!(!scan.have_partition_cols);
-        assert_eq!(scan.predicate, Some(predicate));
+        assert_eq!(
+            scan.physical_predicate,
+            PhysicalPredicate::Some(
+                predicate,
+                StructType::new([StructField::new("id", DataType::INTEGER, true),]).into()
+            )
+        );
     }
 }
