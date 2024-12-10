@@ -16,6 +16,7 @@ use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, Version};
 
 mod log_replay;
+mod resolve_dvs;
 pub mod scan;
 mod scan_file;
 
