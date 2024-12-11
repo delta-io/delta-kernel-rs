@@ -84,13 +84,6 @@ pub(crate) fn get_log_commit_info_schema() -> &'static SchemaRef {
     &LOG_COMMIT_INFO_SCHEMA
 }
 
-pub(crate) fn get_log_commit_info_schema_no_ict() -> &'static SchemaRef {
-    StructType::new([
-        StructField::new("timestamp", DataType::LONG, true),
-        StructField::new("operation", DataType::STRING, true),
-    ])
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
 #[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
 pub struct Format {

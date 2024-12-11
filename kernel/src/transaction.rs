@@ -273,6 +273,7 @@ fn generate_commit_info(
     let commit_info_exprs = [
         // TODO(zach): we should probably take a timestamp closer to actual commit time?
         Expression::literal(timestamp),
+        Expression::null_literal(DataType::LONG),
         Expression::literal(operation.unwrap_or(UNKNOWN_OPERATION)),
         // HACK (part 1/2): since we don't have proper map support, we create a literal struct with
         // one null field to create data that serializes as "operationParameters": {}
