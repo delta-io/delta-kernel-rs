@@ -389,7 +389,7 @@ fn read_with_scan_data(
             .get_parquet_handler()
             .read_parquet_files(
                 &[meta],
-                global_state.read_schema.clone(),
+                global_state.physical_schema.clone(),
                 scan.physical_predicate().clone(),
             )
             .unwrap();

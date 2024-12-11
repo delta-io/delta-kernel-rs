@@ -256,7 +256,7 @@ fn do_work(
 ) {
     // get the type for the function calls
     let engine: &dyn Engine = engine.as_ref();
-    let read_schema = scan_state.read_schema.clone();
+    let physical_schema = scan_state.physical_schema.clone();
     // in a loop, try and get a ScanFile. Note that `recv` will return an `Err` when the other side
     // hangs up, which indicates there's no more data to process.
     while let Ok(scan_file) = scan_file_rx.recv() {
@@ -287,7 +287,7 @@ fn do_work(
         // vector
         let read_results = engine
             .get_parquet_handler()
-            .read_parquet_files(&[meta], read_schema.clone(), None)
+            .read_parquet_files(&[meta], physical_schema.clone(), None)
             .unwrap();
 
         for read_result in read_results {

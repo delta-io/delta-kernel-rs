@@ -96,7 +96,7 @@ pub unsafe extern "C" fn get_global_read_schema(
     state: Handle<SharedGlobalScanState>,
 ) -> Handle<SharedSchema> {
     let state = unsafe { state.as_ref() };
-    state.read_schema.clone().into()
+    state.physical_schema.clone().into()
 }
 
 /// Free a global read schema

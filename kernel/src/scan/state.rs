@@ -24,7 +24,7 @@ pub struct GlobalScanState {
     pub table_root: String,
     pub partition_columns: Vec<String>,
     pub logical_schema: SchemaRef,
-    pub read_schema: SchemaRef,
+    pub physical_schema: SchemaRef,
     pub column_mapping_mode: ColumnMappingMode,
 }
 

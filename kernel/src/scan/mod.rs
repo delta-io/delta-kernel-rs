@@ -113,7 +113,7 @@ impl ScanBuilder {
             logical_schema,
             physical_schema: Arc::new(StructType::new(state_info.read_fields)),
             physical_predicate,
-            all_fields: state_info.all_fields,
+            all_fields: Arc::new(state_info.all_fields),
             have_partition_cols: state_info.have_partition_cols,
         })
     }
@@ -329,7 +329,7 @@ pub struct Scan {
     logical_schema: SchemaRef,
     physical_schema: SchemaRef,
     physical_predicate: PhysicalPredicate,
-    all_fields: Vec<ColumnType>,
+    all_fields: Arc<Vec<ColumnType>>,
     have_partition_cols: bool,
 }
 
@@ -411,7 +411,7 @@ impl Scan {
             table_root: self.snapshot.table_root.to_string(),
             partition_columns: self.snapshot.metadata().partition_columns.clone(),
             logical_schema: self.logical_schema.clone(),
-            read_schema: self.physical_schema.clone(),
+            physical_schema: self.physical_schema.clone(),
             column_mapping_mode: self.snapshot.column_mapping_mode,
         }
     }
@@ -427,7 +427,7 @@ impl Scan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>> + '_> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
         struct ScanFile {
             path: String,
             size: i64,
@@ -456,6 +456,11 @@ impl Scan {
         );
 
         let global_state = Arc::new(self.global_scan_state());
+        let table_root = self.snapshot.table_root.clone();
+        let physical_predicate = self.physical_predicate();
+        let all_fields = self.all_fields.clone();
+        let have_partition_cols = self.have_partition_cols;
+
         let scan_data = self.scan_data(engine.as_ref())?;
         let scan_files_iter = scan_data
             .map(|res| {
@@ -469,10 +474,10 @@ impl Scan {
         let result = scan_files_iter
             .map(move |scan_file| -> DeltaResult<_> {
                 let scan_file = scan_file?;
-                let file_path = self.snapshot.table_root.join(&scan_file.path)?;
+                let file_path = table_root.join(&scan_file.path)?;
                 let mut selection_vector = scan_file
                     .dv_info
-                    .get_selection_vector(engine.as_ref(), &self.snapshot.table_root)?;
+                    .get_selection_vector(engine.as_ref(), &table_root)?;
                 let meta = FileMeta {
                     last_modified: 0,
                     size: scan_file.size as usize,
@@ -485,13 +490,14 @@ impl Scan {
                 // https://github.com/delta-io/delta-kernel-rs/issues/434 for more details.
                 let read_result_iter = engine.get_parquet_handler().read_parquet_files(
                     &[meta],
-                    global_state.read_schema.clone(),
-                    self.physical_predicate(),
+                    global_state.physical_schema.clone(),
+                    physical_predicate.clone(),
                 )?;
 
                 // Arc clones
                 let engine = engine.clone();
                 let global_state = global_state.clone();
+                let all_fields = all_fields.clone();
                 Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
                     let read_result = read_result?;
                     // to transform the physical data into the correct logical form
@@ -500,8 +506,8 @@ impl Scan {
                         read_result,
                         &global_state,
                         &scan_file.partition_values,
-                        &self.all_fields,
-                        self.have_partition_cols,
+                        &all_fields,
+                        have_partition_cols,
                     );
                     let len = logical.as_ref().map_or(0, |res| res.len());
                     // need to split the dv_mask. what's left in dv_mask covers this result, and rest
@@ -651,7 +657,7 @@ fn transform_to_logical_internal(
     all_fields: &[ColumnType],
     have_partition_cols: bool,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    let read_schema = global_state.read_schema.clone();
+    let physical_schema = global_state.physical_schema.clone();
     if !have_partition_cols && global_state.column_mapping_mode == ColumnMappingMode::None {
         return Ok(data);
     }
@@ -678,7 +684,7 @@ fn transform_to_logical_internal(
     let result = engine
         .get_expression_handler()
         .get_evaluator(
-            read_schema,
+            physical_schema,
             read_expression,
             global_state.logical_schema.clone().into(),
         )
