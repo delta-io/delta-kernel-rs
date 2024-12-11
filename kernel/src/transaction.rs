@@ -590,6 +590,7 @@ mod tests {
             serde_json::json!({
                 "commitInfo": {
                     "timestamp": 0,
+                    "inCommitTimestamp": 0,
                     "operation": "test operation",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
@@ -600,6 +601,7 @@ mod tests {
             serde_json::json!({
                 "commitInfo": {
                     "timestamp": 0,
+                    "inCommitTimestamp": 0,
                     "operation": "test operation",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},

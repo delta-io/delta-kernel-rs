@@ -314,7 +314,7 @@ mod tests {
 
         let cdc_timestamp = 12345678;
         let commit_info = CommitInfo {
-            timestamp: Some(cdc_timestamp),
+            in_commit_timestamp: Some(cdc_timestamp),
             ..Default::default()
         };
 
