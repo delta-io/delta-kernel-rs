@@ -18,7 +18,6 @@ use crate::utils::require;
 use crate::{DeltaResult, Error, RowVisitor};
 
 // The type of action associated with a [`CdfScanFile`].
-#[allow(unused)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum CdfScanFileType {
     Add,
@@ -27,7 +26,6 @@ pub(crate) enum CdfScanFileType {
 }
 
 /// Represents all the metadata needed to read a Change Data Feed.
-#[allow(unused)]
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) struct CdfScanFile {
     /// The type of action this file belongs to. This may be one of add, remove, or cdc
@@ -51,7 +49,6 @@ pub(crate) type CdfScanCallback<T> = fn(context: &mut T, scan_file: CdfScanFile)
 
 /// Transforms an iterator of [`TableChangesScanData`] into an iterator of
 /// [`CdfScanFile`] by visiting the engine data.
-#[allow(unused)]
 pub(crate) fn scan_data_to_scan_file(
     scan_data: impl Iterator<Item = DeltaResult<TableChangesScanData>>,
 ) -> impl Iterator<Item = DeltaResult<CdfScanFile>> {
@@ -91,7 +88,6 @@ pub(crate) fn scan_data_to_scan_file(
 ///     )?;
 /// }
 /// ```
-#[allow(unused)]
 pub(crate) fn visit_cdf_scan_files<T>(
     scan_data: &TableChangesScanData,
     context: T,
@@ -110,7 +106,6 @@ pub(crate) fn visit_cdf_scan_files<T>(
 
 /// A visitor that extracts [`CdfScanFile`]s from engine data. Expects data to have the schema
 /// [`cdf_scan_row_schema`].
-#[allow(unused)]
 struct CdfScanFileVisitor<'a, T> {
     callback: CdfScanCallback<T>,
     selection_vector: &'a [bool],
@@ -219,7 +214,6 @@ pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
 
 /// Expression to convert an action with `log_schema` into one with
 /// [`cdf_scan_row_schema`]. This is the expression used to create [`TableChangesScanData`].
-#[allow(unused)]
 pub(crate) fn cdf_scan_row_expression(commit_timestamp: i64, commit_number: i64) -> Expression {
     Expression::struct_from([
         Expression::struct_from([

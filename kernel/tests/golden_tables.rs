@@ -24,18 +24,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 
 mod common;
-use common::to_arrow;
-
-/// unpack the test data from test_table.tar.zst into a temp dir, and return the dir it was
-/// unpacked into
-fn load_test_data(test_name: &str) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
-    let path = format!("tests/golden_data/{}.tar.zst", test_name);
-    let tar = zstd::Decoder::new(std::fs::File::open(path)?)?;
-    let mut archive = tar::Archive::new(tar);
-    let temp_dir = tempfile::tempdir()?;
-    archive.unpack(temp_dir.path())?;
-    Ok(temp_dir)
-}
+use common::{load_test_data, to_arrow};
 
 // NB adapated from DAT: read all parquet files in the directory and concatenate them
 async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
@@ -218,7 +207,7 @@ fn setup_golden_table(
     Option<PathBuf>,
     tempfile::TempDir,
 ) {
-    let test_dir = load_test_data(test_name).unwrap();
+    let test_dir = load_test_data("tests/golden_data", test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
     let table_path = test_path.join("delta");
     let table = Table::try_from_uri(table_path.to_str().expect("table path to string"))

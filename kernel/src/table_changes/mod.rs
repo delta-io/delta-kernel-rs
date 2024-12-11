@@ -178,7 +178,6 @@ impl TableChanges {
         &self.table_root
     }
     /// The partition columns that will be read.
-    #[allow(unused)]
     pub(crate) fn partition_columns(&self) -> &Vec<String> {
         &self.end_snapshot.metadata().partition_columns
     }

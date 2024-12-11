@@ -7,16 +7,15 @@ use crate::{DeltaResult, Engine, Error};
 
 /// A [`CdfScanFile`] with its associated `selection_vector`. The `scan_type` is resolved to
 /// match the `_change_type` that its rows will have in the change data feed.
-#[allow(unused)]
-struct ResolvedCdfScanFile {
+pub(crate) struct ResolvedCdfScanFile {
     /// The scan file that holds the path the data file to be read. The `scan_type` field is
     /// resolved to the `_change_type` of the rows for this data file.
-    scan_file: CdfScanFile,
+    pub(crate) scan_file: CdfScanFile,
     /// Optional vector of bools. If `selection_vector[i] = true`, then that row must be included
     /// in the CDF output. Otherwise the row must be filtered out. The vector may be shorter than
     /// the data file. In this case, all the remaining rows are *not* selected. If `selection_vector`
     /// is `None`, then all rows are selected.
-    selection_vector: Option<Vec<bool>>,
+    pub(crate) selection_vector: Option<Vec<bool>>,
 }
 
 /// Resolves the deletion vectors for a [`CdfScanFile`]. This function handles two
@@ -33,8 +32,7 @@ struct ResolvedCdfScanFile {
 /// 2. The second case handles all other add, remove, and cdc [`CdfScanFile`]s. These will simply
 ///    read the deletion vector (if present), and each is converted into a [`ResolvedCdfScanFile`].
 ///    No changes are made to the `scan_type`.
-#[allow(unused)]
-fn resolve_scan_file_dv(
+pub(crate) fn resolve_scan_file_dv(
     engine: &dyn Engine,
     table_root: &Url,
     scan_file: CdfScanFile,

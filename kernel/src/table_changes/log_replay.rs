@@ -28,7 +28,6 @@ use itertools::Itertools;
 mod tests;
 
 /// Scan data for a Change Data Feed query. This holds metadata that is needed to read data rows.
-#[allow(unused)]
 pub(crate) struct TableChangesScanData {
     /// Engine data with the schema defined in [`scan_row_schema`]
     ///
@@ -127,7 +126,6 @@ struct LogReplayScanner {
     //
     // Note: This will be used once an expression is introduced to transform the engine data in
     // [`TableChangesScanData`]
-    #[allow(unused)]
     timestamp: i64,
 }
 
