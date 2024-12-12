@@ -54,6 +54,14 @@ fn read_cdf_for_table(
 #[test]
 fn cdf_with_deletion_vector() -> Result<(), Box<dyn error::Error>> {
     let batches = read_cdf_for_table("cdf-table-with-dv", 0, None)?;
+    // Each commit performs the following:
+    // 0. Insert  0..=9
+    // 1. Remove  [0, 9]
+    // 2. Restore [0, 9]
+    // 3. Remove  [0, 1, 4, 5]
+    // 4. Restore [1, 4]
+    // 5. Restore [0, 5] and Remove [3]
+    // 6. Restore 3
     let mut expected = vec![
         "+-------+--------------+-----------------+",
         "| value | _change_type | _commit_version |",
@@ -65,13 +73,23 @@ fn cdf_with_deletion_vector() -> Result<(), Box<dyn error::Error>> {
         "| 4     | insert       | 0               |",
         "| 5     | insert       | 0               |",
         "| 6     | insert       | 0               |",
-        "| 8     | insert       | 0               |",
         "| 7     | insert       | 0               |",
+        "| 8     | insert       | 0               |",
         "| 9     | insert       | 0               |",
         "| 0     | delete       | 1               |",
         "| 9     | delete       | 1               |",
         "| 0     | insert       | 2               |",
         "| 9     | insert       | 2               |",
+        "| 0     | delete       | 3               |",
+        "| 1     | delete       | 3               |",
+        "| 4     | delete       | 3               |",
+        "| 5     | delete       | 3               |",
+        "| 1     | insert       | 4               |",
+        "| 4     | insert       | 4               |",
+        "| 3     | delete       | 5               |",
+        "| 0     | insert       | 5               |",
+        "| 5     | insert       | 5               |",
+        "| 3     | insert       | 6               |",
         "+-------+--------------+-----------------+",
     ];
     sort_lines!(expected);
