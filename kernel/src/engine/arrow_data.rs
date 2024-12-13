@@ -8,7 +8,6 @@ use crate::arrow::array::{
     Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray,
 };
 use crate::arrow::datatypes::{DataType as ArrowDataType, FieldRef};
-use arrow_53::util::pretty::print_batches;
 use tracing::debug;
 
 use std::collections::{HashMap, HashSet};

@@ -1,8 +1,6 @@
 //! This module encapsulates the state of a scan
 
-use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::time::SystemTime;
 
 use crate::actions::deletion_vector::deletion_treemap_to_bools;
 use crate::scan::get_transform_for_row;
@@ -15,7 +13,6 @@ use crate::{
     schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef},
     DeltaResult, Engine, EngineData, Error,
 };
-use chrono::{NaiveTime, Utc};
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use tracing::warn;

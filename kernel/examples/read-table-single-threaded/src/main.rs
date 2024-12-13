@@ -137,6 +137,9 @@ fn try_main() -> DeltaResult<()> {
             }
         })
         .try_collect()?;
-    print_batches(&batches)?;
+    // print_batches(&batches)?;
+    // print the total number of rows
+    let total_rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
+    println!("Total rows read: {}", total_rows);
     Ok(())
 }
