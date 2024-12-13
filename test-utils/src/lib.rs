@@ -106,3 +106,13 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
         .unwrap()
         .into()
 }
+
+/// We implement abs_diff here so we don't have to bump our msrv.
+/// TODO: Remove and use std version when msrv >= 1.81.0
+pub fn abs_diff(self_dur: std::time::Duration, other: std::time::Duration) -> std::time::Duration {
+    if let Some(res) = self_dur.checked_sub(other) {
+        res
+    } else {
+        other.checked_sub(self_dur).unwrap()
+    }
+}

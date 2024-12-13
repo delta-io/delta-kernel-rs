@@ -160,7 +160,7 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::{local::LocalFileSystem, ObjectStore};
 
-    use test_utils::delta_path_for_version;
+    use test_utils::{abs_diff, delta_path_for_version};
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngine;
@@ -241,7 +241,7 @@ mod tests {
         assert!(!files.is_empty());
         for meta in files.into_iter() {
             let meta_time = Duration::from_millis(meta.last_modified.try_into().unwrap());
-            assert!(meta_time.abs_diff(begin_time) < Duration::from_secs(10));
+            assert!(abs_diff(meta_time, begin_time) < Duration::from_secs(10));
         }
     }
     #[tokio::test]
