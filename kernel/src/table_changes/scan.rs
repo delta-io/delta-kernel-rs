@@ -1,3 +1,5 @@
+//! Functionality to create and execute table changes scans over the data in the delta table
+
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -16,8 +18,8 @@ use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
 use super::scan_file::scan_data_to_scan_file;
 use super::{TableChanges, CDF_FIELDS};
 
-/// The result of building a [`TableChanges`] scan over a table. This can be used to get a change
-/// data feed from the table
+/// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
+/// data feed from the table.
 #[derive(Debug)]
 pub struct TableChangesScan {
     // The [`TableChanges`] that specifies this scan's start and end versions
@@ -37,7 +39,7 @@ pub struct TableChangesScan {
 
 /// This builder constructs a [`TableChangesScan`] that can be used to read the [`TableChanges`]
 /// of a table. [`TableChangesScanBuilder`] allows you to specify a schema to project the columns
-/// or specify a predicate to filter rows in the Change Data Feed. Note that predicates over Change
+/// or specify a predicate to filter rows in the Change Data Feed. Note that predicates containing Change
 /// Data Feed columns `_change_type`, `_commit_version`, and `_commit_timestamp` are not currently
 /// allowed. See issue [#525](https://github.com/delta-io/delta-kernel-rs/issues/525).
 ///
@@ -45,7 +47,7 @@ pub struct TableChangesScan {
 /// [`ScanBuilder`].
 ///
 /// [`ScanBuilder`]: crate::scan::ScanBuilder
-/// #Examples
+/// # Example
 /// Construct a [`TableChangesScan`] from `table_changes` with a given schema and predicate
 /// ```rust
 /// # use std::sync::Arc;

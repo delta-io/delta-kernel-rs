@@ -10,12 +10,16 @@
 //!
 //! A full `rust` example for reading table data using the default engine can be found in the
 //! [read-table-single-threaded] example (and for a more complex multi-threaded reader see the
-//! [read-table-multi-threaded] example).
+//! [read-table-multi-threaded] example). An example for reading the table changes for a table
+//! using the default engine can be found in the [read-table-changes] example.
+//!
 //!
 //! [read-table-single-threaded]:
 //! https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/examples/read-table-single-threaded
 //! [read-table-multi-threaded]:
 //! https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/examples/read-table-multi-threaded
+//! [read-table-changes]:
+//! https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/examples/read-table-changes
 //!
 //! Simple write examples can be found in the [`write.rs`] integration tests. Standalone write
 //! examples are coming soon!
