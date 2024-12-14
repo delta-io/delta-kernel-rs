@@ -1,18 +1,66 @@
 # Changelog
 
-## unreleased
+## [v0.6.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.6.0/) (2024-12-13)
 
-[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.5.0...HEAD)
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.5.0...v0.6.0)
 
 **API Changes**
 
 *Breaking*
+1. `Scan::execute` takes an `Arc<dyn EngineData>` now ([#553])
+2. `StructField::physical_name` no longer takes a `ColumnMapping` argument ([#543])
+3. removed `ColumnMappingMode` `Default` implementation ([#562])
+4. Remove lifetime requirement on `Scan::execute` ([#588])
+5. `scan::Scan::predicate` renamed as `physical_predicate` to eliminate ambiguity ([#512])
+6. `scan::log_replay::scan_action_iter` now takes fewer (and different) params. ([#512])
+7. `Expression::Unary`, `Expression::Binary`, and `Expression::Variadic` now wrap a struct of the
+   same name containing their fields ([#530])
+8. New `Error` variant `Error::ChangeDataFeedIncompatibleSchema`
 
 *Additions*
+1. Ability to read a table's change data feed with new TableChanges API! See new `table_changes`
+   module as well as the 'read-table-changes' example ([#597]). Changes include:
+  - Implement Log Replay for Change Data Feed ([#540])
+  - `ScanFile` expression and visitor for CDF ([#546])
+  - Resolve deletion vectors to find inserted and removed rows for CDF ([#568])
+  - Helper methods for CDF Physical to Logical Transformation ([#579])
+  - `TableChangesScan::execute` and end to end testing for CDF ([#580])
+  - `TableChangesScan::schema` method to get logical schema ([#589])
+2. Enable relaying log events via FFI ([#542])
 
 **Implemented enhancements:**
+- Define an ExpressionTransform trait ([#530])
+- [chore] appease clippy in rustc 1.83 ([#557])
+- Simplify column mapping mode handling ([#543])
+- Adding some more miri tests ([#503])
+- Data skipping correctly handles nested columns and column mapping ([#512])
+- Engines now return FileMeta with correct millisecond timestamps ([#565])
 
 **Fixed bugs:**
+- don't use std abs_diff, put it in test_utils instead, run tests with msrv in action ([#596])
+- (CDF) Add fix for sv extension ([#591])
+- minimal CI fixes in arrow integration test and semver check ([#548])
+
+[#503]: https://github.com/delta-io/delta-kernel-rs/pull/503
+[#512]: https://github.com/delta-io/delta-kernel-rs/pull/512
+[#530]: https://github.com/delta-io/delta-kernel-rs/pull/530
+[#540]: https://github.com/delta-io/delta-kernel-rs/pull/540
+[#542]: https://github.com/delta-io/delta-kernel-rs/pull/542
+[#543]: https://github.com/delta-io/delta-kernel-rs/pull/543
+[#546]: https://github.com/delta-io/delta-kernel-rs/pull/546
+[#548]: https://github.com/delta-io/delta-kernel-rs/pull/548
+[#553]: https://github.com/delta-io/delta-kernel-rs/pull/553
+[#557]: https://github.com/delta-io/delta-kernel-rs/pull/557
+[#562]: https://github.com/delta-io/delta-kernel-rs/pull/562
+[#565]: https://github.com/delta-io/delta-kernel-rs/pull/565
+[#568]: https://github.com/delta-io/delta-kernel-rs/pull/568
+[#579]: https://github.com/delta-io/delta-kernel-rs/pull/579
+[#580]: https://github.com/delta-io/delta-kernel-rs/pull/580
+[#588]: https://github.com/delta-io/delta-kernel-rs/pull/588
+[#589]: https://github.com/delta-io/delta-kernel-rs/pull/589
+[#591]: https://github.com/delta-io/delta-kernel-rs/pull/591
+[#596]: https://github.com/delta-io/delta-kernel-rs/pull/596
+[#597]: https://github.com/delta-io/delta-kernel-rs/pull/597
 
 
 ## [v0.5.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.5.0/) (2024-11-26)

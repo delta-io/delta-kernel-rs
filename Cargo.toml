@@ -19,7 +19,7 @@ license = "Apache-2.0"
 repository = "https://github.com/delta-io/delta-kernel-rs"
 readme = "README.md"
 rust-version = "1.80"
-version = "0.5.0"
+version = "0.6.0"
 
 [workspace.dependencies]
 arrow = { version = ">=53, <54" }

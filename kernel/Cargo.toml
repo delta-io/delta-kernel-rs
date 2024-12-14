@@ -32,7 +32,7 @@ uuid = "1.10.0"
 z85 = "3.0.5"
 
 # bring in our derive macros
-delta_kernel_derive = { path = "../derive-macros", version = "0.5.0" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.6.0" }
 
 # used for developer-visibility
 visibility = "0.1.1"
