@@ -13,6 +13,9 @@ use crate::actions::deletion_vector::{
 };
 use crate::actions::{get_log_add_schema, get_log_schema, ADD_NAME, REMOVE_NAME};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, ExpressionTransform, Scalar};
+use crate::predicates::parquet_stats_skipping::{
+    ParquetStatsProvider, ParquetStatsSkippingFilter as _,
+};
 use crate::scan::state::{DvInfo, Stats};
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
@@ -183,9 +186,6 @@ impl PhysicalPredicate {
 // the predicate allows to statically skip all files. Since this is direct evaluation (not an
 // expression rewrite), we use a dummy `ParquetStatsProvider` that provides no stats.
 fn can_statically_skip_all_files(predicate: &Expression) -> bool {
-    use crate::engine::parquet_stats_skipping::{
-        ParquetStatsProvider, ParquetStatsSkippingFilter as _,
-    };
     struct NoStats;
     impl ParquetStatsProvider for NoStats {
         fn get_parquet_min_stat(&self, _: &ColumnName, _: &DataType) -> Option<Scalar> {

@@ -1,5 +1,5 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer stats.
-use crate::engine::parquet_stats_skipping::{
+use crate::predicates::parquet_stats_skipping::{
     ParquetStatsProvider, ParquetStatsSkippingFilter as _,
 };
 use crate::expressions::{ColumnName, Expression, Scalar, UnaryExpression, BinaryExpression, VariadicExpression};

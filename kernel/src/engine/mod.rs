@@ -29,7 +29,6 @@ macro_rules! declare_modules {
 declare_modules!(
     (pub, arrow_data),
     (pub, parquet_row_group_skipping),
-    (pub, parquet_stats_skipping),
     (pub(crate), arrow_get_data),
     (pub(crate), arrow_utils),
     (pub(crate), ensure_data_types)
