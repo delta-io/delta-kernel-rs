@@ -101,6 +101,8 @@ jobs:
           toolchain: stable
           override: true
       - uses: Swatinem/rust-cache@v2
+      - name: check kernel builds with no-default-features
+        run: cargo build -p delta_kernel --no-default-features
       - name: build and lint with clippy
         run: cargo clippy --benches --tests --all-features -- -D warnings
       - name: lint without default features
