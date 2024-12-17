@@ -191,6 +191,10 @@ pub enum Error {
 
     #[error("Change data feed encountered incompatible schema. Expected {0}, got {1}")]
     ChangeDataFeedIncompatibleSchema(String, String),
+
+    /// Invalid checkpoint files
+    #[error("Invalid Checkpoint: {0}")]
+    InvalidCheckpoint(String),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -262,6 +266,10 @@ impl Error {
         actual: &StructType,
     ) -> Self {
         Self::ChangeDataFeedIncompatibleSchema(format!("{expected:?}"), format!("{actual:?}"))
+    }
+
+    pub fn invalid_checkpoint(msg: impl ToString) -> Self {
+        Self::InvalidCheckpoint(msg.to_string())
     }
 
     // Capture a backtrace when the error is constructed.
