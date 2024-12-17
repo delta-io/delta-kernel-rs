@@ -112,6 +112,9 @@ integration-test = [
   "walkdir",
 ]
 
+[dependencies.home]
+version = "=0.5.9"
+
 [build-dependencies]
 rustc_version = "0.4.1"
 
