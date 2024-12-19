@@ -177,7 +177,7 @@ fn print_scan_file(
               Size (bytes):\t{size}\n  \
               Num Records:\t{num_record_str}\n  \
               Has DV?:\t{}\n  \
-              TransformExpr:\t {transform:?}\n \
+              Transform:\t{transform:?}\n  \
               Part Vals:\t{partition_values:?}",
         dv_info.has_vector()
     );
