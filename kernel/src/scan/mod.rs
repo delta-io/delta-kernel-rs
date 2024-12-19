@@ -463,6 +463,7 @@ impl Scan {
             size: i64,
             _: Option<Stats>,
             dv_info: DvInfo,
+            _transform: Option<ExpressionRef>,
             partition_values: HashMap<String, String>,
         ) {
             batches.push(ScanFile {
@@ -487,9 +488,15 @@ impl Scan {
         let scan_data = self.scan_data(engine.as_ref())?;
         let scan_files_iter = scan_data
             .map(|res| {
-                let (data, vec, _transforms) = res?;
+                let (data, vec, transforms) = res?;
                 let scan_files = vec![];
-                state::visit_scan_files(data.as_ref(), &vec, scan_files, scan_data_callback)
+                state::visit_scan_files(
+                    data.as_ref(),
+                    &vec,
+                    &transforms,
+                    scan_files,
+                    scan_data_callback,
+                )
             })
             // Iterator<DeltaResult<Vec<ScanFile>>> to Iterator<DeltaResult<ScanFile>>
             .flatten_ok();
@@ -816,11 +823,12 @@ pub(crate) mod test_utils {
         );
         let mut batch_count = 0;
         for res in iter {
-            let (batch, sel, _transforms) = res.unwrap();
+            let (batch, sel, transforms) = res.unwrap();
             assert_eq!(sel, expected_sel_vec);
             crate::scan::state::visit_scan_files(
                 batch.as_ref(),
                 &sel,
+                &transforms,
                 context.clone(),
                 validate_callback,
             )
@@ -1020,6 +1028,7 @@ mod tests {
             _size: i64,
             _: Option<Stats>,
             dv_info: DvInfo,
+            _transform: Option<ExpressionRef>,
             _partition_values: HashMap<String, String>,
         ) {
             paths.push(path.to_string());
@@ -1027,8 +1036,14 @@ mod tests {
         }
         let mut files = vec![];
         for data in scan_data {
-            let (data, vec, _transforms) = data?;
-            files = state::visit_scan_files(data.as_ref(), &vec, files, scan_data_callback)?;
+            let (data, vec, transforms) = data?;
+            files = state::visit_scan_files(
+                data.as_ref(),
+                &vec,
+                &transforms,
+                files,
+                scan_data_callback,
+            )?;
         }
         Ok(files)
     }
