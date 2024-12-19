@@ -15,7 +15,7 @@ use delta_kernel::engine::sync::SyncEngine;
 use delta_kernel::scan::state::{DvInfo, GlobalScanState, Stats};
 use delta_kernel::scan::transform_to_logical;
 use delta_kernel::schema::Schema;
-use delta_kernel::{DeltaResult, Engine, EngineData, FileMeta, Table};
+use delta_kernel::{DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Table};
 
 use clap::{Parser, ValueEnum};
 use url::Url;
@@ -111,6 +111,7 @@ fn send_scan_file(
     size: i64,
     _stats: Option<Stats>,
     dv_info: DvInfo,
+    _transform: Option<ExpressionRef>,
     partition_values: HashMap<String, String>,
 ) {
     let scan_file = ScanFile {
@@ -210,10 +211,11 @@ fn try_main() -> DeltaResult<()> {
     drop(record_batch_tx);
 
     for res in scan_data {
-        let (data, vector, _transforms) = res?;
+        let (data, vector, transforms) = res?;
         scan_file_tx = delta_kernel::scan::state::visit_scan_files(
             data.as_ref(),
             &vector,
+            &transforms,
             scan_file_tx,
             send_scan_file,
         )?;
