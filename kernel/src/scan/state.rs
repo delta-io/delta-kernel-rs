@@ -5,6 +5,7 @@ use std::sync::LazyLock;
 
 use crate::actions::deletion_vector::deletion_treemap_to_bools;
 use crate::utils::require;
+use crate::Expression;
 use crate::{
     actions::{deletion_vector::DeletionVectorDescriptor, visitors::visit_deletion_vector_at},
     engine_data::{GetData, RowVisitor, TypedGetData as _},
@@ -104,6 +105,7 @@ pub type ScanCallback<T> = fn(
     size: i64,
     stats: Option<Stats>,
     dv_info: DvInfo,
+    transform: Option<&Expression>,
     partition_values: HashMap<String, String>,
 );
 
@@ -138,12 +140,14 @@ pub type ScanCallback<T> = fn(
 pub fn visit_scan_files<T>(
     data: &dyn EngineData,
     selection_vector: &[bool],
+    transforms: &HashMap<usize, Expression>,
     context: T,
     callback: ScanCallback<T>,
 ) -> DeltaResult<T> {
     let mut visitor = ScanFileVisitor {
         callback,
         selection_vector,
+        transforms,
         context,
     };
     visitor.visit_rows_of(data)?;
@@ -154,6 +158,7 @@ pub fn visit_scan_files<T>(
 struct ScanFileVisitor<'a, T> {
     callback: ScanCallback<T>,
     selection_vector: &'a [bool],
+    transforms: &'a HashMap<usize, Expression>,
     context: T,
 }
 impl<T> RowVisitor for ScanFileVisitor<'_, T> {
@@ -201,6 +206,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                     size,
                     stats,
                     dv_info,
+                    self.transforms.get(row_index),
                     partition_values,
                 )
             }
