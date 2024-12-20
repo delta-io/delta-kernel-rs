@@ -7,7 +7,7 @@ use delta_kernel::scan::state::{visit_scan_files, DvInfo, GlobalScanState};
 use delta_kernel::scan::{Scan, ScanData};
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{DeltaResult, Error, ExpressionRef};
+use delta_kernel::{DeltaResult, Error, Expression, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -15,6 +15,7 @@ use url::Url;
 use crate::expressions::engine::{
     unwrap_kernel_expression, EnginePredicate, KernelExpressionVisitorState,
 };
+use crate::expressions::SharedExpression;
 use crate::{
     kernel_string_slice, AllocateStringFn, ExclusiveEngineData, ExternEngine, ExternResult,
     IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice, NullableCvoid,
@@ -99,12 +100,26 @@ pub unsafe extern "C" fn get_global_read_schema(
     state.physical_schema.clone().into()
 }
 
-/// Free a global read schema
+/// Get the kernel view of the physical read schema that an engine should read from parquet file in
+/// a scan
+///
+/// # Safety
+/// Engine is responsible for providing a valid GlobalScanState pointer
+#[no_mangle]
+pub unsafe extern "C" fn get_global_logical_schema(
+    state: Handle<SharedGlobalScanState>,
+) -> Handle<SharedSchema> {
+    let state = unsafe { state.as_ref() };
+    state.logical_schema.clone().into()
+}
+
+
+/// Free a schema
 ///
 /// # Safety
 /// Engine is responsible for providing a valid schema obtained via [`get_global_read_schema`]
 #[no_mangle]
-pub unsafe extern "C" fn free_global_read_schema(schema: Handle<SharedSchema>) {
+pub unsafe extern "C" fn free_schema(schema: Handle<SharedSchema>) {
     schema.drop_handle();
 }
 
@@ -269,6 +284,7 @@ type CScanCallback = extern "C" fn(
     size: i64,
     stats: Option<&Stats>,
     dv_info: &DvInfo,
+    transform: Option<&Expression>,
     partition_map: &CStringMap,
 );
 
@@ -305,6 +321,25 @@ pub unsafe extern "C" fn get_from_string_map(
 
 pub struct CTransforms {
     transforms: Vec<Option<ExpressionRef>>,
+}
+
+#[no_mangle]
+/// allow probing into a CTransformMap. If the specified row id is in the map, kernel will return a
+/// handle to the transform expression for that row. If the row id is not in the map, this will
+/// return NULL
+///
+/// # Safety
+///
+/// The engine is responsible for providing a valid [`CTransformMap`] pointer
+pub unsafe extern "C" fn get_from_transform_map(
+    transform_map: &CTransformMap,
+    row: usize,
+) -> Handle<SharedExpression> {
+    if let Some(transform) = transform_map.transforms.get(&row).cloned() {
+        transform.into()
+    } else {
+        panic!("Hrmm");
+    }
 }
 
 /// Get a selection vector out of a [`DvInfo`] struct
@@ -369,9 +404,10 @@ fn rust_callback(
     size: i64,
     kernel_stats: Option<delta_kernel::scan::state::Stats>,
     dv_info: DvInfo,
-    _transform: Option<ExpressionRef>,
+    transform: Option<ExpressionRef>,
     partition_values: HashMap<String, String>,
 ) {
+    let transform = transform.map(|e| e.as_ref().clone());
     let partition_map = CStringMap {
         values: partition_values,
     };
@@ -384,6 +420,7 @@ fn rust_callback(
         size,
         stats.as_ref(),
         &dv_info,
+        transform.as_ref(),
         &partition_map,
     );
 }

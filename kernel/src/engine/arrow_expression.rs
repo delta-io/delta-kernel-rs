@@ -21,6 +21,7 @@ use arrow_schema::{
 };
 use arrow_select::concat::concat;
 use itertools::Itertools;
+use tracing::debug;
 
 use super::arrow_conversion::LIST_ARRAY_ROOT;
 use super::arrow_utils::make_arrow_error;
@@ -537,6 +538,7 @@ pub struct DefaultExpressionEvaluator {
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+        debug!("Arrow evaluator evaluating: {:#?}", self.expression.as_ref());
         let batch = batch
             .any_ref()
             .downcast_ref::<ArrowEngineData>()

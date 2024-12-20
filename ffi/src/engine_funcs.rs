@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use delta_kernel::{schema::Schema, DeltaResult, FileDataReadResultIterator};
+use delta_kernel::{
+    schema::{DataType, Schema, SchemaRef},
+    DeltaResult, EngineData, Expression, ExpressionEvaluator, FileDataReadResultIterator,
+};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -97,7 +100,7 @@ pub unsafe extern "C" fn free_read_result_iter(data: Handle<ExclusiveFileReadRes
 /// Caller is responsible for calling with a valid `ExternEngineHandle` and `FileMeta`
 #[no_mangle]
 pub unsafe extern "C" fn read_parquet_file(
-    engine: Handle<SharedExternEngine>,
+    engine: Handle<SharedExternEngine>, // TODO Does this cause a free?
     file: &FileMeta,
     physical_schema: Handle<SharedSchema>,
 ) -> ExternResult<Handle<ExclusiveFileReadResultIterator>> {
@@ -129,4 +132,102 @@ fn read_parquet_file_impl(
         engine: extern_engine,
     });
     Ok(res.into())
+}
+
+// Expression Eval
+
+#[handle_descriptor(target=dyn ExpressionEvaluator, mutable=false)]
+pub struct SharedExpressionEvaluator;
+
+#[no_mangle]
+pub unsafe extern "C" fn get_evaluator(
+    engine: Handle<SharedExternEngine>,
+    input_schema: Handle<SharedSchema>,
+    expression: &Expression,
+    // TODO: Make this a data_type, and give a way for c code to go between schema <-> datatype
+    output_type: Handle<SharedSchema>,
+) -> Handle<SharedExpressionEvaluator> {
+    let engine = unsafe { engine.clone_as_arc() };
+    let input_schema = unsafe { input_schema.clone_as_arc() };
+    let output_type: DataType = output_type.as_ref().clone().into();
+    get_evaluator_impl(engine, input_schema, expression, output_type)
+}
+
+fn get_evaluator_impl(
+    extern_engine: Arc<dyn ExternEngine>,
+    input_schema: SchemaRef,
+    expression: &Expression,
+    output_type: DataType,
+) -> Handle<SharedExpressionEvaluator> {
+    let engine = extern_engine.engine();
+    let evaluator = engine.get_expression_handler().get_evaluator(
+        input_schema,
+        expression.clone(),
+        output_type,
+    );
+    evaluator.into()
+}
+
+/// Free an evaluator
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_evaluator(evaluator: Handle<SharedExpressionEvaluator>) {
+    debug!("engine released evaluator");
+    evaluator.drop_handle();
+}
+
+
+#[no_mangle]
+pub unsafe extern "C" fn evaluate(
+    engine: Handle<SharedExternEngine>,
+    batch: &mut Handle<ExclusiveEngineData>,
+    evaluator: Handle<SharedExpressionEvaluator>,
+) -> ExternResult<Handle<ExclusiveEngineData>> {
+    let engine = unsafe { engine.clone_as_arc() };
+    let batch = unsafe { batch.as_mut() };
+    let evaluator = unsafe { evaluator.clone_as_arc() };
+    let res = evaluate_impl(batch, evaluator.as_ref());
+    res.into_extern_result(&engine.as_ref())
+}
+
+fn evaluate_impl(
+    batch: &dyn EngineData,
+    evaluator: &dyn ExpressionEvaluator,
+) -> DeltaResult<Handle<ExclusiveEngineData>> {
+    let res = evaluator.evaluate(batch);
+    res.map(|d| d.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_evaluator;
+    use crate::{free_engine, tests::get_default_engine};
+    use delta_kernel::{
+        schema::{DataType, StructField, StructType},
+        Expression,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn test_get_evaluator() {
+        let engine = get_default_engine();
+        let in_schema = Arc::new(StructType::new(vec![StructField::new(
+            "a",
+            DataType::LONG,
+            true,
+        )]));
+        let expr = Expression::literal(1);
+        let output_type = in_schema.clone();
+        unsafe {
+            get_evaluator(
+                engine.shallow_copy(),
+                in_schema.into(),
+                &expr,
+                output_type.into(),
+            );
+            free_engine(engine);
+        }
+    }
 }
