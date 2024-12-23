@@ -25,6 +25,7 @@ fn get_schema() -> StructType {
     StructType::new([
         StructField::new("id", DataType::INTEGER, true),
         StructField::new("value", DataType::STRING, true),
+        StructField::new("partition_col", DataType::INTEGER, true),
     ])
 }
 
@@ -490,6 +491,9 @@ async fn data_skipping_filter() {
             }),
             Action::Add(Add {
                 path: "fake_path_1".into(),
+                partition_values: HashMap::from([
+                    ("partition_col".to_string(), "1".to_string()),
+                ]),
                 stats: Some("{\"numRecords\":4,\"minValues\":{\"id\":4},\"maxValues\":{\"id\":6},\"nullCount\":{\"id\":3}}".into()),
                 data_change: true,
                 deletion_vector: deletion_vector.clone(),
@@ -503,6 +507,9 @@ async fn data_skipping_filter() {
             }),
             Action::Add(Add {
                 path: "fake_path_2".into(),
+                partition_values: HashMap::from([
+                    ("partition_col".to_string(), "2".to_string()),
+                ]),
                 stats: Some("{\"numRecords\":4,\"minValues\":{\"id\":4},\"maxValues\":{\"id\":4},\"nullCount\":{\"id\":3}}".into()),
                 data_change: true,
                 deletion_vector,
@@ -511,6 +518,9 @@ async fn data_skipping_filter() {
             // Add action with max value id = 5
             Action::Add(Add {
                 path: "fake_path_3".into(),
+                partition_values: HashMap::from([
+                    ("partition_col".to_string(), "3".to_string()),
+                ]),
                 stats: Some("{\"numRecords\":4,\"minValues\":{\"id\":4},\"maxValues\":{\"id\":5},\"nullCount\":{\"id\":3}}".into()),
                 data_change: true,
                 ..Default::default()
@@ -533,7 +543,7 @@ async fn data_skipping_filter() {
         .unwrap()
         .into_iter();
 
-    let sv = table_changes_action_iter(engine, commits, logical_schema.into(), predicate)
+    let sv = table_changes_action_iter(engine.clone(), commits.clone(), logical_schema.clone().into(), predicate)
         .unwrap()
         .flat_map(|scan_data| {
             let scan_data = scan_data.unwrap();
@@ -543,6 +553,27 @@ async fn data_skipping_filter() {
 
     // Note: since the first pair is a dv operation, remove action will always be filtered
     assert_eq!(sv, &[false, true, false, false, true]);
+
+    let predicate = Expression::binary(
+        BinaryOperator::LessThanOrEqual,
+        column_expr!("partition_col"),
+        Scalar::from(2),
+    );
+    let predicate = match PhysicalPredicate::try_new(&predicate, &logical_schema) {
+        Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
+        other => panic!("Unexpected result: {:?}", other),
+    };
+
+    let sv = table_changes_action_iter(engine, commits, logical_schema.into(), predicate)
+        .unwrap()
+        .flat_map(|scan_data| {
+            let scan_data = scan_data.unwrap();
+            scan_data.selection_vector
+        })
+        .collect_vec();
+
+    // Note: since the first pair is a dv operation, remove action will always be filtered
+    assert_eq!(sv, &[false, true, false, true, false]);
 }
 
 #[tokio::test]
