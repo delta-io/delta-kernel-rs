@@ -244,7 +244,7 @@ mod tests {
 
     use super::{scan_data_to_scan_file, CdfScanFile, CdfScanFileType};
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
-    use crate::actions::{Add, Cdc, Remove};
+    use crate::actions::{Add, Cdc, CommitInfo, Remove};
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
     use crate::scan::state::DvInfo;
@@ -312,6 +312,12 @@ mod tests {
             ..Default::default()
         };
 
+        let cdc_timestamp = 12345678;
+        let commit_info = CommitInfo {
+            in_commit_timestamp: Some(cdc_timestamp),
+            ..Default::default()
+        };
+
         mock_table
             .commit([
                 Action::Remove(remove_paired.clone()),
@@ -319,7 +325,12 @@ mod tests {
                 Action::Remove(remove.clone()),
             ])
             .await;
-        mock_table.commit([Action::Cdc(cdc.clone())]).await;
+        mock_table
+            .commit([
+                Action::Cdc(cdc.clone()),
+                Action::CommitInfo(commit_info.clone()),
+            ])
+            .await;
         mock_table
             .commit([Action::Remove(remove_no_partition.clone())])
             .await;
@@ -386,7 +397,7 @@ mod tests {
                 },
                 partition_values: cdc.partition_values,
                 commit_version: 1,
-                commit_timestamp: timestamps[1],
+                commit_timestamp: cdc_timestamp,
                 remove_dv: None,
             },
             CdfScanFile {

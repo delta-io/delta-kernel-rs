@@ -7,8 +7,8 @@ use std::sync::{Arc, LazyLock};
 use crate::actions::schemas::GetStructField;
 use crate::actions::visitors::{visit_deletion_vector_at, ProtocolVisitor};
 use crate::actions::{
-    get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, METADATA_NAME,
-    PROTOCOL_NAME, REMOVE_NAME,
+    get_log_add_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME,
+    COMMIT_INFO_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
@@ -78,6 +78,11 @@ pub(crate) fn table_changes_action_iter(
 ///       Deletion vector resolution affects whether a remove action is selected in the second
 ///       phase, so we must perform it ahead of time in phase 1.
 ///     - Ensure that reading is supported on any protocol updates.
+///     - Extract the timestamp from [`CommitInfo`] actions if they are present. These are
+///       generated when in-commit timestamps is enabled. This must be done in the first phase
+///       because the second phase lazily transforms engine data with an extra timestamp column,
+///       so the timestamp must be known ahead of time.
+///       See: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#in-commit-timestamps
 ///     - Ensure that Change Data Feed is enabled for any metadata update. See  [`TableProperties`]
 ///     - Ensure that any schema update is compatible with the provided `schema`. Currently, schema
 ///       compatibility is checked through schema equality. This will be expanded in the future to
@@ -92,12 +97,6 @@ pub(crate) fn table_changes_action_iter(
 /// to check the table property for deletion vector enablement.
 ///
 /// See https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors
-///
-/// TODO: When the kernel supports in-commit timestamps, we will also have to inspect CommitInfo
-/// actions to find the timestamp. These are generated when incommit timestamps is enabled.
-/// This must be done in the first phase because the second phase lazily transforms engine data with
-/// an extra timestamp column. Thus, the timestamp must be known ahead of time.
-/// See https://github.com/delta-io/delta-kernel-rs/issues/559
 ///
 /// 2. Scan file generation phase [`LogReplayScanner::into_scan_batches`]: This iterates over every
 ///    action in the commit, and generates [`TableChangesScanData`]. It does so by transforming the
@@ -136,6 +135,7 @@ impl LogReplayScanner {
     /// 2. Construct a map from path to deletion vector of remove actions that share the same path
     ///    as an add action.
     /// 3. Perform validation on each protocol and metadata action in the commit.
+    /// 4. Extract the in-commit timestamp from [`CommitInfo`] if it is present.
     ///
     /// For more details, see the documentation for [`LogReplayScanner`].
     fn try_new(
@@ -163,6 +163,7 @@ impl LogReplayScanner {
         let mut remove_dvs = HashMap::default();
         let mut add_paths = HashSet::default();
         let mut has_cdc_action = false;
+        let mut timestamp = commit_file.location.last_modified;
         for actions in action_iter {
             let actions = actions?;
 
@@ -170,6 +171,7 @@ impl LogReplayScanner {
                 add_paths: &mut add_paths,
                 remove_dvs: &mut remove_dvs,
                 has_cdc_action: &mut has_cdc_action,
+                timestamp: &mut timestamp,
                 protocol: None,
                 metadata_info: None,
             };
@@ -202,7 +204,7 @@ impl LogReplayScanner {
             remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
         }
         Ok(LogReplayScanner {
-            timestamp: commit_file.location.last_modified,
+            timestamp,
             commit_file,
             has_cdc_action,
             remove_dvs,
@@ -220,7 +222,6 @@ impl LogReplayScanner {
             has_cdc_action,
             remove_dvs,
             commit_file,
-            // TODO: Add the timestamp as a column with an expression
             timestamp,
         } = self;
         let remove_dvs = Arc::new(remove_dvs);
@@ -274,6 +275,7 @@ struct PreparePhaseVisitor<'a> {
     has_cdc_action: &'a mut bool,
     add_paths: &'a mut HashSet<String>,
     remove_dvs: &'a mut HashMap<String, DvInfo>,
+    timestamp: &'a mut i64,
 }
 impl PreparePhaseVisitor<'_> {
     fn schema() -> Arc<StructType> {
@@ -283,6 +285,7 @@ impl PreparePhaseVisitor<'_> {
             Option::<Cdc>::get_struct_field(CDC_NAME),
             Option::<Metadata>::get_struct_field(METADATA_NAME),
             Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
+            Option::<CommitInfo>::get_struct_field(COMMIT_INFO_NAME),
         ]))
     }
 }
@@ -314,6 +317,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 (INTEGER, column_name!("protocol.minWriterVersion")),
                 (string_list.clone(), column_name!("protocol.readerFeatures")),
                 (string_list, column_name!("protocol.writerFeatures")),
+                (LONG, column_name!("commitInfo.inCommitTimestamp")),
             ];
             let (types, names) = types_and_names.into_iter().unzip();
             (names, types).into()
@@ -323,7 +327,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
 
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 16,
+            getters.len() == 17,
             Error::InternalError(format!(
                 "Wrong number of PreparePhaseVisitor getters: {}",
                 getters.len()
@@ -354,6 +358,10 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 let protocol =
                     ProtocolVisitor::visit_protocol(i, min_reader_version, &getters[12..=15])?;
                 self.protocol = Some(protocol);
+            } else if let Some(timestamp) =
+                getters[16].get_long(i, "commitInfo.inCommitTimestamp")?
+            {
+                *self.timestamp = timestamp;
             }
         }
         Ok(())
