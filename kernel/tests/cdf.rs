@@ -388,20 +388,18 @@ fn false_data_change_is_ignored() -> DeltaResult<()> {
 }
 
 #[test]
-fn invalid_range_end_before_start() -> DeltaResult<()> {
+fn invalid_range_end_before_start() {
     let res = read_cdf_for_table("cdf-table-simple", 1, 0, None);
     let expected_msg =
         "Failed to build LogSegment: start_version cannot be greater than end_version";
     assert!(matches!(res, Err(Error::Generic(msg)) if msg == expected_msg));
-    Ok(())
 }
 
 #[test]
-fn invalid_range_start_after_last_version_of_table() -> DeltaResult<()> {
+fn invalid_range_start_after_last_version_of_table() {
     let res = read_cdf_for_table("cdf-table-simple", 3, 4, None);
     let expected_msg = "Expected the first commit to have version 3";
     assert!(matches!(res, Err(Error::Generic(msg)) if msg == expected_msg));
-    Ok(())
 }
 
 #[test]
