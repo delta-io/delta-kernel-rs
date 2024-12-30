@@ -7,15 +7,17 @@ use std::sync::{Arc, LazyLock};
 use crate::actions::schemas::GetStructField;
 use crate::actions::visitors::{visit_deletion_vector_at, ProtocolVisitor};
 use crate::actions::{
-    get_log_add_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME,
-    COMMIT_INFO_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
+    get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, METADATA_NAME,
+    PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
 use crate::path::ParsedLogPath;
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
-use crate::schema::{ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructType};
+use crate::schema::{
+    ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType,
+};
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_changes::{check_cdf_table_properties, ensure_cdf_read_supported};
 use crate::table_properties::TableProperties;
@@ -143,8 +145,6 @@ impl LogReplayScanner {
         commit_file: ParsedLogPath,
         table_schema: &SchemaRef,
     ) -> DeltaResult<Self> {
-        let visitor_schema = PreparePhaseVisitor::schema();
-
         // Note: We do not perform data skipping yet because we need to visit all add and
         // remove actions for deletion vector resolution to be correct.
         //
@@ -156,7 +156,7 @@ impl LogReplayScanner {
         // vectors are resolved so that we can skip both actions in the pair.
         let action_iter = engine.get_json_handler().read_json_files(
             &[commit_file.location.clone()],
-            visitor_schema,
+            PreparePhaseVisitor::schema(),
             None, // not safe to apply data skipping yet
         )?;
 
@@ -279,13 +279,14 @@ struct PreparePhaseVisitor<'a> {
 }
 impl PreparePhaseVisitor<'_> {
     fn schema() -> Arc<StructType> {
+        let ict_type = StructField::new("inCommitTimestamp", DataType::LONG, true);
         Arc::new(StructType::new(vec![
             Option::<Add>::get_struct_field(ADD_NAME),
             Option::<Remove>::get_struct_field(REMOVE_NAME),
             Option::<Cdc>::get_struct_field(CDC_NAME),
             Option::<Metadata>::get_struct_field(METADATA_NAME),
             Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
-            Option::<CommitInfo>::get_struct_field(COMMIT_INFO_NAME),
+            StructField::new("commitInfo", StructType::new([ict_type]), true),
         ]))
     }
 }
