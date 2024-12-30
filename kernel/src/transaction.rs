@@ -273,7 +273,6 @@ fn generate_commit_info(
     let commit_info_exprs = [
         // TODO(zach): we should probably take a timestamp closer to actual commit time?
         Expression::literal(timestamp),
-        Expression::null_literal(DataType::LONG),
         Expression::literal(operation.unwrap_or(UNKNOWN_OPERATION)),
         // HACK (part 1/2): since we don't have proper map support, we create a literal struct with
         // one null field to create data that serializes as "operationParameters": {}
@@ -316,6 +315,9 @@ fn generate_commit_info(
         .get_mut("operationParameters")
         .ok_or_else(|| Error::missing_column("operationParameters"))?
         .data_type = hack_data_type;
+    commit_info_data_type
+        .fields
+        .shift_remove("inCommitTimestamp");
     commit_info_field.data_type = DataType::Struct(commit_info_data_type);
 
     let commit_info_evaluator = engine.get_expression_handler().get_evaluator(
@@ -591,7 +593,6 @@ mod tests {
             serde_json::json!({
                 "commitInfo": {
                     "timestamp": 0,
-                    "inCommitTimestamp": 0,
                     "operation": "test operation",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
@@ -602,7 +603,6 @@ mod tests {
             serde_json::json!({
                 "commitInfo": {
                     "timestamp": 0,
-                    "inCommitTimestamp": 0,
                     "operation": "test operation",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
