@@ -315,6 +315,9 @@ fn generate_commit_info(
         .get_mut("operationParameters")
         .ok_or_else(|| Error::missing_column("operationParameters"))?
         .data_type = hack_data_type;
+
+    // Since writing in-commit timestamps is not supported, we remove the field so it is not
+    // written to the log
     commit_info_data_type
         .fields
         .shift_remove("inCommitTimestamp");
