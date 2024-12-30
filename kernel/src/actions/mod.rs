@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::schemas::GetStructField;
-use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::schema::{SchemaRef, StructType};
 use crate::table_features::{
     ReaderFeatures, WriterFeatures, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
 };
