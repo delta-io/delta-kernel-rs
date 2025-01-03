@@ -1,15 +1,14 @@
 use std::collections::HashSet;
 
-use crate::{
-    schema::{DataType, StructField, StructType},
-    utils::require,
-    DeltaResult, Error,
-};
+use crate::schema::{DataType, StructField, StructType};
+use crate::utils::require;
+use crate::{DeltaResult, Error};
 
 struct NullabilityCheck {
     nullable: bool,
     read_nullable: bool,
 }
+
 impl NullabilityCheck {
     fn is_compatible(&self) -> DeltaResult<()> {
         // The case to avoid is when the read_schema is non-nullable and the existing one is nullable.
@@ -46,6 +45,7 @@ impl StructField {
     }
 }
 impl StructType {
+    #[allow(unused)]
     pub(crate) fn can_read_as(&self, read_type: &StructType) -> DeltaResult<()> {
         // Delta tables do not allow fields that differ in name only by case
         let names: HashSet<&String> = self.fields.keys().collect();
@@ -66,7 +66,6 @@ impl StructType {
                 ),
             }
         }
-
         Ok(())
     }
 }
