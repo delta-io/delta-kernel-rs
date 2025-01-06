@@ -23,7 +23,7 @@ use test_utils::{
 use url::Url;
 
 mod common;
-use common::{load_test_data, read_scan, to_arrow};
+use common::{read_scan, to_arrow};
 
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
 const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c000.snappy.parquet";
@@ -1077,7 +1077,7 @@ fn timestamp_partitioned_table() -> Result<(), Box<dyn std::error::Error>> {
         "+----+-----+---+----------------------+",
     ];
     let test_name = "timestamp-partitioned-table";
-    let test_dir = load_test_data("./tests/data", test_name).unwrap();
+    let test_dir = common::load_test_data("./tests/data", test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
     read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
 }
