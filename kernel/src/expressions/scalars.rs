@@ -595,6 +595,7 @@ mod tests {
         assert_timestamp_eq("1971-07-22T03:06:40.000000Z", 49000000000000);
         assert_timestamp_eq("1971-07-22T03:06:40Z", 49000000000000);
         assert_timestamp_eq("2011-01-11 13:06:07", 1294751167000000);
+        assert_timestamp_eq("2011-01-11 13:06:07.123456", 1294751167123456);
         assert_timestamp_eq("1970-01-01 00:00:00", 0);
     }
     #[test]
@@ -606,6 +607,7 @@ mod tests {
             assert_eq!(scalar, Scalar::TimestampNtz(micros));
         };
         assert_timestamp_eq("2011-01-11 13:06:07", 1294751167000000);
+        assert_timestamp_eq("2011-01-11 13:06:07.123456", 1294751167123456);
         assert_timestamp_eq("1970-01-01 00:00:00", 0);
     }
 
