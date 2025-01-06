@@ -619,11 +619,11 @@ mod tests {
         };
 
         let p_type = PrimitiveType::TimestampNtz;
-        assert_timestamp_fails(&p_type, "1971-07-22T03:06:40.000000Z");
+        assert_timestamp_fails(&p_type, "1971-07-22T03:06:40.678910Z");
         assert_timestamp_fails(&p_type, "1971-07-22T03:06:40Z");
         assert_timestamp_fails(&p_type, "1971-07-22");
 
         let p_type = PrimitiveType::Timestamp;
-        assert_timestamp_fails(&p_type, "1971-07-22")
+        assert_timestamp_fails(&p_type, "1971-07-22");
     }
 }

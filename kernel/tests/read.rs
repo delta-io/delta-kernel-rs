@@ -1063,6 +1063,10 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+// Note: This test is disabled for windows because it creates a directory with name
+// `time=1971-07-22T03:06:40.000000Z`. This is disallowed in windows due to having a `:` in
+// the name.
+#[cfg(not(windows))]
 #[test]
 fn timestamp_partitioned_table() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
