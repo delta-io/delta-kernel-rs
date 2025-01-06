@@ -592,7 +592,7 @@ mod tests {
                 .unwrap();
             assert_eq!(scalar, Scalar::Timestamp(micros));
         };
-        assert_timestamp_eq("1971-07-22T03:06:40.000000Z", 49000000000000);
+        assert_timestamp_eq("1971-07-22T03:06:40.678910Z", 49000000678910);
         assert_timestamp_eq("1971-07-22T03:06:40Z", 49000000000000);
         assert_timestamp_eq("2011-01-11 13:06:07", 1294751167000000);
         assert_timestamp_eq("2011-01-11 13:06:07.123456", 1294751167123456);
