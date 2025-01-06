@@ -23,7 +23,7 @@ use test_utils::{
 use url::Url;
 
 mod common;
-use common::{read_scan, to_arrow};
+use common::{load_test_data, read_scan, to_arrow};
 
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
 const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c000.snappy.parquet";
@@ -1061,4 +1061,19 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
     )
     .expect_err("unknown column");
     Ok(())
+}
+
+#[test]
+fn timestamp_partitioned_table() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+----+-----+---+----------------------+",
+        "| id | x   | s | time                 |",
+        "+----+-----+---+----------------------+",
+        "| 1  | 0.5 |   | 1971-07-22T03:06:40Z |",
+        "+----+-----+---+----------------------+",
+    ];
+    let test_name = "timestamp-partitioned-table";
+    let test_dir = load_test_data("./tests/data", test_name).unwrap();
+    let test_path = test_dir.path().join(test_name);
+    read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
 }
