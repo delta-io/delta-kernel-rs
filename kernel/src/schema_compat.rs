@@ -1,15 +1,41 @@
+//! Provides utilities to perform comparisons between a [`Schema`]s. The api used to check schema
+//! compatibility is [`can_read_as`].
+//!
+//! # Examples
+//!  ```rust, ignore
+//!  # use delta_kernel::schema::StructType;
+//!  # use delta_kernel::schema::StructField;
+//!  # use delta_kernel::schema::DataType;
+//!  let schema = StructType::new([
+//!     StructField::new("id", DataType::LONG, false),
+//!     StructField::new("value", DataType::STRING, true),
+//!  ]);
+//!  let read_schema = StructType::new([
+//!     StructField::new("id", DataType::LONG, true),
+//!     StructField::new("value", DataType::STRING, true),
+//!     StructField::new("year", DataType::INTEGER, true),
+//!  ]);
+//!  assert!(schema.can_read_as(&read_schema).is_ok());
+//!  ````
+//!
+//! [`Schema`]: crate::schema::Schema
 use std::collections::{HashMap, HashSet};
 
 use crate::schema::{DataType, StructField, StructType};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
+/// Represents a nullability comparison between two schemas' fields. A schema whose field
+/// has nullability `nullable` is being read with a schema whose field has nullability
+/// `read_nullable`. `is_compatible` is true if the read nullability is the same or wider than
+/// the schema's nullability.
 struct NullabilityCheck {
     nullable: bool,
     read_nullable: bool,
 }
 
 impl NullabilityCheck {
+    /// Returns true if a value with nullability `nullable` can be read using `read_nullable`.
     fn is_compatible(&self) -> DeltaResult<()> {
         // The case to avoid is when the column is nullable, but the read schema specifies the
         // column as non-nullable. So we avoid the case where !read_nullable && nullable
@@ -24,6 +50,7 @@ impl NullabilityCheck {
 }
 
 impl StructField {
+    /// Returns `Ok` if this [`StructField`] can be read as `read_field` in the read schema.
     fn can_read_as(&self, read_field: &StructField) -> DeltaResult<()> {
         NullabilityCheck {
             nullable: self.nullable,
@@ -44,6 +71,7 @@ impl StructField {
 }
 impl StructType {
     #[allow(unused)]
+    /// Returns `Ok` if this [`StructType`] can be read as `read_type` in the read schema.
     pub(crate) fn can_read_as(&self, read_type: &StructType) -> DeltaResult<()> {
         let field_map: HashMap<String, &StructField> = self
             .fields
@@ -88,6 +116,7 @@ impl StructType {
 }
 
 impl DataType {
+    /// Returns `Ok` if this [`DataType`] can be read as `read_type` in the read schema.
     fn can_read_as(&self, read_type: &DataType) -> DeltaResult<()> {
         match (self, read_type) {
             (DataType::Array(self_array), DataType::Array(read_array)) => {
