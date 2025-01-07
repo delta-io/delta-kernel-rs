@@ -420,6 +420,7 @@ mod tests {
         fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {
             assert!(transform.is_some());
             if let Expression::Struct(inner) = transform.unwrap().as_ref() {
+                assert_eq!(inner.len(), 2, "expected two items in transform struct");
                 if let Expression::Column(ref name) = inner[0] {
                     assert_eq!(name, &column_name!("value"), "First col should be 'value'");
                 } else {
