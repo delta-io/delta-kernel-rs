@@ -80,10 +80,10 @@ pub(crate) fn table_changes_action_iter(
 ///       Deletion vector resolution affects whether a remove action is selected in the second
 ///       phase, so we must perform it ahead of time in phase 1.
 ///     - Ensure that reading is supported on any protocol updates.
-///     - Extract the timestamp from [`CommitInfo`] actions if they are present. These are
-///       generated when in-commit timestamps is enabled. This must be done in the first phase
-///       because the second phase lazily transforms engine data with an extra timestamp column,
-///       so the timestamp must be known ahead of time.
+///     - Extract the in-commit timestamps from [`CommitInfo`] actions if they are present. These are
+///       generated when in-commit timestamps table feature is enabled. This must be done in the
+///       first phase because the second phase lazily transforms engine data with an extra timestamp
+///       column, so the timestamp must be known ahead of time.
 ///       See: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#in-commit-timestamps
 ///     - Ensure that Change Data Feed is enabled for any metadata update. See  [`TableProperties`]
 ///     - Ensure that any schema update is compatible with the provided `schema`. Currently, schema
@@ -171,7 +171,7 @@ impl LogReplayScanner {
                 add_paths: &mut add_paths,
                 remove_dvs: &mut remove_dvs,
                 has_cdc_action: &mut has_cdc_action,
-                timestamp: &mut timestamp,
+                commit_timestamp: &mut timestamp,
                 protocol: None,
                 metadata_info: None,
             };
@@ -275,7 +275,7 @@ struct PreparePhaseVisitor<'a> {
     has_cdc_action: &'a mut bool,
     add_paths: &'a mut HashSet<String>,
     remove_dvs: &'a mut HashMap<String, DvInfo>,
-    timestamp: &'a mut i64,
+    commit_timestamp: &'a mut i64,
 }
 impl PreparePhaseVisitor<'_> {
     fn schema() -> Arc<StructType> {
@@ -362,7 +362,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
             } else if let Some(timestamp) =
                 getters[16].get_long(i, "commitInfo.inCommitTimestamp")?
             {
-                *self.timestamp = timestamp;
+                *self.commit_timestamp = timestamp;
             }
         }
         Ok(())
