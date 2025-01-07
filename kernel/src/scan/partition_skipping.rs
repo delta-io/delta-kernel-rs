@@ -46,7 +46,7 @@ impl PartitionSkippingFilter {
         })
     }
 
-    pub(crate) fn apply(&mut self, actions: &dyn EngineData) -> DeltaResult<Vec<bool>> {
+    pub(crate) fn apply(&self, actions: &dyn EngineData) -> DeltaResult<Vec<bool>> {
         let partitions = self.evaluator.evaluate(actions)?;
         assert_eq!(partitions.len(), actions.len());
 

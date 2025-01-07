@@ -277,7 +277,7 @@ impl LogReplayScanner {
         };
         assert_eq!(data_selection_vector.len(), actions.len());
 
-        let partition_selection_vector = match &mut self.partition_filter {
+        let partition_selection_vector = match &self.partition_filter {
             Some(filter) => filter.apply(actions)?,
             None => vec![true; actions.len()],
         };
