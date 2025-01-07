@@ -388,13 +388,22 @@ impl PrimitiveType {
                 let days = date.signed_duration_since(DateTime::UNIX_EPOCH).num_days() as i32;
                 Ok(Scalar::Date(days))
             }
-            // NOTE: Timestamp and TimestampNtz are parsed in the same way, as microsecond since unix epoch.
+            // NOTE: Timestamp and TimestampNtz are both parsed into microsecond since unix epoch.
+            // They may both have the format `{year}-{month}-{day} {hour}:{minute}:{second}`.
+            // Timestamps may additionally be encoded as a ISO 8601 formatted string such as
+            // `1970-01-01T00:00:00.123456Z`.
+            //
             // The difference arrises mostly in how they are to be handled on the engine side - i.e. timestampNTZ
             // is not adjusted to UTC, this is just so we can (de-)serialize it as a date sting.
             // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
-            Timestamp | TimestampNtz => {
-                let timestamp = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
-                    .map_err(|_| self.parse_error(raw))?;
+            TimestampNtz | Timestamp => {
+                let mut timestamp = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f");
+
+                if timestamp.is_err() && *self == Timestamp {
+                    // Note: `%+` specifies the ISO 8601 / RFC 3339 format
+                    timestamp = NaiveDateTime::parse_from_str(raw, "%+");
+                }
+                let timestamp = timestamp.map_err(|_| self.parse_error(raw))?;
                 let timestamp = Utc.from_utc_datetime(&timestamp);
                 let micros = timestamp
                     .signed_duration_since(DateTime::UNIX_EPOCH)
@@ -575,5 +584,47 @@ mod tests {
         assert_eq!(&format!("{}", array_not_op), "10 NOT IN (1, 2, 3)");
         assert_eq!(&format!("{}", column_op), "3.1415927 IN Column(item)");
         assert_eq!(&format!("{}", column_not_op), "'Cool' NOT IN Column(item)");
+    }
+    #[test]
+    fn test_timestamp_parse() {
+        let assert_timestamp_eq = |scalar_string, micros| {
+            let scalar = PrimitiveType::Timestamp
+                .parse_scalar(scalar_string)
+                .unwrap();
+            assert_eq!(scalar, Scalar::Timestamp(micros));
+        };
+        assert_timestamp_eq("1971-07-22T03:06:40.678910Z", 49000000678910);
+        assert_timestamp_eq("1971-07-22T03:06:40Z", 49000000000000);
+        assert_timestamp_eq("2011-01-11 13:06:07", 1294751167000000);
+        assert_timestamp_eq("2011-01-11 13:06:07.123456", 1294751167123456);
+        assert_timestamp_eq("1970-01-01 00:00:00", 0);
+    }
+    #[test]
+    fn test_timestamp_ntz_parse() {
+        let assert_timestamp_eq = |scalar_string, micros| {
+            let scalar = PrimitiveType::TimestampNtz
+                .parse_scalar(scalar_string)
+                .unwrap();
+            assert_eq!(scalar, Scalar::TimestampNtz(micros));
+        };
+        assert_timestamp_eq("2011-01-11 13:06:07", 1294751167000000);
+        assert_timestamp_eq("2011-01-11 13:06:07.123456", 1294751167123456);
+        assert_timestamp_eq("1970-01-01 00:00:00", 0);
+    }
+
+    #[test]
+    fn test_timestamp_parse_fails() {
+        let assert_timestamp_fails = |p_type: &PrimitiveType, scalar_string| {
+            let res = p_type.parse_scalar(scalar_string);
+            assert!(res.is_err());
+        };
+
+        let p_type = PrimitiveType::TimestampNtz;
+        assert_timestamp_fails(&p_type, "1971-07-22T03:06:40.678910Z");
+        assert_timestamp_fails(&p_type, "1971-07-22T03:06:40Z");
+        assert_timestamp_fails(&p_type, "1971-07-22");
+
+        let p_type = PrimitiveType::Timestamp;
+        assert_timestamp_fails(&p_type, "1971-07-22");
     }
 }

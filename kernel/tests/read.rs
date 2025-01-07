@@ -1062,3 +1062,22 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
     .expect_err("unknown column");
     Ok(())
 }
+
+// Note: This test is disabled for windows because it creates a directory with name
+// `time=1971-07-22T03:06:40.000000Z`. This is disallowed in windows due to having a `:` in
+// the name.
+#[cfg(not(windows))]
+#[test]
+fn timestamp_partitioned_table() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+----+-----+---+----------------------+",
+        "| id | x   | s | time                 |",
+        "+----+-----+---+----------------------+",
+        "| 1  | 0.5 |   | 1971-07-22T03:06:40Z |",
+        "+----+-----+---+----------------------+",
+    ];
+    let test_name = "timestamp-partitioned-table";
+    let test_dir = common::load_test_data("./tests/data", test_name).unwrap();
+    let test_path = test_dir.path().join(test_name);
+    read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
+}
