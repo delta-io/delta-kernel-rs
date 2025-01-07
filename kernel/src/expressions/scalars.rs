@@ -400,6 +400,7 @@ impl PrimitiveType {
                 let mut timestamp = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f");
 
                 if timestamp.is_err() && *self == Timestamp {
+                    // Note: `%+` specifies the ISO 8601 / RFC 3339 format
                     timestamp = NaiveDateTime::parse_from_str(raw, "%+");
                 }
                 let timestamp = timestamp.map_err(|_| self.parse_error(raw))?;
