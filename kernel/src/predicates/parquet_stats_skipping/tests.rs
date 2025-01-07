@@ -45,7 +45,6 @@ impl ParquetStatsProvider for UnimplementedTestFilter {
 fn test_junctions() {
     use VariadicOperator::*;
 
-
     let test_cases = &[
         // Every combo of 0, 1 and 2 inputs
         (&[] as &[Option<bool>], TRUE, FALSE),
@@ -154,7 +153,6 @@ impl ParquetStatsProvider for MinMaxTestFilter {
     }
 }
 
-
 #[test]
 fn test_eval_binary_comparisons() {
     const FIVE: Scalar = Scalar::Integer(5);
@@ -236,7 +234,7 @@ impl ParquetStatsProvider for NullCountTestFilter {
 fn test_eval_is_null() {
     let expressions = [
         Expr::is_null(column_expr!("x")),
-        !Expr::is_null(column_expr!("x"))
+        !Expr::is_null(column_expr!("x")),
     ];
 
     let do_test = |nullcount: i64, expected: &[Option<bool>]| {
@@ -325,35 +323,23 @@ fn test_sql_where() {
 
     // Constrast normal vs SQL WHERE semantics - comparison inside AND
     expect_eq!(
-        AllNullTestFilter.eval_expr(
-            &Expr::and(NULL, Expr::lt(col.clone(), VAL)),
-            false
-        ),
+        AllNullTestFilter.eval_expr(&Expr::and(NULL, Expr::lt(col.clone(), VAL)), false),
         None,
         "{NULL} AND {col} < {VAL}"
     );
     expect_eq!(
-        AllNullTestFilter.eval_sql_where(&Expr::and(
-            NULL,
-            Expr::lt(col.clone(), VAL),
-        )),
+        AllNullTestFilter.eval_sql_where(&Expr::and(NULL, Expr::lt(col.clone(), VAL),)),
         Some(false),
         "WHERE {NULL} AND {col} < {VAL}"
     );
 
     expect_eq!(
-        AllNullTestFilter.eval_expr(
-            &Expr::and(TRUE, Expr::lt(col.clone(), VAL)),
-            false
-        ),
+        AllNullTestFilter.eval_expr(&Expr::and(TRUE, Expr::lt(col.clone(), VAL)), false),
         None, // NULL (from the NULL check) is stronger than TRUE
         "{TRUE} AND {col} < {VAL}"
     );
     expect_eq!(
-        AllNullTestFilter.eval_sql_where(&Expr::and(
-            TRUE,
-            Expr::lt(col.clone(), VAL),
-        )),
+        AllNullTestFilter.eval_sql_where(&Expr::and(TRUE, Expr::lt(col.clone(), VAL),)),
         Some(false), // FALSE (from the NULL check) is stronger than TRUE
         "WHERE {TRUE} AND {col} < {VAL}"
     );
@@ -361,10 +347,7 @@ fn test_sql_where() {
     // Contrast normal vs. SQL WHERE semantics - comparison inside AND inside AND
     expect_eq!(
         AllNullTestFilter.eval_expr(
-            &Expr::and(
-                TRUE,
-                Expr::and(NULL, Expr::lt(col.clone(), VAL)),
-            ),
+            &Expr::and(TRUE, Expr::and(NULL, Expr::lt(col.clone(), VAL)),),
             false,
         ),
         None,
@@ -382,10 +365,7 @@ fn test_sql_where() {
     // Semantics are the same for comparison inside OR inside AND
     expect_eq!(
         AllNullTestFilter.eval_expr(
-            &Expr::or(
-                FALSE,
-                Expr::and(NULL, Expr::lt(col.clone(), VAL)),
-            ),
+            &Expr::or(FALSE, Expr::and(NULL, Expr::lt(col.clone(), VAL)),),
             false,
         ),
         None,

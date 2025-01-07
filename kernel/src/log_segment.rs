@@ -68,7 +68,7 @@ impl LogSegment {
         {
             require!(
                 checkpoint_file.version + 1 == commit_file.version,
-                Error::generic(format!(
+                Error::InvalidCheckpoint(format!(
                     "Gap between checkpoint version {} and next commit {}",
                     checkpoint_file.version, commit_file.version,
                 ))
@@ -358,7 +358,7 @@ fn list_log_files_with_checkpoint(
 
     let Some(latest_checkpoint) = checkpoint_parts.last() else {
         // TODO: We could potentially recover here
-        return Err(Error::generic(
+        return Err(Error::invalid_checkpoint(
             "Had a _last_checkpoint hint but didn't find any checkpoints",
         ));
     };
@@ -369,7 +369,7 @@ fn list_log_files_with_checkpoint(
             latest_checkpoint.version
         );
     } else if checkpoint_parts.len() != checkpoint_metadata.parts.unwrap_or(1) {
-        return Err(Error::Generic(format!(
+        return Err(Error::InvalidCheckpoint(format!(
             "_last_checkpoint indicated that checkpoint should have {} parts, but it has {}",
             checkpoint_metadata.parts.unwrap_or(1),
             checkpoint_parts.len()

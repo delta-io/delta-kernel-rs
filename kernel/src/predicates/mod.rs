@@ -7,6 +7,8 @@ use crate::schema::DataType;
 use std::cmp::Ordering;
 use tracing::debug;
 
+pub(crate) mod parquet_stats_skipping;
+
 #[cfg(test)]
 mod tests;
 
