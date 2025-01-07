@@ -319,15 +319,12 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use crate::expressions::{column_name, Scalar};
-    use crate::scan::{
-        get_state_info,
-        state::{DvInfo, Stats},
-        test_utils::{
-            add_batch_simple, add_batch_with_partition_col, add_batch_with_remove,
-            run_with_validate_callback,
-        },
-        Scan,
+    use crate::scan::state::{DvInfo, Stats};
+    use crate::scan::test_utils::{
+        add_batch_simple, add_batch_with_partition_col, add_batch_with_remove,
+        run_with_validate_callback,
     };
+    use crate::scan::{get_state_info, Scan};
     use crate::Expression;
     use crate::{
         engine::sync::SyncEngine,
