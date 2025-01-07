@@ -25,6 +25,11 @@ impl NullabilityCheck {
 
 impl StructField {
     fn can_read_as(&self, read_field: &StructField) -> DeltaResult<()> {
+        NullabilityCheck {
+            nullable: self.nullable,
+            read_nullable: read_field.nullable,
+        }
+        .is_compatible()?;
         require!(
             self.name() == read_field.name(),
             Error::generic(format!(
@@ -33,13 +38,6 @@ impl StructField {
                 read_field.name()
             ))
         );
-
-        NullabilityCheck {
-            nullable: self.nullable,
-            read_nullable: read_field.nullable,
-        }
-        .is_compatible()?;
-
         self.data_type().can_read_as(read_field.data_type())?;
         Ok(())
     }
@@ -52,7 +50,6 @@ impl StructType {
             .iter()
             .map(|(name, field)| (name.to_lowercase(), field))
             .collect();
-        // Delta tables do not allow fields that differ in name only by case
         require!(
             field_map.len() == self.fields.len(),
             Error::generic("Delta tables don't allow field names that only differ by case")
