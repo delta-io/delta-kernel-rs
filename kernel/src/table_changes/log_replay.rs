@@ -79,9 +79,8 @@ pub(crate) fn table_changes_action_iter(
 ///       phase, so we must perform it ahead of time in phase 1.
 ///     - Ensure that reading is supported on any protocol updates.
 ///     - Ensure that Change Data Feed is enabled for any metadata update. See  [`TableProperties`]
-///     - Ensure that any schema update is compatible with the provided `schema`. Currently, schema
-///       compatibility is checked through schema equality. This will be expanded in the future to
-///       allow limited schema evolution.
+///     - Ensure that any schema update is compatible with the provided `schema`. To see how schema
+///       compatibility is defined, see [`StructType::can_read_as`].
 ///
 /// Note: We check the protocol, change data feed enablement, and schema compatibility in phase 1
 /// in order to detect errors and fail early.
@@ -181,11 +180,8 @@ impl LogReplayScanner {
             }
             if let Some((schema, configuration)) = visitor.metadata_info {
                 let schema: StructType = serde_json::from_str(&schema)?;
-                // Currently, schema compatibility is defined as having equal schema types. In the
-                // future, more permisive schema evolution will be supported.
-                // See: https://github.com/delta-io/delta-kernel-rs/issues/523
                 require!(
-                    table_schema.as_ref() == &schema,
+                    schema.can_read_as(table_schema).is_ok(),
                     Error::change_data_feed_incompatible_schema(table_schema, &schema)
                 );
                 let table_properties = TableProperties::from(configuration);
