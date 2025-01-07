@@ -32,7 +32,6 @@ impl PartitionSkippingFilter {
 
         let (predicate, schema) = physical_predicate?;
         debug!("Creating a partition skipping filter for {:#?}", predicate);
-        println!("reference schema\n{:#?}", schema);
 
         let partitions_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
 
