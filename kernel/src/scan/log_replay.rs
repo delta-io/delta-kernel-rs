@@ -47,7 +47,7 @@ struct AddRemoveDedupVisitor<'seen> {
     selection_vector: Vec<bool>,
     logical_schema: SchemaRef,
     transform: Option<Arc<Transform>>,
-    transforms: HashMap<usize, ExpressionRef>,
+    row_transform_exprs: HashMap<usize, ExpressionRef>,
     is_log_batch: bool,
 }
 
@@ -146,7 +146,7 @@ impl AddRemoveDedupVisitor<'_> {
         }
         if let Some(ref transform) = self.transform {
             let transform_expr = self.get_transform_expr(i, transform, getters)?;
-            self.transforms.insert(i, transform_expr);
+            self.row_transform_exprs.insert(i, transform_expr);
         }
         Ok(true)
     }
@@ -271,7 +271,7 @@ impl LogReplayScanner {
             selection_vector,
             logical_schema,
             transform,
-            transforms: HashMap::new(),
+            row_transform_exprs: HashMap::new(),
             is_log_batch,
         };
         visitor.visit_rows_of(actions)?;
@@ -279,7 +279,7 @@ impl LogReplayScanner {
         // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
         let selection_vector = visitor.selection_vector;
         let result = add_transform.evaluate(actions)?;
-        Ok((result, selection_vector, visitor.transforms))
+        Ok((result, selection_vector, visitor.row_transform_exprs))
     }
 }
 
