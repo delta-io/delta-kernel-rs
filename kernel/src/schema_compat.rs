@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::schema::{DataType, StructField, StructType};
 use crate::utils::require;
@@ -47,24 +47,43 @@ impl StructField {
 impl StructType {
     #[allow(unused)]
     pub(crate) fn can_read_as(&self, read_type: &StructType) -> DeltaResult<()> {
+        let field_map: HashMap<String, &StructField> = self
+            .fields
+            .iter()
+            .map(|(name, field)| (name.to_lowercase(), field))
+            .collect();
         // Delta tables do not allow fields that differ in name only by case
-        let names: HashSet<String> = self.fields.keys().map(|x| x.to_lowercase()).collect();
-        let read_names: HashSet<String> =
+        require!(
+            field_map.len() == self.fields.len(),
+            Error::generic("Delta tables don't allow field names that only differ by case")
+        );
+
+        let read_field_names: HashSet<String> =
             read_type.fields.keys().map(|x| x.to_lowercase()).collect();
-        if !names.is_subset(&read_names) {
+        require!(
+            read_field_names.len() == read_type.fields.len(),
+            Error::generic("Delta tables don't allow field names that only differ by case")
+        );
+
+        // Check that the field names are a subset of the read fields.
+        if !field_map.keys().all(|name| read_field_names.contains(name)) {
             return Err(Error::generic(
                 "Struct has column that does not exist in the read schema",
             ));
         }
         for read_field in read_type.fields() {
-            match self.fields.get(read_field.name()) {
+            match field_map.get(&read_field.name().to_lowercase()) {
                 Some(existing_field) => existing_field.can_read_as(read_field)?,
-                None => require!(
-                    read_field.is_nullable(),
-                    Error::generic(
-                        "read type has non-nullable column that does not exist in this struct",
-                    )
-                ),
+                None => {
+                    // Note: Delta spark does not perform the following check. Hence it ignores fields
+                    // that exist in the read schema that aren't in this schema.
+                    require!(
+                        read_field.is_nullable(),
+                        Error::generic(
+                            "read type has non-nullable column that does not exist in this struct",
+                        )
+                    );
+                }
             }
         }
         Ok(())
@@ -111,7 +130,6 @@ impl DataType {
 
 #[cfg(test)]
 mod tests {
-
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
     #[test]
@@ -136,23 +154,6 @@ mod tests {
 
         assert!(schema.can_read_as(&schema).is_ok());
     }
-
-    #[test]
-    fn different_schema_fails() {
-        let existing_schema = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
-            StructField::new("age", DataType::INTEGER, true),
-        ]);
-        let read_schema = StructType::new([
-            StructField::new("company", DataType::STRING, false),
-            StructField::new("employee_name", DataType::STRING, false),
-            StructField::new("salary", DataType::LONG, false),
-            StructField::new("position_name", DataType::STRING, true),
-        ]);
-        assert!(existing_schema.can_read_as(&read_schema).is_err());
-    }
-
     #[test]
     fn add_nullable_column_to_map_key_and_value() {
         let existing_map_key = StructType::new([
@@ -211,7 +212,8 @@ mod tests {
         assert!(existing_schema.can_read_as(&read_schema).is_err());
     }
     #[test]
-    fn different_field_name_fails() {
+    fn different_field_name_case_fails() {
+        // names differing only in case are not the same
         let existing_schema = StructType::new([
             StructField::new("id", DataType::LONG, false),
             StructField::new("name", DataType::STRING, false),
@@ -224,7 +226,6 @@ mod tests {
         ]);
         assert!(existing_schema.can_read_as(&read_schema).is_err());
     }
-
     #[test]
     fn different_type_fails() {
         let existing_schema = StructType::new([
@@ -283,7 +284,6 @@ mod tests {
         ]);
         assert!(existing_schema.can_read_as(&read_schema).is_ok());
     }
-
     #[test]
     fn new_non_nullable_column_fails() {
         let existing_schema = StructType::new([
@@ -297,6 +297,23 @@ mod tests {
             StructField::new("name", DataType::STRING, false),
             StructField::new("age", DataType::INTEGER, true),
             StructField::new("location", DataType::STRING, false),
+        ]);
+        assert!(existing_schema.can_read_as(&read_schema).is_err());
+    }
+    #[test]
+    fn duplicate_field_modulo_case() {
+        let existing_schema = StructType::new([
+            StructField::new("id", DataType::LONG, false),
+            StructField::new("Id", DataType::LONG, false),
+            StructField::new("name", DataType::STRING, false),
+            StructField::new("age", DataType::INTEGER, true),
+        ]);
+
+        let read_schema = StructType::new([
+            StructField::new("id", DataType::LONG, false),
+            StructField::new("Id", DataType::LONG, false),
+            StructField::new("name", DataType::STRING, false),
+            StructField::new("age", DataType::INTEGER, true),
         ]);
         assert!(existing_schema.can_read_as(&read_schema).is_err());
     }
