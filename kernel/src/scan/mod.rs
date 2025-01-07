@@ -28,6 +28,7 @@ use self::state::GlobalScanState;
 
 pub(crate) mod data_skipping;
 pub mod log_replay;
+pub(crate) mod partition_skipping;
 pub mod state;
 
 /// Builder to scan a snapshot of a table.
