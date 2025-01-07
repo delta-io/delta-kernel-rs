@@ -82,6 +82,37 @@ impl AddRemoveDedupVisitor<'_> {
         }
     }
 
+    /// Compute an expression that will transform from physical to logical for a given Add file action
+    fn get_transform_expr<'a>(
+        &self,
+        i: usize,
+        transform: &Transform,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<ExpressionRef> {
+        let partition_values: HashMap<_, _> = getters[1].get(i, "add.partitionValues")?;
+        let transforms = transform
+            .iter()
+            .map(|transform_expr| match transform_expr {
+                TransformExpr::Partition(field_idx) => {
+                    let field = self.logical_schema.fields.get_index(*field_idx);
+                    let Some((_, field)) = field else {
+                        return Err(Error::generic(
+                            "logical schema did not contain expected field, can't transform data",
+                        ));
+                    };
+                    let name = field.physical_name();
+                    let value_expression = super::parse_partition_value(
+                        partition_values.get(name),
+                        field.data_type(),
+                    )?;
+                    Ok(value_expression.into())
+                }
+                TransformExpr::Static(field_expr) => Ok(field_expr.clone()),
+            })
+            .try_collect()?;
+        Ok(Arc::new(Expression::Struct(transforms)))
+    }
+
     /// True if this row contains an Add action that should survive log replay. Skip it if the row
     /// is not an Add action, or the file has already been seen previously.
     fn is_valid_add<'a>(&mut self, i: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<bool> {
@@ -110,33 +141,14 @@ impl AddRemoveDedupVisitor<'_> {
         // Process both adds and removes, but only return not already-seen adds
         let file_key = FileActionKey::new(path, dv_unique_id);
         let have_seen = self.check_and_record_seen(file_key);
-        if is_add && !have_seen {
-            // compute transform here
-            if let Some(ref transform) = self.transform {
-                let partition_values: HashMap<_, _> = getters[1].get(i, "add.partitionValues")?;
-                let transforms = transform
-                    .iter()
-                    .map(|transform_expr| match transform_expr {
-                        TransformExpr::Partition(field_idx) => {
-                            let field = self.logical_schema.fields.get_index(*field_idx);
-                            let Some((_, field)) = field else {
-                                return Err(Error::generic(
-                                    "logical schema did not contain expected field, can't transform data",
-                                ));
-                            };
-                            let name = field.physical_name();
-                            let value_expression =
-                                super::parse_partition_value(partition_values.get(name), field.data_type())?;
-                            Ok(value_expression.into())
-                        }
-                        TransformExpr::Static(field_expr) => Ok(field_expr.clone()),
-                    })
-                    .try_collect()?;
-                self.transforms
-                    .insert(i, Arc::new(Expression::Struct(transforms)));
-            }
+        if !is_add || have_seen {
+            return Ok(false);
         }
-        Ok(!have_seen && is_add)
+        if let Some(ref transform) = self.transform {
+            let transform_expr = self.get_transform_expr(i, transform, getters)?;
+            self.transforms.insert(i, transform_expr);
+        }
+        Ok(true)
     }
 }
 
