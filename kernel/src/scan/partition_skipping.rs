@@ -99,12 +99,11 @@ impl RowVisitor for PartitionVisitor {
                 let resolver = partition_values
                     .iter()
                     .map(|(k, v)| {
-                        let data_type = self.schema.field(k).map(|f| f.data_type());
+                        let data_type = self.schema.field(k).map(|f| f.data_type()).ok_or(crate::Error::missing_column(k))?;
 
-                        let Some(DataType::Primitive(primitive_type)) = data_type else {
-                            return Err(crate::Error::Generic(
-                                "partition filtering only supported for primitive types"
-                                    .to_string(),
+                        let DataType::Primitive(primitive_type) = data_type else {
+                            return Err(crate::Error::unsupported(
+                                format!("Partition filtering only supported for primitive types. Found type: {}", data_type)
                             ));
                         };
 
