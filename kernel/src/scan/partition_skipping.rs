@@ -5,6 +5,7 @@ use std::{
 
 use tracing::debug;
 
+use crate::expressions::column_expr;
 use crate::schema::column_name;
 use crate::{
     engine_data::GetData,
@@ -14,7 +15,6 @@ use crate::{
     schema::{ColumnName, DataType, MapType, SchemaRef},
     DeltaResult, Engine, EngineData, Expression, ExpressionEvaluator, ExpressionRef, RowVisitor,
 };
-use crate::expressions::column_expr;
 
 pub(crate) struct PartitionSkippingFilter {
     evaluator: Arc<dyn ExpressionEvaluator>,
@@ -101,17 +101,15 @@ impl RowVisitor for PartitionVisitor {
                     .iter()
                     .map(|(k, v)| {
                         let data_type = self.schema.field(k).map(|f| f.data_type());
-                        let primitve_type = if let Some(DataType::Primitive(primitive)) = data_type
-                        {
-                            primitive.to_owned()
-                        } else {
+
+                        let Some(DataType::Primitive(primitive_type)) = data_type else {
                             return Err(crate::Error::Generic(
                                 "partition filtering only supported for primitive types"
                                     .to_string(),
                             ));
                         };
 
-                        let scalar = primitve_type.parse_scalar(v)?;
+                        let scalar = primitive_type.parse_scalar(v)?;
                         Ok((ColumnName::new([k]), scalar))
                     })
                     .collect::<DeltaResult<HashMap<ColumnName, Scalar>>>()

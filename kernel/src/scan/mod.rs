@@ -409,6 +409,7 @@ impl Scan {
             self.logical_schema.clone(),
             static_transform,
             physical_predicate,
+            self.have_partition_cols,
         );
         Ok(Some(it).into_iter().flatten())
     }
@@ -814,6 +815,7 @@ pub(crate) mod test_utils {
             logical_schema,
             transform,
             None,
+            false,
         );
         let mut batch_count = 0;
         for res in iter {
