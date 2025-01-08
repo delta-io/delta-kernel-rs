@@ -94,12 +94,16 @@ impl RowVisitor for PartitionVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let getter = getters[0];
         for i in 0..row_count {
-            let val = getter.get_map(i, "output")?.and_then(|m| {
+            let val = getter.get_map(i, "output")?.map(|m| {
                 let partition_values = m.materialize();
                 let resolver = partition_values
                     .iter()
+                    .filter(|(k, _v)| self.schema.field(k).is_some())
                     .map(|(k, v)| {
-                        let data_type = self.schema.field(k).map(|f| f.data_type()).ok_or(crate::Error::missing_column(k))?;
+                        // The schema we are evaluating only contains the fields of interest,
+                        // not all partition fields. The unwrap is safe because we have already
+                        // checked in the filter above.
+                        let data_type = self.schema.field(k).unwrap().data_type();
 
                         let DataType::Primitive(primitive_type) = data_type else {
                             return Err(crate::Error::unsupported(
@@ -110,13 +114,19 @@ impl RowVisitor for PartitionVisitor {
                         let scalar = primitive_type.parse_scalar(v)?;
                         Ok((ColumnName::new([k]), scalar))
                     })
-                    .collect::<DeltaResult<HashMap<ColumnName, Scalar>>>()
-                    .ok()?;
+                    .collect::<DeltaResult<HashMap<ColumnName, Scalar>>>()?;
+
                 let filter = DefaultPredicateEvaluator::from(resolver);
-                Some(filter.eval_expr(&self.predicate, false).unwrap_or(true))
+                Ok(filter.eval_expr(&self.predicate, false).unwrap_or(false))
             });
 
-            self.selection_vector.push(val.unwrap_or(true));
+            let val = match val {
+                Some(Ok(v)) => v,
+                Some(Err(e)) => return Err(e),
+                None => true,
+            };
+
+            self.selection_vector.push(val);
         }
         Ok(())
     }
