@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::sync::{Arc, LazyLock};
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::actions::get_log_add_schema;
 use crate::actions::visitors::SelectionVectorVisitor;
@@ -99,24 +99,32 @@ impl DataSkippingFilter {
         //
         // 3. The selection evaluator does DISTINCT(col(predicate), 'false') to produce true (= keep) when
         //    the predicate is true/null and false (= skip) when the predicate is false.
-        let select_stats_evaluator = engine.get_expression_handler().get_evaluator(
-            // safety: kernel is very broken if we don't have the schema for Add actions
-            get_log_add_schema().clone(),
-            STATS_EXPR.clone(),
-            DataType::STRING,
-        );
+        let select_stats_evaluator = engine
+            .get_expression_handler()
+            .get_evaluator(
+                // safety: kernel is very broken if we don't have the schema for Add actions
+                get_log_add_schema().clone(),
+                STATS_EXPR.clone(),
+                DataType::STRING,
+            )
+            .inspect_err(|e| warn!("Failed to create stats selector evaluator: {}", e))
+            .ok()?;
 
-        let skipping_evaluator = engine.get_expression_handler().get_evaluator(
-            stats_schema.clone(),
-            Expr::struct_from([as_data_skipping_predicate(&predicate, false)?]),
-            PREDICATE_SCHEMA.clone(),
-        );
+        let skipping_evaluator = engine
+            .get_expression_handler()
+            .get_evaluator(
+                stats_schema.clone(),
+                Expr::struct_from([as_data_skipping_predicate(&predicate, false)?]),
+                PREDICATE_SCHEMA.clone(),
+            )
+            .inspect_err(|e| warn!("Failed to create skipping evaluator: {}", e))
+            .ok()?;
 
-        let filter_evaluator = engine.get_expression_handler().get_evaluator(
-            stats_schema.clone(),
-            FILTER_EXPR.clone(),
-            DataType::BOOLEAN,
-        );
+        let filter_evaluator = engine
+            .get_expression_handler()
+            .get_evaluator(stats_schema.clone(), FILTER_EXPR.clone(), DataType::BOOLEAN)
+            .inspect_err(|e| warn!("Failed to create filter evaluator: {}", e))
+            .ok()?;
 
         Some(Self {
             stats_schema,

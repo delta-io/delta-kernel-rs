@@ -381,11 +381,13 @@ impl Scan {
             PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
             PhysicalPredicate::None => None,
         };
+
         let it = scan_action_iter(
             engine,
             self.replay_for_scan_data(engine)?,
             physical_predicate,
-        );
+        )?;
+
         Ok(Some(it).into_iter().flatten())
     }
 
@@ -687,7 +689,7 @@ fn transform_to_logical_internal(
             physical_schema,
             read_expression,
             global_state.logical_schema.clone().into(),
-        )
+        )?
         .evaluate(data.as_ref())?;
     Ok(result)
 }
@@ -707,7 +709,7 @@ pub(crate) mod test_utils {
             sync::{json::SyncJsonHandler, SyncEngine},
         },
         scan::log_replay::scan_action_iter,
-        EngineData, JsonHandler,
+        DeltaResult, EngineData, JsonHandler,
     };
 
     use super::state::ScanCallback;
@@ -759,26 +761,26 @@ pub(crate) mod test_utils {
         expected_sel_vec: &[bool],
         context: T,
         validate_callback: ScanCallback<T>,
-    ) {
+    ) -> DeltaResult<()> {
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch.into_iter().map(|batch| Ok((batch as _, true))),
             None,
-        );
+        )?;
         let mut batch_count = 0;
         for res in iter {
-            let (batch, sel) = res.unwrap();
-            assert_eq!(sel, expected_sel_vec);
+            let (batch, sel) = res?;
+            assert_eq!(sel.as_slice(), expected_sel_vec);
             crate::scan::state::visit_scan_files(
                 batch.as_ref(),
                 &sel,
                 context.clone(),
                 validate_callback,
-            )
-            .unwrap();
+            )?;
             batch_count += 1;
         }
         assert_eq!(batch_count, 1);
+        Ok(())
     }
 }
 

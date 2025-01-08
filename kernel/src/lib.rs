@@ -336,7 +336,7 @@ pub trait ExpressionHandler: AsAny {
         schema: SchemaRef,
         expression: Expression,
         output_type: DataType,
-    ) -> Arc<dyn ExpressionEvaluator>;
+    ) -> DeltaResult<Arc<dyn ExpressionEvaluator>>;
 }
 
 /// Provides file system related functionalities to Delta Kernel.

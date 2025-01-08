@@ -201,7 +201,7 @@ fn generate_adds<'a>(
             write_metadata_schema.clone(),
             adds_expr,
             log_schema.clone().into(),
-        );
+        )?;
         adds_evaluator.evaluate(write_metadata_batch)
     })
 }
@@ -321,7 +321,7 @@ fn generate_commit_info(
         engine_commit_info_schema.into(),
         commit_info_expr,
         commit_info_empty_struct_schema.into(),
-    );
+    )?;
 
     commit_info_evaluator.evaluate(engine_commit_info)
 }

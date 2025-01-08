@@ -237,21 +237,24 @@ impl LogReplayScanner {
 /// indicates whether the record batch is a log or checkpoint batch.
 pub fn scan_action_iter(
     engine: &dyn Engine,
-    action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
+    action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + 'static,
     physical_predicate: Option<(ExpressionRef, SchemaRef)>,
-) -> impl Iterator<Item = DeltaResult<ScanData>> {
+) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanData>>> {
     let mut log_scanner = LogReplayScanner::new(engine, physical_predicate);
     let add_transform = engine.get_expression_handler().get_evaluator(
         get_log_add_schema().clone(),
         get_add_transform_expr(),
         SCAN_ROW_DATATYPE.clone(),
-    );
-    action_iter
+    )?;
+
+    let actions = action_iter
         .map(move |action_res| {
             let (batch, is_log_batch) = action_res?;
             log_scanner.process_scan_batch(add_transform.as_ref(), batch.as_ref(), is_log_batch)
         })
-        .filter(|res| res.as_ref().map_or(true, |(_, sv)| sv.contains(&true)))
+        .filter(|res| res.as_ref().map_or(true, |(_, sv)| sv.contains(&true)));
+
+    Ok(actions)
 }
 
 #[cfg(test)]
@@ -291,7 +294,8 @@ mod tests {
             &[true, false],
             (),
             validate_simple,
-        );
+        )
+        .unwrap();
     }
 
     #[test]
@@ -301,6 +305,7 @@ mod tests {
             &[false, false, true, false],
             (),
             validate_simple,
-        );
+        )
+        .unwrap();
     }
 }

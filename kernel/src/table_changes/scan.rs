@@ -291,7 +291,8 @@ fn read_scan_file(
         physical_schema.clone(),
         physical_to_logical_expr,
         global_state.logical_schema.clone().into(),
-    );
+    )?;
+
     // Determine if the scan file was derived from a deletion vector pair
     let is_dv_resolved_pair = scan_file.remove_dv.is_some();
 

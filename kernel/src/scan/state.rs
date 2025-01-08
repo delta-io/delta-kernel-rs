@@ -253,6 +253,7 @@ mod tests {
             &[true, false],
             context,
             validate_visit,
-        );
+        )
+        .unwrap();
     }
 }

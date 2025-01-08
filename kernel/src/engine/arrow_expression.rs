@@ -519,12 +519,12 @@ impl ExpressionHandler for ArrowExpressionHandler {
         schema: SchemaRef,
         expression: Expression,
         output_type: DataType,
-    ) -> Arc<dyn ExpressionEvaluator> {
-        Arc::new(DefaultExpressionEvaluator {
+    ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
+        Ok(Arc::new(DefaultExpressionEvaluator {
             input_schema: schema,
             expression: Box::new(expression),
             output_type,
-        })
+        }))
     }
 }
 
