@@ -55,7 +55,8 @@ impl Snapshot {
     ///
     /// - `table_root`: url pointing at the table root (where `_delta_log` folder is located)
     /// - `engine`: Implementation of [`Engine`] apis.
-    /// - `version`: target version of the [`Snapshot`]
+    /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
+    ///   version of the table.
     pub fn try_new(
         table_root: Url,
         engine: &dyn Engine,
@@ -71,6 +72,26 @@ impl Snapshot {
 
         // try_new_from_log_segment will ensure the protocol is supported
         Self::try_new_from_log_segment(table_root, log_segment, engine)
+    }
+
+    /// Create a new [`Snapshot`] instance from an existing [`Snapshot`]. This is useful when you
+    /// already have a [`Snapshot`] lying around and want to do the minimal work to 'update' the
+    /// snapshot to a later version.
+    ///
+    /// # Parameters
+    ///
+    /// - `existing_snapshot`: reference to an existing [`Snapshot`]
+    /// - `engine`: Implementation of [`Engine`] apis.
+    /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
+    ///   version of the table.
+    pub fn new_from(
+        existing_snapshot: &Snapshot,
+        engine: &dyn Engine,
+        version: Option<Version>,
+    ) -> DeltaResult<Self> {
+        // TODO(zach): for now we just pass through to the old API. We should instead optimize this
+        // to avoid replaying overlapping LogSegments.
+        Self::try_new(existing_snapshot.table_root.clone(), engine, version)
     }
 
     /// Create a new [`Snapshot`] instance.
@@ -245,6 +266,25 @@ mod tests {
 
         let engine = SyncEngine::new();
         let snapshot = Snapshot::try_new(url, &engine, None).unwrap();
+
+        let expected =
+            Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
+        assert_eq!(snapshot.protocol(), &expected);
+
+        let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
+        let expected: StructType = serde_json::from_str(schema_string).unwrap();
+        assert_eq!(snapshot.schema(), &expected);
+    }
+
+    #[test]
+    fn test_snapshot_new_from() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+
+        let engine = SyncEngine::new();
+        let old_snapshot = Snapshot::try_new(url, &engine, Some(0)).unwrap();
+        let snapshot = Snapshot::new_from(&old_snapshot, &engine, Some(0)).unwrap();
 
         let expected =
             Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
