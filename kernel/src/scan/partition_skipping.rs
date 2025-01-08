@@ -96,7 +96,6 @@ impl RowVisitor for PartitionVisitor {
         for i in 0..row_count {
             let val = getter.get_map(i, "output")?.and_then(|m| {
                 let partition_values = m.materialize();
-                // TODO(tsaucer) instead of casting to Scalar::String we need to use the appropriate schema
                 let resolver = partition_values
                     .iter()
                     .map(|(k, v)| {
