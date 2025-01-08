@@ -79,7 +79,7 @@ default = []
 
 # this is an 'internal' feature flag which has all the shared bits from default-engine and
 # default-engine-rustls
-_default_engine_base = [
+default-engine-base = [
   "arrow-conversion",
   "arrow-expression",
   "arrow-array",
@@ -100,12 +100,12 @@ _default_engine_base = [
 # the default-engine use the reqwest crate with default features which uses native-tls. if you want
 # to instead use rustls, use 'default-engine-rustls' which has no native-tls dependency
 default-engine = [
-  "_default_engine_base",
+  "default-engine-base",
   "reqwest/default",
 ]
 
 default-engine-rustls = [
-  "_default_engine_base",
+  "default-engine-base",
   "reqwest/rustls-tls-native-roots",
   "reqwest/http2",
 ]
