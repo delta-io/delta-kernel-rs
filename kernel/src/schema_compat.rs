@@ -25,24 +25,20 @@ use crate::schema::{DataType, StructField, StructType};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
-/// Represents a nullability comparison between two schemas' fields. A schema whose field
-/// has nullability `nullable` is being read with a schema whose field has nullability
-/// `read_nullable`. `is_compatible` is true if the read nullability is the same or wider than
-/// the schema's nullability.
-struct NullabilityCheck {
-    nullable: bool,
-    read_nullable: bool,
-}
+/// The nullability flag of a schema's field. This can be compared with a read schema field's
+/// nullability flag using [`NullabilityFlag::can_read_as`].
+struct NullabilityFlag(bool);
 
-impl NullabilityCheck {
-    /// Returns true if a value with nullability `nullable` can be read using `read_nullable`.
-    fn is_compatible(&self) -> DeltaResult<()> {
+impl NullabilityFlag {
+    /// Represents a nullability comparison between two schemas' fields. Returns true if the
+    /// read nullability is the same or wider than the nullability of self.
+    fn can_read_as(&self, read_nullable: NullabilityFlag) -> DeltaResult<()> {
         // The case to avoid is when the column is nullable, but the read schema specifies the
         // column as non-nullable. So we avoid the case where !read_nullable && nullable
         // Hence we check that !(!read_nullable && existing_nullable)
         // == read_nullable || !existing_nullable
         require!(
-            self.read_nullable || !self.nullable,
+            read_nullable.0 || !self.0,
             Error::generic("Read field is non-nullable while this field is nullable")
         );
         Ok(())
@@ -52,11 +48,7 @@ impl NullabilityCheck {
 impl StructField {
     /// Returns `Ok` if this [`StructField`] can be read as `read_field` in the read schema.
     fn can_read_as(&self, read_field: &StructField) -> DeltaResult<()> {
-        NullabilityCheck {
-            nullable: self.nullable,
-            read_nullable: read_field.nullable,
-        }
-        .is_compatible()?;
+        NullabilityFlag(self.nullable).can_read_as(NullabilityFlag(read_field.nullable))?;
         require!(
             self.name() == read_field.name(),
             Error::generic(format!(
@@ -120,11 +112,8 @@ impl DataType {
     fn can_read_as(&self, read_type: &DataType) -> DeltaResult<()> {
         match (self, read_type) {
             (DataType::Array(self_array), DataType::Array(read_array)) => {
-                NullabilityCheck {
-                    nullable: self_array.contains_null(),
-                    read_nullable: read_array.contains_null(),
-                }
-                .is_compatible()?;
+                NullabilityFlag(self_array.contains_null())
+                    .can_read_as(NullabilityFlag(read_array.contains_null()))?;
                 self_array
                     .element_type()
                     .can_read_as(read_array.element_type())?;
@@ -133,11 +122,8 @@ impl DataType {
                 self_struct.can_read_as(read_struct)?
             }
             (DataType::Map(self_map), DataType::Map(read_map)) => {
-                NullabilityCheck {
-                    nullable: self_map.value_contains_null(),
-                    read_nullable: read_map.value_contains_null(),
-                }
-                .is_compatible()?;
+                NullabilityFlag(self_map.value_contains_null())
+                    .can_read_as(NullabilityFlag(read_map.value_contains_null()))?;
                 self_map.key_type().can_read_as(read_map.key_type())?;
                 self_map.value_type().can_read_as(read_map.value_type())?;
             }
