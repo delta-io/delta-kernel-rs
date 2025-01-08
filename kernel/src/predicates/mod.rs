@@ -231,6 +231,102 @@ pub(crate) trait PredicateEvaluator {
     }
 }
 
+/// Support for SQL WHERE semantics in data skipping predicates that may produce a NULL result.
+///
+/// By default, [`apply_expr`] can produce unwelcome behavior for comparisons involving all-NULL
+/// columns (e.g. `a == 10`), because the (legitimately NULL) min/max stats are interpreted as
+/// stats-missing that produces a NULL data skipping result). The resulting NULL can "poison"
+/// the entire expression, causing it to return NULL instead of FALSE that would allow skipping.
+///
+/// Meanwhile, SQL WHERE semantics only keeps rows for which the filter evaluates to TRUE --
+/// effectively turning `<expr>` into the null-safe predicate `AND(<expr> IS NOT NULL, <expr>)`.
+///
+/// We cannot safely evaluate an arbitrary data skipping predicate with null-safe semantics because
+/// NULL could also mean e.g. unknown/missing stats. However, we CAN safely turn a column reference
+/// in a comparison into a null-safe comparison, as long as the comparison's parent expressions are
+/// all AND. To see why, consider a WHERE clause filter of the form:
+///
+/// ```text
+/// AND(..., a {cmp} b, ...)
+/// ```
+///
+/// In order allow skipping based on the all-null `a` or `b`, we want to actually evaluate:
+/// ```text
+/// AND(..., AND(a IS NOT NULL, b IS NOT NULL, a {cmp} b), ...)
+/// ```
+///
+/// This optimization relies on the fact that we only support IS [NOT] NULL skipping for
+/// columns, and we only support skipping for comparisons between columns and literals. Thus, a
+/// typical case such as: `AND(..., x < 10, ...)` would in the all-null case be evaluated as:
+/// ```text
+/// AND(..., AND(x IS NOT NULL, 10 IS NOT NULL, x < 10), ...)
+/// AND(..., AND(FALSE, NULL, NULL), ...)
+/// AND(..., FALSE, ...)
+/// FALSE
+/// ```
+///
+/// In the not all-null case, it would instead evaluate as:
+/// ```text
+/// AND(..., AND(x IS NOT NULL, 10 IS NOT NULL, x < 10), ...)
+/// AND(..., AND(TRUE, NULL, <result>), ...)
+/// ```
+///
+/// If the result was FALSE, it forces both inner and outer AND to FALSE, as desired. If the
+/// result was TRUE or NULL, then it does not contribute to data skipping but also does not
+/// block it if other legs of the AND evaluate to FALSE.
+pub(crate) trait SqlPredicateEvaluator: PredicateEvaluator<Output = bool> {
+    /// Attempts to filter using SQL WHERE semantics.
+    fn eval_sql_where(&self, filter: &Expr) -> Option<bool> {
+        use Expr::{Binary, Variadic};
+        match filter {
+            Variadic(VariadicExpression {
+                op: VariadicOperator::And,
+                exprs,
+            }) => {
+                let exprs: Vec<_> = exprs
+                    .iter()
+                    .map(|expr| self.eval_sql_where(expr))
+                    .map(|result| match result {
+                        Some(value) => Expr::literal(value),
+                        None => Expr::null_literal(DataType::BOOLEAN),
+                    })
+                    .collect();
+                self.eval_variadic(VariadicOperator::And, &exprs, false)
+            }
+            Binary(BinaryExpression { op, left, right }) => {
+                self.eval_binary_nullsafe(*op, left, right)
+            }
+            _ => self.eval_expr(filter, false),
+        }
+    }
+
+    /// Helper method for [`apply_sql_where`], that evaluates `{a} {cmp} {b}` as
+    /// ```text
+    /// AND({a} IS NOT NULL, {b} IS NOT NULL, {a} {cmp} {b})
+    /// ```
+    ///
+    /// The null checks only apply to column expressions, so at least one of them will always be
+    /// NULL (since we don't support skipping over column-column comparisons). If any NULL check
+    /// fails (producing FALSE), it short-circuits the entire AND without ever evaluating the
+    /// comparison. Otherwise, the original comparison will run and -- if FALSE -- can cause data
+    /// skipping as usual.
+    fn eval_binary_nullsafe(&self, op: BinaryOperator, left: &Expr, right: &Expr) -> Option<bool> {
+        use UnaryOperator::IsNull;
+        // Convert `a {cmp} b` to `AND(a IS NOT NULL, b IS NOT NULL, a {cmp} b)`,
+        // and only evaluate the comparison if the null checks don't short circuit.
+        if let Some(false) = self.eval_unary(IsNull, left, true) {
+            return Some(false);
+        }
+        if let Some(false) = self.eval_unary(IsNull, right, true) {
+            return Some(false);
+        }
+        self.eval_binary(op, left, right, false)
+    }
+}
+
+/// Blanket impl for all boolean-output predicate evaluators
+impl<T: PredicateEvaluator<Output = bool>> SqlPredicateEvaluator for T {}
+
 /// A collection of provided methods from the [`PredicateEvaluator`] trait, factored out to allow
 /// reuse by the different predicate evaluator implementations.
 pub(crate) struct PredicateEvaluatorDefaults;
@@ -323,6 +419,14 @@ pub(crate) struct UnimplementedColumnResolver;
 impl ResolveColumnAsScalar for UnimplementedColumnResolver {
     fn resolve_column(&self, _col: &ColumnName) -> Option<Scalar> {
         unimplemented!()
+    }
+}
+
+// Used internally and by some tests
+pub(crate) struct EmptyColumnResolver;
+impl ResolveColumnAsScalar for EmptyColumnResolver {
+    fn resolve_column(&self, _col: &ColumnName) -> Option<Scalar> {
+        None
     }
 }
 

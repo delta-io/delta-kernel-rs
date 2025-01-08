@@ -2,7 +2,6 @@ use super::*;
 use crate::expressions::{
     column_expr, column_name, ArrayData, Expression, StructData, UnaryOperator,
 };
-use crate::predicates::PredicateEvaluator;
 use crate::schema::ArrayType;
 use crate::DataType;
 
@@ -569,4 +568,109 @@ fn eval_binary() {
             "DISTINCT(10, x) (inverted: {inverted})"
         );
     }
+}
+
+#[test]
+fn test_sql_where() {
+    let col = &column_expr!("x");
+    const VAL: Expr = Expr::Literal(Scalar::Integer(1));
+    const NULL: Expr = Expr::Literal(Scalar::Null(DataType::BOOLEAN));
+    const FALSE: Expr = Expr::Literal(Scalar::Boolean(false));
+    const TRUE: Expr = Expr::Literal(Scalar::Boolean(true));
+    let filter = DefaultPredicateEvaluator::from(EmptyColumnResolver);
+
+    // Basic sanity checks
+    expect_eq!(filter.eval_sql_where(&VAL), None, "WHERE {VAL}");
+    expect_eq!(filter.eval_sql_where(col), None, "WHERE {col}");
+    expect_eq!(
+        filter.eval_sql_where(&Expr::is_null(col.clone())),
+        Some(true), // No injected NULL checks
+        "WHERE {col} IS NULL"
+    );
+    expect_eq!(
+        filter.eval_sql_where(&Expr::lt(TRUE, FALSE)),
+        Some(false), // Injected NULL checks don't short circuit when inputs are NOT NULL
+        "WHERE {TRUE} < {FALSE}"
+    );
+
+    // Constrast normal vs SQL WHERE semantics - comparison
+    expect_eq!(
+        filter.eval_expr(&Expr::lt(col.clone(), VAL), false),
+        None,
+        "{col} < {VAL}"
+    );
+    expect_eq!(
+        filter.eval_sql_where(&Expr::lt(col.clone(), VAL)),
+        Some(false),
+        "WHERE {col} < {VAL}"
+    );
+    expect_eq!(
+        filter.eval_expr(&Expr::lt(VAL, col.clone()), false),
+        None,
+        "{VAL} < {col}"
+    );
+    expect_eq!(
+        filter.eval_sql_where(&Expr::lt(VAL, col.clone())),
+        Some(false),
+        "WHERE {VAL} < {col}"
+    );
+
+    // Constrast normal vs SQL WHERE semantics - comparison inside AND
+    expect_eq!(
+        filter.eval_expr(&Expr::and(NULL, Expr::lt(col.clone(), VAL)), false),
+        None,
+        "{NULL} AND {col} < {VAL}"
+    );
+    expect_eq!(
+        filter.eval_sql_where(&Expr::and(NULL, Expr::lt(col.clone(), VAL),)),
+        Some(false),
+        "WHERE {NULL} AND {col} < {VAL}"
+    );
+
+    expect_eq!(
+        filter.eval_expr(&Expr::and(TRUE, Expr::lt(col.clone(), VAL)), false),
+        None, // NULL (from the NULL check) is stronger than TRUE
+        "{TRUE} AND {col} < {VAL}"
+    );
+    expect_eq!(
+        filter.eval_sql_where(&Expr::and(TRUE, Expr::lt(col.clone(), VAL),)),
+        Some(false), // FALSE (from the NULL check) is stronger than TRUE
+        "WHERE {TRUE} AND {col} < {VAL}"
+    );
+
+    // Contrast normal vs. SQL WHERE semantics - comparison inside AND inside AND
+    expect_eq!(
+        filter.eval_expr(
+            &Expr::and(TRUE, Expr::and(NULL, Expr::lt(col.clone(), VAL)),),
+            false,
+        ),
+        None,
+        "{TRUE} AND ({NULL} AND {col} < {VAL})"
+    );
+    expect_eq!(
+        filter.eval_sql_where(&Expr::and(
+            TRUE,
+            Expr::and(NULL, Expr::lt(col.clone(), VAL)),
+        )),
+        Some(false),
+        "WHERE {TRUE} AND ({NULL} AND {col} < {VAL})"
+    );
+
+    // Semantics are the same for comparison inside OR inside AND
+    expect_eq!(
+        filter.eval_expr(
+            &Expr::or(FALSE, Expr::and(NULL, Expr::lt(col.clone(), VAL)),),
+            false,
+        ),
+        None,
+        "{FALSE} OR ({NULL} AND {col} < {VAL})"
+    );
+    expect_eq!(
+        filter.eval_sql_where(&Expr::or(
+            FALSE,
+            Expr::and(NULL, Expr::lt(col.clone(), VAL)),
+        )),
+        None,
+        "WHERE {FALSE} OR ({NULL} AND {col} < {VAL})"
+    );
 }

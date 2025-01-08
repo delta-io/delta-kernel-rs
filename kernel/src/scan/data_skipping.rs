@@ -12,7 +12,7 @@ use crate::expressions::{
     Scalar, VariadicOperator,
 };
 use crate::predicates::{
-    DataSkippingPredicateEvaluator, PredicateEvaluator, PredicateEvaluatorDefaults,
+    DataSkippingPredicateEvaluator, PredicateEvaluator as _, PredicateEvaluatorDefaults,
 };
 use crate::schema::{DataType, PrimitiveType, SchemaRef, SchemaTransform, StructField, StructType};
 use crate::{Engine, EngineData, ExpressionEvaluator, JsonHandler, RowVisitor as _};
