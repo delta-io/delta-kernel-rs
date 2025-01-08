@@ -201,9 +201,17 @@ fn get_add_transform_expr() -> Expression {
 
 impl LogReplayScanner {
     /// Create a new [`LogReplayScanner`] instance
-    fn new(engine: &dyn Engine, physical_predicate: Option<(ExpressionRef, SchemaRef)>) -> Self {
+    fn new(
+        engine: &dyn Engine,
+        physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+        have_partition_cols: bool,
+    ) -> Self {
+        let partition_filter = match have_partition_cols {
+            true => PartitionSkippingFilter::new(engine, physical_predicate.clone()),
+            false => None,
+        };
         Self {
-            partition_filter: PartitionSkippingFilter::new(engine, physical_predicate.clone()),
+            partition_filter,
             data_filter: DataSkippingFilter::new(engine, physical_predicate),
             seen: Default::default(),
         }
@@ -257,8 +265,9 @@ pub fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
     physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+    have_partition_cols: bool,
 ) -> impl Iterator<Item = DeltaResult<ScanData>> {
-    let mut log_scanner = LogReplayScanner::new(engine, physical_predicate);
+    let mut log_scanner = LogReplayScanner::new(engine, physical_predicate, have_partition_cols);
     let add_transform = engine.get_expression_handler().get_evaluator(
         get_log_add_schema().clone(),
         get_add_transform_expr(),
