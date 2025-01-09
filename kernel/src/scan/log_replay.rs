@@ -47,7 +47,7 @@ struct AddRemoveDedupVisitor<'seen> {
     selection_vector: Vec<bool>,
     logical_schema: SchemaRef,
     transform: Option<Arc<Transform>>,
-    row_transform_exprs: HashMap<usize, ExpressionRef>,
+    row_transform_exprs: Vec<Option<ExpressionRef>>,
     is_log_batch: bool,
 }
 
@@ -144,9 +144,15 @@ impl AddRemoveDedupVisitor<'_> {
         if !is_add || have_seen {
             return Ok(false);
         }
-        if let Some(ref transform) = self.transform {
-            let transform_expr = self.get_transform_expr(i, transform, getters)?;
-            self.row_transform_exprs.insert(i, transform_expr);
+        let transform = self
+            .transform
+            .as_ref()
+            .map(|transform| self.get_transform_expr(i, transform, getters))
+            .transpose()?;
+        if transform.is_some() {
+            // fill in any needed `None`s for previous rows
+            self.row_transform_exprs.resize_with(i, Default::default);
+            self.row_transform_exprs.push(transform);
         }
         Ok(true)
     }
@@ -271,7 +277,7 @@ impl LogReplayScanner {
             selection_vector,
             logical_schema,
             transform,
-            row_transform_exprs: HashMap::new(),
+            row_transform_exprs: Vec::new(),
             is_log_batch,
         };
         visitor.visit_rows_of(actions)?;
@@ -439,9 +445,13 @@ mod tests {
 
         for res in iter {
             let (_batch, _sel, transforms) = res.unwrap();
-            assert_eq!(transforms.len(), 2, "Should have two transforms");
-            validate_transform(transforms.get(&0), 17511);
-            validate_transform(transforms.get(&1), 17510);
+            // in this case we have a metadata action first and protocol 3rd, so we expect 4 items,
+            // the first and 3rd being a `None`
+            assert_eq!(transforms.len(), 4, "Should have 4 transforms");
+            assert!(transforms[0].is_none(), "transform at [0] should be None");
+            assert!(transforms[2].is_none(), "transform at [2] should be None");
+            validate_transform(transforms[1].as_ref(), 17511);
+            validate_transform(transforms[3].as_ref(), 17510);
         }
     }
 }
