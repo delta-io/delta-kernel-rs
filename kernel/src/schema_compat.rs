@@ -62,8 +62,8 @@ impl StructField {
     }
 }
 impl StructType {
-    #[allow(unused)]
     /// Returns `Ok` if this [`StructType`] can be read as `read_type` in the read schema.
+    #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn can_read_as(&self, read_type: &StructType) -> DeltaResult<()> {
         let field_map: HashMap<String, &StructField> = self
