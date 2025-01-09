@@ -274,8 +274,30 @@ pub(crate) trait PredicateEvaluator {
 /// If the result was FALSE, it forces both inner and outer AND to FALSE, as desired. If the
 /// result was TRUE or NULL, then it does not contribute to data skipping but also does not
 /// block it if other legs of the AND evaluate to FALSE.
-pub(crate) trait SqlPredicateEvaluator: PredicateEvaluator<Output = bool> {
+pub(crate) trait SqlPredicateEvaluator: PredicateEvaluator {
     /// Attempts to filter using SQL WHERE semantics.
+    fn eval_sql_where(&self, filter: &Expr) -> Option<Self::Output>;
+
+    /// Helper method for [`apply_sql_where`], that evaluates `{a} {cmp} {b}` as
+    /// ```text
+    /// AND({a} IS NOT NULL, {b} IS NOT NULL, {a} {cmp} {b})
+    /// ```
+    ///
+    /// The null checks only apply to column expressions, so at least one of them will always be
+    /// NULL (since we don't support skipping over column-column comparisons). If any NULL check
+    /// fails (producing FALSE), it short-circuits the entire AND without ever evaluating the
+    /// comparison. Otherwise, the original comparison will run and -- if FALSE -- can cause data
+    /// skipping as usual.
+    fn eval_binary_nullsafe(
+        &self,
+        op: BinaryOperator,
+        left: &Expr,
+        right: &Expr,
+    ) -> Option<Self::Output>;
+}
+
+/// Blanket impl for all boolean-output predicate evaluators
+impl<T: PredicateEvaluator<Output = bool>> SqlPredicateEvaluator for T {
     fn eval_sql_where(&self, filter: &Expr) -> Option<bool> {
         use Expr::{Binary, Variadic};
         match filter {
@@ -300,16 +322,6 @@ pub(crate) trait SqlPredicateEvaluator: PredicateEvaluator<Output = bool> {
         }
     }
 
-    /// Helper method for [`apply_sql_where`], that evaluates `{a} {cmp} {b}` as
-    /// ```text
-    /// AND({a} IS NOT NULL, {b} IS NOT NULL, {a} {cmp} {b})
-    /// ```
-    ///
-    /// The null checks only apply to column expressions, so at least one of them will always be
-    /// NULL (since we don't support skipping over column-column comparisons). If any NULL check
-    /// fails (producing FALSE), it short-circuits the entire AND without ever evaluating the
-    /// comparison. Otherwise, the original comparison will run and -- if FALSE -- can cause data
-    /// skipping as usual.
     fn eval_binary_nullsafe(&self, op: BinaryOperator, left: &Expr, right: &Expr) -> Option<bool> {
         use UnaryOperator::IsNull;
         // Convert `a {cmp} b` to `AND(a IS NOT NULL, b IS NOT NULL, a {cmp} b)`,
@@ -323,9 +335,6 @@ pub(crate) trait SqlPredicateEvaluator: PredicateEvaluator<Output = bool> {
         self.eval_binary(op, left, right, false)
     }
 }
-
-/// Blanket impl for all boolean-output predicate evaluators
-impl<T: PredicateEvaluator<Output = bool>> SqlPredicateEvaluator for T {}
 
 /// A collection of provided methods from the [`PredicateEvaluator`] trait, factored out to allow
 /// reuse by the different predicate evaluator implementations.

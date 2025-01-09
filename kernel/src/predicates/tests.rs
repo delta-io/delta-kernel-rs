@@ -579,7 +579,7 @@ impl ResolveColumnAsScalar for NullColumnResolver {
 }
 
 #[test]
-fn test_sql_where_null() {
+fn test_sql_where() {
     let col = &column_expr!("x");
     const VAL: Expr = Expr::Literal(Scalar::Integer(1));
     const NULL: Expr = Expr::Literal(Scalar::Null(DataType::BOOLEAN));
