@@ -456,3 +456,15 @@ pub trait Engine: AsAny {
     /// Get the connector provided [`ParquetHandler`].
     fn get_parquet_handler(&self) -> Arc<dyn ParquetHandler>;
 }
+
+// we have an 'internal' feature flag: default-engine-base, which is actually just the shared
+// pieces of default-engine and default-engine-rustls. the crate can't compile with _only_
+// default-engine-base, so we give a friendly error here.
+#[cfg(all(
+    feature = "default-engine-base",
+    not(any(feature = "default-engine", feature = "default-engine-rustls",))
+))]
+compile_error!(
+    "The default-engine-base feature flag is not meant to be used directly. \
+    Please use either default-engine or default-engine-rustls."
+);

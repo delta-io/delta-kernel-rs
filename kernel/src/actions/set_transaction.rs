@@ -80,7 +80,7 @@ impl SetTransactionScanner {
     }
 }
 
-#[cfg(all(test, feature = "default-engine"))]
+#[cfg(all(test, feature = "sync-engine"))]
 mod tests {
     use std::path::PathBuf;
 

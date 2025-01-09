@@ -54,7 +54,7 @@ hdfs-native-object-store = { workspace = true, optional = true }
 # Used in default and sync engine
 parquet = { workspace = true, optional = true }
 # Used for fetching direct urls (like pre-signed urls)
-reqwest = { version = "0.12.7", optional = true }
+reqwest = { version = "0.12.8", default-features = false, optional = true }
 strum = { version = "0.26", features = ["derive"] }
 
 
@@ -76,7 +76,10 @@ cloud = [
   "hdfs-native-object-store",
 ]
 default = []
-default-engine = [
+
+# this is an 'internal' feature flag which has all the shared bits from default-engine and
+# default-engine-rustls
+default-engine-base = [
   "arrow-conversion",
   "arrow-expression",
   "arrow-array",
@@ -89,10 +92,22 @@ default-engine = [
   "object_store",
   "parquet/async",
   "parquet/object_store",
-  "reqwest",
   "tokio",
   "uuid/v4",
   "uuid/fast-rng",
+]
+
+# the default-engine use the reqwest crate with default features which uses native-tls. if you want
+# to instead use rustls, use 'default-engine-rustls' which has no native-tls dependency
+default-engine = [
+  "default-engine-base",
+  "reqwest/default",
+]
+
+default-engine-rustls = [
+  "default-engine-base",
+  "reqwest/rustls-tls-native-roots",
+  "reqwest/http2",
 ]
 
 developer-visibility = []
