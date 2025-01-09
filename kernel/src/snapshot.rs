@@ -182,8 +182,8 @@ struct CheckpointMetadata {
 /// the read. Thus, the semantics of this function are to return `None` if the file is not found or
 /// is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and are assumed to
 /// cause failure.
-///
-/// TODO: java kernel retries three times before failing, should we do the same?
+//
+// TODO: java kernel retries three times before failing, should we do the same?
 fn read_last_checkpoint(
     fs_client: &dyn FileSystemClient,
     log_root: &Url,

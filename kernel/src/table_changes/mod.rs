@@ -75,7 +75,7 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 ///   file modification time of the log file. No timezone is associated with the timestamp.
 ///
 ///   Currently, in-commit timestamps (ICT) is not supported. In the future when ICT is enabled, the
-///   timestamp will be retrieved from the `inCommitTimestamp` field of the CommitInfo` action.
+///   timestamp will be retrieved from the `inCommitTimestamp` field of the [`CommitInfo`] action.
 ///   See issue [#559](https://github.com/delta-io/delta-kernel-rs/issues/559)
 ///   For details on In-Commit Timestamps, see the [Protocol](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#in-commit-timestamps).
 ///
@@ -93,6 +93,7 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 ///   future to allow compatible schemas that are not the exact same.
 ///   See issue [#523](https://github.com/delta-io/delta-kernel-rs/issues/523)
 ///
+/// [`CommitInfo`]: crate::actions::CommitInfo
 ///  # Examples
 ///  Get `TableChanges` for versions 0 to 1 (inclusive)
 ///  ```rust

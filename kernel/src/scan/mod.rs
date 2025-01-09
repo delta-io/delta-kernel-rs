@@ -8,6 +8,7 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
+use self::log_replay::scan_action_iter;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
@@ -16,7 +17,6 @@ use crate::expressions::{ColumnName, Expression, ExpressionRef, ExpressionTransf
 use crate::predicates::parquet_stats_skipping::{
     ParquetStatsProvider, ParquetStatsSkippingFilter as _,
 };
-use crate::scan::state::{DvInfo, Stats};
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
     StructType,
@@ -25,12 +25,11 @@ use crate::snapshot::Snapshot;
 use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta};
 
-use self::log_replay::scan_action_iter;
-use self::state::GlobalScanState;
-
 pub(crate) mod data_skipping;
 pub mod log_replay;
 pub mod state;
+
+pub use state::*;
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
@@ -63,8 +62,8 @@ impl ScanBuilder {
     /// A table with columns `[a, b, c]` could have a scan which reads only the first
     /// two columns by using the schema `[a, b]`.
     ///
-    /// [`Schema`]: crate::schema::Schema
-    /// [`Snapshot`]: crate::snapshot::Snapshot
+    /// [Schema]: crate::schema::Schema
+    /// [Snapshot]: crate::snapshot::Snapshot
     pub fn with_schema(mut self, schema: SchemaRef) -> Self {
         self.schema = Some(schema);
         self
@@ -345,7 +344,7 @@ impl std::fmt::Debug for Scan {
 impl Scan {
     /// Get a shared reference to the [`Schema`] of the scan.
     ///
-    /// [`Schema`]: crate::schema::Schema
+    /// [Schema]: crate::schema::Schema
     pub fn schema(&self) -> &SchemaRef {
         &self.logical_schema
     }
@@ -466,7 +465,7 @@ impl Scan {
             .map(|res| {
                 let (data, vec) = res?;
                 let scan_files = vec![];
-                state::visit_scan_files(data.as_ref(), &vec, scan_files, scan_data_callback)
+                visit_scan_files(data.as_ref(), &vec, scan_files, scan_data_callback)
             })
             // Iterator<DeltaResult<Vec<ScanFile>>> to Iterator<DeltaResult<ScanFile>>
             .flatten_ok();

@@ -21,10 +21,15 @@ use super::log_replay::SCAN_ROW_SCHEMA;
 /// State that doesn't change between scans
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GlobalScanState {
+    /// Storage location where the table is stored as a URL
     pub table_root: String,
+    /// Columns this table is partitioned by
     pub partition_columns: Vec<String>,
+    /// Logical schema of the table including computed and/or mapped columns
     pub logical_schema: SchemaRef,
+    /// Physical schema of the table as it is stored on disk
     pub physical_schema: SchemaRef,
+    /// Column mapping mode for this table
     pub column_mapping_mode: ColumnMappingMode,
 }
 

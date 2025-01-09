@@ -43,7 +43,7 @@
 //!
 //! Delta Kernel needs to perform some basic operations against file systems like listing and
 //! reading files. These interactions are encapsulated in the [`FileSystemClient`] trait.
-//! Implementors must take care that all assumptions on the behavior if the functions - like sorted
+//! Implementors must take care that all assumptions on the behavior of the functions - like sorted
 //! results - are respected.
 //!
 //! ## Reading log and data files
@@ -103,6 +103,7 @@ pub use delta_kernel_derive;
 pub use engine_data::{EngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef};
+pub use snapshot::Snapshot;
 pub use table::Table;
 
 #[cfg(any(

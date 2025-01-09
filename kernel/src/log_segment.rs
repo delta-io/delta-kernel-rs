@@ -187,11 +187,15 @@ impl LogSegment {
     /// The boolean flags indicates whether the data was read from
     /// a commit file (true) or a checkpoint file (false).
     ///
-    /// `read_schema` is the schema to read the log files with. This can be used
-    /// to project the log files to a subset of the columns.
+    /// # Arguments
     ///
-    /// `meta_predicate` is an optional expression to filter the log files with. It is _NOT_ the
-    /// query's predicate, but rather a predicate for filtering log files themselves.
+    /// - `engine` is the engine to use to read and process the log files.
+    /// - `commit_read_schema` is the schema to read the commit files with. This can be used
+    ///   to project the log files to a subset of the columns.
+    /// - `checkpoint_read_schema` is the schema to read the checkpoint files with. This can be used
+    ///   to project the log files to a subset of the columns.
+    /// - `meta_predicate` is an optional expression to filter the log files with. It is _NOT_ the
+    ///   query's predicate, but rather a predicate for filtering log files themselves.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn replay(
         &self,

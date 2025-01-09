@@ -13,7 +13,6 @@ use self::storage::parse_url_opts;
 use object_store::{path::Path, DynObjectStore};
 use url::Url;
 
-use self::executor::TaskExecutor;
 use self::filesystem::ObjectStoreFileSystemClient;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
@@ -32,6 +31,10 @@ pub mod filesystem;
 pub mod json;
 pub mod parquet;
 pub mod storage;
+
+#[cfg(feature = "tokio")]
+pub use executor::tokio::*;
+pub use executor::*;
 
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {

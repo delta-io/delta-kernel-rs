@@ -1,3 +1,29 @@
+<p align="center">
+  <a href="https://delta.io/">
+    <img src="https://github.com/delta-io/delta-rs/blob/main/docs\delta-rust-no-whitespace.svg?raw=true" alt="delta-kernel-rs logo" height="150">
+  </a>
+</p>
+<p align="center">
+  An implementation of the Delta protocol for use in native query engines.
+  <br>
+  <a href="https://docs.rs/delta_kernel/latest/delta_kernel/">Rust docs</a>
+  ·
+  <a href="https://github.com/delta-io/delta-kernel-rs/issues/new?template=bug_report.yml">Report a bug</a>
+  ·
+  <a href="https://github.com/delta-io/delta-kernel-rs/issues/new?template=feature_request.yml">Request a feature</a>
+  <br>
+  <br>
+  <a target="_blank" href="https://github.com/delta-io/delta-kernel-rs" style="background:none">
+    <img src="https://img.shields.io/github/stars/delta-io/delta-kernel-rs?logo=github&color=F75101">
+  </a>
+  <a target="_blank" href="https://crates.io/crates/delta_kernel" style="background:none">
+    <img alt="Crate" src="https://img.shields.io/crates/v/delta_kernel.svg?style=flat-square&color=00ADD4&logo=rust" >
+  </a>
+  <a target="_blank" href="https://go.delta.io/slack">
+    <img alt="#delta-rs in the Delta Lake Slack workspace" src="https://img.shields.io/badge/slack-delta-blue.svg?logo=slack&style=flat-square&color=F75101">
+  </a>
+</p>
+
 # delta-kernel-rs
 
 Delta-kernel-rs is an experimental [Delta][delta] implementation focused on interoperability with a
@@ -12,11 +38,12 @@ is the Rust/C equivalent of [Java Delta Kernel][java-kernel].
 
 Delta-kernel-rs is split into a few different crates:
 
-- kernel: The actual core kernel crate
-- acceptance: Acceptance tests that validate correctness  via the [Delta Acceptance Tests][dat]
-- derive-macros: A crate for our [derive-macros] to live in
-- ffi: Functionallity that enables delta-kernel-rs to be used from `C` or `C++` See the [ffi](ffi)
+- [kernel](kernel): The actual core kernel crate
+- [acceptance](acceptance): Acceptance tests that validate correctness  via the [Delta Acceptance Tests][dat]
+- [derive-macros](derive-macros): A crate for our [derive-macros] to live in
+- [ffi](ffi): Functionallity that enables delta-kernel-rs to be used from `C` or `C++` See the [ffi](ffi)
   directory for more information.
+- [ffi-proc-macros](ffi-proc-macros): Procedural macros for the delta_kernel_ffi crate.
 
 ## Building
 By default we build only the `kernel` and `acceptance` crates, which will also build `derive-macros`
@@ -111,7 +138,6 @@ and then checking what version of `object_store` it depends on.
 ## Documentation
 
 - [API Docs](https://docs.rs/delta_kernel/latest/delta_kernel/)
-- [arcitecture.md](doc/architecture.md) document describing the kernel architecture (currently wip)
 
 ## Examples
 
@@ -179,7 +205,6 @@ Some design principles which should be considered:
 [delta-github]: https://github.com/delta-io/delta
 [java-kernel]: https://github.com/delta-io/delta/tree/master/kernel
 [rustup]: https://rustup.rs
-[architecture.md]: https://github.com/delta-io/delta-kernel-rs/tree/master/architecture.md
 [dat]: https://github.com/delta-incubator/dat
 [derive-macros]: https://doc.rust-lang.org/reference/procedural-macros.html
 [API Docs]: https://docs.rs/delta_kernel/latest/delta_kernel/

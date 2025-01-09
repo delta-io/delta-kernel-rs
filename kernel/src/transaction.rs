@@ -209,7 +209,7 @@ fn generate_adds<'a>(
 /// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
 /// write table data.
 ///
-/// [`Transaction`]: struct.Transaction.html
+/// [Transaction]: struct.Transaction.html
 pub struct WriteContext {
     target_dir: Url,
     schema: SchemaRef,
