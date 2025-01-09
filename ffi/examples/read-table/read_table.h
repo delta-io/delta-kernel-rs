@@ -1,6 +1,6 @@
 #pragma once
 
-#include <delta_kernel_ffi.h>
+#include "delta_kernel_ffi.h"
 
 // A list of partition column names
 typedef struct PartitionList

@@ -1,6 +1,6 @@
 #pragma once
 
-#include <delta_kernel_ffi.h>
+#include "delta_kernel_ffi.h"
 
 // This is how we represent our errors. The kernel will ask us to contruct this struct whenever it
 // enounters an error, and then return the contructed EngineError to us

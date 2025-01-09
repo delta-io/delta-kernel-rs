@@ -3,9 +3,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::SharedSchema;
+
 use delta_kernel::scan::state::{visit_scan_files, DvInfo, GlobalScanState};
 use delta_kernel::scan::{Scan, ScanData};
-use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Error};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -70,8 +71,6 @@ fn scan_impl(
 
 #[handle_descriptor(target=GlobalScanState, mutable=false, sized=true)]
 pub struct SharedGlobalScanState;
-#[handle_descriptor(target=Schema, mutable=false, sized=true)]
-pub struct SharedSchema;
 
 /// Get the global state for a scan. See the docs for [`delta_kernel::scan::state::GlobalScanState`]
 /// for more information.

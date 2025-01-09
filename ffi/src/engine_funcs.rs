@@ -8,7 +8,7 @@ use tracing::debug;
 use url::Url;
 
 use crate::{
-    scan::SharedSchema, ExclusiveEngineData, ExternEngine, ExternResult, IntoExternResult,
+    SharedSchema, ExclusiveEngineData, ExternEngine, ExternResult, IntoExternResult,
     KernelStringSlice, NullableCvoid, SharedExternEngine, TryFromStringSlice,
 };
 

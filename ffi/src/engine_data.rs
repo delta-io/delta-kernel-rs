@@ -84,3 +84,26 @@ fn get_raw_arrow_data_impl(data: Box<dyn EngineData>) -> DeltaResult<*mut ArrowF
     let ret_data = Box::new(ArrowFFIData { array, schema });
     Ok(Box::leak(ret_data))
 }
+
+#[cfg(feature = "default-engine")]
+#[no_mangle]
+pub unsafe extern "C" fn get_engine_data(
+    data: *mut ArrowFFIData,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveEngineData>> {
+    get_engine_data_impl(data)
+        .map(|engine_data| engine_data.into())
+        .into_extern_result(&engine.as_ref())
+}
+
+#[cfg(feature = "default-engine")]
+unsafe fn get_engine_data_impl(data: *mut ArrowFFIData) -> DeltaResult<Box<dyn EngineData>> {
+    let array_local = std::ptr::read(&(*data).array);
+    let schema_local = std::ptr::read(&(*data).schema);
+
+    let array: arrow_array::StructArray =
+        arrow_array::ffi::from_ffi(array_local, &schema_local)?.into();
+    let record_batch: arrow_array::RecordBatch = array.into();
+    let engine_data = delta_kernel::engine::arrow_data::ArrowEngineData::from(record_batch);
+    Ok(Box::new(engine_data))
+}

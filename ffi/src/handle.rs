@@ -3,19 +3,19 @@
 //!
 //! Creating a [`Handle<T>`] always implies some kind of ownership transfer. A mutable handle takes
 //! ownership of the object itself (analagous to [`Box<T>`]), while a non-mutable (shared) handle
-//! takes ownership of a shared reference to the object (analagous to [`std::sync::Arc<T>`]). Thus, a created
-//! handle remains [valid][Handle#Validity], and its underlying object remains accessible, until the
-//! handle is explicitly dropped or consumed. Dropping a mutable handle always drops the underlying
-//! object as well; dropping a shared handle only drops the underlying object if the handle was the
-//! last reference to that object.
+//! takes ownership of a shared reference to the object (analagous to [`std::sync::Arc<T>`]). Thus,
+//! a created handle remains [valid][Handle#Validity], and its underlying object remains
+//! accessible, until the handle is explicitly dropped or consumed. Dropping a mutable handle
+//! always drops the underlying object as well; dropping a shared handle only drops the underlying
+//! object if the handle was the last reference to that object.
 //!
 //! Because handles carry ownership semantics, and lifetime information is not preserved across the
 //! FFI boundary, handles are always opaque types to avoid confusiong them with normal references
 //! and pointers (`&Foo`, `*const Foo`, etc) that are possibly only valid until the FFI call
-//! returns. For the same reason, mutable handles implement neither [`Copy`] nor [`Clone`]. However,
-//! this only helps on the Rust side, because handles appear as simple pointers in the FFI and are
-//! thus easily duplicated there. In order to improve safety, external (non-Rust) code is strongly
-//! advised to maintain "unique pointer" semantics for mutable handles.
+//! returns. For the same reason, mutable handles implement neither [`Copy`] nor [`Clone`].
+//! However, this only helps on the Rust side, because handles appear as simple pointers in the FFI
+//! and are thus easily duplicated there. In order to improve safety, external (non-Rust) code is
+//! strongly advised to maintain "unique pointer" semantics for mutable handles.
 //!
 //! NOTE: While shared handles could conceptually impl [`Clone`], cloning would require unsafe code
 //! and so we can't actually implement the trait. Use [`Handle::clone_handle`] instead.

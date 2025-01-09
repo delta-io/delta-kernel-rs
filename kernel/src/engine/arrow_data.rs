@@ -6,7 +6,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::{Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray};
 use arrow_schema::{FieldRef, DataType as ArrowDataType};
-use tracing::{debug};
+use tracing::debug;
 
 use std::collections::{HashMap, HashSet};
 

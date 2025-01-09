@@ -183,6 +183,7 @@ impl AllocateError for &dyn ExternEngine {
         etype: KernelError,
         msg: KernelStringSlice,
     ) -> *mut EngineError {
+        println!("etype: {etype:?}");
         self.error_allocator().allocate_error(etype, msg)
     }
 }

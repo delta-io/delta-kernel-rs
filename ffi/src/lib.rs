@@ -11,7 +11,9 @@ use std::sync::Arc;
 use tracing::debug;
 use url::Url;
 
+use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
+use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{DeltaResult, Engine, EngineData, Table};
 use delta_kernel_ffi_macros::handle_descriptor;
 
@@ -324,6 +326,9 @@ pub unsafe extern "C" fn free_bool_slice(slice: KernelBoolSlice) {
 pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
     let _ = slice.into_vec();
 }
+
+#[handle_descriptor(target=Schema, mutable=false, sized=true)]
+pub struct SharedSchema;
 
 // TODO: Do we want this handle at all? Perhaps we should just _always_ pass raw *mut c_void pointers
 // that are the engine data? Even if we want the type, should it be a shared handle instead?
@@ -660,6 +665,137 @@ fn string_slice_next_impl(
 #[no_mangle]
 pub unsafe extern "C" fn free_string_slice_data(data: Handle<StringSliceIterator>) {
     data.drop_handle();
+}
+
+#[handle_descriptor(target=Transaction, mutable=true, sized=true)]
+pub struct ExclusiveTransaction;
+
+/// Start a transaction on the latest snapshot of the table.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles and path pointer.
+#[no_mangle]
+pub unsafe extern "C" fn transaction(
+    path: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let url = unsafe { unwrap_and_parse_path_as_url(path) };
+    let engine = unsafe { engine.as_ref() };
+    transaction_impl(url, engine).into_extern_result(&engine)
+}
+
+fn transaction_impl(
+    url: DeltaResult<Url>,
+    extern_engine: &dyn ExternEngine,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    let table = Table::try_from_uri(url?)?;
+    let transaction = table.new_transaction(extern_engine.engine().as_ref())?;
+    Ok(Box::new(transaction).into())
+}
+
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_transaction(txn: Handle<ExclusiveTransaction>) {
+    debug!("engine released transaction");
+    txn.drop_handle();
+}
+
+/// TODO
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle. CONSUMES TRANSACTION and commit info
+#[no_mangle]
+pub unsafe extern "C" fn with_commit_info(
+    txn: Handle<ExclusiveTransaction>,
+    commit_info: Handle<ExclusiveEngineData>,
+) -> Handle<ExclusiveTransaction> {
+    let txn = unsafe { txn.into_inner() };
+    let commit_info = unsafe { commit_info.into_inner() };
+    Box::new(txn.with_commit_info(commit_info)).into()
+}
+
+use delta_kernel::transaction::WriteContext;
+
+#[handle_descriptor(target=WriteContext, mutable=false, sized=true)]
+pub struct SharedWriteContext;
+
+#[no_mangle]
+pub unsafe extern "C" fn get_write_context(
+    txn: Handle<ExclusiveTransaction>,
+) -> Handle<SharedWriteContext> {
+    let txn = unsafe { txn.as_ref() };
+    Arc::new(txn.get_write_context()).into()
+}
+
+/// TODO
+///
+/// # Safety
+/// Engine is responsible for providing a valid WriteContext pointer
+#[no_mangle]
+pub unsafe extern "C" fn get_write_schema(
+    write_context: Handle<SharedWriteContext>,
+) -> Handle<SharedSchema> {
+    let write_context = unsafe { write_context.as_ref() };
+    write_context.schema().clone().into()
+}
+
+/// TODO
+///
+/// # Safety
+/// Engine is responsible for providing a valid WriteContext pointer
+#[no_mangle]
+pub unsafe extern "C" fn get_write_path(
+    write_context: Handle<SharedWriteContext>,
+    allocate_fn: AllocateStringFn,
+) -> NullableCvoid {
+    let write_context = unsafe { write_context.as_ref() };
+    let write_path = write_context.target_dir().to_string();
+    allocate_fn(kernel_string_slice!(write_path))
+}
+
+/// TODO
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle. Assumes no concurrent txn usage. Consumes
+/// write_metadata.
+#[no_mangle]
+pub unsafe extern "C" fn add_write_metadata(
+    mut txn: Handle<ExclusiveTransaction>,
+    write_metadata: Handle<ExclusiveEngineData>,
+) {
+    let txn = unsafe { txn.as_mut() };
+    let write_metadata = unsafe { write_metadata.into_inner() };
+    txn.add_write_metadata(write_metadata);
+}
+
+/// TODO
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle. And MUST NOT USE transaction after this
+/// method is called.
+#[no_mangle]
+pub unsafe extern "C" fn commit(
+    txn: Handle<ExclusiveTransaction>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<u64> {
+    let txn = unsafe { txn.into_inner() };
+    let extern_engine = unsafe { engine.as_ref() };
+    let engine = extern_engine.engine();
+    // FIXME for now just erasing the enum
+    match txn.commit(engine.as_ref()) {
+        Ok(CommitResult::Committed(v)) => Ok(v),
+        Ok(CommitResult::Conflict(_, v)) => Err(delta_kernel::Error::Generic(format!(
+            "commit conflict at version {v}"
+        ))),
+        Err(e) => Err(e),
+    }
+    .into_extern_result(&extern_engine)
 }
 
 // A set that can identify its contents by address
