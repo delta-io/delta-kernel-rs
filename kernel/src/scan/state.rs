@@ -5,6 +5,7 @@ use std::sync::LazyLock;
 
 use crate::actions::deletion_vector::deletion_treemap_to_bools;
 use crate::scan::get_transform_for_row;
+use crate::schema::Schema;
 use crate::utils::require;
 use crate::ExpressionRef;
 use crate::{
@@ -97,6 +98,29 @@ impl DvInfo {
                 dv.row_indexes(fs_client, table_root)
             })
             .transpose()
+    }
+}
+
+/// utility function for applying a transform expression to convert data from physical to logical
+/// format
+pub fn transform_to_logical(
+    engine: &dyn Engine,
+    physical_data: Box<dyn EngineData>,
+    physical_schema: &SchemaRef,
+    logical_schema: &Schema,
+    transform: &Option<ExpressionRef>,
+) -> DeltaResult<Box<dyn EngineData>> {
+    if let Some(ref transform) = transform {
+        engine
+            .get_expression_handler()
+            .get_evaluator(
+                physical_schema.clone(),
+                transform.as_ref().clone(), // TODO: Maybe eval should take a ref
+                logical_schema.clone().into(),
+            )
+            .evaluate(physical_data.as_ref())
+    } else {
+        Ok(physical_data)
     }
 }
 
