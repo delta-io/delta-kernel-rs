@@ -375,7 +375,7 @@ pub struct Add {
     /// in the added file must be contained in one or more remove actions in the same version.
     pub data_change: bool,
 
-    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this logical file.
+    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this logical file encoded as a JSON string.
     ///
     /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
@@ -442,7 +442,7 @@ struct Remove {
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) size: Option<i64>,
 
-    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this logical file.
+    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this logical file encoded as a JSON string.
     ///
     /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
@@ -639,11 +639,11 @@ mod tests {
                 StructField::new("extendedFileMetadata", DataType::BOOLEAN, true),
                 partition_values_field(),
                 StructField::new("size", DataType::LONG, true),
+                StructField::new("stats", DataType::STRING, true),
                 tags_field(),
                 deletion_vector_field(),
                 StructField::new("baseRowId", DataType::LONG, true),
                 StructField::new("defaultRowCommitVersion", DataType::LONG, true),
-                StructField::new("stats", DataType::STRING, true),
             ]),
             true,
         )]));
