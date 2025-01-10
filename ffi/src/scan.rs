@@ -7,7 +7,7 @@ use delta_kernel::scan::state::{visit_scan_files, DvInfo, GlobalScanState};
 use delta_kernel::scan::{Scan, ScanData};
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::{DeltaResult, Error, Expression, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -15,6 +15,7 @@ use url::Url;
 use crate::expressions::engine::{
     unwrap_kernel_expression, EnginePredicate, KernelExpressionVisitorState,
 };
+use crate::expressions::SharedExpression;
 use crate::{
     kernel_string_slice, AllocateStringFn, ExclusiveEngineData, ExternEngine, ExternResult,
     IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice, NullableCvoid,
@@ -99,12 +100,26 @@ pub unsafe extern "C" fn get_global_read_schema(
     state.physical_schema.clone().into()
 }
 
-/// Free a global read schema
+/// Get the kernel view of the physical read schema that an engine should read from parquet file in
+/// a scan
+///
+/// # Safety
+/// Engine is responsible for providing a valid GlobalScanState pointer
+#[no_mangle]
+pub unsafe extern "C" fn get_global_logical_schema(
+    state: Handle<SharedGlobalScanState>,
+) -> Handle<SharedSchema> {
+    let state = unsafe { state.as_ref() };
+    state.logical_schema.clone().into()
+}
+
+
+/// Free a schema
 ///
 /// # Safety
 /// Engine is responsible for providing a valid schema obtained via [`get_global_read_schema`]
 #[no_mangle]
-pub unsafe extern "C" fn free_global_read_schema(schema: Handle<SharedSchema>) {
+pub unsafe extern "C" fn free_schema(schema: Handle<SharedSchema>) {
     schema.drop_handle();
 }
 
@@ -211,6 +226,7 @@ pub unsafe extern "C" fn kernel_scan_data_next(
         engine_context: NullableCvoid,
         engine_data: Handle<ExclusiveEngineData>,
         selection_vector: KernelBoolSlice,
+        transforms: &CTransformMap,
     ),
 ) -> ExternResult<bool> {
     let data = unsafe { data.as_ref() };
@@ -224,15 +240,17 @@ fn kernel_scan_data_next_impl(
         engine_context: NullableCvoid,
         engine_data: Handle<ExclusiveEngineData>,
         selection_vector: KernelBoolSlice,
+        transforms: &CTransformMap,
     ),
 ) -> DeltaResult<bool> {
     let mut data = data
         .data
         .lock()
         .map_err(|_| Error::generic("poisoned mutex"))?;
-    if let Some((data, sel_vec)) = data.next().transpose()? {
+    if let Some((data, sel_vec, transforms)) = data.next().transpose()? {
         let bool_slice = KernelBoolSlice::from(sel_vec);
-        (engine_visitor)(engine_context, data.into(), bool_slice);
+        let transform_map = CTransformMap { transforms };
+        (engine_visitor)(engine_context, data.into(), bool_slice, &transform_map);
         Ok(true)
     } else {
         Ok(false)
@@ -266,6 +284,7 @@ type CScanCallback = extern "C" fn(
     size: i64,
     stats: Option<&Stats>,
     dv_info: &DvInfo,
+    transform: Option<&Expression>,
     partition_map: &CStringMap,
 );
 
@@ -281,7 +300,7 @@ pub struct CStringMap {
 /// # Safety
 ///
 /// The engine is responsible for providing a valid [`CStringMap`] pointer and [`KernelStringSlice`]
-pub unsafe extern "C" fn get_from_map(
+pub unsafe extern "C" fn get_from_string_map(
     map: &CStringMap,
     key: KernelStringSlice,
     allocate_fn: AllocateStringFn,
@@ -291,6 +310,30 @@ pub unsafe extern "C" fn get_from_map(
     map.values
         .get(string_key.unwrap())
         .and_then(|v| allocate_fn(kernel_string_slice!(v)))
+}
+
+pub struct CTransformMap {
+    transforms: HashMap<usize, ExpressionRef>,
+}
+
+
+#[no_mangle]
+/// allow probing into a CTransformMap. If the specified row id is in the map, kernel will return a
+/// handle to the transform expression for that row. If the row id is not in the map, this will
+/// return NULL
+///
+/// # Safety
+///
+/// The engine is responsible for providing a valid [`CTransformMap`] pointer
+pub unsafe extern "C" fn get_from_transform_map(
+    transform_map: &CTransformMap,
+    row: usize,
+) -> Handle<SharedExpression> {
+    if let Some(transform) = transform_map.transforms.get(&row).cloned() {
+        transform.into()
+    } else {
+        panic!("Hrmm");
+    }
 }
 
 /// Get a selection vector out of a [`DvInfo`] struct
@@ -355,8 +398,10 @@ fn rust_callback(
     size: i64,
     kernel_stats: Option<delta_kernel::scan::state::Stats>,
     dv_info: DvInfo,
+    transform: Option<ExpressionRef>,
     partition_values: HashMap<String, String>,
 ) {
+    let transform = transform.map(|e| e.as_ref().clone());
     let partition_map = CStringMap {
         values: partition_values,
     };
@@ -369,6 +414,7 @@ fn rust_callback(
         size,
         stats.as_ref(),
         &dv_info,
+        transform.as_ref(),
         &partition_map,
     );
 }
@@ -388,6 +434,7 @@ struct ContextWrapper {
 pub unsafe extern "C" fn visit_scan_data(
     data: Handle<ExclusiveEngineData>,
     selection_vec: KernelBoolSlice,
+    transforms: &CTransformMap,
     engine_context: NullableCvoid,
     callback: CScanCallback,
 ) {
@@ -398,5 +445,12 @@ pub unsafe extern "C" fn visit_scan_data(
         callback,
     };
     // TODO: return ExternResult to caller instead of panicking?
-    visit_scan_files(data, selection_vec, context_wrapper, rust_callback).unwrap();
+    visit_scan_files(
+        data,
+        selection_vec,
+        &transforms.transforms,
+        context_wrapper,
+        rust_callback,
+    )
+    .unwrap();
 }

@@ -320,7 +320,24 @@ pub enum ColumnType {
     Partition(usize),
 }
 
-pub type ScanData = (Box<dyn EngineData>, Vec<bool>);
+/// A transform is ultimately a `Struct` expr. This holds the set of expressions that make that struct expr up
+type Transform = Vec<TransformExpr>;
+
+/// Transforms aren't computed all at once. So static ones can just go straight to `Expression`, but
+/// things like partition columns need to filled in. This enum holds an expression that's part of a
+/// `Transform`.
+pub(crate) enum TransformExpr {
+    Static(Expression),
+    Partition(usize),
+}
+
+// TODO(nick): Make this a struct in a follow-on PR
+// (data, deletion_vec, transforms)
+pub type ScanData = (
+    Box<dyn EngineData>,
+    Vec<bool>,
+    HashMap<usize, ExpressionRef>,
+);
 
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
@@ -359,6 +376,21 @@ impl Scan {
         }
     }
 
+    /// Convert the parts of the transform that can be computed statically into `Expression`s. For
+    /// parts that cannot be computed statically, include enough metadata so lower levels of
+    /// processing can create and fill in an expression.
+    fn get_static_transform(all_fields: &[ColumnType]) -> Transform {
+        all_fields
+            .iter()
+            .map(|field| match field {
+                ColumnType::Selected(col_name) => {
+                    TransformExpr::Static(ColumnName::new([col_name]).into())
+                }
+                ColumnType::Partition(idx) => TransformExpr::Partition(*idx),
+            })
+            .collect()
+    }
+
     /// Get an iterator of [`EngineData`]s that should be included in scan for a query. This handles
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if
     /// possible). Each item in the returned iterator is a tuple of:
@@ -371,11 +403,26 @@ impl Scan {
     ///   the query. NB: If you are using the default engine and plan to call arrow's
     ///   `filter_record_batch`, you _need_ to extend this vector to the full length of the batch or
     ///   arrow will drop the extra rows.
+    /// - `HashMap<usize, Expression>`: Transformation expressions that need to be applied. For each
+    ///    row at index `i` in the above data, if an expression exists in this map for key `i`, the
+    ///    associated expression _must_ be applied to the data read from the file specified by the
+    ///    row. The resultant schema for this expression is guaranteed to be `Scan.schema()`. If
+    ///    there is no entry for a row `i` in this map, no expression need be applied and the data
+    ///    read from disk is already in the correct logical state.
     pub fn scan_data(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanData>>> {
-        // NOTE: This is a cheap arc clone
+        // Compute the static part of the transformation. This is `None` if no transformation is
+        // needed (currently just means no partition cols, but will be extended for other transforms
+        // as we support them)
+        let static_transform = if self.have_partition_cols
+            || self.snapshot.column_mapping_mode != ColumnMappingMode::None
+        {
+            Some(Arc::new(Scan::get_static_transform(&self.all_fields)))
+        } else {
+            None
+        };
         let physical_predicate = match self.physical_predicate.clone() {
             PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),
             PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
@@ -384,6 +431,8 @@ impl Scan {
         let it = scan_action_iter(
             engine,
             self.replay_for_scan_data(engine)?,
+            self.logical_schema.clone(),
+            static_transform,
             physical_predicate,
         );
         Ok(Some(it).into_iter().flatten())
@@ -432,7 +481,7 @@ impl Scan {
             path: String,
             size: i64,
             dv_info: DvInfo,
-            partition_values: HashMap<String, String>,
+            transform: Option<ExpressionRef>,
         }
         fn scan_data_callback(
             batches: &mut Vec<ScanFile>,
@@ -440,13 +489,14 @@ impl Scan {
             size: i64,
             _: Option<Stats>,
             dv_info: DvInfo,
-            partition_values: HashMap<String, String>,
+            transform: Option<ExpressionRef>,
+            _: HashMap<String, String>,
         ) {
             batches.push(ScanFile {
                 path: path.to_string(),
                 size,
                 dv_info,
-                partition_values,
+                transform,
             });
         }
 
@@ -458,15 +508,19 @@ impl Scan {
         let global_state = Arc::new(self.global_scan_state());
         let table_root = self.snapshot.table_root.clone();
         let physical_predicate = self.physical_predicate();
-        let all_fields = self.all_fields.clone();
-        let have_partition_cols = self.have_partition_cols;
 
         let scan_data = self.scan_data(engine.as_ref())?;
         let scan_files_iter = scan_data
             .map(|res| {
-                let (data, vec) = res?;
+                let (data, vec, transforms) = res?;
                 let scan_files = vec![];
-                state::visit_scan_files(data.as_ref(), &vec, scan_files, scan_data_callback)
+                state::visit_scan_files(
+                    data.as_ref(),
+                    &vec,
+                    &transforms,
+                    scan_files,
+                    scan_data_callback,
+                )
             })
             // Iterator<DeltaResult<Vec<ScanFile>>> to Iterator<DeltaResult<ScanFile>>
             .flatten_ok();
@@ -497,18 +551,21 @@ impl Scan {
                 // Arc clones
                 let engine = engine.clone();
                 let global_state = global_state.clone();
-                let all_fields = all_fields.clone();
                 Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
                     let read_result = read_result?;
                     // to transform the physical data into the correct logical form
-                    let logical = transform_to_logical_internal(
-                        engine.as_ref(),
-                        read_result,
-                        &global_state,
-                        &scan_file.partition_values,
-                        &all_fields,
-                        have_partition_cols,
-                    );
+                    let logical = if let Some(ref transform) = scan_file.transform {
+                        engine
+                            .get_expression_handler()
+                            .get_evaluator(
+                                global_state.physical_schema.clone(),
+                                transform.as_ref().clone(), // TODO: Maybe eval should take a ref
+                                global_state.logical_schema.clone().into(),
+                            )
+                            .evaluate(read_result.as_ref())
+                    } else {
+                        Ok(read_result)
+                    };
                     let len = logical.as_ref().map_or(0, |res| res.len());
                     // need to split the dv_mask. what's left in dv_mask covers this result, and rest
                     // will cover the following results. we `take()` out of `selection_vector` to avoid
@@ -625,73 +682,6 @@ pub fn selection_vector(
     Ok(deletion_treemap_to_bools(dv_treemap))
 }
 
-/// Transform the raw data read from parquet into the correct logical form, based on the provided
-/// global scan state and partition values
-pub fn transform_to_logical(
-    engine: &dyn Engine,
-    data: Box<dyn EngineData>,
-    global_state: &GlobalScanState,
-    partition_values: &HashMap<String, String>,
-) -> DeltaResult<Box<dyn EngineData>> {
-    let state_info = get_state_info(
-        &global_state.logical_schema,
-        &global_state.partition_columns,
-    )?;
-    transform_to_logical_internal(
-        engine,
-        data,
-        global_state,
-        partition_values,
-        &state_info.all_fields,
-        state_info.have_partition_cols,
-    )
-}
-
-// We have this function because `execute` can save `all_fields` and `have_partition_cols` in the
-// scan, and then reuse them for each batch transform
-fn transform_to_logical_internal(
-    engine: &dyn Engine,
-    data: Box<dyn EngineData>,
-    global_state: &GlobalScanState,
-    partition_values: &std::collections::HashMap<String, String>,
-    all_fields: &[ColumnType],
-    have_partition_cols: bool,
-) -> DeltaResult<Box<dyn EngineData>> {
-    let physical_schema = global_state.physical_schema.clone();
-    if !have_partition_cols && global_state.column_mapping_mode == ColumnMappingMode::None {
-        return Ok(data);
-    }
-    // need to add back partition cols and/or fix-up mapped columns
-    let all_fields = all_fields
-        .iter()
-        .map(|field| match field {
-            ColumnType::Partition(field_idx) => {
-                let field = global_state.logical_schema.fields.get_index(*field_idx);
-                let Some((_, field)) = field else {
-                    return Err(Error::generic(
-                        "logical schema did not contain expected field, can't transform data",
-                    ));
-                };
-                let name = field.physical_name();
-                let value_expression =
-                    parse_partition_value(partition_values.get(name), field.data_type())?;
-                Ok(value_expression.into())
-            }
-            ColumnType::Selected(field_name) => Ok(ColumnName::new([field_name]).into()),
-        })
-        .try_collect()?;
-    let read_expression = Expression::Struct(all_fields);
-    let result = engine
-        .get_expression_handler()
-        .get_evaluator(
-            physical_schema,
-            read_expression,
-            global_state.logical_schema.clone().into(),
-        )
-        .evaluate(data.as_ref())?;
-    Ok(result)
-}
-
 // some utils that are used in file_stream.rs and state.rs tests
 #[cfg(test)]
 pub(crate) mod test_utils {
@@ -707,10 +697,11 @@ pub(crate) mod test_utils {
             sync::{json::SyncJsonHandler, SyncEngine},
         },
         scan::log_replay::scan_action_iter,
+        schema::SchemaRef,
         EngineData, JsonHandler,
     };
 
-    use super::state::ScanCallback;
+    use super::{state::ScanCallback, Transform};
 
     // TODO(nick): Merge all copies of this into one "test utils" thing
     fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
@@ -753,25 +744,50 @@ pub(crate) mod test_utils {
         ArrowEngineData::try_from_engine_data(parsed).unwrap()
     }
 
+    // add batch with a `date` partition col
+    pub(crate) fn add_batch_with_partition_col() -> Box<ArrowEngineData> {
+        let handler = SyncJsonHandler {};
+        let json_strings: StringArray = vec![
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","partitionValues": {"date": "2017-12-11"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["date"],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
+        ]
+        .into();
+        let output_schema = get_log_schema().clone();
+        let parsed = handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        ArrowEngineData::try_from_engine_data(parsed).unwrap()
+    }
+
+    /// Create a scan action iter and validate what's called back. If you pass `None` as
+    /// `logical_schema`, `transform` should also be `None`
     #[allow(clippy::vec_box)]
     pub(crate) fn run_with_validate_callback<T: Clone>(
         batch: Vec<Box<ArrowEngineData>>,
+        logical_schema: Option<SchemaRef>,
+        transform: Option<Arc<Transform>>,
         expected_sel_vec: &[bool],
         context: T,
         validate_callback: ScanCallback<T>,
     ) {
+        let logical_schema =
+            logical_schema.unwrap_or_else(|| Arc::new(crate::schema::StructType::new(vec![])));
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch.into_iter().map(|batch| Ok((batch as _, true))),
+            logical_schema,
+            transform,
             None,
         );
         let mut batch_count = 0;
         for res in iter {
-            let (batch, sel) = res.unwrap();
+            let (batch, sel, transforms) = res.unwrap();
             assert_eq!(sel, expected_sel_vec);
             crate::scan::state::visit_scan_files(
                 batch.as_ref(),
                 &sel,
+                &transforms,
                 context.clone(),
                 validate_callback,
             )
@@ -975,6 +991,7 @@ mod tests {
             _size: i64,
             _: Option<Stats>,
             dv_info: DvInfo,
+            _transform: Option<ExpressionRef>,
             _partition_values: HashMap<String, String>,
         ) {
             paths.push(path.to_string());
@@ -982,8 +999,14 @@ mod tests {
         }
         let mut files = vec![];
         for data in scan_data {
-            let (data, vec) = data?;
-            files = state::visit_scan_files(data.as_ref(), &vec, files, scan_data_callback)?;
+            let (data, vec, transforms) = data?;
+            files = state::visit_scan_files(
+                data.as_ref(),
+                &vec,
+                &transforms,
+                files,
+                scan_data_callback,
+            )?;
         }
         Ok(files)
     }

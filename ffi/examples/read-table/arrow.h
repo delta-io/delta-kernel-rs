@@ -15,13 +15,15 @@ typedef struct ArrowContext
   gsize num_batches;
   GList* batches;
   GArrowBooleanArray* cur_filter;
+  const Expression* cur_transform;
 } ArrowContext;
 
 ArrowContext* init_arrow_context(void);
 void c_read_parquet_file(
   struct EngineContext* context,
   const KernelStringSlice path,
-  const KernelBoolSlice selection_vector);
+  const KernelBoolSlice selection_vector,
+  const Expression* transform);
 void print_arrow_context(ArrowContext* context);
 void free_arrow_context(ArrowContext* context);
 

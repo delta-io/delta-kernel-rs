@@ -14,6 +14,7 @@ typedef struct PartitionList
 struct EngineContext
 {
   SharedGlobalScanState* global_state;
+  SharedSchema* logical_schema;
   SharedSchema* read_schema;
   char* table_root;
   SharedExternEngine* engine;

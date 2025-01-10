@@ -330,7 +330,7 @@ pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
 /// an opaque struct that encapsulates data read by an engine. this handle can be passed back into
 /// some kernel calls to operate on the data, or can be converted into the raw data as read by the
 /// [`delta_kernel::Engine`] by calling [`get_raw_engine_data`]
-#[handle_descriptor(target=dyn EngineData, mutable=true, sized=false)]
+#[handle_descriptor(target=dyn EngineData, mutable=true)]
 pub struct ExclusiveEngineData;
 
 /// Drop an `ExclusiveEngineData`.
@@ -767,7 +767,7 @@ mod tests {
         }
     }
 
-    fn get_default_engine() -> Handle<SharedExternEngine> {
+    pub(crate) fn get_default_engine() -> Handle<SharedExternEngine> {
         let path = "memory:///doesntmatter/foo";
         let path = kernel_string_slice!(path);
         let builder = unsafe { ok_or_panic(get_engine_builder(path, allocate_err)) };

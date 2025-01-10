@@ -11,6 +11,7 @@ ArrowContext* init_arrow_context()
   context->num_batches = 0;
   context->batches = NULL;
   context->cur_filter = NULL;
+  context->cur_transform = NULL;
   return context;
 }
 
@@ -50,86 +51,10 @@ static GArrowRecordBatch* get_record_batch(FFI_ArrowArray* array, GArrowSchema* 
   return record_batch;
 }
 
-// Add columns to a record batch for each partition. In a "real" engine we would want to parse the
-// string values into the correct data type. This program just adds all partition columns as strings
-// for simplicity
-static GArrowRecordBatch* add_partition_columns(
-  GArrowRecordBatch* record_batch,
-  PartitionList* partition_cols,
-  const CStringMap* partition_values)
-{
-  gint64 rows = garrow_record_batch_get_n_rows(record_batch);
-  gint64 cols = garrow_record_batch_get_n_columns(record_batch);
-  GArrowRecordBatch* cur_record_batch = record_batch;
-  GError* error = NULL;
-  for (uintptr_t i = 0; i < partition_cols->len; i++) {
-    char* col = partition_cols->cols[i];
-    guint pos = cols + i;
-    KernelStringSlice key = { col, strlen(col) };
-    char* partition_val = get_from_map(partition_values, key, allocate_string);
-    print_diag(
-      "  Adding partition column '%s' with value '%s' at column %u\n",
-      col,
-      partition_val ? partition_val : "NULL",
-      pos);
-    GArrowStringArrayBuilder* builder = garrow_string_array_builder_new();
-    for (gint64 i = 0; i < rows; i++) {
-      if (partition_val) {
-        garrow_string_array_builder_append_string(builder, partition_val, &error);
-      } else {
-        garrow_array_builder_append_null((GArrowArrayBuilder*)builder, &error);
-      }
-      if (report_g_error("Can't append to partition column builder", error)) {
-        break;
-      }
-    }
-
-    if (partition_val) {
-      free(partition_val);
-    }
-
-    if (error != NULL) {
-      printf("Giving up on column %s\n", col);
-      g_error_free(error);
-      g_object_unref(builder);
-      error = NULL;
-      continue;
-    }
-
-    GArrowArray* partition_col = garrow_array_builder_finish((GArrowArrayBuilder*)builder, &error);
-    if (report_g_error("Can't build string array for parition column", error)) {
-      printf("Giving up on column %s\n", col);
-      g_error_free(error);
-      g_object_unref(builder);
-      error = NULL;
-      continue;
-    }
-    g_object_unref(builder);
-
-    GArrowDataType* string_data_type = (GArrowDataType*)garrow_string_data_type_new();
-    GArrowField* field = garrow_field_new(col, string_data_type);
-    GArrowRecordBatch* old_batch = cur_record_batch;
-    cur_record_batch = garrow_record_batch_add_column(old_batch, pos, field, partition_col, &error);
-    g_object_unref(old_batch);
-    g_object_unref(partition_col);
-    g_object_unref(string_data_type);
-    g_object_unref(field);
-    if (cur_record_batch == NULL) {
-      if (error != NULL) {
-        printf("Could not add column at %u: %s\n", pos, error->message);
-        g_error_free(error);
-      }
-    }
-  }
-  return cur_record_batch;
-}
-
 // append a batch to our context
 static void add_batch_to_context(
   ArrowContext* context,
-  ArrowFFIData* arrow_data,
-  PartitionList* partition_cols,
-  const CStringMap* partition_values)
+  ArrowFFIData* arrow_data)
 {
   GArrowSchema* schema = get_schema(&arrow_data->schema);
   GArrowRecordBatch* record_batch = get_record_batch(&arrow_data->array, schema);
@@ -141,11 +66,6 @@ static void add_batch_to_context(
     g_object_unref(unfiltered);
     g_object_unref(context->cur_filter);
     context->cur_filter = NULL;
-  }
-  record_batch = add_partition_columns(record_batch, partition_cols, partition_values);
-  if (record_batch == NULL) {
-    printf("Failed to add parition columns, not adding batch\n");
-    return;
   }
   context->batches = g_list_append(context->batches, record_batch);
   context->num_batches++;
@@ -187,20 +107,47 @@ static GArrowBooleanArray* slice_to_arrow_bool_array(const KernelBoolSlice slice
   return (GArrowBooleanArray*)ret;
 }
 
+static ExclusiveEngineData* apply_transform(
+  struct EngineContext* context,
+  ExclusiveEngineData* data) {
+  print_diag("  Applying transform\n");
+  SharedExpressionEvaluator* evaluator = get_evaluator(
+    context->engine,
+    context->read_schema, // input schema
+    context->arrow_context->cur_transform,
+    context->logical_schema); // output schema
+  ExternResultHandleExclusiveEngineData transformed_res = evaluate(
+    context->engine,
+    &data,
+    evaluator);
+  if (transformed_res.tag != OkHandleExclusiveEngineData) {
+    print_error("Failed to transform read data.", (Error*)transformed_res.err);
+    free_error((Error*)transformed_res.err);
+    return NULL;
+  }
+  free_engine_data(data);
+  free_evaluator(evaluator);
+  return transformed_res.ok;
+}
+
 // This is the callback that will be called for each chunk of data read from the parquet file
 static void visit_read_data(void* vcontext, ExclusiveEngineData* data)
 {
   print_diag("  Converting read data to arrow\n");
   struct EngineContext* context = vcontext;
-  ExternResultArrowFFIData arrow_res = get_raw_arrow_data(data, context->engine);
+  ExclusiveEngineData* transformed = apply_transform(context, data);
+  if (!transformed) {
+    // TODO: What?
+    exit(-1);
+  }
+  ExternResultArrowFFIData arrow_res = get_raw_arrow_data(transformed, context->engine);
   if (arrow_res.tag != OkArrowFFIData) {
     print_error("Failed to get arrow data.", (Error*)arrow_res.err);
     free_error((Error*)arrow_res.err);
     exit(-1);
   }
   ArrowFFIData* arrow_data = arrow_res.ok;
-  add_batch_to_context(
-    context->arrow_context, arrow_data, context->partition_cols, context->partition_values);
+  add_batch_to_context(context->arrow_context, arrow_data);
   free(arrow_data); // just frees the struct, the data and schema are freed/owned by add_batch_to_context
 }
 
@@ -208,7 +155,8 @@ static void visit_read_data(void* vcontext, ExclusiveEngineData* data)
 void c_read_parquet_file(
   struct EngineContext* context,
   const KernelStringSlice path,
-  const KernelBoolSlice selection_vector)
+  const KernelBoolSlice selection_vector,
+  const Expression* transform)
 {
   int full_len = strlen(context->table_root) + path.len + 1;
   char* full_path = malloc(sizeof(char) * full_len);
@@ -233,6 +181,7 @@ void c_read_parquet_file(
     }
     context->arrow_context->cur_filter = sel_array;
   }
+  context->arrow_context->cur_transform = transform;
   ExclusiveFileReadResultIterator* read_iter = read_res.ok;
   for (;;) {
     ExternResultbool ok_res = read_result_next(read_iter, context, visit_read_data);

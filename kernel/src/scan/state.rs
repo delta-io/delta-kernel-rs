@@ -5,6 +5,7 @@ use std::sync::LazyLock;
 
 use crate::actions::deletion_vector::deletion_treemap_to_bools;
 use crate::utils::require;
+use crate::ExpressionRef;
 use crate::{
     actions::{deletion_vector::DeletionVectorDescriptor, visitors::visit_deletion_vector_at},
     engine_data::{GetData, RowVisitor, TypedGetData as _},
@@ -104,6 +105,7 @@ pub type ScanCallback<T> = fn(
     size: i64,
     stats: Option<Stats>,
     dv_info: DvInfo,
+    transform: Option<ExpressionRef>,
     partition_values: HashMap<String, String>,
 );
 
@@ -138,12 +140,14 @@ pub type ScanCallback<T> = fn(
 pub fn visit_scan_files<T>(
     data: &dyn EngineData,
     selection_vector: &[bool],
+    transforms: &HashMap<usize, ExpressionRef>,
     context: T,
     callback: ScanCallback<T>,
 ) -> DeltaResult<T> {
     let mut visitor = ScanFileVisitor {
         callback,
         selection_vector,
+        transforms,
         context,
     };
     visitor.visit_rows_of(data)?;
@@ -154,6 +158,7 @@ pub fn visit_scan_files<T>(
 struct ScanFileVisitor<'a, T> {
     callback: ScanCallback<T>,
     selection_vector: &'a [bool],
+    transforms: &'a HashMap<usize, ExpressionRef>,
     context: T,
 }
 impl<T> RowVisitor for ScanFileVisitor<'_, T> {
@@ -201,6 +206,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                     size,
                     stats,
                     dv_info,
+                    self.transforms.get(&row_index).cloned(), // cheap Arc clone
                     partition_values,
                 )
             }
@@ -213,7 +219,10 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
+    use crate::{
+        scan::test_utils::{add_batch_simple, run_with_validate_callback},
+        ExpressionRef,
+    };
 
     use super::{DvInfo, Stats};
 
@@ -228,6 +237,7 @@ mod tests {
         size: i64,
         stats: Option<Stats>,
         dv_info: DvInfo,
+        transform: Option<ExpressionRef>,
         part_vals: HashMap<String, String>,
     ) {
         assert_eq!(
@@ -242,6 +252,7 @@ mod tests {
         assert!(dv_info.deletion_vector.is_some());
         let dv = dv_info.deletion_vector.unwrap();
         assert_eq!(dv.unique_id(), "uvBn[lx{q8@P<9BNH/isA@1");
+        assert!(transform.is_none());
         assert_eq!(context.id, 2);
     }
 
@@ -250,6 +261,8 @@ mod tests {
         let context = TestContext { id: 2 };
         run_with_validate_callback(
             vec![add_batch_simple()],
+            None, // not testing schema
+            None, // not testing transform
             &[true, false],
             context,
             validate_visit,

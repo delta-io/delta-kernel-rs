@@ -13,9 +13,8 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::sync::SyncEngine;
 use delta_kernel::scan::state::{DvInfo, GlobalScanState, Stats};
-use delta_kernel::scan::transform_to_logical;
 use delta_kernel::schema::Schema;
-use delta_kernel::{DeltaResult, Engine, EngineData, FileMeta, Table};
+use delta_kernel::{DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Table};
 
 use clap::{Parser, ValueEnum};
 use url::Url;
@@ -81,7 +80,7 @@ fn main() -> ExitCode {
 struct ScanFile {
     path: String,
     size: i64,
-    partition_values: HashMap<String, String>,
+    transform: Option<ExpressionRef>,
     dv_info: DvInfo,
 }
 
@@ -111,12 +110,13 @@ fn send_scan_file(
     size: i64,
     _stats: Option<Stats>,
     dv_info: DvInfo,
-    partition_values: HashMap<String, String>,
+    transform: Option<ExpressionRef>,
+    _: HashMap<String, String>,
 ) {
     let scan_file = ScanFile {
         path: path.to_string(),
         size,
-        partition_values,
+        transform,
         dv_info,
     };
     scan_tx.send(scan_file).unwrap();
@@ -210,10 +210,11 @@ fn try_main() -> DeltaResult<()> {
     drop(record_batch_tx);
 
     for res in scan_data {
-        let (data, vector) = res?;
+        let (data, vector, transforms) = res?;
         scan_file_tx = delta_kernel::scan::state::visit_scan_files(
             data.as_ref(),
             &vector,
+            &transforms,
             scan_file_tx,
             send_scan_file,
         )?;
@@ -256,7 +257,6 @@ fn do_work(
 ) {
     // get the type for the function calls
     let engine: &dyn Engine = engine.as_ref();
-    let physical_schema = scan_state.physical_schema.clone();
     // in a loop, try and get a ScanFile. Note that `recv` will return an `Err` when the other side
     // hangs up, which indicates there's no more data to process.
     while let Ok(scan_file) = scan_file_rx.recv() {
@@ -287,21 +287,26 @@ fn do_work(
         // vector
         let read_results = engine
             .get_parquet_handler()
-            .read_parquet_files(&[meta], physical_schema.clone(), None)
+            .read_parquet_files(&[meta], scan_state.physical_schema.clone(), None)
             .unwrap();
 
         for read_result in read_results {
             let read_result = read_result.unwrap();
             let len = read_result.len();
-
-            // ask the kernel to transform the physical data into the correct logical form
-            let logical = transform_to_logical(
-                engine,
-                read_result,
-                &scan_state,
-                &scan_file.partition_values,
-            )
-            .unwrap();
+            // to transform the physical data into the correct logical form
+            let logical = if let Some(ref transform) = scan_file.transform {
+                engine
+                    .get_expression_handler()
+                    .get_evaluator(
+                        scan_state.physical_schema.clone(),
+                        transform.as_ref().clone(), // TODO: Maybe eval should take a ref
+                        scan_state.logical_schema.clone().into(),
+                    )
+                    .evaluate(read_result.as_ref())
+                    .unwrap()
+            } else {
+                read_result
+            };
 
             let record_batch = to_arrow(logical).unwrap();
 
