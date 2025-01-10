@@ -22,6 +22,7 @@ pre-release-replacements = [
 ]
 pre-release-hook = ["git", "cliff", "--repository", "../", "--config", "../cliff.toml", "--unreleased", "--prepend", "../CHANGELOG.md", "--tag", "{{version}}" ]
 pre-release-commit-message = "release {{version}}"
+tag-message = "release version {{version}}"
 
 [dependencies]
 bytes = "1.7"

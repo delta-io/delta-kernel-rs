@@ -95,18 +95,18 @@ handle_release_branch() {
     if ! cargo release --workspace "$version" --no-publish --no-push --no-tag --execute; then
         log_error "Failed to update CHANGELOG and README"
     fi
-    log_success "CHANGELOG and README updated"
 
-    # Create and merge PR
+    git diff --stat
+
+    git diff
+
     if confirm "Would you like to open a PR with these changes?"; then
         local current_branch
         current_branch=$(git rev-parse --abbrev-ref HEAD)
 
-        # Push changes
         log_info "Pushing changes to remote..."
         git push origin "$current_branch"
 
-        # Open PR (this uses gh cli if available, otherwise provides instructions)
         if command -v gh >/dev/null 2>&1; then
             gh pr create --title "release $version" --body "release $version"
             log_success "PR created successfully"
