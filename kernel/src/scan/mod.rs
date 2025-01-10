@@ -537,19 +537,14 @@ impl Scan {
                 let global_state = global_state.clone();
                 Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
                     let read_result = read_result?;
-                    // to transform the physical data into the correct logical form
-                    let logical = if let Some(ref transform) = scan_file.transform {
-                        engine
-                            .get_expression_handler()
-                            .get_evaluator(
-                                global_state.physical_schema.clone(),
-                                transform.as_ref().clone(), // TODO: Maybe eval should take a ref
-                                global_state.logical_schema.clone().into(),
-                            )
-                            .evaluate(read_result.as_ref())
-                    } else {
-                        Ok(read_result)
-                    };
+                    // transform the physical data into the correct logical form
+                    let logical = state::transform_to_logical(
+                        engine.as_ref(),
+                        read_result,
+                        &global_state.physical_schema,
+                        &global_state.logical_schema,
+                        &scan_file.transform,
+                    );
                     let len = logical.as_ref().map_or(0, |res| res.len());
                     // need to split the dv_mask. what's left in dv_mask covers this result, and rest
                     // will cover the following results. we `take()` out of `selection_vector` to avoid

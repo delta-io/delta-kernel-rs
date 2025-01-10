@@ -11,7 +11,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{column_expr, BinaryOperator, Expression, ExpressionRef};
-use delta_kernel::scan::state::{visit_scan_files, DvInfo, Stats};
+use delta_kernel::scan::state::{transform_to_logical, visit_scan_files, DvInfo, Stats};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, Schema};
 use delta_kernel::{Engine, FileMeta, Table};
@@ -405,20 +405,14 @@ fn read_with_scan_data(
             let read_result = read_result.unwrap();
             let len = read_result.len();
             // to transform the physical data into the correct logical form
-            let logical = if let Some(ref transform) = scan_file.transform {
-                engine
-                    .get_expression_handler()
-                    .get_evaluator(
-                        global_state.physical_schema.clone(),
-                        transform.as_ref().clone(), // TODO: Maybe eval should take a ref
-                        global_state.logical_schema.clone().into(),
-                    )
-                    .evaluate(read_result.as_ref())
-                    .unwrap()
-            } else {
-                read_result
-            };
-
+            let logical = transform_to_logical(
+                engine,
+                read_result,
+                &global_state.physical_schema,
+                &global_state.logical_schema,
+                &scan_file.transform,
+            )
+            .unwrap();
             let record_batch = to_arrow(logical).unwrap();
             let rest = split_vector(selection_vector.as_mut(), len, Some(true));
             let batch = if let Some(mask) = selection_vector.clone() {
