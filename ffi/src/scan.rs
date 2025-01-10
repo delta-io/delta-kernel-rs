@@ -300,26 +300,6 @@ pub struct CTransforms {
     transforms: Vec<Option<ExpressionRef>>,
 }
 
-// #[no_mangle]
-// /// allow probing into a CStringMap. If the specified key is in the map, kernel will call
-// /// allocate_fn with the value associated with the key and return the value returned from that
-// /// function. If the key is not in the map, this will return NULL
-// ///
-// /// # Safety
-// ///
-// /// The engine is responsible for providing a valid [`CStringMap`] pointer and [`KernelStringSlice`]
-// pub unsafe extern "C" fn get_from_transform_map(
-//     map: &CTransformMap,
-//     key: usize,
-//     allocate_fn: AllocateStringFn,
-// ) -> NullableCvoid {
-//     // TODO: Return ExternResult to caller instead of panicking?
-//     let string_key = unsafe { TryFromStringSlice::try_from_slice(&key) };
-//     map.values
-//         .get(string_key.unwrap())
-//         .and_then(|v| allocate_fn(kernel_string_slice!(v)))
-// }
-
 /// Get a selection vector out of a [`DvInfo`] struct
 ///
 /// # Safety
