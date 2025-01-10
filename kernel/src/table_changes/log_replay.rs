@@ -7,8 +7,8 @@ use std::sync::{Arc, LazyLock};
 use crate::actions::schemas::GetStructField;
 use crate::actions::visitors::{visit_deletion_vector_at, ProtocolVisitor};
 use crate::actions::{
-    get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, METADATA_NAME,
-    PROTOCOL_NAME, REMOVE_NAME,
+    get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, COMMIT_INFO_NAME,
+    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
@@ -282,7 +282,7 @@ impl PreparePhaseVisitor<'_> {
             Option::<Cdc>::get_struct_field(CDC_NAME),
             Option::<Metadata>::get_struct_field(METADATA_NAME),
             Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
-            StructField::new("commitInfo", StructType::new([ict_type]), true),
+            StructField::new(COMMIT_INFO_NAME, StructType::new([ict_type]), true),
         ]))
     }
 }
