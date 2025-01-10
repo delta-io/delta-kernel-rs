@@ -27,7 +27,7 @@ pub enum Error {
     },
 
     /// An error performing operations on arrow data
-    #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+    #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
     #[error(transparent)]
     Arrow(arrow_schema::ArrowError),
 
@@ -75,7 +75,7 @@ pub enum Error {
     #[error("Object store path error: {0}")]
     ObjectStorePath(#[from] object_store::path::Error),
 
-    #[cfg(feature = "default-engine")]
+    #[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
     #[error("Reqwest Error: {0}")]
     Reqwest(#[from] reqwest::Error),
 
@@ -303,7 +303,7 @@ from_with_backtrace!(
     (std::io::Error, IOError)
 );
 
-#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
 impl From<arrow_schema::ArrowError> for Error {
     fn from(value: arrow_schema::ArrowError) -> Self {
         Self::Arrow(value).with_backtrace()
