@@ -393,12 +393,12 @@ fn test_eval_is_null() {
     let expr = Expression::literal(1);
     expect_eq!(
         filter.eval_unary(UnaryOperator::IsNull, &expr, true),
-        None,
+        Some(true),
         "1 IS NOT NULL"
     );
     expect_eq!(
         filter.eval_unary(UnaryOperator::IsNull, &expr, false),
-        None,
+        Some(false),
         "1 IS NULL"
     );
 }

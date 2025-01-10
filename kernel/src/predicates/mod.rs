@@ -210,30 +210,6 @@ pub(crate) trait PredicateEvaluator {
         }
     }
 
-    /// Performs the null-safe binary comparison of `{a} {cmp} {b}` as if it were expanded to:
-    ///
-    /// ```text
-    /// AND({a} IS NOT NULL, {b} IS NOT NULL, {a} {cmp} {b})
-    /// ```
-    ///
-    /// Attempting to NULL-check anything other than a column or literal produces NULL, which causes
-    /// this method to return NULL. Otherwise, if either NULL check fails (producing FALSE), it
-    /// short-circuits the entire AND to FALSE. Otherwise, the result of the original comparison
-    /// determines the outcome and -- if FALSE -- can cause data skipping as usual.
-    fn eval_binary_nullsafe(
-        &self,
-        op: BinaryOperator,
-        left: &Expr,
-        right: &Expr,
-    ) -> Option<Self::Output> {
-        let exprs = [
-            self.eval_unary(UnaryOperator::IsNull, left, true),
-            self.eval_unary(UnaryOperator::IsNull, right, true),
-            self.eval_binary(op, left, right, false),
-        ];
-        self.finish_eval_variadic(VariadicOperator::And, exprs, false)
-    }
-
     /// Dispatches a variadic operation, leveraging each implementation's [`finish_eval_variadic`].
     fn eval_variadic(
         &self,
@@ -281,7 +257,7 @@ pub(crate) trait PredicateEvaluator {
     ///
     /// To prevent wrong data skipping in such cases, the predicate evaluator always returns NULL
     /// for a NULL check over anything except for literals and columns with known values. So we must
-    /// push the NULL check down through supported operations (currently only AND and comparisons)
+    /// push the NULL check down through supported operations (AND plus null-intolerant comparisons)
     /// until it reaches columns and literals where it can do some good, e.g.:
     ///
     /// ```text
@@ -353,9 +329,14 @@ pub(crate) trait PredicateEvaluator {
                 let exprs = exprs.iter().map(|expr| self.eval_sql_where(expr));
                 PredicateEvaluator::finish_eval_variadic(self, VariadicOperator::And, exprs, false)
             }
-            Binary(BinaryExpression { op, left, right }) => {
-                // Invoke the nullsafe comparison instead of the usual `eval_binary`
-                self.eval_binary_nullsafe(*op, left, right)
+            Binary(BinaryExpression { op, left, right }) if op.is_null_intolerant_comparison() => {
+                // Perform a nullsafe comparison instead of the usual `eval_binary`
+                let exprs = [
+                    self.eval_unary(UnaryOperator::IsNull, left, true),
+                    self.eval_unary(UnaryOperator::IsNull, right, true),
+                    self.eval_binary(*op, left, right, false),
+                ];
+                self.finish_eval_variadic(VariadicOperator::And, exprs, false)
             }
             _ => self.eval_expr(filter, false),
         }
