@@ -76,6 +76,15 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         }
         "delta.checkpointPolicy" => props.checkpoint_policy = CheckpointPolicy::try_from(v).ok(),
         "delta.enableRowTracking" => props.enable_row_tracking = Some(parse_bool(v)?),
+        "delta.enableInCommitTimestamps" => {
+            props.enable_in_commit_timestamps = Some(parse_bool(v)?)
+        }
+        "delta.inCommitTimestampEnablementVersion" => {
+            props.in_commit_timestamp_enablement_version = Some(parse_int(v)?)
+        }
+        "delta.inCommitTimestampEnablementTimestamp" => {
+            props.in_commit_timestamp_enablement_timestamp = Some(parse_int(v)?)
+        }
         _ => return None,
     }
     Some(())
