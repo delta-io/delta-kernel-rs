@@ -313,7 +313,12 @@ fn test_sql_where() {
         None,
     );
     do_test(NO_NULL, &Expr::lt(col.clone(), VAL), Some(true), Some(true));
-    do_test(SOME_NULL, &Expr::lt(col.clone(), VAL), Some(true), Some(true));
+    do_test(
+        SOME_NULL,
+        &Expr::lt(col.clone(), VAL),
+        Some(true),
+        Some(true),
+    );
 
     // SQL WHERE allows a present-but-null column to be pruned, but not a missing column.
     do_test(ALL_NULL, &Expr::lt(col.clone(), VAL), None, Some(false));
