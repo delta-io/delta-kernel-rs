@@ -1,8 +1,8 @@
 # Changelog
 
-## [0.6.1](https://github.com/delta-io/delta-kernel-rs/tree/0.6.1/) (2025-01-10)
+## [v0.6.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.6.1/) (2025-01-10)
 
-[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.6.0...0.6.1)
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.6.0...v0.6.1)
 
 
 ### 🚀 Features / new APIs
@@ -17,12 +17,12 @@
 ### ⚙️ Chores/CI
 
 1. Expand the arrow version range to allow arrow v54 ([#616])
+2. Update to CodeCov @v5 ([#608])
 
 ### Other
 
 1. Fix msrv check by pinning `home` dependency ([#605])
-2. Update to CodeCov @v5 ([#608])
-3. Add release script ([#636])
+2. Add release script ([#636])
 
 
 [#605]: https://github.com/delta-io/delta-kernel-rs/pull/605

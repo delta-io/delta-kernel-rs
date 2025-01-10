@@ -2,7 +2,7 @@
 
 ###################################################################################################
 # USAGE:
-# 1. on a release branch: ./release.sh <version>
+# 1. on a release branch: ./release.sh <version> (example: ./release.sh 0.1.0)
 # 2. on main branch (after merging release branch): ./release.sh
 ###################################################################################################
 
@@ -155,6 +155,15 @@ publish() {
     fi
 }
 
+
+validate_version() {
+    local version=$1
+    # Check if version starts with a number
+    if [[ ! $version =~ ^[0-9] ]]; then
+        log_error "Version must start with a number (e.g., '0.1.1'). Got: '$version'"
+    fi
+}
+
 check_requirements
 
 if is_main_branch; then
@@ -166,5 +175,6 @@ else
     if [[ $# -ne 1 ]]; then
         log_error "Version argument required when on release branch\nUsage: $0 <version>"
     fi
+    validate_version "$1"
     handle_release_branch "$1"
 fi
