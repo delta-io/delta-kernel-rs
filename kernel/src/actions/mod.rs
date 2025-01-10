@@ -334,7 +334,9 @@ struct CommitInfo {
     pub(crate) timestamp: Option<i64>,
     /// The time this logical file was created, as milliseconds since the epoch. Unlike
     /// `timestamp`, this field is guaranteed to be monotonically increase with each commit.
-    /// If in-commit timestamps are enabled, this is always required.
+    /// Note: If in-commit timestamps are enabled, both the following must be true:
+    /// - The `inCommitTimestamp` field must always be present in CommitInfo.
+    /// - The CommitInfo action must always be the first one in a commit.
     pub(crate) in_commit_timestamp: Option<i64>,
     /// An arbitrary string that identifies the operation associated with this commit. This is
     /// specified by the engine. Read: optional, write: required (that is, kernel alwarys writes).
