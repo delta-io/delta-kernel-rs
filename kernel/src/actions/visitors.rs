@@ -289,11 +289,11 @@ impl RemoveVisitor {
             extended_file_metadata,
             partition_values,
             size,
+            stats,
             tags: None,
             deletion_vector,
             base_row_id,
             default_row_commit_version,
-            stats,
         })
     }
     pub(crate) fn names_and_types() -> (&'static [ColumnName], &'static [DataType]) {
@@ -636,16 +636,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_remove_partitioned() {
+    fn test_parse_remove() {
         let engine = SyncEngine::new();
         let json_handler = engine.get_json_handler();
         let json_strings: StringArray = vec![
-            r#"{"commitInfo":{"timestamp":1670892998177,"operation":"DELETE","operationParameters":{"mode":"Append","partitionBy":"[\"c1\",\"c2\"]"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"3","numOutputRows":"3","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,
-            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
-            r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
-            r#"{"remove":{"path":"c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet","deletionTimestamp":1670892998135,"dataChange":true,"partitionValues":{"c1":"4","c2":"c"},"size":452,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":5},\"maxValues\":{\"c3\":5},\"nullCount\":{\"c3\":0}}"}}"#,
-            r#"{"remove":{"path":"c1=5/c2=b/part-00007-4e73fa3b-2c88-424a-8051-f8b54328ffdb.c000.snappy.parquet","deletionTimestamp":1670892998136,"dataChange":true,"partitionValues":{"c1":"5","c2":"b"},"size":452,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":6},\"maxValues\":{\"c3\":6},\"nullCount\":{\"c3\":0}}"}}"#,
-            r#"{"remove":{"path":"c1=6/c2=a/part-00011-10619b10-b691-4fd0-acc4-2a9608499d7c.c000.snappy.parquet","deletionTimestamp":1670892998137,"dataChange":true,"partitionValues":{"c1":"6","c2":"a"},"size":452,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":4},\"maxValues\":{\"c3\":4},\"nullCount\":{\"c3\":0}}"}}"#,
+            r#"{"commitInfo":{"timestamp":1670892998177,"operation":"DELETE","operationParameters":{"mode":"Append"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"1","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,
+            r#"{"remove":{"path":"part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet","deletionTimestamp":1670892998135,"dataChange":true,"size":452,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":5},\"maxValues\":{\"c3\":5},\"nullCount\":{\"c3\":0}}"}}"#,
         ]
         .into();
         let output_schema = get_log_schema().clone();
@@ -654,44 +650,62 @@ mod tests {
             .unwrap();
         let mut remove_visitor = RemoveVisitor::default();
         remove_visitor.visit_rows_of(batch.as_ref()).unwrap();
-        let remove1 = Remove {
-            path: "c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet".into(),
+        let expected_remove: Remove = Remove {
+            path: "part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet".into(),
             deletion_timestamp: Some(1670892998135),
             data_change: true,
-            extended_file_metadata: None,
+            size: Some(452),
+            stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":5},\"maxValues\":{\"c3\":5},\"nullCount\":{\"c3\":0}}".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            remove_visitor.removes.len(),
+            1,
+            "Unexpected number of removal actions"
+        );
+        assert_eq!(
+            remove_visitor.removes[0], expected_remove,
+            "Unexpected removal action"
+        );
+    }
+
+    #[test]
+    fn test_parse_remove_partitioned() {
+        let engine = SyncEngine::new();
+        let json_handler = engine.get_json_handler();
+        let json_strings: StringArray = vec![
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
+            r#"{"remove":{"path":"c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet","deletionTimestamp":1670892998135,"dataChange":true,"partitionValues":{"c1":"4","c2":"c"},"size":452,\"nullCount\":{\"c3\":0}}"}}"#,
+        ]
+        .into();
+        let output_schema = get_log_schema().clone();
+        let batch = json_handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        let mut remove_visitor = RemoveVisitor::default();
+        remove_visitor.visit_rows_of(batch.as_ref()).unwrap();
+        let expected_remove = Remove {
+            path: "c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet"
+                .into(),
+            deletion_timestamp: Some(1670892998135),
+            data_change: true,
             partition_values: Some(HashMap::from([
                 ("c1".to_string(), "4".to_string()),
                 ("c2".to_string(), "c".to_string()),
             ])),
             size: Some(452),
-            stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":5},\"maxValues\":{\"c3\":5},\"nullCount\":{\"c3\":0}}".into()),
             ..Default::default()
         };
-        let remove2 = Remove {
-            path: "c1=5/c2=b/part-00007-4e73fa3b-2c88-424a-8051-f8b54328ffdb.c000.snappy.parquet".into(),
-            deletion_timestamp: Some(1670892998136),
-            partition_values: Some(HashMap::from([
-                ("c1".to_string(), "5".to_string()),
-                ("c2".to_string(), "b".to_string()),
-            ])),
-            stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":6},\"maxValues\":{\"c3\":6},\"nullCount\":{\"c3\":0}}".into()),
-            ..remove1.clone()
-        };
-        let remove3 = Remove {
-            path: "c1=6/c2=a/part-00011-10619b10-b691-4fd0-acc4-2a9608499d7c.c000.snappy.parquet".into(),
-            deletion_timestamp: Some(1670892998137),
-            partition_values: Some(HashMap::from([
-                ("c1".to_string(), "6".to_string()),
-                ("c2".to_string(), "a".to_string()),
-            ])),
-            stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":4},\"maxValues\":{\"c3\":4},\"nullCount\":{\"c3\":0}}".into()),
-            ..remove1.clone()
-        };
-        let expected = vec![remove1, remove2, remove3];
-        assert_eq!(remove_visitor.removes.len(), expected.len());
-        for (remove, expected) in remove_visitor.removes.into_iter().zip(expected.into_iter()) {
-            assert_eq!(remove, expected);
-        }
+        assert_eq!(
+            remove_visitor.removes.len(),
+            1,
+            "Unexpected number of removal actions"
+        );
+        assert_eq!(
+            remove_visitor.removes[0], expected_remove,
+            "Unexpected removal action"
+        );
     }
 
     #[test]
