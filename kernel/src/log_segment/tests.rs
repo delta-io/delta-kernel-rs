@@ -511,3 +511,43 @@ fn table_changes_fails_with_larger_start_version_than_end() {
     let log_segment_res = LogSegment::for_table_changes(client.as_ref(), log_root, 1, Some(0));
     assert!(log_segment_res.is_err());
 }
+
+#[test]
+fn test_list_files_with_unusual_patterns() {
+    // Create paths for all the unusual patterns
+    let paths = vec![
+        // hex instead of decimal
+        Path::from("_delta_log/00000000deadbeef.commit.json"),
+        // bogus part numbering
+        Path::from("_delta_log/00000000000000000000.checkpoint.0000000010.0000000000.parquet"),
+        // v2 checkpoint
+        Path::from(
+            "_delta_log/00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json",
+        ),
+        // compacted log file
+        Path::from("_delta_log/00000000000000000004.00000000000000000006.compacted.json"),
+        // CRC file
+        Path::from("_delta_log/00000000000000000001.crc"),
+        // Valid commit file for comparison
+        Path::from("_delta_log/00000000000000000002.json"),
+    ];
+
+    let (client, log_root) = build_log_with_paths_and_checkpoint(&paths, None);
+
+    // Test that list_log_files doesn't fail
+    let result = super::list_log_files(&*client, &log_root, None, None);
+    assert!(result.is_ok(), "list_log_files should not fail");
+
+    // Collect the results and verify
+    let paths: Vec<_> = result.unwrap().try_collect().unwrap();
+
+    // We should find exactly one file (the valid commit)
+    assert_eq!(paths.len(), 1, "Should find exactly one valid file");
+
+    // Verify that the valid commit file is included
+    let has_valid_commit = paths.iter().any(|p| p.version == 2 && p.is_commit());
+    assert!(has_valid_commit, "Should find the valid commit file");
+
+    // All other files should have been filtered out by ParsedLogPath::try_from
+    // and the filter_map_ok(identity) call
+}
