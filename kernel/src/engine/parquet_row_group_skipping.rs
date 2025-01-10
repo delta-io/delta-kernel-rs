@@ -1,6 +1,5 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer stats.
 use crate::expressions::{ColumnName, Expression, Scalar, UnaryExpression, BinaryExpression, VariadicExpression};
-use crate::predicates::SqlPredicateEvaluator as _;
 use crate::predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::schema::{DataType, PrimitiveType};
 use chrono::{DateTime, Days};
@@ -56,6 +55,7 @@ impl<'a> RowGroupFilter<'a> {
 
     /// Applies a filtering predicate to a row group. Return value false means to skip it.
     fn apply(row_group: &'a RowGroupMetaData, predicate: &Expression) -> bool {
+        use crate::predicates::PredicateEvaluator as _;
         RowGroupFilter::new(row_group, predicate).eval_sql_where(predicate) != Some(false)
     }
 

@@ -8,12 +8,11 @@ use crate::actions::get_log_add_schema;
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
 use crate::expressions::{
-    column_expr, joined_column_expr, BinaryExpression, BinaryOperator, ColumnName,
-    Expression as Expr, ExpressionRef, Scalar, UnaryOperator, VariadicExpression, VariadicOperator,
+    column_expr, joined_column_expr, BinaryOperator, ColumnName, Expression as Expr, ExpressionRef,
+    Scalar, VariadicOperator,
 };
 use crate::predicates::{
     DataSkippingPredicateEvaluator, PredicateEvaluator, PredicateEvaluatorDefaults,
-    SqlPredicateEvaluator,
 };
 use crate::schema::{DataType, PrimitiveType, SchemaRef, SchemaTransform, StructField, StructType};
 use crate::{Engine, EngineData, ExpressionEvaluator, JsonHandler, RowVisitor as _};
@@ -213,6 +212,10 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         Some(Expr::binary(op, col, val.clone()))
     }
 
+    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
+        PredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted).map(Expr::literal)
+    }
+
     fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
         PredicateEvaluatorDefaults::eval_scalar(val, inverted).map(Expr::literal)
     }
@@ -263,34 +266,5 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
             })
             .collect();
         Some(Expr::variadic(op, exprs))
-    }
-}
-
-impl SqlPredicateEvaluator for DataSkippingPredicateCreator {
-    fn eval_sql_where(&self, filter: &Expr) -> Option<Expr> {
-        use Expr::{Binary, Variadic};
-        match filter {
-            Variadic(VariadicExpression {
-                op: VariadicOperator::And,
-                exprs,
-            }) => {
-                let exprs = exprs.iter().map(|expr| self.eval_sql_where(expr));
-                PredicateEvaluator::finish_eval_variadic(self, VariadicOperator::And, exprs, false)
-            }
-            Binary(BinaryExpression { op, left, right }) => {
-                self.eval_binary_nullsafe(*op, left, right)
-            }
-            _ => self.eval_expr(filter, false),
-        }
-    }
-
-    fn eval_binary_nullsafe(&self, op: BinaryOperator, left: &Expr, right: &Expr) -> Option<Expr> {
-        // Convert `a {cmp} b` to `AND(a IS NOT NULL, b IS NOT NULL, a {cmp} b)`.
-        let exprs = [
-            self.eval_unary(UnaryOperator::IsNull, left, true),
-            self.eval_unary(UnaryOperator::IsNull, right, true),
-            self.eval_binary(op, left, right, false),
-        ];
-        PredicateEvaluator::finish_eval_variadic(self, VariadicOperator::And, exprs, false)
     }
 }

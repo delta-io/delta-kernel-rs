@@ -60,6 +60,10 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
         PredicateEvaluatorDefaults::partial_cmp_scalars(ord, &col, val, inverted)
     }
 
+    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<bool> {
+        PredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted)
+    }
+
     fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<bool> {
         PredicateEvaluatorDefaults::eval_scalar(val, inverted)
     }
