@@ -21,7 +21,6 @@
 //! [`Schema`]: crate::schema::Schema
 use std::collections::{HashMap, HashSet};
 
-use crate::schema::{DataType, StructField, StructType};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
@@ -45,9 +44,9 @@ impl NullabilityFlag {
     }
 }
 
-impl StructField {
+impl crate::schema::StructField {
     /// Returns `Ok` if this [`StructField`] can be read as `read_field` in the read schema.
-    fn can_read_as(&self, read_field: &StructField) -> DeltaResult<()> {
+    fn can_read_as(&self, read_field: &Self) -> DeltaResult<()> {
         NullabilityFlag(self.nullable).can_read_as(NullabilityFlag(read_field.nullable))?;
         require!(
             self.name() == read_field.name(),
@@ -61,12 +60,12 @@ impl StructField {
         Ok(())
     }
 }
-impl StructType {
+impl crate::schema::StructType {
     /// Returns `Ok` if this [`StructType`] can be read as `read_type` in the read schema.
     #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    pub(crate) fn can_read_as(&self, read_type: &StructType) -> DeltaResult<()> {
-        let field_map: HashMap<String, &StructField> = self
+    pub(crate) fn can_read_as(&self, read_type: &Self) -> DeltaResult<()> {
+        let field_map: HashMap<String, &crate::schema::StructField> = self
             .fields
             .iter()
             .map(|(name, field)| (name.to_lowercase(), field))
@@ -108,21 +107,21 @@ impl StructType {
     }
 }
 
-impl DataType {
+impl crate::schema::DataType {
     /// Returns `Ok` if this [`DataType`] can be read as `read_type` in the read schema.
-    fn can_read_as(&self, read_type: &DataType) -> DeltaResult<()> {
+    fn can_read_as(&self, read_type: &Self) -> DeltaResult<()> {
         match (self, read_type) {
-            (DataType::Array(self_array), DataType::Array(read_array)) => {
+            (Self::Array(self_array), Self::Array(read_array)) => {
                 NullabilityFlag(self_array.contains_null())
                     .can_read_as(NullabilityFlag(read_array.contains_null()))?;
                 self_array
                     .element_type()
                     .can_read_as(read_array.element_type())?;
             }
-            (DataType::Struct(self_struct), DataType::Struct(read_struct)) => {
+            (Self::Struct(self_struct), Self::Struct(read_struct)) => {
                 self_struct.can_read_as(read_struct)?
             }
-            (DataType::Map(self_map), DataType::Map(read_map)) => {
+            (Self::Map(self_map), Self::Map(read_map)) => {
                 NullabilityFlag(self_map.value_contains_null())
                     .can_read_as(NullabilityFlag(read_map.value_contains_null()))?;
                 self_map.key_type().can_read_as(read_map.key_type())?;
