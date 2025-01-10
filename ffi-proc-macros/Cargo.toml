@@ -10,6 +10,9 @@ readme.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[package.metadata.release]
+release = false
+
 [lib]
 proc-macro = true
 

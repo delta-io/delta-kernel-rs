@@ -8,6 +8,9 @@ repository.workspace = true
 readme.workspace = true
 version.workspace = true
 
+[package.metadata.release]
+release = false
+
 [dependencies]
 delta_kernel = { path = "../kernel" }
 
