@@ -52,7 +52,8 @@ impl BinaryOperator {
         use BinaryOperator::*;
         match self {
             Plus | Minus | Multiply | Divide => false, // not a comparison
-            LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual | Equal | NotEqual => true,
+            LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual => true,
+            Equal | NotEqual => true,
             Distinct | In | NotIn => false, // tolerates NULL input
         }
     }

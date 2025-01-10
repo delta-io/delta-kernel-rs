@@ -591,137 +591,59 @@ fn test_sql_where() {
     // Basic sanity checks
     expect_eq!(null_filter.eval_sql_where(&VAL), None, "WHERE {VAL}");
     expect_eq!(null_filter.eval_sql_where(col), None, "WHERE {col}");
-    expect_eq!(
-        null_filter.eval_sql_where(&Expr::is_null(col.clone())),
-        Some(true), // No injected NULL checks
-        "WHERE {col} IS NULL"
-    );
-    expect_eq!(
-        null_filter.eval_sql_where(&Expr::lt(TRUE, FALSE)),
-        Some(false), // Injected NULL checks don't short circuit when inputs are NOT NULL
-        "WHERE {TRUE} < {FALSE}"
-    );
-    expect_eq!(
-        empty_filter.eval_sql_where(&Expr::lt(TRUE, FALSE)),
-        Some(false), // No column references
-        "WHERE {TRUE} < {FALSE}"
-    );
+
+    // SQL eval does not modify behavior of IS NULL
+    let expr = &Expr::is_null(col.clone());
+    expect_eq!(null_filter.eval_sql_where(expr), Some(true), "{expr}");
+
+    // Injected NULL checks only short circuit if inputs are NULL
+    let expr = &Expr::lt(FALSE, TRUE);
+    expect_eq!(null_filter.eval_sql_where(expr), Some(true), "{expr}");
+    expect_eq!(empty_filter.eval_sql_where(expr), Some(true), "{expr}");
 
     // Constrast normal vs SQL WHERE semantics - comparison
-    expect_eq!(
-        null_filter.eval_expr(&Expr::lt(col.clone(), VAL), false),
-        None,
-        "{col} < {VAL}"
-    );
-    expect_eq!(
-        null_filter.eval_sql_where(&Expr::lt(col.clone(), VAL)),
-        Some(false),
-        "WHERE {col} < {VAL}"
-    );
-    expect_eq!(
-        empty_filter.eval_sql_where(&Expr::lt(col.clone(), VAL)),
-        None, // NULL check produces NULL due to missing column
-        "WHERE {col} < {VAL}"
-    );
+    let expr = &Expr::lt(col.clone(), VAL);
+    expect_eq!(null_filter.eval_expr(expr, false), None, "{expr}");
+    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
+    // NULL check produces NULL due to missing column
+    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
 
-    expect_eq!(
-        null_filter.eval_expr(&Expr::lt(VAL, col.clone()), false),
-        None,
-        "{VAL} < {col}"
-    );
-    expect_eq!(
-        null_filter.eval_sql_where(&Expr::lt(VAL, col.clone())),
-        Some(false),
-        "WHERE {VAL} < {col}"
-    );
-    expect_eq!(
-        empty_filter.eval_sql_where(&Expr::lt(VAL, col.clone())),
-        None,
-        "WHERE {VAL} < {col}"
-    );
+    let expr = &Expr::lt(VAL, col.clone());
+    expect_eq!(null_filter.eval_expr(expr, false), None, "{expr}");
+    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
+    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
+
+    let expr = &Expr::distinct(VAL, col.clone());
+    expect_eq!(null_filter.eval_expr(expr, false), Some(true), "{expr}");
+    expect_eq!(null_filter.eval_sql_where(expr), Some(true), "{expr}");
+    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
+
+    let expr = &Expr::distinct(NULL, col.clone());
+    expect_eq!(null_filter.eval_expr(expr, false), Some(false), "{expr}");
+    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
+    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
 
     // Constrast normal vs SQL WHERE semantics - comparison inside AND
-    expect_eq!(
-        null_filter.eval_expr(&Expr::and(NULL, Expr::lt(col.clone(), VAL)), false),
-        None,
-        "{NULL} AND {col} < {VAL}"
-    );
-    expect_eq!(
-        null_filter.eval_sql_where(&Expr::and(NULL, Expr::lt(col.clone(), VAL),)),
-        Some(false),
-        "WHERE {NULL} AND {col} < {VAL}"
-    );
-    expect_eq!(
-        empty_filter.eval_sql_where(&Expr::and(NULL, Expr::lt(col.clone(), VAL),)),
-        None,
-        "WHERE {NULL} AND {col} < {VAL}"
-    );
+    let expr = &Expr::and(NULL, Expr::lt(col.clone(), VAL));
+    expect_eq!(null_filter.eval_expr(expr, false), None, "{expr}");
+    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
+    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
 
-    expect_eq!(
-        null_filter.eval_expr(&Expr::and(TRUE, Expr::lt(col.clone(), VAL)), false),
-        None, // NULL (from the NULL check) is stronger than TRUE
-        "{TRUE} AND {col} < {VAL}"
-    );
-    expect_eq!(
-        null_filter.eval_sql_where(&Expr::and(TRUE, Expr::lt(col.clone(), VAL),)),
-        Some(false), // FALSE (from the NULL check) is stronger than TRUE
-        "WHERE {TRUE} AND {col} < {VAL}"
-    );
-    expect_eq!(
-        empty_filter.eval_sql_where(&Expr::and(TRUE, Expr::lt(col.clone(), VAL),)),
-        None, // FALSE (from the NULL check) is stronger than TRUE
-        "WHERE {TRUE} AND {col} < {VAL}"
-    );
+    // NULL/FALSE (from the NULL check) is stronger than TRUE
+    let expr = &Expr::and(TRUE, Expr::lt(col.clone(), VAL));
+    expect_eq!(null_filter.eval_expr(expr, false), None, "{expr}");
+    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
+    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
 
     // Contrast normal vs. SQL WHERE semantics - comparison inside AND inside AND
-    expect_eq!(
-        null_filter.eval_expr(
-            &Expr::and(TRUE, Expr::and(NULL, Expr::lt(col.clone(), VAL)),),
-            false,
-        ),
-        None,
-        "{TRUE} AND ({NULL} AND {col} < {VAL})"
-    );
-    expect_eq!(
-        null_filter.eval_sql_where(&Expr::and(
-            TRUE,
-            Expr::and(NULL, Expr::lt(col.clone(), VAL)),
-        )),
-        Some(false),
-        "WHERE {TRUE} AND ({NULL} AND {col} < {VAL})"
-    );
-    expect_eq!(
-        empty_filter.eval_sql_where(&Expr::and(
-            TRUE,
-            Expr::and(NULL, Expr::lt(col.clone(), VAL)),
-        )),
-        None,
-        "WHERE {TRUE} AND ({NULL} AND {col} < {VAL})"
-    );
+    let expr = &Expr::and(TRUE, Expr::and(NULL, Expr::lt(col.clone(), VAL)));
+    expect_eq!(null_filter.eval_expr(expr, false), None, "{expr}");
+    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
+    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
 
     // Semantics are the same for comparison inside OR inside AND
-    expect_eq!(
-        null_filter.eval_expr(
-            &Expr::or(FALSE, Expr::and(NULL, Expr::lt(col.clone(), VAL)),),
-            false,
-        ),
-        None,
-        "{FALSE} OR ({NULL} AND {col} < {VAL})"
-    );
-    expect_eq!(
-        null_filter.eval_sql_where(&Expr::or(
-            FALSE,
-            Expr::and(NULL, Expr::lt(col.clone(), VAL)),
-        )),
-        None,
-        "WHERE {FALSE} OR ({NULL} AND {col} < {VAL})"
-    );
-    expect_eq!(
-        empty_filter.eval_sql_where(&Expr::or(
-            FALSE,
-            Expr::and(NULL, Expr::lt(col.clone(), VAL)),
-        )),
-        None,
-        "WHERE {FALSE} OR ({NULL} AND {col} < {VAL})"
-    );
+    let expr = &Expr::or(FALSE, Expr::and(NULL, Expr::lt(col.clone(), VAL)));
+    expect_eq!(null_filter.eval_expr(expr, false), None, "{expr}");
+    expect_eq!(null_filter.eval_sql_where(expr), None, "{expr}");
+    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
 }

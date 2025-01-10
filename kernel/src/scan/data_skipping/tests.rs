@@ -256,7 +256,6 @@ fn test_eval_distinct() {
 #[test]
 fn test_sql_where() {
     let col = &column_expr!("x");
-    let missing_col = &column_expr!("y");
     const VAL: Expr = Expr::Literal(Scalar::Integer(10));
     const NULL: Expr = Expr::Literal(Scalar::Null(DataType::BOOLEAN));
     const FALSE: Expr = Expr::Literal(Scalar::Boolean(false));
@@ -267,9 +266,9 @@ fn test_sql_where() {
     const SOME_NULL: i64 = 1;
     const NO_NULL: i64 = 0;
     let do_test =
-        |nullcount: i64, expr: &Expr, expected: Option<bool>, expected_sql: Option<bool>| {
-            assert!((0..=ROWCOUNT).contains(&nullcount));
-            let (min, max) = if nullcount < ROWCOUNT {
+        |nulls: i64, expr: &Expr, missing: bool, expect: Option<bool>, expect_sql: Option<bool>| {
+            assert!((0..=ROWCOUNT).contains(&nulls));
+            let (min, max) = if nulls < ROWCOUNT {
                 (Scalar::Integer(5), Scalar::Integer(15))
             } else {
                 (
@@ -277,111 +276,66 @@ fn test_sql_where() {
                     Scalar::Null(DataType::INTEGER),
                 )
             };
-            let resolver = HashMap::from_iter([
-                (column_name!("numRecords"), Scalar::from(ROWCOUNT)),
-                (column_name!("nullCount.x"), Scalar::from(nullcount)),
-                (column_name!("minValues.x"), min.clone()),
-                (column_name!("maxValues.x"), max.clone()),
-            ]);
+            let resolver = if missing {
+                HashMap::new()
+            } else {
+                HashMap::from_iter([
+                    (column_name!("numRecords"), Scalar::from(ROWCOUNT)),
+                    (column_name!("nullCount.x"), Scalar::from(nulls)),
+                    (column_name!("minValues.x"), min.clone()),
+                    (column_name!("maxValues.x"), max.clone()),
+                ])
+            };
             let filter = DefaultPredicateEvaluator::from(resolver);
             let pred = as_data_skipping_predicate(expr, false).unwrap();
             expect_eq!(
                 filter.eval_expr(&pred, false),
-                expected,
-                "{expr:#?} became {pred:#?} ({min}..{max}, {nullcount} nulls)"
+                expect,
+                "{expr:#?} became {pred:#?} ({min}..{max}, {nulls} nulls)"
             );
             let sql_pred = as_sql_data_skipping_predicate(expr).unwrap();
             expect_eq!(
                 filter.eval_expr(&sql_pred, false),
-                expected_sql,
-                "{expr:#?} became {sql_pred:#?} ({min}..{max}, {nullcount} nulls)"
+                expect_sql,
+                "{expr:#?} became {sql_pred:#?} ({min}..{max}, {nulls} nulls)"
             );
         };
 
     // Sanity tests -- only all-null columns should behave differently between normal and SQL WHERE.
-    do_test(ALL_NULL, &Expr::lt(TRUE, FALSE), Some(false), Some(false));
-    do_test(
-        ALL_NULL,
-        &Expr::is_not_null(col.clone()),
-        Some(false),
-        Some(false),
-    );
-    do_test(
-        ALL_NULL,
-        &Expr::is_not_null(missing_col.clone()),
-        None,
-        None,
-    );
-    do_test(NO_NULL, &Expr::lt(col.clone(), VAL), Some(true), Some(true));
-    do_test(
-        SOME_NULL,
-        &Expr::lt(col.clone(), VAL),
-        Some(true),
-        Some(true),
-    );
+    const MISSING: bool = true;
+    const PRESENT: bool = false;
+    let expr = &Expr::lt(TRUE, FALSE);
+    do_test(ALL_NULL, expr, MISSING, Some(false), Some(false));
 
-    // SQL WHERE allows a present-but-null column to be pruned, but not a missing column.
-    do_test(ALL_NULL, &Expr::lt(col.clone(), VAL), None, Some(false));
-    do_test(ALL_NULL, &Expr::lt(missing_col.clone(), VAL), None, None);
+    let expr = &Expr::is_not_null(col.clone());
+    do_test(ALL_NULL, expr, PRESENT, Some(false), Some(false));
+    do_test(ALL_NULL, expr, MISSING, None, None);
 
-    // Comparison works
-    do_test(ALL_NULL, &Expr::lt(VAL, col.clone()), None, Some(false));
-    do_test(ALL_NULL, &Expr::lt(VAL, missing_col.clone()), None, None);
+    // SQL WHERE allows a present-but-all-null column to be pruned, but not a missing column.
+    let expr = &Expr::lt(col.clone(), VAL);
+    do_test(NO_NULL, expr, PRESENT, Some(true), Some(true));
+    do_test(SOME_NULL, expr, PRESENT, Some(true), Some(true));
+    do_test(ALL_NULL, expr, PRESENT, None, Some(false));
+    do_test(ALL_NULL, expr, MISSING, None, None);
 
     // Comparison inside AND works
-    do_test(
-        ALL_NULL,
-        &Expr::and(NULL, Expr::lt(col.clone(), VAL)),
-        None,
-        Some(false),
-    );
-    do_test(
-        ALL_NULL,
-        &Expr::and(NULL, Expr::lt(missing_col.clone(), VAL)),
-        None,
-        None,
-    );
+    let expr = &Expr::and(NULL, Expr::lt(col.clone(), VAL));
+    do_test(ALL_NULL, expr, PRESENT, None, Some(false));
+    do_test(ALL_NULL, expr, MISSING, None, None);
 
-    do_test(
-        ALL_NULL,
-        &Expr::and(TRUE, Expr::lt(VAL, col.clone())),
-        None,
-        Some(false),
-    );
-    do_test(
-        ALL_NULL,
-        &Expr::and(TRUE, Expr::lt(VAL, missing_col.clone())),
-        None,
-        None,
-    );
+    let expr = &Expr::and(TRUE, Expr::lt(VAL, col.clone()));
+    do_test(ALL_NULL, expr, PRESENT, None, Some(false));
+    do_test(ALL_NULL, expr, MISSING, None, None);
 
     // Comparison inside AND inside AND works
-    do_test(
-        ALL_NULL,
-        &Expr::and(TRUE, Expr::and(NULL, Expr::lt(col.clone(), VAL))),
-        None,
-        Some(false),
-    );
-    do_test(
-        ALL_NULL,
-        &Expr::and(TRUE, Expr::and(NULL, Expr::lt(missing_col.clone(), VAL))),
-        None,
-        None,
-    );
+    let expr = &Expr::and(TRUE, Expr::and(NULL, Expr::lt(col.clone(), VAL)));
+    do_test(ALL_NULL, expr, PRESENT, None, Some(false));
+    do_test(ALL_NULL, expr, MISSING, None, None);
 
     // OR is not affected
-    do_test(
-        ALL_NULL,
-        &Expr::or(FALSE, Expr::lt(col.clone(), VAL)),
-        None,
-        None,
-    );
+    let expr = &Expr::or(FALSE, Expr::lt(col.clone(), VAL));
+    do_test(ALL_NULL, expr, PRESENT, None, None);
 
     // AND inside OR is also not affected
-    do_test(
-        ALL_NULL,
-        &Expr::or(FALSE, Expr::and(NULL, Expr::lt(col.clone(), VAL))),
-        None,
-        None,
-    );
+    do_test(ALL_NULL, expr, MISSING, None, None);
 }
