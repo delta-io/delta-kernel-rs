@@ -127,7 +127,11 @@ pub(crate) trait PredicateEvaluator {
         match op {
             UnaryOperator::Not => self.eval_expr(expr, !inverted),
             UnaryOperator::IsNull => match expr {
-                // Data skipping only supports IS [NOT] NULL over columns and literals
+                // WARNING: Only literals and columns can be safely null-checked. Attempting to
+                // null-check an expressions such as `a < 10` could wrongly produce FALSE in case
+                // `a` is just plain missing (rather than known to be NULL. A missing-value can
+                // arise e.g. if data skipping encounters a column with missing stats, or if
+                // partition pruning encounters a non-partition column.
                 Expr::Literal(val) => self.eval_scalar_is_null(val, inverted),
                 Expr::Column(col) => self.eval_is_null(col, inverted),
                 _ => {
@@ -206,17 +210,16 @@ pub(crate) trait PredicateEvaluator {
         }
     }
 
-    /// Performs the null-safe binary comparison of `{a} {cmp} {b}` as if by:
+    /// Performs the null-safe binary comparison of `{a} {cmp} {b}` as if it were expanded to:
     ///
     /// ```text
     /// AND({a} IS NOT NULL, {b} IS NOT NULL, {a} {cmp} {b})
     /// ```
     ///
-    /// The null checks only apply to column expressions, so at least one of them will always be
-    /// NULL (since we don't support skipping over column-column comparisons). If any NULL check
-    /// fails (producing FALSE), it short-circuits the entire AND to FALSE without ever evaluating
-    /// the comparison. Otherwise, the original comparison will run and -- if FALSE -- can cause
-    /// data skipping as usual.
+    /// Attempting to NULL-check anything other than a column or literal produces NULL, which causes
+    /// this method to return NULL. Otherwise, if either NULL check fails (producing FALSE), it
+    /// short-circuits the entire AND to FALSE. Otherwise, the result of the original comparison
+    /// determines the outcome and -- if FALSE -- can cause data skipping as usual.
     fn eval_binary_nullsafe(
         &self,
         op: BinaryOperator,
@@ -261,58 +264,84 @@ pub(crate) trait PredicateEvaluator {
 
     /// Evaluates a predicate with SQL WHERE semantics.
     ///
-    /// By default, [`eval_expr`] can produce unwelcome behavior for comparisons involving NULL
-    /// columns (e.g. `a < 10` when `a` is NULL), because the (legitimately NULL) value is
-    /// interpreted the same as a missing value and produces a NULL result. The resulting NULL can
-    /// "poison" the entire expression, causing it to return NULL instead of FALSE that would allow
-    /// data skipping. Meanwhile, SQL WHERE semantics only keeps rows for which the filter evaluates
-    /// to TRUE. This behavior difference between data skipping and SQL WHERE semantics can be
-    /// address by performing a null-safe comparison of `a < 10` as if by `AND(a IS NOT NULL, a < 10)`.
+    /// By default, [`eval_expr`] behaves badly for comparisons involving NULL columns (e.g. `a <
+    /// 10` when `a` is NULL), because the (legitimately) NULL value is interpreted the same as a
+    /// missing value and produces a NULL result. The resulting NULL does not allow data skipping,
+    /// which is looking for a FALSE result. Meanwhile, SQL WHERE semantics only keeps rows for
+    /// which the filter evaluates to TRUE (discarding rows that evaluate to FALSE or NULL).
     ///
-    /// We cannot safely evaluate an arbitrary data skipping predicate with null-safe semantics because
-    /// NULL could also mean e.g. unknown/missing stats. However, we CAN safely turn a column reference
-    /// in a comparison into a null-safe comparison, as long as the comparison's parent expressions are
-    /// all AND. To see why, consider a WHERE clause filter of the form:
+    /// Conceptually, the behavior difference between data skipping and SQL WHERE semantics can be
+    /// addressed by performing a null-safe comparison of `WHERE <expr>`, as if it were expanded to
+    /// `WHERE <expr> IS NOT NULL AND <expr>`.
+    ///
+    /// HOWEVER, we cannot safely NULL-check the result of an arbitrary data skipping predicate
+    /// because an expression will also produce NULL when the value is just plain missing
+    /// (e.g. attempting data skipping over a column that lacks stats), and that NULL could
+    /// propagate all the way to top-level and be wrongly interpreted as NOT TRUE (= skippable).
+    ///
+    /// To prevent wrong data skipping in such cases, the predicate evaluator always returns NULL
+    /// for a NULL check over anything except for literals and columns with known values. So we must
+    /// push the NULL check down through supported operations (currently only AND and comparisons)
+    /// until it reaches columns and literals where it can do some good, e.g.:
     ///
     /// ```text
-    /// AND(..., a {cmp} b, ...)
+    /// WHERE a < 10 AND (b < 20 OR c < 30)
     /// ```
     ///
-    /// In order allow skipping based on the all-null `a` or `b`, we want to actually evaluate:
+    /// would conceptually be interpreted as
+    ///
     /// ```text
-    /// AND(..., AND(a IS NOT NULL, b IS NOT NULL, a {cmp} b), ...)
+    /// WHERE
+    ///   (a < 10 AND (b < 20 OR c < 30)) IS NOT NULL AND
+    ///   (a < 10 AND (b < 20 OR c < 30))
     /// ```
     ///
-    /// This optimization relies on the fact that `IS [NOT] NULL` returns NULL for missing data,
-    /// while returning TRUE/FALSE for properly NULL data. Thus, given an expression of the form
-    /// `AND(..., x < 10, ...)`, the NULL case would evaluate as:
+    /// We then push the NULL check down through the top-level AND:
     ///
     /// ```text
-    /// AND(..., AND(x IS NOT NULL, 10 IS NOT NULL, x < 10), ...)
+    /// WHERE
+    ///   (a < 10 IS NOT NULL AND a < 10) AND
+    ///   ((b < 20 OR c < 30) IS NOT NULL AND (b < 20 OR c < 30))
+    /// ```
+    ///
+    /// and attempt to push it further into the `a < 10` and `OR` clauses:
+    ///
+    /// ```text
+    /// WHERE
+    ///   (a IS NOT NULL AND 10 IS NOT NULL AND a < 10) AND
+    ///   (b < 20 OR c < 30)
+    /// ```
+    ///
+    /// Any time the push-down reaches an operator that does not support push-down (such as OR), we
+    /// simply drop the NULL check. This way, the top-level NULL check only applies to
+    /// sub-expressions that can safely implement it, while ignoring other sub-expressions. The
+    /// unsupported sub-expressions could produce nulls at runtime that prevent skipping, but false
+    /// positives are OK -- the query will still correctly filter out the unwanted rows that result.
+    ///
+    /// At expression evaluation time, a NULL value of `a` (from our example) would evaluate as:
+    ///
+    /// ```text
+    /// AND(..., AND(a IS NOT NULL, 10 IS NOT NULL, a < 10), ...)
     /// AND(..., AND(FALSE, TRUE, NULL), ...)
     /// AND(..., FALSE, ...)
     /// FALSE
     /// ```
     ///
-    /// While the non-null case would instead evaluate as:
+    /// While a non-NULL value of `a` would instead evaluate as:
     ///
     /// ```text
-    /// AND(..., AND(x IS NOT NULL, 10 IS NOT NULL, x < 10), ...)
+    /// AND(..., AND(a IS NOT NULL, 10 IS NOT NULL, a < 10), ...)
     /// AND(..., AND(TRUE, TRUE, <result>), ...)
     /// AND(..., <result>, ...)
     /// ```
     ///
-    /// While the missing-value case would safely disable the clause by evaluating as NULL:
+    /// And a missing value for `a` would safely disable the clause:
     ///
     /// ```text
-    /// AND(..., AND(x IS NOT NULL, 10 IS NOT NULL, x < 10), ...)
+    /// AND(..., AND(a IS NOT NULL, 10 IS NOT NULL, a < 10), ...)
     /// AND(..., AND(NULL, TRUE, NULL), ...)
     /// AND(..., NULL, ...)
     /// ```
-    ///
-    /// In summary: If the result was FALSE, it forces both inner and outer AND to FALSE, as
-    /// desired. If the result was TRUE or NULL, then it does not contribute to data skipping but
-    /// also does not block it when other legs of the AND evaluate to FALSE.
     fn eval_sql_where(&self, filter: &Expr) -> Option<Self::Output> {
         use Expr::{Binary, Variadic};
         match filter {
@@ -320,10 +349,12 @@ pub(crate) trait PredicateEvaluator {
                 op: VariadicOperator::And,
                 exprs,
             }) => {
+                // Recursively invoke `eval_sql_where` instead of the usual `eval_expr`
                 let exprs = exprs.iter().map(|expr| self.eval_sql_where(expr));
                 PredicateEvaluator::finish_eval_variadic(self, VariadicOperator::And, exprs, false)
             }
             Binary(BinaryExpression { op, left, right }) => {
+                // Invoke the nullsafe comparison instead of the usual `eval_binary`
                 self.eval_binary_nullsafe(*op, left, right)
             }
             _ => self.eval_expr(filter, false),
