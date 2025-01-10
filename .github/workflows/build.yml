@@ -107,6 +107,10 @@ jobs:
         run: cargo clippy --benches --tests --all-features -- -D warnings
       - name: lint without default features
         run: cargo clippy --no-default-features -- -D warnings
+      - name: check kernel builds with default-engine
+        run: cargo build -p feature_tests --features default-engine
+      - name: check kernel builds with default-engine-rustls
+        run: cargo build -p feature_tests --features default-engine-rustls
   test:
     runs-on: ${{ matrix.os }}
     strategy:
