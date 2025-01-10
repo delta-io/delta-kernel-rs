@@ -211,7 +211,7 @@ pub unsafe extern "C" fn kernel_scan_data_next(
         engine_context: NullableCvoid,
         engine_data: Handle<ExclusiveEngineData>,
         selection_vector: KernelBoolSlice,
-        transforms: &CTransformMap,
+        transforms: &CTransforms,
     ),
 ) -> ExternResult<bool> {
     let data = unsafe { data.as_ref() };
@@ -225,7 +225,7 @@ fn kernel_scan_data_next_impl(
         engine_context: NullableCvoid,
         engine_data: Handle<ExclusiveEngineData>,
         selection_vector: KernelBoolSlice,
-        transforms: &CTransformMap,
+        transforms: &CTransforms,
     ),
 ) -> DeltaResult<bool> {
     let mut data = data
@@ -234,7 +234,7 @@ fn kernel_scan_data_next_impl(
         .map_err(|_| Error::generic("poisoned mutex"))?;
     if let Some((data, sel_vec, transforms)) = data.next().transpose()? {
         let bool_slice = KernelBoolSlice::from(sel_vec);
-        let transform_map = CTransformMap { transforms };
+        let transform_map = CTransforms { transforms };
         (engine_visitor)(engine_context, data.into(), bool_slice, &transform_map);
         Ok(true)
     } else {
@@ -296,9 +296,8 @@ pub unsafe extern "C" fn get_from_string_map(
         .and_then(|v| allocate_fn(kernel_string_slice!(v)))
 }
 
-
-pub struct CTransformMap {
-    transforms: HashMap<usize, ExpressionRef>,
+pub struct CTransforms {
+    transforms: Vec<Option<ExpressionRef>>,
 }
 
 // #[no_mangle]
@@ -320,7 +319,6 @@ pub struct CTransformMap {
 //         .get(string_key.unwrap())
 //         .and_then(|v| allocate_fn(kernel_string_slice!(v)))
 // }
-
 
 /// Get a selection vector out of a [`DvInfo`] struct
 ///
@@ -418,7 +416,7 @@ struct ContextWrapper {
 pub unsafe extern "C" fn visit_scan_data(
     data: Handle<ExclusiveEngineData>,
     selection_vec: KernelBoolSlice,
-    transforms: &CTransformMap,
+    transforms: &CTransforms,
     engine_context: NullableCvoid,
     callback: CScanCallback,
 ) {
@@ -429,5 +427,12 @@ pub unsafe extern "C" fn visit_scan_data(
         callback,
     };
     // TODO: return ExternResult to caller instead of panicking?
-    visit_scan_files(data, selection_vec, &transforms.transforms, context_wrapper, rust_callback).unwrap();
+    visit_scan_files(
+        data,
+        selection_vec,
+        &transforms.transforms,
+        context_wrapper,
+        rust_callback,
+    )
+    .unwrap();
 }
