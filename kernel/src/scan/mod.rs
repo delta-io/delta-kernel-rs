@@ -471,63 +471,76 @@ impl Scan {
             // Iterator<DeltaResult<Vec<ScanFile>>> to Iterator<DeltaResult<ScanFile>>
             .flatten_ok();
 
-        let result = scan_files_iter
-            .map(move |scan_file| -> DeltaResult<_> {
-                let scan_file = scan_file?;
-                let file_path = table_root.join(&scan_file.path)?;
-                let mut selection_vector = scan_file
-                    .dv_info
-                    .get_selection_vector(engine.as_ref(), &table_root)?;
-                let meta = FileMeta {
-                    last_modified: 0,
-                    size: scan_file.size as usize,
-                    location: file_path,
+        let mut file_metas = Vec::new();
+        let mut partition_values_vec = Vec::new();
+        let mut selection_vectors = Vec::new();
+
+        for scan_file_res in scan_files_iter {
+            let scan_file = scan_file_res?;
+            let file_path = table_root.join(&scan_file.path)?;
+            let selection_vector = scan_file
+                .dv_info
+                .get_selection_vector(engine.as_ref(), &table_root)?;
+
+            let meta = FileMeta {
+                last_modified: 0,
+                size: scan_file.size as usize,
+                location: file_path,
+            };
+
+            file_metas.push(meta);
+            partition_values_vec.push(scan_file.partition_values);
+            selection_vectors.push(selection_vector);
+        }
+
+        // read all files at once
+        let read_result_iter = engine.get_parquet_handler().read_parquet_files(
+            &file_metas,
+            global_state.physical_schema.clone(),
+            physical_predicate.clone(),
+        )?;
+
+        let engine_clone = engine.clone();
+        let global_state_clone = global_state.clone();
+        let all_fields_clone = all_fields.clone();
+
+        let mut selection_vectors_iter = selection_vectors.into_iter();
+        let mut partition_values_iter = partition_values_vec.into_iter();
+
+        let result = read_result_iter
+            .enumerate()
+            .map(move |(i, read_result)| -> DeltaResult<_> {
+                let read_result = read_result?; // this is the parquet batch for the i-th file
+
+                // let partition_values = partition_values_iter
+                //     .nth(i)
+                //     .expect("Partition values length mismatch with read_result_iter");
+                // let mut selection_vector = selection_vectors_iter
+                //     .nth(i)
+                //     .expect("Selection vector length mismatch with read_result_iter");
+
+                let logical = transform_to_logical_internal(
+                    engine_clone.as_ref(),
+                    read_result,
+                    &global_state_clone,
+                    &HashMap::new(),
+                    &all_fields_clone,
+                    have_partition_cols,
+                );
+
+                // let len = logical.as_ref().map_or(0, |res| res.len());
+                // let mut sv = selection_vector.take();
+                // let rest = split_vector(sv.as_mut(), len, None);
+
+                let scan_result = ScanResult {
+                    raw_data: logical,
+                    raw_mask: None,
                 };
 
-                // WARNING: We validated the physical predicate against a schema that includes
-                // partition columns, but the read schema we use here does _NOT_ include partition
-                // columns. So we cannot safely assume that all column references are valid. See
-                // https://github.com/delta-io/delta-kernel-rs/issues/434 for more details.
-                let read_result_iter = engine.get_parquet_handler().read_parquet_files(
-                    &[meta],
-                    global_state.physical_schema.clone(),
-                    physical_predicate.clone(),
-                )?;
 
-                // Arc clones
-                let engine = engine.clone();
-                let global_state = global_state.clone();
-                let all_fields = all_fields.clone();
-                Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
-                    let read_result = read_result?;
-                    // to transform the physical data into the correct logical form
-                    let logical = transform_to_logical_internal(
-                        engine.as_ref(),
-                        read_result,
-                        &global_state,
-                        &scan_file.partition_values,
-                        &all_fields,
-                        have_partition_cols,
-                    );
-                    let len = logical.as_ref().map_or(0, |res| res.len());
-                    // need to split the dv_mask. what's left in dv_mask covers this result, and rest
-                    // will cover the following results. we `take()` out of `selection_vector` to avoid
-                    // trying to return a captured variable. We're going to reassign `selection_vector`
-                    // to `rest` in a moment anyway
-                    let mut sv = selection_vector.take();
-                    let rest = split_vector(sv.as_mut(), len, None);
-                    let result = ScanResult {
-                        raw_data: logical,
-                        raw_mask: sv,
-                    };
-                    selection_vector = rest;
-                    Ok(result)
-                }))
-            })
-            // Iterator<DeltaResult<Iterator<DeltaResult<ScanResult>>>> to Iterator<DeltaResult<DeltaResult<ScanResult>>>
-            .flatten_ok()
-            // Iterator<DeltaResult<DeltaResult<ScanResult>>> to Iterator<DeltaResult<ScanResult>>
-            .map(|x| x?);
+                Ok(scan_result)
+            });
+
         Ok(result)
     }
 }

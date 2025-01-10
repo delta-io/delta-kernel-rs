@@ -202,6 +202,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 physical_schema.clone(),
                 predicate,
                 self.store.clone(),
+                None,
             )),
         };
         FileStream::new_async_read_iterator(
@@ -215,13 +216,14 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 }
 
 /// Implements [`FileOpener`] for a parquet file
-struct ParquetOpener {
+pub(crate) struct ParquetOpener {
     // projection: Arc<[usize]>,
     batch_size: usize,
     table_schema: SchemaRef,
     predicate: Option<ExpressionRef>,
     limit: Option<usize>,
     store: Arc<DynObjectStore>,
+    runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 impl ParquetOpener {
@@ -230,6 +232,7 @@ impl ParquetOpener {
         table_schema: SchemaRef,
         predicate: Option<ExpressionRef>,
         store: Arc<DynObjectStore>,
+        runtime: Option<Arc<tokio::runtime::Runtime>>,
     ) -> Self {
         Self {
             batch_size,
@@ -237,6 +240,7 @@ impl ParquetOpener {
             predicate,
             limit: None,
             store,
+            runtime,
         }
     }
 }
@@ -251,11 +255,18 @@ impl FileOpener for ParquetOpener {
         let table_schema = self.table_schema.clone();
         let predicate = self.predicate.clone();
         let limit = self.limit;
+        let handle = match &self.runtime {
+            Some(runtime) => Some(runtime.handle().clone()),
+            None => None,
+        };
 
         Ok(Box::pin(async move {
             // TODO avoid IO by converting passed file meta to ObjectMeta
             let meta = store.head(&path).await?;
             let mut reader = ParquetObjectReader::new(store, meta);
+            if let Some(handle) = handle {
+                reader = reader.with_runtime(handle);
+            }
             let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
             let parquet_schema = metadata.schema();
             let (indicies, requested_ordering) =
@@ -281,6 +292,9 @@ impl FileOpener for ParquetOpener {
 
             let stream = builder.with_batch_size(batch_size).build()?;
 
+            // println!("read IO");
+            // tokio::time::sleep(std::time::Duration::from_millis(10000)).await; // simulate IO delay
+
             let stream = stream.map(move |rbr| {
                 // re-order each batch if needed
                 rbr.map_err(Error::Parquet).and_then(|rb| {
@@ -293,7 +307,7 @@ impl FileOpener for ParquetOpener {
 }
 
 /// Implements [`FileOpener`] for a opening a parquet file from a presigned URL
-struct PresignedUrlOpener {
+pub(crate) struct PresignedUrlOpener {
     batch_size: usize,
     predicate: Option<ExpressionRef>,
     limit: Option<usize>,

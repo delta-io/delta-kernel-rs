@@ -24,7 +24,7 @@ pub type FileOpenFuture =
 /// stream of [`RecordBatch`]
 ///
 /// [`ObjectStore`]: object_store::ObjectStore
-pub trait FileOpener: Send + Unpin {
+pub trait FileOpener: Send + Unpin + Sync {
     /// Asynchronously open the specified file and return a stream
     /// of [`RecordBatch`]
     fn open(&self, file_meta: FileMeta, range: Option<Range<i64>>) -> DeltaResult<FileOpenFuture>;
