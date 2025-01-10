@@ -146,3 +146,10 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "fmt",
 ] }
+
+[package.metadata.release]
+pre-release-replacements = [
+  {file="../README.md", search="delta_kernel = \"[a-z0-9\\.-]+\"", replace="delta_kernel = \"{{version}}\""},
+  {file="../README.md", search="version = \"[a-z0-9\\.-]+\"", replace="version = \"{{version}}\""},
+]
+pre-release-hook = ["git", "cliff", "--unreleased", "--prepend", "../CHANGELOG.md", "--tag", "{{version}}" ]
