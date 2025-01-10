@@ -88,7 +88,7 @@ void do_visit_scan_data(
   void* engine_context,
   ExclusiveEngineData* engine_data,
   KernelBoolSlice selection_vec,
-  const CTransformMap* transforms)
+  const CTransforms* transforms)
 {
   print_diag("\nScan iterator found some data to read\n  Of this data, here is "
              "a selection vector\n");
