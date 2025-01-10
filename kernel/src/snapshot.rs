@@ -10,9 +10,8 @@ use crate::actions::{Metadata, Protocol};
 use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
 use crate::schema::Schema;
-use crate::table_features::{
-    column_mapping_mode, validate_schema_column_mapping, ColumnMappingMode,
-};
+use crate::table_configuration::TableConfiguration;
+use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, Error, FileSystemClient, Version};
 
@@ -25,11 +24,7 @@ const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 pub struct Snapshot {
     pub(crate) table_root: Url,
     pub(crate) log_segment: LogSegment,
-    metadata: Metadata,
-    protocol: Protocol,
-    schema: Schema,
-    table_properties: TableProperties,
-    pub(crate) column_mapping_mode: ColumnMappingMode,
+    table_configuration: TableConfiguration,
 }
 
 impl Drop for Snapshot {
@@ -43,7 +38,7 @@ impl std::fmt::Debug for Snapshot {
         f.debug_struct("Snapshot")
             .field("path", &self.log_segment.log_root.as_str())
             .field("version", &self.version())
-            .field("metadata", &self.metadata)
+            .field("metadata", &self.metadata())
             .finish()
     }
 }
@@ -80,24 +75,11 @@ impl Snapshot {
         engine: &dyn Engine,
     ) -> DeltaResult<Self> {
         let (metadata, protocol) = log_segment.read_metadata(engine)?;
-
-        // important! before a read/write to the table we must check it is supported
-        protocol.ensure_read_supported()?;
-
-        // validate column mapping mode -- all schema fields should be correctly (un)annotated
-        let schema = metadata.parse_schema()?;
-        let table_properties = metadata.parse_table_properties();
-        let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
-        validate_schema_column_mapping(&schema, column_mapping_mode)?;
-
+        let table_configuration = TableConfiguration::new(metadata, protocol)?;
         Ok(Self {
             table_root: location,
             log_segment,
-            metadata,
-            protocol,
-            schema,
-            table_properties,
-            column_mapping_mode,
+            table_configuration,
         })
     }
 
@@ -118,29 +100,33 @@ impl Snapshot {
 
     /// Table [`Schema`] at this `Snapshot`s version.
     pub fn schema(&self) -> &Schema {
-        &self.schema
+        &self.table_configuration.schema()
     }
 
     /// Table [`Metadata`] at this `Snapshot`s version.
     pub fn metadata(&self) -> &Metadata {
-        &self.metadata
+        &self.table_configuration.metadata()
     }
 
     /// Table [`Protocol`] at this `Snapshot`s version.
     pub fn protocol(&self) -> &Protocol {
-        &self.protocol
+        &self.table_configuration.protocol()
     }
 
     /// Get the [`TableProperties`] for this [`Snapshot`].
     pub fn table_properties(&self) -> &TableProperties {
-        &self.table_properties
+        &self.table_configuration.table_properties()
+    }
+    /// Get the [`TableConfiguration`] for this [`Snapshot`].
+    pub fn table_configuration(&self) -> &TableConfiguration {
+        &self.table_configuration
     }
 
     /// Get the [column mapping
     /// mode](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping) at this
     /// `Snapshot`s version.
     pub fn column_mapping_mode(&self) -> ColumnMappingMode {
-        self.column_mapping_mode
+        *self.table_configuration.column_mapping_mode()
     }
 
     /// Create a [`ScanBuilder`] for an `Arc<Snapshot>`.
