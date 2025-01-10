@@ -96,9 +96,10 @@ handle_release_branch() {
         log_error "Failed to update CHANGELOG and README"
     fi
 
-    git diff --stat
-
-    git diff
+    if confirm "Print diff of CHANGELOG/README changes?"; then
+        git diff --stat HEAD^
+        git diff HEAD^
+    fi
 
     if confirm "Would you like to open a PR with these changes?"; then
         local current_branch
