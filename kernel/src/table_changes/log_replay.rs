@@ -164,7 +164,7 @@ impl LogReplayScanner {
         let mut add_paths = HashSet::default();
         let mut has_cdc_action = false;
         let mut timestamp = commit_file.location.last_modified;
-        for actions in action_iter {
+        for (i, actions) in action_iter.enumerate() {
             let actions = actions?;
 
             let mut visitor = PreparePhaseVisitor {
@@ -174,6 +174,7 @@ impl LogReplayScanner {
                 commit_timestamp: &mut timestamp,
                 protocol: None,
                 metadata_info: None,
+                is_first_batch: i == 0,
             };
             visitor.visit_rows_of(actions.as_ref())?;
 
@@ -276,6 +277,7 @@ struct PreparePhaseVisitor<'a> {
     add_paths: &'a mut HashSet<String>,
     remove_dvs: &'a mut HashMap<String, DvInfo>,
     commit_timestamp: &'a mut i64,
+    is_first_batch: bool,
 }
 impl PreparePhaseVisitor<'_> {
     fn schema() -> Arc<StructType> {
@@ -362,7 +364,9 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
             } else if let Some(timestamp) =
                 getters[16].get_long(i, "commitInfo.inCommitTimestamp")?
             {
-                *self.commit_timestamp = timestamp;
+                if self.is_first_batch && i == 0 {
+                    *self.commit_timestamp = timestamp;
+                }
             }
         }
         Ok(())

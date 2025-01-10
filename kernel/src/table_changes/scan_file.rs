@@ -327,8 +327,8 @@ mod tests {
             .await;
         mock_table
             .commit([
-                Action::Cdc(cdc.clone()),
                 Action::CommitInfo(commit_info.clone()),
+                Action::Cdc(cdc.clone()),
             ])
             .await;
         mock_table
