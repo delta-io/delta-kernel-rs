@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use crate::actions::deletion_vector::deletion_treemap_to_bools;
+use crate::scan::get_transform_for_row;
 use crate::utils::require;
 use crate::ExpressionRef;
 use crate::{
@@ -140,7 +141,7 @@ pub type ScanCallback<T> = fn(
 pub fn visit_scan_files<T>(
     data: &dyn EngineData,
     selection_vector: &[bool],
-    transforms: &HashMap<usize, ExpressionRef>,
+    transforms: &Vec<Option<ExpressionRef>>,
     context: T,
     callback: ScanCallback<T>,
 ) -> DeltaResult<T> {
@@ -158,7 +159,7 @@ pub fn visit_scan_files<T>(
 struct ScanFileVisitor<'a, T> {
     callback: ScanCallback<T>,
     selection_vector: &'a [bool],
-    transforms: &'a HashMap<usize, ExpressionRef>,
+    transforms: &'a Vec<Option<ExpressionRef>>,
     context: T,
 }
 impl<T> RowVisitor for ScanFileVisitor<'_, T> {
@@ -206,7 +207,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                     size,
                     stats,
                     dv_info,
-                    self.transforms.get(&row_index).cloned(), // cheap Arc clone
+                    get_transform_for_row(row_index, self.transforms),
                     partition_values,
                 )
             }

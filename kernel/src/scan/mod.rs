@@ -304,6 +304,20 @@ pub enum ColumnType {
 /// A transform is ultimately a `Struct` expr. This holds the set of expressions that make that struct expr up
 type Transform = Vec<TransformExpr>;
 
+/// utility method making it easy to get a transform for a particular row. If the requested row is
+/// outside the range of the passed slice returns `None`, otherwise returns the element at the index
+/// of the specified row
+pub fn get_transform_for_row(
+    row: usize,
+    transforms: &[Option<ExpressionRef>],
+) -> Option<ExpressionRef> {
+    if row < transforms.len() {
+        transforms[row].clone()
+    } else {
+        None
+    }
+}
+
 /// Transforms aren't computed all at once. So static ones can just go straight to `Expression`, but
 /// things like partition columns need to filled in. This enum holds an expression that's part of a
 /// `Transform`.
