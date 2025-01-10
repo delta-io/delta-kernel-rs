@@ -21,7 +21,8 @@ pre-release-replacements = [
   {file="../README.md", search="version = \"[a-z0-9\\.-]+\"", replace="version = \"{{version}}\""},
 ]
 pre-release-hook = ["git", "cliff", "--repository", "../", "--config", "../cliff.toml", "--unreleased", "--prepend", "../CHANGELOG.md", "--tag", "{{version}}" ]
-pre-release-commit-message = "release {{version}}"
+tag = true
+tag-name = "v{{version}}"
 tag-message = "release version {{version}}"
 
 [dependencies]
