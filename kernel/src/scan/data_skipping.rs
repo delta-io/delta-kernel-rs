@@ -36,13 +36,13 @@ mod tests;
 ///         are not eligible for data skipping.
 /// - `OR` is rewritten only if all operands are eligible for data skipping. Otherwise, the whole OR
 ///        expression is dropped.
-fn as_data_skipping_predicate(expr: &Expr, inverted: bool) -> Option<Expr> {
-    DataSkippingPredicateCreator.eval_expr(expr, inverted)
+#[cfg(test)]
+fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
+    DataSkippingPredicateCreator.eval_expr(expr, false)
 }
 
-/// Like `as_data_skipping_predicate`, but invokes `SqlPredicateEvaluator::eval_sql_where` instead
-/// of `PredicateEvaluator::eval_expr`.
-#[cfg(test)]
+/// Like `as_data_skipping_predicate`, but invokes [`PredicateEvaluator::eval_sql_where`] instead
+/// of [`PredicateEvaluator::eval_expr`].
 fn as_sql_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
     DataSkippingPredicateCreator.eval_sql_where(expr)
 }
@@ -115,7 +115,7 @@ impl DataSkippingFilter {
 
         let skipping_evaluator = engine.get_expression_handler().get_evaluator(
             stats_schema.clone(),
-            Expr::struct_from([as_data_skipping_predicate(&predicate, false)?]),
+            Expr::struct_from([as_sql_data_skipping_predicate(&predicate)?]),
             PREDICATE_SCHEMA.clone(),
         );
 

@@ -34,7 +34,7 @@ fn test_eval_is_null() {
         ]);
         let filter = DefaultPredicateEvaluator::from(resolver);
         for (expr, expect) in expressions.iter().zip(expected) {
-            let pred = as_data_skipping_predicate(expr, false).unwrap();
+            let pred = as_data_skipping_predicate(expr).unwrap();
             expect_eq!(
                 filter.eval_expr(&pred, false),
                 *expect,
@@ -77,7 +77,7 @@ fn test_eval_binary_comparisons() {
         ]);
         let filter = DefaultPredicateEvaluator::from(resolver);
         for (expr, expect) in expressions.iter().zip(expected.iter()) {
-            let pred = as_data_skipping_predicate(expr, false).unwrap();
+            let pred = as_data_skipping_predicate(expr).unwrap();
             expect_eq!(
                 filter.eval_expr(&pred, false),
                 *expect,
@@ -160,7 +160,7 @@ fn test_eval_variadic() {
             .collect();
 
         let expr = Expr::and_from(inputs.clone());
-        let pred = as_data_skipping_predicate(&expr, false).unwrap();
+        let pred = as_data_skipping_predicate(&expr).unwrap();
         expect_eq!(
             filter.eval_expr(&pred, false),
             *expect_and,
@@ -168,19 +168,19 @@ fn test_eval_variadic() {
         );
 
         let expr = Expr::or_from(inputs.clone());
-        let pred = as_data_skipping_predicate(&expr, false).unwrap();
+        let pred = as_data_skipping_predicate(&expr).unwrap();
         expect_eq!(filter.eval_expr(&pred, false), *expect_or, "OR({inputs:?})");
 
-        let expr = Expr::and_from(inputs.clone());
-        let pred = as_data_skipping_predicate(&expr, true).unwrap();
+        let expr = !Expr::and_from(inputs.clone());
+        let pred = as_data_skipping_predicate(&expr).unwrap();
         expect_eq!(
             filter.eval_expr(&pred, false),
             expect_and.map(|val| !val),
             "NOT AND({inputs:?})"
         );
 
-        let expr = Expr::or_from(inputs.clone());
-        let pred = as_data_skipping_predicate(&expr, true).unwrap();
+        let expr = !Expr::or_from(inputs.clone());
+        let pred = as_data_skipping_predicate(&expr).unwrap();
         expect_eq!(
             filter.eval_expr(&pred, false),
             expect_or.map(|val| !val),
@@ -216,7 +216,7 @@ fn test_eval_distinct() {
         ]);
         let filter = DefaultPredicateEvaluator::from(resolver);
         for (expr, expect) in expressions.iter().zip(expected) {
-            let pred = as_data_skipping_predicate(expr, false).unwrap();
+            let pred = as_data_skipping_predicate(expr).unwrap();
             expect_eq!(
                 filter.eval_expr(&pred, false),
                 *expect,
@@ -287,7 +287,7 @@ fn test_sql_where() {
                 ])
             };
             let filter = DefaultPredicateEvaluator::from(resolver);
-            let pred = as_data_skipping_predicate(expr, false).unwrap();
+            let pred = as_data_skipping_predicate(expr).unwrap();
             expect_eq!(
                 filter.eval_expr(&pred, false),
                 expect,
