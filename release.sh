@@ -107,14 +107,14 @@ handle_release_branch() {
 
         log_info "Pushing changes to remote..."
         git push origin "$current_branch"
-    fi
 
-    if confirm "Would you like to create a PR to merge this release into 'main'?"; then
-        if command -v gh >/dev/null 2>&1; then
-            gh pr create --title "release $version" --body "release $version"
-            log_success "PR created successfully"
-        else
-            log_warning "GitHub CLI not found. Please create a PR manually."
+        if confirm "Would you like to create a PR to merge this release into 'main'?"; then
+            if command -v gh >/dev/null 2>&1; then
+                gh pr create --title "release $version" --body "release $version"
+                log_success "PR created successfully"
+            else
+                log_warning "GitHub CLI not found. Please create a PR manually."
+            fi
         fi
     fi
 }

@@ -48,7 +48,8 @@ filter_unconventional = false
 split_commits = false
 # regex for preprocessing the commit messages
 commit_preprocessors = []
-# regex for parsing and grouping commits
+# regex for parsing and grouping commits. note that e.g. both doc and docs are matched since we have
+# trim = true above.
 commit_parsers = [
   { field = "github.pr_labels", pattern = "breaking-change", group = "<!-- 0 --> 🏗️ Breaking changes" },
   { message = "^feat", group = "<!-- 1 -->🚀 Features / new APIs" },
