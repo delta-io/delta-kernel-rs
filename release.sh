@@ -13,8 +13,8 @@
 # Exit on error, undefined variables, and pipe failures
 set -euo pipefail
 
-# print commands before executing them
-set -x
+# print commands before executing them for debugging
+# set -x
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -92,7 +92,7 @@ handle_release_branch() {
 
     # Update CHANGELOG and README
     log_info "Updating CHANGELOG.md and README.md..."
-    if ! cargo release --workspace "$version" --no-publish --no-push --no-tag; then
+    if ! cargo release --workspace "$version" --no-publish --no-push --no-tag --execute; then
         log_error "Failed to update CHANGELOG and README"
     fi
     log_success "CHANGELOG and README updated"
@@ -108,11 +108,10 @@ handle_release_branch() {
 
         # Open PR (this uses gh cli if available, otherwise provides instructions)
         if command -v gh >/dev/null 2>&1; then
-            gh pr create --title "Release $version" --body "Automated release PR for version $version"
+            gh pr create --title "release $version" --body "release $version"
             log_success "PR created successfully"
         else
-            log_warning "GitHub CLI not found. Please create a PR manually from $current_branch to main"
-            log_info "Visit: https://github.com/OWNER/REPO/compare/main...$current_branch"
+            log_warning "GitHub CLI not found. Please create a PR manually."
         fi
     fi
 }
