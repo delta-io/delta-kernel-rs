@@ -23,17 +23,21 @@ rust-version = "1.80"
 version = "0.6.0"
 
 [workspace.dependencies]
-arrow = { version = ">=53, <54" }
-arrow-arith = { version = ">=53, <54" }
-arrow-array = { version = ">=53, <54" }
-arrow-buffer = { version = ">=53, <54" }
-arrow-cast = { version = ">=53, <54" }
-arrow-data = { version = ">=53, <54" }
-arrow-ord = { version = ">=53, <54" }
-arrow-json = { version = ">=53, <54" }
-arrow-select = { version = ">=53, <54" }
-arrow-schema = { version = ">=53, <54" }
-parquet = { version = ">=53, <54", features = ["object_store"] }
+# When changing the arrow version range, also modify ffi/Cargo.toml which has
+# its own arrow version ranges witeh modified features. Failure to do so will
+# result in compilation errors as two different sets of arrow dependencies may
+# be sourced
+arrow = { version = ">=53, <55" }
+arrow-arith = { version = ">=53, <55" }
+arrow-array = { version = ">=53, <55" }
+arrow-buffer = { version = ">=53, <55" }
+arrow-cast = { version = ">=53, <55" }
+arrow-data = { version = ">=53, <55" }
+arrow-ord = { version = ">=53, <55" }
+arrow-json = { version = ">=53, <55" }
+arrow-select = { version = ">=53, <55" }
+arrow-schema = { version = ">=53, <55" }
+parquet = { version = ">=53, <55", features = ["object_store"] }
 object_store = { version = ">=0.11, <0.12" }
 hdfs-native-object-store = "0.12.0"
 hdfs-native = "0.10.0"
