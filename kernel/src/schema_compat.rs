@@ -2,7 +2,7 @@
 //! compatibility is [`can_read_as`].
 //!
 //! # Examples
-//!  ```rust
+//!  ```rust, ignore
 //!  # use delta_kernel::schema::StructType;
 //!  # use delta_kernel::schema::StructField;
 //!  # use delta_kernel::schema::DataType;
@@ -63,7 +63,6 @@ impl crate::schema::StructField {
 impl crate::schema::StructType {
     /// Returns `Ok` if this [`StructType`] can be read as `read_type` in the read schema.
     #[allow(unused)]
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn can_read_as(&self, read_type: &Self) -> DeltaResult<()> {
         let field_map: HashMap<String, &crate::schema::StructField> = self
             .fields
