@@ -101,13 +101,15 @@ handle_release_branch() {
         git diff HEAD^
     fi
 
-    if confirm "Would you like to open a PR with these changes?"; then
+    if confirm "Would you like to push these changes to 'origin' remote?"; then
         local current_branch
         current_branch=$(git rev-parse --abbrev-ref HEAD)
 
         log_info "Pushing changes to remote..."
         git push origin "$current_branch"
+    fi
 
+    if confirm "Would you like to create a PR to merge this release into 'main'?"; then
         if command -v gh >/dev/null 2>&1; then
             gh pr create --title "release $version" --body "release $version"
             log_success "PR created successfully"
@@ -119,9 +121,6 @@ handle_release_branch() {
 
 # Handle main branch workflow (publish and tag)
 handle_main_branch() {
-    local current_version
-    current_version=$(get_current_version)
-
     # could potentially just use full 'cargo release' command here
     publish "delta_kernel_derive" "$current_version"
     publish "delta_kernel" "$current_version"
@@ -136,7 +135,8 @@ handle_main_branch() {
 
 publish() {
     local crate_name="$1"
-    local version="$2"
+    local current_version
+    current_version=$(get_current_version "$crate_name")
 
     if is_version_published "delta_kernel_derive"; then
         log_error "delta_kernel_derive version $current_version is already published to crates.io"
@@ -155,22 +155,16 @@ publish() {
     fi
 }
 
-# Main workflow
-main() {
-    check_requirements
+check_requirements
 
-    if is_main_branch; then
-        if [[ $# -ne 0 ]]; then
-            log_warning "Version argument ignored on main branch - using version from Cargo.toml"
-        fi
-        handle_main_branch
-    else
-        if [[ $# -ne 1 ]]; then
-            log_error "Version argument required when on release branch\nUsage: $0 <version>"
-        fi
-        handle_release_branch "$1"
+if is_main_branch; then
+    if [[ $# -ne 0 ]]; then
+        log_error "Version argument not expected on main branch\nUsage: $0"
     fi
-}
-
-# Entry point
-main "$@"
+    handle_main_branch
+else
+    if [[ $# -ne 1 ]]; then
+        log_error "Version argument required when on release branch\nUsage: $0 <version>"
+    fi
+    handle_release_branch "$1"
+fi
