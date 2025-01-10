@@ -117,30 +117,42 @@ handle_release_branch() {
     fi
 }
 
-# Handle main branch workflow (publishing)
+# Handle main branch workflow (publish and tag)
 handle_main_branch() {
     local current_version
     current_version=$(get_current_version)
 
-    # Check for clean working tree
-    if ! is_working_tree_clean; then
-        log_error "Working tree is not clean. Please commit or stash changes before publishing"
-    fi
+    # could potentially just use full 'cargo release' command here
+    publish "delta_kernel_derive" "$current_version"
+    publish "delta_kernel" "$current_version"
 
-    # Check if version is already published
-    if is_version_published "delta_kernel"; then
-        log_error "delta_kernel at version $current_version is already published to crates.io"
+    if confirm "Would you like to tag this release?"; then
+        log_info "Tagging release $current_version..."
+        git tag -a "v$current_version" -m "Release $current_version"
+        git push upstream "v$current_version"
+        log_success "Tagged release $current_version"
     fi
+}
+
+publish() {
+    local crate_name="$1"
+    local version="$2"
 
     if is_version_published "delta_kernel_derive"; then
         log_error "delta_kernel_derive version $current_version is already published to crates.io"
     fi
-
-    log_info "Publishing delta_kernel version $current_version to crates.io..."
-    if ! cargo release; then
-        log_error "Failed to publish to crates.io"
+    log_info "[DRY RUN] Publishing $crate_name version $version to crates.io..."
+    if ! cargo publish --dry-run -p "$crate_name"; then
+        log_error "Failed to publish $crate_name to crates.io"
     fi
-    log_success "Successfully published version $current_version to crates.io"
+
+    if confirm "Dry run complete. Continue with publishing?"; then
+        log_info "Publishing $crate_name version $version to crates.io..."
+        if ! cargo publish -p "$crate_name"; then
+            log_error "Failed to publish $crate_name to crates.io"
+        fi
+        log_success "Successfully published $crate_name version $version to crates.io"
+    fi
 }
 
 # Main workflow
