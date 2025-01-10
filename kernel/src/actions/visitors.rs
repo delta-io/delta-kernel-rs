@@ -268,7 +268,7 @@ impl RemoveVisitor {
             getters[3].get_opt(row_index, "remove.extendedFileMetadata")?;
 
         let partition_values: Option<HashMap<_, _>> =
-            getters[4].get_opt(row_index, "add.partitionValues")?;
+            getters[4].get_opt(row_index, "remove.partitionValues")?;
 
         let size: Option<i64> = getters[5].get_opt(row_index, "remove.size")?;
 
@@ -606,11 +606,7 @@ mod tests {
             modification_time: 1670892998135,
             data_change: true,
             stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":5},\"maxValues\":{\"c3\":5},\"nullCount\":{\"c3\":0}}".into()),
-            tags: None,
-            deletion_vector: None,
-            base_row_id: None,
-            default_row_commit_version: None,
-            clustering_provider: None,
+            ..Default::default()
         };
         let add2 = Add {
             path: "c1=5/c2=b/part-00007-4e73fa3b-2c88-424a-8051-f8b54328ffdb.c000.snappy.parquet".into(),
@@ -633,7 +629,7 @@ mod tests {
             ..add1.clone()
         };
         let expected = vec![add1, add2, add3];
-        assert!(add_visitor.adds.len() == expected.len());
+        assert_eq!(add_visitor.adds.len(), expected.len());
         for (add, expected) in add_visitor.adds.into_iter().zip(expected.into_iter()) {
             assert_eq!(add, expected);
         }
@@ -669,10 +665,7 @@ mod tests {
             ])),
             size: Some(452),
             stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":5},\"maxValues\":{\"c3\":5},\"nullCount\":{\"c3\":0}}".into()),
-            tags: None,
-            deletion_vector: None,
-            base_row_id: None,
-            default_row_commit_version: None,
+            ..Default::default()
         };
         let remove2 = Remove {
             path: "c1=5/c2=b/part-00007-4e73fa3b-2c88-424a-8051-f8b54328ffdb.c000.snappy.parquet".into(),
@@ -695,7 +688,7 @@ mod tests {
             ..remove1.clone()
         };
         let expected = vec![remove1, remove2, remove3];
-        assert!(remove_visitor.removes.len() == expected.len());
+        assert_eq!(remove_visitor.removes.len(), expected.len());
         for (remove, expected) in remove_visitor.removes.into_iter().zip(expected.into_iter()) {
             assert_eq!(remove, expected);
         }
