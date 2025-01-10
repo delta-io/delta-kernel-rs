@@ -268,7 +268,7 @@ fn test_sql_where() {
     const NO_NULL: i64 = 0;
     let do_test =
         |nullcount: i64, expr: &Expr, expected: Option<bool>, expected_sql: Option<bool>| {
-            assert!(0 <= nullcount && nullcount <= ROWCOUNT);
+            assert!((0..=ROWCOUNT).contains(&nullcount));
             let (min, max) = if nullcount < ROWCOUNT {
                 (Scalar::Integer(5), Scalar::Integer(15))
             } else {
