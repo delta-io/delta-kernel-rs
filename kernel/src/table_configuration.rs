@@ -22,7 +22,7 @@ use crate::{DeltaResult, Version};
 /// [`TableConfiguration::is_deletion_vector_supported`] and deletion vector write enablement can
 /// be checked  with [`TableConfiguration::is_deletion_vector_enabled`].
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct TableConfiguration {
     metadata: Metadata,
     protocol: Protocol,
