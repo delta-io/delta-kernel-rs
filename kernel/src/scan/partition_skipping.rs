@@ -5,7 +5,6 @@ use std::{
 
 use tracing::debug;
 
-use crate::{expressions::column_expr, schema::StructType};
 use crate::schema::column_name;
 use crate::{
     engine_data::GetData,
@@ -15,6 +14,7 @@ use crate::{
     schema::{ColumnName, DataType, MapType, SchemaRef},
     DeltaResult, Engine, EngineData, Expression, ExpressionEvaluator, ExpressionRef, RowVisitor,
 };
+use crate::{expressions::column_expr, schema::StructType};
 
 pub(crate) struct PartitionSkippingFilter {
     evaluator: Arc<dyn ExpressionEvaluator>,
@@ -37,7 +37,10 @@ impl PartitionSkippingFilter {
         // Limit the schema passed to the row visitor of only the fields that are included
         // in the predicate and are also partition columns. The data skipping columns will
         // be handled elsewhere.
-        let partition_fields = schema.fields().filter(|f| partition_columns.contains(f.name())).cloned();
+        let partition_fields = schema
+            .fields()
+            .filter(|f| partition_columns.contains(f.name()))
+            .cloned();
         let schema = Arc::new(StructType::new(partition_fields));
 
         let partitions_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
