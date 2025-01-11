@@ -129,7 +129,9 @@ pub trait TypedGetData<'a, T> {
     fn get_opt(&'a self, row_index: usize, field_name: &str) -> DeltaResult<Option<T>>;
     fn get(&'a self, row_index: usize, field_name: &str) -> DeltaResult<T> {
         let val = self.get_opt(row_index, field_name)?;
-        val.ok_or_else(|| Error::MissingData(format!("Data missing for field {field_name}")))
+        val.ok_or_else(|| {
+            Error::MissingData(format!("Data missing for field {field_name}")).with_backtrace()
+        })
     }
 }
 
