@@ -33,7 +33,7 @@ use crate::{DeltaResult, Version};
 /// `try_new` successfully returns `TableConfiguration`, it is also guaranteed that reading the
 /// table is supported.
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct TableConfiguration {
     metadata: Metadata,
     protocol: Protocol,

@@ -10,7 +10,8 @@ use crate::actions::deletion_vector::split_vector;
 use crate::scan::state::GlobalScanState;
 use crate::scan::{ColumnType, PhysicalPredicate, ScanResult};
 use crate::schema::{SchemaRef, StructType};
-use crate::{DeltaResult, Engine, ExpressionRef, FileMeta};
+use crate::table_configuration::TableConfiguration;
+use crate::{table_configuration, DeltaResult, Engine, ExpressionRef, FileMeta};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanData};
 use super::physical_to_logical::{physical_to_logical_expr, scan_file_physical_schema};
@@ -198,7 +199,14 @@ impl TableChangesScan {
             PhysicalPredicate::None => None,
         };
         let schema = self.table_changes.end_snapshot.schema().clone().into();
-        let it = table_changes_action_iter(engine, commits, schema, physical_predicate)?;
+        let table_configuration = self.table_changes.table_configuration.clone();
+        let it = table_changes_action_iter(
+            engine,
+            commits,
+            schema,
+            physical_predicate,
+            table_configuration,
+        )?;
         Ok(Some(it).into_iter().flatten())
     }
 

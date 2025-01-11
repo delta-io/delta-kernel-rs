@@ -42,8 +42,8 @@ impl MetadataVisitor {
         // get format out of primitives
         let format_provider: String = getters[3].get(row_index, "metadata.format.provider")?;
         // options for format is always empty, so skip getters[4]
-        let schema_string: String = getters[5].get(row_index, "metadata.schema_string")?;
-        let partition_columns: Vec<_> = getters[6].get(row_index, "metadata.partition_list")?;
+        let schema_string: String = getters[5].get(row_index, "metadata.schemaString")?;
+        let partition_columns: Vec<_> = getters[6].get(row_index, "metadata.partitionColumns")?;
         let created_time: Option<i64> = getters[7].get_opt(row_index, "metadata.created_time")?;
         let configuration_map_opt: Option<HashMap<_, _>> =
             getters[8].get_opt(row_index, "metadata.configuration")?;
@@ -75,9 +75,9 @@ impl RowVisitor for MetadataVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
             // Since id column is required, use it to detect presence of a metadata action
-            if let Some(id) = getters[0].get_opt(i, "metadata.id")? {
+            if let Some(id) = getters[0].get_opt(i, "metaData.id")? {
                 self.metadata = Some(Self::visit_metadata(i, id, getters)?);
-                break;
+                break; // A commit has at most metaData action
             }
         }
         Ok(())

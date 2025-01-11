@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::schemas::GetStructField;
-use crate::actions::visitors::{visit_deletion_vector_at, ProtocolVisitor};
+use crate::actions::visitors::{visit_deletion_vector_at, MetadataVisitor, ProtocolVisitor};
 use crate::actions::{
     get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, METADATA_NAME,
     PROTOCOL_NAME, REMOVE_NAME,
@@ -18,6 +18,7 @@ use crate::scan::state::DvInfo;
 use crate::schema::{ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructType};
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_changes::{check_cdf_table_properties, ensure_cdf_read_supported};
+use crate::table_configuration::TableConfiguration;
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef, RowVisitor};
@@ -52,14 +53,23 @@ pub(crate) fn table_changes_action_iter(
     commit_files: impl IntoIterator<Item = ParsedLogPath>,
     table_schema: SchemaRef,
     physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+    mut table_configuration: TableConfiguration,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanData>>> {
     let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
+    let engine_clone = engine.clone();
     let result = commit_files
         .into_iter()
-        .map(move |commit_file| -> DeltaResult<_> {
-            let scanner = LogReplayScanner::try_new(engine.as_ref(), commit_file, &table_schema)?;
-            scanner.into_scan_batches(engine.clone(), filter.clone())
+        .map(move |commit_file| -> DeltaResult<ProcessedCDFCommit> {
+            process_cdf_commit(
+                engine.as_ref(),
+                commit_file,
+                &table_schema,
+                &mut table_configuration,
+            )
         }) //Iterator-Result-Iterator-Result
+        .map(move |processed_commit| -> DeltaResult<_> {
+            commit_to_scan_batches(processed_commit?, engine_clone.clone(), filter.clone())
+        })
         .flatten_ok() // Iterator-Result-Result
         .map(|x| x?); // Iterator-Result
     Ok(result)
@@ -109,7 +119,7 @@ pub(crate) fn table_changes_action_iter(
 /// Note: As a consequence of the two phases, LogReplayScanner will iterate over each action in the
 /// commit twice. It also may use an unbounded amount of memory, proportional to the number of
 /// `add` + `remove` actions in the _single_ commit.
-struct LogReplayScanner {
+struct ProcessedCDFCommit {
     // True if a `cdc` action was found after running [`LogReplayScanner::try_new`]
     has_cdc_action: bool,
     // A map from path to the deletion vector from the remove action. It is guaranteed that there
@@ -129,148 +139,148 @@ struct LogReplayScanner {
     timestamp: i64,
 }
 
-impl LogReplayScanner {
-    /// Constructs a LogReplayScanner, performing the Prepare phase detailed in [`LogReplayScanner`].
-    /// This iterates over each action in the commit. It performs the following:
-    /// 1. Check the commits for the presence of a `cdc` action.
-    /// 2. Construct a map from path to deletion vector of remove actions that share the same path
-    ///    as an add action.
-    /// 3. Perform validation on each protocol and metadata action in the commit.
-    ///
-    /// For more details, see the documentation for [`LogReplayScanner`].
-    fn try_new(
-        engine: &dyn Engine,
-        commit_file: ParsedLogPath,
-        table_schema: &SchemaRef,
-    ) -> DeltaResult<Self> {
-        let visitor_schema = PreparePhaseVisitor::schema();
+/// Constructs a LogReplayScanner, performing the Prepare phase detailed in [`LogReplayScanner`].
+/// This iterates over each action in the commit. It performs the following:
+/// 1. Check the commits for the presence of a `cdc` action.
+/// 2. Construct a map from path to deletion vector of remove actions that share the same path
+///    as an add action.
+/// 3. Perform validation on each protocol and metadata action in the commit.
+///
+/// For more details, see the documentation for [`LogReplayScanner`].
+fn process_cdf_commit(
+    engine: &dyn Engine,
+    commit_file: ParsedLogPath,
+    table_schema: &SchemaRef,
+    table_configuration: &mut TableConfiguration,
+) -> DeltaResult<ProcessedCDFCommit> {
+    let visitor_schema = PreparePhaseVisitor::schema();
 
-        // Note: We do not perform data skipping yet because we need to visit all add and
-        // remove actions for deletion vector resolution to be correct.
-        //
-        // Consider a scenario with a pair of add/remove actions with the same path. The add
-        // action has file statistics, while the remove action does not (stats is optional for
-        // remove). In this scenario we might skip the add action, while the remove action remains.
-        // As a result, we would read the file path for the remove action, which is unnecessary because
-        // all of the rows will be filtered by the predicate. Instead, we wait until deletion
-        // vectors are resolved so that we can skip both actions in the pair.
-        let action_iter = engine.get_json_handler().read_json_files(
-            &[commit_file.location.clone()],
-            visitor_schema,
-            None, // not safe to apply data skipping yet
-        )?;
+    // Note: We do not perform data skipping yet because we need to visit all add and
+    // remove actions for deletion vector resolution to be correct.
+    //
+    // Consider a scenario with a pair of add/remove actions with the same path. The add
+    // action has file statistics, while the remove action does not (stats is optional for
+    // remove). In this scenario we might skip the add action, while the remove action remains.
+    // As a result, we would read the file path for the remove action, which is unnecessary because
+    // all of the rows will be filtered by the predicate. Instead, we wait until deletion
+    // vectors are resolved so that we can skip both actions in the pair.
+    let action_iter = engine.get_json_handler().read_json_files(
+        &[commit_file.location.clone()],
+        visitor_schema,
+        None, // not safe to apply data skipping yet
+    )?;
 
-        let mut remove_dvs = HashMap::default();
-        let mut add_paths = HashSet::default();
-        let mut has_cdc_action = false;
-        for actions in action_iter {
-            let actions = actions?;
+    let mut remove_dvs = HashMap::default();
+    let mut add_paths = HashSet::default();
+    let mut has_cdc_action = false;
+    for actions in action_iter {
+        let actions = actions?;
 
-            let mut visitor = PreparePhaseVisitor {
-                add_paths: &mut add_paths,
-                remove_dvs: &mut remove_dvs,
-                has_cdc_action: &mut has_cdc_action,
-                protocol: None,
-                metadata_info: None,
-            };
-            visitor.visit_rows_of(actions.as_ref())?;
+        let mut visitor = PreparePhaseVisitor {
+            add_paths: &mut add_paths,
+            remove_dvs: &mut remove_dvs,
+            has_cdc_action: &mut has_cdc_action,
+            protocol: None,
+            metadata: None,
+        };
+        visitor.visit_rows_of(actions.as_ref())?;
 
-            if let Some(protocol) = visitor.protocol {
-                ensure_cdf_read_supported(&protocol)
-                    .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;
-            }
-            if let Some((schema, configuration)) = visitor.metadata_info {
-                let schema: StructType = serde_json::from_str(&schema)?;
-                // Currently, schema compatibility is defined as having equal schema types. In the
-                // future, more permisive schema evolution will be supported.
-                // See: https://github.com/delta-io/delta-kernel-rs/issues/523
-                require!(
-                    table_schema.as_ref() == &schema,
-                    Error::change_data_feed_incompatible_schema(table_schema, &schema)
-                );
-                let table_properties = TableProperties::from(configuration);
-                check_cdf_table_properties(&table_properties)
-                    .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;
-            }
+        //table_configuration.with_protocol(visitor.protocol)?;
+        //if let Some(metadata) = visitor.metadata {
+        //    table_configuration.with_metadata(metadata)?;
+        //    // Currently, schema compatibility is defined as having equal schema types. In the
+        //    // future, more permisive schema evolution will be supported.
+        //    // See: https://github.com/delta-io/delta-kernel-rs/issues/523
+        //    require!(
+        //        table_schema.as_ref() == table_configuration.schema(),
+        //        Error::change_data_feed_incompatible_schema(
+        //            table_schema,
+        //            table_configuration.schema()
+        //        )
+        //    );
+        //}
+        if !table_configuration.is_cdf_read_supported() {
+            return Err(Error::change_data_feed_unsupported(commit_file.version));
         }
-        // We resolve the remove deletion vector map after visiting the entire commit.
-        if has_cdc_action {
-            remove_dvs.clear();
-        } else {
-            // The only (path, deletion_vector) pairs we must track are ones whose path is the
-            // same as an `add` action.
-            remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
-        }
-        Ok(LogReplayScanner {
-            timestamp: commit_file.location.last_modified,
-            commit_file,
-            has_cdc_action,
-            remove_dvs,
+    }
+    // We resolve the remove deletion vector map after visiting the entire commit.
+    if has_cdc_action {
+        remove_dvs.clear();
+    } else {
+        // The only (path, deletion_vector) pairs we must track are ones whose path is the
+        // same as an `add` action.
+        remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
+    }
+    let processed_commit = ProcessedCDFCommit {
+        timestamp: commit_file.location.last_modified,
+        commit_file,
+        has_cdc_action,
+        remove_dvs,
+    };
+    Ok(processed_commit)
+}
+
+/// Generates an iterator of [`TableChangesScanData`] by iterating over each action of the
+/// commit, generating a selection vector, and transforming the engine data. This performs
+/// phase 2 of [`LogReplayScanner`].
+fn commit_to_scan_batches(
+    processed_commit: ProcessedCDFCommit,
+    engine: Arc<dyn Engine>,
+    filter: Option<Arc<DataSkippingFilter>>,
+) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanData>>> {
+    let ProcessedCDFCommit {
+        has_cdc_action,
+        remove_dvs,
+        commit_file,
+        // TODO: Add the timestamp as a column with an expression
+        timestamp,
+    } = processed_commit;
+    let remove_dvs = Arc::new(remove_dvs);
+
+    let schema = FileActionSelectionVisitor::schema();
+    let action_iter =
+        engine
+            .get_json_handler()
+            .read_json_files(&[commit_file.location.clone()], schema, None)?;
+    let commit_version = commit_file
+        .version
+        .try_into()
+        .map_err(|_| Error::generic("Failed to convert commit version to i64"))?;
+    let evaluator = engine.get_expression_handler().get_evaluator(
+        get_log_add_schema().clone(),
+        cdf_scan_row_expression(timestamp, commit_version),
+        cdf_scan_row_schema().into(),
+    );
+
+    let result = action_iter.map(move |actions| -> DeltaResult<_> {
+        let actions = actions?;
+
+        // Apply data skipping to get back a selection vector for actions that passed skipping.
+        // We start our selection vector based on what was filtered. We will add to this vector
+        // below if a file has been removed. Note: None implies all files passed data skipping.
+        let selection_vector = match &filter {
+            Some(filter) => filter.apply(actions.as_ref())?,
+            None => vec![true; actions.len()],
+        };
+
+        let mut visitor =
+            FileActionSelectionVisitor::new(&remove_dvs, selection_vector, has_cdc_action);
+        visitor.visit_rows_of(actions.as_ref())?;
+        let scan_data = evaluator.evaluate(actions.as_ref())?;
+        Ok(TableChangesScanData {
+            scan_data,
+            selection_vector: visitor.selection_vector,
+            remove_dvs: remove_dvs.clone(),
         })
-    }
-    /// Generates an iterator of [`TableChangesScanData`] by iterating over each action of the
-    /// commit, generating a selection vector, and transforming the engine data. This performs
-    /// phase 2 of [`LogReplayScanner`].
-    fn into_scan_batches(
-        self,
-        engine: Arc<dyn Engine>,
-        filter: Option<Arc<DataSkippingFilter>>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanData>>> {
-        let Self {
-            has_cdc_action,
-            remove_dvs,
-            commit_file,
-            // TODO: Add the timestamp as a column with an expression
-            timestamp,
-        } = self;
-        let remove_dvs = Arc::new(remove_dvs);
-
-        let schema = FileActionSelectionVisitor::schema();
-        let action_iter = engine.get_json_handler().read_json_files(
-            &[commit_file.location.clone()],
-            schema,
-            None,
-        )?;
-        let commit_version = commit_file
-            .version
-            .try_into()
-            .map_err(|_| Error::generic("Failed to convert commit version to i64"))?;
-        let evaluator = engine.get_expression_handler().get_evaluator(
-            get_log_add_schema().clone(),
-            cdf_scan_row_expression(timestamp, commit_version),
-            cdf_scan_row_schema().into(),
-        );
-
-        let result = action_iter.map(move |actions| -> DeltaResult<_> {
-            let actions = actions?;
-
-            // Apply data skipping to get back a selection vector for actions that passed skipping.
-            // We start our selection vector based on what was filtered. We will add to this vector
-            // below if a file has been removed. Note: None implies all files passed data skipping.
-            let selection_vector = match &filter {
-                Some(filter) => filter.apply(actions.as_ref())?,
-                None => vec![true; actions.len()],
-            };
-
-            let mut visitor =
-                FileActionSelectionVisitor::new(&remove_dvs, selection_vector, has_cdc_action);
-            visitor.visit_rows_of(actions.as_ref())?;
-            let scan_data = evaluator.evaluate(actions.as_ref())?;
-            Ok(TableChangesScanData {
-                scan_data,
-                selection_vector: visitor.selection_vector,
-                remove_dvs: remove_dvs.clone(),
-            })
-        });
-        Ok(result)
-    }
+    });
+    Ok(result)
 }
 
 // This is a visitor used in the prepare phase of [`LogReplayScanner`]. See
 // [`LogReplayScanner::try_new`] for details usage.
 struct PreparePhaseVisitor<'a> {
     protocol: Option<Protocol>,
-    metadata_info: Option<(String, HashMap<String, String>)>,
+    metadata: Option<Metadata>,
     has_cdc_action: &'a mut bool,
     add_paths: &'a mut HashSet<String>,
     remove_dvs: &'a mut HashMap<String, DvInfo>,
@@ -295,8 +305,8 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
             const INTEGER: DataType = DataType::INTEGER;
             const LONG: DataType = DataType::LONG;
             const BOOLEAN: DataType = DataType::BOOLEAN;
-            let string_list: DataType = ArrayType::new(STRING, false).into();
-            let string_string_map = MapType::new(STRING, STRING, false).into();
+            let s_list: DataType = ArrayType::new(STRING, false).into();
+            let ss_map: DataType = MapType::new(STRING, STRING, false).into();
             let types_and_names = vec![
                 (STRING, column_name!("add.path")),
                 (BOOLEAN, column_name!("add.dataChange")),
@@ -308,12 +318,18 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 (INTEGER, column_name!("remove.deletionVector.sizeInBytes")),
                 (LONG, column_name!("remove.deletionVector.cardinality")),
                 (STRING, column_name!("cdc.path")),
+                (STRING, column_name!("metaData.name")),
+                (STRING, column_name!("metaData.description")),
+                (STRING, column_name!("metaData.format.provider")),
+                (ss_map.clone(), column_name!("metaData.format.options")),
                 (STRING, column_name!("metaData.schemaString")),
-                (string_string_map, column_name!("metaData.configuration")),
+                (s_list.clone(), column_name!("metaData.partitionColumns")),
+                (LONG, column_name!("metadata.createdTime")),
+                (ss_map, column_name!("metaData.configuration")),
                 (INTEGER, column_name!("protocol.minReaderVersion")),
                 (INTEGER, column_name!("protocol.minWriterVersion")),
-                (string_list.clone(), column_name!("protocol.readerFeatures")),
-                (string_list, column_name!("protocol.writerFeatures")),
+                (s_list.clone(), column_name!("protocol.readerFeatures")),
+                (s_list, column_name!("protocol.writerFeatures")),
             ];
             let (types, names) = types_and_names.into_iter().unzip();
             (names, types).into()
@@ -323,7 +339,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
 
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 16,
+            getters.len() == 22,
             Error::InternalError(format!(
                 "Wrong number of PreparePhaseVisitor getters: {}",
                 getters.len()
@@ -344,15 +360,14 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 }
             } else if getters[9].get_str(i, "cdc.path")?.is_some() {
                 *self.has_cdc_action = true;
-            } else if let Some(schema) = getters[10].get_str(i, "metaData.schemaString")? {
-                let configuration_map_opt = getters[11].get_opt(i, "metadata.configuration")?;
-                let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
-                self.metadata_info = Some((schema.to_string(), configuration));
+            } else if let Some(id) = getters[10].get_str(i, "metaData.id")? {
+                let metadata = MetadataVisitor::visit_metadata(i, id.to_string(), getters)?;
+                self.metadata = Some(metadata);
             } else if let Some(min_reader_version) =
-                getters[12].get_int(i, "protocol.min_reader_version")?
+                getters[18].get_int(i, "protocol.min_reader_version")?
             {
                 let protocol =
-                    ProtocolVisitor::visit_protocol(i, min_reader_version, &getters[12..=15])?;
+                    ProtocolVisitor::visit_protocol(i, min_reader_version, &getters[18..=21])?;
                 self.protocol = Some(protocol);
             }
         }
