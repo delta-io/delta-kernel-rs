@@ -5,7 +5,7 @@ use std::{
 
 use tracing::debug;
 
-use crate::expressions::column_expr;
+use crate::{expressions::column_expr, schema::StructType};
 use crate::schema::column_name;
 use crate::{
     engine_data::GetData,
@@ -26,12 +26,19 @@ impl PartitionSkippingFilter {
     pub(crate) fn new(
         engine: &dyn Engine,
         physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+        partition_columns: &[String],
     ) -> Option<Self> {
         static PARITIONS_EXPR: LazyLock<Expression> =
             LazyLock::new(|| column_expr!("add.partitionValues"));
 
         let (predicate, schema) = physical_predicate?;
         debug!("Creating a partition skipping filter for {:#?}", predicate);
+
+        // Limit the schema passed to the row visitor of only the fields that are included
+        // in the predicate and are also partition columns. The data skipping columns will
+        // be handled elsewhere.
+        let partition_fields = schema.fields().filter(|f| partition_columns.contains(f.name())).cloned();
+        let schema = Arc::new(StructType::new(partition_fields));
 
         let partitions_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
 
@@ -96,23 +103,19 @@ impl RowVisitor for PartitionVisitor {
         for i in 0..row_count {
             let val = getter.get_map(i, "output")?.map(|m| {
                 let partition_values = m.materialize();
-                let resolver = partition_values
-                    .iter()
-                    .filter(|(k, _v)| self.schema.field(k).is_some())
-                    .map(|(k, v)| {
-                        // The schema we are evaluating only contains the fields of interest,
-                        // not all partition fields. The unwrap is safe because we have already
-                        // checked in the filter above.
-                        let data_type = self.schema.field(k).unwrap().data_type();
+                let resolver = self.schema.fields()
+                    .map(|field| {
+                        let data_type = field.data_type();
 
                         let DataType::Primitive(primitive_type) = data_type else {
                             return Err(crate::Error::unsupported(
-                                format!("Partition filtering only supported for primitive types. Found type: {}", data_type)
+                                format!("Partition filtering only supported for primitive types. Found type {} for field {}", data_type, field.name())
                             ));
                         };
 
-                        let scalar = primitive_type.parse_scalar(v)?;
-                        Ok((ColumnName::new([k]), scalar))
+                        let scalar = partition_values.get(field.name()).map(|v| primitive_type.parse_scalar(v)).transpose()?.unwrap_or(Scalar::Null(data_type.clone()));
+
+                        Ok((ColumnName::new([field.name()]), scalar))
                     })
                     .collect::<DeltaResult<HashMap<ColumnName, Scalar>>>()?;
 

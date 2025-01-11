@@ -256,11 +256,11 @@ impl LogReplayScanner {
     fn new(
         engine: &dyn Engine,
         physical_predicate: Option<(ExpressionRef, SchemaRef)>,
-        have_partition_cols: bool,
+        partition_columns: &[String],
     ) -> Self {
-        let partition_filter = match have_partition_cols {
-            true => PartitionSkippingFilter::new(engine, physical_predicate.clone()),
-            false => None,
+        let partition_filter = match partition_columns.is_empty() {
+            false => PartitionSkippingFilter::new(engine, physical_predicate.clone(), partition_columns),
+            true => None,
         };
         Self {
             partition_filter,
@@ -324,9 +324,9 @@ pub(crate) fn scan_action_iter(
     logical_schema: SchemaRef,
     transform: Option<Arc<Transform>>,
     physical_predicate: Option<(ExpressionRef, SchemaRef)>,
-    have_partition_cols: bool,
+    partition_columns: &[String],
 ) -> impl Iterator<Item = DeltaResult<ScanData>> {
-    let mut log_scanner = LogReplayScanner::new(engine, physical_predicate, have_partition_cols);
+    let mut log_scanner = LogReplayScanner::new(engine, physical_predicate, partition_columns);
     let add_transform = engine.get_expression_handler().get_evaluator(
         get_log_add_schema().clone(),
         get_add_transform_expr(),
