@@ -6,9 +6,9 @@ header = """
 """
 # Tera template
 body = """
-## [{{ version }}](https://github.com/delta-io/delta-kernel-rs/tree/{{ version }}/) ({{ timestamp | date(format="%Y-%m-%d") }})
+## [v{{ version }}](https://github.com/delta-io/delta-kernel-rs/tree/v{{ version }}/) ({{ timestamp | date(format="%Y-%m-%d") }})
 
-[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/{{ previous.version }}...{{ version }})
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/{{ previous.version }}...v{{ version }})
 
 {% for group, commits in commits | group_by(attribute="group") %}
     ### {{ group | striptags | trim | upper_first }}
