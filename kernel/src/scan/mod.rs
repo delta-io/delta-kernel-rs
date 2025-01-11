@@ -13,9 +13,7 @@ use crate::actions::deletion_vector::{
 };
 use crate::actions::{get_log_add_schema, get_log_schema, ADD_NAME, REMOVE_NAME};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, ExpressionTransform, Scalar};
-use crate::predicates::parquet_stats_skipping::{
-    ParquetStatsProvider, ParquetStatsSkippingFilter as _,
-};
+use crate::predicates::{DefaultPredicateEvaluator, EmptyColumnResolver};
 use crate::scan::state::{DvInfo, Stats};
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
@@ -184,27 +182,10 @@ impl PhysicalPredicate {
 
 // Evaluates a static data skipping predicate, ignoring any column references, and returns true if
 // the predicate allows to statically skip all files. Since this is direct evaluation (not an
-// expression rewrite), we use a dummy `ParquetStatsProvider` that provides no stats.
+// expression rewrite), we use a `DefaultPredicateEvaluator` with an empty column resolver.
 fn can_statically_skip_all_files(predicate: &Expression) -> bool {
-    struct NoStats;
-    impl ParquetStatsProvider for NoStats {
-        fn get_parquet_min_stat(&self, _: &ColumnName, _: &DataType) -> Option<Scalar> {
-            None
-        }
-
-        fn get_parquet_max_stat(&self, _: &ColumnName, _: &DataType) -> Option<Scalar> {
-            None
-        }
-
-        fn get_parquet_nullcount_stat(&self, _: &ColumnName) -> Option<i64> {
-            None
-        }
-
-        fn get_parquet_rowcount_stat(&self) -> i64 {
-            0
-        }
-    }
-    NoStats.eval_sql_where(predicate) == Some(false)
+    use crate::predicates::PredicateEvaluator as _;
+    DefaultPredicateEvaluator::from(EmptyColumnResolver).eval_sql_where(predicate) == Some(false)
 }
 
 // Build the stats read schema filtering the table schema to keep only skipping-eligible
