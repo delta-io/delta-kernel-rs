@@ -117,7 +117,7 @@ impl RowVisitor for PartitionVisitor {
                     .collect::<DeltaResult<HashMap<ColumnName, Scalar>>>()?;
 
                 let filter = DefaultPredicateEvaluator::from(resolver);
-                Ok(filter.eval_expr(&self.predicate, false).unwrap_or(false))
+                Ok(filter.eval_expr(&self.predicate, false).unwrap_or(true))
             });
 
             let val = match val {
