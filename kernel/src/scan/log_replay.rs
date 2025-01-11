@@ -259,7 +259,9 @@ impl LogReplayScanner {
         partition_columns: &[String],
     ) -> Self {
         let partition_filter = match partition_columns.is_empty() {
-            false => PartitionSkippingFilter::new(engine, physical_predicate.clone(), partition_columns),
+            false => {
+                PartitionSkippingFilter::new(engine, physical_predicate.clone(), partition_columns)
+            }
             true => None,
         };
         Self {
