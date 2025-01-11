@@ -104,7 +104,7 @@ impl RowVisitor for PartitionVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let getter = getters[0];
         for i in 0..row_count {
-            let val = getter.get_map(i, "output")?.map(|m| {
+            let val: Option<DeltaResult<bool>> = getter.get_map(i, "output")?.map(|m| {
                 let partition_values = m.materialize();
                 let resolver = self.schema.fields()
                     .map(|field| {
@@ -126,13 +126,7 @@ impl RowVisitor for PartitionVisitor {
                 Ok(filter.eval_expr(&self.predicate, false).unwrap_or(true))
             });
 
-            let val = match val {
-                Some(Ok(v)) => v,
-                Some(Err(e)) => return Err(e),
-                None => true,
-            };
-
-            self.selection_vector.push(val);
+            self.selection_vector.push(val.transpose()?.unwrap_or(true));
         }
         Ok(())
     }
