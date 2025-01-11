@@ -5,6 +5,7 @@ use std::sync::{Arc, LazyLock};
 use tracing::debug;
 
 use super::data_skipping::DataSkippingFilter;
+use super::partition_skipping::PartitionSkippingFilter;
 use super::ScanData;
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
@@ -29,7 +30,11 @@ impl FileActionKey {
 }
 
 struct LogReplayScanner {
-    filter: Option<DataSkippingFilter>,
+    /// Filter based on partition values
+    partition_filter: Option<PartitionSkippingFilter>,
+
+    /// Filter based on min/max values in the statistics
+    data_filter: Option<DataSkippingFilter>,
 
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
@@ -196,9 +201,21 @@ fn get_add_transform_expr() -> Expression {
 
 impl LogReplayScanner {
     /// Create a new [`LogReplayScanner`] instance
-    fn new(engine: &dyn Engine, physical_predicate: Option<(ExpressionRef, SchemaRef)>) -> Self {
+    fn new(
+        engine: &dyn Engine,
+        physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+        partition_columns: &[String],
+    ) -> Self {
+        let partition_predicate = physical_predicate
+            .as_ref()
+            .filter(|_| !partition_columns.is_empty());
         Self {
-            filter: DataSkippingFilter::new(engine, physical_predicate),
+            partition_filter: PartitionSkippingFilter::new(
+                engine,
+                partition_predicate.cloned(),
+                partition_columns,
+            ),
+            data_filter: DataSkippingFilter::new(engine, physical_predicate),
             seen: Default::default(),
         }
     }
@@ -211,11 +228,23 @@ impl LogReplayScanner {
     ) -> DeltaResult<ScanData> {
         // Apply data skipping to get back a selection vector for actions that passed skipping. We
         // will update the vector below as log replay identifies duplicates that should be ignored.
-        let selection_vector = match &self.filter {
+        let data_selection_vector = match &self.data_filter {
             Some(filter) => filter.apply(actions)?,
             None => vec![true; actions.len()],
         };
-        assert_eq!(selection_vector.len(), actions.len());
+        assert_eq!(data_selection_vector.len(), actions.len());
+
+        let partition_selection_vector = match &self.partition_filter {
+            Some(filter) => filter.apply(actions)?,
+            None => vec![true; actions.len()],
+        };
+        assert_eq!(partition_selection_vector.len(), actions.len());
+
+        let selection_vector = data_selection_vector
+            .iter()
+            .zip(partition_selection_vector.iter())
+            .map(|(a, b)| *a && *b)
+            .collect();
 
         let mut visitor = AddRemoveDedupVisitor {
             seen: &mut self.seen,
@@ -239,8 +268,9 @@ pub fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
     physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+    partition_columns: &[String],
 ) -> impl Iterator<Item = DeltaResult<ScanData>> {
-    let mut log_scanner = LogReplayScanner::new(engine, physical_predicate);
+    let mut log_scanner = LogReplayScanner::new(engine, physical_predicate, partition_columns);
     let add_transform = engine.get_expression_handler().get_evaluator(
         get_log_add_schema().clone(),
         get_add_transform_expr(),
