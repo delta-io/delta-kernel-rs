@@ -255,7 +255,7 @@ impl RemoveVisitor {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Remove> {
         require!(
-            getters.len() == 14,
+            getters.len() == 15,
             Error::InternalError(format!(
                 "Wrong number of RemoveVisitor getters: {}",
                 getters.len()
@@ -267,25 +267,29 @@ impl RemoveVisitor {
         let extended_file_metadata: Option<bool> =
             getters[3].get_opt(row_index, "remove.extendedFileMetadata")?;
 
-        // TODO(nick) handle partition values in getters[4]
+        let partition_values: Option<HashMap<_, _>> =
+            getters[4].get_opt(row_index, "remove.partitionValues")?;
 
         let size: Option<i64> = getters[5].get_opt(row_index, "remove.size")?;
 
-        // TODO(nick) tags are skipped in getters[6]
+        let stats: Option<String> = getters[6].get_opt(row_index, "remove.stats")?;
 
-        let deletion_vector = visit_deletion_vector_at(row_index, &getters[7..])?;
+        // TODO(nick) tags are skipped in getters[7]
 
-        let base_row_id: Option<i64> = getters[12].get_opt(row_index, "remove.baseRowId")?;
+        let deletion_vector = visit_deletion_vector_at(row_index, &getters[8..])?;
+
+        let base_row_id: Option<i64> = getters[13].get_opt(row_index, "remove.baseRowId")?;
         let default_row_commit_version: Option<i64> =
-            getters[13].get_opt(row_index, "remove.defaultRowCommitVersion")?;
+            getters[14].get_opt(row_index, "remove.defaultRowCommitVersion")?;
 
         Ok(Remove {
             path,
             data_change,
             deletion_timestamp,
             extended_file_metadata,
-            partition_values: None,
+            partition_values,
             size,
+            stats,
             tags: None,
             deletion_vector,
             base_row_id,
@@ -305,10 +309,9 @@ impl RowVisitor for RemoveVisitor {
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
-            // Since path column is required, use it to detect presence of an Remove action
+            // Since path column is required, use it to detect presence of a Remove action
             if let Some(path) = getters[0].get_opt(i, "remove.path")? {
                 self.removes.push(Self::visit_remove(i, path, getters)?);
-                break;
             }
         }
         Ok(())
@@ -603,11 +606,7 @@ mod tests {
             modification_time: 1670892998135,
             data_change: true,
             stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":5},\"maxValues\":{\"c3\":5},\"nullCount\":{\"c3\":0}}".into()),
-            tags: None,
-            deletion_vector: None,
-            base_row_id: None,
-            default_row_commit_version: None,
-            clustering_provider: None,
+            ..Default::default()
         };
         let add2 = Add {
             path: "c1=5/c2=b/part-00007-4e73fa3b-2c88-424a-8051-f8b54328ffdb.c000.snappy.parquet".into(),
@@ -630,9 +629,83 @@ mod tests {
             ..add1.clone()
         };
         let expected = vec![add1, add2, add3];
+        assert_eq!(add_visitor.adds.len(), expected.len());
         for (add, expected) in add_visitor.adds.into_iter().zip(expected.into_iter()) {
             assert_eq!(add, expected);
         }
+    }
+
+    #[test]
+    fn test_parse_remove() {
+        let engine = SyncEngine::new();
+        let json_handler = engine.get_json_handler();
+        let json_strings: StringArray = vec![
+            r#"{"commitInfo":{"timestamp":1670892998177,"operation":"DELETE","operationParameters":{"mode":"Append"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"1","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,
+            r#"{"remove":{"path":"part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet","deletionTimestamp":1670892998135,"dataChange":true,"size":452,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":5},\"maxValues\":{\"c3\":5},\"nullCount\":{\"c3\":0}}"}}"#,
+        ]
+        .into();
+        let output_schema = get_log_schema().clone();
+        let batch = json_handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        let mut remove_visitor = RemoveVisitor::default();
+        remove_visitor.visit_rows_of(batch.as_ref()).unwrap();
+        let expected_remove: Remove = Remove {
+            path: "part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet".into(),
+            deletion_timestamp: Some(1670892998135),
+            data_change: true,
+            size: Some(452),
+            stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":5},\"maxValues\":{\"c3\":5},\"nullCount\":{\"c3\":0}}".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            remove_visitor.removes.len(),
+            1,
+            "Unexpected number of removal actions"
+        );
+        assert_eq!(
+            remove_visitor.removes[0], expected_remove,
+            "Unexpected removal action"
+        );
+    }
+
+    #[test]
+    fn test_parse_remove_partitioned() {
+        let engine = SyncEngine::new();
+        let json_handler = engine.get_json_handler();
+        let json_strings: StringArray = vec![
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
+            r#"{"remove":{"path":"c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet","deletionTimestamp":1670892998135,"dataChange":true,"partitionValues":{"c1":"4","c2":"c"},"size":452}}"#,
+        ]
+        .into();
+        let output_schema = get_log_schema().clone();
+        let batch = json_handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        let mut remove_visitor = RemoveVisitor::default();
+        remove_visitor.visit_rows_of(batch.as_ref()).unwrap();
+        let expected_remove = Remove {
+            path: "c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet"
+                .into(),
+            deletion_timestamp: Some(1670892998135),
+            data_change: true,
+            partition_values: Some(HashMap::from([
+                ("c1".to_string(), "4".to_string()),
+                ("c2".to_string(), "c".to_string()),
+            ])),
+            size: Some(452),
+            ..Default::default()
+        };
+        assert_eq!(
+            remove_visitor.removes.len(),
+            1,
+            "Unexpected number of removal actions"
+        );
+        assert_eq!(
+            remove_visitor.removes[0], expected_remove,
+            "Unexpected removal action"
+        );
     }
 
     #[test]
