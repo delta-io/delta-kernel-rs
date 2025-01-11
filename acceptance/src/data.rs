@@ -112,6 +112,7 @@ pub async fn assert_scan_data(engine: Arc<dyn Engine>, test_case: &TestCaseInfo)
     let snapshot = table.snapshot(engine.as_ref(), None)?;
     let scan = snapshot.into_scan_builder().build()?;
     let mut schema = None;
+    // TODO replace with new util
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
         .map(|scan_result| -> DeltaResult<_> {

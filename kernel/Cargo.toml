@@ -63,6 +63,8 @@ parquet = { workspace = true, optional = true }
 # Used for fetching direct urls (like pre-signed urls)
 reqwest = { version = "0.12.8", default-features = false, optional = true }
 strum = { version = "0.26", features = ["derive"] }
+# used in arrow-compute feature for record batch filtering utility
+arrow = { workspace = true, optional = true }
 
 
 # optionally used with default engine (though not required)
@@ -73,6 +75,7 @@ hdfs-native = { workspace = true, optional = true }
 walkdir = { workspace = true, optional = true }
 
 [features]
+arrow-compute = ["arrow", "arrow-conversion"]
 arrow-conversion = ["arrow-schema"]
 arrow-expression = ["arrow-arith", "arrow-array", "arrow-buffer", "arrow-ord", "arrow-schema"]
 cloud = [

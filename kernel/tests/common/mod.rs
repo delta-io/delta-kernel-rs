@@ -1,4 +1,3 @@
-use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
 use itertools::Itertools;
@@ -6,6 +5,7 @@ use itertools::Itertools;
 use crate::ArrowEngineData;
 use delta_kernel::scan::Scan;
 use delta_kernel::{DeltaResult, Engine, EngineData, Table};
+use delta_kernel::engine::arrow_compute::materialize_scan_results;
 
 use std::sync::Arc;
 
@@ -87,18 +87,5 @@ pub(crate) fn test_read(
 // TODO (zach): this is listed as unused for acceptance crate
 #[allow(unused)]
 pub(crate) fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<RecordBatch>> {
-    let scan_results = scan.execute(engine)?;
-    scan_results
-        .map(|scan_result| -> DeltaResult<_> {
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch = to_arrow(data)?;
-            if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
-            } else {
-                Ok(record_batch)
-            }
-        })
-        .try_collect()
+    materialize_scan_results(scan.execute(engine)?).try_collect()
 }

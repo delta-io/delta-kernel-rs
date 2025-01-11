@@ -290,6 +290,7 @@ fn do_work(
             .read_parquet_files(&[meta], physical_schema.clone(), None)
             .unwrap();
 
+        // replace with materialize_scan_results?
         for read_result in read_results {
             let read_result = read_result.unwrap();
             let len = read_result.len();

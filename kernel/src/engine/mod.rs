@@ -33,3 +33,6 @@ declare_modules!(
     (pub(crate), arrow_utils),
     (pub(crate), ensure_data_types)
 );
+
+#[cfg(feature = "arrow-compute")]
+pub mod arrow_compute;

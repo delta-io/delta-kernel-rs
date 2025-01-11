@@ -1,9 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
-use arrow::{compute::filter_record_batch, util::pretty::print_batches};
+use arrow::util::pretty::print_batches;
 use arrow_array::RecordBatch;
 use clap::Parser;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_compute::materialize_scan_results;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::{DeltaResult, Table};
@@ -35,24 +35,8 @@ fn main() -> DeltaResult<()> {
     let table_changes = table.table_changes(engine.as_ref(), cli.start_version, cli.end_version)?;
 
     let table_changes_scan = table_changes.into_scan_builder().build()?;
-    let batches: Vec<RecordBatch> = table_changes_scan
-        .execute(engine.clone())?
-        .map(|scan_result| -> DeltaResult<_> {
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch: RecordBatch = data
-                .into_any()
-                .downcast::<ArrowEngineData>()
-                .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
-                .into();
-            if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
-            } else {
-                Ok(record_batch)
-            }
-        })
-        .try_collect()?;
+    let batches: Vec<RecordBatch> =
+        materialize_scan_results(table_changes_scan.execute(engine.clone())?).try_collect()?;
     print_batches(&batches)?;
     Ok(())
 }

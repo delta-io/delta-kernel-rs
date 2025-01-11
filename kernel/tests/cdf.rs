@@ -1,15 +1,15 @@
 use std::{error, sync::Arc};
 
-use arrow::compute::filter_record_batch;
 use arrow_array::RecordBatch;
 use delta_kernel::engine::sync::SyncEngine;
 use itertools::Itertools;
 
+use delta_kernel::engine::arrow_compute::materialize_scan_results;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::{DeltaResult, Table, Version};
 
 mod common;
-use common::{load_test_data, to_arrow};
+use common::load_test_data;
 
 fn read_cdf_for_table(
     test_name: impl AsRef<str>,
@@ -35,19 +35,8 @@ fn read_cdf_for_table(
         .into_scan_builder()
         .with_schema(schema)
         .build()?;
-    let batches: Vec<RecordBatch> = scan
-        .execute(engine)?
-        .map(|scan_result| -> DeltaResult<_> {
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch = to_arrow(data)?;
-            match mask {
-                Some(mask) => Ok(filter_record_batch(&record_batch, &mask.into())?),
-                None => Ok(record_batch),
-            }
-        })
-        .try_collect()?;
+    let batches: Vec<RecordBatch> =
+        materialize_scan_results(scan.execute(engine)?).try_collect()?;
     Ok(batches)
 }
 

@@ -394,6 +394,7 @@ fn read_with_scan_data(
             )
             .unwrap();
 
+        // TODO(zach): use materialize_scan_results?
         for read_result in read_results {
             let read_result = read_result.unwrap();
             let len = read_result.len();

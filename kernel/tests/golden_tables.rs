@@ -3,28 +3,29 @@
 //! Data (golden tables) are stored in tests/golden_data/<table_name>.tar.zst
 //! Each table directory has a table/ and expected/ subdirectory with the input/output respectively
 
-use arrow::array::AsArray;
-use arrow::{compute::filter_record_batch, record_batch::RecordBatch};
-use arrow_ord::sort::{lexsort_to_indices, SortColumn};
-use arrow_schema::{FieldRef, Schema};
-use arrow_select::{concat::concat_batches, take::take};
-use itertools::Itertools;
-use paste::paste;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Table};
+use arrow::array::AsArray;
+use arrow::record_batch::RecordBatch;
+use arrow_array::{Array, StructArray};
+use arrow_ord::sort::{lexsort_to_indices, SortColumn};
+use arrow_schema::DataType;
+use arrow_schema::{FieldRef, Schema};
+use arrow_select::{concat::concat_batches, take::take};
 use futures::{stream::TryStreamExt, StreamExt};
+use itertools::Itertools;
 use object_store::{local::LocalFileSystem, ObjectStore};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use paste::paste;
 
-use arrow_array::{Array, StructArray};
-use arrow_schema::DataType;
+use delta_kernel::engine::arrow_compute::materialize_scan_results;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Table};
 
 mod common;
-use common::{load_test_data, to_arrow};
+use common::load_test_data;
 
 // NB adapated from DAT: read all parquet files in the directory and concatenate them
 async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
@@ -167,19 +168,7 @@ async fn latest_snapshot_test(
     let snapshot = table.snapshot(&engine, None)?;
     let scan = snapshot.into_scan_builder().build()?;
     let scan_res = scan.execute(Arc::new(engine))?;
-    let batches: Vec<RecordBatch> = scan_res
-        .map(|scan_result| -> DeltaResult<_> {
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch = to_arrow(data)?;
-            if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
-            } else {
-                Ok(record_batch)
-            }
-        })
-        .try_collect()?;
+    let batches: Vec<RecordBatch> = materialize_scan_results(scan_res).try_collect()?;
 
     let expected = read_expected(&expected_path.expect("expect an expected dir")).await?;
 
