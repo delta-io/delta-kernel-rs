@@ -661,11 +661,11 @@ mod tests {
         assert_eq!(
             remove_visitor.removes.len(),
             1,
-            "Unexpected number of removal actions"
+            "Unexpected number of remove actions"
         );
         assert_eq!(
             remove_visitor.removes[0], expected_remove,
-            "Unexpected removal action"
+            "Unexpected remove action"
         );
     }
 
@@ -700,11 +700,11 @@ mod tests {
         assert_eq!(
             remove_visitor.removes.len(),
             1,
-            "Unexpected number of removal actions"
+            "Unexpected number of remove actions"
         );
         assert_eq!(
             remove_visitor.removes[0], expected_remove,
-            "Unexpected removal action"
+            "Unexpected remove action"
         );
     }
 
