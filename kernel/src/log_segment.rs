@@ -384,7 +384,7 @@ fn list_log_files_with_checkpoint(
 
 /// Validates that all the checkpoint parts belong to the same checkpoint version and that all parts
 /// are present. Returns `true` if we have a complete checkpoint, `false` otherwise.
-fn validate_checkpoint_parts(version: u64, checkpoint_parts: &Vec<ParsedLogPath>) -> bool {
+fn validate_checkpoint_parts(version: u64, checkpoint_parts: &[ParsedLogPath]) -> bool {
     if checkpoint_parts.is_empty() {
         return false;
     }
