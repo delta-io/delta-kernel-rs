@@ -2,7 +2,6 @@
 //! files.
 
 use crate::actions::{get_log_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
-use crate::log_segment::delta_log_group_iterator::DeltaLogGroupingIterator;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::snapshot::CheckpointMetadata;
@@ -16,7 +15,6 @@ use std::sync::{Arc, LazyLock};
 use tracing::warn;
 use url::Url;
 
-mod delta_log_group_iterator;
 #[cfg(test)]
 mod tests;
 
@@ -314,22 +312,27 @@ fn list_log_files_with_version(
     let mut checkpoint_parts = vec![];
     let mut max_checkpoint_version = start_version;
 
-    let log_iterator = DeltaLogGroupingIterator::new(list_log_files(
-        fs_client,
-        log_root,
-        start_version,
-        end_version,
-    )?);
+    let log_files = list_log_files(fs_client, log_root, start_version, end_version)?;
 
-    for (version, files) in log_iterator {
-        let mut new_checkpoint_parts = Vec::new();
+    for (version, files) in &log_files
+        .filter_map(|res| match res {
+            Ok(path) => Some(path),
+            Err(e) => {
+                warn!("Error processing path: {:?}", e);
+                None
+            }
+        })
+        .chunk_by(|path| path.version)
+    {
+        let mut new_checkpoint_parts = vec![];
 
-        files.into_iter().for_each(|file| match file {
-            f if f.is_commit() => commit_files.push(f),
-            f if f.is_checkpoint() => new_checkpoint_parts.push(f),
-            _ => {}
-        });
-
+        for file in files {
+            if file.is_commit() {
+                commit_files.push(file);
+            } else if file.is_checkpoint() {
+                new_checkpoint_parts.push(file);
+            }
+        }
         if validate_checkpoint_parts(version, &new_checkpoint_parts)
             && (max_checkpoint_version.is_none() || Some(version) >= max_checkpoint_version)
         {

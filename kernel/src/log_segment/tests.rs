@@ -7,7 +7,7 @@ use url::Url;
 use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreFileSystemClient;
 use crate::engine::sync::SyncEngine;
-use crate::log_segment::{list_log_files, DeltaLogGroupingIterator, LogSegment};
+use crate::log_segment::LogSegment;
 use crate::snapshot::CheckpointMetadata;
 use crate::{FileSystemClient, Table};
 use test_utils::delta_path_for_version;
@@ -105,70 +105,6 @@ fn build_log_with_paths_and_checkpoint(
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
     (Box::new(client), log_root)
-}
-
-#[test]
-fn test_delta_log_group_iterator() {
-    // Test that the DeltaLogGroupingIterator groups log files by version correctly
-    let (client, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_multipart_checkpoint(1, 1, 3),
-            delta_path_for_version(1, "json"),
-            delta_path_for_multipart_checkpoint(1, 2, 3),
-            delta_path_for_version(2, "checkpoint.parquet"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_multipart_checkpoint(3, 1, 3),
-            delta_path_for_multipart_checkpoint(3, 2, 3),
-            delta_path_for_version(4, "json"),
-        ],
-        None,
-    );
-
-    let log_files: Vec<_> = list_log_files(client.as_ref(), &log_root, None, None)
-        .unwrap()
-        .collect();
-
-    let mut iterator = DeltaLogGroupingIterator::new(log_files.into_iter());
-
-    if let Some((version, files)) = iterator.next() {
-        assert_eq!(version, 1, "Expected version 1 but got {}", version);
-        assert_eq!(files.len(), 3);
-        assert!(files.iter().all(|file| file.version == 1));
-    } else {
-        panic!("Expected group for version 1, but none was found");
-    }
-
-    if let Some((version, files)) = iterator.next() {
-        assert_eq!(version, 2, "Expected version 2 but got {}", version);
-        assert_eq!(files.len(), 2);
-        assert!(files.iter().all(|file| file.version == 2));
-    } else {
-        panic!("Expected group for version 2, but none was found");
-    }
-
-    if let Some((version, files)) = iterator.next() {
-        assert_eq!(version, 3, "Expected version 3 but got {}", version);
-        assert_eq!(files.len(), 2);
-        assert!(files.iter().all(|file| file.version == 3));
-    } else {
-        panic!("Expected group for version 3, but none was found");
-    }
-
-    if let Some((version, files)) = iterator.next() {
-        assert_eq!(version, 4, "Expected version 4 but got {}", version);
-        assert_eq!(files.len(), 1);
-        assert!(files.iter().all(|file| file.version == 4));
-    } else {
-        panic!("Expected group for version 4, but none was found");
-    }
-
-    // Verify that there are no more groups after version 4
-    if let Some((version, _)) = iterator.next() {
-        panic!(
-            "Expected no more groups, but found group for version {}",
-            version
-        );
-    }
 }
 
 #[test]
