@@ -2,7 +2,8 @@
 //! files.
 
 use crate::actions::{get_log_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
-use crate::path::ParsedLogPath;
+use crate::log_segment::delta_log_group_iterator::DeltaLogGroupingIterator;
+use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::snapshot::CheckpointMetadata;
 use crate::utils::require;
@@ -10,12 +11,12 @@ use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, FileSystemClient, Version,
 };
 use itertools::Itertools;
-use std::cmp::Ordering;
 use std::convert::identity;
 use std::sync::{Arc, LazyLock};
 use tracing::warn;
 use url::Url;
 
+mod delta_log_group_iterator;
 #[cfg(test)]
 mod tests;
 
@@ -313,27 +314,27 @@ fn list_log_files_with_version(
     let mut checkpoint_parts = vec![];
     let mut max_checkpoint_version = start_version;
 
-    for parsed_path in list_log_files(fs_client, log_root, start_version, end_version)? {
-        let parsed_path = parsed_path?;
-        if parsed_path.is_commit() {
-            commit_files.push(parsed_path);
-        } else if parsed_path.is_checkpoint() {
-            let path_version = parsed_path.version;
-            match max_checkpoint_version {
-                None => {
-                    checkpoint_parts.push(parsed_path);
-                    max_checkpoint_version = Some(path_version);
-                }
-                Some(checkpoint_version) => match path_version.cmp(&checkpoint_version) {
-                    Ordering::Greater => {
-                        max_checkpoint_version = Some(path_version);
-                        checkpoint_parts.clear();
-                        checkpoint_parts.push(parsed_path);
-                    }
-                    Ordering::Equal => checkpoint_parts.push(parsed_path),
-                    Ordering::Less => {}
-                },
-            }
+    let log_iterator = DeltaLogGroupingIterator::new(list_log_files(
+        fs_client,
+        log_root,
+        start_version,
+        end_version,
+    )?);
+
+    for (version, files) in log_iterator {
+        let mut new_checkpoint_parts = Vec::new();
+
+        files.into_iter().for_each(|file| match file {
+            f if f.is_commit() => commit_files.push(f),
+            f if f.is_checkpoint() => new_checkpoint_parts.push(f),
+            _ => {}
+        });
+
+        if validate_checkpoint_parts(version, &new_checkpoint_parts)
+            && (max_checkpoint_version.is_none() || Some(version) >= max_checkpoint_version)
+        {
+            max_checkpoint_version = Some(version);
+            checkpoint_parts = new_checkpoint_parts;
         }
     }
 
@@ -376,4 +377,40 @@ fn list_log_files_with_checkpoint(
         )));
     }
     Ok((commit_files, checkpoint_parts))
+}
+
+/// Validates that all the checkpoint parts belong to the same checkpoint version and that all parts
+/// are present. Returns `true` if we have a complete checkpoint, `false` otherwise.
+fn validate_checkpoint_parts(version: u64, checkpoint_parts: &Vec<ParsedLogPath>) -> bool {
+    if checkpoint_parts.is_empty() {
+        return false;
+    }
+
+    match checkpoint_parts.last().map(|file| &file.file_type) {
+        Some(LogPathFileType::MultiPartCheckpoint { num_parts, .. }) => {
+            if *num_parts as usize != checkpoint_parts.len() {
+                warn!(
+                    "Found a multi-part checkpoint at version {}. Found {} parts, expected {}",
+                    version,
+                    checkpoint_parts.len(),
+                    num_parts
+                );
+                return false;
+            }
+        }
+        Some(LogPathFileType::SinglePartCheckpoint) => {
+            if checkpoint_parts.len() != 1 {
+                warn!(
+                    "Found a single-part checkpoint at version {}. Found {} parts",
+                    version,
+                    checkpoint_parts.len()
+                );
+                return false;
+            }
+        }
+        // TODO: Include UuidCheckpoint once we actually support v2 checkpoints
+        _ => {}
+    }
+
+    true
 }

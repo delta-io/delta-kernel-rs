@@ -7,7 +7,7 @@ use url::Url;
 use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreFileSystemClient;
 use crate::engine::sync::SyncEngine;
-use crate::log_segment::LogSegment;
+use crate::log_segment::{list_log_files, DeltaLogGroupingIterator, LogSegment};
 use crate::snapshot::CheckpointMetadata;
 use crate::{FileSystemClient, Table};
 use test_utils::delta_path_for_version;
@@ -105,6 +105,70 @@ fn build_log_with_paths_and_checkpoint(
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
     (Box::new(client), log_root)
+}
+
+#[test]
+fn test_delta_log_group_iterator() {
+    // Test that the DeltaLogGroupingIterator groups log files by version correctly
+    let (client, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_multipart_checkpoint(1, 1, 3),
+            delta_path_for_version(1, "json"),
+            delta_path_for_multipart_checkpoint(1, 2, 3),
+            delta_path_for_version(2, "checkpoint.parquet"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_multipart_checkpoint(3, 1, 3),
+            delta_path_for_multipart_checkpoint(3, 2, 3),
+            delta_path_for_version(4, "json"),
+        ],
+        None,
+    );
+
+    let log_files: Vec<_> = list_log_files(client.as_ref(), &log_root, None, None)
+        .unwrap()
+        .collect();
+
+    let mut iterator = DeltaLogGroupingIterator::new(log_files.into_iter());
+
+    if let Some((version, files)) = iterator.next() {
+        assert_eq!(version, 1, "Expected version 1 but got {}", version);
+        assert_eq!(files.len(), 3);
+        assert!(files.iter().all(|file| file.version == 1));
+    } else {
+        panic!("Expected group for version 1, but none was found");
+    }
+
+    if let Some((version, files)) = iterator.next() {
+        assert_eq!(version, 2, "Expected version 2 but got {}", version);
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|file| file.version == 2));
+    } else {
+        panic!("Expected group for version 2, but none was found");
+    }
+
+    if let Some((version, files)) = iterator.next() {
+        assert_eq!(version, 3, "Expected version 3 but got {}", version);
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|file| file.version == 3));
+    } else {
+        panic!("Expected group for version 3, but none was found");
+    }
+
+    if let Some((version, files)) = iterator.next() {
+        assert_eq!(version, 4, "Expected version 4 but got {}", version);
+        assert_eq!(files.len(), 1);
+        assert!(files.iter().all(|file| file.version == 4));
+    } else {
+        panic!("Expected group for version 4, but none was found");
+    }
+
+    // Verify that there are no more groups after version 4
+    if let Some((version, _)) = iterator.next() {
+        panic!(
+            "Expected no more groups, but found group for version {}",
+            version
+        );
+    }
 }
 
 #[test]
@@ -257,11 +321,8 @@ fn build_snapshot_with_bad_checkpoint_hint_fails() {
     assert!(log_segment.is_err())
 }
 
-#[ignore]
 #[test]
 fn build_snapshot_with_missing_checkpoint_part_no_hint() {
-    // TODO: Handle checkpoints correctly so that this test passes: https://github.com/delta-io/delta-kernel-rs/issues/497
-
     // Part 2 of 3 is missing from checkpoint 5. The Snapshot should be made of checkpoint
     // number 3 and commit files 4 to 7.
     let (client, log_root) = build_log_with_paths_and_checkpoint(
@@ -290,6 +351,50 @@ fn build_snapshot_with_missing_checkpoint_part_no_hint() {
 
     assert_eq!(checkpoint_parts.len(), 1);
     assert_eq!(checkpoint_parts[0].version, 3);
+
+    let versions = commit_files.into_iter().map(|x| x.version).collect_vec();
+    let expected_versions = vec![4, 5, 6, 7];
+    assert_eq!(versions, expected_versions);
+}
+
+#[test]
+fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_checkpoint() {
+    // When the _last_checkpoint is out of date and the most recent checkpoint is incomplete, the
+    // Snapshot should be made of the most recent complete checkpoint and the commit files that
+    // follow it.
+    let checkpoint_metadata = CheckpointMetadata {
+        version: 3,
+        size: 10,
+        parts: None,
+        size_in_bytes: None,
+        num_of_add_files: None,
+        checkpoint_schema: None,
+        checksum: None,
+    };
+
+    let (client, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "checkpoint.parquet"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "checkpoint.parquet"),
+            delta_path_for_version(4, "json"),
+            delta_path_for_multipart_checkpoint(5, 1, 3),
+            // Part 2 is missing!
+            delta_path_for_multipart_checkpoint(5, 3, 3),
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(6, "json"),
+            delta_path_for_version(7, "json"),
+        ],
+        Some(&checkpoint_metadata),
+    );
+
+    let log_segment =
+        LogSegment::for_snapshot(client.as_ref(), log_root, checkpoint_metadata, None).unwrap();
+    let commit_files = log_segment.ascending_commit_files;
+    let checkpoint_parts = log_segment.checkpoint_parts;
+
+    assert_eq!(checkpoint_parts.len(), 1);
 
     let versions = commit_files.into_iter().map(|x| x.version).collect_vec();
     let expected_versions = vec![4, 5, 6, 7];
