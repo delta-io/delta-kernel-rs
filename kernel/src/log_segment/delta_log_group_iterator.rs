@@ -1,3 +1,5 @@
+//! An iterator that groups [`ParsedLogPath`]s by version.
+
 use tracing::warn;
 
 use crate::log_segment::ParsedLogPath;
@@ -6,7 +8,8 @@ use crate::Version;
 use std::iter::Peekable;
 
 /**
- * An iterator that groups [`ParsedLogPath`]s by version.
+ * The [`DeltaLogGroupingIterator`] is a utility iterator that groups log paths.
+ * It takes an iterator of [`ParsedLogPath`]s and groups them by version.
  * For example for an input iterator:
  * - 11.checkpoint.0.1.parquet
  * - 11.checkpoint.1.1.parquet
