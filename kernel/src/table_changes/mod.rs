@@ -165,11 +165,9 @@ impl TableChanges {
 
         // Verify that the start and end schemas are compatible. We must still check schema
         // compatibility for each schema update in the CDF range.
-        // Note: Schema compatibility check will be changed in the future to be more flexible.
-        // See issue [#523](https://github.com/delta-io/delta-kernel-rs/issues/523)
-        if start_snapshot.schema() != end_snapshot.schema() {
+        if let Err(err) = start_snapshot.schema().can_read_as(end_snapshot.schema()) {
             return Err(Error::generic(format!(
-                "Failed to build TableChanges: Start and end version schemas are different. Found start version schema {:?} and end version schema {:?}", start_snapshot.schema(), end_snapshot.schema(),
+                "Failed to build TableChanges: {}\n Found start version schema {:?} and end version schema {:?}", err, start_snapshot.schema(), end_snapshot.schema(),
             )));
         }
 
@@ -303,7 +301,7 @@ mod tests {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
         let table = Table::try_from_uri(path).unwrap();
-        let expected_msg = "Failed to build TableChanges: Start and end version schemas are different. Found start version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: true, metadata: {} }} } and end version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: false, metadata: {} }} }";
+        let expected_msg = "Failed to build TableChanges: Generic delta kernel error: Read field is non-nullable while this field is nullable\n Found start version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: true, metadata: {} }} } and end version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: false, metadata: {} }} }";
 
         // A field in the schema goes from being nullable to non-nullable
         let table_changes_res = table.table_changes(engine.as_ref(), 3, 4);
