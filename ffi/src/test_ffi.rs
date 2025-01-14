@@ -12,7 +12,7 @@ use delta_kernel::{
 /// output expression can be found in `ffi/tests/test_expression_visitor/expected.txt`.
 ///
 /// # Safety
-/// The caller is responsible for freeing the retured memory, either by calling
+/// The caller is responsible for freeing the returned memory, either by calling
 /// [`free_kernel_predicate`], or [`Handle::drop_handle`]
 #[no_mangle]
 pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpression> {

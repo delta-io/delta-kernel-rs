@@ -383,7 +383,7 @@ struct ContextWrapper {
 /// data which provides the data handle and selection vector as each element in the iterator.
 ///
 /// # Safety
-/// engine is responsbile for passing a valid [`ExclusiveEngineData`] and selection vector.
+/// engine is responsible for passing a valid [`ExclusiveEngineData`] and selection vector.
 #[no_mangle]
 pub unsafe extern "C" fn visit_scan_data(
     data: Handle<ExclusiveEngineData>,

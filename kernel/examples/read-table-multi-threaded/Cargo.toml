@@ -17,3 +17,6 @@ env_logger = "0.11.5"
 itertools = "0.13"
 spmc = "0.3.0"
 url = "2"
+
+[package.metadata.release]
+release = false

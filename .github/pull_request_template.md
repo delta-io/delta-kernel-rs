@@ -7,6 +7,19 @@ Thanks for sending a pull request!  Here are some tips for you:
   5. Be sure to keep the PR description updated to reflect all changes.
 -->
 
+<!--
+PR title formatting:
+This project uses conventional commits: https://www.conventionalcommits.org/
+
+Each PR corresponds to a commit on the `main` branch, with the title of the PR (typically) being
+used for the commit message on main. In order to ensure proper formatting in the CHANGELOG please
+ensure your PR title adheres to the conventional commit specification.
+
+Examples:
+- new feature PR: "feat: new API for snapshot.update()"
+- bugfix PR: "fix: correctly apply DV in read-table example"
+-->
+
 ## What changes are proposed in this pull request?
 <!--
 Please clarify what changes you are proposing and why the changes are needed.
