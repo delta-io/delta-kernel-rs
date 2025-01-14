@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[package.metadata.release]
+release = false
+
 [dependencies]
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
