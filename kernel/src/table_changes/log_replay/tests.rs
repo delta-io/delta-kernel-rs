@@ -469,6 +469,7 @@ async fn dv() {
     assert_eq!(sv, &[false, true, true]);
 }
 
+// Note: Data skipping does not work on Remove actions.
 #[tokio::test]
 async fn data_skipping_filter() {
     let engine = Arc::new(SyncEngine::new());
