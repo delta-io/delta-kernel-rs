@@ -15,8 +15,8 @@ fn create_kernel_schema() -> delta_kernel::schema::Schema {
 fn main() {
     let arrow_schema = create_arrow_schema();
     let kernel_schema = create_kernel_schema();
-    let convereted: delta_kernel::schema::Schema =
+    let converted: delta_kernel::schema::Schema =
         delta_kernel::schema::Schema::try_from(&arrow_schema).expect("couldn't convert");
-    assert!(kernel_schema == convereted);
+    assert!(kernel_schema == converted);
     println!("Okay, made it");
 }
