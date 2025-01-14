@@ -10,8 +10,7 @@ use crate::actions::deletion_vector::split_vector;
 use crate::scan::state::GlobalScanState;
 use crate::scan::{ColumnType, PhysicalPredicate, ScanResult};
 use crate::schema::{SchemaRef, StructType};
-use crate::table_configuration::TableConfiguration;
-use crate::{table_configuration, DeltaResult, Engine, ExpressionRef, FileMeta};
+use crate::{DeltaResult, Engine, ExpressionRef, FileMeta};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanData};
 use super::physical_to_logical::{physical_to_logical_expr, scan_file_physical_schema};
