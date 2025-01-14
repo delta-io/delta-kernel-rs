@@ -399,19 +399,20 @@ impl Scan {
     ///   the query. NB: If you are using the default engine and plan to call arrow's
     ///   `filter_record_batch`, you _need_ to extend this vector to the full length of the batch or
     ///   arrow will drop the extra rows.
-    /// - `HashMap<usize, Expression>`: Transformation expressions that need to be applied. For each
-    ///    row at index `i` in the above data, if an expression exists in this map for key `i`, the
-    ///    associated expression _must_ be applied to the data read from the file specified by the
-    ///    row. The resultant schema for this expression is guaranteed to be `Scan.schema()`. If
-    ///    there is no entry for a row `i` in this map, no expression need be applied and the data
-    ///    read from disk is already in the correct logical state.
+    /// - `Vec<Option<Expression>>`: Transformation expressions that need to be applied. For each
+    ///    row at index `i` in the above data, if an expression exists at index `i` in the `Vec`,
+    ///    the associated expression _must_ be applied to the data read from the file specified by
+    ///    the row. The resultant schema for this expression is guaranteed to be `Scan.schema()`. If
+    ///    the item at index `i` in this `Vec` is `None`, or if the `Vec` contains fewer than `i`
+    ///    elements, no expression need be applied and the data read from disk is already in the
+    ///    correct logical state.
     pub fn scan_data(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanData>>> {
         // Compute the static part of the transformation. This is `None` if no transformation is
-        // needed (currently just means no partition cols, but will be extended for other transforms
-        // as we support them)
+        // needed (currently just means no partition cols AND no column mapping but will be extended
+        // for other transforms as we support them)
         let static_transform = (self.have_partition_cols
             || self.snapshot.column_mapping_mode != ColumnMappingMode::None)
             .then_some(Arc::new(Scan::get_static_transform(&self.all_fields)));

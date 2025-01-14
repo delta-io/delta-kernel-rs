@@ -101,11 +101,11 @@ impl AddRemoveDedupVisitor<'_> {
                         ));
                     };
                     let name = field.physical_name();
-                    let value_expression = super::parse_partition_value(
+                    let partition_value = super::parse_partition_value(
                         partition_values.get(name),
                         field.data_type(),
                     )?;
-                    Ok(value_expression.into())
+                    Ok(partition_value.into())
                 }
                 TransformExpr::Static(field_expr) => Ok(field_expr.clone()),
             })
@@ -138,10 +138,9 @@ impl AddRemoveDedupVisitor<'_> {
             None => None,
         };
 
-        // Process both adds and removes, but only return not already-seen adds
+        // Check both adds and removes (skipping already-seen), but only transform and return adds
         let file_key = FileActionKey::new(path, dv_unique_id);
-        let have_seen = self.check_and_record_seen(file_key);
-        if !is_add || have_seen {
+        if self.check_and_record_seen(file_key) || !is_add {
             return Ok(false);
         }
         let transform = self
@@ -422,25 +421,24 @@ mod tests {
 
         fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {
             assert!(transform.is_some());
-            if let Expression::Struct(inner) = transform.unwrap().as_ref() {
-                assert_eq!(inner.len(), 2, "expected two items in transform struct");
-                if let Expression::Column(ref name) = inner[0] {
-                    assert_eq!(name, &column_name!("value"), "First col should be 'value'");
-                } else {
-                    panic!("Expected first expression to be a column");
-                }
-                if let Expression::Literal(ref scalar) = inner[1] {
-                    assert_eq!(
-                        scalar,
-                        &Scalar::Date(expected_date_offset),
-                        "Didn't get expected date offset"
-                    );
-                } else {
-                    panic!("Expected second expression to be a literal");
-                }
-            } else {
+            let Expression::Struct(inner) = transform.unwrap().as_ref() else {
                 panic!("Transform should always be a struct expr");
-            }
+            };
+            assert_eq!(inner.len(), 2, "expected two items in transform struct");
+
+            let Expression::Column(ref name) = inner[0] else {
+                panic!("Expected first expression to be a column");
+            };
+            assert_eq!(name, &column_name!("value"), "First col should be 'value'");
+
+            let Expression::Literal(ref scalar) = inner[1] else {
+                panic!("Expected second expression to be a literal");
+            };
+            assert_eq!(
+                scalar,
+                &Scalar::Date(expected_date_offset),
+                "Didn't get expected date offset"
+            );
         }
 
         for res in iter {
