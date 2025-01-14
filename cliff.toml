@@ -1,0 +1,70 @@
+# git-cliff configuration file. see https://git-cliff.org/docs/configuration
+
+[changelog]
+header = """
+# Changelog\n
+"""
+# Tera template
+body = """
+## [v{{ version }}](https://github.com/delta-io/delta-kernel-rs/tree/v{{ version }}/) ({{ timestamp | date(format="%Y-%m-%d") }})
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/{{ previous.version }}...v{{ version }})
+
+{% for group, commits in commits | group_by(attribute="group") %}
+    ### {{ group | striptags | trim | upper_first }}
+    {% for commit in commits %}
+        {{ loop.index }}. {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
+            {{ commit.message | split(pat="\n") | first | upper_first | replace(from="(#", to="([#")\
+            | replace(from="0)", to="0])")\
+            | replace(from="1)", to="1])")\
+            | replace(from="2)", to="2])")\
+            | replace(from="3)", to="3])")\
+            | replace(from="4)", to="4])")\
+            | replace(from="5)", to="5])")\
+            | replace(from="6)", to="6])")\
+            | replace(from="7)", to="7])")\
+            | replace(from="8)", to="8])")\
+            | replace(from="9)", to="9])") }}\
+    {% endfor %}
+{% endfor %}
+{% for commit in commits %}
+{% set message = commit.message | split(pat="\n") | first %}\
+{% set pr = message | split(pat="(#") | last | split(pat=")") | first %}\
+[#{{ pr }}]: https://github.com/delta-io/delta-kernel-rs/pull/{{ pr }}\
+{% endfor %}\n\n\n
+"""
+footer = """
+"""
+# remove the leading and trailing s
+trim = true
+postprocessors = []
+
+[git]
+# parse the commits based on https://www.conventionalcommits.org
+conventional_commits = true
+# filter out the commits that are not conventional
+filter_unconventional = false
+# process each line of a commit as an individual commit
+split_commits = false
+# regex for preprocessing the commit messages
+commit_preprocessors = []
+# regex for parsing and grouping commits. note that e.g. both doc and docs are matched since we have
+# trim = true above.
+commit_parsers = [
+  { field = "github.pr_labels", pattern = "breaking-change", group = "<!-- 0 --> 🏗️ Breaking changes" },
+  { message = "^feat", group = "<!-- 1 -->🚀 Features / new APIs" },
+  { message = "^fix", group = "<!-- 2 -->🐛 Bug Fixes" },
+  { message = "^doc", group = "<!-- 3 -->📚 Documentation" },
+  { message = "^perf", group = "<!-- 4 -->⚡ Performance" },
+  { message = "^refactor", group = "<!-- 5 -->🚜 Refactor" },
+  { message = "^test", group = "<!-- 6 -->🧪 Testing" },
+  { message = "^chore|^ci", group = "<!-- 7 -->⚙️ Chores/CI" },
+  { message = "^revert", group = "<!-- 8 -->◀️ Revert" },
+  { message = ".*", group = "<!-- 9 -->Other" },
+]
+# filter out the commits that are not matched by commit parsers
+filter_commits = false
+# sort the tags topologically
+topo_order = false
+# sort the commits inside sections by oldest/newest order
+sort_commits = "oldest"
