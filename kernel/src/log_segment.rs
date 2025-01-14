@@ -9,7 +9,7 @@ use crate::utils::require;
 use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, FileSystemClient, Version,
 };
-use itertools::Itertools;
+use itertools::{process_results, Itertools};
 use std::convert::identity;
 use std::sync::{Arc, LazyLock};
 use tracing::warn;
@@ -310,36 +310,25 @@ fn list_log_files_with_version(
     // on config at some point
     let mut commit_files = Vec::with_capacity(10);
     let mut checkpoint_parts = vec![];
-    let mut max_checkpoint_version = start_version;
 
     let log_files = list_log_files(fs_client, log_root, start_version, end_version)?;
 
-    for (version, files) in &log_files
-        .filter_map(|res| match res {
-            Ok(path) => Some(path),
-            Err(e) => {
-                warn!("Error processing path: {:?}", e);
-                None
+    process_results(log_files, |iter| {
+        let log_files = iter.chunk_by(move |x| x.version);
+        for (version, files) in &log_files {
+            let mut new_checkpoint_parts = vec![];
+            for file in files {
+                if file.is_commit() {
+                    commit_files.push(file);
+                } else if file.is_checkpoint() {
+                    new_checkpoint_parts.push(file);
+                }
             }
-        })
-        .chunk_by(|path| path.version)
-    {
-        let mut new_checkpoint_parts = vec![];
-
-        for file in files {
-            if file.is_commit() {
-                commit_files.push(file);
-            } else if file.is_checkpoint() {
-                new_checkpoint_parts.push(file);
+            if validate_checkpoint_parts(version, &new_checkpoint_parts) {
+                checkpoint_parts = new_checkpoint_parts;
             }
         }
-        if validate_checkpoint_parts(version, &new_checkpoint_parts)
-            && (max_checkpoint_version.is_none() || Some(version) >= max_checkpoint_version)
-        {
-            max_checkpoint_version = Some(version);
-            checkpoint_parts = new_checkpoint_parts;
-        }
-    }
+    })?;
 
     Ok((commit_files, checkpoint_parts))
 }
@@ -385,10 +374,6 @@ fn list_log_files_with_checkpoint(
 /// Validates that all the checkpoint parts belong to the same checkpoint version and that all parts
 /// are present. Returns `true` if we have a complete checkpoint, `false` otherwise.
 fn validate_checkpoint_parts(version: u64, checkpoint_parts: &[ParsedLogPath]) -> bool {
-    if checkpoint_parts.is_empty() {
-        return false;
-    }
-
     match checkpoint_parts.last().map(|file| &file.file_type) {
         Some(LogPathFileType::MultiPartCheckpoint { num_parts, .. }) => {
             if *num_parts as usize != checkpoint_parts.len() {
@@ -411,8 +396,29 @@ fn validate_checkpoint_parts(version: u64, checkpoint_parts: &[ParsedLogPath]) -
                 return false;
             }
         }
-        // TODO: Include UuidCheckpoint once we actually support v2 checkpoints
-        _ => {}
+        Some(LogPathFileType::UuidCheckpoint(_)) => {
+            warn!(
+                "Found a UUID checkpoint at version {} when it is not supported",
+                version
+            );
+            return false;
+        }
+        Some(LogPathFileType::Commit) | Some(LogPathFileType::CompactedCommit { .. }) => {
+            warn!(
+                "Found a commit file at version {} when expecting a checkpoint",
+                version
+            );
+            return false;
+        }
+        Some(LogPathFileType::Unknown) => {
+            warn!(
+                "Found an unknown file type at version {} when expecting a checkpoint",
+                version
+            );
+            return false;
+        }
+        // No checkpoint parts
+        None => return false,
     }
 
     true
