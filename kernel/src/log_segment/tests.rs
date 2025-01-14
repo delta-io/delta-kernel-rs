@@ -137,6 +137,44 @@ fn build_snapshot_with_unsupported_uuid_checkpoint() {
 }
 
 #[test]
+fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
+    let (client, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_multipart_checkpoint(1, 1, 3),
+            // Part 2 is missing!
+            delta_path_for_multipart_checkpoint(3, 3, 3),
+            // Part 1 is missing!
+            delta_path_for_multipart_checkpoint(2, 1, 2),
+            delta_path_for_version(2, "json"),
+            delta_path_for_multipart_checkpoint(3, 1, 3),
+            // Part 2 is missing!
+            delta_path_for_multipart_checkpoint(3, 3, 3),
+            delta_path_for_multipart_checkpoint(3, 1, 4),
+            delta_path_for_multipart_checkpoint(3, 2, 4),
+            delta_path_for_multipart_checkpoint(3, 3, 4),
+            delta_path_for_multipart_checkpoint(3, 4, 4),
+            delta_path_for_version(4, "json"),
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(6, "json"),
+            delta_path_for_version(7, "json"),
+        ],
+        None,
+    );
+
+    let log_segment = LogSegment::for_snapshot(client.as_ref(), log_root, None, None).unwrap();
+    let commit_files = log_segment.ascending_commit_files;
+    let checkpoint_parts = log_segment.checkpoint_parts;
+
+    assert_eq!(checkpoint_parts.len(), 4);
+    assert_eq!(checkpoint_parts[0].version, 3);
+
+    let versions = commit_files.into_iter().map(|x| x.version).collect_vec();
+    let expected_versions = vec![4, 5, 6, 7];
+    assert_eq!(versions, expected_versions);
+}
+
+#[test]
 fn build_snapshot_with_out_of_date_last_checkpoint() {
     let checkpoint_metadata = CheckpointMetadata {
         version: 3,

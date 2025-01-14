@@ -10,6 +10,7 @@ use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, FileSystemClient, Version,
 };
 use itertools::{process_results, Itertools};
+use std::collections::HashMap;
 use std::convert::identity;
 use std::sync::{Arc, LazyLock};
 use tracing::warn;
@@ -324,8 +325,54 @@ fn list_log_files_with_version(
                     new_checkpoint_parts.push(file);
                 }
             }
-            if validate_checkpoint_parts(version, &new_checkpoint_parts) {
-                checkpoint_parts = new_checkpoint_parts;
+
+            // Group checkpoint parts by the number of parts they have
+            let mut checkpoints = HashMap::new();
+            for part_file in new_checkpoint_parts {
+                use LogPathFileType::*;
+                match &part_file.file_type {
+                    SinglePartCheckpoint
+                    | UuidCheckpoint(_)
+                    | MultiPartCheckpoint {
+                        part_num: 1,
+                        num_parts: 1,
+                    } => {
+                        // All single-file checkpoints are equivalent, just keep one
+                        checkpoints.insert(1, vec![part_file]);
+                    }
+                    MultiPartCheckpoint {
+                        part_num: 1,
+                        num_parts,
+                    } => {
+                        // Start a new multi-part checkpoint with at least 2 parts
+                        checkpoints.insert(*num_parts, vec![part_file]);
+                    }
+                    MultiPartCheckpoint {
+                        part_num,
+                        num_parts,
+                    } => {
+                        // Continue a new multi-part checkpoint with at least 2 parts
+                        if let Some(part_files) = checkpoints.get_mut(num_parts) {
+                            if *part_num == 1 + part_files.len() as u32 {
+                                // Safe to append because all previous parts exist
+                                part_files.push(part_file);
+                            }
+                        }
+                    }
+                    Commit | CompactedCommit { .. } | Unknown => {} // invalid file type => do nothing
+                }
+            }
+
+            // Find a complete checkpoint (all parts exist)
+            if let Some((_, complete_checkpoint)) = checkpoints
+                .into_iter()
+                .find(|(num_parts, part_files)| part_files.len() as u32 == *num_parts)
+            {
+                // Validate the checkpoint before updating state
+                if validate_checkpoint_parts(version, &complete_checkpoint) {
+                    checkpoint_parts = complete_checkpoint;
+                    commit_files.clear(); // Clear commit files once checkpoint is found
+                }
             }
         }
     })?;
