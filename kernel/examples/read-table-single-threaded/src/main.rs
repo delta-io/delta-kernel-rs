@@ -69,7 +69,7 @@ fn main() -> ExitCode {
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
 
-    // build a table and get the lastest snapshot from it
+    // build a table and get the latest snapshot from it
     let table = Table::try_from_uri(&cli.path)?;
     println!("Reading {}", table.location());
 

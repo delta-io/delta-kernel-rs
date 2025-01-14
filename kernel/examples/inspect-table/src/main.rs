@@ -184,7 +184,7 @@ fn print_scan_file(
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
 
-    // build a table and get the lastest snapshot from it
+    // build a table and get the latest snapshot from it
     let table = Table::try_from_uri(&cli.path)?;
 
     let engine = DefaultEngine::try_new(

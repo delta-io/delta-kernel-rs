@@ -737,7 +737,7 @@ mod tests {
             ),
         ]);
 
-        // Similer to ExpressionDepthChecker::check, but also returns call count
+        // Similar to ExpressionDepthChecker::check, but also returns call count
         let check_with_call_count =
             |depth_limit| ExpressionDepthChecker::check_with_call_count(&expr, depth_limit);
 

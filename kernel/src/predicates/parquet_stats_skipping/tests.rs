@@ -299,7 +299,7 @@ fn test_sql_where() {
         "WHERE {TRUE} < {FALSE}"
     );
 
-    // Constrast normal vs SQL WHERE semantics - comparison
+    // Contrast normal vs SQL WHERE semantics - comparison
     expect_eq!(
         AllNullTestFilter.eval_expr(&Expr::lt(col.clone(), VAL), false),
         None,
@@ -321,7 +321,7 @@ fn test_sql_where() {
         "WHERE {VAL} < {col}"
     );
 
-    // Constrast normal vs SQL WHERE semantics - comparison inside AND
+    // Contrast normal vs SQL WHERE semantics - comparison inside AND
     expect_eq!(
         AllNullTestFilter.eval_expr(&Expr::and(NULL, Expr::lt(col.clone(), VAL)), false),
         None,
