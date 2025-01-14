@@ -17,9 +17,7 @@ use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
 use crate::schema::{ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructType};
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
-use crate::table_changes::{check_cdf_table_properties, ensure_cdf_read_supported};
 use crate::table_configuration::TableConfiguration;
-use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef, RowVisitor};
 
@@ -319,13 +317,8 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 (LONG, column_name!("remove.deletionVector.cardinality")),
                 (STRING, column_name!("cdc.path")),
                 (STRING, column_name!("metaData.id")),
-                (STRING, column_name!("metaData.name")),
-                (STRING, column_name!("metaData.description")),
-                (STRING, column_name!("metaData.format.provider")),
-                (ss_map.clone(), column_name!("metaData.format.options")),
                 (STRING, column_name!("metaData.schemaString")),
                 (s_list.clone(), column_name!("metaData.partitionColumns")),
-                (LONG, column_name!("metaData.createdTime")),
                 (ss_map, column_name!("metaData.configuration")),
                 (INTEGER, column_name!("protocol.minReaderVersion")),
                 (INTEGER, column_name!("protocol.minWriterVersion")),
@@ -340,7 +333,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
 
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 23,
+            getters.len() == 18,
             Error::InternalError(format!(
                 "Wrong number of PreparePhaseVisitor getters: {}",
                 getters.len()
@@ -362,14 +355,22 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
             } else if getters[9].get_str(i, "cdc.path")?.is_some() {
                 *self.has_cdc_action = true;
             } else if let Some(id) = getters[10].get_str(i, "metaData.id")? {
-                let metadata =
-                    MetadataVisitor::visit_metadata(i, id.to_string(), &getters[10..=18])?;
-                self.metadata = Some(metadata);
+                let schema_string = getters[11].get(i, "metaData.schemaString")?;
+                let partition_columns = getters[12].get(i, "metaData.partitionColumns")?;
+                let configuration_map_opt = getters[13].get_opt(i, "metaData.configuration")?;
+                let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
+                self.metadata = Some(Metadata {
+                    id: id.to_string(),
+                    schema_string,
+                    partition_columns,
+                    configuration,
+                    ..Default::default()
+                });
             } else if let Some(min_reader_version) =
-                getters[19].get_int(i, "protocol.min_reader_version")?
+                getters[14].get_int(i, "protocol.min_reader_version")?
             {
                 let protocol =
-                    ProtocolVisitor::visit_protocol(i, min_reader_version, &getters[19..=22])?;
+                    ProtocolVisitor::visit_protocol(i, min_reader_version, &getters[14..=17])?;
                 self.protocol = Some(protocol);
             }
         }
