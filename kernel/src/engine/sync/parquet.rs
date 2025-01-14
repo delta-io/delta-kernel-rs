@@ -21,9 +21,8 @@ fn try_create_from_parquet(
     let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
     let parquet_schema = metadata.schema();
     let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let (indicies, requested_ordering) = get_requested_indices(&schema, parquet_schema)?;
-    if let Some(mask) = generate_mask(&schema, parquet_schema, builder.parquet_schema(), &indicies)
-    {
+    let (indices, requested_ordering) = get_requested_indices(&schema, parquet_schema)?;
+    if let Some(mask) = generate_mask(&schema, parquet_schema, builder.parquet_schema(), &indices) {
         builder = builder.with_projection(mask);
     }
     if let Some(predicate) = predicate {

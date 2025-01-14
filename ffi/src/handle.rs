@@ -2,8 +2,8 @@
 //! boundary.
 //!
 //! Creating a [`Handle<T>`] always implies some kind of ownership transfer. A mutable handle takes
-//! ownership of the object itself (analagous to [`Box<T>`]), while a non-mutable (shared) handle
-//! takes ownership of a shared reference to the object (analagous to [`std::sync::Arc<T>`]). Thus, a created
+//! ownership of the object itself (analogous to [`Box<T>`]), while a non-mutable (shared) handle
+//! takes ownership of a shared reference to the object (analogous to [`std::sync::Arc<T>`]). Thus, a created
 //! handle remains [valid][Handle#Validity], and its underlying object remains accessible, until the
 //! handle is explicitly dropped or consumed. Dropping a mutable handle always drops the underlying
 //! object as well; dropping a shared handle only drops the underlying object if the handle was the

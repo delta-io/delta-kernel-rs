@@ -241,7 +241,7 @@ impl WriteContext {
 /// Result after committing a transaction. If 'committed', the version is the new version written
 /// to the log. If 'conflict', the transaction is returned so the caller can resolve the conflict
 /// (along with the version which conflicted).
-// TODO(zach): in order to make the returning of a transcation useful, we need to add APIs to
+// TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
 // update the transaction to a new version etc.
 #[derive(Debug)]
 pub enum CommitResult {

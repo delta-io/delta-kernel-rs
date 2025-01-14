@@ -1156,7 +1156,7 @@ mod tests {
             ),
         ]);
 
-        // Similer to SchemaDepthChecker::check, but also returns call count
+        // Similar to SchemaDepthChecker::check, but also returns call count
         let check_with_call_count =
             |depth_limit| SchemaDepthChecker::check_with_call_count(&schema, depth_limit);
 
