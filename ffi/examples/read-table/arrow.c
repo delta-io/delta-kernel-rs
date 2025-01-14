@@ -97,7 +97,7 @@ static GArrowRecordBatch* add_partition_columns(
     }
 
     GArrowArray* partition_col = garrow_array_builder_finish((GArrowArrayBuilder*)builder, &error);
-    if (report_g_error("Can't build string array for parition column", error)) {
+    if (report_g_error("Can't build string array for partition column", error)) {
       printf("Giving up on column %s\n", col);
       g_error_free(error);
       g_object_unref(builder);
@@ -144,7 +144,7 @@ static void add_batch_to_context(
   }
   record_batch = add_partition_columns(record_batch, partition_cols, partition_values);
   if (record_batch == NULL) {
-    printf("Failed to add parition columns, not adding batch\n");
+    printf("Failed to add partition columns, not adding batch\n");
     return;
   }
   context->batches = g_list_append(context->batches, record_batch);

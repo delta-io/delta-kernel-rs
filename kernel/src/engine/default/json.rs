@@ -29,7 +29,7 @@ pub struct DefaultJsonHandler<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
     /// The executor to run async tasks on
     task_executor: Arc<E>,
-    /// The maximun number of batches to read ahead
+    /// The maximum number of batches to read ahead
     readahead: usize,
     /// The number of rows to read per batch
     batch_size: usize,
