@@ -255,7 +255,7 @@ impl RemoveVisitor {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Remove> {
         require!(
-            getters.len() == 15,
+            getters.len() == 14,
             Error::InternalError(format!(
                 "Wrong number of RemoveVisitor getters: {}",
                 getters.len()
@@ -272,15 +272,13 @@ impl RemoveVisitor {
 
         let size: Option<i64> = getters[5].get_opt(row_index, "remove.size")?;
 
-        let stats: Option<String> = getters[6].get_opt(row_index, "remove.stats")?;
+        // TODO(nick) tags are skipped in getters[6]
 
-        // TODO(nick) tags are skipped in getters[7]
+        let deletion_vector = visit_deletion_vector_at(row_index, &getters[7..])?;
 
-        let deletion_vector = visit_deletion_vector_at(row_index, &getters[8..])?;
-
-        let base_row_id: Option<i64> = getters[13].get_opt(row_index, "remove.baseRowId")?;
+        let base_row_id: Option<i64> = getters[12].get_opt(row_index, "remove.baseRowId")?;
         let default_row_commit_version: Option<i64> =
-            getters[14].get_opt(row_index, "remove.defaultRowCommitVersion")?;
+            getters[13].get_opt(row_index, "remove.defaultRowCommitVersion")?;
 
         Ok(Remove {
             path,
@@ -289,7 +287,6 @@ impl RemoveVisitor {
             extended_file_metadata,
             partition_values,
             size,
-            stats,
             tags: None,
             deletion_vector,
             base_row_id,
@@ -633,40 +630,6 @@ mod tests {
         for (add, expected) in add_visitor.adds.into_iter().zip(expected.into_iter()) {
             assert_eq!(add, expected);
         }
-    }
-
-    #[test]
-    fn test_parse_remove() {
-        let engine = SyncEngine::new();
-        let json_handler = engine.get_json_handler();
-        let json_strings: StringArray = vec![
-            r#"{"commitInfo":{"timestamp":1670892998177,"operation":"DELETE","operationParameters":{"mode":"Append"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"1","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,
-            r#"{"remove":{"path":"part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet","deletionTimestamp":1670892998135,"dataChange":true,"size":452,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":5},\"maxValues\":{\"c3\":5},\"nullCount\":{\"c3\":0}}"}}"#,
-        ]
-        .into();
-        let output_schema = get_log_schema().clone();
-        let batch = json_handler
-            .parse_json(string_array_to_engine_data(json_strings), output_schema)
-            .unwrap();
-        let mut remove_visitor = RemoveVisitor::default();
-        remove_visitor.visit_rows_of(batch.as_ref()).unwrap();
-        let expected_remove: Remove = Remove {
-            path: "part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet".into(),
-            deletion_timestamp: Some(1670892998135),
-            data_change: true,
-            size: Some(452),
-            stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":5},\"maxValues\":{\"c3\":5},\"nullCount\":{\"c3\":0}}".into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            remove_visitor.removes.len(),
-            1,
-            "Unexpected number of remove actions"
-        );
-        assert_eq!(
-            remove_visitor.removes[0], expected_remove,
-            "Unexpected remove action"
-        );
     }
 
     #[test]

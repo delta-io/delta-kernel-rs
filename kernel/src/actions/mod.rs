@@ -442,12 +442,6 @@ struct Remove {
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) size: Option<i64>,
 
-    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this logical file encoded as a JSON string.
-    ///
-    /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
-    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
-    pub(crate) stats: Option<String>,
-
     /// Map containing metadata about this logical file.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) tags: Option<HashMap<String, String>>,
@@ -639,7 +633,6 @@ mod tests {
                 StructField::new("extendedFileMetadata", DataType::BOOLEAN, true),
                 partition_values_field(),
                 StructField::new("size", DataType::LONG, true),
-                StructField::new("stats", DataType::STRING, true),
                 tags_field(),
                 deletion_vector_field(),
                 StructField::new("baseRowId", DataType::LONG, true),
