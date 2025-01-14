@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::schemas::GetStructField;
-use crate::actions::visitors::{visit_deletion_vector_at, MetadataVisitor, ProtocolVisitor};
+use crate::actions::visitors::{visit_deletion_vector_at, ProtocolVisitor};
 use crate::actions::{
     get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, METADATA_NAME,
     PROTOCOL_NAME, REMOVE_NAME,
@@ -284,14 +284,17 @@ struct PreparePhaseVisitor<'a> {
     remove_dvs: &'a mut HashMap<String, DvInfo>,
 }
 impl PreparePhaseVisitor<'_> {
-    fn schema() -> Arc<StructType> {
-        Arc::new(StructType::new(vec![
-            Option::<Add>::get_struct_field(ADD_NAME),
-            Option::<Remove>::get_struct_field(REMOVE_NAME),
-            Option::<Cdc>::get_struct_field(CDC_NAME),
-            Option::<Metadata>::get_struct_field(METADATA_NAME),
-            Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
-        ]))
+    fn schema() -> SchemaRef {
+        static PREPARE_PHASE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+            Arc::new(StructType::new(vec![
+                Option::<Add>::get_struct_field(ADD_NAME),
+                Option::<Remove>::get_struct_field(REMOVE_NAME),
+                Option::<Cdc>::get_struct_field(CDC_NAME),
+                Option::<Metadata>::get_struct_field(METADATA_NAME),
+                Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
+            ]))
+        });
+        PREPARE_PHASE_SCHEMA.clone()
     }
 }
 
