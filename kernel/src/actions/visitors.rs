@@ -37,16 +37,16 @@ impl MetadataVisitor {
                 getters.len()
             ))
         );
-        let name: Option<String> = getters[1].get_opt(row_index, "metadata.name")?;
-        let description: Option<String> = getters[2].get_opt(row_index, "metadata.description")?;
+        let name: Option<String> = getters[1].get_opt(row_index, "metaData.name")?;
+        let description: Option<String> = getters[2].get_opt(row_index, "metaData.description")?;
         // get format out of primitives
-        let format_provider: String = getters[3].get(row_index, "metadata.format.provider")?;
+        let format_provider: String = getters[3].get(row_index, "metaData.format.provider")?;
         // options for format is always empty, so skip getters[4]
-        let schema_string: String = getters[5].get(row_index, "metadata.schemaString")?;
-        let partition_columns: Vec<_> = getters[6].get(row_index, "metadata.partitionColumns")?;
-        let created_time: Option<i64> = getters[7].get_opt(row_index, "metadata.created_time")?;
+        let schema_string: String = getters[5].get(row_index, "metaData.schemaString")?;
+        let partition_columns: Vec<_> = getters[6].get(row_index, "metaData.partitionColumns")?;
+        let created_time: Option<i64> = getters[7].get_opt(row_index, "metaData.created_time")?;
         let configuration_map_opt: Option<HashMap<_, _>> =
-            getters[8].get_opt(row_index, "metadata.configuration")?;
+            getters[8].get_opt(row_index, "metaData.configuration")?;
         let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
 
         Ok(Metadata {
