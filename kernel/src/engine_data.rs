@@ -199,7 +199,7 @@ pub trait RowVisitor {
     /// "getter" of type [`GetData`] will be present. This can be used to actually get at the data
     /// for each row. You can `use` the `TypedGetData` trait if you want to have a way to extract
     /// typed data that will fail if the "getter" is for an unexpected type.  The data in `getters`
-    /// does not outlive the call to this funtion (i.e. it should be copied if needed).
+    /// does not outlive the call to this function (i.e. it should be copied if needed).
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()>;
 
     /// Visit the rows of an [`EngineData`], selecting the leaf column names given by

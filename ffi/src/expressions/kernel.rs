@@ -83,7 +83,7 @@ pub struct EngineExpressionVisitor {
     /// Visit a 64bit timestamp belonging to the list identified by `sibling_list_id`.
     /// The timestamp is microsecond precision with no timezone.
     pub visit_literal_timestamp_ntz: VisitLiteralFn<i64>,
-    /// Visit a 32bit intger `date` representing days since UNIX epoch 1970-01-01.  The `date` belongs
+    /// Visit a 32bit integer `date` representing days since UNIX epoch 1970-01-01.  The `date` belongs
     /// to the list identified by `sibling_list_id`.
     pub visit_literal_date: VisitLiteralFn<i32>,
     /// Visit binary data at the `buffer` with length `len` belonging to the list identified by

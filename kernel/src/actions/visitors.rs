@@ -367,7 +367,7 @@ impl RowVisitor for CdcVisitor {
 
 pub type SetTransactionMap = HashMap<String, SetTransaction>;
 
-/// Extact application transaction actions from the log into a map
+/// Extract application transaction actions from the log into a map
 ///
 /// This visitor maintains the first entry for each application id it
 /// encounters.  When a specific application id is required then

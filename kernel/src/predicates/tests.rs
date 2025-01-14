@@ -51,7 +51,7 @@ fn test_default_eval_scalar() {
     }
 }
 
-// verifies that partial orderings behave as excpected for all Scalar types
+// verifies that partial orderings behave as expected for all Scalar types
 #[test]
 fn test_default_partial_cmp_scalars() {
     use Ordering::*;

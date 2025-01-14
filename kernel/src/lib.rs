@@ -202,7 +202,7 @@ impl FileMeta {
 /// let b: Arc<Bar> = a.downcast().unwrap();
 /// ```
 ///
-/// In contrast, very similer code that relies only on `Any` would fail to compile:
+/// In contrast, very similar code that relies only on `Any` would fail to compile:
 ///
 /// ```fail_compile
 /// # use std::any::Any;
@@ -404,7 +404,7 @@ pub trait JsonHandler: AsAny {
     ///
     /// - `path` - URL specifying the location to write the JSON file
     /// - `data` - Iterator of EngineData to write to the JSON file. Each row should be written as
-    ///   a new JSON object appended to the file. (that is, the file is newline-delimeted JSON, and
+    ///   a new JSON object appended to the file. (that is, the file is newline-delimited JSON, and
     ///   each row is a JSON object on a single line)
     /// - `overwrite` - If true, overwrite the file if it exists. If false, the call must fail if
     ///   the file exists.

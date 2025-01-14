@@ -55,9 +55,9 @@ macro_rules! prim_array_cmp {
 
 pub(crate) use prim_array_cmp;
 
-/// Get the indicies in `parquet_schema` of the specified columns in `requested_schema`. This
-/// returns a tuples of (mask_indicies: Vec<parquet_schema_index>, reorder_indicies:
-/// Vec<requested_index>). `mask_indicies` is used for generating the mask for reading from the
+/// Get the indices in `parquet_schema` of the specified columns in `requested_schema`. This
+/// returns a tuples of (mask_indices: Vec<parquet_schema_index>, reorder_indices:
+/// Vec<requested_index>). `mask_indices` is used for generating the mask for reading from the
 pub(crate) fn make_arrow_error(s: impl Into<String>) -> Error {
     Error::Arrow(arrow_schema::ArrowError::InvalidArgumentError(s.into())).with_backtrace()
 }

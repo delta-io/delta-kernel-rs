@@ -6,6 +6,7 @@
 .idea/
 .vscode/
 .vim
+.zed
 
 # Rust
 .cargo/

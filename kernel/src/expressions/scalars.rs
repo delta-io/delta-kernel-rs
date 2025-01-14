@@ -393,7 +393,7 @@ impl PrimitiveType {
             // Timestamps may additionally be encoded as a ISO 8601 formatted string such as
             // `1970-01-01T00:00:00.123456Z`.
             //
-            // The difference arrises mostly in how they are to be handled on the engine side - i.e. timestampNTZ
+            // The difference arises mostly in how they are to be handled on the engine side - i.e. timestampNTZ
             // is not adjusted to UTC, this is just so we can (de-)serialize it as a date sting.
             // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
             TimestampNtz | Timestamp => {

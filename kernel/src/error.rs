@@ -1,4 +1,4 @@
-//! Defintions of errors that the delta kernel can encounter
+//! Definitions of errors that the delta kernel can encounter
 
 use std::{
     backtrace::{Backtrace, BacktraceStatus},
@@ -58,7 +58,7 @@ pub enum Error {
     #[error("Internal error {0}. This is a kernel bug, please report.")]
     InternalError(String),
 
-    /// An error enountered while working with parquet data
+    /// An error encountered while working with parquet data
     #[cfg(feature = "parquet")]
     #[error("Arrow error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
@@ -99,7 +99,7 @@ pub enum Error {
     #[error("No table version found.")]
     MissingVersion,
 
-    /// An error occured while working with deletion vectors
+    /// An error occurred while working with deletion vectors
     #[error("Deletion Vector error: {0}")]
     DeletionVector(String),
 
