@@ -138,6 +138,14 @@ impl TableChanges {
         start_version: Version,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
+        let log_root = table_root.join("_delta_log/")?;
+        let log_segment = LogSegment::for_table_changes(
+            engine.get_file_system_client().as_ref(),
+            log_root,
+            start_version,
+            end_version,
+        )?;
+
         // Both snapshots ensure that reading is supported at the start and end version using
         // `ensure_read_supported`. Note that we must still verify that reading is
         // supported for every protocol action in the CDF range.
@@ -172,14 +180,6 @@ impl TableChanges {
                 "Failed to build TableChanges: Start and end version schemas are different. Found start version schema {:?} and end version schema {:?}", start_snapshot.schema(), end_snapshot.schema(),
             )));
         }
-
-        let log_root = table_root.join("_delta_log/")?;
-        let log_segment = LogSegment::for_table_changes(
-            engine.get_file_system_client().as_ref(),
-            log_root,
-            start_version,
-            end_version,
-        )?;
 
         let schema = StructType::new(
             end_snapshot
