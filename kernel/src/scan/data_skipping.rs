@@ -84,7 +84,7 @@ impl DataSkippingFilter {
         let stats_schema = Arc::new(StructType::new([
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", nullcount_schema),
-            StructField::new("minValues", referenced_schema.clone(), true),
+            StructField::nullable("minValues", referenced_schema.clone()),
             StructField::nullable("maxValues", referenced_schema),
         ]));
 

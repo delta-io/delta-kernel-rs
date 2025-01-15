@@ -188,13 +188,13 @@ pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
 
         let add = StructType::new([
             StructField::nullable("path", DataType::STRING),
-            StructField::new("deletionVector", deletion_vector.clone(), true),
-            StructField::new("fileConstantValues", file_constant_values.clone(), true),
+            StructField::nullable("deletionVector", deletion_vector.clone()),
+            StructField::nullable("fileConstantValues", file_constant_values.clone()),
         ]);
         let remove = StructType::new([
             StructField::nullable("path", DataType::STRING),
             StructField::nullable("deletionVector", deletion_vector),
-            StructField::new("fileConstantValues", file_constant_values.clone(), true),
+            StructField::nullable("fileConstantValues", file_constant_values.clone()),
         ]);
         let cdc = StructType::new([
             StructField::nullable("path", DataType::STRING),

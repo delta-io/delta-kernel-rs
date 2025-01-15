@@ -277,10 +277,9 @@ fn generate_commit_info(
         // HACK (part 1/2): since we don't have proper map support, we create a literal struct with
         // one null field to create data that serializes as "operationParameters": {}
         Expression::literal(Scalar::Struct(StructData::try_new(
-            vec![StructField::new(
+            vec![StructField::nullable(
                 "operation_parameter_int",
                 DataType::INTEGER,
-                true,
             )],
             vec![Scalar::Null(DataType::INTEGER)],
         )?)),
@@ -304,10 +303,9 @@ fn generate_commit_info(
     };
     let engine_commit_info_schema =
         commit_info_data_type.project_as_struct(&["engineCommitInfo"])?;
-    let hack_data_type = DataType::Struct(Box::new(StructType::new(vec![StructField::new(
+    let hack_data_type = DataType::Struct(Box::new(StructType::new(vec![StructField::nullable(
         "hack_operation_parameter_int",
         DataType::INTEGER,
-        true,
     )])));
 
     commit_info_data_type

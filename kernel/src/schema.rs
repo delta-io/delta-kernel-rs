@@ -1100,59 +1100,52 @@ mod tests {
     #[test]
     fn test_depth_checker() {
         let schema = DataType::struct_type([
-            StructField::new(
+            StructField::nullable(
                 "a",
                 ArrayType::new(
                     DataType::struct_type([
                         StructField::nullable("w", DataType::LONG),
-                        StructField::new("x", ArrayType::new(DataType::LONG, true), true),
-                        StructField::new(
+                        StructField::nullable("x", ArrayType::new(DataType::LONG, true)),
+                        StructField::nullable(
                             "y",
                             MapType::new(DataType::LONG, DataType::STRING, true),
-                            true,
                         ),
-                        StructField::new(
+                        StructField::nullable(
                             "z",
                             DataType::struct_type([
                                 StructField::nullable("n", DataType::LONG),
                                 StructField::nullable("m", DataType::STRING),
                             ]),
-                            true,
                         ),
                     ]),
                     true,
                 ),
-                true,
             ),
-            StructField::new(
+            StructField::nullable(
                 "b",
                 DataType::struct_type([
-                    StructField::new("o", ArrayType::new(DataType::LONG, true), true),
-                    StructField::new(
+                    StructField::nullable("o", ArrayType::new(DataType::LONG, true)),
+                    StructField::nullable(
                         "p",
                         MapType::new(DataType::LONG, DataType::STRING, true),
-                        true,
                     ),
-                    StructField::new(
+                    StructField::nullable(
                         "q",
                         DataType::struct_type([
-                            StructField::new(
+                            StructField::nullable(
                                 "s",
                                 DataType::struct_type([
                                     StructField::nullable("u", DataType::LONG),
                                     StructField::nullable("v", DataType::LONG),
                                 ]),
-                                true,
                             ),
                             StructField::nullable("t", DataType::LONG),
                         ]),
-                        true,
                     ),
                     StructField::nullable("r", DataType::LONG),
                 ]),
-                true,
             ),
-            StructField::new(
+            StructField::nullable(
                 "c",
                 MapType::new(
                     DataType::LONG,
@@ -1162,7 +1155,6 @@ mod tests {
                     ]),
                     true,
                 ),
-                true,
             ),
         ]);
 

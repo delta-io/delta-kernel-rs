@@ -98,6 +98,6 @@ impl<T: ToDataType> GetStructField for T {
 // Option types produce nullable fields
 impl<T: ToDataType> GetStructField for Option<T> {
     fn get_struct_field(name: impl Into<String>) -> StructField {
-        StructField::new(name, T::to_data_type(), true)
+        StructField::nullable(name, T::to_data_type())
     }
 }

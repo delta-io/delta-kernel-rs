@@ -400,29 +400,26 @@ mod tests {
 
     #[test]
     fn ensure_struct() {
-        let schema = DataType::struct_type([StructField::new(
+        let schema = DataType::struct_type([StructField::nullable(
             "a",
             ArrayType::new(
                 DataType::struct_type([
                     StructField::nullable("w", DataType::LONG),
-                    StructField::new("x", ArrayType::new(DataType::LONG, true), true),
-                    StructField::new(
+                    StructField::nullable("x", ArrayType::new(DataType::LONG, true)),
+                    StructField::nullable(
                         "y",
                         MapType::new(DataType::LONG, DataType::STRING, true),
-                        true,
                     ),
-                    StructField::new(
+                    StructField::nullable(
                         "z",
                         DataType::struct_type([
                             StructField::nullable("n", DataType::LONG),
                             StructField::nullable("m", DataType::STRING),
                         ]),
-                        true,
                     ),
                 ]),
                 true,
             ),
-            true,
         )]);
         let arrow_struct: ArrowDataType = (&schema).try_into().unwrap();
         assert!(ensure_data_types(&schema, &arrow_struct, true).is_ok());
