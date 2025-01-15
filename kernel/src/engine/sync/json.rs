@@ -1,6 +1,7 @@
 use std::{fs::File, io::BufReader, io::Write};
 
-use arrow_schema::SchemaRef as ArrowSchemaRef;
+use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use crate::arrow::json::ReaderBuilder;
 use tempfile::NamedTempFile;
 use url::Url;
 
@@ -22,7 +23,7 @@ fn try_create_from_json(
     arrow_schema: ArrowSchemaRef,
     _predicate: Option<ExpressionRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
-    let json = arrow_json::ReaderBuilder::new(arrow_schema)
+    let json = ReaderBuilder::new(arrow_schema)
         .build(BufReader::new(file))?
         .map(|data| Ok(ArrowEngineData::new(data?)));
     Ok(json)
@@ -92,10 +93,8 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::{RecordBatch, StringArray};
-    use arrow_schema::DataType as ArrowDataType;
-    use arrow_schema::Field;
-    use arrow_schema::Schema as ArrowSchema;
+    use crate::arrow::array::{RecordBatch, StringArray};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use serde_json::json;
     use url::Url;
 

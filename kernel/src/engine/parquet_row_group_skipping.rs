@@ -2,13 +2,13 @@
 use crate::expressions::{
     BinaryExpression, ColumnName, Expression, Scalar, UnaryExpression, VariadicExpression,
 };
+use crate::parquet::arrow::arrow_reader::ArrowReaderBuilder;
+use crate::parquet::file::metadata::RowGroupMetaData;
+use crate::parquet::file::statistics::Statistics;
+use crate::parquet::schema::types::ColumnDescPtr;
 use crate::predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::schema::{DataType, PrimitiveType};
 use chrono::{DateTime, Days};
-use parquet::arrow::arrow_reader::ArrowReaderBuilder;
-use parquet::file::metadata::RowGroupMetaData;
-use parquet::file::statistics::Statistics;
-use parquet::schema::types::ColumnDescPtr;
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
