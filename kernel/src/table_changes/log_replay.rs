@@ -209,13 +209,13 @@ fn process_cdf_commit(
         // same as an `add` action.
         remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
     }
-    let processed_commit = ProcessedCDFCommit {
+
+    Ok(ProcessedCDFCommit {
         timestamp: commit_file.location.last_modified,
         commit_file,
         has_cdc_action,
         remove_dvs,
-    };
-    Ok(processed_commit)
+    })
 }
 
 /// Generates an iterator of [`TableChangesScanData`] by iterating over each action of the
@@ -306,8 +306,8 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
             const INTEGER: DataType = DataType::INTEGER;
             const LONG: DataType = DataType::LONG;
             const BOOLEAN: DataType = DataType::BOOLEAN;
-            let s_list: DataType = ArrayType::new(STRING, false).into();
-            let ss_map: DataType = MapType::new(STRING, STRING, false).into();
+            let str_list: DataType = ArrayType::new(STRING, false).into();
+            let str_str_map: DataType = MapType::new(STRING, STRING, false).into();
             let types_and_names = vec![
                 (STRING, column_name!("add.path")),
                 (BOOLEAN, column_name!("add.dataChange")),
@@ -321,12 +321,12 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 (STRING, column_name!("cdc.path")),
                 (STRING, column_name!("metaData.id")),
                 (STRING, column_name!("metaData.schemaString")),
-                (s_list.clone(), column_name!("metaData.partitionColumns")),
-                (ss_map, column_name!("metaData.configuration")),
+                (str_list.clone(), column_name!("metaData.partitionColumns")),
+                (str_str_map, column_name!("metaData.configuration")),
                 (INTEGER, column_name!("protocol.minReaderVersion")),
                 (INTEGER, column_name!("protocol.minWriterVersion")),
-                (s_list.clone(), column_name!("protocol.readerFeatures")),
-                (s_list, column_name!("protocol.writerFeatures")),
+                (str_list.clone(), column_name!("protocol.readerFeatures")),
+                (str_list, column_name!("protocol.writerFeatures")),
             ];
             let (types, names) = types_and_names.into_iter().unzip();
             (names, types).into()
@@ -367,7 +367,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                     schema_string,
                     partition_columns,
                     configuration,
-                    ..Default::default()
+                    ..Default::default() // Other fields are ignored
                 });
             } else if let Some(min_reader_version) =
                 getters[14].get_int(i, "protocol.min_reader_version")?
