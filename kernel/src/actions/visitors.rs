@@ -76,7 +76,7 @@ impl RowVisitor for MetadataVisitor {
             // Since id column is required, use it to detect presence of a metadata action
             if let Some(id) = getters[0].get_opt(i, "metaData.id")? {
                 self.metadata = Some(Self::visit_metadata(i, id, getters)?);
-                break; // A commit has at most metaData action
+                break; // A commit has at most one metaData action
             }
         }
         Ok(())
@@ -158,7 +158,7 @@ impl RowVisitor for ProtocolVisitor {
             // Since minReaderVersion column is required, use it to detect presence of a Protocol action
             if let Some(mrv) = getters[0].get_opt(i, "protocol.min_reader_version")? {
                 self.protocol = Some(Self::visit_protocol(i, mrv, getters)?);
-                break;
+                break; // A commit has at most one Protocol action
             }
         }
         Ok(())
