@@ -241,7 +241,7 @@ impl WriteContext {
 /// Result after committing a transaction. If 'committed', the version is the new version written
 /// to the log. If 'conflict', the transaction is returned so the caller can resolve the conflict
 /// (along with the version which conflicted).
-// TODO(zach): in order to make the returning of a transcation useful, we need to add APIs to
+// TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
 // update the transaction to a new version etc.
 #[derive(Debug)]
 pub enum CommitResult {
@@ -315,6 +315,12 @@ fn generate_commit_info(
         .get_mut("operationParameters")
         .ok_or_else(|| Error::missing_column("operationParameters"))?
         .data_type = hack_data_type;
+
+    // Since writing in-commit timestamps is not supported, we remove the field so it is not
+    // written to the log
+    commit_info_data_type
+        .fields
+        .shift_remove("inCommitTimestamp");
     commit_info_field.data_type = DataType::Struct(commit_info_data_type);
 
     let commit_info_evaluator = engine.get_expression_handler().get_evaluator(

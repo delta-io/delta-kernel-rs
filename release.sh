@@ -2,7 +2,7 @@
 
 ###################################################################################################
 # USAGE:
-# 1. on a release branch: ./release.sh <version>
+# 1. on a release branch: ./release.sh <version> (example: ./release.sh 0.1.0)
 # 2. on main branch (after merging release branch): ./release.sh
 ###################################################################################################
 
@@ -53,7 +53,7 @@ is_working_tree_clean() {
 is_version_published() {
     local crate_name="$1"
     local version
-    version=get_current_version "$crate_name"
+    version=$(get_current_version "$crate_name")
 
     if [[ -z "$version" ]]; then
         log_error "Could not find crate '$crate_name' in workspace"
@@ -122,14 +122,20 @@ handle_release_branch() {
 # Handle main branch workflow (publish and tag)
 handle_main_branch() {
     # could potentially just use full 'cargo release' command here
-    publish "delta_kernel_derive" "$current_version"
-    publish "delta_kernel" "$current_version"
+    publish "delta_kernel_derive"
+    publish "delta_kernel"
+
+    # hack: just redo getting the version
+    local version
+    version=$(get_current_version "delta_kernel")
 
     if confirm "Would you like to tag this release?"; then
-        log_info "Tagging release $current_version..."
-        git tag -a "v$current_version" -m "Release $current_version"
-        git push upstream "v$current_version"
-        log_success "Tagged release $current_version"
+        log_info "Tagging release $version..."
+        if confirm "Tagging as v$version. continue?"; then
+            git tag -a "v$version" -m "Release v$version"
+            git push upstream tag "v$version"
+            log_success "Tagged release $version"
+        fi
     fi
 }
 
@@ -138,20 +144,29 @@ publish() {
     local current_version
     current_version=$(get_current_version "$crate_name")
 
-    if is_version_published "delta_kernel_derive"; then
-        log_error "delta_kernel_derive version $current_version is already published to crates.io"
+    if is_version_published "$crate_name"; then
+        log_error "$crate_name version $current_version is already published to crates.io"
     fi
-    log_info "[DRY RUN] Publishing $crate_name version $version to crates.io..."
+    log_info "[DRY RUN] Publishing $crate_name version $current_version to crates.io..."
     if ! cargo publish --dry-run -p "$crate_name"; then
         log_error "Failed to publish $crate_name to crates.io"
     fi
 
     if confirm "Dry run complete. Continue with publishing?"; then
-        log_info "Publishing $crate_name version $version to crates.io..."
+        log_info "Publishing $crate_name version $current_version to crates.io..."
         if ! cargo publish -p "$crate_name"; then
             log_error "Failed to publish $crate_name to crates.io"
         fi
-        log_success "Successfully published $crate_name version $version to crates.io"
+        log_success "Successfully published $crate_name version $current_version to crates.io"
+    fi
+}
+
+
+validate_version() {
+    local version=$1
+    # Check if version starts with a number
+    if [[ ! $version =~ ^[0-9] ]]; then
+        log_error "Version must start with a number (e.g., '0.1.1'). Got: '$version'"
     fi
 }
 
@@ -166,5 +181,6 @@ else
     if [[ $# -ne 1 ]]; then
         log_error "Version argument required when on release branch\nUsage: $0 <version>"
     fi
+    validate_version "$1"
     handle_release_branch "$1"
 fi

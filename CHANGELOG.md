@@ -1,5 +1,39 @@
 # Changelog
 
+## [v0.6.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.6.1/) (2025-01-10)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.6.0...v0.6.1)
+
+
+### 🚀 Features / new APIs
+
+1. New feature flag `default-engine-rustls` ([#572])
+
+### 🐛 Bug Fixes
+
+1. Allow partition value timestamp to be ISO8601 formatted string ([#622])
+2. Fix stderr output for handle tests ([#630])
+
+### ⚙️ Chores/CI
+
+1. Expand the arrow version range to allow arrow v54 ([#616])
+2. Update to CodeCov @v5 ([#608])
+
+### Other
+
+1. Fix msrv check by pinning `home` dependency ([#605])
+2. Add release script ([#636])
+
+
+[#605]: https://github.com/delta-io/delta-kernel-rs/pull/605
+[#608]: https://github.com/delta-io/delta-kernel-rs/pull/608
+[#622]: https://github.com/delta-io/delta-kernel-rs/pull/622
+[#630]: https://github.com/delta-io/delta-kernel-rs/pull/630
+[#572]: https://github.com/delta-io/delta-kernel-rs/pull/572
+[#616]: https://github.com/delta-io/delta-kernel-rs/pull/616
+[#636]: https://github.com/delta-io/delta-kernel-rs/pull/636
+
+
 ## [v0.6.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.6.0/) (2024-12-17)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.5.0...v0.6.0)

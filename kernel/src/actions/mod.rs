@@ -331,8 +331,13 @@ where
 struct CommitInfo {
     /// The time this logical file was created, as milliseconds since the epoch.
     /// Read: optional, write: required (that is, kernel always writes).
-    /// If in-commit timestamps are enabled, this is always required.
     pub(crate) timestamp: Option<i64>,
+    /// The time this logical file was created, as milliseconds since the epoch. Unlike
+    /// `timestamp`, this field is guaranteed to be monotonically increase with each commit.
+    /// Note: If in-commit timestamps are enabled, both the following must be true:
+    /// - The `inCommitTimestamp` field must always be present in CommitInfo.
+    /// - The CommitInfo action must always be the first one in a commit.
+    pub(crate) in_commit_timestamp: Option<i64>,
     /// An arbitrary string that identifies the operation associated with this commit. This is
     /// specified by the engine. Read: optional, write: required (that is, kernel alwarys writes).
     pub(crate) operation: Option<String>,
@@ -375,7 +380,7 @@ pub struct Add {
     /// in the added file must be contained in one or more remove actions in the same version.
     pub data_change: bool,
 
-    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this logical file.
+    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this logical file encoded as a JSON string.
     ///
     /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
@@ -694,6 +699,7 @@ mod tests {
             "commitInfo",
             StructType::new(vec![
                 StructField::new("timestamp", DataType::LONG, true),
+                StructField::new("inCommitTimestamp", DataType::LONG, true),
                 StructField::new("operation", DataType::STRING, true),
                 StructField::new(
                     "operationParameters",
