@@ -91,14 +91,13 @@ impl TableConfiguration {
     pub fn is_cdf_read_supported(&self) -> DeltaResult<()> {
         static CDF_SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeatures>> =
             LazyLock::new(|| HashSet::from([ReaderFeatures::DeletionVectors]));
-        let protocol = &self.protocol;
-        match protocol.reader_features() {
+        match self.protocol.reader_features() {
             // if min_reader_version = 3 and all reader features are subset of supported => OK
-            Some(reader_features) if protocol.min_reader_version() == 3 => {
+            Some(reader_features) if self.protocol.min_reader_version() == 3 => {
                 ensure_supported_features(reader_features, &CDF_SUPPORTED_READER_FEATURES)?
             }
             // if min_reader_version = 1 and there are no reader features => OK
-            None if protocol.min_reader_version() == 1 => (),
+            None if self.protocol.min_reader_version() == 1 => {}
             // any other protocol is not supported
             _ => {
                 return Err(Error::unsupported(
