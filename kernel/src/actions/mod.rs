@@ -541,10 +541,7 @@ mod tests {
                     ]),
                 ),
                 StructField::not_null("schemaString", DataType::STRING),
-                StructField::not_null(
-                    "partitionColumns",
-                    ArrayType::new(DataType::STRING, false),
-                ),
+                StructField::not_null("partitionColumns", ArrayType::new(DataType::STRING, false)),
                 StructField::nullable("createdTime", DataType::LONG),
                 StructField::not_null(
                     "configuration",
