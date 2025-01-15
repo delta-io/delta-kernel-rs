@@ -763,7 +763,7 @@ mod tests {
     #[test]
     fn simple_mask_indices() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
+            StructField::not_null("i", DataType::INTEGER),
             StructField::nullable("s", DataType::STRING),
             StructField::nullable("i2", DataType::INTEGER),
         ]));
@@ -787,7 +787,7 @@ mod tests {
     #[test]
     fn ensure_data_types_fails_correctly() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
+            StructField::not_null("i", DataType::INTEGER),
             StructField::nullable("s", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
@@ -798,7 +798,7 @@ mod tests {
         assert!(res.is_err());
 
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
+            StructField::not_null("i", DataType::INTEGER),
             StructField::nullable("s", DataType::STRING),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
@@ -835,7 +835,7 @@ mod tests {
     #[test]
     fn simple_reorder_indices() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
+            StructField::not_null("i", DataType::INTEGER),
             StructField::nullable("s", DataType::STRING),
             StructField::nullable("i2", DataType::INTEGER),
         ]));
@@ -859,7 +859,7 @@ mod tests {
     #[test]
     fn simple_nullable_field_missing() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
+            StructField::not_null("i", DataType::INTEGER),
             StructField::nullable("s", DataType::STRING),
             StructField::nullable("i2", DataType::INTEGER),
         ]));
@@ -882,16 +882,16 @@ mod tests {
     #[test]
     fn nested_indices() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
+            StructField::not_null("i", DataType::INTEGER),
             StructField::new(
                 "nested",
                 StructType::new([
-                    StructField::new("int32", DataType::INTEGER, false),
-                    StructField::new("string", DataType::STRING, false),
+                    StructField::not_null("int32", DataType::INTEGER),
+                    StructField::not_null("string", DataType::STRING),
                 ]),
                 false,
             ),
-            StructField::new("j", DataType::INTEGER, false),
+            StructField::not_null("j", DataType::INTEGER),
         ]));
         let parquet_schema = nested_parquet_schema();
         let (mask_indices, reorder_indices) =
@@ -915,13 +915,13 @@ mod tests {
             StructField::new(
                 "nested",
                 StructType::new([
-                    StructField::new("string", DataType::STRING, false),
-                    StructField::new("int32", DataType::INTEGER, false),
+                    StructField::not_null("string", DataType::STRING),
+                    StructField::not_null("int32", DataType::INTEGER),
                 ]),
                 false,
             ),
-            StructField::new("j", DataType::INTEGER, false),
-            StructField::new("i", DataType::INTEGER, false),
+            StructField::not_null("j", DataType::INTEGER),
+            StructField::not_null("i", DataType::INTEGER),
         ]));
         let parquet_schema = nested_parquet_schema();
         let (mask_indices, reorder_indices) =
@@ -942,13 +942,13 @@ mod tests {
     #[test]
     fn nested_indices_mask_inner() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
+            StructField::not_null("i", DataType::INTEGER),
             StructField::new(
                 "nested",
-                StructType::new([StructField::new("int32", DataType::INTEGER, false)]),
+                StructType::new([StructField::not_null("int32", DataType::INTEGER)]),
                 false,
             ),
-            StructField::new("j", DataType::INTEGER, false),
+            StructField::not_null("j", DataType::INTEGER),
         ]));
         let parquet_schema = nested_parquet_schema();
         let (mask_indices, reorder_indices) =
@@ -966,9 +966,9 @@ mod tests {
     #[test]
     fn simple_list_mask() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
+            StructField::not_null("i", DataType::INTEGER),
             StructField::new("list", ArrayType::new(DataType::INTEGER, false), false),
-            StructField::new("j", DataType::INTEGER, false),
+            StructField::not_null("j", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
@@ -1025,20 +1025,20 @@ mod tests {
     #[test]
     fn nested_indices_list() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
+            StructField::not_null("i", DataType::INTEGER),
             StructField::new(
                 "list",
                 ArrayType::new(
                     StructType::new([
-                        StructField::new("int32", DataType::INTEGER, false),
-                        StructField::new("string", DataType::STRING, false),
+                        StructField::not_null("int32", DataType::INTEGER),
+                        StructField::not_null("string", DataType::STRING),
                     ])
                     .into(),
                     false,
                 ),
                 false,
             ),
-            StructField::new("j", DataType::INTEGER, false),
+            StructField::not_null("j", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
@@ -1077,8 +1077,8 @@ mod tests {
     #[test]
     fn nested_indices_unselected_list() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
-            StructField::new("j", DataType::INTEGER, false),
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::not_null("j", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
@@ -1110,16 +1110,16 @@ mod tests {
     #[test]
     fn nested_indices_list_mask_inner() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
+            StructField::not_null("i", DataType::INTEGER),
             StructField::new(
                 "list",
                 ArrayType::new(
-                    StructType::new([StructField::new("int32", DataType::INTEGER, false)]).into(),
+                    StructType::new([StructField::not_null("int32", DataType::INTEGER)]).into(),
                     false,
                 ),
                 false,
             ),
-            StructField::new("j", DataType::INTEGER, false),
+            StructField::not_null("j", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
@@ -1155,20 +1155,20 @@ mod tests {
     #[test]
     fn nested_indices_list_mask_inner_reorder() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
+            StructField::not_null("i", DataType::INTEGER),
             StructField::new(
                 "list",
                 ArrayType::new(
                     StructType::new([
-                        StructField::new("string", DataType::STRING, false),
-                        StructField::new("int2", DataType::INTEGER, false),
+                        StructField::not_null("string", DataType::STRING),
+                        StructField::not_null("int2", DataType::INTEGER),
                     ])
                     .into(),
                     false,
                 ),
                 false,
             ),
-            StructField::new("j", DataType::INTEGER, false),
+            StructField::not_null("j", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false), // field 0
@@ -1208,16 +1208,16 @@ mod tests {
     #[test]
     fn skipped_struct() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
+            StructField::not_null("i", DataType::INTEGER),
             StructField::new(
                 "nested",
                 StructType::new([
-                    StructField::new("int32", DataType::INTEGER, false),
-                    StructField::new("string", DataType::STRING, false),
+                    StructField::not_null("int32", DataType::INTEGER),
+                    StructField::not_null("string", DataType::STRING),
                 ]),
                 false,
             ),
-            StructField::new("j", DataType::INTEGER, false),
+            StructField::not_null("j", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new(

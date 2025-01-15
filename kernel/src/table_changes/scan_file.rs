@@ -205,8 +205,8 @@ pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
             StructField::nullable("add", add),
             StructField::nullable("remove", remove),
             StructField::nullable("cdc", cdc),
-            StructField::new("timestamp", DataType::LONG, false),
-            StructField::new("commit_version", DataType::LONG, false),
+            StructField::not_null("timestamp", DataType::LONG),
+            StructField::not_null("commit_version", DataType::LONG),
         ]))
     });
     CDF_SCAN_ROW_SCHEMA.clone()

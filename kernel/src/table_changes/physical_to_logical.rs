@@ -69,7 +69,7 @@ pub(crate) fn scan_file_physical_schema(
     physical_schema: &StructType,
 ) -> SchemaRef {
     if scan_file.scan_type == CdfScanFileType::Cdc {
-        let change_type = StructField::new(CHANGE_TYPE_COL_NAME, DataType::STRING, false);
+        let change_type = StructField::not_null(CHANGE_TYPE_COL_NAME, DataType::STRING);
         let fields = physical_schema.fields().cloned().chain(Some(change_type));
         StructType::new(fields).into()
     } else {
@@ -105,10 +105,10 @@ mod tests {
             };
             let logical_schema = StructType::new([
                 StructField::nullable("id", DataType::STRING),
-                StructField::new("age", DataType::LONG, false),
-                StructField::new(CHANGE_TYPE_COL_NAME, DataType::STRING, false),
-                StructField::new(COMMIT_VERSION_COL_NAME, DataType::LONG, false),
-                StructField::new(COMMIT_TIMESTAMP_COL_NAME, DataType::TIMESTAMP, false),
+                StructField::not_null("age", DataType::LONG),
+                StructField::not_null(CHANGE_TYPE_COL_NAME, DataType::STRING),
+                StructField::not_null(COMMIT_VERSION_COL_NAME, DataType::LONG),
+                StructField::not_null(COMMIT_TIMESTAMP_COL_NAME, DataType::TIMESTAMP),
             ]);
             let all_fields = vec![
                 ColumnType::Selected("id".to_string()),

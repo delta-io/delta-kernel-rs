@@ -421,7 +421,7 @@ mod tests {
             scan.logical_schema,
             StructType::new([
                 StructField::nullable("id", DataType::INTEGER),
-                StructField::new("_commit_version", DataType::LONG, false),
+                StructField::not_null("_commit_version", DataType::LONG),
             ])
             .into()
         );

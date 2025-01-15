@@ -264,7 +264,7 @@ mod tests {
         let mut metadata = HashMap::new();
         metadata.insert("description", "hello world".to_owned());
         let struct_field =
-            StructField::new("name", DataType::STRING, false).with_metadata(metadata);
+            StructField::not_null("name", DataType::STRING).with_metadata(metadata);
 
         let arrow_field = ArrowField::try_from(&struct_field)?;
         let new_metadata = arrow_field.metadata();

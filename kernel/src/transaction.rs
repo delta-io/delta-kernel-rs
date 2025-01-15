@@ -677,15 +677,15 @@ mod tests {
     fn test_write_metadata_schema() {
         let schema = get_write_metadata_schema();
         let expected = StructType::new(vec![
-            StructField::new("path", DataType::STRING, false),
+            StructField::not_null("path", DataType::STRING),
             StructField::new(
                 "partitionValues",
                 MapType::new(DataType::STRING, DataType::STRING, true),
                 false,
             ),
-            StructField::new("size", DataType::LONG, false),
-            StructField::new("modificationTime", DataType::LONG, false),
-            StructField::new("dataChange", DataType::BOOLEAN, false),
+            StructField::not_null("size", DataType::LONG),
+            StructField::not_null("modificationTime", DataType::LONG),
+            StructField::not_null("dataChange", DataType::BOOLEAN),
         ]);
         assert_eq!(*schema, expected.into());
     }

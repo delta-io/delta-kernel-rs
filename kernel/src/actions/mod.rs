@@ -527,13 +527,13 @@ mod tests {
         let expected = Arc::new(StructType::new([StructField::new(
             "metaData",
             StructType::new([
-                StructField::new("id", DataType::STRING, false),
+                StructField::not_null("id", DataType::STRING),
                 StructField::nullable("name", DataType::STRING),
                 StructField::nullable("description", DataType::STRING),
                 StructField::new(
                     "format",
                     StructType::new([
-                        StructField::new("provider", DataType::STRING, false),
+                        StructField::not_null("provider", DataType::STRING),
                         StructField::new(
                             "options",
                             MapType::new(DataType::STRING, DataType::STRING, false),
@@ -542,7 +542,7 @@ mod tests {
                     ]),
                     false,
                 ),
-                StructField::new("schemaString", DataType::STRING, false),
+                StructField::not_null("schemaString", DataType::STRING),
                 StructField::new(
                     "partitionColumns",
                     ArrayType::new(DataType::STRING, false),
@@ -569,15 +569,15 @@ mod tests {
         let expected = Arc::new(StructType::new([StructField::new(
             "add",
             StructType::new([
-                StructField::new("path", DataType::STRING, false),
+                StructField::not_null("path", DataType::STRING),
                 StructField::new(
                     "partitionValues",
                     MapType::new(DataType::STRING, DataType::STRING, true),
                     false,
                 ),
-                StructField::new("size", DataType::LONG, false),
-                StructField::new("modificationTime", DataType::LONG, false),
-                StructField::new("dataChange", DataType::BOOLEAN, false),
+                StructField::not_null("size", DataType::LONG),
+                StructField::not_null("modificationTime", DataType::LONG),
+                StructField::not_null("dataChange", DataType::BOOLEAN),
                 StructField::nullable("stats", DataType::STRING),
                 StructField::new(
                     "tags",
@@ -614,11 +614,11 @@ mod tests {
         StructField::new(
             "deletionVector",
             DataType::struct_type([
-                StructField::new("storageType", DataType::STRING, false),
-                StructField::new("pathOrInlineDv", DataType::STRING, false),
+                StructField::not_null("storageType", DataType::STRING),
+                StructField::not_null("pathOrInlineDv", DataType::STRING),
                 StructField::nullable("offset", DataType::INTEGER),
-                StructField::new("sizeInBytes", DataType::INTEGER, false),
-                StructField::new("cardinality", DataType::LONG, false),
+                StructField::not_null("sizeInBytes", DataType::INTEGER),
+                StructField::not_null("cardinality", DataType::LONG),
             ]),
             true,
         )
@@ -632,9 +632,9 @@ mod tests {
         let expected = Arc::new(StructType::new([StructField::new(
             "remove",
             StructType::new([
-                StructField::new("path", DataType::STRING, false),
+                StructField::not_null("path", DataType::STRING),
                 StructField::nullable("deletionTimestamp", DataType::LONG),
-                StructField::new("dataChange", DataType::BOOLEAN, false),
+                StructField::not_null("dataChange", DataType::BOOLEAN),
                 StructField::nullable("extendedFileMetadata", DataType::BOOLEAN),
                 partition_values_field(),
                 StructField::nullable("size", DataType::LONG),
@@ -656,14 +656,14 @@ mod tests {
         let expected = Arc::new(StructType::new([StructField::new(
             "cdc",
             StructType::new([
-                StructField::new("path", DataType::STRING, false),
+                StructField::not_null("path", DataType::STRING),
                 StructField::new(
                     "partitionValues",
                     MapType::new(DataType::STRING, DataType::STRING, true),
                     false,
                 ),
-                StructField::new("size", DataType::LONG, false),
-                StructField::new("dataChange", DataType::BOOLEAN, false),
+                StructField::not_null("size", DataType::LONG),
+                StructField::not_null("dataChange", DataType::BOOLEAN),
                 tags_field(),
             ]),
             true,
@@ -680,8 +680,8 @@ mod tests {
         let expected = Arc::new(StructType::new([StructField::new(
             "txn",
             StructType::new([
-                StructField::new("appId", DataType::STRING, false),
-                StructField::new("version", DataType::LONG, false),
+                StructField::not_null("appId", DataType::STRING),
+                StructField::not_null("version", DataType::LONG),
                 StructField::nullable("lastUpdated", DataType::LONG),
             ]),
             true,

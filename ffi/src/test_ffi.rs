@@ -25,8 +25,8 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
     let array_data = ArrayData::new(array_type.clone(), vec![Scalar::Short(5), Scalar::Short(0)]);
 
     let nested_fields = vec![
-        StructField::new("a", DataType::INTEGER, false),
-        StructField::new("b", array_type, false),
+        StructField::not_null("a", DataType::INTEGER),
+        StructField::not_null("b", array_type),
     ];
     let nested_values = vec![Scalar::Integer(500), Scalar::Array(array_data.clone())];
     let nested_struct = StructData::try_new(nested_fields.clone(), nested_values).unwrap();

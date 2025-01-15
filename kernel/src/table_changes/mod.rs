@@ -60,9 +60,9 @@ static ADD_CHANGE_TYPE: &str = "insert";
 static REMOVE_CHANGE_TYPE: &str = "delete";
 static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
     [
-        StructField::new(CHANGE_TYPE_COL_NAME, DataType::STRING, false),
-        StructField::new(COMMIT_VERSION_COL_NAME, DataType::LONG, false),
-        StructField::new(COMMIT_TIMESTAMP_COL_NAME, DataType::TIMESTAMP, false),
+        StructField::not_null(CHANGE_TYPE_COL_NAME, DataType::STRING),
+        StructField::not_null(COMMIT_VERSION_COL_NAME, DataType::LONG),
+        StructField::not_null(COMMIT_TIMESTAMP_COL_NAME, DataType::TIMESTAMP),
     ]
 });
 

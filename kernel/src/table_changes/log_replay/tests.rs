@@ -252,7 +252,7 @@ async fn incompatible_schemas_fail() {
     // The CDF schema has fields: nullable `id`  and nullable `value`.
     // This commit has schema with fields: non-nullable `id` and nullable `value`.
     let schema = StructType::new([
-        StructField::new("id", DataType::LONG, false),
+        StructField::not_null("id", DataType::LONG),
         StructField::nullable("value", DataType::STRING),
     ]);
     assert_incompatible_schema(schema, get_schema()).await;
