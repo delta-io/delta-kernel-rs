@@ -431,7 +431,7 @@ impl MapType {
     /// Create a schema assuming the map is stored as a struct with the specified key and value field names
     pub fn as_struct_schema(&self, key_name: String, val_name: String) -> Schema {
         StructType::new([
-            StructField::new(key_name, self.key_type.clone(), false),
+            StructField::not_null(key_name, self.key_type.clone()),
             StructField::new(val_name, self.value_type.clone(), self.value_contains_null),
         ])
     }

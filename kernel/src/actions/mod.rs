@@ -530,29 +530,25 @@ mod tests {
                 StructField::not_null("id", DataType::STRING),
                 StructField::nullable("name", DataType::STRING),
                 StructField::nullable("description", DataType::STRING),
-                StructField::new(
+                StructField::not_null(
                     "format",
                     StructType::new([
                         StructField::not_null("provider", DataType::STRING),
-                        StructField::new(
+                        StructField::not_null(
                             "options",
                             MapType::new(DataType::STRING, DataType::STRING, false),
-                            false,
                         ),
                     ]),
-                    false,
                 ),
                 StructField::not_null("schemaString", DataType::STRING),
-                StructField::new(
+                StructField::not_null(
                     "partitionColumns",
                     ArrayType::new(DataType::STRING, false),
-                    false,
                 ),
                 StructField::nullable("createdTime", DataType::LONG),
-                StructField::new(
+                StructField::not_null(
                     "configuration",
                     MapType::new(DataType::STRING, DataType::STRING, false),
-                    false,
                 ),
             ]),
         )]));
@@ -569,10 +565,9 @@ mod tests {
             "add",
             StructType::new([
                 StructField::not_null("path", DataType::STRING),
-                StructField::new(
+                StructField::not_null(
                     "partitionValues",
                     MapType::new(DataType::STRING, DataType::STRING, true),
-                    false,
                 ),
                 StructField::not_null("size", DataType::LONG),
                 StructField::not_null("modificationTime", DataType::LONG),
@@ -650,10 +645,9 @@ mod tests {
             "cdc",
             StructType::new([
                 StructField::not_null("path", DataType::STRING),
-                StructField::new(
+                StructField::not_null(
                     "partitionValues",
                     MapType::new(DataType::STRING, DataType::STRING, true),
-                    false,
                 ),
                 StructField::not_null("size", DataType::LONG),
                 StructField::not_null("dataChange", DataType::BOOLEAN),

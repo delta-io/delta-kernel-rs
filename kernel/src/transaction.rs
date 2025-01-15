@@ -676,10 +676,9 @@ mod tests {
         let schema = get_write_metadata_schema();
         let expected = StructType::new(vec![
             StructField::not_null("path", DataType::STRING),
-            StructField::new(
+            StructField::not_null(
                 "partitionValues",
                 MapType::new(DataType::STRING, DataType::STRING, true),
-                false,
             ),
             StructField::not_null("size", DataType::LONG),
             StructField::not_null("modificationTime", DataType::LONG),
