@@ -201,6 +201,10 @@ fn process_cdf_commit(
             return Err(Error::change_data_feed_unsupported(commit_file.version));
         }
     }
+
+    table_configuration
+        .can_read_cdf()
+        .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;
     // We resolve the remove deletion vector map after visiting the entire commit.
     if has_cdc_action {
         remove_dvs.clear();
