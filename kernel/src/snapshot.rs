@@ -100,22 +100,22 @@ impl Snapshot {
 
     /// Table [`Schema`] at this `Snapshot`s version.
     pub fn schema(&self) -> &Schema {
-        &self.table_configuration.schema()
+        self.table_configuration.schema()
     }
 
     /// Table [`Metadata`] at this `Snapshot`s version.
     pub fn metadata(&self) -> &Metadata {
-        &self.table_configuration.metadata()
+        self.table_configuration.metadata()
     }
 
     /// Table [`Protocol`] at this `Snapshot`s version.
     pub fn protocol(&self) -> &Protocol {
-        &self.table_configuration.protocol()
+        self.table_configuration.protocol()
     }
 
     /// Get the [`TableProperties`] for this [`Snapshot`].
     pub fn table_properties(&self) -> &TableProperties {
-        &self.table_configuration.table_properties()
+        self.table_configuration.table_properties()
     }
     /// Get the [`TableConfiguration`] for this [`Snapshot`].
     pub fn table_configuration(&self) -> &TableConfiguration {
