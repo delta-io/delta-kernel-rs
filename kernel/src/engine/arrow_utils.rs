@@ -764,8 +764,8 @@ mod tests {
     fn simple_mask_indices() {
         let requested_schema = Arc::new(StructType::new([
             StructField::new("i", DataType::INTEGER, false),
-            StructField::new("s", DataType::STRING, true),
-            StructField::new("i2", DataType::INTEGER, true),
+            StructField::nullable("s", DataType::STRING),
+            StructField::nullable("i2", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
@@ -788,7 +788,7 @@ mod tests {
     fn ensure_data_types_fails_correctly() {
         let requested_schema = Arc::new(StructType::new([
             StructField::new("i", DataType::INTEGER, false),
-            StructField::new("s", DataType::INTEGER, true),
+            StructField::nullable("s", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
@@ -799,7 +799,7 @@ mod tests {
 
         let requested_schema = Arc::new(StructType::new([
             StructField::new("i", DataType::INTEGER, false),
-            StructField::new("s", DataType::STRING, true),
+            StructField::nullable("s", DataType::STRING),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
@@ -836,8 +836,8 @@ mod tests {
     fn simple_reorder_indices() {
         let requested_schema = Arc::new(StructType::new([
             StructField::new("i", DataType::INTEGER, false),
-            StructField::new("s", DataType::STRING, true),
-            StructField::new("i2", DataType::INTEGER, true),
+            StructField::nullable("s", DataType::STRING),
+            StructField::nullable("i2", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i2", ArrowDataType::Int32, true),
@@ -860,8 +860,8 @@ mod tests {
     fn simple_nullable_field_missing() {
         let requested_schema = Arc::new(StructType::new([
             StructField::new("i", DataType::INTEGER, false),
-            StructField::new("s", DataType::STRING, true),
-            StructField::new("i2", DataType::INTEGER, true),
+            StructField::nullable("s", DataType::STRING),
+            StructField::nullable("i2", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
@@ -1386,8 +1386,8 @@ mod tests {
     #[test]
     fn no_matches() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("s", DataType::STRING, true),
-            StructField::new("i2", DataType::INTEGER, true),
+            StructField::nullable("s", DataType::STRING),
+            StructField::nullable("i2", DataType::INTEGER),
         ]));
         let nots_field = ArrowField::new("NOTs", ArrowDataType::Utf8, true);
         let noti2_field = ArrowField::new("NOTi2", ArrowDataType::Int32, true);

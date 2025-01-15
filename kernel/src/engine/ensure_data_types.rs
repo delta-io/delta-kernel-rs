@@ -404,7 +404,7 @@ mod tests {
             "a",
             ArrayType::new(
                 DataType::struct_type([
-                    StructField::new("w", DataType::LONG, true),
+                    StructField::nullable("w", DataType::LONG),
                     StructField::new("x", ArrayType::new(DataType::LONG, true), true),
                     StructField::new(
                         "y",
@@ -414,8 +414,8 @@ mod tests {
                     StructField::new(
                         "z",
                         DataType::struct_type([
-                            StructField::new("n", DataType::LONG, true),
-                            StructField::new("m", DataType::STRING, true),
+                            StructField::nullable("n", DataType::LONG),
+                            StructField::nullable("m", DataType::STRING),
                         ]),
                         true,
                     ),
@@ -428,8 +428,8 @@ mod tests {
         assert!(ensure_data_types(&schema, &arrow_struct, true).is_ok());
 
         let kernel_simple = DataType::struct_type([
-            StructField::new("w", DataType::LONG, true),
-            StructField::new("x", DataType::LONG, true),
+            StructField::nullable("w", DataType::LONG),
+            StructField::nullable("x", DataType::LONG),
         ]);
 
         let arrow_simple_ok = ArrowField::new_struct(

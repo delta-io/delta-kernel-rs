@@ -528,8 +528,8 @@ mod tests {
             "metaData",
             StructType::new([
                 StructField::new("id", DataType::STRING, false),
-                StructField::new("name", DataType::STRING, true),
-                StructField::new("description", DataType::STRING, true),
+                StructField::nullable("name", DataType::STRING),
+                StructField::nullable("description", DataType::STRING),
                 StructField::new(
                     "format",
                     StructType::new([
@@ -548,7 +548,7 @@ mod tests {
                     ArrayType::new(DataType::STRING, false),
                     false,
                 ),
-                StructField::new("createdTime", DataType::LONG, true),
+                StructField::nullable("createdTime", DataType::LONG),
                 StructField::new(
                     "configuration",
                     MapType::new(DataType::STRING, DataType::STRING, false),
@@ -578,16 +578,16 @@ mod tests {
                 StructField::new("size", DataType::LONG, false),
                 StructField::new("modificationTime", DataType::LONG, false),
                 StructField::new("dataChange", DataType::BOOLEAN, false),
-                StructField::new("stats", DataType::STRING, true),
+                StructField::nullable("stats", DataType::STRING),
                 StructField::new(
                     "tags",
                     MapType::new(DataType::STRING, DataType::STRING, false),
                     true,
                 ),
                 deletion_vector_field(),
-                StructField::new("baseRowId", DataType::LONG, true),
-                StructField::new("defaultRowCommitVersion", DataType::LONG, true),
-                StructField::new("clusteringProvider", DataType::STRING, true),
+                StructField::nullable("baseRowId", DataType::LONG),
+                StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+                StructField::nullable("clusteringProvider", DataType::STRING),
             ]),
             true,
         )]));
@@ -616,7 +616,7 @@ mod tests {
             DataType::struct_type([
                 StructField::new("storageType", DataType::STRING, false),
                 StructField::new("pathOrInlineDv", DataType::STRING, false),
-                StructField::new("offset", DataType::INTEGER, true),
+                StructField::nullable("offset", DataType::INTEGER),
                 StructField::new("sizeInBytes", DataType::INTEGER, false),
                 StructField::new("cardinality", DataType::LONG, false),
             ]),
@@ -633,15 +633,15 @@ mod tests {
             "remove",
             StructType::new([
                 StructField::new("path", DataType::STRING, false),
-                StructField::new("deletionTimestamp", DataType::LONG, true),
+                StructField::nullable("deletionTimestamp", DataType::LONG),
                 StructField::new("dataChange", DataType::BOOLEAN, false),
-                StructField::new("extendedFileMetadata", DataType::BOOLEAN, true),
+                StructField::nullable("extendedFileMetadata", DataType::BOOLEAN),
                 partition_values_field(),
-                StructField::new("size", DataType::LONG, true),
+                StructField::nullable("size", DataType::LONG),
                 tags_field(),
                 deletion_vector_field(),
-                StructField::new("baseRowId", DataType::LONG, true),
-                StructField::new("defaultRowCommitVersion", DataType::LONG, true),
+                StructField::nullable("baseRowId", DataType::LONG),
+                StructField::nullable("defaultRowCommitVersion", DataType::LONG),
             ]),
             true,
         )]));
@@ -682,7 +682,7 @@ mod tests {
             StructType::new([
                 StructField::new("appId", DataType::STRING, false),
                 StructField::new("version", DataType::LONG, false),
-                StructField::new("lastUpdated", DataType::LONG, true),
+                StructField::nullable("lastUpdated", DataType::LONG),
             ]),
             true,
         )]));
@@ -698,15 +698,15 @@ mod tests {
         let expected = Arc::new(StructType::new(vec![StructField::new(
             "commitInfo",
             StructType::new(vec![
-                StructField::new("timestamp", DataType::LONG, true),
-                StructField::new("inCommitTimestamp", DataType::LONG, true),
-                StructField::new("operation", DataType::STRING, true),
+                StructField::nullable("timestamp", DataType::LONG),
+                StructField::nullable("inCommitTimestamp", DataType::LONG),
+                StructField::nullable("operation", DataType::STRING),
                 StructField::new(
                     "operationParameters",
                     MapType::new(DataType::STRING, DataType::STRING, false),
                     true,
                 ),
-                StructField::new("kernelVersion", DataType::STRING, true),
+                StructField::nullable("kernelVersion", DataType::STRING),
                 StructField::new(
                     "engineCommitInfo",
                     MapType::new(DataType::STRING, DataType::STRING, false),

@@ -104,7 +104,7 @@ mod tests {
                 commit_timestamp: 1234,
             };
             let logical_schema = StructType::new([
-                StructField::new("id", DataType::STRING, true),
+                StructField::nullable("id", DataType::STRING),
                 StructField::new("age", DataType::LONG, false),
                 StructField::new(CHANGE_TYPE_COL_NAME, DataType::STRING, false),
                 StructField::new(COMMIT_VERSION_COL_NAME, DataType::LONG, false),

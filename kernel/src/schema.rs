@@ -1104,7 +1104,7 @@ mod tests {
                 "a",
                 ArrayType::new(
                     DataType::struct_type([
-                        StructField::new("w", DataType::LONG, true),
+                        StructField::nullable("w", DataType::LONG),
                         StructField::new("x", ArrayType::new(DataType::LONG, true), true),
                         StructField::new(
                             "y",
@@ -1114,8 +1114,8 @@ mod tests {
                         StructField::new(
                             "z",
                             DataType::struct_type([
-                                StructField::new("n", DataType::LONG, true),
-                                StructField::new("m", DataType::STRING, true),
+                                StructField::nullable("n", DataType::LONG),
+                                StructField::nullable("m", DataType::STRING),
                             ]),
                             true,
                         ),
@@ -1139,16 +1139,16 @@ mod tests {
                             StructField::new(
                                 "s",
                                 DataType::struct_type([
-                                    StructField::new("u", DataType::LONG, true),
-                                    StructField::new("v", DataType::LONG, true),
+                                    StructField::nullable("u", DataType::LONG),
+                                    StructField::nullable("v", DataType::LONG),
                                 ]),
                                 true,
                             ),
-                            StructField::new("t", DataType::LONG, true),
+                            StructField::nullable("t", DataType::LONG),
                         ]),
                         true,
                     ),
-                    StructField::new("r", DataType::LONG, true),
+                    StructField::nullable("r", DataType::LONG),
                 ]),
                 true,
             ),
@@ -1157,8 +1157,8 @@ mod tests {
                 MapType::new(
                     DataType::LONG,
                     DataType::struct_type([
-                        StructField::new("f", DataType::LONG, true),
-                        StructField::new("g", DataType::STRING, true),
+                        StructField::nullable("f", DataType::LONG),
+                        StructField::nullable("g", DataType::STRING),
                     ]),
                     true,
                 ),

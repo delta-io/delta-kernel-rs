@@ -466,8 +466,8 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     // create a simple partitioned table: one int column named 'number', partitioned by string
     // column named 'partition'
     let table_schema = Arc::new(StructType::new(vec![
-        StructField::new("number", DataType::INTEGER, true),
-        StructField::new("partition", DataType::STRING, true),
+        StructField::nullable("number", DataType::INTEGER),
+        StructField::nullable("partition", DataType::STRING),
     ]));
     let data_schema = Arc::new(StructType::new(vec![StructField::new(
         "number",
