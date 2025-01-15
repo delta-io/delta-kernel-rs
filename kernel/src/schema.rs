@@ -122,6 +122,16 @@ impl StructField {
         }
     }
 
+    /// Creates a new nullable field
+    pub fn nullable(name: impl Into<String>, data_type: impl Into<DataType>) -> Self {
+        Self::new(name, data_type, true)
+    }
+
+    /// Creates a new non-nullable field
+    pub fn not_null(name: impl Into<String>, data_type: impl Into<DataType>) -> Self {
+        Self::new(name, data_type, false)
+    }
+
     pub fn with_metadata(
         mut self,
         metadata: impl IntoIterator<Item = (impl Into<String>, impl Into<MetadataValue>)>,
