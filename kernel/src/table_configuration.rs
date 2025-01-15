@@ -88,7 +88,7 @@ impl TableConfiguration {
     /// See the documentation of [`TableChanges`] for more details.
     ///
     /// [`TableChanges`]: crate::table_changes::TableChanges
-    pub fn can_read_cdf(&self) -> DeltaResult<()> {
+    pub fn is_cdf_read_supported(&self) -> DeltaResult<()> {
         static CDF_SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeatures>> =
             LazyLock::new(|| HashSet::from([ReaderFeatures::DeletionVectors]));
         let protocol = &self.protocol;
@@ -128,8 +128,8 @@ impl TableConfiguration {
     /// > Readers must read the table considering the existence of DVs, even when the
     /// > delta.enableDeletionVectors table property is not set.
     ///
-    /// See: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors
-    pub fn can_read_deletion_vectors(&self) -> DeltaResult<()> {
+    /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors>
+    pub fn is_deletion_vector_read_supported(&self) -> DeltaResult<()> {
         static DELETION_VECTOR_READER_FEATURE: LazyLock<HashSet<ReaderFeatures>> =
             LazyLock::new(|| HashSet::from([ReaderFeatures::DeletionVectors]));
         require!(
@@ -142,14 +142,13 @@ impl TableConfiguration {
             ));
         };
         ensure_supported_features(features, &DELETION_VECTOR_READER_FEATURE)?;
-
         Ok(())
     }
 
     /// Returns `Ok(())` if writing deletion vectors is supported on this table.
     ///
-    /// See: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors
-    pub fn can_write_deletion_vectors(&self) -> DeltaResult<()> {
+    /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors>
+    pub fn is_deletion_vector_write_supported(&self) -> DeltaResult<()> {
         static DELETION_VECTOR_WRITER_FEATURE: LazyLock<HashSet<WriterFeatures>> =
             LazyLock::new(|| HashSet::from([WriterFeatures::DeletionVectors]));
         require!(

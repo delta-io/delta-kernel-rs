@@ -164,7 +164,7 @@ impl TableChanges {
         let check_table_config = |snapshot: &Snapshot| {
             snapshot
                 .table_configuration()
-                .can_read_cdf()
+                .is_cdf_read_supported()
                 .map_err(|_| Error::change_data_feed_unsupported(snapshot.version()))
         };
         check_table_config(&start_snapshot)?;
