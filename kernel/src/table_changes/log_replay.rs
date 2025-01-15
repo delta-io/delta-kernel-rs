@@ -57,7 +57,7 @@ pub(crate) fn table_changes_action_iter(
     let engine_clone = engine.clone();
     let result = commit_files
         .into_iter()
-        .map(move |commit_file| -> DeltaResult<ProcessedCDFCommit> {
+        .map(move |commit_file| -> DeltaResult<ProcessedCdfCommit> {
             process_cdf_commit(
                 engine.as_ref(),
                 commit_file,
@@ -117,7 +117,7 @@ pub(crate) fn table_changes_action_iter(
 /// Note: As a consequence of the two phases, LogReplayScanner will iterate over each action in the
 /// commit twice. It also may use an unbounded amount of memory, proportional to the number of
 /// `add` + `remove` actions in the _single_ commit.
-struct ProcessedCDFCommit {
+struct ProcessedCdfCommit {
     // True if a `cdc` action was found after running [`LogReplayScanner::try_new`]
     has_cdc_action: bool,
     // A map from path to the deletion vector from the remove action. It is guaranteed that there
@@ -150,7 +150,7 @@ fn process_cdf_commit(
     commit_file: ParsedLogPath,
     table_schema: &SchemaRef,
     table_configuration: &mut TableConfiguration,
-) -> DeltaResult<ProcessedCDFCommit> {
+) -> DeltaResult<ProcessedCdfCommit> {
     let visitor_schema = PreparePhaseVisitor::schema();
 
     // Note: We do not perform data skipping yet because we need to visit all add and
@@ -210,7 +210,7 @@ fn process_cdf_commit(
         remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
     }
 
-    Ok(ProcessedCDFCommit {
+    Ok(ProcessedCdfCommit {
         timestamp: commit_file.location.last_modified,
         commit_file,
         has_cdc_action,
@@ -222,11 +222,11 @@ fn process_cdf_commit(
 /// commit, generating a selection vector, and transforming the engine data. This performs
 /// phase 2 of [`LogReplayScanner`].
 fn commit_to_scan_batches(
-    processed_commit: ProcessedCDFCommit,
+    processed_commit: ProcessedCdfCommit,
     engine: Arc<dyn Engine>,
     filter: Option<Arc<DataSkippingFilter>>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanData>>> {
-    let ProcessedCDFCommit {
+    let ProcessedCdfCommit {
         has_cdc_action,
         remove_dvs,
         commit_file,
