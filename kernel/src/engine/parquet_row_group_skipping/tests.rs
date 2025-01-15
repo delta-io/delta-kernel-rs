@@ -2,7 +2,7 @@ use super::*;
 use crate::predicates::DataSkippingPredicateEvaluator as _;
 use crate::expressions::{column_name, column_expr};
 use crate::Expression;
-use parquet::arrow::arrow_reader::ArrowReaderMetadata;
+use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use std::fs::File;
 
 /// Performs an exhaustive set of reads against a specially crafted parquet file.

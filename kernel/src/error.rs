@@ -10,6 +10,9 @@ use crate::schema::{DataType, StructType};
 use crate::table_properties::ParseIntervalError;
 use crate::Version;
 
+#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
+use crate::arrow::error::ArrowError;
+
 /// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
 
@@ -29,7 +32,7 @@ pub enum Error {
     /// An error performing operations on arrow data
     #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
     #[error(transparent)]
-    Arrow(arrow_schema::ArrowError),
+    Arrow(ArrowError),
 
     /// User tried to convert engine data to the wrong type
     #[error("Invalid engine data type. Could not convert to {0}")]
@@ -58,10 +61,10 @@ pub enum Error {
     #[error("Internal error {0}. This is a kernel bug, please report.")]
     InternalError(String),
 
-    /// An error encountered while working with parquet data
-    #[cfg(feature = "parquet")]
+    /// An error enountered while working with parquet data
+    #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
     #[error("Arrow error: {0}")]
-    Parquet(#[from] parquet::errors::ParquetError),
+    Parquet(#[from] crate::parquet::errors::ParquetError),
 
     /// An error interacting with the object_store crate
     // We don't use [#from] object_store::Error here as our From impl transforms
@@ -304,8 +307,8 @@ from_with_backtrace!(
 );
 
 #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
-impl From<arrow_schema::ArrowError> for Error {
-    fn from(value: arrow_schema::ArrowError) -> Self {
+impl From<ArrowError> for Error {
+    fn from(value: ArrowError) -> Self {
         Self::Arrow(value).with_backtrace()
     }
 }

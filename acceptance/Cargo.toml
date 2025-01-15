@@ -14,19 +14,14 @@ rust-version.workspace = true
 release = false
 
 [dependencies]
-arrow-array = { workspace = true }
-arrow-cast = { workspace = true }
-arrow-ord = { workspace = true }
-arrow-select = { workspace = true }
-arrow-schema = { workspace = true }
 delta_kernel = { path = "../kernel", features = [
   "default-engine",
+  "arrow_53",
   "developer-visibility",
 ] }
 futures = "0.3"
 itertools = "0.13"
 object_store = { workspace = true }
-parquet = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"

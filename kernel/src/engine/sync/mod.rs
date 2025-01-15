@@ -7,7 +7,7 @@ use crate::{
     FileMeta, FileSystemClient, JsonHandler, ParquetHandler, SchemaRef,
 };
 
-use arrow_schema::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use itertools::Itertools;
 use std::fs::File;
 use std::sync::Arc;
