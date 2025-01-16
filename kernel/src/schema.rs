@@ -122,6 +122,16 @@ impl StructField {
         }
     }
 
+    /// Creates a new nullable field
+    pub fn nullable(name: impl Into<String>, data_type: impl Into<DataType>) -> Self {
+        Self::new(name, data_type, true)
+    }
+
+    /// Creates a new non-nullable field
+    pub fn not_null(name: impl Into<String>, data_type: impl Into<DataType>) -> Self {
+        Self::new(name, data_type, false)
+    }
+
     pub fn with_metadata(
         mut self,
         metadata: impl IntoIterator<Item = (impl Into<String>, impl Into<MetadataValue>)>,
@@ -421,7 +431,7 @@ impl MapType {
     /// Create a schema assuming the map is stored as a struct with the specified key and value field names
     pub fn as_struct_schema(&self, key_name: String, val_name: String) -> Schema {
         StructType::new([
-            StructField::new(key_name, self.key_type.clone(), false),
+            StructField::not_null(key_name, self.key_type.clone()),
             StructField::new(val_name, self.value_type.clone(), self.value_contains_null),
         ])
     }
@@ -1090,69 +1100,61 @@ mod tests {
     #[test]
     fn test_depth_checker() {
         let schema = DataType::struct_type([
-            StructField::new(
+            StructField::nullable(
                 "a",
                 ArrayType::new(
                     DataType::struct_type([
-                        StructField::new("w", DataType::LONG, true),
-                        StructField::new("x", ArrayType::new(DataType::LONG, true), true),
-                        StructField::new(
+                        StructField::nullable("w", DataType::LONG),
+                        StructField::nullable("x", ArrayType::new(DataType::LONG, true)),
+                        StructField::nullable(
                             "y",
                             MapType::new(DataType::LONG, DataType::STRING, true),
-                            true,
                         ),
-                        StructField::new(
+                        StructField::nullable(
                             "z",
                             DataType::struct_type([
-                                StructField::new("n", DataType::LONG, true),
-                                StructField::new("m", DataType::STRING, true),
+                                StructField::nullable("n", DataType::LONG),
+                                StructField::nullable("m", DataType::STRING),
                             ]),
-                            true,
                         ),
                     ]),
                     true,
                 ),
-                true,
             ),
-            StructField::new(
+            StructField::nullable(
                 "b",
                 DataType::struct_type([
-                    StructField::new("o", ArrayType::new(DataType::LONG, true), true),
-                    StructField::new(
+                    StructField::nullable("o", ArrayType::new(DataType::LONG, true)),
+                    StructField::nullable(
                         "p",
                         MapType::new(DataType::LONG, DataType::STRING, true),
-                        true,
                     ),
-                    StructField::new(
+                    StructField::nullable(
                         "q",
                         DataType::struct_type([
-                            StructField::new(
+                            StructField::nullable(
                                 "s",
                                 DataType::struct_type([
-                                    StructField::new("u", DataType::LONG, true),
-                                    StructField::new("v", DataType::LONG, true),
+                                    StructField::nullable("u", DataType::LONG),
+                                    StructField::nullable("v", DataType::LONG),
                                 ]),
-                                true,
                             ),
-                            StructField::new("t", DataType::LONG, true),
+                            StructField::nullable("t", DataType::LONG),
                         ]),
-                        true,
                     ),
-                    StructField::new("r", DataType::LONG, true),
+                    StructField::nullable("r", DataType::LONG),
                 ]),
-                true,
             ),
-            StructField::new(
+            StructField::nullable(
                 "c",
                 MapType::new(
                     DataType::LONG,
                     DataType::struct_type([
-                        StructField::new("f", DataType::LONG, true),
-                        StructField::new("g", DataType::STRING, true),
+                        StructField::nullable("f", DataType::LONG),
+                        StructField::nullable("g", DataType::STRING),
                     ]),
                     true,
                 ),
-                true,
             ),
         ]);
 
