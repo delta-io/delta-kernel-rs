@@ -241,10 +241,10 @@ pub(crate) trait PredicateEvaluator {
     /// Evaluates a predicate with SQL WHERE semantics.
     ///
     /// By default, [`eval_expr`] behaves badly for comparisons involving NULL columns (e.g. `a <
-    /// 10` when `a` is NULL), because the (legitimately) NULL value is interpreted the same as a
-    /// missing value and produces a NULL result. The resulting NULL does not allow data skipping,
-    /// which is looking for a FALSE result. Meanwhile, SQL WHERE semantics only keeps rows for
-    /// which the filter evaluates to TRUE (discarding rows that evaluate to FALSE or NULL).
+    /// 10` when `a` is NULL), because NULL values are interpreted as "stats missing" (= cannot
+    /// skip). This can "poison" the entire expression, causing it to return NULL instead of FALSE
+    /// that would allow skipping. Meanwhile, SQL WHERE semantics only keeps rows for which the
+    /// filter evaluates to TRUE (discarding rows that evaluate to FALSE or NULL).
     ///
     /// Conceptually, the behavior difference between data skipping and SQL WHERE semantics can be
     /// addressed by performing a null-safe comparison of `WHERE <expr>`, as if it were expanded to
@@ -255,10 +255,10 @@ pub(crate) trait PredicateEvaluator {
     /// (e.g. attempting data skipping over a column that lacks stats), and that NULL could
     /// propagate all the way to top-level and be wrongly interpreted as NOT TRUE (= skippable).
     ///
-    /// To prevent wrong data skipping in such cases, the predicate evaluator always returns NULL
-    /// for a NULL check over anything except for literals and columns with known values. So we must
-    /// push the NULL check down through supported operations (AND plus null-intolerant comparisons)
-    /// until it reaches columns and literals where it can do some good, e.g.:
+    /// To prevent wrong data skipping, the predicate evaluator always returns NULL for a NULL check
+    /// over anything except for literals and columns with known values. So we must push the NULL
+    /// check down through supported operations (AND as well as null-intolerant comparisons `<`,
+    /// `!=`, etc) until it reaches columns and literals where it can do some good, e.g.:
     ///
     /// ```text
     /// WHERE a < 10 AND (b < 20 OR c < 30)
@@ -327,7 +327,7 @@ pub(crate) trait PredicateEvaluator {
             }) => {
                 // Recursively invoke `eval_sql_where` instead of the usual `eval_expr`
                 let exprs = exprs.iter().map(|expr| self.eval_sql_where(expr));
-                PredicateEvaluator::finish_eval_variadic(self, VariadicOperator::And, exprs, false)
+                self.finish_eval_variadic(VariadicOperator::And, exprs, false)
             }
             Binary(BinaryExpression { op, left, right }) if op.is_null_intolerant_comparison() => {
                 // Perform a nullsafe comparison instead of the usual `eval_binary`
