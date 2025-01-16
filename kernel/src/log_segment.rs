@@ -332,8 +332,8 @@ fn list_log_files_with_version(
                 }
             }
 
-            // Group and find the first complete checkpoint found for this version,
-            // no matter how many exist as they are all equivalent.
+            // Group and find the first complete checkpoint for this version.
+            // All checkpoints for the same version are equivalent, so we only take one.
             if let Some((_, complete_checkpoint)) = group_checkpoint_parts(new_checkpoint_parts)
                 .into_iter()
                 .find(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
