@@ -20,7 +20,21 @@ mod tests;
 ///
 /// Because inversion (`NOT` operator) has special semantics and can often be optimized away by
 /// pushing it down, most methods take an `inverted` flag. That allows operations like
-/// [`UnaryOperator::Not`] to simply evaluate their operand with a flipped `inverted` flag,
+/// [`UnaryOperator::Not`] to simply evaluate their operand with a flipped `inverted` flag, and
+/// greatly simplifies the implementations of most operators (other than those which have to
+/// directly implement NOT semantics, which are unavoidably complex in that regard).
+///
+/// # Parameterized output type
+///
+/// The types involved in predicate evaluation are parameterized and implementation-specific. For
+/// example, [`crate::engine::parquet_stats_skipping::ParquetStatsProvider`] directly evaluates the
+/// predicate over parquet footer stats and returns boolean results, while
+/// [`crate::scan::data_skipping::DataSkippingPredicateCreator`] instead transforms the input
+/// predicate expression to a data skipping predicate expresion that the engine can evaluated
+/// directly against Delta data skipping stats during log replay. Although this approach is harder
+/// to read and reason about at first, the majority of expressions can be implemented generically,
+/// which greatly reduces redundancy and ensures that all flavors of predicate evaluation have the
+/// same semantics.
 ///
 /// # NULL and error semantics
 ///
@@ -557,12 +571,6 @@ impl<R: ResolveColumnAsScalar> PredicateEvaluator for DefaultPredicateEvaluator<
 /// example, comparisons involving a column are converted into comparisons over that column's
 /// min/max stats, and NULL checks are converted into comparisons involving the column's nullcount
 /// and rowcount stats.
-///
-/// The types involved in these operations are parameterized and implementation-specific. For
-/// example, [`crate::engine::parquet_stats_skipping::ParquetStatsProvider`] directly evaluates data
-/// skipping expressions and returnss boolean results, while
-/// [`crate::scan::data_skipping::DataSkippingPredicateCreator`] instead converts the input
-/// predicate to a data skipping predicate that can be evaluated directly later.
 pub(crate) trait DataSkippingPredicateEvaluator {
     /// The output type produced by this expression evaluator
     type Output;
