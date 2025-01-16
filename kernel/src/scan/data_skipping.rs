@@ -59,7 +59,7 @@ impl DataSkippingFilter {
         physical_predicate: Option<(ExpressionRef, SchemaRef)>,
     ) -> Option<Self> {
         static PREDICATE_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
-            DataType::struct_type([StructField::new("predicate", DataType::BOOLEAN, true)])
+            DataType::struct_type([StructField::nullable("predicate", DataType::BOOLEAN)])
         });
         static STATS_EXPR: LazyLock<Expr> = LazyLock::new(|| column_expr!("add.stats"));
         static FILTER_EXPR: LazyLock<Expr> =
@@ -82,10 +82,10 @@ impl DataSkippingFilter {
             .transform_struct(&referenced_schema)?
             .into_owned();
         let stats_schema = Arc::new(StructType::new([
-            StructField::new("numRecords", DataType::LONG, true),
-            StructField::new("nullCount", nullcount_schema, true),
-            StructField::new("minValues", referenced_schema.clone(), true),
-            StructField::new("maxValues", referenced_schema, true),
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", nullcount_schema),
+            StructField::nullable("minValues", referenced_schema.clone()),
+            StructField::nullable("maxValues", referenced_schema),
         ]));
 
         // Skipping happens in several steps:
