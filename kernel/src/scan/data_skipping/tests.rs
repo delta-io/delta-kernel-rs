@@ -332,10 +332,13 @@ fn test_sql_where() {
     do_test(ALL_NULL, expr, PRESENT, None, Some(false));
     do_test(ALL_NULL, expr, MISSING, None, None);
 
-    // OR is not affected
+    // Comparison inside OR works
     let expr = &Expr::or(FALSE, Expr::lt(col.clone(), VAL));
-    do_test(ALL_NULL, expr, PRESENT, None, None);
+    do_test(ALL_NULL, expr, PRESENT, None, Some(false));
+    do_test(ALL_NULL, expr, MISSING, None, None);
 
-    // AND inside OR is also not affected
+    // Comparison inside AND inside OR works
+    let expr = &Expr::or(FALSE, Expr::and(TRUE, Expr::lt(col.clone(), VAL)));
+    do_test(ALL_NULL, expr, PRESENT, None, Some(false));
     do_test(ALL_NULL, expr, MISSING, None, None);
 }

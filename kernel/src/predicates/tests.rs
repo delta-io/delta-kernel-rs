@@ -641,9 +641,9 @@ fn test_sql_where() {
     expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
     expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
 
-    // Semantics are the same for comparison inside OR inside AND
+    // Ditto for comparison inside OR inside AND
     let expr = &Expr::or(FALSE, Expr::and(NULL, Expr::lt(col.clone(), VAL)));
     expect_eq!(null_filter.eval_expr(expr, false), None, "{expr}");
-    expect_eq!(null_filter.eval_sql_where(expr), None, "{expr}");
+    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
     expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
 }

@@ -255,24 +255,43 @@ pub(crate) trait PredicateEvaluator {
     /// Evaluates a predicate with SQL WHERE semantics.
     ///
     /// By default, [`eval_expr`] behaves badly for comparisons involving NULL columns (e.g. `a <
-    /// 10` when `a` is NULL), because NULL values are interpreted as "stats missing" (= cannot
-    /// skip). This can "poison" the entire expression, causing it to return NULL instead of FALSE
-    /// that would allow skipping. Meanwhile, SQL WHERE semantics only keeps rows for which the
-    /// filter evaluates to TRUE (discarding rows that evaluate to FALSE or NULL).
+    /// 10` when `a` is NULL), because the comparison correctly evaluates to NULL, but NULL
+    /// expressions are interpreted as "stats missing" (= cannot skip). This ambiguity can "poison"
+    /// the entire expression, causing it to return NULL instead of FALSE that would allow skipping:
+    ///
+    /// ```text
+    /// WHERE a < 10 -- NULL (can't skip file)
+    /// WHERE a < 10 AND TRUE -- NULL (can't skip file)
+    /// WHERE a < 10 OR FALSE -- NULL (can't skip file)
+    /// ```
+    ///
+    /// Meanwhile, SQL WHERE semantics only keeps rows for which the filter evaluates to
+    /// TRUE (discarding rows that evaluate to FALSE or NULL):
+    ///
+    /// ```text
+    /// WHERE a < 10 -- NULL (discard row)
+    /// WHERE a < 10 AND TRUE -- NULL (discard row)
+    /// WHERE a < 10 OR FALSE -- NULL (discard row)
+    /// ```
     ///
     /// Conceptually, the behavior difference between data skipping and SQL WHERE semantics can be
-    /// addressed by performing a null-safe comparison of `WHERE <expr>`, as if it were expanded to
-    /// `WHERE <expr> IS NOT NULL AND <expr>`.
+    /// addressed by evaluating with null-safe semantics, as if by `<expr> IS NOT NULL AND <expr>`:
+    ///
+    /// ```text
+    /// WHERE (a < 10) IS NOT NULL AND (a < 10) -- FALSE (skip file)
+    /// WHERE (a < 10 AND TRUE) IS NOT NULL AND (a < 10 AND TRUE) -- FALSE (skip file)
+    /// WHERE (a < 10 OR FALSE) IS NOT NULL AND (a < 10 OR FALSE) -- FALSE (skip file)
+    /// ```
     ///
     /// HOWEVER, we cannot safely NULL-check the result of an arbitrary data skipping predicate
-    /// because an expression will also produce NULL when the value is just plain missing
-    /// (e.g. attempting data skipping over a column that lacks stats), and that NULL could
-    /// propagate all the way to top-level and be wrongly interpreted as NOT TRUE (= skippable).
+    /// because an expression will also produce NULL if the value is just plain missing (e.g. data
+    /// skipping over a column that lacks stats), and if that NULL should propagate all the way to
+    /// top-level, it would be wrongly interpreted as FALSE (= skippable).
     ///
     /// To prevent wrong data skipping, the predicate evaluator always returns NULL for a NULL check
     /// over anything except for literals and columns with known values. So we must push the NULL
-    /// check down through supported operations (AND as well as null-intolerant comparisons `<`,
-    /// `!=`, etc) until it reaches columns and literals where it can do some good, e.g.:
+    /// check down through supported operations (AND as well as null-intolerant comparisons like
+    /// `<`, `!=`, etc) until it reaches columns and literals where it can do some good, e.g.:
     ///
     /// ```text
     /// WHERE a < 10 AND (b < 20 OR c < 30)
@@ -335,13 +354,10 @@ pub(crate) trait PredicateEvaluator {
     fn eval_sql_where(&self, filter: &Expr) -> Option<Self::Output> {
         use Expr::{Binary, Variadic};
         match filter {
-            Variadic(VariadicExpression {
-                op: VariadicOperator::And,
-                exprs,
-            }) => {
-                // Recursively invoke `eval_sql_where` instead of the usual `eval_expr`
-                let exprs = exprs.iter().map(|expr| self.eval_sql_where(expr));
-                self.finish_eval_variadic(VariadicOperator::And, exprs, false)
+            Variadic(v) => {
+                // Recursively invoke `eval_sql_where` instead of the usual `eval_expr` for AND/OR.
+                let exprs = v.exprs.iter().map(|expr| self.eval_sql_where(expr));
+                self.finish_eval_variadic(v.op, exprs, false)
             }
             Binary(BinaryExpression { op, left, right }) if op.is_null_intolerant_comparison() => {
                 // Perform a nullsafe comparison instead of the usual `eval_binary`
