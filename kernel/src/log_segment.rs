@@ -339,7 +339,7 @@ fn list_log_files_with_version(
                 .find(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
             {
                 checkpoint_parts = complete_checkpoint;
-                commit_files.clear(); // Clear commits when a complete checkpoint is found
+                commit_files.clear(); // Log replay only uses commits after a complete checkpoint
             }
         }
         (commit_files, checkpoint_parts)
