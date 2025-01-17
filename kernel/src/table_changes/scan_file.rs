@@ -251,7 +251,7 @@ mod tests {
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::log_replay::table_changes_action_iter;
     use crate::table_configuration::TableConfiguration;
-    use crate::table_features::ReaderFeatures;
+    use crate::table_features::{ReaderFeatures, WriterFeatures};
     use crate::utils::test_utils::{Action, LocalMockTable};
     use crate::Engine;
 
@@ -357,11 +357,11 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::DeletionVectors]),
-            Some([ReaderFeatures::ColumnMapping]),
+            Some::<Vec<String>>(vec![]),
+            Some::<Vec<String>>(vec![]),
         )
         .unwrap();
-        let table_config = TableConfiguration::new(metadata, protocol).unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol).unwrap();
 
         let scan_data = table_changes_action_iter(
             Arc::new(engine),

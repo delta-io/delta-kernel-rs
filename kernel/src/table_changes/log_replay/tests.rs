@@ -49,7 +49,7 @@ fn table_config() -> TableConfiguration {
         Some([WriterFeatures::ColumnMapping]),
     )
     .unwrap();
-    TableConfiguration::new(metadata, protocol).unwrap()
+    TableConfiguration::try_new(metadata, protocol).unwrap()
 }
 
 fn get_segment(

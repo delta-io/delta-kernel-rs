@@ -19,7 +19,7 @@ use crate::schema::{ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef, RowVisitor};
+use crate::{table, DeltaResult, Engine, EngineData, Error, ExpressionRef, RowVisitor};
 
 use itertools::Itertools;
 
@@ -181,30 +181,31 @@ fn process_cdf_commit(
             protocol: None,
             metadata: None,
         };
-        visitor.visit_rows_of(actions.as_ref())?;
 
-        //table_configuration.with_protocol(visitor.protocol)?;
-        //if let Some(metadata) = visitor.metadata {
-        //    table_configuration.with_metadata(metadata)?;
-        //    // Currently, schema compatibility is defined as having equal schema types. In the
-        //    // future, more permisive schema evolution will be supported.
-        //    // See: https://github.com/delta-io/delta-kernel-rs/issues/523
-        //    require!(
-        //        table_schema.as_ref() == table_configuration.schema(),
-        //        Error::change_data_feed_incompatible_schema(
-        //            table_schema,
-        //            table_configuration.schema()
-        //        )
-        //    );
-        //}
-        if !table_configuration.is_cdf_read_supported() {
-            return Err(Error::change_data_feed_unsupported(commit_file.version));
+        visitor.visit_rows_of(actions.as_ref())?;
+        let has_metadata = visitor.metadata.is_some();
+        match (visitor.protocol, visitor.metadata) {
+            (None, None) => {}
+            (p, m) => {
+                let p = p.unwrap_or_else(|| table_configuration.protocol().clone());
+                let m = m.unwrap_or_else(|| table_configuration.metadata().clone());
+                *table_configuration = TableConfiguration::try_new(m, p)?;
+                if !table_configuration.is_cdf_read_supported() {
+                    return Err(Error::change_data_feed_unsupported(commit_file.version));
+                }
+            }
+        }
+        if has_metadata {
+            require!(
+                table_schema.as_ref() == table_configuration.schema(),
+                Error::change_data_feed_incompatible_schema(
+                    table_schema,
+                    table_configuration.schema()
+                )
+            );
         }
     }
 
-    table_configuration
-        .can_read_cdf()
-        .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;
     // We resolve the remove deletion vector map after visiting the entire commit.
     if has_cdc_action {
         remove_dvs.clear();
