@@ -288,9 +288,13 @@ fn list_log_files(
 
     Ok(fs_client
         .list_from(&start_from)?
-        .map(|meta| ParsedLogPath::try_from(meta?))
-        // TODO this filters out .crc files etc which start with "." - how do we want to use these kind of files?
+        .map(|meta| meta.map(|m| ParsedLogPath::try_from(m).ok().flatten()))
         .filter_map_ok(identity)
+        .filter(|path_res| {
+            path_res
+                .as_ref()
+                .map_or(true, |path| path.is_commit() || path.is_checkpoint())
+        })
         .take_while(move |path_res| match path_res {
             Ok(path) => !end_version.is_some_and(|end_version| end_version < path.version),
             Err(_) => true,
