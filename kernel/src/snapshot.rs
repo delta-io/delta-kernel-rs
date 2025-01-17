@@ -12,7 +12,6 @@ use crate::scan::ScanBuilder;
 use crate::schema::Schema;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
-use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, Error, FileSystemClient, Version};
 
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";

@@ -22,7 +22,7 @@ pub(crate) struct TableConfiguration {
 }
 
 impl TableConfiguration {
-    pub fn try_new(metadata: Metadata, protocol: Protocol) -> DeltaResult<Self> {
+    pub(crate) fn try_new(metadata: Metadata, protocol: Protocol) -> DeltaResult<Self> {
         // important! before a read/write to the table we must check it is supported
         protocol.ensure_read_supported()?;
 
@@ -60,6 +60,7 @@ impl TableConfiguration {
         &self.metadata
     }
 
+    #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn table_properties(&self) -> &TableProperties {
         &self.table_properties
@@ -69,6 +70,7 @@ impl TableConfiguration {
     /// See the documentation of [`TableChanges`] for more details.
     ///
     /// [`TableChanges`]: crate::table_changes::TableChanges
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn is_cdf_read_supported(&self) -> bool {
         static CDF_SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeatures>> =
             LazyLock::new(|| HashSet::from([ReaderFeatures::DeletionVectors]));
@@ -97,6 +99,7 @@ impl TableConfiguration {
     /// both the protocol's readerFeatures and writerFeatures.
     ///
     /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors>
+    #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn is_deletion_vector_supported(&self) -> bool {
         let read_supported = self
@@ -115,6 +118,7 @@ impl TableConfiguration {
     /// table property is set to `true`.
     ///
     /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors>
+    #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn is_deletion_vector_enabled(&self) -> bool {
         self.is_deletion_vector_supported()
