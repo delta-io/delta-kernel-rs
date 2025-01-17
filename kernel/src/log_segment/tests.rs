@@ -142,13 +142,13 @@ fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
         &[
             delta_path_for_version(0, "json"),
             delta_path_for_multipart_checkpoint(1, 1, 3),
-            // Part 2 is missing!
+            // Part 2 of 3 at version 1 is missing!
             delta_path_for_multipart_checkpoint(3, 3, 3),
-            // Part 1 is missing!
             delta_path_for_multipart_checkpoint(2, 1, 2),
+            // Part 2 of 2 at version 2 is missing!
             delta_path_for_version(2, "json"),
             delta_path_for_multipart_checkpoint(3, 1, 3),
-            // Part 2 is missing!
+            // Part 2 of 3 at version 3 is missing!
             delta_path_for_multipart_checkpoint(3, 3, 3),
             delta_path_for_multipart_checkpoint(3, 1, 4),
             delta_path_for_multipart_checkpoint(3, 2, 4),
@@ -276,7 +276,7 @@ fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
             delta_path_for_version(3, "json"),
             delta_path_for_version(4, "json"),
             delta_path_for_multipart_checkpoint(5, 1, 3),
-            // Part 2 is missing!
+            // Part 2 of 3 at version 5 is missing!
             delta_path_for_multipart_checkpoint(5, 3, 3),
             delta_path_for_version(5, "json"),
             delta_path_for_version(6, "json"),
@@ -338,7 +338,7 @@ fn build_snapshot_with_missing_checkpoint_part_no_hint() {
             delta_path_for_version(3, "json"),
             delta_path_for_version(4, "json"),
             delta_path_for_multipart_checkpoint(5, 1, 3),
-            // Part 2 is missing!
+            // Part 2 of 3 at version 5 is missing!
             delta_path_for_multipart_checkpoint(5, 3, 3),
             delta_path_for_version(5, "json"),
             delta_path_for_version(6, "json"),
@@ -383,7 +383,7 @@ fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_checkpo
             delta_path_for_version(3, "checkpoint.parquet"),
             delta_path_for_version(4, "json"),
             delta_path_for_multipart_checkpoint(5, 1, 3),
-            // Part 2 is missing!
+            // Part 2 of 3 at version 5 is missing!
             delta_path_for_multipart_checkpoint(5, 3, 3),
             delta_path_for_version(5, "json"),
             delta_path_for_version(6, "json"),
