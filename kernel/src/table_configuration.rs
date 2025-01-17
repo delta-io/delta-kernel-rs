@@ -2,6 +2,8 @@
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
+use url::Url;
+
 use crate::actions::{ensure_supported_features, Metadata, Protocol};
 use crate::schema::{Schema, SchemaRef};
 use crate::table_features::{
@@ -9,7 +11,7 @@ use crate::table_features::{
     WriterFeatures,
 };
 use crate::table_properties::TableProperties;
-use crate::DeltaResult;
+use crate::{DeltaResult, Version};
 
 /// Holds all the configuration for a table, including supported reader and writer features,
 /// table properties, and schema. [`TableConfiguration`] performs checks when constructed using
@@ -27,10 +29,17 @@ pub(crate) struct TableConfiguration {
     schema: SchemaRef,
     table_properties: TableProperties,
     column_mapping_mode: ColumnMappingMode,
+    table_root: Url,
+    version: Version,
 }
 
 impl TableConfiguration {
-    pub(crate) fn try_new(metadata: Metadata, protocol: Protocol) -> DeltaResult<Self> {
+    pub(crate) fn try_new(
+        metadata: Metadata,
+        protocol: Protocol,
+        table_root: Url,
+        version: Version,
+    ) -> DeltaResult<Self> {
         // important! before a read/write to the table we must check it is supported
         protocol.ensure_read_supported()?;
 
@@ -46,33 +55,45 @@ impl TableConfiguration {
             protocol,
             table_properties,
             column_mapping_mode,
+            table_root,
+            version,
         })
     }
-    /// The [`Metadata`] for this table configuration.
+    /// The [`Metadata`] for this table at this version.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn metadata(&self) -> &Metadata {
         &self.metadata
     }
-    /// The [`ColumnMappingMode`] for this table configuration.
+    /// The [`ColumnMappingMode`] for this table at this version.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn column_mapping_mode(&self) -> &ColumnMappingMode {
         &self.column_mapping_mode
     }
-    /// The [`Schema`] of this table configuration's [`Metadata`]
+    /// The [`Schema`] of for this table at this version.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn schema(&self) -> &Schema {
         self.schema.as_ref()
     }
-    /// The [`Protocol`] of this table configuration
+    /// The [`Protocol`] of this table at  this version.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn protocol(&self) -> &Protocol {
         &self.protocol
     }
-    /// The [`TableProperties`] of this table configuration
+    /// The [`TableProperties`] of this table at this version.
     #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn table_properties(&self) -> &TableProperties {
         &self.table_properties
+    }
+    /// The [`Version`] which this [`TableConfiguration`] belongs to.
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn version(&self) -> Version {
+        self.version
+    }
+    /// The [`Url`] of the table this [`TableConfiguration`] belongs to
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn table_root(&self) -> &Url {
+        &self.table_root
     }
     /// Ensures that kernel supports reading Change Data Feed on this table and that it is enabled.
     /// See the documentation of [`TableChanges`] for more details.

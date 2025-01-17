@@ -423,7 +423,7 @@ impl Scan {
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
         self.snapshot
-            .log_segment
+            .log_segment()
             .replay(engine, commit_read_schema, checkpoint_read_schema, None)
     }
 
@@ -431,7 +431,7 @@ impl Scan {
     /// only be called once per scan.
     pub fn global_scan_state(&self) -> GlobalScanState {
         GlobalScanState {
-            table_root: self.snapshot.table_root.to_string(),
+            table_root: self.snapshot.table_root().to_string(),
             partition_columns: self.snapshot.metadata().partition_columns.clone(),
             logical_schema: self.logical_schema.clone(),
             physical_schema: self.physical_schema.clone(),
@@ -479,7 +479,7 @@ impl Scan {
         );
 
         let global_state = Arc::new(self.global_scan_state());
-        let table_root = self.snapshot.table_root.clone();
+        let table_root = self.snapshot.table_root().clone();
         let physical_predicate = self.physical_predicate();
         let all_fields = self.all_fields.clone();
         let have_partition_cols = self.have_partition_cols;
