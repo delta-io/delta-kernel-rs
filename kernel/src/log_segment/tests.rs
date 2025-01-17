@@ -143,7 +143,7 @@ fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
             delta_path_for_version(0, "json"),
             delta_path_for_multipart_checkpoint(1, 1, 3),
             // Part 2 of 3 at version 1 is missing!
-            delta_path_for_multipart_checkpoint(3, 3, 3),
+            delta_path_for_multipart_checkpoint(1, 3, 3),
             delta_path_for_multipart_checkpoint(2, 1, 2),
             // Part 2 of 2 at version 2 is missing!
             delta_path_for_version(2, "json"),
