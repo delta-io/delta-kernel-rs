@@ -10,10 +10,10 @@ use crate::table_features::{
     WriterFeatures,
 };
 use crate::table_properties::TableProperties;
-use crate::utils::require;
-use crate::{DeltaResult, Error};
+use crate::DeltaResult;
 
-pub struct TableConfiguration {
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+pub(crate) struct TableConfiguration {
     metadata: Metadata,
     protocol: Protocol,
     schema: SchemaRef,
@@ -39,18 +39,28 @@ impl TableConfiguration {
             column_mapping_mode,
         })
     }
+
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn column_mapping_mode(&self) -> &ColumnMappingMode {
         &self.column_mapping_mode
     }
+
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn schema(&self) -> &Schema {
         self.schema.as_ref()
     }
+
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn protocol(&self) -> &Protocol {
         &self.protocol
     }
+
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn metadata(&self) -> &Metadata {
         &self.metadata
     }
+
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn table_properties(&self) -> &TableProperties {
         &self.table_properties
     }
@@ -59,7 +69,7 @@ impl TableConfiguration {
     /// See the documentation of [`TableChanges`] for more details.
     ///
     /// [`TableChanges`]: crate::table_changes::TableChanges
-    pub fn is_cdf_read_supported(&self) -> bool {
+    pub(crate) fn is_cdf_read_supported(&self) -> bool {
         static CDF_SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeatures>> =
             LazyLock::new(|| HashSet::from([ReaderFeatures::DeletionVectors]));
         let protocol_supported = match self.protocol.reader_features() {
@@ -82,38 +92,31 @@ impl TableConfiguration {
         );
         protocol_supported && cdf_enabled && column_mapping_disabled
     }
-    /// Returns `Ok(())` if reading deletion vectors is supported on this table.
-    ///
-    /// Note:  readers are not disallowed from reading deletion vectors if the table property is
-    /// false or not present. The protocol only states that:
-    /// > Readers must read the table considering the existence of DVs, even when the
-    /// > delta.enableDeletionVectors table property is not set.
+    /// Returns `true` if deletion vectors is supported on this table. To support deletion vectors,
+    /// a table must support reader version 3, writer version 7, and the deletionVectors feature in
+    /// both the protocol's readerFeatures and writerFeatures.
     ///
     /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors>
-    pub fn is_deletion_vector_supported(&self) -> bool {
-        static DELETION_VECTOR_READER_FEATURE: LazyLock<HashSet<ReaderFeatures>> =
-            LazyLock::new(|| HashSet::from([ReaderFeatures::DeletionVectors]));
-        static DELETION_VECTOR_WRITER_FEATURE: LazyLock<HashSet<WriterFeatures>> =
-            LazyLock::new(|| HashSet::from([WriterFeatures::DeletionVectors]));
-        let reader_supported = match self.protocol().reader_features() {
-            Some(features) if self.protocol().min_reader_version() == 3 => {
-                ensure_supported_features(features, &DELETION_VECTOR_READER_FEATURE).is_ok()
-            }
-            _ => false,
-        };
-        let writer_supported = match self.protocol().writer_features() {
-            Some(features) if self.protocol().min_writer_version() == 7 => {
-                ensure_supported_features(features, &DELETION_VECTOR_WRITER_FEATURE).is_ok()
-            }
-            _ => false,
-        };
-        reader_supported && writer_supported
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn is_deletion_vector_supported(&self) -> bool {
+        let read_supported = self
+            .protocol()
+            .has_reader_feature(&ReaderFeatures::DeletionVectors)
+            && self.protocol.min_reader_version() == 3;
+        let write_supported = self
+            .protocol()
+            .has_writer_feature(&WriterFeatures::DeletionVectors)
+            && self.protocol.min_writer_version() == 7;
+        read_supported && write_supported
     }
 
-    /// Returns `Ok(())` if writing deletion vectors is supported on this table.
+    /// Returns `true` if writing deletion vectors is supported on this table. This is the case
+    /// when the deletion vectors is supported on this table and the `delta.enableDeletionVectors`
+    /// table property is set to `true`.
     ///
     /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors>
-    pub fn is_deletion_vector_enabled(&self) -> bool {
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn is_deletion_vector_enabled(&self) -> bool {
         self.is_deletion_vector_supported()
             && self
                 .table_properties
