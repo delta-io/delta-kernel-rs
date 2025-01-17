@@ -162,10 +162,11 @@ impl TableChanges {
         //
         // Note: We must still check each metadata and protocol action in the CDF range.
         let check_table_config = |snapshot: &Snapshot| {
-            snapshot
-                .table_configuration()
-                .is_cdf_read_supported()
-                .map_err(|_| Error::change_data_feed_unsupported(snapshot.version()))
+            if snapshot.table_configuration().is_cdf_read_supported() {
+                Ok(())
+            } else {
+                Err(Error::change_data_feed_unsupported(snapshot.version()))
+            }
         };
         check_table_config(&start_snapshot)?;
         check_table_config(&end_snapshot)?;
