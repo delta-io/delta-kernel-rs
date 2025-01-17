@@ -43,7 +43,7 @@ void print_partition_info(struct EngineContext* context, const CStringMap* parti
 }
 
 // Kernel will call this function for each file that should be scanned. The arguments include enough
-// context to constuct the correct logical data from the physically read parquet
+// context to construct the correct logical data from the physically read parquet
 void scan_row_callback(
   void* engine_context,
   KernelStringSlice path,

@@ -400,36 +400,33 @@ mod tests {
 
     #[test]
     fn ensure_struct() {
-        let schema = DataType::struct_type([StructField::new(
+        let schema = DataType::struct_type([StructField::nullable(
             "a",
             ArrayType::new(
                 DataType::struct_type([
-                    StructField::new("w", DataType::LONG, true),
-                    StructField::new("x", ArrayType::new(DataType::LONG, true), true),
-                    StructField::new(
+                    StructField::nullable("w", DataType::LONG),
+                    StructField::nullable("x", ArrayType::new(DataType::LONG, true)),
+                    StructField::nullable(
                         "y",
                         MapType::new(DataType::LONG, DataType::STRING, true),
-                        true,
                     ),
-                    StructField::new(
+                    StructField::nullable(
                         "z",
                         DataType::struct_type([
-                            StructField::new("n", DataType::LONG, true),
-                            StructField::new("m", DataType::STRING, true),
+                            StructField::nullable("n", DataType::LONG),
+                            StructField::nullable("m", DataType::STRING),
                         ]),
-                        true,
                     ),
                 ]),
                 true,
             ),
-            true,
         )]);
         let arrow_struct: ArrowDataType = (&schema).try_into().unwrap();
         assert!(ensure_data_types(&schema, &arrow_struct, true).is_ok());
 
         let kernel_simple = DataType::struct_type([
-            StructField::new("w", DataType::LONG, true),
-            StructField::new("x", DataType::LONG, true),
+            StructField::nullable("w", DataType::LONG),
+            StructField::nullable("x", DataType::LONG),
         ]);
 
         let arrow_simple_ok = ArrowField::new_struct(

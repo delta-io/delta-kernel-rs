@@ -258,7 +258,7 @@ impl FileOpener for ParquetOpener {
             let mut reader = ParquetObjectReader::new(store, meta);
             let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
             let parquet_schema = metadata.schema();
-            let (indicies, requested_ordering) =
+            let (indices, requested_ordering) =
                 get_requested_indices(&table_schema, parquet_schema)?;
             let options = ArrowReaderOptions::new(); //.with_page_index(enable_page_index);
             let mut builder =
@@ -267,7 +267,7 @@ impl FileOpener for ParquetOpener {
                 &table_schema,
                 parquet_schema,
                 builder.parquet_schema(),
-                &indicies,
+                &indices,
             ) {
                 builder = builder.with_projection(mask)
             }
@@ -330,7 +330,7 @@ impl FileOpener for PresignedUrlOpener {
             let reader = client.get(file_meta.location).send().await?.bytes().await?;
             let metadata = ArrowReaderMetadata::load(&reader, Default::default())?;
             let parquet_schema = metadata.schema();
-            let (indicies, requested_ordering) =
+            let (indices, requested_ordering) =
                 get_requested_indices(&table_schema, parquet_schema)?;
 
             let options = ArrowReaderOptions::new();
@@ -340,7 +340,7 @@ impl FileOpener for PresignedUrlOpener {
                 &table_schema,
                 parquet_schema,
                 builder.parquet_schema(),
-                &indicies,
+                &indices,
             ) {
                 builder = builder.with_projection(mask)
             }

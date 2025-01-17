@@ -15,7 +15,7 @@ Delta-kernel-rs is split into a few different crates:
 - kernel: The actual core kernel crate
 - acceptance: Acceptance tests that validate correctness  via the [Delta Acceptance Tests][dat]
 - derive-macros: A crate for our [derive-macros] to live in
-- ffi: Functionallity that enables delta-kernel-rs to be used from `C` or `C++` See the [ffi](ffi)
+- ffi: Functionality that enables delta-kernel-rs to be used from `C` or `C++` See the [ffi](ffi)
   directory for more information.
 
 ## Building
@@ -66,12 +66,12 @@ are still unstable. We therefore may break APIs within minor releases (that is, 
 we will not break APIs in patch releases (`0.1.0` -> `0.1.1`).
 
 ## Arrow versioning
-If you enable the `default-engine` or `sync-engine` features, you get an implemenation of the
+If you enable the `default-engine` or `sync-engine` features, you get an implementation of the
 `Engine` trait that uses [Arrow] as its data format.
 
 The [`arrow crate`](https://docs.rs/arrow/latest/arrow/) tends to release new major versions rather
 quickly. To enable engines that already integrate arrow to also integrate kernel and not force them
-to track a specific version of arrow that kernel depends on, we take as broad dependecy on arrow
+to track a specific version of arrow that kernel depends on, we take as broad dependency on arrow
 versions as we can.
 
 This means you can force kernel to rely on the specific arrow version that your engine already uses,
@@ -96,7 +96,7 @@ arrow-schema = "53.0"
 parquet = "53.0"
 ```
 
-Note that unfortunatly patching in `cargo` requires that _exactly one_ version matches your
+Note that unfortunately patching in `cargo` requires that _exactly one_ version matches your
 specification. If only arrow "53.0.0" had been released the above will work, but if "53.0.1" where
 to be released, the specification will break and you will need to provide a more restrictive
 specification like `"=53.0.0"`.
@@ -111,7 +111,7 @@ and then checking what version of `object_store` it depends on.
 ## Documentation
 
 - [API Docs](https://docs.rs/delta_kernel/latest/delta_kernel/)
-- [arcitecture.md](doc/architecture.md) document describing the kernel architecture (currently wip)
+- [architecture.md](doc/architecture.md) document describing the kernel architecture (currently wip)
 
 ## Examples
 

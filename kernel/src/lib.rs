@@ -202,7 +202,7 @@ impl FileMeta {
 /// let b: Arc<Bar> = a.downcast().unwrap();
 /// ```
 ///
-/// In contrast, very similer code that relies only on `Any` would fail to compile:
+/// In contrast, very similar code that relies only on `Any` would fail to compile:
 ///
 /// ```fail_compile
 /// # use std::any::Any;
@@ -371,8 +371,20 @@ pub trait JsonHandler: AsAny {
         output_schema: SchemaRef,
     ) -> DeltaResult<Box<dyn EngineData>>;
 
-    /// Read and parse the JSON format file at given locations and return
-    /// the data as EngineData with the columns requested by physical schema.
+    /// Read and parse the JSON format file at given locations and return the data as EngineData with
+    /// the columns requested by physical schema. Note: The [`FileDataReadResultIterator`] must emit
+    /// data from files in the order that `files` is given. For example if files ["a", "b"] is provided,
+    /// then the engine data iterator must first return all the engine data from file "a", _then_ all
+    /// the engine data from file "b". Moreover, for a given file, all of its [`EngineData`] and
+    /// constituent rows must be in order that they occur in the file. Consider a file with rows
+    /// (1, 2, 3). The following are legal iterator batches:
+    ///    iter: [EngineData(1, 2), EngineData(3)]
+    ///    iter: [EngineData(1), EngineData(2, 3)]
+    ///    iter: [EngineData(1, 2, 3)]
+    /// The following are illegal batches:
+    ///    iter: [EngineData(3), EngineData(1, 2)]
+    ///    iter: [EngineData(1), EngineData(3, 2)]
+    ///    iter: [EngineData(2, 1, 3)]
     ///
     /// # Parameters
     ///
@@ -404,7 +416,7 @@ pub trait JsonHandler: AsAny {
     ///
     /// - `path` - URL specifying the location to write the JSON file
     /// - `data` - Iterator of EngineData to write to the JSON file. Each row should be written as
-    ///   a new JSON object appended to the file. (that is, the file is newline-delimeted JSON, and
+    ///   a new JSON object appended to the file. (that is, the file is newline-delimited JSON, and
     ///   each row is a JSON object on a single line)
     /// - `overwrite` - If true, overwrite the file if it exists. If false, the call must fail if
     ///   the file exists.

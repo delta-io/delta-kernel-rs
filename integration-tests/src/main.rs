@@ -7,16 +7,16 @@ fn create_arrow_schema() -> arrow::datatypes::Schema {
 
 fn create_kernel_schema() -> delta_kernel::schema::Schema {
     use delta_kernel::schema::{DataType, Schema, StructField};
-    let field_a = StructField::new("a", DataType::LONG, false);
-    let field_b = StructField::new("b", DataType::BOOLEAN, false);
+    let field_a = StructField::not_null("a", DataType::LONG);
+    let field_b = StructField::not_null("b", DataType::BOOLEAN);
     Schema::new(vec![field_a, field_b])
 }
 
 fn main() {
     let arrow_schema = create_arrow_schema();
     let kernel_schema = create_kernel_schema();
-    let convereted: delta_kernel::schema::Schema =
+    let converted: delta_kernel::schema::Schema =
         delta_kernel::schema::Schema::try_from(&arrow_schema).expect("couldn't convert");
-    assert!(kernel_schema == convereted);
+    assert!(kernel_schema == converted);
     println!("Okay, made it");
 }

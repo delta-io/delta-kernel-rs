@@ -162,21 +162,21 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
     // Note that fields projected out of a nullable struct must be nullable
     let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
     let file_constant_values =
-        StructType::new([StructField::new("partitionValues", partition_values, true)]);
+        StructType::new([StructField::nullable("partitionValues", partition_values)]);
     let deletion_vector = StructType::new([
-        StructField::new("storageType", DataType::STRING, true),
-        StructField::new("pathOrInlineDv", DataType::STRING, true),
-        StructField::new("offset", DataType::INTEGER, true),
-        StructField::new("sizeInBytes", DataType::INTEGER, true),
-        StructField::new("cardinality", DataType::LONG, true),
+        StructField::nullable("storageType", DataType::STRING),
+        StructField::nullable("pathOrInlineDv", DataType::STRING),
+        StructField::nullable("offset", DataType::INTEGER),
+        StructField::nullable("sizeInBytes", DataType::INTEGER),
+        StructField::nullable("cardinality", DataType::LONG),
     ]);
     Arc::new(StructType::new([
-        StructField::new("path", DataType::STRING, true),
-        StructField::new("size", DataType::LONG, true),
-        StructField::new("modificationTime", DataType::LONG, true),
-        StructField::new("stats", DataType::STRING, true),
-        StructField::new("deletionVector", deletion_vector, true),
-        StructField::new("fileConstantValues", file_constant_values, true),
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("size", DataType::LONG),
+        StructField::nullable("modificationTime", DataType::LONG),
+        StructField::nullable("stats", DataType::STRING),
+        StructField::nullable("deletionVector", deletion_vector),
+        StructField::nullable("fileConstantValues", file_constant_values),
     ]))
 });
 
