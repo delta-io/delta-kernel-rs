@@ -21,8 +21,7 @@ const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 /// have a defined schema (which may change over time for any given table), specific version, and
 /// frozen log segment.
 pub struct Snapshot {
-    pub(crate) table_root: Url,
-    pub(crate) log_segment: LogSegment,
+    log_segment: LogSegment,
     table_configuration: TableConfiguration,
 }
 
@@ -74,9 +73,9 @@ impl Snapshot {
         engine: &dyn Engine,
     ) -> DeltaResult<Self> {
         let (metadata, protocol) = log_segment.read_metadata(engine)?;
-        let table_configuration = TableConfiguration::try_new(metadata, protocol)?;
+        let table_configuration =
+            TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
         Ok(Self {
-            table_root: location,
             log_segment,
             table_configuration,
         })
@@ -84,12 +83,12 @@ impl Snapshot {
 
     /// Log segment this snapshot uses
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    fn _log_segment(&self) -> &LogSegment {
+    fn log_segment(&self) -> &LogSegment {
         &self.log_segment
     }
 
     pub fn table_root(&self) -> &Url {
-        &self.table_root
+        &self.table_configuration.table_root()
     }
 
     /// Version of this `Snapshot` in the table.
