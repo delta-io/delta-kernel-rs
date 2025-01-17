@@ -19,7 +19,7 @@ use crate::schema::{ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
-use crate::{table, DeltaResult, Engine, EngineData, Error, ExpressionRef, RowVisitor};
+use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef, RowVisitor};
 
 use itertools::Itertools;
 
@@ -362,16 +362,13 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 }
             } else if getters[9].get_str(i, "cdc.path")?.is_some() {
                 *self.has_cdc_action = true;
-            } else if let Some(id) = getters[10].get_str(i, "metaData.id")? {
-                let schema_string = getters[11].get(i, "metaData.schemaString")?;
-                let partition_columns = getters[12].get(i, "metaData.partitionColumns")?;
+            } else if let Some(id) = getters[10].get_opt(i, "metaData.id")? {
                 let configuration_map_opt = getters[13].get_opt(i, "metaData.configuration")?;
-                let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
                 self.metadata = Some(Metadata {
-                    id: id.to_string(),
-                    schema_string,
-                    partition_columns,
-                    configuration,
+                    id,
+                    schema_string: getters[11].get(i, "metaData.schemaString")?,
+                    partition_columns: getters[12].get(i, "metaData.partitionColumns")?,
+                    configuration: configuration_map_opt.unwrap_or_else(HashMap::new),
                     ..Default::default() // Other fields are ignored
                 });
             } else if let Some(min_reader_version) =
