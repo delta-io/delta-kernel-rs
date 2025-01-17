@@ -1,5 +1,4 @@
-//! High level api to check table feature status.
-
+//! Provides a level api to check feature support and enablement for a table.
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
@@ -12,6 +11,15 @@ use crate::table_features::{
 use crate::table_properties::TableProperties;
 use crate::DeltaResult;
 
+/// Holds all the configuration for a table, including supported reader and writer features,
+/// table properties, and schema. [`TableConfiguration`] performs checks when constructed using
+/// [`TableConfiguration::try_new`]  to validate that Metadata and Protocol are correctly formatted
+/// and mutually compatible.
+///
+/// For example, deletion vector support can be checked with
+/// [`TableConfiguration::is_deletion_vector_supported`] and deletion vector write enablement can
+/// be checked  with [`TableConfiguration::is_deletion_vector_enabled`]. [`TableConfiguration`]
+/// wraps both a [`Metadata`]  and a [`Protocol`], and validates that they are well-formed.
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct TableConfiguration {
     metadata: Metadata,
@@ -26,10 +34,11 @@ impl TableConfiguration {
         // important! before a read/write to the table we must check it is supported
         protocol.ensure_read_supported()?;
 
-        // validate column mapping mode -- all schema fields should be correctly (un)annotated
         let schema = Arc::new(metadata.parse_schema()?);
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
+
+        // validate column mapping mode -- all schema fields should be correctly (un)annotated
         validate_schema_column_mapping(&schema, column_mapping_mode)?;
         Ok(Self {
             schema,
@@ -39,34 +48,33 @@ impl TableConfiguration {
             column_mapping_mode,
         })
     }
-
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    pub(crate) fn column_mapping_mode(&self) -> &ColumnMappingMode {
-        &self.column_mapping_mode
-    }
-
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    pub(crate) fn schema(&self) -> &Schema {
-        self.schema.as_ref()
-    }
-
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    pub(crate) fn protocol(&self) -> &Protocol {
-        &self.protocol
-    }
-
+    /// The [`Metadata`] for this table configuration.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn metadata(&self) -> &Metadata {
         &self.metadata
     }
-
+    /// The [`ColumnMappingMode`] for this table configuration.
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn column_mapping_mode(&self) -> &ColumnMappingMode {
+        &self.column_mapping_mode
+    }
+    /// The [`Schema`] of this table configuration's [`Metadata`]
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn schema(&self) -> &Schema {
+        self.schema.as_ref()
+    }
+    /// The [`Protocol`] of this table configuration
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn protocol(&self) -> &Protocol {
+        &self.protocol
+    }
+    /// The [`TableProperties`] of this table configuration
     #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn table_properties(&self) -> &TableProperties {
         &self.table_properties
     }
-
-    /// Ensures that Change Data Feed is supported for a table with this [`Protocol`] .
+    /// Ensures that kernel supports reading Change Data Feed on this table and that it is enabled.
     /// See the documentation of [`TableChanges`] for more details.
     ///
     /// [`TableChanges`]: crate::table_changes::TableChanges
