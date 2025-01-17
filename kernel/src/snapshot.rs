@@ -104,18 +104,17 @@ impl Snapshot {
     }
 
     /// Table [`Metadata`] at this `Snapshot`s version.
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    pub(crate) fn metadata(&self) -> &Metadata {
+    pub fn metadata(&self) -> &Metadata {
         self.table_configuration.metadata()
     }
 
     /// Table [`Protocol`] at this `Snapshot`s version.
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    pub(crate) fn protocol(&self) -> &Protocol {
+    pub fn protocol(&self) -> &Protocol {
         self.table_configuration.protocol()
     }
 
     /// Get the [`TableConfiguration`] for this [`Snapshot`].
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn table_configuration(&self) -> &TableConfiguration {
         &self.table_configuration
     }
