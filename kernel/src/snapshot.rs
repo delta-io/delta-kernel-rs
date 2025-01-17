@@ -75,7 +75,7 @@ impl Snapshot {
         engine: &dyn Engine,
     ) -> DeltaResult<Self> {
         let (metadata, protocol) = log_segment.read_metadata(engine)?;
-        let table_configuration = TableConfiguration::new(metadata, protocol)?;
+        let table_configuration = TableConfiguration::try_new(metadata, protocol)?;
         Ok(Self {
             table_root: location,
             log_segment,
@@ -104,28 +104,26 @@ impl Snapshot {
     }
 
     /// Table [`Metadata`] at this `Snapshot`s version.
-    pub fn metadata(&self) -> &Metadata {
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn metadata(&self) -> &Metadata {
         self.table_configuration.metadata()
     }
 
     /// Table [`Protocol`] at this `Snapshot`s version.
-    pub fn protocol(&self) -> &Protocol {
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn protocol(&self) -> &Protocol {
         self.table_configuration.protocol()
     }
 
-    /// Get the [`TableProperties`] for this [`Snapshot`].
-    pub fn table_properties(&self) -> &TableProperties {
-        self.table_configuration.table_properties()
-    }
     /// Get the [`TableConfiguration`] for this [`Snapshot`].
-    pub fn table_configuration(&self) -> &TableConfiguration {
+    pub(crate) fn table_configuration(&self) -> &TableConfiguration {
         &self.table_configuration
     }
 
     /// Get the [column mapping
     /// mode](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping) at this
     /// `Snapshot`s version.
-    pub fn column_mapping_mode(&self) -> ColumnMappingMode {
+    pub(crate) fn column_mapping_mode(&self) -> ColumnMappingMode {
         *self.table_configuration.column_mapping_mode()
     }
 
