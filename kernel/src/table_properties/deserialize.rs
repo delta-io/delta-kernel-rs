@@ -76,6 +76,7 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         }
         "delta.checkpointPolicy" => props.checkpoint_policy = CheckpointPolicy::try_from(v).ok(),
         "delta.enableRowTracking" => props.enable_row_tracking = Some(parse_bool(v)?),
+        "delta.enableTypeWidening" => props.enable_type_widening = Some(parse_bool(v)?),
         _ => return None,
     }
     Some(())

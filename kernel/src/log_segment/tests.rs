@@ -9,7 +9,7 @@ use crate::engine::default::filesystem::ObjectStoreFileSystemClient;
 use crate::engine::sync::SyncEngine;
 use crate::log_segment::LogSegment;
 use crate::snapshot::CheckpointMetadata;
-use crate::{FileSystemClient, Table};
+use crate::{Error, FileSystemClient, Table};
 use test_utils::delta_path_for_version;
 
 // NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
@@ -500,7 +500,6 @@ fn test_non_contiguous_log() {
 
 #[test]
 fn table_changes_fails_with_larger_start_version_than_end() {
-    // Commit with version 1 is missing
     let (client, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -510,4 +509,61 @@ fn table_changes_fails_with_larger_start_version_than_end() {
     );
     let log_segment_res = LogSegment::for_table_changes(client.as_ref(), log_root, 1, Some(0));
     assert!(log_segment_res.is_err());
+}
+
+#[test]
+fn empty_log_segment_returns_specific_error() {
+    let (client, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+        ],
+        None,
+    );
+    let log_segment_res = LogSegment::for_table_changes(client.as_ref(), log_root, 2, None);
+    assert!(matches!(log_segment_res, Err(Error::FileNotFound(_))));
+}
+
+#[test]
+fn extend_log_segment_by_andother_log_segment() {
+    let (client, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "json"),
+        ],
+        None,
+    );
+
+    let mut log_segment =
+        LogSegment::for_snapshot(client.as_ref(), log_root.clone(), None, 1).unwrap();
+    assert_eq!(log_segment.end_version, 1);
+    assert_eq!(log_segment.ascending_commit_files.len(), 2);
+    let log_segment_changes =
+        LogSegment::for_table_changes(client.as_ref(), log_root.clone(), 2, None).unwrap();
+    log_segment.extend(&log_segment_changes).unwrap();
+    assert_eq!(log_segment.end_version, 3);
+    assert_eq!(log_segment.ascending_commit_files.len(), 4);
+
+    // non contiguous ranges
+    let mut log_segment =
+        LogSegment::for_snapshot(client.as_ref(), log_root.clone(), None, 0).unwrap();
+    assert!(log_segment.extend(&log_segment_changes).is_err());
+
+    // non matching log roots
+    let mut log_segment =
+        LogSegment::for_snapshot(client.as_ref(), log_root.clone(), None, 1).unwrap();
+    let mut log_segment_changes =
+        LogSegment::for_table_changes(client.as_ref(), log_root.clone(), 2, None).unwrap();
+    log_segment_changes.log_root = Url::parse("file:///").unwrap();
+    assert!(log_segment.extend(&log_segment_changes).is_err());
+
+    // non-empty checkpoint parts
+    let mut log_segment =
+        LogSegment::for_snapshot(client.as_ref(), log_root.clone(), None, 1).unwrap();
+    let mut log_segment_changes =
+        LogSegment::for_table_changes(client.as_ref(), log_root.clone(), 2, None).unwrap();
+    log_segment_changes.checkpoint_parts = log_segment.ascending_commit_files.clone();
+    assert!(log_segment.extend(&log_segment_changes).is_err());
 }
