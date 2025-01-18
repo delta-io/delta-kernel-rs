@@ -13,10 +13,10 @@ use crate::table_features::{
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Version};
 
-/// Holds all the configuration for a table, including supported reader and writer features,
-/// table properties, and schema. [`TableConfiguration`] performs checks when constructed using
-/// [`TableConfiguration::try_new`]  to validate that Metadata and Protocol are correctly formatted
-/// and mutually compatible.
+/// Holds all the configuration for a table at a specific version. This includes the supported
+/// reader and writer features, table properties, and schema. [`TableConfiguration`] performs
+/// checks when constructed using [`TableConfiguration::try_new`]  to validate that Metadata
+/// and Protocol are correctly formatted and mutually compatible.
 ///
 /// For example, deletion vector support can be checked with
 /// [`TableConfiguration::is_deletion_vector_supported`] and deletion vector write enablement can
@@ -34,6 +34,9 @@ pub(crate) struct TableConfiguration {
 }
 
 impl TableConfiguration {
+    /// Constructs a [`TableConfiguration`] for a table located in `table_root` at version
+    /// `version`. This validates  that the [`Metadata`] and [`Protocol`] are mutually compatible,
+    /// and that the kernel supports reading from this table.
     pub(crate) fn try_new(
         metadata: Metadata,
         protocol: Protocol,
