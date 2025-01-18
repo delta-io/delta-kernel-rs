@@ -252,7 +252,7 @@ pub(crate) trait PredicateEvaluator {
         }
     }
 
-    /// Evaluates a predicate with SQL WHERE semantics.
+    /// Evaluates a (possibly inverted) predicate with SQL WHERE semantics.
     ///
     /// By default, [`eval_expr`] behaves badly for comparisons involving NULL columns (e.g. `a <
     /// 10` when `a` is NULL), because the comparison correctly evaluates to NULL, but NULL
@@ -351,25 +351,56 @@ pub(crate) trait PredicateEvaluator {
     /// AND(..., AND(NULL, TRUE, NULL), ...)
     /// AND(..., NULL, ...)
     /// ```
-    fn eval_sql_where(&self, filter: &Expr) -> Option<Self::Output> {
-        use Expr::{Binary, Variadic};
+    ///
+    /// WARNING: Not an idempotent transform. If data skipping eval produces a sql predicate,
+    /// evaluating the result with sql semantics has undefined behavior.
+    fn eval_expr_sql_where(&self, filter: &Expr, inverted: bool) -> Option<Self::Output> {
+        use Expr::*;
         match filter {
             Variadic(v) => {
-                // Recursively invoke `eval_sql_where` instead of the usual `eval_expr` for AND/OR.
-                let exprs = v.exprs.iter().map(|expr| self.eval_sql_where(expr));
-                self.finish_eval_variadic(v.op, exprs, false)
+                // Recursively invoke `eval_expr_sql_where` instead of the usual `eval_expr` for AND/OR.
+                let exprs = v
+                    .exprs
+                    .iter()
+                    .map(|expr| self.eval_expr_sql_where(expr, inverted));
+                self.finish_eval_variadic(v.op, exprs, inverted)
             }
             Binary(BinaryExpression { op, left, right }) if op.is_null_intolerant_comparison() => {
                 // Perform a nullsafe comparison instead of the usual `eval_binary`
                 let exprs = [
                     self.eval_unary(UnaryOperator::IsNull, left, true),
                     self.eval_unary(UnaryOperator::IsNull, right, true),
-                    self.eval_binary(*op, left, right, false),
+                    self.eval_binary(*op, left, right, inverted),
                 ];
                 self.finish_eval_variadic(VariadicOperator::And, exprs, false)
             }
-            _ => self.eval_expr(filter, false),
+            Unary(UnaryExpression {
+                op: UnaryOperator::Not,
+                expr,
+            }) => self.eval_expr_sql_where(expr, !inverted),
+            Column(col) => {
+                // Perform a nullsafe comparison instead of the usual `eval_column`
+                let exprs = [
+                    self.eval_unary(UnaryOperator::IsNull, filter, true),
+                    self.eval_column(col, inverted),
+                ];
+                self.finish_eval_variadic(VariadicOperator::And, exprs, false)
+            }
+            // NOTE: It's unsafe to process other expressions like DISTINCT, IS NULL, and literals
+            // with null-safe semantics, so just process them normally.
+            _ => self.eval_expr(filter, inverted),
         }
+    }
+
+    /// A convenient wrapper for [`eval_expr`].
+    #[cfg(test)]
+    fn eval(&self, expr: &Expr) -> Option<Self::Output> {
+        self.eval_expr(expr, false)
+    }
+
+    /// A convenient wrapper for [`eval_expr_sql_where`].
+    fn eval_sql_where(&self, expr: &Expr) -> Option<Self::Output> {
+        self.eval_expr_sql_where(expr, false)
     }
 }
 
