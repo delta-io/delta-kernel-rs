@@ -88,7 +88,7 @@ impl Snapshot {
     }
 
     pub fn table_root(&self) -> &Url {
-        &self.table_configuration.table_root()
+        self.table_configuration.table_root()
     }
 
     /// Version of this `Snapshot` in the table.
