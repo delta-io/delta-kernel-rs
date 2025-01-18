@@ -160,3 +160,39 @@ impl TableConfiguration {
                 .unwrap_or(false)
     }
 }
+
+#[cfg(test)]
+mod test {
+    use std::collections::HashMap;
+
+    use url::Url;
+
+    use crate::{
+        actions::{Metadata, Protocol},
+        table_features::{ReaderFeatures, WriterFeatures},
+    };
+
+    use super::TableConfiguration;
+
+    #[test]
+    fn dv_support_tests() {
+        let metadata = Metadata {
+            configuration: HashMap::from_iter([(
+                "delta.enableChangeDataFeed".to_string(),
+                "true".to_string(),
+            )]),
+            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
+            ..Default::default()
+        };
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeatures::DeletionVectors]),
+            Some([WriterFeatures::DeletionVectors]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let res = TableConfiguration::try_new(metadata, protocol, table_root, 0);
+        assert!(res.is_ok(), "Got error {:?}", res.err());
+    }
+}
