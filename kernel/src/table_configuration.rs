@@ -67,20 +67,15 @@ impl TableConfiguration {
     pub(crate) fn metadata(&self) -> &Metadata {
         &self.metadata
     }
-    /// The [`ColumnMappingMode`] for this table at this version.
+    /// The [`Protocol`] of this table at  this version.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    pub(crate) fn column_mapping_mode(&self) -> &ColumnMappingMode {
-        &self.column_mapping_mode
+    pub(crate) fn protocol(&self) -> &Protocol {
+        &self.protocol
     }
     /// The [`Schema`] of for this table at this version.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn schema(&self) -> &Schema {
         self.schema.as_ref()
-    }
-    /// The [`Protocol`] of this table at  this version.
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    pub(crate) fn protocol(&self) -> &Protocol {
-        &self.protocol
     }
     /// The [`TableProperties`] of this table at this version.
     #[allow(unused)]
@@ -88,15 +83,20 @@ impl TableConfiguration {
     pub(crate) fn table_properties(&self) -> &TableProperties {
         &self.table_properties
     }
-    /// The [`Version`] which this [`TableConfiguration`] belongs to.
+    /// The [`ColumnMappingMode`] for this table at this version.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    pub(crate) fn version(&self) -> Version {
-        self.version
+    pub(crate) fn column_mapping_mode(&self) -> &ColumnMappingMode {
+        &self.column_mapping_mode
     }
     /// The [`Url`] of the table this [`TableConfiguration`] belongs to
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn table_root(&self) -> &Url {
         &self.table_root
+    }
+    /// The [`Version`] which this [`TableConfiguration`] belongs to.
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn version(&self) -> Version {
+        self.version
     }
     /// Ensures that kernel supports reading Change Data Feed on this table and that it is enabled.
     /// See the documentation of [`TableChanges`] for more details.
