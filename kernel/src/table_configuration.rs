@@ -1,4 +1,4 @@
-//! Provides a level api to check feature support and enablement for a table.
+//! Provides a high level api to check feature support/enablement for a table.
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
@@ -14,14 +14,13 @@ use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Version};
 
 /// Holds all the configuration for a table at a specific version. This includes the supported
-/// reader and writer features, table properties, and schema. [`TableConfiguration`] performs
-/// checks when constructed using `TableConfiguration::try_new`  to validate that Metadata
-/// and Protocol are correctly formatted and mutually compatible.
+/// reader and writer features, table properties, schema, version, and table root.
+/// [`TableConfiguration`] performs checks when constructed using `TableConfiguration::try_new`
+/// to validate that Metadata and Protocol are correctly formatted and mutually compatible.
 ///
 /// For example, deletion vector support can be checked with
 /// [`TableConfiguration::is_deletion_vector_supported`] and deletion vector write enablement can
-/// be checked  with [`TableConfiguration::is_deletion_vector_enabled`]. [`TableConfiguration`]
-/// wraps both a [`Metadata`]  and a [`Protocol`], and validates that they are well-formed.
+/// be checked  with [`TableConfiguration::is_deletion_vector_enabled`].
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 #[derive(Debug)]
 pub(crate) struct TableConfiguration {
@@ -36,15 +35,14 @@ pub(crate) struct TableConfiguration {
 
 impl TableConfiguration {
     /// Constructs a [`TableConfiguration`] for a table located in `table_root` at version
-    /// `version`. This validates  that the [`Metadata`] and [`Protocol`] are mutually compatible,
-    /// and that the kernel supports reading from this table.
+    /// `version`. This validates  that the [`Metadata`] and [`Protocol`] are compatible with one
+    /// another, and that the kernel supports reading from this table.
     pub(crate) fn try_new(
         metadata: Metadata,
         protocol: Protocol,
         table_root: Url,
         version: Version,
     ) -> DeltaResult<Self> {
-        // important! before a read/write to the table we must check it is supported
         protocol.ensure_read_supported()?;
 
         let schema = Arc::new(metadata.parse_schema()?);
@@ -99,6 +97,7 @@ impl TableConfiguration {
     pub(crate) fn version(&self) -> Version {
         self.version
     }
+
     /// Ensures that kernel supports reading Change Data Feed on this table and that it is enabled.
     /// See the documentation of [`TableChanges`] for more details.
     ///
