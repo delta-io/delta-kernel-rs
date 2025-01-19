@@ -198,7 +198,14 @@ impl TableChangesScan {
             PhysicalPredicate::None => None,
         };
         let schema = self.table_changes.end_snapshot.schema().clone().into();
-        let it = table_changes_action_iter(engine, commits, schema, physical_predicate)?;
+        let table_configuration = self.table_changes.start_table_config.clone();
+        let it = table_changes_action_iter(
+            engine,
+            commits,
+            schema,
+            physical_predicate,
+            table_configuration,
+        )?;
         Ok(Some(it).into_iter().flatten())
     }
 
@@ -211,7 +218,7 @@ impl TableChangesScan {
             partition_columns: end_snapshot.metadata().partition_columns.clone(),
             logical_schema: self.logical_schema.clone(),
             physical_schema: self.physical_schema.clone(),
-            column_mapping_mode: end_snapshot.column_mapping_mode,
+            column_mapping_mode: end_snapshot.column_mapping_mode(),
         }
     }
 
