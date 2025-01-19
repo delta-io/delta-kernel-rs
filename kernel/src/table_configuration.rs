@@ -23,6 +23,7 @@ use crate::{DeltaResult, Version};
 /// be checked  with [`TableConfiguration::is_deletion_vector_enabled`]. [`TableConfiguration`]
 /// wraps both a [`Metadata`]  and a [`Protocol`], and validates that they are well-formed.
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[derive(Debug)]
 pub(crate) struct TableConfiguration {
     metadata: Metadata,
     protocol: Protocol,
@@ -167,15 +168,13 @@ mod test {
 
     use url::Url;
 
-    use crate::{
-        actions::{Metadata, Protocol},
-        table_features::{ReaderFeatures, WriterFeatures},
-    };
+    use crate::actions::{Metadata, Protocol};
+    use crate::table_features::{ReaderFeatures, WriterFeatures};
 
     use super::TableConfiguration;
 
     #[test]
-    fn dv_support_tests() {
+    fn dv_supported_not_enabled() {
         let metadata = Metadata {
             configuration: HashMap::from_iter([(
                 "delta.enableChangeDataFeed".to_string(),
@@ -192,7 +191,73 @@ mod test {
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        let res = TableConfiguration::try_new(metadata, protocol, table_root, 0);
-        assert!(res.is_ok(), "Got error {:?}", res.err());
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        assert!(table_config.is_deletion_vector_supported());
+        assert!(!table_config.is_deletion_vector_enabled());
+    }
+    #[test]
+    fn dv_enabled() {
+        let metadata = Metadata {
+            configuration: HashMap::from_iter([(
+                "delta.enableChangeDataFeed".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "delta.enableDeletionVectors".to_string(),
+                "true".to_string(),
+            )]),
+            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
+            ..Default::default()
+        };
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeatures::DeletionVectors]),
+            Some([WriterFeatures::DeletionVectors]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        assert!(table_config.is_deletion_vector_supported());
+        assert!(table_config.is_deletion_vector_enabled());
+    }
+    #[test]
+    fn fails_on_unsupported_feature() {
+        let metadata = Metadata {
+            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
+            ..Default::default()
+        };
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeatures::V2Checkpoint]),
+            Some([WriterFeatures::V2Checkpoint]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        TableConfiguration::try_new(metadata, protocol, table_root, 0)
+            .expect_err("V2Checkpoints is not currently supported");
+    }
+    #[test]
+    fn dv_not_supported() {
+        let metadata = Metadata {
+            configuration: HashMap::from_iter([(
+                "delta.enableChangeDataFeed".to_string(),
+                "true".to_string(),
+            )]),
+            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
+            ..Default::default()
+        };
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeatures::TimestampWithoutTimezone]),
+            Some([WriterFeatures::TimestampWithoutTimezone]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        assert!(!table_config.is_deletion_vector_supported());
+        assert!(!table_config.is_deletion_vector_enabled());
     }
 }
