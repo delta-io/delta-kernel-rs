@@ -15,7 +15,7 @@ use crate::{DeltaResult, Version};
 
 /// Holds all the configuration for a table at a specific version. This includes the supported
 /// reader and writer features, table properties, and schema. [`TableConfiguration`] performs
-/// checks when constructed using [`TableConfiguration::try_new`]  to validate that Metadata
+/// checks when constructed using `TableConfiguration::try_new`  to validate that Metadata
 /// and Protocol are correctly formatted and mutually compatible.
 ///
 /// For example, deletion vector support can be checked with
