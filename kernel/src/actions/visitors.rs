@@ -37,29 +37,20 @@ impl MetadataVisitor {
                 getters.len()
             ))
         );
-        let name: Option<String> = getters[1].get_opt(row_index, "metaData.name")?;
-        let description: Option<String> = getters[2].get_opt(row_index, "metaData.description")?;
         // get format out of primitives
-        let format_provider = getters[3].get(row_index, "metaData.format.provider")?;
-        // options for format is always empty, so skip getters[4]
-        let schema_string = getters[5].get(row_index, "metaData.schemaString")?;
-        let partition_columns = getters[6].get(row_index, "metaData.partitionColumns")?;
-        let created_time = getters[7].get_opt(row_index, "metaData.created_time")?;
         let configuration_map_opt = getters[8].get_opt(row_index, "metaData.configuration")?;
-        let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
-
         Ok(Metadata {
             id,
-            name,
-            description,
+            name: getters[1].get_opt(row_index, "metaData.name")?,
+            description: getters[2].get_opt(row_index, "metaData.description")?,
             format: Format {
-                provider: format_provider,
-                options: HashMap::new(),
+                provider: getters[3].get(row_index, "metaData.format.provider")?,
+                options: HashMap::new(), // options for format is always empty, so skip getters[4]
             },
-            schema_string,
-            partition_columns,
-            created_time,
-            configuration,
+            schema_string: getters[5].get(row_index, "metaData.schemaString")?,
+            partition_columns: getters[6].get(row_index, "metaData.partitionColumns")?,
+            created_time: getters[7].get_opt(row_index, "metaData.created_time")?,
+            configuration: configuration_map_opt.unwrap_or_else(HashMap::new),
         })
     }
 }

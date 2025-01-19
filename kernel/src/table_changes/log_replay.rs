@@ -54,19 +54,19 @@ pub(crate) fn table_changes_action_iter(
     mut table_configuration: TableConfiguration,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanData>>> {
     let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
-    let engine_clone = engine.clone();
+    let process_engine_ref = engine.clone();
     let result = commit_files
         .into_iter()
         .map(move |commit_file| -> DeltaResult<ProcessedCdfCommit> {
             process_cdf_commit(
-                engine.as_ref(),
+                process_engine_ref.as_ref(),
                 commit_file,
                 &table_schema,
                 &mut table_configuration,
             )
         }) //Iterator-Result-Iterator-Result
         .map(move |processed_commit| -> DeltaResult<_> {
-            commit_to_scan_batches(processed_commit?, engine_clone.clone(), filter.clone())
+            commit_to_scan_batches(processed_commit?, engine.clone(), filter.clone())
         })
         .flatten_ok() // Iterator-Result-Result
         .map(|x| x?); // Iterator-Result
@@ -210,7 +210,6 @@ fn process_cdf_commit(
             );
         }
     }
-
     // We resolve the remove deletion vector map after visiting the entire commit.
     if has_cdc_action {
         remove_dvs.clear();

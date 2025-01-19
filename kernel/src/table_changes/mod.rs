@@ -110,7 +110,7 @@ pub struct TableChanges {
     end_snapshot: Snapshot,
     start_version: Version,
     schema: Schema,
-    table_configuration: TableConfiguration,
+    start_table_config: TableConfiguration,
 }
 
 impl TableChanges {
@@ -192,7 +192,7 @@ impl TableChanges {
             log_segment,
             start_version,
             schema,
-            table_configuration: start_snapshot.table_configuration().clone(),
+            start_table_config: start_snapshot.table_configuration().clone(),
         })
     }
 
@@ -218,7 +218,6 @@ impl TableChanges {
     pub(crate) fn partition_columns(&self) -> &Vec<String> {
         &self.end_snapshot.metadata().partition_columns
     }
-
     /// Create a [`TableChangesScanBuilder`] for an `Arc<TableChanges>`.
     pub fn scan_builder(self: Arc<Self>) -> TableChangesScanBuilder {
         TableChangesScanBuilder::new(self)
