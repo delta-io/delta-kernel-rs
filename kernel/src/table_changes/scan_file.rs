@@ -251,7 +251,6 @@ mod tests {
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::log_replay::table_changes_action_iter;
     use crate::table_configuration::TableConfiguration;
-    use crate::table_features::{ReaderFeatures, WriterFeatures};
     use crate::utils::test_utils::{Action, LocalMockTable};
     use crate::Engine;
 
@@ -361,7 +360,7 @@ mod tests {
             Some::<Vec<String>>(vec![]),
         )
         .unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol).unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
 
         let scan_data = table_changes_action_iter(
             Arc::new(engine),
