@@ -192,6 +192,26 @@ impl TableConfiguration {
                 .enable_deletion_vectors
                 .unwrap_or(false)
     }
+    #[allow(unused)]
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn is_append_only_supported(&self) -> bool {
+        match self.protocol.min_writer_version() {
+            7 if self
+                .protocol
+                .has_writer_feature(&WriterFeatures::AppendOnly) =>
+            {
+                true
+            }
+            ver if (2..7).contains(&ver) => true,
+            _ => false,
+        }
+    }
+
+    #[allow(unused)]
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn is_append_only_enabled(&self) -> bool {
+        self.is_append_only_supported() && self.table_properties.append_only.unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
@@ -291,31 +311,5 @@ mod test {
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(!table_config.is_deletion_vector_supported());
         assert!(!table_config.is_deletion_vector_enabled());
-    }
-
-    pub fn is_append_only_table(&self) -> DeltaResult<()> {
-        static APPEND_ONLY_WRITER_FEATURE: LazyLock<HashSet<WriterFeatures>> =
-            LazyLock::new(|| HashSet::from([WriterFeatures::AppendOnly]));
-        match self.protocol.reader_features() {
-            // if min_writer_version = 7 and the append only writer feature is enabled => OK
-            Some(reader_features) if self.protocol.min_writer_version() == 7 => {
-                ensure_supported_features(reader_features, &APPEND_ONLY_WRITER_FEATURE)?
-            }
-            // if min_writer_version is between 2 and 6 inclusive and there are no reader features => OK
-            None if 2 <= self.protocol.min_reader_version()
-                && self.protocol.min_writer_version() <= 6 => {}
-            // any other protocol is not supported
-            _ => {
-                return Err(Error::unsupported(
-                    "Change data feed not supported on this protocol",
-                ));
-            }
-        };
-        require!(
-            self.table_properties.append_only.unwrap_or(false),
-            Error::unsupported("Append only table is not enabled")
-        );
-
-        Ok(())
     }
 }
