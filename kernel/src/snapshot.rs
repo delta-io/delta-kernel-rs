@@ -10,10 +10,8 @@ use crate::actions::{Metadata, Protocol};
 use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
 use crate::schema::Schema;
-use crate::table_features::{
-    column_mapping_mode, validate_schema_column_mapping, ColumnMappingMode,
-};
-use crate::table_properties::TableProperties;
+use crate::table_configuration::TableConfiguration;
+use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Engine, Error, FileSystemClient, Version};
 
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
@@ -23,13 +21,8 @@ const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 /// have a defined schema (which may change over time for any given table), specific version, and
 /// frozen log segment.
 pub struct Snapshot {
-    pub(crate) table_root: Url,
-    pub(crate) log_segment: LogSegment,
-    metadata: Metadata,
-    protocol: Protocol,
-    schema: Schema,
-    table_properties: TableProperties,
-    pub(crate) column_mapping_mode: ColumnMappingMode,
+    log_segment: LogSegment,
+    table_configuration: TableConfiguration,
 }
 
 impl Drop for Snapshot {
@@ -43,7 +36,7 @@ impl std::fmt::Debug for Snapshot {
         f.debug_struct("Snapshot")
             .field("path", &self.log_segment.log_root.as_str())
             .field("version", &self.version())
-            .field("metadata", &self.metadata)
+            .field("metadata", &self.metadata())
             .finish()
     }
 }
@@ -80,35 +73,22 @@ impl Snapshot {
         engine: &dyn Engine,
     ) -> DeltaResult<Self> {
         let (metadata, protocol) = log_segment.read_metadata(engine)?;
-
-        // important! before a read/write to the table we must check it is supported
-        protocol.ensure_read_supported()?;
-
-        // validate column mapping mode -- all schema fields should be correctly (un)annotated
-        let schema = metadata.parse_schema()?;
-        let table_properties = metadata.parse_table_properties();
-        let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
-        validate_schema_column_mapping(&schema, column_mapping_mode)?;
-
+        let table_configuration =
+            TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
         Ok(Self {
-            table_root: location,
             log_segment,
-            metadata,
-            protocol,
-            schema,
-            table_properties,
-            column_mapping_mode,
+            table_configuration,
         })
     }
 
     /// Log segment this snapshot uses
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    fn _log_segment(&self) -> &LogSegment {
+    pub(crate) fn log_segment(&self) -> &LogSegment {
         &self.log_segment
     }
 
     pub fn table_root(&self) -> &Url {
-        &self.table_root
+        self.table_configuration.table_root()
     }
 
     /// Version of this `Snapshot` in the table.
@@ -118,29 +98,30 @@ impl Snapshot {
 
     /// Table [`Schema`] at this `Snapshot`s version.
     pub fn schema(&self) -> &Schema {
-        &self.schema
+        self.table_configuration.schema()
     }
 
     /// Table [`Metadata`] at this `Snapshot`s version.
     pub fn metadata(&self) -> &Metadata {
-        &self.metadata
+        self.table_configuration.metadata()
     }
 
     /// Table [`Protocol`] at this `Snapshot`s version.
     pub fn protocol(&self) -> &Protocol {
-        &self.protocol
+        self.table_configuration.protocol()
     }
 
-    /// Get the [`TableProperties`] for this [`Snapshot`].
-    pub fn table_properties(&self) -> &TableProperties {
-        &self.table_properties
+    /// Get the [`TableConfiguration`] for this [`Snapshot`].
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn table_configuration(&self) -> &TableConfiguration {
+        &self.table_configuration
     }
 
     /// Get the [column mapping
     /// mode](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping) at this
     /// `Snapshot`s version.
-    pub fn column_mapping_mode(&self) -> ColumnMappingMode {
-        self.column_mapping_mode
+    pub(crate) fn column_mapping_mode(&self) -> ColumnMappingMode {
+        *self.table_configuration.column_mapping_mode()
     }
 
     /// Create a [`ScanBuilder`] for an `Arc<Snapshot>`.
