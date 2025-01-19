@@ -189,7 +189,12 @@ fn process_cdf_commit(
             (p, m) => {
                 let p = p.unwrap_or_else(|| table_configuration.protocol().clone());
                 let m = m.unwrap_or_else(|| table_configuration.metadata().clone());
-                *table_configuration = TableConfiguration::try_new(m, p)?;
+                *table_configuration = TableConfiguration::try_new(
+                    m,
+                    p,
+                    table_configuration.table_root().clone(),
+                    commit_file.version,
+                )?;
                 if !table_configuration.is_cdf_read_supported() {
                     return Err(Error::change_data_feed_unsupported(commit_file.version));
                 }

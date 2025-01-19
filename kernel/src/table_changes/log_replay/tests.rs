@@ -28,7 +28,8 @@ fn get_schema() -> StructType {
     ])
 }
 
-fn table_config() -> TableConfiguration {
+fn table_config(path: &Path) -> TableConfiguration {
+    let table_root = url::Url::from_directory_path(path).unwrap();
     let schema_string = serde_json::to_string(&get_schema()).unwrap();
     let metadata = Metadata {
         schema_string,
@@ -49,7 +50,7 @@ fn table_config() -> TableConfiguration {
         Some([WriterFeatures::ColumnMapping]),
     )
     .unwrap();
-    TableConfiguration::try_new(metadata, protocol).unwrap()
+    TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
 }
 
 fn get_segment(
@@ -111,8 +112,9 @@ async fn metadata_protocol() {
         .unwrap()
         .into_iter();
 
+    let table_config = table_config(mock_table.table_root());
     let scan_batches =
-        table_changes_action_iter(engine, commits, get_schema().into(), None, table_config())
+        table_changes_action_iter(engine, commits, get_schema().into(), None, table_config)
             .unwrap();
     let sv = result_to_sv(scan_batches);
     assert_eq!(sv, &[false, false]);
@@ -137,8 +139,9 @@ async fn cdf_not_enabled() {
         .unwrap()
         .into_iter();
 
+    let table_config = table_config(mock_table.table_root());
     let res: DeltaResult<Vec<_>> =
-        table_changes_action_iter(engine, commits, get_schema().into(), None, table_config())
+        table_changes_action_iter(engine, commits, get_schema().into(), None, table_config)
             .unwrap()
             .try_collect();
 
@@ -168,8 +171,9 @@ async fn unsupported_reader_feature() {
         .unwrap()
         .into_iter();
 
+    let table_config = table_config(mock_table.table_root());
     let res: DeltaResult<Vec<_>> =
-        table_changes_action_iter(engine, commits, get_schema().into(), None, table_config())
+        table_changes_action_iter(engine, commits, get_schema().into(), None, table_config)
             .unwrap()
             .try_collect();
 
@@ -199,8 +203,9 @@ async fn column_mapping_should_fail() {
         .unwrap()
         .into_iter();
 
+    let table_config = table_config(mock_table.table_root());
     let res: DeltaResult<Vec<_>> =
-        table_changes_action_iter(engine, commits, get_schema().into(), None, table_config())
+        table_changes_action_iter(engine, commits, get_schema().into(), None, table_config)
             .unwrap()
             .try_collect();
 
@@ -230,8 +235,9 @@ async fn incompatible_schemas_fail() {
             .unwrap()
             .into_iter();
 
+        let table_config = table_config(mock_table.table_root());
         let res: DeltaResult<Vec<_>> =
-            table_changes_action_iter(engine, commits, cdf_schema.into(), None, table_config())
+            table_changes_action_iter(engine, commits, cdf_schema.into(), None, table_config)
                 .unwrap()
                 .try_collect();
 
@@ -320,7 +326,8 @@ async fn add_remove() {
         .unwrap()
         .into_iter();
 
-    let sv = table_changes_action_iter(engine, commits, get_schema().into(), None, table_config())
+    let table_config = table_config(mock_table.table_root());
+    let sv = table_changes_action_iter(engine, commits, get_schema().into(), None, table_config)
         .unwrap()
         .flat_map(|scan_data| {
             let scan_data = scan_data.unwrap();
@@ -370,7 +377,8 @@ async fn filter_data_change() {
         .unwrap()
         .into_iter();
 
-    let sv = table_changes_action_iter(engine, commits, get_schema().into(), None, table_config())
+    let table_config = table_config(mock_table.table_root());
+    let sv = table_changes_action_iter(engine, commits, get_schema().into(), None, table_config)
         .unwrap()
         .flat_map(|scan_data| {
             let scan_data = scan_data.unwrap();
@@ -416,7 +424,8 @@ async fn cdc_selection() {
         .unwrap()
         .into_iter();
 
-    let sv = table_changes_action_iter(engine, commits, get_schema().into(), None, table_config())
+    let table_config = table_config(mock_table.table_root());
+    let sv = table_changes_action_iter(engine, commits, get_schema().into(), None, table_config)
         .unwrap()
         .flat_map(|scan_data| {
             let scan_data = scan_data.unwrap();
@@ -482,7 +491,9 @@ async fn dv() {
         },
     )])
     .into();
-    let sv = table_changes_action_iter(engine, commits, get_schema().into(), None, table_config())
+
+    let table_config = table_config(mock_table.table_root());
+    let sv = table_changes_action_iter(engine, commits, get_schema().into(), None, table_config)
         .unwrap()
         .flat_map(|scan_data| {
             let scan_data = scan_data.unwrap();
@@ -559,12 +570,13 @@ async fn data_skipping_filter() {
         .unwrap()
         .into_iter();
 
+    let table_config = table_config(mock_table.table_root());
     let sv = table_changes_action_iter(
         engine,
         commits,
         logical_schema.into(),
         predicate,
-        table_config(),
+        table_config,
     )
     .unwrap()
     .flat_map(|scan_data| {
@@ -610,8 +622,9 @@ async fn failing_protocol() {
         .unwrap()
         .into_iter();
 
+    let table_config = table_config(mock_table.table_root());
     let res: DeltaResult<Vec<_>> =
-        table_changes_action_iter(engine, commits, get_schema().into(), None, table_config())
+        table_changes_action_iter(engine, commits, get_schema().into(), None, table_config)
             .unwrap()
             .try_collect();
 
@@ -637,11 +650,12 @@ async fn file_meta_timestamp() {
 
     let commit = commits.next().unwrap();
     let file_meta_ts = commit.location.last_modified;
+    let mut table_config = table_config(mock_table.table_root());
     let processed_commit = process_cdf_commit(
         engine.as_ref(),
         commit,
         &get_schema().into(),
-        &mut table_config(),
+        &mut table_config,
     )
     .unwrap();
     assert_eq!(processed_commit.timestamp, file_meta_ts);
