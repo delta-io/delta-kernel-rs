@@ -83,7 +83,7 @@ impl Snapshot {
 
     /// Log segment this snapshot uses
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    fn log_segment(&self) -> &LogSegment {
+    pub(crate) fn log_segment(&self) -> &LogSegment {
         &self.log_segment
     }
 
