@@ -87,7 +87,6 @@ pub mod table_properties;
 pub mod transaction;
 
 pub(crate) mod predicates;
-pub(crate) mod schema_compat;
 pub(crate) mod utils;
 
 #[cfg(feature = "developer-visibility")]
