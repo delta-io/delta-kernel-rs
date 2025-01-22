@@ -9,7 +9,7 @@ use crate::utils::require;
 use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, FileSystemClient, Version,
 };
-use itertools::{process_results, Itertools};
+use itertools::Itertools;
 use std::collections::HashMap;
 use std::convert::identity;
 use std::sync::{Arc, LazyLock};
