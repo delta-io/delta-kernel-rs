@@ -172,11 +172,7 @@ fn test_eval_binary_comparisons() {
     let do_test = |min: Scalar, max: Scalar, expected: &[Option<bool>]| {
         let filter = MinMaxTestFilter::new(Some(min.clone()), Some(max.clone()));
         for (expr, expect) in expressions.iter().zip(expected.iter()) {
-            expect_eq!(
-                filter.eval_expr(expr, false),
-                *expect,
-                "{expr:#?} with [{min}..{max}]"
-            );
+            expect_eq!(filter.eval(expr), *expect, "{expr:#?} with [{min}..{max}]");
         }
     };
 
@@ -240,11 +236,7 @@ fn test_eval_is_null() {
     let do_test = |nullcount: i64, expected: &[Option<bool>]| {
         let filter = NullCountTestFilter::new(Some(nullcount), 2);
         for (expr, expect) in expressions.iter().zip(expected) {
-            expect_eq!(
-                filter.eval_expr(expr, false),
-                *expect,
-                "{expr:#?} ({nullcount} nulls)"
-            );
+            expect_eq!(filter.eval(expr), *expect, "{expr:#?} ({nullcount} nulls)");
         }
     };
 

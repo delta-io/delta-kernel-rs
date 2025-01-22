@@ -259,7 +259,7 @@ impl Expression {
         Self::Literal(value.into())
     }
 
-    pub fn null_literal(data_type: DataType) -> Self {
+    pub const fn null_literal(data_type: DataType) -> Self {
         Self::Literal(Scalar::Null(data_type))
     }
 
