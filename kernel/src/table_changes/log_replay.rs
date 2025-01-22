@@ -183,15 +183,14 @@ fn process_cdf_commit(
         };
 
         visitor.visit_rows_of(actions.as_ref())?;
-        let has_metadata = visitor.metadata.is_some();
+        let metadata_changed = visitor.metadata.is_some();
         match (visitor.protocol, visitor.metadata) {
-            (None, None) => {}
-            (p, m) => {
-                let p = p.unwrap_or_else(|| table_configuration.protocol().clone());
-                let m = m.unwrap_or_else(|| table_configuration.metadata().clone());
+            (None, None) => {} // no change
+            (protocol, metadata) => {
+                // at least one of protocol and metadata changed, so update the table configuration
                 *table_configuration = TableConfiguration::try_new(
-                    m,
-                    p,
+                    metadata.unwrap_or_else(|| table_configuration.metadata().clone()),
+                    protocol.unwrap_or_else(|| table_configuration.protocol().clone()),
                     table_configuration.table_root().clone(),
                     commit_file.version,
                 )?;
@@ -200,7 +199,7 @@ fn process_cdf_commit(
                 }
             }
         }
-        if has_metadata {
+        if metadata_changed {
             require!(
                 table_schema.as_ref() == table_configuration.schema(),
                 Error::change_data_feed_incompatible_schema(
