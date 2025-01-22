@@ -13,9 +13,7 @@ use crate::actions::deletion_vector::{
 };
 use crate::actions::{get_log_add_schema, get_log_schema, ADD_NAME, REMOVE_NAME};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, ExpressionTransform, Scalar};
-use crate::predicates::parquet_stats_skipping::{
-    ParquetStatsProvider, ParquetStatsSkippingFilter as _,
-};
+use crate::predicates::{DefaultPredicateEvaluator, EmptyColumnResolver};
 use crate::scan::state::{DvInfo, Stats};
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
@@ -184,27 +182,10 @@ impl PhysicalPredicate {
 
 // Evaluates a static data skipping predicate, ignoring any column references, and returns true if
 // the predicate allows to statically skip all files. Since this is direct evaluation (not an
-// expression rewrite), we use a dummy `ParquetStatsProvider` that provides no stats.
+// expression rewrite), we use a `DefaultPredicateEvaluator` with an empty column resolver.
 fn can_statically_skip_all_files(predicate: &Expression) -> bool {
-    struct NoStats;
-    impl ParquetStatsProvider for NoStats {
-        fn get_parquet_min_stat(&self, _: &ColumnName, _: &DataType) -> Option<Scalar> {
-            None
-        }
-
-        fn get_parquet_max_stat(&self, _: &ColumnName, _: &DataType) -> Option<Scalar> {
-            None
-        }
-
-        fn get_parquet_nullcount_stat(&self, _: &ColumnName) -> Option<i64> {
-            None
-        }
-
-        fn get_parquet_rowcount_stat(&self) -> i64 {
-            0
-        }
-    }
-    NoStats.eval_sql_where(predicate) == Some(false)
+    use crate::predicates::PredicateEvaluator as _;
+    DefaultPredicateEvaluator::from(EmptyColumnResolver).eval_sql_where(predicate) == Some(false)
 }
 
 // Build the stats read schema filtering the table schema to keep only skipping-eligible
@@ -888,34 +869,32 @@ mod tests {
     #[test]
     fn test_physical_predicate() {
         let logical_schema = StructType::new(vec![
-            StructField::new("a", DataType::LONG, true),
-            StructField::new("b", DataType::LONG, true).with_metadata([(
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", DataType::LONG).with_metadata([(
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                 "phys_b",
             )]),
-            StructField::new("phys_b", DataType::LONG, true).with_metadata([(
+            StructField::nullable("phys_b", DataType::LONG).with_metadata([(
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                 "phys_c",
             )]),
-            StructField::new(
+            StructField::nullable(
                 "nested",
                 StructType::new(vec![
-                    StructField::new("x", DataType::LONG, true),
-                    StructField::new("y", DataType::LONG, true).with_metadata([(
+                    StructField::nullable("x", DataType::LONG),
+                    StructField::nullable("y", DataType::LONG).with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                         "phys_y",
                     )]),
                 ]),
-                true,
             ),
-            StructField::new(
+            StructField::nullable(
                 "mapped",
-                StructType::new(vec![StructField::new("n", DataType::LONG, true)
+                StructType::new(vec![StructField::nullable("n", DataType::LONG)
                     .with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                         "phys_n",
                     )])]),
-                true,
             )
             .with_metadata([(
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -936,14 +915,14 @@ mod tests {
                 column_expr!("a"),
                 Some(PhysicalPredicate::Some(
                     column_expr!("a").into(),
-                    StructType::new(vec![StructField::new("a", DataType::LONG, true)]).into(),
+                    StructType::new(vec![StructField::nullable("a", DataType::LONG)]).into(),
                 )),
             ),
             (
                 column_expr!("b"),
                 Some(PhysicalPredicate::Some(
                     column_expr!("phys_b").into(),
-                    StructType::new(vec![StructField::new("phys_b", DataType::LONG, true)
+                    StructType::new(vec![StructField::nullable("phys_b", DataType::LONG)
                         .with_metadata([(
                             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                             "phys_b",
@@ -955,10 +934,9 @@ mod tests {
                 column_expr!("nested.x"),
                 Some(PhysicalPredicate::Some(
                     column_expr!("nested.x").into(),
-                    StructType::new(vec![StructField::new(
+                    StructType::new(vec![StructField::nullable(
                         "nested",
-                        StructType::new(vec![StructField::new("x", DataType::LONG, true)]),
-                        true,
+                        StructType::new(vec![StructField::nullable("x", DataType::LONG)]),
                     )])
                     .into(),
                 )),
@@ -967,14 +945,13 @@ mod tests {
                 column_expr!("nested.y"),
                 Some(PhysicalPredicate::Some(
                     column_expr!("nested.phys_y").into(),
-                    StructType::new(vec![StructField::new(
+                    StructType::new(vec![StructField::nullable(
                         "nested",
-                        StructType::new(vec![StructField::new("phys_y", DataType::LONG, true)
+                        StructType::new(vec![StructField::nullable("phys_y", DataType::LONG)
                             .with_metadata([(
                                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                                 "phys_y",
                             )])]),
-                        true,
                     )])
                     .into(),
                 )),
@@ -983,14 +960,13 @@ mod tests {
                 column_expr!("mapped.n"),
                 Some(PhysicalPredicate::Some(
                     column_expr!("phys_mapped.phys_n").into(),
-                    StructType::new(vec![StructField::new(
+                    StructType::new(vec![StructField::nullable(
                         "phys_mapped",
-                        StructType::new(vec![StructField::new("phys_n", DataType::LONG, true)
+                        StructType::new(vec![StructField::nullable("phys_n", DataType::LONG)
                             .with_metadata([(
                                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                                 "phys_n",
                             )])]),
-                        true,
                     )
                     .with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -1003,14 +979,13 @@ mod tests {
                 Expression::and(column_expr!("mapped.n"), true),
                 Some(PhysicalPredicate::Some(
                     Expression::and(column_expr!("phys_mapped.phys_n"), true).into(),
-                    StructType::new(vec![StructField::new(
+                    StructType::new(vec![StructField::nullable(
                         "phys_mapped",
-                        StructType::new(vec![StructField::new("phys_n", DataType::LONG, true)
+                        StructType::new(vec![StructField::nullable("phys_n", DataType::LONG)
                             .with_metadata([(
                                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                                 "phys_n",
                             )])]),
-                        true,
                     )
                     .with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
