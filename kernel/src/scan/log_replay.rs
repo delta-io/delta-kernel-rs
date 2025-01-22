@@ -96,8 +96,8 @@ impl AddRemoveDedupVisitor<'_> {
                 TransformExpr::Partition(field_idx) => {
                     let field = self.logical_schema.fields.get_index(*field_idx);
                     let Some((_, field)) = field else {
-                        return Err(Error::generic(
-                            "logical schema did not contain expected field, can't transform data",
+                        return Err(Error::Generic(
+                            format!("logical schema did not contain expected field at {field_idx}, can't transform data")
                         ));
                     };
                     let name = field.physical_name();
