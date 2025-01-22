@@ -84,8 +84,8 @@ impl TableConfiguration {
     }
     /// The [`ColumnMappingMode`] for this table at this version.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    pub(crate) fn column_mapping_mode(&self) -> &ColumnMappingMode {
-        &self.column_mapping_mode
+    pub(crate) fn column_mapping_mode(&self) -> ColumnMappingMode {
+        self.column_mapping_mode
     }
     /// The [`Url`] of the table this [`TableConfiguration`] belongs to
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
@@ -112,7 +112,7 @@ impl TableConfiguration {
                 ensure_supported_features(reader_features, &CDF_SUPPORTED_READER_FEATURES).is_ok()
             }
             // if min_reader_version = 1 and there are no reader features => OK
-            None if self.protocol.min_reader_version() == 1 => true,
+            None => self.protocol.min_reader_version() == 1,
             // any other protocol is not supported
             _ => false,
         };

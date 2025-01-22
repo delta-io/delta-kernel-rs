@@ -121,7 +121,7 @@ impl Snapshot {
     /// mode](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping) at this
     /// `Snapshot`s version.
     pub(crate) fn column_mapping_mode(&self) -> ColumnMappingMode {
-        *self.table_configuration.column_mapping_mode()
+        self.table_configuration.column_mapping_mode()
     }
 
     /// Create a [`ScanBuilder`] for an `Arc<Snapshot>`.
