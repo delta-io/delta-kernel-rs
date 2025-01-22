@@ -414,13 +414,13 @@ pub(crate) trait PredicateEvaluator {
         }
     }
 
-    /// A convenient wrapper for [`eval_expr`].
+    /// A convenient non-inverted wrapper for [`eval_expr`]
     #[cfg(test)]
     fn eval(&self, expr: &Expr) -> Option<Self::Output> {
         self.eval_expr(expr, false)
     }
 
-    /// A convenient wrapper for [`eval_expr_sql_where`].
+    /// A convenient non-inverted wrapper for [`eval_expr_sql_where`].
     fn eval_sql_where(&self, expr: &Expr) -> Option<Self::Output> {
         self.eval_expr_sql_where(expr, false)
     }
