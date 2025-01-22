@@ -28,7 +28,7 @@ use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructTy
 ///     that element's (already-visited) children.
 ///  4. The [`visit_schema`] method returns the id of the list of top-level columns
 // WARNING: the visitor MUST NOT retain internal references to the string slices passed to visitor methods
-// TODO: struct nullability and field metadata
+// TODO: struct field metadata
 #[repr(C)]
 pub struct EngineSchemaVisitor {
     /// opaque state pointer
@@ -265,10 +265,7 @@ pub unsafe extern "C" fn visit_schema(
                 )
             }
             DataType::Array(at) => {
-                call!(
-                    visit_array,
-                    visit_array_item(visitor, at, at.contains_null)
-                )
+                call!(visit_array, visit_array_item(visitor, at, at.contains_null))
             }
             DataType::Primitive(PrimitiveType::Decimal(precision, scale)) => {
                 call!(visit_decimal, *precision, *scale)
