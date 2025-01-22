@@ -15,7 +15,7 @@
 //!     StructField::new("value", DataType::STRING, true),
 //!     StructField::new("year", DataType::INTEGER, true),
 //!  ]);
-//!  // Schemas are compatible since the `year` value is nullable
+//!  // Schemas are compatible since the `read_schema` adds a nullable column `year`
 //!  assert!(schema.can_read_as(&read_schema).is_ok());
 //!  ````
 //!
@@ -25,6 +25,12 @@ use std::collections::{HashMap, HashSet};
 use crate::utils::require;
 
 use super::{DataType, StructField, StructType};
+
+/// The nullability flag of a schema's field. This can be compared with a read schema field's
+/// nullability flag using [`Nullable::can_read_as`].
+#[allow(unused)]
+#[derive(Clone, Copy)]
+pub(crate) struct Nullable(bool);
 
 /// Represents the ways a schema comparison can fail.
 #[derive(Debug, thiserror::Error)]
@@ -49,20 +55,17 @@ pub(crate) type SchemaComparisonResult = Result<(), Error>;
 
 /// Represents a schema compatibility check for the type. If `self` can be read as `read_type`,
 /// this function returns `Ok(())`. Otherwise, this function returns `Err`.
+///
+/// TODO (Oussama): Remove the `allow(unsued)` once this is used in CDF.
 #[allow(unused)]
 pub(crate) trait SchemaComparison {
     fn can_read_as(&self, read_type: &Self) -> SchemaComparisonResult;
 }
 
-/// The nullability flag of a schema's field. This can be compared with a read schema field's
-/// nullability flag using [`NullabilityFlag::can_read_as`].
-#[allow(unused)]
-pub(crate) struct NullabilityFlag(bool);
-
-impl SchemaComparison for NullabilityFlag {
+impl SchemaComparison for Nullable {
     /// Represents a nullability comparison between two schemas' fields. Returns true if the
     /// read nullability is the same or wider than the nullability of self.
-    fn can_read_as(&self, read_nullable: &NullabilityFlag) -> SchemaComparisonResult {
+    fn can_read_as(&self, read_nullable: &Nullable) -> SchemaComparisonResult {
         // The case to avoid is when the column is nullable, but the read schema specifies the
         // column as non-nullable. So we avoid the case where !read_nullable && nullable
         // Hence we check that !(!read_nullable && existing_nullable)
@@ -79,7 +82,7 @@ impl SchemaComparison for StructField {
     ///     2. The both this field and `read_field` must have the same name.
     ///     3. You can read this data type as the `read_field`'s data type.
     fn can_read_as(&self, read_field: &Self) -> SchemaComparisonResult {
-        NullabilityFlag(self.nullable).can_read_as(&NullabilityFlag(read_field.nullable))?;
+        Nullable(self.nullable).can_read_as(&Nullable(read_field.nullable))?;
         require!(self.name() == read_field.name(), Error::FieldNameMismatch);
         self.data_type().can_read_as(read_field.data_type())?;
         Ok(())
@@ -113,9 +116,9 @@ impl SchemaComparison for StructType {
         );
 
         // Check that the field names are a subset of the read fields.
-        if !lowercase_field_map
+        if lowercase_field_map
             .keys()
-            .all(|name| lowercase_read_field_names.contains(name))
+            .any(|name| !lowercase_read_field_names.contains(name))
         {
             return Err(Error::MissingColumn);
         }
@@ -123,8 +126,8 @@ impl SchemaComparison for StructType {
             match lowercase_field_map.get(&read_field.name().to_lowercase()) {
                 Some(existing_field) => existing_field.can_read_as(read_field)?,
                 None => {
-                    // Note: Delta spark does not perform the following check. Hence it ignores fields
-                    // that exist in the read schema that aren't in this schema.
+                    // Note: Delta spark does not perform the following check. Hence it ignores
+                    // non-null fields that exist in the read schema that aren't in this schema.
                     require!(read_field.is_nullable(), Error::NewNonNullableColumn);
                 }
             }
@@ -139,14 +142,14 @@ impl SchemaComparison for DataType {
     ///        compatible data types with type widening. See issue [`#623`]
     ///     2. For complex data types, the nested types must be compatible as defined by [`SchemaComparison`]
     ///     3. For array data types, the nullability may not be tightened in the `read_type`. See
-    ///        [`NullabilityFlag::can_read_as`]
+    ///        [`Nullable::can_read_as`]
     ///
     /// [`#623`]: <https://github.com/delta-io/delta-kernel-rs/issues/623>
     fn can_read_as(&self, read_type: &Self) -> SchemaComparisonResult {
         match (self, read_type) {
             (Self::Array(self_array), Self::Array(read_array)) => {
-                NullabilityFlag(self_array.contains_null())
-                    .can_read_as(&NullabilityFlag(read_array.contains_null()))?;
+                Nullable(self_array.contains_null())
+                    .can_read_as(&Nullable(read_array.contains_null()))?;
                 self_array
                     .element_type()
                     .can_read_as(read_array.element_type())?;
@@ -155,8 +158,8 @@ impl SchemaComparison for DataType {
                 self_struct.can_read_as(read_struct)?
             }
             (Self::Map(self_map), Self::Map(read_map)) => {
-                NullabilityFlag(self_map.value_contains_null())
-                    .can_read_as(&NullabilityFlag(read_map.value_contains_null()))?;
+                Nullable(self_map.value_contains_null())
+                    .can_read_as(&Nullable(read_map.value_contains_null()))?;
                 self_map.key_type().can_read_as(read_map.key_type())?;
                 self_map.value_type().can_read_as(read_map.value_type())?;
             }
@@ -172,7 +175,7 @@ impl SchemaComparison for DataType {
 
 #[cfg(test)]
 mod tests {
-    use crate::schema::schema_compare::{Error, SchemaComparison};
+    use crate::schema::compare::{Error, SchemaComparison};
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
     #[test]
