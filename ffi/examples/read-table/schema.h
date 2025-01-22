@@ -2,7 +2,6 @@
 #include "read_table.h"
 #include "kernel_utils.h"
 #include <stdint.h>
-#include <time.h>
 
 /**
  * This module defines a very simple model of a schema, used only to be able to print the schema of
@@ -123,13 +122,11 @@ void visit_array(
   uintptr_t sibling_list_id,
   struct KernelStringSlice name,
   bool is_nullable,
-  bool contains_null,
   uintptr_t child_list_id)
 {
   SchemaBuilder* builder = data;
   char* name_ptr = malloc(sizeof(char) * (name.len + 24));
   snprintf(name_ptr, name.len + 1, "%s", name.ptr);
-  snprintf(name_ptr + name.len, 24, " (contains null: %s)", contains_null ? "true" : "false");
   PRINT_CHILD_VISIT("array", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* array_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "array", is_nullable);
   array_item->children = child_list_id;
@@ -139,13 +136,11 @@ void visit_map(
   uintptr_t sibling_list_id,
   struct KernelStringSlice name,
   bool is_nullable,
-  bool value_contains_null,
   uintptr_t child_list_id)
 {
   SchemaBuilder* builder = data;
   char* name_ptr = malloc(sizeof(char) * (name.len + 24));
   snprintf(name_ptr, name.len + 1, "%s", name.ptr);
-  snprintf(name_ptr + name.len, 24, " (contains null: %s)", value_contains_null ? "true" : "false");
   PRINT_CHILD_VISIT("map", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* map_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "map", is_nullable);
   map_item->children = child_list_id;

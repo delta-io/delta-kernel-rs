@@ -54,7 +54,6 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        contains_null: bool, // if this array can contain null values
         child_list_id: usize,
     ),
 
@@ -66,7 +65,6 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
-        value_contains_null: bool, // if this map can contain null values
         child_list_id: usize,
     ),
 
@@ -263,17 +261,12 @@ pub unsafe extern "C" fn visit_schema(
             DataType::Map(mt) => {
                 call!(
                     visit_map,
-                    // TODO: Should we no longer support value_contains_null argument in visitor_map
-                    // if nullability of the value will anyway be known through simple type visitor?
-                    // Same for contains_null in visitor_array.
-                    mt.value_contains_null,
                     visit_map_types(visitor, mt, mt.value_contains_null)
                 )
             }
             DataType::Array(at) => {
                 call!(
                     visit_array,
-                    at.contains_null,
                     visit_array_item(visitor, at, at.contains_null)
                 )
             }
