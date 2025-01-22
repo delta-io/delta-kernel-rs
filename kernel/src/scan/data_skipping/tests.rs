@@ -319,16 +319,17 @@ fn test_sql_where() {
     do_test(ALL_NULL, expr, MISSING, None, None);
 
     // Comparison inside AND works
-    let expr = &Expr::and(NULL, Expr::lt(col.clone(), VAL));
-    do_test(ALL_NULL, expr, PRESENT, None, Some(false));
-    do_test(ALL_NULL, expr, MISSING, None, None);
-
     let expr = &Expr::and(TRUE, Expr::lt(VAL, col.clone()));
     do_test(ALL_NULL, expr, PRESENT, None, Some(false));
     do_test(ALL_NULL, expr, MISSING, None, None);
 
+    // NULL inside AND allows static skipping under SQL semantics
+    let expr = &Expr::and(NULL, Expr::lt(col.clone(), VAL));
+    do_test(ALL_NULL, expr, PRESENT, None, Some(false));
+    do_test(ALL_NULL, expr, MISSING, None, Some(false));
+
     // Comparison inside AND inside AND works
-    let expr = &Expr::and(TRUE, Expr::and(NULL, Expr::lt(col.clone(), VAL)));
+    let expr = &Expr::and(TRUE, Expr::and(TRUE, Expr::lt(col.clone(), VAL)));
     do_test(ALL_NULL, expr, PRESENT, None, Some(false));
     do_test(ALL_NULL, expr, MISSING, None, None);
 
