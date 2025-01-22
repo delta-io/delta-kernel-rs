@@ -386,8 +386,30 @@ pub(crate) trait PredicateEvaluator {
                 ];
                 self.finish_eval_variadic(VariadicOperator::And, exprs, false)
             }
-            // NOTE: It's unsafe to process other expressions like DISTINCT, IS NULL, and literals
-            // with null-safe semantics, so just process them normally.
+            Literal(val) if val.is_null() => {
+                // AND(NULL IS NOT NULL, NULL) = AND(FALSE, NULL) = FALSE
+                self.eval_scalar(&Scalar::from(false), false)
+            }
+            // Process all remaining expressions normally, because they are not proven safe. Indeed,
+            // expressions like DISTINCT and IS [NOT] NULL are known-unsafe under SQL semantics:
+            //
+            // ```
+            // x IS NULL    # when x really is NULL
+            // = AND(x IS NOT NULL, x IS NULL)
+            // = AND(FALSE, TRUE)
+            // = FALSE
+            //
+            // DISTINCT(x, 10)  # when x is NULL
+            // = AND(x IS NOT NULL, 10 IS NOT NULL, DISTINCT(x, 10))
+            // = AND(FALSE, TRUE, TRUE)
+            // = FALSE
+            //
+            // DISTINCT(x, NULL) # when x is not NULL
+            // = AND(x IS NOT NULL, NULL IS NOT NULL, DISTINCT(x, NULL))
+            // = AND(TRUE, FALSE, TRUE)
+            // = FALSE
+            // ```
+            //
             _ => self.eval_expr(filter, inverted),
         }
     }

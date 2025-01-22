@@ -776,17 +776,19 @@ mod tests {
 
     #[test]
     fn test_static_skipping() {
+        const NULL: Expression = Expression::null_literal(DataType::BOOLEAN);
         let test_cases = [
             (false, column_expr!("a")),
             (true, Expression::literal(false)),
             (false, Expression::literal(true)),
-            (false, Expression::null_literal(DataType::LONG)),
+            (true, NULL),
             (true, Expression::and(column_expr!("a"), false)),
             (false, Expression::or(column_expr!("a"), true)),
             (false, Expression::or(column_expr!("a"), false)),
             (false, Expression::lt(column_expr!("a"), 10)),
             (false, Expression::lt(Expression::literal(10), 100)),
             (true, Expression::gt(Expression::literal(10), 100)),
+            (true, Expression::and(NULL, column_expr!("a"))),
         ];
         for (should_skip, predicate) in test_cases {
             assert_eq!(
