@@ -1,4 +1,6 @@
-//! Provides a high level api to check feature support/enablement for a table.
+//! This module defines [`TableConfiguration`], a high level api to check feature support/enablement for a table.
+//! This encapsulates [`Protocol`], [`Metadata`], and extracts the [`TableProperties`] and [`ColumnMappingMode`].
+//! Protocol and Metadata are deeply intertwined when dealing with table features and
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
@@ -43,8 +45,6 @@ impl TableConfiguration {
         table_root: Url,
         version: Version,
     ) -> DeltaResult<Self> {
-        protocol.ensure_read_supported()?;
-
         let schema = Arc::new(metadata.parse_schema()?);
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
@@ -98,7 +98,15 @@ impl TableConfiguration {
         self.version
     }
 
-    /// Ensures that kernel supports reading Change Data Feed on this table and that it is enabled.
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn is_write_supported(&self) -> bool {
+        self.protocol.ensure_write_supported().is_ok()
+    }
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn is_read_supported(&self) -> bool {
+        self.protocol.ensure_read_supported().is_ok()
+    }
+    /// Returns `true` if kernel supports reading Change Data Feed on this table.
     /// See the documentation of [`TableChanges`] for more details.
     ///
     /// [`TableChanges`]: crate::table_changes::TableChanges
@@ -234,8 +242,8 @@ mod test {
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        TableConfiguration::try_new(metadata, protocol, table_root, 0)
-            .expect_err("V2Checkpoints is not currently supported");
+        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        assert!(!config.is_read_supported())
     }
     #[test]
     fn dv_not_supported() {

@@ -12,6 +12,7 @@ use crate::scan::ScanBuilder;
 use crate::schema::Schema;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
+use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, Error, FileSystemClient, Version};
 
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
@@ -75,6 +76,11 @@ impl Snapshot {
         let (metadata, protocol) = log_segment.read_metadata(engine)?;
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
+        if !table_configuration.is_read_supported() {
+            return Err(Error::internal_error(
+                "Reading is not supported on this table",
+            ));
+        }
         Ok(Self {
             log_segment,
             table_configuration,
@@ -111,16 +117,19 @@ impl Snapshot {
         self.table_configuration.protocol()
     }
 
+    /// Get the [`TableProperties`] for this [`Snapshot`].
+    pub fn table_properties(&self) -> &TableProperties {
+        self.table_configuration().table_properties()
+    }
     /// Get the [`TableConfiguration`] for this [`Snapshot`].
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn table_configuration(&self) -> &TableConfiguration {
         &self.table_configuration
     }
-
     /// Get the [column mapping
     /// mode](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping) at this
     /// `Snapshot`s version.
-    pub(crate) fn column_mapping_mode(&self) -> ColumnMappingMode {
+    pub fn column_mapping_mode(&self) -> ColumnMappingMode {
         self.table_configuration.column_mapping_mode()
     }
 
