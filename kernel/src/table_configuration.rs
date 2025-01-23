@@ -37,13 +37,21 @@ pub(crate) struct TableConfiguration {
 
 impl TableConfiguration {
     /// Constructs a [`TableConfiguration`] for a table located in `table_root` at `version`.
-    /// This validates that the [`Metadata`] and [`Protocol`] are compatible with one another.
+    /// This validates that the [`Metadata`] and [`Protocol`] are compatible with one another
+    /// and that the kernel supports reading from this table.
+    ///
+    /// Note: This only returns successfully kernel supports reading the table. It's important
+    /// to do this validation is done in `try_new` because all table accesses must first construct
+    /// the [`TableConfiguration`]. This ensures that developers never forget to check that kernel
+    /// supports reading the table, and that all table accesses are legal.
     pub(crate) fn try_new(
         metadata: Metadata,
         protocol: Protocol,
         table_root: Url,
         version: Version,
     ) -> DeltaResult<Self> {
+        protocol.ensure_read_supported()?;
+
         let schema = Arc::new(metadata.parse_schema()?);
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
@@ -102,12 +110,6 @@ impl TableConfiguration {
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn is_write_supported(&self) -> bool {
         self.protocol.ensure_write_supported().is_ok()
-    }
-    /// Returns `true` if the kernel supports reading from this table. This checks that the
-    /// protocol's reader features are all supported.
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    pub(crate) fn is_read_supported(&self) -> bool {
-        self.protocol.ensure_read_supported().is_ok()
     }
     /// Returns `true` if kernel supports reading Change Data Feed on this table.
     /// See the documentation of [`TableChanges`] for more details.
