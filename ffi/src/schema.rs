@@ -28,7 +28,7 @@ use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructTy
 ///     that element's (already-visited) children.
 ///  4. The [`visit_schema`] method returns the id of the list of top-level columns
 // WARNING: the visitor MUST NOT retain internal references to the string slices passed to visitor methods
-// TODO: struct nullability and field metadata
+// TODO: struct field metadata
 #[repr(C)]
 pub struct EngineSchemaVisitor {
     /// opaque state pointer
@@ -43,6 +43,7 @@ pub struct EngineSchemaVisitor {
         data: *mut c_void,
         sibling_list_id: usize,
         name: KernelStringSlice,
+        is_nullable: bool,
         child_list_id: usize,
     ),
 
@@ -52,7 +53,7 @@ pub struct EngineSchemaVisitor {
         data: *mut c_void,
         sibling_list_id: usize,
         name: KernelStringSlice,
-        contains_null: bool, // if this array can contain null values
+        is_nullable: bool,
         child_list_id: usize,
     ),
 
@@ -63,7 +64,7 @@ pub struct EngineSchemaVisitor {
         data: *mut c_void,
         sibling_list_id: usize,
         name: KernelStringSlice,
-        value_contains_null: bool, // if this map can contain null values
+        is_nullable: bool,
         child_list_id: usize,
     ),
 
@@ -72,57 +73,106 @@ pub struct EngineSchemaVisitor {
         data: *mut c_void,
         sibling_list_id: usize,
         name: KernelStringSlice,
+        is_nullable: bool,
         precision: u8,
         scale: u8,
     ),
 
     /// Visit a `string` belonging to the list identified by `sibling_list_id`.
-    pub visit_string:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    pub visit_string: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+    ),
 
     /// Visit a `long` belonging to the list identified by `sibling_list_id`.
-    pub visit_long:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    pub visit_long: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+    ),
 
     /// Visit an `integer` belonging to the list identified by `sibling_list_id`.
-    pub visit_integer:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    pub visit_integer: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+    ),
 
     /// Visit a `short` belonging to the list identified by `sibling_list_id`.
-    pub visit_short:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    pub visit_short: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+    ),
 
     /// Visit a `byte` belonging to the list identified by `sibling_list_id`.
-    pub visit_byte:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    pub visit_byte: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+    ),
 
     /// Visit a `float` belonging to the list identified by `sibling_list_id`.
-    pub visit_float:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    pub visit_float: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+    ),
 
     /// Visit a `double` belonging to the list identified by `sibling_list_id`.
-    pub visit_double:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    pub visit_double: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+    ),
 
     /// Visit a `boolean` belonging to the list identified by `sibling_list_id`.
-    pub visit_boolean:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    pub visit_boolean: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+    ),
 
     /// Visit `binary` belonging to the list identified by `sibling_list_id`.
-    pub visit_binary:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    pub visit_binary: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+    ),
 
     /// Visit a `date` belonging to the list identified by `sibling_list_id`.
-    pub visit_date:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    pub visit_date: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+    ),
 
     /// Visit a `timestamp` belonging to the list identified by `sibling_list_id`.
-    pub visit_timestamp:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    pub visit_timestamp: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+    ),
 
     /// Visit a `timestamp` with no timezone belonging to the list identified by `sibling_list_id`.
-    pub visit_timestamp_ntz:
-        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
+    pub visit_timestamp_ntz: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+    ),
 }
 
 /// Visit the schema of the passed `SnapshotHandle`, using the provided `visitor`. See the
@@ -143,28 +193,55 @@ pub unsafe extern "C" fn visit_schema(
     fn visit_struct_fields(visitor: &EngineSchemaVisitor, s: &StructType) -> usize {
         let child_list_id = (visitor.make_field_list)(visitor.data, s.fields.len());
         for field in s.fields() {
-            visit_schema_item(field.data_type(), field.name(), visitor, child_list_id);
+            visit_schema_item(
+                field.name(),
+                field.data_type(),
+                field.is_nullable(),
+                visitor,
+                child_list_id,
+            );
         }
         child_list_id
     }
 
-    fn visit_array_item(visitor: &EngineSchemaVisitor, at: &ArrayType) -> usize {
+    fn visit_array_item(
+        visitor: &EngineSchemaVisitor,
+        at: &ArrayType,
+        contains_null: bool,
+    ) -> usize {
         let child_list_id = (visitor.make_field_list)(visitor.data, 1);
-        visit_schema_item(&at.element_type, "array_element", visitor, child_list_id);
+        visit_schema_item(
+            "array_element",
+            &at.element_type,
+            contains_null,
+            visitor,
+            child_list_id,
+        );
         child_list_id
     }
 
-    fn visit_map_types(visitor: &EngineSchemaVisitor, mt: &MapType) -> usize {
+    fn visit_map_types(
+        visitor: &EngineSchemaVisitor,
+        mt: &MapType,
+        value_contains_null: bool,
+    ) -> usize {
         let child_list_id = (visitor.make_field_list)(visitor.data, 2);
-        visit_schema_item(&mt.key_type, "map_key", visitor, child_list_id);
-        visit_schema_item(&mt.value_type, "map_value", visitor, child_list_id);
+        visit_schema_item("map_key", &mt.key_type, false, visitor, child_list_id);
+        visit_schema_item(
+            "map_value",
+            &mt.value_type,
+            value_contains_null,
+            visitor,
+            child_list_id,
+        );
         child_list_id
     }
 
     // Visit a struct field (recursively) and add the result to the list of siblings.
     fn visit_schema_item(
-        data_type: &DataType,
         name: &str,
+        data_type: &DataType,
+        is_nullable: bool,
         visitor: &EngineSchemaVisitor,
         sibling_list_id: usize,
     ) {
@@ -173,7 +250,8 @@ pub unsafe extern "C" fn visit_schema(
                 (visitor.$visitor_fn)(
                     visitor.data,
                     sibling_list_id,
-                    kernel_string_slice!(name)
+                    kernel_string_slice!(name),
+                    is_nullable
                     $(, $extra_args) *
                 )
             };
@@ -183,12 +261,11 @@ pub unsafe extern "C" fn visit_schema(
             DataType::Map(mt) => {
                 call!(
                     visit_map,
-                    mt.value_contains_null,
-                    visit_map_types(visitor, mt)
+                    visit_map_types(visitor, mt, mt.value_contains_null)
                 )
             }
             DataType::Array(at) => {
-                call!(visit_array, at.contains_null, visit_array_item(visitor, at))
+                call!(visit_array, visit_array_item(visitor, at, at.contains_null))
             }
             DataType::Primitive(PrimitiveType::Decimal(precision, scale)) => {
                 call!(visit_decimal, *precision, *scale)
