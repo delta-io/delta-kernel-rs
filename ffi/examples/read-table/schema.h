@@ -85,7 +85,7 @@ void print_list(SchemaBuilder* builder, uintptr_t list_id, int indent, int paren
   }
 }
 
-void print_metadata(const char *name, const CStringMap* metadata)
+void print_physical_name(const char *name, const CStringMap* metadata)
 {
 #ifdef VERBOSE
   char* key_str = "delta.columnMapping.physicalName";
@@ -98,6 +98,7 @@ void print_metadata(const char *name, const CStringMap* metadata)
     printf("No physical name\n");
   }
 #else
+  (void)name;
   (void)metadata;
 #endif
 }
@@ -132,7 +133,7 @@ void visit_struct(
   SchemaBuilder* builder = data;
   char* name_ptr = allocate_string(name);
   PRINT_CHILD_VISIT("struct", name_ptr, sibling_list_id, "Children", child_list_id);
-  print_metadata(name_ptr, metadata);
+  print_physical_name(name_ptr, metadata);
   SchemaItem* struct_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "struct", is_nullable);
   struct_item->children = child_list_id;
 }
@@ -149,7 +150,7 @@ void visit_array(
   char* name_ptr = malloc(sizeof(char) * (name.len + 22));
   snprintf(name_ptr, name.len + 1, "%s", name.ptr);
   snprintf(name_ptr + name.len, 22, " (is nullable: %s)", is_nullable ? "true" : "false");
-  print_metadata(name_ptr, metadata);
+  print_physical_name(name_ptr, metadata);
   PRINT_CHILD_VISIT("array", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* array_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "array", is_nullable);
   array_item->children = child_list_id;
@@ -167,7 +168,7 @@ void visit_map(
   char* name_ptr = malloc(sizeof(char) * (name.len + 22));
   snprintf(name_ptr, name.len + 1, "%s", name.ptr);
   snprintf(name_ptr + name.len, 22, " (is nullable: %s)", is_nullable ? "true" : "false");
-  print_metadata(name_ptr, metadata);
+  print_physical_name(name_ptr, metadata);
   PRINT_CHILD_VISIT("map", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* map_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "map", is_nullable);
   map_item->children = child_list_id;
@@ -186,7 +187,7 @@ void visit_decimal(
   char* name_ptr = allocate_string(name);
   char* type = malloc(19 * sizeof(char));
   snprintf(type, 19, "decimal(%u)(%d)", precision, scale);
-  print_metadata(name_ptr, metadata);
+  print_physical_name(name_ptr, metadata);
   PRINT_NO_CHILD_VISIT(type, name_ptr, sibling_list_id);
   add_to_list(&builder->lists[sibling_list_id], name_ptr, type, is_nullable);
 }
@@ -201,7 +202,7 @@ void visit_simple_type(
 {
   SchemaBuilder* builder = data;
   char* name_ptr = allocate_string(name);
-  print_metadata(name_ptr, metadata);
+  print_physical_name(name_ptr, metadata);
   PRINT_NO_CHILD_VISIT(type, name_ptr, sibling_list_id);
   add_to_list(&builder->lists[sibling_list_id], name_ptr, type, is_nullable);
 }
