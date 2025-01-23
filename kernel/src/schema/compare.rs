@@ -28,7 +28,6 @@ use super::{DataType, StructField, StructType};
 
 /// The nullability flag of a schema's field. This can be compared with a read schema field's
 /// nullability flag using [`Nullable::can_read_as`].
-#[allow(unused)]
 #[derive(Clone, Copy)]
 pub(crate) struct Nullable(bool);
 
@@ -50,14 +49,10 @@ pub(crate) enum Error {
 }
 
 /// A [`std::result::Result`] that has the schema comparison [`Error`] as the error variant.
-#[allow(unused)]
 pub(crate) type SchemaComparisonResult = Result<(), Error>;
 
 /// Represents a schema compatibility check for the type. If `self` can be read as `read_type`,
 /// this function returns `Ok(())`. Otherwise, this function returns `Err`.
-///
-/// TODO (Oussama): Remove the `allow(unsued)` once this is used in CDF.
-#[allow(unused)]
 pub(crate) trait SchemaComparison {
     fn can_read_as(&self, read_type: &Self) -> SchemaComparisonResult;
 }
