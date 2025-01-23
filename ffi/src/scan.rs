@@ -270,7 +270,7 @@ type CScanCallback = extern "C" fn(
 );
 
 pub struct CStringMap {
-    values: HashMap<String, String>,
+    pub values: HashMap<String, String>,
 }
 
 #[no_mangle]

@@ -1,7 +1,9 @@
 use std::os::raw::c_void;
 
+use crate::scan::CStringMap;
 use crate::{handle::Handle, kernel_string_slice, KernelStringSlice, SharedSnapshot};
 use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
+
 /// The `EngineSchemaVisitor` defines a visitor system to allow engines to build their own
 /// representation of a schema from a particular schema within kernel.
 ///
@@ -28,7 +30,6 @@ use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructTy
 ///     that element's (already-visited) children.
 ///  4. The [`visit_schema`] method returns the id of the list of top-level columns
 // WARNING: the visitor MUST NOT retain internal references to the string slices passed to visitor methods
-// TODO: struct field metadata
 #[repr(C)]
 pub struct EngineSchemaVisitor {
     /// opaque state pointer
@@ -44,6 +45,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
+        metadata: &CStringMap,
         child_list_id: usize,
     ),
 
@@ -54,6 +56,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
+        metadata: &CStringMap,
         child_list_id: usize,
     ),
 
@@ -65,6 +68,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
+        metadata: &CStringMap,
         child_list_id: usize,
     ),
 
@@ -74,6 +78,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
+        metadata: &CStringMap,
         precision: u8,
         scale: u8,
     ),
@@ -84,6 +89,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
+        metadata: &CStringMap,
     ),
 
     /// Visit a `long` belonging to the list identified by `sibling_list_id`.
@@ -92,6 +98,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
+        metadata: &CStringMap,
     ),
 
     /// Visit an `integer` belonging to the list identified by `sibling_list_id`.
@@ -100,6 +107,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
+        metadata: &CStringMap,
     ),
 
     /// Visit a `short` belonging to the list identified by `sibling_list_id`.
@@ -108,6 +116,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
+        metadata: &CStringMap,
     ),
 
     /// Visit a `byte` belonging to the list identified by `sibling_list_id`.
@@ -116,6 +125,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
+        metadata: &CStringMap,
     ),
 
     /// Visit a `float` belonging to the list identified by `sibling_list_id`.
@@ -124,6 +134,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
+        metadata: &CStringMap,
     ),
 
     /// Visit a `double` belonging to the list identified by `sibling_list_id`.
@@ -132,6 +143,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
+        metadata: &CStringMap,
     ),
 
     /// Visit a `boolean` belonging to the list identified by `sibling_list_id`.
@@ -140,6 +152,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
+        metadata: &CStringMap,
     ),
 
     /// Visit `binary` belonging to the list identified by `sibling_list_id`.
@@ -148,6 +161,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
+        metadata: &CStringMap,
     ),
 
     /// Visit a `date` belonging to the list identified by `sibling_list_id`.
@@ -156,6 +170,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
+        metadata: &CStringMap,
     ),
 
     /// Visit a `timestamp` belonging to the list identified by `sibling_list_id`.
@@ -164,6 +179,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
+        metadata: &CStringMap,
     ),
 
     /// Visit a `timestamp` with no timezone belonging to the list identified by `sibling_list_id`.
@@ -172,6 +188,7 @@ pub struct EngineSchemaVisitor {
         sibling_list_id: usize,
         name: KernelStringSlice,
         is_nullable: bool,
+        metadata: &CStringMap,
     ),
 }
 
@@ -193,10 +210,14 @@ pub unsafe extern "C" fn visit_schema(
     fn visit_struct_fields(visitor: &EngineSchemaVisitor, s: &StructType) -> usize {
         let child_list_id = (visitor.make_field_list)(visitor.data, s.fields.len());
         for field in s.fields() {
+            let metadata = CStringMap {
+                values: field.metadata_with_string_values(),
+            };
             visit_schema_item(
                 field.name(),
                 field.data_type(),
                 field.is_nullable(),
+                &metadata,
                 visitor,
                 child_list_id,
             );
@@ -208,12 +229,14 @@ pub unsafe extern "C" fn visit_schema(
         visitor: &EngineSchemaVisitor,
         at: &ArrayType,
         contains_null: bool,
+        metadata: &CStringMap,
     ) -> usize {
         let child_list_id = (visitor.make_field_list)(visitor.data, 1);
         visit_schema_item(
             "array_element",
             &at.element_type,
             contains_null,
+            metadata,
             visitor,
             child_list_id,
         );
@@ -224,13 +247,22 @@ pub unsafe extern "C" fn visit_schema(
         visitor: &EngineSchemaVisitor,
         mt: &MapType,
         value_contains_null: bool,
+        metadata: &CStringMap,
     ) -> usize {
         let child_list_id = (visitor.make_field_list)(visitor.data, 2);
-        visit_schema_item("map_key", &mt.key_type, false, visitor, child_list_id);
+        visit_schema_item(
+            "map_key",
+            &mt.key_type,
+            false,
+            metadata,
+            visitor,
+            child_list_id,
+        );
         visit_schema_item(
             "map_value",
             &mt.value_type,
             value_contains_null,
+            metadata,
             visitor,
             child_list_id,
         );
@@ -242,6 +274,7 @@ pub unsafe extern "C" fn visit_schema(
         name: &str,
         data_type: &DataType,
         is_nullable: bool,
+        metadata: &CStringMap,
         visitor: &EngineSchemaVisitor,
         sibling_list_id: usize,
     ) {
@@ -251,7 +284,8 @@ pub unsafe extern "C" fn visit_schema(
                     visitor.data,
                     sibling_list_id,
                     kernel_string_slice!(name),
-                    is_nullable
+                    is_nullable,
+                    metadata
                     $(, $extra_args) *
                 )
             };
@@ -261,11 +295,14 @@ pub unsafe extern "C" fn visit_schema(
             DataType::Map(mt) => {
                 call!(
                     visit_map,
-                    visit_map_types(visitor, mt, mt.value_contains_null)
+                    visit_map_types(visitor, mt, mt.value_contains_null, metadata)
                 )
             }
             DataType::Array(at) => {
-                call!(visit_array, visit_array_item(visitor, at, at.contains_null))
+                call!(
+                    visit_array,
+                    visit_array_item(visitor, at, at.contains_null, metadata)
+                )
             }
             DataType::Primitive(PrimitiveType::Decimal(precision, scale)) => {
                 call!(visit_decimal, *precision, *scale)
