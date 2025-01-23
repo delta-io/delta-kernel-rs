@@ -14,6 +14,8 @@ pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
+pub(crate) mod compare;
+
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
 
