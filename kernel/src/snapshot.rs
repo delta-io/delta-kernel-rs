@@ -76,11 +76,6 @@ impl Snapshot {
         let (metadata, protocol) = log_segment.read_metadata(engine)?;
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
-        if !table_configuration.is_read_supported() {
-            return Err(Error::internal_error(
-                "Reading is not supported on this table",
-            ));
-        }
         Ok(Self {
             log_segment,
             table_configuration,

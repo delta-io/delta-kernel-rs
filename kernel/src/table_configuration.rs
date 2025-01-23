@@ -137,7 +137,7 @@ impl TableConfiguration {
             self.table_properties.column_mapping_mode,
             None | Some(ColumnMappingMode::None)
         );
-        self.is_read_supported() && protocol_supported && cdf_enabled && column_mapping_disabled
+        protocol_supported && cdf_enabled && column_mapping_disabled
     }
     /// Returns `true` if deletion vectors is supported on this table. To support deletion vectors,
     /// a table must support reader version 3, writer version 7, and the deletionVectors feature in
@@ -247,8 +247,8 @@ mod test {
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
-        assert!(!config.is_read_supported())
+        TableConfiguration::try_new(metadata, protocol, table_root, 0)
+            .expect_err("V2 checkpoint is not supported in kernel");
     }
     #[test]
     fn dv_not_supported() {
