@@ -230,7 +230,7 @@ fn kernel_scan_data_next_impl(
         .data
         .lock()
         .map_err(|_| Error::generic("poisoned mutex"))?;
-    if let Some((data, sel_vec)) = data.next().transpose()? {
+    if let Some((data, sel_vec, _transforms)) = data.next().transpose()? {
         let bool_slice = KernelBoolSlice::from(sel_vec);
         (engine_visitor)(engine_context, data.into(), bool_slice);
         Ok(true)

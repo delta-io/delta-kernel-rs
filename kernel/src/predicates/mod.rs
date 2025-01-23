@@ -252,7 +252,7 @@ pub(crate) trait PredicateEvaluator {
         }
     }
 
-    /// Evaluates a predicate with SQL WHERE semantics.
+    /// Evaluates a (possibly inverted) predicate with SQL WHERE semantics.
     ///
     /// By default, [`eval_expr`] behaves badly for comparisons involving NULL columns (e.g. `a <
     /// 10` when `a` is NULL), because the comparison correctly evaluates to NULL, but NULL
@@ -351,25 +351,78 @@ pub(crate) trait PredicateEvaluator {
     /// AND(..., AND(NULL, TRUE, NULL), ...)
     /// AND(..., NULL, ...)
     /// ```
-    fn eval_sql_where(&self, filter: &Expr) -> Option<Self::Output> {
-        use Expr::{Binary, Variadic};
+    ///
+    /// WARNING: Not an idempotent transform. If data skipping eval produces a sql predicate,
+    /// evaluating the result with sql semantics has undefined behavior.
+    fn eval_expr_sql_where(&self, filter: &Expr, inverted: bool) -> Option<Self::Output> {
+        use Expr::*;
         match filter {
             Variadic(v) => {
-                // Recursively invoke `eval_sql_where` instead of the usual `eval_expr` for AND/OR.
-                let exprs = v.exprs.iter().map(|expr| self.eval_sql_where(expr));
-                self.finish_eval_variadic(v.op, exprs, false)
+                // Recursively invoke `eval_expr_sql_where` instead of the usual `eval_expr` for AND/OR.
+                let exprs = v
+                    .exprs
+                    .iter()
+                    .map(|expr| self.eval_expr_sql_where(expr, inverted));
+                self.finish_eval_variadic(v.op, exprs, inverted)
             }
             Binary(BinaryExpression { op, left, right }) if op.is_null_intolerant_comparison() => {
                 // Perform a nullsafe comparison instead of the usual `eval_binary`
                 let exprs = [
                     self.eval_unary(UnaryOperator::IsNull, left, true),
                     self.eval_unary(UnaryOperator::IsNull, right, true),
-                    self.eval_binary(*op, left, right, false),
+                    self.eval_binary(*op, left, right, inverted),
                 ];
                 self.finish_eval_variadic(VariadicOperator::And, exprs, false)
             }
-            _ => self.eval_expr(filter, false),
+            Unary(UnaryExpression {
+                op: UnaryOperator::Not,
+                expr,
+            }) => self.eval_expr_sql_where(expr, !inverted),
+            Column(col) => {
+                // Perform a nullsafe comparison instead of the usual `eval_column`
+                let exprs = [
+                    self.eval_unary(UnaryOperator::IsNull, filter, true),
+                    self.eval_column(col, inverted),
+                ];
+                self.finish_eval_variadic(VariadicOperator::And, exprs, false)
+            }
+            Literal(val) if val.is_null() => {
+                // AND(NULL IS NOT NULL, NULL) = AND(FALSE, NULL) = FALSE
+                self.eval_scalar(&Scalar::from(false), false)
+            }
+            // Process all remaining expressions normally, because they are not proven safe. Indeed,
+            // expressions like DISTINCT and IS [NOT] NULL are known-unsafe under SQL semantics:
+            //
+            // ```
+            // x IS NULL    # when x really is NULL
+            // = AND(x IS NOT NULL, x IS NULL)
+            // = AND(FALSE, TRUE)
+            // = FALSE
+            //
+            // DISTINCT(x, 10)  # when x is NULL
+            // = AND(x IS NOT NULL, 10 IS NOT NULL, DISTINCT(x, 10))
+            // = AND(FALSE, TRUE, TRUE)
+            // = FALSE
+            //
+            // DISTINCT(x, NULL) # when x is not NULL
+            // = AND(x IS NOT NULL, NULL IS NOT NULL, DISTINCT(x, NULL))
+            // = AND(TRUE, FALSE, TRUE)
+            // = FALSE
+            // ```
+            //
+            _ => self.eval_expr(filter, inverted),
         }
+    }
+
+    /// A convenient non-inverted wrapper for [`eval_expr`]
+    #[cfg(test)]
+    fn eval(&self, expr: &Expr) -> Option<Self::Output> {
+        self.eval_expr(expr, false)
+    }
+
+    /// A convenient non-inverted wrapper for [`eval_expr_sql_where`].
+    fn eval_sql_where(&self, expr: &Expr) -> Option<Self::Output> {
+        self.eval_expr_sql_where(expr, false)
     }
 }
 

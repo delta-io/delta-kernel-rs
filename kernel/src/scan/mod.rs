@@ -301,7 +301,20 @@ pub enum ColumnType {
     Partition(usize),
 }
 
-pub type ScanData = (Box<dyn EngineData>, Vec<bool>);
+/// A transform is ultimately a `Struct` expr. This holds the set of expressions that make that struct expr up
+type Transform = Vec<TransformExpr>;
+
+/// Transforms aren't computed all at once. So static ones can just go straight to `Expression`, but
+/// things like partition columns need to filled in. This enum holds an expression that's part of a
+/// `Transform`.
+pub(crate) enum TransformExpr {
+    Static(Expression),
+    Partition(usize),
+}
+
+// TODO(nick): Make this a struct in a follow-on PR
+// (data, deletion_vec, transforms)
+pub type ScanData = (Box<dyn EngineData>, Vec<bool>, Vec<Option<ExpressionRef>>);
 
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
@@ -340,6 +353,21 @@ impl Scan {
         }
     }
 
+    /// Convert the parts of the transform that can be computed statically into `Expression`s. For
+    /// parts that cannot be computed statically, include enough metadata so lower levels of
+    /// processing can create and fill in an expression.
+    fn get_static_transform(all_fields: &[ColumnType]) -> Transform {
+        all_fields
+            .iter()
+            .map(|field| match field {
+                ColumnType::Selected(col_name) => {
+                    TransformExpr::Static(ColumnName::new([col_name]).into())
+                }
+                ColumnType::Partition(idx) => TransformExpr::Partition(*idx),
+            })
+            .collect()
+    }
+
     /// Get an iterator of [`EngineData`]s that should be included in scan for a query. This handles
     /// log-replay, reconciling Add and Remove actions, and applying data skipping (if
     /// possible). Each item in the returned iterator is a tuple of:
@@ -352,11 +380,23 @@ impl Scan {
     ///   the query. NB: If you are using the default engine and plan to call arrow's
     ///   `filter_record_batch`, you _need_ to extend this vector to the full length of the batch or
     ///   arrow will drop the extra rows.
+    /// - `Vec<Option<Expression>>`: Transformation expressions that need to be applied. For each
+    ///    row at index `i` in the above data, if an expression exists at index `i` in the `Vec`,
+    ///    the associated expression _must_ be applied to the data read from the file specified by
+    ///    the row. The resultant schema for this expression is guaranteed to be `Scan.schema()`. If
+    ///    the item at index `i` in this `Vec` is `None`, or if the `Vec` contains fewer than `i`
+    ///    elements, no expression need be applied and the data read from disk is already in the
+    ///    correct logical state.
     pub fn scan_data(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanData>>> {
-        // NOTE: This is a cheap arc clone
+        // Compute the static part of the transformation. This is `None` if no transformation is
+        // needed (currently just means no partition cols AND no column mapping but will be extended
+        // for other transforms as we support them)
+        let static_transform = (self.have_partition_cols
+            || self.snapshot.column_mapping_mode != ColumnMappingMode::None)
+            .then_some(Arc::new(Scan::get_static_transform(&self.all_fields)));
         let physical_predicate = match self.physical_predicate.clone() {
             PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),
             PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
@@ -365,6 +405,8 @@ impl Scan {
         let it = scan_action_iter(
             engine,
             self.replay_for_scan_data(engine)?,
+            self.logical_schema.clone(),
+            static_transform,
             physical_predicate,
         );
         Ok(Some(it).into_iter().flatten())
@@ -445,7 +487,7 @@ impl Scan {
         let scan_data = self.scan_data(engine.as_ref())?;
         let scan_files_iter = scan_data
             .map(|res| {
-                let (data, vec) = res?;
+                let (data, vec, _transforms) = res?;
                 let scan_files = vec![];
                 state::visit_scan_files(data.as_ref(), &vec, scan_files, scan_data_callback)
             })
@@ -688,10 +730,11 @@ pub(crate) mod test_utils {
             sync::{json::SyncJsonHandler, SyncEngine},
         },
         scan::log_replay::scan_action_iter,
+        schema::SchemaRef,
         EngineData, JsonHandler,
     };
 
-    use super::state::ScanCallback;
+    use super::{state::ScanCallback, Transform};
 
     // TODO(nick): Merge all copies of this into one "test utils" thing
     fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
@@ -734,21 +777,46 @@ pub(crate) mod test_utils {
         ArrowEngineData::try_from_engine_data(parsed).unwrap()
     }
 
+    // add batch with a `date` partition col
+    pub(crate) fn add_batch_with_partition_col() -> Box<ArrowEngineData> {
+        let handler = SyncJsonHandler {};
+        let json_strings: StringArray = vec![
+            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"date\",\"type\":\"date\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["date"],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c001.snappy.parquet","partitionValues": {"date": "2017-12-11"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+        ]
+        .into();
+        let output_schema = get_log_schema().clone();
+        let parsed = handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        ArrowEngineData::try_from_engine_data(parsed).unwrap()
+    }
+
+    /// Create a scan action iter and validate what's called back. If you pass `None` as
+    /// `logical_schema`, `transform` should also be `None`
     #[allow(clippy::vec_box)]
     pub(crate) fn run_with_validate_callback<T: Clone>(
         batch: Vec<Box<ArrowEngineData>>,
+        logical_schema: Option<SchemaRef>,
+        transform: Option<Arc<Transform>>,
         expected_sel_vec: &[bool],
         context: T,
         validate_callback: ScanCallback<T>,
     ) {
+        let logical_schema =
+            logical_schema.unwrap_or_else(|| Arc::new(crate::schema::StructType::new(vec![])));
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch.into_iter().map(|batch| Ok((batch as _, true))),
+            logical_schema,
+            transform,
             None,
         );
         let mut batch_count = 0;
         for res in iter {
-            let (batch, sel) = res.unwrap();
+            let (batch, sel, _transforms) = res.unwrap();
             assert_eq!(sel, expected_sel_vec);
             crate::scan::state::visit_scan_files(
                 batch.as_ref(),
@@ -776,17 +844,19 @@ mod tests {
 
     #[test]
     fn test_static_skipping() {
+        const NULL: Expression = Expression::null_literal(DataType::BOOLEAN);
         let test_cases = [
             (false, column_expr!("a")),
             (true, Expression::literal(false)),
             (false, Expression::literal(true)),
-            (false, Expression::null_literal(DataType::LONG)),
+            (true, NULL),
             (true, Expression::and(column_expr!("a"), false)),
             (false, Expression::or(column_expr!("a"), true)),
             (false, Expression::or(column_expr!("a"), false)),
             (false, Expression::lt(column_expr!("a"), 10)),
             (false, Expression::lt(Expression::literal(10), 100)),
             (true, Expression::gt(Expression::literal(10), 100)),
+            (true, Expression::and(NULL, column_expr!("a"))),
         ];
         for (should_skip, predicate) in test_cases {
             assert_eq!(
@@ -957,7 +1027,7 @@ mod tests {
         }
         let mut files = vec![];
         for data in scan_data {
-            let (data, vec) = data?;
+            let (data, vec, _transforms) = data?;
             files = state::visit_scan_files(data.as_ref(), &vec, files, scan_data_callback)?;
         }
         Ok(files)

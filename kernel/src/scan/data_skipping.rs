@@ -38,7 +38,7 @@ mod tests;
 ///        expression is dropped.
 #[cfg(test)]
 fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
-    DataSkippingPredicateCreator.eval_expr(expr, false)
+    DataSkippingPredicateCreator.eval(expr)
 }
 
 /// Like `as_data_skipping_predicate`, but invokes [`PredicateEvaluator::eval_sql_where`] instead

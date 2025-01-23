@@ -210,7 +210,7 @@ fn try_main() -> DeltaResult<()> {
     drop(record_batch_tx);
 
     for res in scan_data {
-        let (data, vector) = res?;
+        let (data, vector, _transforms) = res?;
         scan_file_tx = delta_kernel::scan::state::visit_scan_files(
             data.as_ref(),
             &vector,

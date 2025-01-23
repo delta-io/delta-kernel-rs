@@ -250,6 +250,8 @@ mod tests {
         let context = TestContext { id: 2 };
         run_with_validate_callback(
             vec![add_batch_simple()],
+            None, // not testing schema
+            None, // not testing transform
             &[true, false],
             context,
             validate_visit,
