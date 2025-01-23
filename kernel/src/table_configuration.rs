@@ -36,9 +36,8 @@ pub(crate) struct TableConfiguration {
 }
 
 impl TableConfiguration {
-    /// Constructs a [`TableConfiguration`] for a table located in `table_root` at version
-    /// `version`. This validates  that the [`Metadata`] and [`Protocol`] are compatible with one
-    /// another, and that the kernel supports reading from this table.
+    /// Constructs a [`TableConfiguration`] for a table located in `table_root` at `version`.
+    /// This validates  that the [`Metadata`] and [`Protocol`] are compatible with one another.
     pub(crate) fn try_new(
         metadata: Metadata,
         protocol: Protocol,
@@ -97,11 +96,14 @@ impl TableConfiguration {
     pub(crate) fn version(&self) -> Version {
         self.version
     }
-
+    /// Returns `true` if the kernel supports writing to this table. This checks that the
+    /// protocol's writer features are all supported.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn is_write_supported(&self) -> bool {
         self.protocol.ensure_write_supported().is_ok()
     }
+    /// Returns `true` if the kernel supports reading from this table. This checks that the
+    /// protocol's reader features are all supported.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn is_read_supported(&self) -> bool {
         self.protocol.ensure_read_supported().is_ok()
@@ -132,7 +134,7 @@ impl TableConfiguration {
             self.table_properties.column_mapping_mode,
             None | Some(ColumnMappingMode::None)
         );
-        protocol_supported && cdf_enabled && column_mapping_disabled
+        self.is_read_supported() && protocol_supported && cdf_enabled && column_mapping_disabled
     }
     /// Returns `true` if deletion vectors is supported on this table. To support deletion vectors,
     /// a table must support reader version 3, writer version 7, and the deletionVectors feature in
