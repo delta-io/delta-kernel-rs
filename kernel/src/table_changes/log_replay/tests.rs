@@ -185,6 +185,8 @@ async fn column_mapping_should_fail() {
 // Note: This should be removed once type widening support is added for CDF
 #[tokio::test]
 async fn incompatible_schemas_fail() {
+    const PASSES: bool = true;
+    const FAILS: bool = false;
     async fn assert_schema_check(commit_schema: StructType, cdf_schema: StructType, passes: bool) {
         let engine = Arc::new(SyncEngine::new());
         let mut mock_table = LocalMockTable::new();
@@ -229,7 +231,7 @@ async fn incompatible_schemas_fail() {
         StructField::nullable("value", DataType::STRING),
         StructField::nullable("year", DataType::INTEGER),
     ]);
-    assert_schema_check(schema, get_schema(), false).await;
+    assert_schema_check(schema, get_schema(), FAILS).await;
 
     // Commit schema's `id` column has wider type than in the read schema.
     //
@@ -239,7 +241,7 @@ async fn incompatible_schemas_fail() {
         StructField::nullable("id", DataType::LONG),
         StructField::nullable("value", DataType::STRING),
     ]);
-    assert_schema_check(schema, get_schema(), false).await;
+    assert_schema_check(schema, get_schema(), FAILS).await;
 
     // Commit schema's `id` column is narrower than in the read schema.
     // NOTE: Once type widening is supported, this should not return an error.
@@ -254,7 +256,7 @@ async fn incompatible_schemas_fail() {
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable("value", DataType::STRING),
     ]);
-    assert_schema_check(commit_schema, cdf_schema, false).await;
+    assert_schema_check(commit_schema, cdf_schema, FAILS).await;
 
     // Commit schema's `id` column has an incompatible type with the read schema's.
     //
@@ -264,7 +266,7 @@ async fn incompatible_schemas_fail() {
         StructField::nullable("id", DataType::STRING),
         StructField::nullable("value", DataType::STRING),
     ]);
-    assert_schema_check(schema, get_schema(), false).await;
+    assert_schema_check(schema, get_schema(), FAILS).await;
 
     // Commit schema's `id` column is non-nullable, but is nullable in the read schema.
     //
@@ -274,14 +276,14 @@ async fn incompatible_schemas_fail() {
         StructField::new("id", DataType::INTEGER, false),
         StructField::new("value", DataType::STRING, true),
     ]);
-    assert_schema_check(schema, get_schema(), true).await;
+    assert_schema_check(schema, get_schema(), PASSES).await;
 
     // Commit schema is missing a nullable `value` column that's found in the read schema.
     //
     // The CDF schema has fields: `id` (nullable) and `value` (nullable).
     // This commit has schema with fields: `id` (nullable).
     let schema = get_schema().project_as_struct(&["id"]).unwrap();
-    assert_schema_check(schema, get_schema(), true).await;
+    assert_schema_check(schema, get_schema(), PASSES).await;
 }
 
 #[tokio::test]
