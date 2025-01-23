@@ -22,7 +22,7 @@ use crate::{DeltaResult, Version};
 ///
 /// For example, deletion vector support can be checked with
 /// [`TableConfiguration::is_deletion_vector_supported`] and deletion vector write enablement can
-/// be checked  with [`TableConfiguration::is_deletion_vector_enabled`].
+/// be checked with [`TableConfiguration::is_deletion_vector_enabled`].
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 #[derive(Debug)]
 pub(crate) struct TableConfiguration {
@@ -37,7 +37,7 @@ pub(crate) struct TableConfiguration {
 
 impl TableConfiguration {
     /// Constructs a [`TableConfiguration`] for a table located in `table_root` at `version`.
-    /// This validates  that the [`Metadata`] and [`Protocol`] are compatible with one another.
+    /// This validates that the [`Metadata`] and [`Protocol`] are compatible with one another.
     pub(crate) fn try_new(
         metadata: Metadata,
         protocol: Protocol,
@@ -65,7 +65,7 @@ impl TableConfiguration {
     pub(crate) fn metadata(&self) -> &Metadata {
         &self.metadata
     }
-    /// The [`Protocol`] of this table at  this version.
+    /// The [`Protocol`] of this table at this version.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn protocol(&self) -> &Protocol {
         &self.protocol
