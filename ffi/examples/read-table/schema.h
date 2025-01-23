@@ -128,7 +128,7 @@ void visit_array(
   SchemaBuilder* builder = data;
   char* name_ptr = malloc(sizeof(char) * (name.len + 24));
   snprintf(name_ptr, name.len + 1, "%s", name.ptr);
-  snprintf(name_ptr + name.len, 24, " (is nullable: %s)", is_nullable ? "true" : "false");
+  snprintf(name_ptr + name.len, 22, " (is nullable: %s)", is_nullable ? "true" : "false");
   PRINT_CHILD_VISIT("array", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* array_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "array", is_nullable);
   array_item->children = child_list_id;
@@ -144,7 +144,7 @@ void visit_map(
   SchemaBuilder* builder = data;
   char* name_ptr = malloc(sizeof(char) * (name.len + 24));
   snprintf(name_ptr, name.len + 1, "%s", name.ptr);
-  snprintf(name_ptr + name.len, 24, " (is nullable: %s)", is_nullable ? "true" : "false");
+  snprintf(name_ptr + name.len, 22, " (is nullable: %s)", is_nullable ? "true" : "false");
   PRINT_CHILD_VISIT("map", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* map_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "map", is_nullable);
   map_item->children = child_list_id;
