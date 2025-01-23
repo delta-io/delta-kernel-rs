@@ -98,6 +98,7 @@ impl TableConfiguration {
     }
     /// Returns `true` if the kernel supports writing to this table. This checks that the
     /// protocol's writer features are all supported.
+    #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn is_write_supported(&self) -> bool {
         self.protocol.ensure_write_supported().is_ok()

@@ -99,7 +99,7 @@ impl Snapshot {
 
     /// Version of this `Snapshot` in the table.
     pub fn version(&self) -> Version {
-        self.log_segment.end_version
+        self.table_configuration().version()
     }
 
     /// Table [`Schema`] at this `Snapshot`s version.
