@@ -1,5 +1,5 @@
 //! Provides utilities to perform comparisons between a [`Schema`]s. The api used to check schema
-//! compatibility is [`can_read_as`].
+//! compatibility is [`can_read_as`] that is exposed through the [`SchemaComparison`] trait.
 //!
 //! # Examples
 //!  ```rust, ignore
@@ -35,7 +35,7 @@ pub(crate) struct Nullable(bool);
 /// Represents the ways a schema comparison can fail.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
-    #[error("The nullability was tightened for a schema field")]
+    #[error("The nullability was tightened for a field")]
     NullabilityTightening,
     #[error("Field names do not match")]
     FieldNameMismatch,
