@@ -337,6 +337,15 @@ pub trait ExpressionHandler: AsAny {
         expression: Expression,
         output_type: DataType,
     ) -> Arc<dyn ExpressionEvaluator>;
+
+    /// Create a single-row [`EngineData`] by evaluating an [`Expression`] with no column
+    /// references.
+    ///
+    /// The schema of the output is the schema parameter which must match the output of the
+    /// expression.
+    // Note: we will stick with a Schema instead of DataType (more constrained can expand in
+    // future)
+    fn create_one(&self, schema: SchemaRef, expr: &Expression) -> DeltaResult<Box<dyn EngineData>>;
 }
 
 /// Provides file system related functionalities to Delta Kernel.
