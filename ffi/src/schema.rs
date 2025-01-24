@@ -227,14 +227,14 @@ pub unsafe extern "C" fn visit_schema(
         visitor: &EngineSchemaVisitor,
         at: &ArrayType,
         contains_null: bool,
-        metadata: &CStringMap,
     ) -> usize {
         let child_list_id = (visitor.make_field_list)(visitor.data, 1);
+        let metadata = CStringMap::default();
         visit_schema_item(
             "array_element",
             &at.element_type,
             contains_null,
-            metadata,
+            &metadata,
             visitor,
             child_list_id,
         );
@@ -245,14 +245,14 @@ pub unsafe extern "C" fn visit_schema(
         visitor: &EngineSchemaVisitor,
         mt: &MapType,
         value_contains_null: bool,
-        metadata: &CStringMap,
     ) -> usize {
         let child_list_id = (visitor.make_field_list)(visitor.data, 2);
+        let metadata = CStringMap::default();
         visit_schema_item(
             "map_key",
             &mt.key_type,
             false,
-            metadata,
+            &metadata,
             visitor,
             child_list_id,
         );
@@ -260,7 +260,7 @@ pub unsafe extern "C" fn visit_schema(
             "map_value",
             &mt.value_type,
             value_contains_null,
-            metadata,
+            &metadata,
             visitor,
             child_list_id,
         );
@@ -293,14 +293,11 @@ pub unsafe extern "C" fn visit_schema(
             DataType::Map(mt) => {
                 call!(
                     visit_map,
-                    visit_map_types(visitor, mt, mt.value_contains_null, metadata)
+                    visit_map_types(visitor, mt, mt.value_contains_null)
                 )
             }
             DataType::Array(at) => {
-                call!(
-                    visit_array,
-                    visit_array_item(visitor, at, at.contains_null, metadata)
-                )
+                call!(visit_array, visit_array_item(visitor, at, at.contains_null))
             }
             DataType::Primitive(PrimitiveType::Decimal(precision, scale)) => {
                 call!(visit_decimal, *precision, *scale)

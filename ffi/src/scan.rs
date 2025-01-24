@@ -274,8 +274,14 @@ pub struct CStringMap {
 }
 
 impl CStringMap {
-    pub fn new(values: HashMap<String, String>) -> CStringMap {
-        CStringMap { values }
+    pub fn new(values: HashMap<String, String>) -> Self {
+        Self { values }
+    }
+
+    pub fn default() -> Self {
+        Self {
+            values: Default::default(),
+        }
     }
 }
 
