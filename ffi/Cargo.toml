@@ -22,6 +22,7 @@ tracing-core = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [ "json" ] }
 url = "2"
 delta_kernel = { path = "../kernel", default-features = false, features = [
+  "arrow",
   "developer-visibility",
 ] }
 delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.7.0" }
