@@ -86,11 +86,8 @@ fn assert_schema_fields_match(schema: &Schema, golden: &Schema) {
 fn normalize_col(col: Arc<dyn Array>) -> Arc<dyn Array> {
     if let DataType::Timestamp(unit, Some(zone)) = col.data_type() {
         if **zone == *"+00:00" {
-            delta_kernel::arrow::compute::cast(
-                &col,
-                &DataType::Timestamp(*unit, Some("UTC".into())),
-            )
-            .expect("Could not cast to UTC")
+            let data_type = DataType::Timestamp(*unit, Some("UTC".into()));
+            delta_kernel::arrow::compute::cast(&col, &data_type).expect("Could not cast to UTC")
         } else {
             col
         }
