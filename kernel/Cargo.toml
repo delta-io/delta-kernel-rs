@@ -51,7 +51,7 @@ uuid = "1.10.0"
 z85 = "3.0.5"
 
 # bring in our derive macros
-delta_kernel_derive = { path = "../derive-macros", version = "0.7.0" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.6.1" }
 
 # used for developer-visibility
 visibility = "0.1.1"
@@ -89,14 +89,10 @@ walkdir = { workspace = true, optional = true }
 [features]
 # The default version to be expected
 arrow = ["arrow_53"]
-# The default version to be expected
-parquet = ["parquet_53"]
 
-arrow_53 = ["dep:arrow_53", "parquet_53"]
-parquet_53 = ["dep:parquet_53"]
+arrow_53 = ["dep:arrow_53", "dep:parquet_53"]
 
-arrow_54 = ["dep:arrow_54", "parquet_54"]
-parquet_54 = ["dep:parquet_54"]
+arrow_54 = ["dep:arrow_54", "dep:parquet_54"]
 
 arrow-conversion = []
 arrow-expression = []
