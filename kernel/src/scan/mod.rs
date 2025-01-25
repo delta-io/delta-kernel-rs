@@ -311,11 +311,7 @@ pub fn get_transform_for_row(
     row: usize,
     transforms: &[Option<ExpressionRef>],
 ) -> Option<ExpressionRef> {
-    if row < transforms.len() {
-        transforms[row].clone()
-    } else {
-        None
-    }
+    transforms.get(row).cloned().flatten()
 }
 
 /// Transforms aren't computed all at once. So static ones can just go straight to `Expression`, but

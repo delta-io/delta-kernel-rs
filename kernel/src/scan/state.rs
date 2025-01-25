@@ -141,7 +141,7 @@ pub type ScanCallback<T> = fn(
 pub fn visit_scan_files<T>(
     data: &dyn EngineData,
     selection_vector: &[bool],
-    transforms: &Vec<Option<ExpressionRef>>,
+    transforms: &[Option<ExpressionRef>],
     context: T,
     callback: ScanCallback<T>,
 ) -> DeltaResult<T> {
@@ -159,7 +159,7 @@ pub fn visit_scan_files<T>(
 struct ScanFileVisitor<'a, T> {
     callback: ScanCallback<T>,
     selection_vector: &'a [bool],
-    transforms: &'a Vec<Option<ExpressionRef>>,
+    transforms: &'a [Option<ExpressionRef>],
     context: T,
 }
 impl<T> RowVisitor for ScanFileVisitor<'_, T> {
@@ -220,10 +220,8 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::{
-        scan::test_utils::{add_batch_simple, run_with_validate_callback},
-        ExpressionRef,
-    };
+    use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
+    use crate::ExpressionRef;
 
     use super::{DvInfo, Stats};
 
