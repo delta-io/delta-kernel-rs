@@ -284,7 +284,9 @@ impl LogReplayScanner {
             None => vec![true; actions.len()],
         };
         if data_selection_vector.len() != actions.len() {
-            return Err(crate::Error::internal_error("Data skipping filter returned incorrect number of rows"))
+            return Err(crate::Error::internal_error(
+                "Data skipping filter returned incorrect number of rows",
+            ));
         }
 
         let partition_selection_vector = match &self.partition_filter {
@@ -292,7 +294,9 @@ impl LogReplayScanner {
             None => vec![true; actions.len()],
         };
         if partition_selection_vector.len() != actions.len() {
-            return Err(crate::Error::internal_error("Partition skipping filter returned incorrect number of rows"))
+            return Err(crate::Error::internal_error(
+                "Partition skipping filter returned incorrect number of rows",
+            ));
         }
 
         let selection_vector = data_selection_vector

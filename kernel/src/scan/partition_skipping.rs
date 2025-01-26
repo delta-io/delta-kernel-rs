@@ -42,9 +42,7 @@ impl PartitionSkippingFilter {
             .filter(|f| partition_columns.contains(f.name()))
             .cloned()
             .peekable();
-        if partition_fields.peek().is_none() {
-            return None
-        }
+        partition_fields.peek()?;
         let schema = Arc::new(StructType::new(partition_fields));
 
         let partitions_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
