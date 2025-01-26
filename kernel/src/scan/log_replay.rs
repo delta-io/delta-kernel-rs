@@ -6,8 +6,8 @@ use itertools::Itertools;
 use tracing::debug;
 
 use super::data_skipping::DataSkippingFilter;
-use super::{ScanData, Transform};
 use super::partition_skipping::PartitionSkippingFilter;
+use super::{ScanData, Transform};
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{column_expr, column_name, ColumnName, Expression, ExpressionRef};
@@ -424,7 +424,7 @@ mod tests {
             logical_schema,
             None,
             None,
-            &[]
+            &[],
         );
         for res in iter {
             let (_batch, _sel, transforms) = res.unwrap();
@@ -448,7 +448,7 @@ mod tests {
             schema,
             static_transform,
             None,
-            &[]
+            &[],
         );
 
         fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {
