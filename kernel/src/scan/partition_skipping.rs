@@ -142,7 +142,6 @@ mod tests {
     use crate::expressions::UnaryOperator;
     use crate::scan::get_log_schema;
     use crate::schema::{DataType, Schema, StructField};
-    use crate::DeltaResult;
     use crate::{DeltaResult, Engine, EngineData, Expression};
 
     use super::PartitionSkippingFilter;

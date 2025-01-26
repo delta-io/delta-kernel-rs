@@ -424,6 +424,7 @@ mod tests {
             logical_schema,
             None,
             None,
+            &[]
         );
         for res in iter {
             let (_batch, _sel, transforms) = res.unwrap();
@@ -447,6 +448,7 @@ mod tests {
             schema,
             static_transform,
             None,
+            &[]
         );
 
         fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {
