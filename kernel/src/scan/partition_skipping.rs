@@ -116,7 +116,11 @@ impl RowVisitor for PartitionVisitor {
                             ));
                         };
 
-                        let scalar = partition_values.get(field.name()).map(|v| primitive_type.parse_scalar(v)).transpose()?.unwrap_or(Scalar::Null(data_type.clone()));
+                        let scalar = partition_values
+                            .get(field.name())
+                            .map(|v| primitive_type.parse_scalar(v))
+                            .transpose()?
+                            .unwrap_or(Scalar::Null(data_type.clone()));
 
                         Ok((ColumnName::new([field.name()]), scalar))
                     })
