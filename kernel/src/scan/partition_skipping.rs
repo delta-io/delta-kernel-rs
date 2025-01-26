@@ -120,7 +120,11 @@ impl RowVisitor for PartitionVisitor {
                             .get(field.name())
                             .map(|v| primitive_type.parse_scalar(v))
                             .transpose()?
-                            .unwrap_or(Scalar::Null(data_type.clone()));
+                            .unwrap_or(
+                                match field.nullable {
+                                    true => Ok(Scalar::Null(data_type.clone())),
+                                    false => Err(crate::Error::missing_data(format!("Missing partition values on a non-nullable field is not supported. Field {}", field.name)))
+                                }?);
 
                         Ok((ColumnName::new([field.name()]), scalar))
                     })
