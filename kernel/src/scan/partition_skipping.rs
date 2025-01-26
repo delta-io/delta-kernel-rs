@@ -37,10 +37,14 @@ impl PartitionSkippingFilter {
         // Limit the schema passed to the row visitor of only the fields that are included
         // in the predicate and are also partition columns. The data skipping columns will
         // be handled elsewhere.
-        let partition_fields = schema
+        let mut partition_fields = schema
             .fields()
             .filter(|f| partition_columns.contains(f.name()))
-            .cloned();
+            .cloned()
+            .peekable();
+        if partition_fields.peek().is_none() {
+            return None
+        }
         let schema = Arc::new(StructType::new(partition_fields));
 
         let partitions_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
