@@ -283,13 +283,17 @@ impl LogReplayScanner {
             Some(filter) => filter.apply(actions)?,
             None => vec![true; actions.len()],
         };
-        assert_eq!(data_selection_vector.len(), actions.len());
+        if data_selection_vector.len() != actions.len() {
+            return Err(crate::Error::internal_error("Data skipping filter returned incorrect number of rows"))
+        }
 
         let partition_selection_vector = match &self.partition_filter {
             Some(filter) => filter.apply(actions)?,
             None => vec![true; actions.len()],
         };
-        assert_eq!(partition_selection_vector.len(), actions.len());
+        if partition_selection_vector.len() != actions.len() {
+            return Err(crate::Error::internal_error("Partition skipping filter returned incorrect number of rows"))
+        }
 
         let selection_vector = data_selection_vector
             .iter()
