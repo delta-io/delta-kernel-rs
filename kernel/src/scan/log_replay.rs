@@ -258,13 +258,10 @@ impl LogReplayScanner {
         physical_predicate: Option<(ExpressionRef, SchemaRef)>,
         partition_columns: &[String],
     ) -> Self {
-        let partition_predicate = physical_predicate
-            .as_ref()
-            .filter(|_| !partition_columns.is_empty());
         Self {
             partition_filter: PartitionSkippingFilter::new(
                 engine,
-                partition_predicate.cloned(),
+                physical_predicate.clone(),
                 partition_columns,
             ),
             data_filter: DataSkippingFilter::new(engine, physical_predicate),
