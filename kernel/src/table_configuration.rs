@@ -1,11 +1,11 @@
 //! This module defines [`TableConfiguration`], a high level api to check feature support and
 //! feature enablement for a table at a given version. This encapsulates [`Protocol`], [`Metadata`],
 //! [`Schema`], [`TableProperties`], and [`ColumnMappingMode`]. These structs in isolation should
-//! be considered raw and unvalidated if they are not a part of [`TableConfiguration`].  We unify
+//! be considered raw and unvalidated if they are not a part of [`TableConfiguration`]. We unify
 //! these fields because they are deeply intertwined when dealing with table features. For example:
 //! To check that deletion vector writes are enabled, you must check both both the protocol's
 //! reader/writer features, and ensure that the deletion vector table property is enabled in the
-//! metadata.
+//! [`TableProperties`].
 //!
 //! [`Schema`]: crate::schema::Schema
 use std::collections::HashSet;
@@ -23,13 +23,15 @@ use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Version};
 
 /// Holds all the configuration for a table at a specific version. This includes the supported
-/// reader and writer features, table properties, schema, version, and table root.
-/// [`TableConfiguration`] performs checks when constructed using `TableConfiguration::try_new`
-/// to validate that Metadata and Protocol are correctly formatted and mutually compatible.
+/// reader and writer features, table properties, schema, version, and table root. This can be used
+/// to check whether a table supports a feature or has it enabled. For example, deletion vector
+/// support can be checked with [`TableConfiguration::is_deletion_vector_supported`] and deletion
+/// vector write enablement can be checked with [`TableConfiguration::is_deletion_vector_enabled`].
 ///
-/// For example, deletion vector support can be checked with
-/// [`TableConfiguration::is_deletion_vector_supported`] and deletion vector write enablement can
-/// be checked with [`TableConfiguration::is_deletion_vector_enabled`].
+/// [`TableConfiguration`] performs checks upon construction using `TableConfiguration::try_new`
+/// to validate that Metadata and Protocol are correctly formatted and mutually compatible. If
+/// `try_new` successfully returns `TableConfiguration`, it is also guaranteed that reading the
+/// table is supported.
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 #[derive(Debug)]
 pub(crate) struct TableConfiguration {
