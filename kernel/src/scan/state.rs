@@ -4,7 +4,10 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use crate::actions::deletion_vector::deletion_treemap_to_bools;
+use crate::scan::get_transform_for_row;
+use crate::schema::Schema;
 use crate::utils::require;
+use crate::ExpressionRef;
 use crate::{
     actions::{deletion_vector::DeletionVectorDescriptor, visitors::visit_deletion_vector_at},
     engine_data::{GetData, RowVisitor, TypedGetData as _},
@@ -98,12 +101,36 @@ impl DvInfo {
     }
 }
 
+/// utility function for applying a transform expression to convert data from physical to logical
+/// format
+pub fn transform_to_logical(
+    engine: &dyn Engine,
+    physical_data: Box<dyn EngineData>,
+    physical_schema: &SchemaRef,
+    logical_schema: &Schema,
+    transform: &Option<ExpressionRef>,
+) -> DeltaResult<Box<dyn EngineData>> {
+    if let Some(ref transform) = transform {
+        engine
+            .get_expression_handler()
+            .get_evaluator(
+                physical_schema.clone(),
+                transform.as_ref().clone(), // TODO: Maybe eval should take a ref
+                logical_schema.clone().into(),
+            )
+            .evaluate(physical_data.as_ref())
+    } else {
+        Ok(physical_data)
+    }
+}
+
 pub type ScanCallback<T> = fn(
     context: &mut T,
     path: &str,
     size: i64,
     stats: Option<Stats>,
     dv_info: DvInfo,
+    transform: Option<ExpressionRef>,
     partition_values: HashMap<String, String>,
 );
 
@@ -138,12 +165,14 @@ pub type ScanCallback<T> = fn(
 pub fn visit_scan_files<T>(
     data: &dyn EngineData,
     selection_vector: &[bool],
+    transforms: &Vec<Option<ExpressionRef>>,
     context: T,
     callback: ScanCallback<T>,
 ) -> DeltaResult<T> {
     let mut visitor = ScanFileVisitor {
         callback,
         selection_vector,
+        transforms,
         context,
     };
     visitor.visit_rows_of(data)?;
@@ -154,6 +183,7 @@ pub fn visit_scan_files<T>(
 struct ScanFileVisitor<'a, T> {
     callback: ScanCallback<T>,
     selection_vector: &'a [bool],
+    transforms: &'a Vec<Option<ExpressionRef>>,
     context: T,
 }
 impl<T> RowVisitor for ScanFileVisitor<'_, T> {
@@ -201,6 +231,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                     size,
                     stats,
                     dv_info,
+                    get_transform_for_row(row_index, self.transforms),
                     partition_values,
                 )
             }
@@ -213,7 +244,10 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
+    use crate::{
+        scan::test_utils::{add_batch_simple, run_with_validate_callback},
+        ExpressionRef,
+    };
 
     use super::{DvInfo, Stats};
 
@@ -228,6 +262,7 @@ mod tests {
         size: i64,
         stats: Option<Stats>,
         dv_info: DvInfo,
+        transform: Option<ExpressionRef>,
         part_vals: HashMap<String, String>,
     ) {
         assert_eq!(
@@ -242,6 +277,7 @@ mod tests {
         assert!(dv_info.deletion_vector.is_some());
         let dv = dv_info.deletion_vector.unwrap();
         assert_eq!(dv.unique_id(), "uvBn[lx{q8@P<9BNH/isA@1");
+        assert!(transform.is_none());
         assert_eq!(context.id, 2);
     }
 
