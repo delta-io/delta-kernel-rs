@@ -178,7 +178,7 @@ impl TableConfiguration {
         read_supported && write_supported
     }
 
-    /// Returns `true` if writing deletion vectors is supported on this table. This is the case
+    /// Returns `true` if writing deletion vectors is enabled for this table. This is the case
     /// when the deletion vectors is supported on this table and the `delta.enableDeletionVectors`
     /// table property is set to `true`.
     ///
