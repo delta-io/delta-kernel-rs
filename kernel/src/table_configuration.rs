@@ -1,9 +1,13 @@
 //! This module defines [`TableConfiguration`], a high level api to check feature support and
-//! feature enablement for a table. This encapsulates [`Protocol`] and [`Metadata`], and extracts
-//! [`TableProperties`] and [`ColumnMappingMode`]. We unify Protocol and Metadata because they
-//! are deeply intertwined when dealing with table features. For example: To check that deletion
-//! vector writes are enabled, you must check both both the protocol's reader/writer features, and
-//! ensurethat the deletion vector table property is enabled in the metadata.
+//! feature enablement for a table at a given version. This encapsulates [`Protocol`], [`Metadata`],
+//! [`Schema`], [`TableProperties`], and [`ColumnMappingMode`]. These structs in isolation should
+//! be considered raw and unvalidated if they are not a part of [`TableConfiguration`].  We unify
+//! these fields because they are deeply intertwined when dealing with table features. For example:
+//! To check that deletion vector writes are enabled, you must check both both the protocol's
+//! reader/writer features, and ensure that the deletion vector table property is enabled in the
+//! metadata.
+//!
+//! [`Schema`]: crate::schema::Schema
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
