@@ -51,6 +51,17 @@ impl TableConfiguration {
     /// to do this validation is done in `try_new` because all table accesses must first construct
     /// the [`TableConfiguration`]. This ensures that developers never forget to check that kernel
     /// supports reading the table, and that all table accesses are legal.
+    ///
+    /// Note: In the future, we will perform stricter checks on the set of reader and writer
+    /// features. In particular, we will check that:
+    ///     - Non-legacy features must appear in both reader features and writer features lists.
+    ///       If such a feature is present, the reader version and writer version must be 3, and 5
+    ///       respectively.
+    ///     - Legacy reader features occur when the reader version is 3, but the writer version is
+    ///       either 5 or 6. In this case, the writer feature list must be empty.
+    ///     - Column mapping is the only legacy feature present in kernel. No future delta versions
+    ///       will introduce new legacy features.
+    /// See: <https://github.com/delta-io/delta-kernel-rs/issues/650>
     pub(crate) fn try_new(
         metadata: Metadata,
         protocol: Protocol,
