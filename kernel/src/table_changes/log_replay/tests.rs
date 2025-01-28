@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 fn get_schema() -> StructType {
     StructType::new([
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("value", DataType::STRING, true),
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
     ])
 }
 
@@ -219,17 +219,17 @@ async fn incompatible_schemas_fail() {
     // The CDF schema has fields: `id: int` and `value: string`.
     // This commit has schema with fields: `id: long`, `value: string` and `year: int` (nullable).
     let schema = StructType::new([
-        StructField::new("id", DataType::LONG, true),
-        StructField::new("value", DataType::STRING, true),
-        StructField::new("year", DataType::INTEGER, true),
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("value", DataType::STRING),
+        StructField::nullable("year", DataType::INTEGER),
     ]);
     assert_incompatible_schema(schema, get_schema()).await;
 
     // The CDF schema has fields: `id: int` and `value: string`.
     // This commit has schema with fields: `id: long` and `value: string`.
     let schema = StructType::new([
-        StructField::new("id", DataType::LONG, true),
-        StructField::new("value", DataType::STRING, true),
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("value", DataType::STRING),
     ]);
     assert_incompatible_schema(schema, get_schema()).await;
 
@@ -238,12 +238,12 @@ async fn incompatible_schemas_fail() {
     // The CDF schema has fields: `id: long` and `value: string`.
     // This commit has schema with fields: `id: int` and `value: string`.
     let cdf_schema = StructType::new([
-        StructField::new("id", DataType::LONG, true),
-        StructField::new("value", DataType::STRING, true),
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("value", DataType::STRING),
     ]);
     let commit_schema = StructType::new([
-        StructField::new("id", DataType::INTEGER, true),
-        StructField::new("value", DataType::STRING, true),
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
     ]);
     assert_incompatible_schema(cdf_schema, commit_schema).await;
 
@@ -252,16 +252,16 @@ async fn incompatible_schemas_fail() {
     // The CDF schema has fields: nullable `id`  and nullable `value`.
     // This commit has schema with fields: non-nullable `id` and nullable `value`.
     let schema = StructType::new([
-        StructField::new("id", DataType::LONG, false),
-        StructField::new("value", DataType::STRING, true),
+        StructField::not_null("id", DataType::LONG),
+        StructField::nullable("value", DataType::STRING),
     ]);
     assert_incompatible_schema(schema, get_schema()).await;
 
     // The CDF schema has fields: `id: int` and `value: string`.
     // This commit has schema with fields:`id: string` and `value: string`.
     let schema = StructType::new([
-        StructField::new("id", DataType::STRING, true),
-        StructField::new("value", DataType::STRING, true),
+        StructField::nullable("id", DataType::STRING),
+        StructField::nullable("value", DataType::STRING),
     ]);
     assert_incompatible_schema(schema, get_schema()).await;
 

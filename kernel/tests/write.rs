@@ -147,10 +147,9 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     let (store, engine, table_location) = setup("test_table", true);
 
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::new(vec![StructField::new(
+    let schema = Arc::new(StructType::new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-        true,
     )]));
     let table = create_table(store.clone(), table_location, schema, &[]).await?;
 
@@ -201,10 +200,9 @@ async fn test_empty_commit() -> Result<(), Box<dyn std::error::Error>> {
     let (store, engine, table_location) = setup("test_table", true);
 
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::new(vec![StructField::new(
+    let schema = Arc::new(StructType::new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-        true,
     )]));
     let table = create_table(store.clone(), table_location, schema, &[]).await?;
 
@@ -224,10 +222,9 @@ async fn test_invalid_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     let (store, engine, table_location) = setup("test_table", true);
 
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::new(vec![StructField::new(
+    let schema = Arc::new(StructType::new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-        true,
     )]));
     let table = create_table(store.clone(), table_location, schema, &[]).await?;
 
@@ -336,10 +333,9 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
     let (store, engine, table_location) = setup("test_table", true);
 
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::new(vec![StructField::new(
+    let schema = Arc::new(StructType::new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-        true,
     )]));
     let table = create_table(store.clone(), table_location, schema.clone(), &[]).await?;
 
@@ -466,13 +462,12 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     // create a simple partitioned table: one int column named 'number', partitioned by string
     // column named 'partition'
     let table_schema = Arc::new(StructType::new(vec![
-        StructField::new("number", DataType::INTEGER, true),
-        StructField::new("partition", DataType::STRING, true),
+        StructField::nullable("number", DataType::INTEGER),
+        StructField::nullable("partition", DataType::STRING),
     ]));
-    let data_schema = Arc::new(StructType::new(vec![StructField::new(
+    let data_schema = Arc::new(StructType::new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-        true,
     )]));
     let table = create_table(
         store.clone(),
@@ -611,16 +606,14 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
     let (store, engine, table_location) = setup("test_table", true);
 
     // create a simple table: one int column named 'number'
-    let table_schema = Arc::new(StructType::new(vec![StructField::new(
+    let table_schema = Arc::new(StructType::new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-        true,
     )]));
     // incompatible data schema: one string column named 'string'
-    let data_schema = Arc::new(StructType::new(vec![StructField::new(
+    let data_schema = Arc::new(StructType::new(vec![StructField::nullable(
         "string",
         DataType::STRING,
-        true,
     )]));
     let table = create_table(store.clone(), table_location, table_schema.clone(), &[]).await?;
 

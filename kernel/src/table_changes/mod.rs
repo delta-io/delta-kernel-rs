@@ -60,9 +60,9 @@ static ADD_CHANGE_TYPE: &str = "insert";
 static REMOVE_CHANGE_TYPE: &str = "delete";
 static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
     [
-        StructField::new(CHANGE_TYPE_COL_NAME, DataType::STRING, false),
-        StructField::new(COMMIT_VERSION_COL_NAME, DataType::LONG, false),
-        StructField::new(COMMIT_TIMESTAMP_COL_NAME, DataType::TIMESTAMP, false),
+        StructField::not_null(CHANGE_TYPE_COL_NAME, DataType::STRING),
+        StructField::not_null(COMMIT_VERSION_COL_NAME, DataType::LONG),
+        StructField::not_null(COMMIT_TIMESTAMP_COL_NAME, DataType::TIMESTAMP),
     ]
 });
 
@@ -161,15 +161,15 @@ impl TableChanges {
         // we support CDF with those features enabled.
         //
         // Note: We must still check each metadata and protocol action in the CDF range.
-        let check_snapshot = |snapshot: &Snapshot| -> DeltaResult<()> {
-            ensure_cdf_read_supported(snapshot.protocol())?;
-            check_cdf_table_properties(snapshot.table_properties())?;
-            Ok(())
+        let check_table_config = |snapshot: &Snapshot| {
+            if snapshot.table_configuration().is_cdf_read_supported() {
+                Ok(())
+            } else {
+                Err(Error::change_data_feed_unsupported(snapshot.version()))
+            }
         };
-        check_snapshot(&start_snapshot)
-            .map_err(|_| Error::change_data_feed_unsupported(start_snapshot.version()))?;
-        check_snapshot(&end_snapshot)
-            .map_err(|_| Error::change_data_feed_unsupported(end_snapshot.version()))?;
+        check_table_config(&start_snapshot)?;
+        check_table_config(&end_snapshot)?;
 
         // Verify that the start and end schemas are compatible. We must still check schema
         // compatibility for each schema update in the CDF range.
@@ -316,8 +316,8 @@ mod tests {
         let engine = Box::new(SyncEngine::new());
         let table = Table::try_from_uri(path).unwrap();
         let expected_schema = [
-            StructField::new("part", DataType::INTEGER, true),
-            StructField::new("id", DataType::INTEGER, true),
+            StructField::nullable("part", DataType::INTEGER),
+            StructField::nullable("id", DataType::INTEGER),
         ]
         .into_iter()
         .chain(CDF_FIELDS.clone());

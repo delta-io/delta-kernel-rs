@@ -277,10 +277,9 @@ fn generate_commit_info(
         // HACK (part 1/2): since we don't have proper map support, we create a literal struct with
         // one null field to create data that serializes as "operationParameters": {}
         Expression::literal(Scalar::Struct(StructData::try_new(
-            vec![StructField::new(
+            vec![StructField::nullable(
                 "operation_parameter_int",
                 DataType::INTEGER,
-                true,
             )],
             vec![Scalar::Null(DataType::INTEGER)],
         )?)),
@@ -304,10 +303,9 @@ fn generate_commit_info(
     };
     let engine_commit_info_schema =
         commit_info_data_type.project_as_struct(&["engineCommitInfo"])?;
-    let hack_data_type = DataType::Struct(Box::new(StructType::new(vec![StructField::new(
+    let hack_data_type = DataType::Struct(Box::new(StructType::new(vec![StructField::nullable(
         "hack_operation_parameter_int",
         DataType::INTEGER,
-        true,
     )])));
 
     commit_info_data_type
@@ -677,15 +675,14 @@ mod tests {
     fn test_write_metadata_schema() {
         let schema = get_write_metadata_schema();
         let expected = StructType::new(vec![
-            StructField::new("path", DataType::STRING, false),
-            StructField::new(
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null(
                 "partitionValues",
                 MapType::new(DataType::STRING, DataType::STRING, true),
-                false,
             ),
-            StructField::new("size", DataType::LONG, false),
-            StructField::new("modificationTime", DataType::LONG, false),
-            StructField::new("dataChange", DataType::BOOLEAN, false),
+            StructField::not_null("size", DataType::LONG),
+            StructField::not_null("modificationTime", DataType::LONG),
+            StructField::not_null("dataChange", DataType::BOOLEAN),
         ]);
         assert_eq!(*schema, expected.into());
     }

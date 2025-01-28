@@ -82,6 +82,7 @@ pub mod schema;
 pub mod snapshot;
 pub mod table;
 pub mod table_changes;
+pub mod table_configuration;
 pub mod table_features;
 pub mod table_properties;
 pub mod transaction;

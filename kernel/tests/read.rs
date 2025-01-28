@@ -369,7 +369,7 @@ fn read_with_scan_data(
     let scan_data = scan.scan_data(engine)?;
     let mut scan_files = vec![];
     for data in scan_data {
-        let (data, vec) = data?;
+        let (data, vec, _transforms) = data?;
         scan_files = visit_scan_files(data.as_ref(), &vec, scan_files, scan_data_callback)?;
     }
 

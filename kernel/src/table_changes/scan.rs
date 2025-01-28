@@ -211,7 +211,7 @@ impl TableChangesScan {
             partition_columns: end_snapshot.metadata().partition_columns.clone(),
             logical_schema: self.logical_schema.clone(),
             physical_schema: self.physical_schema.clone(),
-            column_mapping_mode: end_snapshot.column_mapping_mode,
+            column_mapping_mode: end_snapshot.column_mapping_mode(),
         }
     }
 
@@ -420,8 +420,8 @@ mod tests {
         assert_eq!(
             scan.logical_schema,
             StructType::new([
-                StructField::new("id", DataType::INTEGER, true),
-                StructField::new("_commit_version", DataType::LONG, false),
+                StructField::nullable("id", DataType::INTEGER),
+                StructField::not_null("_commit_version", DataType::LONG),
             ])
             .into()
         );
@@ -429,7 +429,7 @@ mod tests {
             scan.physical_predicate,
             PhysicalPredicate::Some(
                 predicate,
-                StructType::new([StructField::new("id", DataType::INTEGER, true),]).into()
+                StructType::new([StructField::nullable("id", DataType::INTEGER),]).into()
             )
         );
     }

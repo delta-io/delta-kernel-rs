@@ -524,38 +524,30 @@ mod tests {
             .project(&[METADATA_NAME])
             .expect("Couldn't get metaData field");
 
-        let expected = Arc::new(StructType::new([StructField::new(
+        let expected = Arc::new(StructType::new([StructField::nullable(
             "metaData",
             StructType::new([
-                StructField::new("id", DataType::STRING, false),
-                StructField::new("name", DataType::STRING, true),
-                StructField::new("description", DataType::STRING, true),
-                StructField::new(
+                StructField::not_null("id", DataType::STRING),
+                StructField::nullable("name", DataType::STRING),
+                StructField::nullable("description", DataType::STRING),
+                StructField::not_null(
                     "format",
                     StructType::new([
-                        StructField::new("provider", DataType::STRING, false),
-                        StructField::new(
+                        StructField::not_null("provider", DataType::STRING),
+                        StructField::not_null(
                             "options",
                             MapType::new(DataType::STRING, DataType::STRING, false),
-                            false,
                         ),
                     ]),
-                    false,
                 ),
-                StructField::new("schemaString", DataType::STRING, false),
-                StructField::new(
-                    "partitionColumns",
-                    ArrayType::new(DataType::STRING, false),
-                    false,
-                ),
-                StructField::new("createdTime", DataType::LONG, true),
-                StructField::new(
+                StructField::not_null("schemaString", DataType::STRING),
+                StructField::not_null("partitionColumns", ArrayType::new(DataType::STRING, false)),
+                StructField::nullable("createdTime", DataType::LONG),
+                StructField::not_null(
                     "configuration",
                     MapType::new(DataType::STRING, DataType::STRING, false),
-                    false,
                 ),
             ]),
-            true,
         )]));
         assert_eq!(schema, expected);
     }
@@ -566,61 +558,55 @@ mod tests {
             .project(&[ADD_NAME])
             .expect("Couldn't get add field");
 
-        let expected = Arc::new(StructType::new([StructField::new(
+        let expected = Arc::new(StructType::new([StructField::nullable(
             "add",
             StructType::new([
-                StructField::new("path", DataType::STRING, false),
-                StructField::new(
+                StructField::not_null("path", DataType::STRING),
+                StructField::not_null(
                     "partitionValues",
                     MapType::new(DataType::STRING, DataType::STRING, true),
-                    false,
                 ),
-                StructField::new("size", DataType::LONG, false),
-                StructField::new("modificationTime", DataType::LONG, false),
-                StructField::new("dataChange", DataType::BOOLEAN, false),
-                StructField::new("stats", DataType::STRING, true),
-                StructField::new(
+                StructField::not_null("size", DataType::LONG),
+                StructField::not_null("modificationTime", DataType::LONG),
+                StructField::not_null("dataChange", DataType::BOOLEAN),
+                StructField::nullable("stats", DataType::STRING),
+                StructField::nullable(
                     "tags",
                     MapType::new(DataType::STRING, DataType::STRING, false),
-                    true,
                 ),
                 deletion_vector_field(),
-                StructField::new("baseRowId", DataType::LONG, true),
-                StructField::new("defaultRowCommitVersion", DataType::LONG, true),
-                StructField::new("clusteringProvider", DataType::STRING, true),
+                StructField::nullable("baseRowId", DataType::LONG),
+                StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+                StructField::nullable("clusteringProvider", DataType::STRING),
             ]),
-            true,
         )]));
         assert_eq!(schema, expected);
     }
 
     fn tags_field() -> StructField {
-        StructField::new(
+        StructField::nullable(
             "tags",
             MapType::new(DataType::STRING, DataType::STRING, false),
-            true,
         )
     }
 
     fn partition_values_field() -> StructField {
-        StructField::new(
+        StructField::nullable(
             "partitionValues",
             MapType::new(DataType::STRING, DataType::STRING, false),
-            true,
         )
     }
 
     fn deletion_vector_field() -> StructField {
-        StructField::new(
+        StructField::nullable(
             "deletionVector",
             DataType::struct_type([
-                StructField::new("storageType", DataType::STRING, false),
-                StructField::new("pathOrInlineDv", DataType::STRING, false),
-                StructField::new("offset", DataType::INTEGER, true),
-                StructField::new("sizeInBytes", DataType::INTEGER, false),
-                StructField::new("cardinality", DataType::LONG, false),
+                StructField::not_null("storageType", DataType::STRING),
+                StructField::not_null("pathOrInlineDv", DataType::STRING),
+                StructField::nullable("offset", DataType::INTEGER),
+                StructField::not_null("sizeInBytes", DataType::INTEGER),
+                StructField::not_null("cardinality", DataType::LONG),
             ]),
-            true,
         )
     }
 
@@ -629,21 +615,20 @@ mod tests {
         let schema = get_log_schema()
             .project(&[REMOVE_NAME])
             .expect("Couldn't get remove field");
-        let expected = Arc::new(StructType::new([StructField::new(
+        let expected = Arc::new(StructType::new([StructField::nullable(
             "remove",
             StructType::new([
-                StructField::new("path", DataType::STRING, false),
-                StructField::new("deletionTimestamp", DataType::LONG, true),
-                StructField::new("dataChange", DataType::BOOLEAN, false),
-                StructField::new("extendedFileMetadata", DataType::BOOLEAN, true),
+                StructField::not_null("path", DataType::STRING),
+                StructField::nullable("deletionTimestamp", DataType::LONG),
+                StructField::not_null("dataChange", DataType::BOOLEAN),
+                StructField::nullable("extendedFileMetadata", DataType::BOOLEAN),
                 partition_values_field(),
-                StructField::new("size", DataType::LONG, true),
+                StructField::nullable("size", DataType::LONG),
                 tags_field(),
                 deletion_vector_field(),
-                StructField::new("baseRowId", DataType::LONG, true),
-                StructField::new("defaultRowCommitVersion", DataType::LONG, true),
+                StructField::nullable("baseRowId", DataType::LONG),
+                StructField::nullable("defaultRowCommitVersion", DataType::LONG),
             ]),
-            true,
         )]));
         assert_eq!(schema, expected);
     }
@@ -653,20 +638,18 @@ mod tests {
         let schema = get_log_schema()
             .project(&[CDC_NAME])
             .expect("Couldn't get remove field");
-        let expected = Arc::new(StructType::new([StructField::new(
+        let expected = Arc::new(StructType::new([StructField::nullable(
             "cdc",
             StructType::new([
-                StructField::new("path", DataType::STRING, false),
-                StructField::new(
+                StructField::not_null("path", DataType::STRING),
+                StructField::not_null(
                     "partitionValues",
                     MapType::new(DataType::STRING, DataType::STRING, true),
-                    false,
                 ),
-                StructField::new("size", DataType::LONG, false),
-                StructField::new("dataChange", DataType::BOOLEAN, false),
+                StructField::not_null("size", DataType::LONG),
+                StructField::not_null("dataChange", DataType::BOOLEAN),
                 tags_field(),
             ]),
-            true,
         )]));
         assert_eq!(schema, expected);
     }
@@ -677,14 +660,13 @@ mod tests {
             .project(&["txn"])
             .expect("Couldn't get transaction field");
 
-        let expected = Arc::new(StructType::new([StructField::new(
+        let expected = Arc::new(StructType::new([StructField::nullable(
             "txn",
             StructType::new([
-                StructField::new("appId", DataType::STRING, false),
-                StructField::new("version", DataType::LONG, false),
-                StructField::new("lastUpdated", DataType::LONG, true),
+                StructField::not_null("appId", DataType::STRING),
+                StructField::not_null("version", DataType::LONG),
+                StructField::nullable("lastUpdated", DataType::LONG),
             ]),
-            true,
         )]));
         assert_eq!(schema, expected);
     }
@@ -695,25 +677,22 @@ mod tests {
             .project(&["commitInfo"])
             .expect("Couldn't get commitInfo field");
 
-        let expected = Arc::new(StructType::new(vec![StructField::new(
+        let expected = Arc::new(StructType::new(vec![StructField::nullable(
             "commitInfo",
             StructType::new(vec![
-                StructField::new("timestamp", DataType::LONG, true),
-                StructField::new("inCommitTimestamp", DataType::LONG, true),
-                StructField::new("operation", DataType::STRING, true),
-                StructField::new(
+                StructField::nullable("timestamp", DataType::LONG),
+                StructField::nullable("inCommitTimestamp", DataType::LONG),
+                StructField::nullable("operation", DataType::STRING),
+                StructField::nullable(
                     "operationParameters",
                     MapType::new(DataType::STRING, DataType::STRING, false),
-                    true,
                 ),
-                StructField::new("kernelVersion", DataType::STRING, true),
-                StructField::new(
+                StructField::nullable("kernelVersion", DataType::STRING),
+                StructField::nullable(
                     "engineCommitInfo",
                     MapType::new(DataType::STRING, DataType::STRING, false),
-                    true,
                 ),
             ]),
-            true,
         )]));
         assert_eq!(schema, expected);
     }
