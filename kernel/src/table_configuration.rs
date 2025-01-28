@@ -28,7 +28,7 @@ use crate::{DeltaResult, Version};
 /// support can be checked with [`TableConfiguration::is_deletion_vector_supported`] and deletion
 /// vector write enablement can be checked with [`TableConfiguration::is_deletion_vector_enabled`].
 ///
-/// [`TableConfiguration`] performs checks upon construction using `TableConfiguration::try_new`
+/// [`TableConfiguration`] performs checks upon construction with `TableConfiguration::try_new`
 /// to validate that Metadata and Protocol are correctly formatted and mutually compatible. If
 /// `try_new` successfully returns `TableConfiguration`, it is also guaranteed that reading the
 /// table is supported.
