@@ -192,18 +192,18 @@ impl TableConfiguration {
                 .enable_deletion_vectors
                 .unwrap_or(false)
     }
+
+    /// Returns `true` if the table supports the appendOnly table feature. To support this feature:
+    /// - The table must have a writer version between 2 and 7 (inclusive)
+    /// - If the table is on writer version 7, it must have the [`WriterFeatures::AppendOnly`]
+    ///   writer feature.
     #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn is_append_only_supported(&self) -> bool {
-        match self.protocol.min_writer_version() {
-            7 if self
-                .protocol
-                .has_writer_feature(&WriterFeatures::AppendOnly) =>
-            {
-                true
-            }
-            ver if (2..7).contains(&ver) => true,
-            _ => false,
+        let protocol = &self.protocol;
+        match protocol.min_writer_version() {
+            7 if protocol.has_writer_feature(&WriterFeatures::AppendOnly) => true,
+            version => (2..=6).contains(&version),
         }
     }
 
