@@ -210,12 +210,11 @@ pub unsafe extern "C" fn visit_schema(
     fn visit_struct_fields(visitor: &EngineSchemaVisitor, s: &StructType) -> usize {
         let child_list_id = (visitor.make_field_list)(visitor.data, s.fields.len());
         for field in s.fields() {
-            let metadata = CStringMap::new(field.metadata_with_string_values());
             visit_schema_item(
                 field.name(),
                 field.data_type(),
                 field.is_nullable(),
-                &metadata,
+                &field.metadata_with_string_values().into(),
                 visitor,
                 child_list_id,
             );
