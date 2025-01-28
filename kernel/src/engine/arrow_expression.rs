@@ -1,5 +1,5 @@
 //! Expression handling based on arrow-rs compute kernels.
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -32,7 +32,10 @@ use crate::expressions::{
     BinaryExpression, BinaryOperator, Expression, Scalar, UnaryExpression, UnaryOperator,
     VariadicExpression, VariadicOperator,
 };
-use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField};
+use crate::schema::{
+    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
+    StructType,
+};
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
 
 // TODO leverage scalars / Datum
@@ -527,13 +530,14 @@ impl ExpressionHandler for ArrowExpressionHandler {
         })
     }
 
+    /// TODO
     fn create_one(&self, schema: SchemaRef, values: &[Scalar]) -> DeltaResult<Box<dyn EngineData>> {
         let mut array_transform = SingleRowArrayTransform::new(values);
         let datatype = schema.into();
-        array_transform
-            .transform(&datatype) // FIXME
-            .unwrap(); // FIXME
-        let array = array_transform.finish()?;
+        // we build up the array within the `SignatureArrayTransform` - we don't actually care
+        // about the 'transformed' type
+        let _transformed = array_transform.transform(&datatype);
+        let array = array_transform.into_array()?;
         let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap(); // FIXME
 
         let record_batch: RecordBatch = struct_array.into(); // FIXME will panic for top-level null
@@ -551,6 +555,8 @@ struct SingleRowArrayTransform<'a> {
     /// A stack of built arrays. After visiting children, we pop them off to
     /// build the parent container, then push the parent back on.
     stack: Vec<ArrayRef>,
+    /// If an error occurs, it will be stored here.
+    error: Option<Error>,
 }
 
 impl<'a> SingleRowArrayTransform<'a> {
@@ -559,11 +565,16 @@ impl<'a> SingleRowArrayTransform<'a> {
             scalars,
             next_scalar_idx: 0,
             stack: Vec::new(),
+            error: None,
         }
     }
 
-    /// top of `stack` should be our single-row struct array
-    fn finish(mut self) -> DeltaResult<ArrayRef> {
+    /// return the single-row array (or propagate Error). the top of `stack` should be our
+    /// single-row struct array
+    fn into_array(mut self) -> DeltaResult<ArrayRef> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
         match self.stack.pop() {
             Some(array) => Ok(array),
             None => Err(Error::generic("didn't build array")),
@@ -571,17 +582,28 @@ impl<'a> SingleRowArrayTransform<'a> {
     }
 }
 
-use crate::schema::SchemaTransform;
-use crate::schema::StructType;
-use std::borrow::Cow;
 impl<'a> SchemaTransform<'a> for SingleRowArrayTransform<'a> {
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
+        // first always check error to terminate early if possible
+        if self.error.is_some() {
+            return None;
+        }
+
         // check bounds
         if self.next_scalar_idx >= self.scalars.len() {
             return None; // TODO
         }
         let scalar = &self.scalars[self.next_scalar_idx];
         self.next_scalar_idx += 1;
+
+        let DataType::Primitive(scalar_type) = scalar.data_type() else {
+            return None; // FIXME
+        };
+        if scalar_type != *ptype {
+            self.error = Some(Error::generic(
+            "Mismatched scalar type when creating single-row array: expected {ptype}, got {scalar_type}"));
+            return None; // FIXME
+        }
 
         let arr = match scalar.to_array(1) {
             Ok(a) => a,
@@ -593,6 +615,11 @@ impl<'a> SchemaTransform<'a> for SingleRowArrayTransform<'a> {
     }
 
     fn transform_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
+        // first always check error to terminate early if possible
+        if self.error.is_some() {
+            return None;
+        }
+
         self.recurse_into_struct(stype)?;
 
         let n_fields = stype.fields.len();
@@ -626,11 +653,24 @@ impl<'a> SchemaTransform<'a> for SingleRowArrayTransform<'a> {
     }
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        // first always check error to terminate early if possible
+        if self.error.is_some() {
+            return None;
+        }
+
+        // FIXME
+        // struct field (or containing array/map) decides whether the child type is nullable (any
+        // nullable parent makes the field nullable)
         self.recurse_into_struct_field(field)
     }
 
     // For arrays, do something similar:
     fn transform_array(&mut self, atype: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
+        // first always check error to terminate early if possible
+        if self.error.is_some() {
+            return None;
+        }
+
         // Recurse into child
         self.recurse_into_array(atype)?;
 
@@ -643,6 +683,11 @@ impl<'a> SchemaTransform<'a> for SingleRowArrayTransform<'a> {
     }
 
     fn transform_map(&mut self, mtype: &'a MapType) -> Option<Cow<'a, MapType>> {
+        // first always check error to terminate early if possible
+        if self.error.is_some() {
+            return None;
+        }
+
         self.recurse_into_map(mtype)?;
 
         let value_arr = self.stack.pop().unwrap();
@@ -1016,179 +1061,130 @@ mod tests {
         assert_eq!(actual_rb, expected);
     }
 
-    //#[test]
-    //fn test_create_one_string() {
-    //    let expr = Expression::struct_from([Expression::literal("a")]);
-    //    let schema = Arc::new(crate::schema::StructType::new([StructField::new(
-    //        "col_1",
-    //        DeltaDataTypes::STRING,
-    //        true,
-    //    )]));
-    //
-    //    let handler = ArrowExpressionHandler;
-    //    let actual = handler.create_one(schema, &expr).unwrap();
-    //    let expected = record_batch!(("col_1", Utf8, ["a"])).unwrap();
-    //    let actual_rb: RecordBatch = actual
-    //        .into_any()
-    //        .downcast::<ArrowEngineData>()
-    //        .unwrap()
-    //        .into();
-    //    assert_eq!(actual_rb, expected);
-    //}
-    //
-    //#[test]
-    //fn test_create_one_null() {
-    //    let expr = Expression::struct_from([Expression::null_literal(DeltaDataTypes::INTEGER)]);
-    //    let schema = Arc::new(crate::schema::StructType::new([StructField::new(
-    //        "col_1",
-    //        DeltaDataTypes::INTEGER,
-    //        true,
-    //    )]));
-    //
-    //    let handler = ArrowExpressionHandler;
-    //    let actual = handler.create_one(schema, &expr).unwrap();
-    //    let expected = record_batch!(("col_1", Int32, [None])).unwrap();
-    //    let actual_rb: RecordBatch = actual
-    //        .into_any()
-    //        .downcast::<ArrowEngineData>()
-    //        .unwrap()
-    //        .into();
-    //    assert_eq!(actual_rb, expected);
-    //}
-    //
-    //#[test]
-    //fn test_create_one_non_null() {
-    //    let expr = Expression::struct_from([Expression::literal(1)]);
-    //    let schema = Arc::new(crate::schema::StructType::new([StructField::new(
-    //        "a",
-    //        DeltaDataTypes::INTEGER,
-    //        false,
-    //    )]));
-    //
-    //    let handler = ArrowExpressionHandler;
-    //    let actual = handler.create_one(schema, &expr).unwrap();
-    //    let expected_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
-    //        "a",
-    //        DataType::Int32,
-    //        false,
-    //    )]));
-    //    let expected =
-    //        RecordBatch::try_new(expected_schema, vec![create_array!(Int32, [1])]).unwrap();
-    //    let actual_rb: RecordBatch = actual
-    //        .into_any()
-    //        .downcast::<ArrowEngineData>()
-    //        .unwrap()
-    //        .into();
-    //    assert_eq!(actual_rb, expected);
-    //}
-    //
-    //#[test]
-    //fn test_create_one_disallow_column_ref() {
-    //    let expr = Expression::struct_from([column_expr!("a")]);
-    //    let schema = Arc::new(crate::schema::StructType::new([StructField::new(
-    //        "a",
-    //        DeltaDataTypes::INTEGER,
-    //        true,
-    //    )]));
-    //
-    //    let handler = ArrowExpressionHandler;
-    //    let actual = handler.create_one(schema, &expr);
-    //    assert!(actual.is_err());
-    //}
-    //
-    //#[test]
-    //fn test_create_one_disallow_operator() {
-    //    let expr = Expression::struct_from([Expression::binary(
-    //        BinaryOperator::Plus,
-    //        Expression::literal(1),
-    //        Expression::literal(2),
-    //    )]);
-    //    let schema = Arc::new(crate::schema::StructType::new([StructField::new(
-    //        "a",
-    //        DeltaDataTypes::INTEGER,
-    //        true,
-    //    )]));
-    //
-    //    let handler = ArrowExpressionHandler;
-    //    let actual = handler.create_one(schema, &expr);
-    //    assert!(actual.is_err());
-    //}
-    //
-    //#[test]
-    //fn test_create_one_nested() {
-    //    let expr = Expression::struct_from([Expression::struct_from([
-    //        Expression::literal(1),
-    //        Expression::literal(2),
-    //    ])]);
-    //    let schema = Arc::new(crate::schema::StructType::new([StructField::new(
-    //        "a",
-    //        DeltaDataTypes::struct_type([
-    //            StructField::new("b", DeltaDataTypes::INTEGER, true),
-    //            StructField::new("c", DeltaDataTypes::INTEGER, false),
-    //        ]),
-    //        false,
-    //    )]));
-    //
-    //    let handler = ArrowExpressionHandler;
-    //    let actual = handler.create_one(schema, &expr).unwrap();
-    //    let expected_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
-    //        "a",
-    //        DataType::Struct(
-    //            vec![
-    //                Field::new("b", DataType::Int32, true),
-    //                Field::new("c", DataType::Int32, false),
-    //            ]
-    //            .into(),
-    //        ),
-    //        false,
-    //    )]));
-    //    let expected = RecordBatch::try_new(
-    //        expected_schema,
-    //        vec![Arc::new(StructArray::from(vec![
-    //            (
-    //                Arc::new(Field::new("b", DataType::Int32, true)),
-    //                create_array!(Int32, [1]) as ArrayRef,
-    //            ),
-    //            (
-    //                Arc::new(Field::new("c", DataType::Int32, false)),
-    //                create_array!(Int32, [2]) as ArrayRef,
-    //            ),
-    //        ]))],
-    //    )
-    //    .unwrap();
-    //    let actual_rb: RecordBatch = actual
-    //        .into_any()
-    //        .downcast::<ArrowEngineData>()
-    //        .unwrap()
-    //        .into();
-    //    assert_eq!(actual_rb, expected);
-    //
-    //    // make the same but with literal struct instead of struct of literal
-    //    let struct_data = StructData::try_new(
-    //        vec![
-    //            StructField::new("b", DeltaDataTypes::INTEGER, true),
-    //            StructField::new("c", DeltaDataTypes::INTEGER, false),
-    //        ],
-    //        vec![Scalar::Integer(1), Scalar::Integer(2)],
-    //    )
-    //    .unwrap();
-    //    let expr = Expression::struct_from([Expression::literal(Scalar::Struct(struct_data))]);
-    //    let schema = Arc::new(crate::schema::StructType::new([StructField::new(
-    //        "a",
-    //        DeltaDataTypes::struct_type([
-    //            StructField::new("b", DeltaDataTypes::INTEGER, true),
-    //            StructField::new("c", DeltaDataTypes::INTEGER, false),
-    //        ]),
-    //        false,
-    //    )]));
-    //
-    //    let handler = ArrowExpressionHandler;
-    //    let actual = handler.create_one(schema, &expr).unwrap();
-    //    let actual_rb: RecordBatch = actual
-    //        .into_any()
-    //        .downcast::<ArrowEngineData>()
-    //        .unwrap()
-    //        .into();
-    //    assert_eq!(actual_rb, expected);
-    //}
+    #[test]
+    fn test_create_one_string() {
+        let values = &["a".into()];
+        let schema = Arc::new(crate::schema::StructType::new([StructField::new(
+            "col_1",
+            DeltaDataTypes::STRING,
+            true,
+        )]));
+
+        let handler = ArrowExpressionHandler;
+        let actual = handler.create_one(schema, values).unwrap();
+        let expected = record_batch!(("col_1", Utf8, ["a"])).unwrap();
+        let actual_rb: RecordBatch = actual
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+        assert_eq!(actual_rb, expected);
+    }
+
+    #[test]
+    fn test_create_one_incorrect_schema() {
+        let values = &["a".into()];
+        let schema = Arc::new(crate::schema::StructType::new([StructField::new(
+            "col_1",
+            DeltaDataTypes::INTEGER,
+            true,
+        )]));
+
+        let handler = ArrowExpressionHandler;
+        // FIXME check err
+        assert!(handler.create_one(schema, values).is_err())
+    }
+
+    #[test]
+    fn test_create_one_null() {
+        let values = &[Scalar::Null(DeltaDataTypes::INTEGER)];
+        let schema = Arc::new(crate::schema::StructType::new([StructField::new(
+            "col_1",
+            DeltaDataTypes::INTEGER,
+            true,
+        )]));
+
+        let handler = ArrowExpressionHandler;
+        let actual = handler.create_one(schema, values).unwrap();
+        let expected = record_batch!(("col_1", Int32, [None])).unwrap();
+        let actual_rb: RecordBatch = actual
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+        assert_eq!(actual_rb, expected);
+    }
+
+    #[test]
+    fn test_create_one_non_null() {
+        let values: &[Scalar] = &[1.into()];
+        let schema = Arc::new(crate::schema::StructType::new([StructField::new(
+            "a",
+            DeltaDataTypes::INTEGER,
+            false,
+        )]));
+
+        let handler = ArrowExpressionHandler;
+        let actual = handler.create_one(schema, values).unwrap();
+        let expected_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+        let expected =
+            RecordBatch::try_new(expected_schema, vec![create_array!(Int32, [1])]).unwrap();
+        let actual_rb: RecordBatch = actual
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+        assert_eq!(actual_rb, expected);
+    }
+
+    #[test]
+    fn test_create_one_nested() {
+        let values: &[Scalar] = &[1.into(), 2.into()];
+        let schema = Arc::new(crate::schema::StructType::new([StructField::new(
+            "a",
+            DeltaDataTypes::struct_type([
+                StructField::new("b", DeltaDataTypes::INTEGER, true),
+                StructField::new("c", DeltaDataTypes::INTEGER, false),
+            ]),
+            false,
+        )]));
+
+        let handler = ArrowExpressionHandler;
+        let actual = handler.create_one(schema, values).unwrap();
+        let expected_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+            "a",
+            DataType::Struct(
+                vec![
+                    Field::new("b", DataType::Int32, true),
+                    Field::new("c", DataType::Int32, false),
+                ]
+                .into(),
+            ),
+            false,
+        )]));
+        let expected = RecordBatch::try_new(
+            expected_schema,
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    Arc::new(Field::new("b", DataType::Int32, true)),
+                    create_array!(Int32, [1]) as ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new("c", DataType::Int32, false)),
+                    create_array!(Int32, [2]) as ArrayRef,
+                ),
+            ]))],
+        )
+        .unwrap();
+        let actual_rb: RecordBatch = actual
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+        assert_eq!(actual_rb, expected);
+    }
 }
