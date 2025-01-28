@@ -60,7 +60,7 @@ impl SetTransactionScanner {
             ))
         });
         self.snapshot
-            .log_segment
+            .log_segment()
             .replay(engine, schema.clone(), schema, META_PREDICATE.clone())
     }
 
