@@ -151,13 +151,8 @@ impl TableChanges {
         let end_snapshot = Snapshot::try_new(table_root.as_url().clone(), engine, end_version)?;
 
         // Verify CDF is enabled at the beginning and end of the interval using
-        // [`check_cdf_table_properties`] to fail early. This also ensures that column mapping is
-        // disabled.
-        //
-        // We also check the [`Protocol`] using [`ensure_cdf_read_supported`] to verify that
-        // we support CDF with those features enabled.
-        //
-        // Note: We must still check each metadata and protocol action in the CDF range.
+        // [`TableConfiguration::is_cdf_read_supported`] to fail early. This also ensures that
+        // column mapping is disabled.
         let check_table_config = |snapshot: &Snapshot| {
             if snapshot.table_configuration().is_cdf_read_supported() {
                 Ok(())

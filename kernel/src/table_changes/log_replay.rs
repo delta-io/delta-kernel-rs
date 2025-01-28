@@ -66,7 +66,7 @@ pub(crate) fn table_changes_action_iter(
             )
         }) //Iterator-Result-Iterator-Result
         .map(move |processed_commit| -> DeltaResult<_> {
-            commit_to_scan_batches(processed_commit?, engine.clone(), filter.clone())
+            cdf_commit_to_scan_batches(processed_commit?, engine.clone(), filter.clone())
         })
         .flatten_ok() // Iterator-Result-Result
         .map(|x| x?); // Iterator-Result
@@ -217,7 +217,6 @@ fn process_cdf_commit(
         // same as an `add` action.
         remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
     }
-
     Ok(ProcessedCdfCommit {
         timestamp: commit_file.location.last_modified,
         commit_file,
@@ -229,7 +228,7 @@ fn process_cdf_commit(
 /// Generates an iterator of [`TableChangesScanData`] by iterating over each action of the
 /// commit, generating a selection vector, and transforming the engine data. This performs
 /// phase 2 of [`LogReplayScanner`].
-fn commit_to_scan_batches(
+fn cdf_commit_to_scan_batches(
     processed_commit: ProcessedCdfCommit,
     engine: Arc<dyn Engine>,
     filter: Option<Arc<DataSkippingFilter>>,
