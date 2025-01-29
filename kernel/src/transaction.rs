@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::iter;
+use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,6 +12,7 @@ use crate::expressions::{column_expr, Scalar, StructData};
 use crate::path::ParsedLogPath;
 use crate::schema::{SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
+use crate::table_configuration::SupportError;
 use crate::{DataType, DeltaResult, Engine, EngineData, Expression, Version};
 
 use itertools::chain;
@@ -51,7 +53,7 @@ pub fn get_write_metadata_schema() -> &'static SchemaRef {
 /// txn.commit(&engine)?;
 /// ```
 pub struct Transaction {
-    read_snapshot: Arc<Snapshot>,
+    read_snapshot: WriteSupportedSnapshot,
     operation: Option<String>,
     commit_info: Option<Arc<dyn EngineData>>,
     write_metadata: Vec<Box<dyn EngineData>>,
@@ -67,6 +69,27 @@ impl std::fmt::Debug for Transaction {
     }
 }
 
+pub(crate) struct WriteSupportedSnapshot(Arc<Snapshot>);
+impl WriteSupportedSnapshot {
+    fn try_new(snapshot: Arc<Snapshot>) -> Result<Self, SupportError> {
+        snapshot.table_configuration().is_write_supported()?;
+        Ok(WriteSupportedSnapshot(snapshot))
+    }
+}
+impl TryFrom<Arc<Snapshot>> for WriteSupportedSnapshot {
+    type Error = SupportError;
+
+    fn try_from(value: Arc<Snapshot>) -> Result<Self, Self::Error> {
+        Self::try_new(value)
+    }
+}
+impl Deref for WriteSupportedSnapshot {
+    type Target = Snapshot;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
 impl Transaction {
     /// Create a new transaction from a snapshot. The snapshot will be used to read the current
     /// state of the table (e.g. to read the current version).
@@ -75,13 +98,10 @@ impl Transaction {
     /// [Table::new_transaction](crate::table::Table::new_transaction) to create a transaction from
     /// a table automatically backed by the latest snapshot.
     pub(crate) fn try_new(snapshot: impl Into<Arc<Snapshot>>) -> DeltaResult<Self> {
-        let read_snapshot = snapshot.into();
-
-        // important! before a read/write to the table we must check it is supported
-        read_snapshot.table_configuration().is_write_supported()?;
+        let read_snapshot: Arc<Snapshot> = snapshot.into();
 
         Ok(Transaction {
-            read_snapshot,
+            read_snapshot: read_snapshot.try_into()?,
             operation: None,
             commit_info: None,
             write_metadata: vec![],

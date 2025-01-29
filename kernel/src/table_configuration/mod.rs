@@ -101,28 +101,6 @@ impl Deref for ReadSupportedTableConfiguration {
     }
 }
 
-pub(crate) struct WriteSupportedTableConfiguration(TableConfiguration);
-impl WriteSupportedTableConfiguration {
-    fn try_new(table_configuration: TableConfiguration) -> SupportResult<Self> {
-        table_configuration.is_write_supported()?;
-        Ok(WriteSupportedTableConfiguration(table_configuration))
-    }
-}
-impl TryFrom<TableConfiguration> for WriteSupportedTableConfiguration {
-    type Error = SupportError;
-
-    fn try_from(value: TableConfiguration) -> Result<Self, Self::Error> {
-        Self::try_new(value)
-    }
-}
-impl Deref for WriteSupportedTableConfiguration {
-    type Target = TableConfiguration;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
 /// Holds all the configuration for a table at a specific version. This includes the supported
 /// reader and writer features, table properties, schema, version, and table root. This can be used
 /// to check whether a table supports a feature or has it enabled. For example, deletion vector
