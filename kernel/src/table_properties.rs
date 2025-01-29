@@ -200,7 +200,31 @@ pub enum CheckpointPolicy {
     /// v2 checkpoints
     V2,
 }
-
+pub(crate) mod property_names {
+    pub(crate) const APPEND_ONLY: &str = "delta.appendOnly";
+    pub(crate) const AUTO_COMPACT: &str = "delta.autoOptimize.autoCompact";
+    pub(crate) const OPTIMIZE_WRITE: &str = "delta.autoOptimize.optimizeWrite";
+    pub(crate) const CHECKPOINT_INTERVAL: &str = "delta.checkpointInterval";
+    pub(crate) const CHECKPOINT_WRITE_STATS_AS_JSON: &str = "delta.checkpoint.writeStatsAsJson";
+    pub(crate) const CHECKPOINT_WRITE_STATS_AS_STRUCT: &str = "delta.checkpoint.writeStatsAsStruct";
+    pub(crate) const COLUMN_MAPPING_MODE: &str = "delta.columnMapping.mode";
+    pub(crate) const DATA_SKIPPING_NUM_INDEXED_COLS: &str = "delta.dataSkippingNumIndexedCols";
+    pub(crate) const DATA_SKIPPING_STATS_COLUMNS: &str = "delta.dataSkippingStatsColumns";
+    pub(crate) const DELETED_FILE_RETENTION_DURATION: &str = "delta.deletedFileRetentionDuration";
+    pub(crate) const ENABLE_CHANGE_DATA_FEED: &str = "delta.enableChangeDataFeed";
+    pub(crate) const ENABLE_DELETION_VECTORS: &str = "delta.enableDeletionVectors";
+    pub(crate) const ISOLATION_LEVEL: &str = "delta.isolationLevel";
+    pub(crate) const LOG_RETENTION_DURATION: &str = "delta.logRetentionDuration";
+    pub(crate) const ENABLE_EXPIRED_LOG_CLEANUP: &str = "delta.enableExpiredLogCleanup";
+    pub(crate) const RANDOMIZE_FILE_PREFIXES: &str = "delta.randomizeFilePrefixes";
+    pub(crate) const RANDOM_PREFIX_LENGTH: &str = "delta.randomPrefixLength";
+    pub(crate) const SET_TRANSACTION_RETENTION_DURATION: &str =
+        "delta.setTransactionRetentionDuration";
+    pub(crate) const TARGET_FILE_SIZE: &str = "delta.targetFileSize";
+    pub(crate) const TUNE_FILE_SIZES_FOR_REWRITES: &str = "delta.tuneFileSizesForRewrites";
+    pub(crate) const CHECKPOINT_POLICY: &str = "delta.checkpointPolicy";
+    pub(crate) const ENABLE_ROW_TRACKING: &str = "delta.enableRowTracking";
+}
 #[cfg(test)]
 mod tests {
     use super::*;

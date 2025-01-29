@@ -154,10 +154,10 @@ impl TableChanges {
         // [`TableConfiguration::is_cdf_read_supported`] to fail early. This also ensures that
         // column mapping is disabled.
         let check_table_config = |snapshot: &Snapshot| {
-            if snapshot.table_configuration().is_cdf_read_supported() {
-                Ok(())
+            if let Err(err) = snapshot.table_configuration().is_cdf_read_supported() {
+                Err(Error::change_data_feed_unsupported(snapshot.version(), err))
             } else {
-                Err(Error::change_data_feed_unsupported(snapshot.version()))
+                Ok(())
             }
         };
         check_table_config(&start_snapshot)?;
@@ -229,6 +229,8 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::schema::{DataType, StructField};
     use crate::table_changes::CDF_FIELDS;
+    use crate::table_configuration::SupportError;
+    use crate::table_properties::property_names::ENABLE_CHANGE_DATA_FEED;
     use crate::{Error, Table};
     use itertools::assert_equal;
 
@@ -251,7 +253,14 @@ mod tests {
         let invalid_ranges = [(0, 2), (1, 2), (2, 2), (2, 3)];
         for (start_version, end_version) in invalid_ranges {
             let res = table.table_changes(engine.as_ref(), start_version, end_version);
-            assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))))
+            let Err(Error::ChangeDataFeedUnsupported(
+                2,
+                SupportError::MissingTableProperty(property),
+            )) = res
+            else {
+                panic!("Expected CDF to fail in version range ({start_version}, {end_version})");
+            };
+            assert_eq!(property, ENABLE_CHANGE_DATA_FEED);
         }
     }
     #[test]

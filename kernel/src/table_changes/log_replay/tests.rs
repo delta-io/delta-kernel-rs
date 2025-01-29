@@ -10,8 +10,9 @@ use crate::path::ParsedLogPath;
 use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
 use crate::schema::{DataType, StructField, StructType};
-use crate::table_configuration::TableConfiguration;
+use crate::table_configuration::{SupportError, TableConfiguration};
 use crate::table_features::{ReaderFeatures, WriterFeatures};
+use crate::table_properties::property_names::{COLUMN_MAPPING_MODE, ENABLE_CHANGE_DATA_FEED};
 use crate::utils::test_utils::{Action, LocalMockTable};
 use crate::Expression;
 use crate::{DeltaResult, Engine, Error, Version};
@@ -124,6 +125,11 @@ async fn cdf_not_enabled() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
     let schema_string = serde_json::to_string(&get_schema()).unwrap();
+    let table_config = table_config(mock_table.table_root());
+    mock_table.commit([
+        Action::Protocol(table_config.protocol().clone()),
+        Action::Metadata(table_config.metadata().clone()),
+    ]);
     mock_table
         .commit([Action::Metadata(Metadata {
             schema_string,
@@ -139,19 +145,28 @@ async fn cdf_not_enabled() {
         .unwrap()
         .into_iter();
 
-    let table_config = table_config(mock_table.table_root());
     let res: DeltaResult<Vec<_>> =
         table_changes_action_iter(engine, commits, get_schema().into(), None, table_config)
             .unwrap()
             .try_collect();
 
-    assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))));
+    let Err(Error::ChangeDataFeedUnsupported(1, SupportError::MissingTableProperty(property))) =
+        res
+    else {
+        panic!("CDF should fail on table that does not enable it");
+    };
+    assert_eq!(property, ENABLE_CHANGE_DATA_FEED);
 }
 
 #[tokio::test]
 async fn unsupported_reader_feature() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
+    let table_config = table_config(mock_table.table_root());
+    mock_table.commit([
+        Action::Protocol(table_config.protocol().clone()),
+        Action::Metadata(table_config.metadata().clone()),
+    ]);
     mock_table
         .commit([Action::Protocol(
             Protocol::try_new(
@@ -171,19 +186,30 @@ async fn unsupported_reader_feature() {
         .unwrap()
         .into_iter();
 
-    let table_config = table_config(mock_table.table_root());
     let res: DeltaResult<Vec<_>> =
         table_changes_action_iter(engine, commits, get_schema().into(), None, table_config)
             .unwrap()
             .try_collect();
 
-    assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))));
+    let Err(Error::ChangeDataFeedUnsupported(1, SupportError::UnsupportedReaderFeatures(set))) =
+        res
+    else {
+        unreachable!();
+    };
+    assert!(set.len() == 1);
+    assert!(set.contains(&ReaderFeatures::ColumnMapping));
 }
 #[tokio::test]
 async fn column_mapping_should_fail() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
     let schema_string = serde_json::to_string(&get_schema()).unwrap();
+
+    let table_config = table_config(mock_table.table_root());
+    mock_table.commit([
+        Action::Protocol(table_config.protocol().clone()),
+        Action::Metadata(table_config.metadata().clone()),
+    ]);
     mock_table
         .commit([Action::Metadata(Metadata {
             schema_string,
@@ -199,17 +225,21 @@ async fn column_mapping_should_fail() {
         })])
         .await;
 
-    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 1, None)
         .unwrap()
         .into_iter();
 
-    let table_config = table_config(mock_table.table_root());
     let res: DeltaResult<Vec<_>> =
         table_changes_action_iter(engine, commits, get_schema().into(), None, table_config)
             .unwrap()
             .try_collect();
 
-    assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))));
+    let Err(Error::ChangeDataFeedUnsupported(1, SupportError::UnsupportedTableProperty(property))) =
+        res
+    else {
+        unreachable!()
+    };
+    assert_eq!(property, COLUMN_MAPPING_MODE);
 }
 
 // Note: This should be removed once type widening support is added for CDF

@@ -7,8 +7,8 @@ use std::{
 };
 
 use crate::schema::{DataType, StructType};
-use crate::table_properties::ParseIntervalError;
-use crate::Version;
+use crate::{table_configuration::SupportError, Version};
+use crate::{table_configuration::TableConfigurationError, table_properties::ParseIntervalError};
 
 /// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
@@ -186,8 +186,8 @@ pub enum Error {
     #[error(transparent)]
     ParseIntervalError(#[from] ParseIntervalError),
 
-    #[error("Change data feed is unsupported for the table at version {0}")]
-    ChangeDataFeedUnsupported(Version),
+    #[error("Change data feed is unsupported for the table at version {0} due to an unsupported protocol or metadata: {1}")]
+    ChangeDataFeedUnsupported(Version, SupportError),
 
     #[error("Change data feed encountered incompatible schema. Expected {0}, got {1}")]
     ChangeDataFeedIncompatibleSchema(String, String),
@@ -195,6 +195,10 @@ pub enum Error {
     /// Invalid checkpoint files
     #[error("Invalid Checkpoint: {0}")]
     InvalidCheckpoint(String),
+
+    /// Table Configuration Error
+    #[error("{0}")]
+    TableConfigurationError(#[from] TableConfigurationError),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -258,8 +262,8 @@ impl Error {
     pub fn unsupported(msg: impl ToString) -> Self {
         Self::Unsupported(msg.to_string())
     }
-    pub fn change_data_feed_unsupported(version: impl Into<Version>) -> Self {
-        Self::ChangeDataFeedUnsupported(version.into())
+    pub fn change_data_feed_unsupported(version: impl Into<Version>, err: SupportError) -> Self {
+        Self::ChangeDataFeedUnsupported(version.into(), err)
     }
     pub(crate) fn change_data_feed_incompatible_schema(
         expected: &StructType,

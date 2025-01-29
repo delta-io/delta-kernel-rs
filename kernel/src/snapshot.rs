@@ -10,7 +10,9 @@ use crate::actions::{Metadata, Protocol};
 use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
 use crate::schema::Schema;
-use crate::table_configuration::TableConfiguration;
+use crate::table_configuration::{
+    ReadSupportedTableConfiguration, TableConfiguration, TableConfigurationError,
+};
 use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, Error, FileSystemClient, Version};
@@ -23,7 +25,7 @@ const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 /// frozen log segment.
 pub struct Snapshot {
     log_segment: LogSegment,
-    table_configuration: TableConfiguration,
+    table_configuration: ReadSupportedTableConfiguration,
 }
 
 impl Drop for Snapshot {
@@ -74,8 +76,11 @@ impl Snapshot {
         engine: &dyn Engine,
     ) -> DeltaResult<Self> {
         let (metadata, protocol) = log_segment.read_metadata(engine)?;
-        let table_configuration =
-            TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
+        let table_configuration = ReadSupportedTableConfiguration::try_from(
+            TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?,
+        )
+        .map_err(TableConfigurationError::SupportError)?;
+
         Ok(Self {
             log_segment,
             table_configuration,

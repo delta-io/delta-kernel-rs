@@ -50,6 +50,20 @@ pub enum ReaderFeatures {
     VacuumProtocolCheck,
 }
 
+impl From<&ReaderFeatures> for WriterFeatures {
+    fn from(value: &ReaderFeatures) -> Self {
+        match value {
+            ReaderFeatures::ColumnMapping => WriterFeatures::ColumnMapping,
+            ReaderFeatures::DeletionVectors => WriterFeatures::DeletionVectors,
+            ReaderFeatures::TimestampWithoutTimezone => WriterFeatures::TimestampWithoutTimezone,
+            ReaderFeatures::TypeWidening => WriterFeatures::TypeWidening,
+            ReaderFeatures::TypeWideningPreview => WriterFeatures::TypeWideningPreview,
+            ReaderFeatures::V2Checkpoint => WriterFeatures::V2Checkpoint,
+            ReaderFeatures::VacuumProtocolCheck => WriterFeatures::VacuumProtocolCheck,
+        }
+    }
+}
+
 /// Similar to reader features, writer features communicate capabilities that must be implemented
 /// in order to correctly write to a given table. That is, writers must implement and respect all
 /// features listed in a table's `WriterFeatures`.
