@@ -269,16 +269,9 @@ type CScanCallback = extern "C" fn(
     partition_map: &CStringMap,
 );
 
+#[derive(Default)]
 pub struct CStringMap {
     values: HashMap<String, String>,
-}
-
-impl CStringMap {
-    pub fn default() -> Self {
-        Self {
-            values: Default::default(),
-        }
-    }
 }
 
 impl From<HashMap<String, String>> for CStringMap {
