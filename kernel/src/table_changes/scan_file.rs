@@ -353,13 +353,12 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let protocol = Protocol::try_new(
+        let protocol = Protocol::new(
             3,
             7,
             Some::<Vec<String>>(vec![]),
             Some::<Vec<String>>(vec![]),
-        )
-        .unwrap();
+        );
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
 
         let scan_data = table_changes_action_iter(

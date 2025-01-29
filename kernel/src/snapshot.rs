@@ -10,9 +10,7 @@ use crate::actions::{Metadata, Protocol};
 use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
 use crate::schema::Schema;
-use crate::table_configuration::{
-    ReadSupportedTableConfiguration, TableConfiguration, TableConfigurationError,
-};
+use crate::table_configuration::{ReadSupportedTableConfiguration, TableConfiguration};
 use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, Error, FileSystemClient, Version};
@@ -78,8 +76,7 @@ impl Snapshot {
         let (metadata, protocol) = log_segment.read_metadata(engine)?;
         let table_configuration = ReadSupportedTableConfiguration::try_from(
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?,
-        )
-        .map_err(TableConfigurationError::SupportError)?;
+        )?;
 
         Ok(Self {
             log_segment,
@@ -218,8 +215,7 @@ mod tests {
         let engine = SyncEngine::new();
         let snapshot = Snapshot::try_new(url, &engine, Some(1)).unwrap();
 
-        let expected =
-            Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
+        let expected = Protocol::new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"]));
         assert_eq!(snapshot.protocol(), &expected);
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
@@ -236,8 +232,7 @@ mod tests {
         let engine = SyncEngine::new();
         let snapshot = Snapshot::try_new(url, &engine, None).unwrap();
 
-        let expected =
-            Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
+        let expected = Protocol::new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"]));
         assert_eq!(snapshot.protocol(), &expected);
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;

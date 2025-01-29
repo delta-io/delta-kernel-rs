@@ -7,8 +7,10 @@ use std::{
 };
 
 use crate::schema::{DataType, StructType};
+use crate::{
+    table_configuration::InvalidTableConfigurationError, table_properties::ParseIntervalError,
+};
 use crate::{table_configuration::SupportError, Version};
-use crate::{table_configuration::TableConfigurationError, table_properties::ParseIntervalError};
 
 /// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
@@ -197,8 +199,12 @@ pub enum Error {
     InvalidCheckpoint(String),
 
     /// Table Configuration Error
-    #[error("{0}")]
-    TableConfigurationError(#[from] TableConfigurationError),
+    #[error("Got an invalid table configuration: {0}")]
+    InvalidTableConfigurationError(#[from] InvalidTableConfigurationError),
+
+    /// Table Configuration Error
+    #[error("The table configuration is not supported in kernel: {0}")]
+    SupportError(#[from] SupportError),
 }
 
 // Convenience constructors for Error types that take a String argument

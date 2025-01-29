@@ -10,8 +10,7 @@ use crate::actions::schemas::GetStructField;
 use crate::schema::{SchemaRef, StructType};
 use crate::table_features::{ReaderFeatures, WriterFeatures};
 use crate::table_properties::TableProperties;
-use crate::utils::require;
-use crate::{DeltaResult, EngineData, Error, RowVisitor as _};
+use crate::{DeltaResult, EngineData, RowVisitor as _};
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use delta_kernel_derive::Schema;
@@ -159,6 +158,24 @@ pub struct Protocol {
 }
 
 impl Protocol {
+    /// Try to create a new Protocol instance from reader/writer versions and table features. This
+    /// can fail if the protocol is invalid.
+    pub fn new(
+        min_reader_version: i32,
+        min_writer_version: i32,
+        reader_features: Option<impl IntoIterator<Item = impl Into<String>>>,
+        writer_features: Option<impl IntoIterator<Item = impl Into<String>>>,
+    ) -> Self {
+        let reader_features = reader_features.map(|f| f.into_iter().map(Into::into).collect());
+        let writer_features = writer_features.map(|f| f.into_iter().map(Into::into).collect());
+        Protocol {
+            min_reader_version,
+            min_writer_version,
+            reader_features,
+            writer_features,
+        }
+    }
+
     /// Create a new Protocol by visiting the EngineData and extracting the first protocol row into
     /// a Protocol instance. If no protocol row is found, returns Ok(None).
     pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {

@@ -44,13 +44,15 @@ fn table_config(path: &Path) -> TableConfiguration {
         ]),
         ..Default::default()
     };
-    let protocol = Protocol::try_new(
+    let protocol = Protocol::new(
         3,
         7,
         Some([ReaderFeatures::DeletionVectors]),
-        Some([WriterFeatures::ColumnMapping]),
-    )
-    .unwrap();
+        Some([
+            WriterFeatures::DeletionVectors,
+            WriterFeatures::ColumnMapping,
+        ]),
+    );
     TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap()
 }
 
@@ -97,15 +99,15 @@ async fn metadata_protocol() {
                 ]),
                 ..Default::default()
             }),
-            Action::Protocol(
-                Protocol::try_new(
-                    3,
-                    7,
-                    Some([ReaderFeatures::DeletionVectors]),
-                    Some([ReaderFeatures::ColumnMapping]),
-                )
-                .unwrap(),
-            ),
+            Action::Protocol(Protocol::new(
+                3,
+                7,
+                Some([ReaderFeatures::DeletionVectors]),
+                Some([
+                    WriterFeatures::DeletionVectors,
+                    WriterFeatures::ColumnMapping,
+                ]),
+            )),
         ])
         .await;
 
@@ -126,10 +128,12 @@ async fn cdf_not_enabled() {
     let mut mock_table = LocalMockTable::new();
     let schema_string = serde_json::to_string(&get_schema()).unwrap();
     let table_config = table_config(mock_table.table_root());
-    mock_table.commit([
-        Action::Protocol(table_config.protocol().clone()),
-        Action::Metadata(table_config.metadata().clone()),
-    ]);
+    mock_table
+        .commit([
+            Action::Protocol(table_config.protocol().clone()),
+            Action::Metadata(table_config.metadata().clone()),
+        ])
+        .await;
     mock_table
         .commit([Action::Metadata(Metadata {
             schema_string,
@@ -163,23 +167,25 @@ async fn unsupported_reader_feature() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
     let table_config = table_config(mock_table.table_root());
-    mock_table.commit([
-        Action::Protocol(table_config.protocol().clone()),
-        Action::Metadata(table_config.metadata().clone()),
-    ]);
     mock_table
-        .commit([Action::Protocol(
-            Protocol::try_new(
-                3,
-                7,
-                Some([
-                    ReaderFeatures::DeletionVectors,
-                    ReaderFeatures::ColumnMapping,
-                ]),
-                Some([""; 0]),
-            )
-            .unwrap(),
-        )])
+        .commit([
+            Action::Protocol(table_config.protocol().clone()),
+            Action::Metadata(table_config.metadata().clone()),
+        ])
+        .await;
+    mock_table
+        .commit([Action::Protocol(Protocol::new(
+            3,
+            7,
+            Some([
+                ReaderFeatures::DeletionVectors,
+                ReaderFeatures::ColumnMapping,
+            ]),
+            Some([
+                WriterFeatures::DeletionVectors,
+                WriterFeatures::ColumnMapping,
+            ]),
+        ))])
         .await;
 
     let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
@@ -206,10 +212,12 @@ async fn column_mapping_should_fail() {
     let schema_string = serde_json::to_string(&get_schema()).unwrap();
 
     let table_config = table_config(mock_table.table_root());
-    mock_table.commit([
-        Action::Protocol(table_config.protocol().clone()),
-        Action::Metadata(table_config.metadata().clone()),
-    ]);
+    mock_table
+        .commit([
+            Action::Protocol(table_config.protocol().clone()),
+            Action::Metadata(table_config.metadata().clone()),
+        ])
+        .await;
     mock_table
         .commit([Action::Metadata(Metadata {
             schema_string,
@@ -624,13 +632,12 @@ async fn failing_protocol() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
 
-    let protocol = Protocol::try_new(
+    let protocol = Protocol::new(
         3,
         1,
         ["fake_feature".to_string()].into(),
         ["fake_feature".to_string()].into(),
-    )
-    .unwrap();
+    );
 
     mock_table
         .commit([

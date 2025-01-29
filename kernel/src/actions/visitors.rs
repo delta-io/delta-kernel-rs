@@ -129,12 +129,12 @@ impl ProtocolVisitor {
         let writer_features: Option<Vec<_>> =
             getters[3].get_opt(row_index, "protocol.writer_features")?;
 
-        Protocol::try_new(
+        Ok(Protocol::new(
             min_reader_version,
             min_writer_version,
             reader_features,
             writer_features,
-        )
+        ))
     }
 }
 

@@ -11,7 +11,6 @@ use crate::expressions::{column_expr, Scalar, StructData};
 use crate::path::ParsedLogPath;
 use crate::schema::{SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
-use crate::table_configuration::TableConfigurationError;
 use crate::{DataType, DeltaResult, Engine, EngineData, Expression, Version};
 
 use itertools::chain;
@@ -79,10 +78,7 @@ impl Transaction {
         let read_snapshot = snapshot.into();
 
         // important! before a read/write to the table we must check it is supported
-        read_snapshot
-            .table_configuration()
-            .is_write_supported()
-            .map_err(TableConfigurationError::SupportError)?;
+        read_snapshot.table_configuration().is_write_supported()?;
 
         Ok(Transaction {
             read_snapshot,
