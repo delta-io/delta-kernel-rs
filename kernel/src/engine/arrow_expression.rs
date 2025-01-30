@@ -1,5 +1,6 @@
 //! Expression handling based on arrow-rs compute kernels.
 use std::borrow::Borrow;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -32,6 +33,7 @@ use crate::expressions::{
     BinaryExpression, BinaryOperator, Expression, Scalar, UnaryExpression, UnaryOperator,
     VariadicExpression, VariadicOperator,
 };
+use crate::predicates::PredicateEvaluatorDefaults;
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField};
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
 
@@ -280,6 +282,83 @@ fn evaluate_expression(
                     (ArrowDataType::Decimal256(_, _), Decimal256Type)
                 }
             }
+            (Column(name), Literal(Scalar::Array(ad))) => {
+                fn op<T: ArrowPrimitiveType>(
+                    values: &dyn Array,
+                    from: fn(T::Native) -> Scalar,
+                ) -> impl Iterator<Item = Option<Scalar>> + '_ {
+                    values.as_primitive::<T>().iter().map(move |v| v.map(from))
+                }
+
+                fn str_op<'a>(
+                    column: impl IntoIterator<Item = Option<&'a str>> + 'a,
+                ) -> impl Iterator<Item = Option<Scalar>> + 'a {
+                    column.into_iter().map(|v| v.map(Scalar::from))
+                }
+
+                fn op_in(
+                    inlist: &[Scalar],
+                    values: impl Iterator<Item = Option<Scalar>>,
+                ) -> BooleanArray {
+                    // `v IN (k1, ..., kN)` is logically equivalent to `v = k1 OR ... OR v = kN`, so evaluate
+                    // it as such, ensuring correct handling of NULL inputs (including `Scalar::Null`).
+                    values
+                        .map(|v| {
+                            PredicateEvaluatorDefaults::finish_eval_variadic(
+                                VariadicOperator::Or,
+                                inlist
+                                    .iter()
+                                    .map(|k| Some(v.as_ref()?.partial_cmp(k)? == Ordering::Equal)),
+                                false,
+                            )
+                        })
+                        .collect()
+                }
+
+                #[allow(deprecated)]
+                let inlist = ad.array_elements();
+                let column = extract_column(batch, name)?;
+                let data_type = ad
+                    .array_type()
+                    .element_type()
+                    .as_primitive_opt()
+                    .ok_or_else(|| {
+                        Error::invalid_expression(format!(
+                            "IN only supports array literals with primitive elements, got: '{:?}'",
+                            ad.array_type().element_type()
+                        ))
+                    })?;
+
+                // safety: as_* methods on arrow arrays can panic, but we checked the data type before applying.
+                let arr = match (column.data_type(), data_type) {
+                    (ArrowDataType::Utf8, PrimitiveType::String) => op_in(inlist, str_op(column.as_string::<i32>())),
+                    (ArrowDataType::LargeUtf8, PrimitiveType::String) => op_in(inlist, str_op(column.as_string::<i64>())),
+                    (ArrowDataType::Utf8View, PrimitiveType::String) => op_in(inlist, str_op(column.as_string_view())),
+                    (ArrowDataType::Int8, PrimitiveType::Byte) => op_in(inlist,op::<Int8Type>( &column, Scalar::from)),
+                    (ArrowDataType::Int16, PrimitiveType::Short) => op_in(inlist,op::<Int16Type>(&column, Scalar::from)),
+                    (ArrowDataType::Int32, PrimitiveType::Integer) => op_in(inlist,op::<Int32Type>(&column, Scalar::from)),
+                    (ArrowDataType::Int64, PrimitiveType::Long) => op_in(inlist,op::<Int64Type>(&column, Scalar::from)),
+                    (ArrowDataType::Float32, PrimitiveType::Float) => op_in(inlist,op::<Float32Type>(&column, Scalar::from)),
+                    (ArrowDataType::Float64, PrimitiveType::Double) => {op_in(inlist,op::<Float64Type>(&column, Scalar::from))},
+                    (ArrowDataType::Date32, PrimitiveType::Date) => {
+                        op_in(inlist,op::<Date32Type>(&column, Scalar::Date))
+                    },
+                    (
+                        ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_)),
+                        PrimitiveType::Timestamp,
+                    ) => op_in(inlist,op::<TimestampMicrosecondType>(column.as_ref(), Scalar::Timestamp)),
+                    (
+                        ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+                        PrimitiveType::TimestampNtz,
+                    ) => op_in(inlist,op::<TimestampMicrosecondType>(column.as_ref(), Scalar::TimestampNtz)),
+                    (l, r) => {
+                        return Err(Error::invalid_expression(format!(
+                        "Cannot check if value of type '{l}' is contained in array with values of type '{r}'"
+                    )))
+                    }
+                };
+                Ok(Arc::new(arr))
+            }
             (Literal(lit), Literal(Scalar::Array(ad))) => {
                 #[allow(deprecated)]
                 let exists = ad.array_elements().contains(lit);
@@ -382,8 +461,8 @@ fn new_field_with_metadata(
 
 // A helper that is a wrapper over `transform_field_and_col`. This will take apart the passed struct
 // and use that method to transform each column and then put the struct back together. Target types
-// and names for each column should be passed in `target_types_and_names`. The number of elements in
-// the `target_types_and_names` iterator _must_ be the same as the number of columns in
+// and names for each column should be passed in `target_fields`. The number of elements in
+// the `target_fields` iterator _must_ be the same as the number of columns in
 // `struct_array`. The transformation is ordinal. That is, the order of fields in `target_fields`
 // _must_ match the order of the columns in `struct_array`.
 fn transform_struct(
@@ -689,6 +768,85 @@ mod tests {
 
         let in_result = evaluate_expression(&str_not_op, &batch, None).unwrap();
         let in_expected = BooleanArray::from(vec![false, false, false]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+    }
+
+    #[test]
+    fn test_column_in_array() {
+        let values = Int32Array::from(vec![0, 1, 2, 3]);
+        let field = Arc::new(Field::new("item", DataType::Int32, true));
+        let rhs = Expression::literal(Scalar::Array(ArrayData::new(
+            ArrayType::new(PrimitiveType::Integer.into(), false),
+            [Scalar::Integer(1), Scalar::Integer(3)],
+        )));
+        let schema = Schema::new([field.clone()]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
+
+        let in_op = Expression::binary(BinaryOperator::In, column_expr!("item"), rhs.clone());
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
+        let in_expected = BooleanArray::from(vec![false, true, false, true]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        let not_in_op = Expression::binary(BinaryOperator::NotIn, column_expr!("item"), rhs);
+        let not_in_result =
+            evaluate_expression(&not_in_op, &batch, Some(&crate::schema::DataType::BOOLEAN))
+                .unwrap();
+        let not_in_expected = BooleanArray::from(vec![true, false, true, false]);
+        assert_eq!(not_in_result.as_ref(), &not_in_expected);
+
+        let in_expected = BooleanArray::from(vec![false, true, false, true]);
+
+        // Date arrays
+        let values = Date32Array::from(vec![0, 1, 2, 3]);
+        let field = Arc::new(Field::new("item", DataType::Date32, true));
+        let rhs = Expression::literal(Scalar::Array(ArrayData::new(
+            ArrayType::new(PrimitiveType::Date.into(), false),
+            [Scalar::Date(1), Scalar::Date(3)],
+        )));
+        let schema = Schema::new([field.clone()]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
+        let in_op = Expression::binary(BinaryOperator::In, column_expr!("item"), rhs.clone());
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        // Timestamp arrays
+        let values = TimestampMicrosecondArray::from(vec![0, 1, 2, 3]).with_timezone("UTC");
+        let field = Arc::new(Field::new(
+            "item",
+            (&crate::schema::DataType::TIMESTAMP).try_into().unwrap(),
+            true,
+        ));
+        let rhs = Expression::literal(Scalar::Array(ArrayData::new(
+            ArrayType::new(PrimitiveType::Timestamp.into(), false),
+            [Scalar::Timestamp(1), Scalar::Timestamp(3)],
+        )));
+        let schema = Schema::new([field.clone()]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
+        let in_op = Expression::binary(BinaryOperator::In, column_expr!("item"), rhs.clone());
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        // Timestamp NTZ arrays
+        let values = TimestampMicrosecondArray::from(vec![0, 1, 2, 3]);
+        let field = Arc::new(Field::new(
+            "item",
+            (&crate::schema::DataType::TIMESTAMP_NTZ)
+                .try_into()
+                .unwrap(),
+            true,
+        ));
+        let rhs = Expression::literal(Scalar::Array(ArrayData::new(
+            ArrayType::new(PrimitiveType::TimestampNtz.into(), false),
+            [Scalar::TimestampNtz(1), Scalar::TimestampNtz(3)],
+        )));
+        let schema = Schema::new([field.clone()]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
+        let in_op = Expression::binary(BinaryOperator::In, column_expr!("item"), rhs.clone());
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
         assert_eq!(in_result.as_ref(), &in_expected);
     }
 

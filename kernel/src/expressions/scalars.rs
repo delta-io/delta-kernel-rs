@@ -89,7 +89,7 @@ impl StructData {
 
 /// A single value, which can be null. Used for representing literal values
 /// in [Expressions][crate::expressions::Expression].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Scalar {
     /// 32bit integer
     Integer(i32),
@@ -221,6 +221,12 @@ impl Display for Scalar {
                 write!(f, ")")
             }
         }
+    }
+}
+
+impl PartialEq for Scalar {
+    fn eq(&self, other: &Scalar) -> bool {
+        self.partial_cmp(other) == Some(Ordering::Equal)
     }
 }
 
@@ -585,6 +591,7 @@ mod tests {
         assert_eq!(&format!("{}", column_op), "3.1415927 IN Column(item)");
         assert_eq!(&format!("{}", column_not_op), "'Cool' NOT IN Column(item)");
     }
+
     #[test]
     fn test_timestamp_parse() {
         let assert_timestamp_eq = |scalar_string, micros| {
@@ -599,6 +606,7 @@ mod tests {
         assert_timestamp_eq("2011-01-11 13:06:07.123456", 1294751167123456);
         assert_timestamp_eq("1970-01-01 00:00:00", 0);
     }
+
     #[test]
     fn test_timestamp_ntz_parse() {
         let assert_timestamp_eq = |scalar_string, micros| {
@@ -626,5 +634,37 @@ mod tests {
 
         let p_type = PrimitiveType::Timestamp;
         assert_timestamp_fails(&p_type, "1971-07-22");
+    }
+
+    #[test]
+    fn test_partial_cmp() {
+        let a = Scalar::Integer(1);
+        let b = Scalar::Integer(2);
+        let c = Scalar::Null(DataType::INTEGER);
+        assert_eq!(a.partial_cmp(&b), Some(Ordering::Less));
+        assert_eq!(b.partial_cmp(&a), Some(Ordering::Greater));
+        assert_eq!(a.partial_cmp(&a), Some(Ordering::Equal));
+        assert_eq!(b.partial_cmp(&b), Some(Ordering::Equal));
+        assert_eq!(a.partial_cmp(&c), None);
+        assert_eq!(c.partial_cmp(&a), None);
+
+        // assert that NULL values are incomparable
+        let null = Scalar::Null(DataType::INTEGER);
+        assert_eq!(null.partial_cmp(&null), None);
+    }
+
+    #[test]
+    fn test_partial_eq() {
+        let a = Scalar::Integer(1);
+        let b = Scalar::Integer(2);
+        let c = Scalar::Null(DataType::INTEGER);
+        assert!(!a.eq(&b));
+        assert!(a.eq(&a));
+        assert!(!a.eq(&c));
+        assert!(!c.eq(&a));
+
+        // assert that NULL values are incomparable
+        let null = Scalar::Null(DataType::INTEGER);
+        assert!(!null.eq(&null));
     }
 }

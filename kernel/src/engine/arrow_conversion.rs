@@ -208,7 +208,7 @@ impl TryFrom<&ArrowDataType> for DataType {
             ArrowDataType::Date64 => Ok(DataType::DATE),
             ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => Ok(DataType::TIMESTAMP_NTZ),
             ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(tz))
-                if tz.eq_ignore_ascii_case("utc") =>
+                if tz.eq_ignore_ascii_case("utc") || tz.eq_ignore_ascii_case("+00:00") =>
             {
                 Ok(DataType::TIMESTAMP)
             }
