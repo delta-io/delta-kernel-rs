@@ -12,18 +12,18 @@ use crate::{
     DeltaResult, EngineData, Error,
 };
 
-use arrow_array::{
+use crate::arrow::array::{
     cast::AsArray, new_null_array, Array as ArrowArray, GenericListArray, OffsetSizeTrait,
     RecordBatch, StringArray, StructArray,
 };
-use arrow_json::{LineDelimitedWriter, ReaderBuilder};
-use arrow_schema::{
+use crate::arrow::json::{LineDelimitedWriter, ReaderBuilder};
+use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef, Fields,
     SchemaRef as ArrowSchemaRef,
 };
-use arrow_select::concat::concat_batches;
+use crate::arrow::compute::concat_batches;
+use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 use itertools::Itertools;
-use parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 use tracing::debug;
 
 macro_rules! prim_array_cmp {
@@ -40,7 +40,7 @@ macro_rules! prim_array_cmp {
                         .ok_or(Error::invalid_expression(
                             format!("Cannot cast to list array: {}", $right_arr.data_type()))
                         )?;
-                arrow_ord::comparison::in_list(prim_array, list_array).map(wrap_comparison_result)
+                crate::arrow::compute::kernels::comparison::in_list(prim_array, list_array).map(wrap_comparison_result)
             }
         )+
             _ => Err(ArrowError::CastError(
@@ -59,7 +59,7 @@ pub(crate) use prim_array_cmp;
 /// returns a tuples of (mask_indices: Vec<parquet_schema_index>, reorder_indices:
 /// Vec<requested_index>). `mask_indices` is used for generating the mask for reading from the
 pub(crate) fn make_arrow_error(s: impl Into<String>) -> Error {
-    Error::Arrow(arrow_schema::ArrowError::InvalidArgumentError(s.into())).with_backtrace()
+    Error::Arrow(crate::arrow::error::ArrowError::InvalidArgumentError(s.into())).with_backtrace()
 }
 
 /*
@@ -500,7 +500,7 @@ pub(crate) fn reorder_struct_array(
             match &reorder_index.transform {
                 ReorderIndexTransform::Cast(target) => {
                     let col = input_cols[parquet_position].as_ref();
-                    let col = Arc::new(arrow_cast::cast::cast(col, target)?);
+                    let col = Arc::new(crate::arrow::compute::cast(col, target)?);
                     let new_field = Arc::new(
                         input_fields[parquet_position]
                             .as_ref()
@@ -679,14 +679,14 @@ pub(crate) fn to_json_bytes(
 mod tests {
     use std::sync::Arc;
 
-    use arrow::{
+    use crate::arrow::{
         array::AsArray,
         buffer::{OffsetBuffer, ScalarBuffer},
     };
-    use arrow_array::{
+    use crate::arrow::array::{
         Array, ArrayRef as ArrowArrayRef, BooleanArray, GenericListArray, Int32Array, StructArray,
     };
-    use arrow_schema::{
+    use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
         SchemaRef as ArrowSchemaRef,
     };

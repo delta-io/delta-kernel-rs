@@ -720,8 +720,8 @@ fn transform_to_logical_internal(
 pub(crate) mod test_utils {
     use std::sync::Arc;
 
-    use arrow_array::{RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use crate::arrow::array::{RecordBatch, StringArray};
+    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 
     use crate::{
         actions::get_log_schema,
