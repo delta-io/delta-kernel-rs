@@ -166,7 +166,6 @@ impl RowVisitor for ProtocolVisitor {
     }
 }
 
-#[allow(unused)]
 #[derive(Default)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct AddVisitor {
@@ -240,7 +239,6 @@ impl RowVisitor for AddVisitor {
     }
 }
 
-#[allow(unused)]
 #[derive(Default)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct RemoveVisitor {
@@ -315,7 +313,6 @@ impl RowVisitor for RemoveVisitor {
     }
 }
 
-#[allow(unused)]
 #[derive(Default)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
