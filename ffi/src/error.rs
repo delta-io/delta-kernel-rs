@@ -105,7 +105,7 @@ impl From<Error> for KernelError {
             Error::MissingCommitInfo => KernelError::MissingCommitInfo,
             Error::Unsupported(_) => KernelError::UnsupportedError,
             Error::ParseIntervalError(_) => KernelError::ParseIntervalError,
-            Error::ChangeDataFeedUnsupported(_) => KernelError::ChangeDataFeedUnsupported,
+            Error::ChangeDataFeedUnsupported(_, _) => KernelError::ChangeDataFeedUnsupported,
             Error::ChangeDataFeedIncompatibleSchema(_, _) => {
                 KernelError::ChangeDataFeedIncompatibleSchema
             }
