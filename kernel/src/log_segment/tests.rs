@@ -31,7 +31,7 @@ fn test_replay_for_metadata() {
     let table = Table::new(url);
     let snapshot = table.snapshot(&engine, None).unwrap();
     let data: Vec<_> = snapshot
-        .log_segment
+        .log_segment()
         .replay_for_metadata(&engine)
         .unwrap()
         .try_collect()
