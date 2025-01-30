@@ -28,6 +28,7 @@ use self::state::GlobalScanState;
 
 pub(crate) mod data_skipping;
 pub mod log_replay;
+pub(crate) mod partition_skipping;
 pub mod state;
 
 /// Builder to scan a snapshot of a table.
@@ -408,6 +409,7 @@ impl Scan {
             self.logical_schema.clone(),
             static_transform,
             physical_predicate,
+            &self.snapshot.metadata().partition_columns,
         );
         Ok(Some(it).into_iter().flatten())
     }
@@ -813,6 +815,7 @@ pub(crate) mod test_utils {
             logical_schema,
             transform,
             None,
+            &[],
         );
         let mut batch_count = 0;
         for res in iter {
