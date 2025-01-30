@@ -10,7 +10,8 @@ use super::{ScanData, Transform};
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{column_expr, column_name, ColumnName, Expression, ExpressionRef};
-use crate::scan::{DeletionVectorDescriptor, TransformExpr};
+use crate::predicates::{DefaultPredicateEvaluator, PredicateEvaluator as _};
+use crate::scan::{DeletionVectorDescriptor, Scalar, TransformExpr};
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator};
@@ -30,7 +31,8 @@ impl FileActionKey {
 }
 
 struct LogReplayScanner {
-    filter: Option<DataSkippingFilter>,
+    partition_filter: Option<ExpressionRef>,
+    data_skipping_filter: Option<DataSkippingFilter>,
 
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
@@ -47,6 +49,7 @@ struct AddRemoveDedupVisitor<'seen> {
     selection_vector: Vec<bool>,
     logical_schema: SchemaRef,
     transform: Option<Arc<Transform>>,
+    partition_filter: Option<ExpressionRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
     is_log_batch: bool,
 }
@@ -82,35 +85,78 @@ impl AddRemoveDedupVisitor<'_> {
         }
     }
 
-    /// Compute an expression that will transform from physical to logical for a given Add file action
-    fn get_transform_expr<'a>(
+    fn parse_partition_value(
         &self,
-        i: usize,
+        field_idx: usize,
+        partition_values: &HashMap<String, String>,
+    ) -> DeltaResult<(usize, (String, Scalar))> {
+        let field = self.logical_schema.fields.get_index(field_idx);
+        let Some((_, field)) = field else {
+            return Err(Error::InternalError(format!(
+                "out of bounds partition column field index {field_idx}"
+            )));
+        };
+        let name = field.physical_name();
+        let partition_value =
+            super::parse_partition_value(partition_values.get(name), field.data_type())?;
+        Ok((field_idx, (name.to_string(), partition_value)))
+    }
+
+    fn parse_partition_values(
+        &self,
         transform: &Transform,
-        getters: &[&'a dyn GetData<'a>],
+        partition_values: &HashMap<String, String>,
+    ) -> DeltaResult<HashMap<usize, (String, Scalar)>> {
+        transform
+            .iter()
+            .filter_map(|transform_expr| match transform_expr {
+                TransformExpr::Partition(field_idx) => {
+                    Some(self.parse_partition_value(*field_idx, partition_values))
+                }
+                TransformExpr::Static(_) => None,
+            })
+            .try_collect()
+    }
+
+    /// Compute an expression that will transform from physical to logical for a given Add file action
+    fn get_transform_expr(
+        &self,
+        transform: &Transform,
+        mut partition_values: HashMap<usize, (String, Scalar)>,
     ) -> DeltaResult<ExpressionRef> {
-        let partition_values: HashMap<_, _> = getters[1].get(i, "add.partitionValues")?;
         let transforms = transform
             .iter()
             .map(|transform_expr| match transform_expr {
                 TransformExpr::Partition(field_idx) => {
-                    let field = self.logical_schema.fields.get_index(*field_idx);
-                    let Some((_, field)) = field else {
-                        return Err(Error::Generic(
-                            format!("logical schema did not contain expected field at {field_idx}, can't transform data")
-                        ));
+                    let Some((_, partition_value)) = partition_values.remove(field_idx) else {
+                        return Err(Error::InternalError(format!(
+                            "missing partition value for field index {field_idx}"
+                        )));
                     };
-                    let name = field.physical_name();
-                    let partition_value = super::parse_partition_value(
-                        partition_values.get(name),
-                        field.data_type(),
-                    )?;
                     Ok(partition_value.into())
                 }
                 TransformExpr::Static(field_expr) => Ok(field_expr.clone()),
             })
             .try_collect()?;
         Ok(Arc::new(Expression::Struct(transforms)))
+    }
+
+    fn is_file_partition_pruned(
+        &self,
+        partition_values: &HashMap<usize, (String, Scalar)>,
+    ) -> bool {
+        if partition_values.is_empty() {
+            return false;
+        }
+        let Some(partition_filter) = &self.partition_filter else {
+            return false;
+        };
+        let partition_values: HashMap<_, _> = partition_values
+            .values()
+            .map(|(k, v)| (ColumnName::new([k]), v.clone()))
+            .collect();
+        let evaluator = DefaultPredicateEvaluator::from(partition_values);
+        evaluator.eval_sql_where(partition_filter) == Some(false)
     }
 
     /// True if this row contains an Add action that should survive log replay. Skip it if the row
@@ -138,6 +184,24 @@ impl AddRemoveDedupVisitor<'_> {
             None => None,
         };
 
+        // Apply partition pruning (to adds only) before deduplication, so that we don't waste memory
+        // tracking pruned files. Removes don't get pruned and we'll still have to track them.
+        //
+        // WARNING: It's not safe to partition-prune removes (just like it's not safe to data skip
+        // removes), because they are needed to suppress earlier incompatible adds we might
+        // encounter if the table's schema was replaced after the most recent checkpoint.
+        let partition_values = match &self.transform {
+            Some(transform) if is_add => {
+                let partition_values = getters[1].get(i, "add.partitionValues")?;
+                let partition_values = self.parse_partition_values(transform, &partition_values)?;
+                if self.is_file_partition_pruned(&partition_values) {
+                    return Ok(false);
+                }
+                partition_values
+            }
+            _ => Default::default(),
+        };
+
         // Check both adds and removes (skipping already-seen), but only transform and return adds
         let file_key = FileActionKey::new(path, dv_unique_id);
         if self.check_and_record_seen(file_key) || !is_add {
@@ -146,7 +210,7 @@ impl AddRemoveDedupVisitor<'_> {
         let transform = self
             .transform
             .as_ref()
-            .map(|transform| self.get_transform_expr(i, transform, getters))
+            .map(|transform| self.get_transform_expr(transform, partition_values))
             .transpose()?;
         if transform.is_some() {
             // fill in any needed `None`s for previous rows
@@ -250,7 +314,8 @@ impl LogReplayScanner {
     /// Create a new [`LogReplayScanner`] instance
     fn new(engine: &dyn Engine, physical_predicate: Option<(ExpressionRef, SchemaRef)>) -> Self {
         Self {
-            filter: DataSkippingFilter::new(engine, physical_predicate),
+            partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
+            data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
             seen: Default::default(),
         }
     }
@@ -265,7 +330,7 @@ impl LogReplayScanner {
     ) -> DeltaResult<ScanData> {
         // Apply data skipping to get back a selection vector for actions that passed skipping. We
         // will update the vector below as log replay identifies duplicates that should be ignored.
-        let selection_vector = match &self.filter {
+        let selection_vector = match &self.data_skipping_filter {
             Some(filter) => filter.apply(actions)?,
             None => vec![true; actions.len()],
         };
@@ -276,6 +341,7 @@ impl LogReplayScanner {
             selection_vector,
             logical_schema,
             transform,
+            partition_filter: self.partition_filter.clone(),
             row_transform_exprs: Vec::new(),
             is_log_batch,
         };
