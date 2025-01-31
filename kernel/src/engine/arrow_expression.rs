@@ -534,10 +534,10 @@ impl ExpressionHandler for ArrowExpressionHandler {
     fn create_one(&self, schema: SchemaRef, values: &[Scalar]) -> DeltaResult<Box<dyn EngineData>> {
         let mut array_transform = SingleRowArrayTransform::new(values);
         let datatype = schema.into();
-        // we build up the array within the `SignatureArrayTransform` - we don't actually care
+        // we build up the array within the `SingleRowArrayTransform` - we don't actually care
         // about the 'transformed' type
         let _transformed = array_transform.transform(&datatype);
-        let array = array_transform.into_array()?;
+        let array = array_transform.into_struct_array()?;
         let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap(); // FIXME
 
         let record_batch: RecordBatch = struct_array.into(); // FIXME will panic for top-level null
@@ -547,9 +547,11 @@ impl ExpressionHandler for ArrowExpressionHandler {
 
 mod single_row_array_transform {
     use std::borrow::Cow;
+    use std::mem;
     use std::sync::Arc;
 
     use arrow_array::{ArrayRef, StructArray};
+    use arrow_schema::DataType as ArrowDataType;
     use arrow_schema::Field as ArrowField;
     use itertools::Itertools;
     use tracing::debug;
@@ -562,12 +564,10 @@ mod single_row_array_transform {
 
     /// [`SchemaTransform`] that will transform a [`Schema`] and an ordered list of leaf values (as
     /// Scalar slice) into an arrow Array with a single row of each literal.
-    #[derive(Debug, Default)]
-    pub(crate) struct SingleRowArrayTransform<'a> {
+    #[derive(Debug)]
+    pub(crate) struct SingleRowArrayTransform<'a, T: Iterator<Item = &'a Scalar>> {
         /// Leaf-node values to insert in schema order.
-        scalars: &'a [Scalar],
-        /// Index into `scalars` for the next leaf we encounter.
-        next_scalar_idx: usize,
+        scalars: T,
         /// A stack of built arrays. After visiting children, we pop them off to
         /// build the parent container, then push the parent back on.
         stack: Vec<ArrayRef>,
@@ -575,23 +575,30 @@ mod single_row_array_transform {
         error: Option<Error>,
     }
 
-    impl<'a> SingleRowArrayTransform<'a> {
-        pub(crate) fn new(scalars: &'a [Scalar]) -> Self {
+    impl<'a, T: Iterator<Item = &'a Scalar>> SingleRowArrayTransform<'a, T> {
+        pub(crate) fn new(scalars: impl IntoIterator<Item = &'a Scalar, IntoIter = T>) -> Self {
             Self {
-                scalars,
-                ..Default::default()
+                scalars: scalars.into_iter(),
+                stack: Vec::new(),
+                error: None,
             }
         }
 
         /// return the single-row array (or propagate Error). the top of `stack` should be our
         /// single-row struct array
-        pub(crate) fn into_array(mut self) -> DeltaResult<ArrayRef> {
+        pub(crate) fn into_struct_array(mut self) -> DeltaResult<ArrayRef> {
             if let Some(e) = self.error {
                 return Err(e);
             }
             match self.stack.pop() {
-                Some(array) => Ok(array),
-                None => Err(Error::generic("didn't build array")),
+                Some(array) if self.stack.is_empty() => match array.data_type() {
+                    ArrowDataType::Struct(_) => Ok(array),
+                    _ => Err(Error::generic("Expected struct array")),
+                },
+                Some(_) => Err(Error::generic(
+                    "additional arrays left in the stack (possibly too many scalars)",
+                )),
+                None => Err(Error::generic("no array present in the stack")),
             }
         }
 
@@ -603,7 +610,7 @@ mod single_row_array_transform {
         }
     }
 
-    impl<'a> SchemaTransform<'a> for SingleRowArrayTransform<'a> {
+    impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for SingleRowArrayTransform<'a, T> {
         fn transform_primitive(
             &mut self,
             prim_type: &'a PrimitiveType,
@@ -613,15 +620,15 @@ mod single_row_array_transform {
                 return None;
             }
 
-            if self.next_scalar_idx >= self.scalars.len() {
-                self.set_error(Error::generic(
-                    "Not enough scalars to create a single-row array",
-                ));
-                return None;
-            }
-
-            let scalar = &self.scalars[self.next_scalar_idx];
-            self.next_scalar_idx += 1;
+            let scalar = match self.scalars.next() {
+                Some(s) => s,
+                None => {
+                    self.set_error(Error::generic(
+                        "Not enough scalars to create a single-row array",
+                    ));
+                    return None;
+                }
+            };
 
             match scalar.data_type() {
                 DataType::Primitive(scalar_type) => {
@@ -663,20 +670,15 @@ mod single_row_array_transform {
 
             let num_fields = struct_type.fields.len();
             let stack_len = self.stack.len();
-            if stack_len < num_fields {
+            if stack_len != num_fields {
                 self.set_error(Error::Generic(format!(
-                    "Not enough child arrays to create a single-row struct: expected {}, got {}",
+                    "Incorrect number of child arrays to create a single-row struct: expected {}, got {}",
                     num_fields, stack_len
                 )));
                 return None;
             }
 
-            let mut child_arrays = Vec::with_capacity(num_fields);
-            for _ in 0..num_fields {
-                child_arrays.push(self.stack.pop().unwrap());
-            }
-            // reverse child_arrays since we popped them off the stack
-            child_arrays.reverse();
+            let child_arrays = mem::take(&mut self.stack);
 
             let fields = match struct_type.fields().map(ArrowField::try_from).try_collect() {
                 Ok(f) => f,
@@ -685,6 +687,9 @@ mod single_row_array_transform {
                     return None;
                 }
             };
+
+            // TODO: null buffer is always none since we are purposely creating a single-row array,
+            // but if the literals are all null we should use the NullBuffer?
             let array = match StructArray::try_new(fields, child_arrays, None) {
                 Ok(arr) => arr,
                 Err(e) => {
@@ -692,8 +697,7 @@ mod single_row_array_transform {
                     return None;
                 }
             };
-            let array = Arc::new(array) as ArrayRef;
-            self.stack.push(array);
+            self.stack.push(Arc::new(array));
             Some(Cow::Borrowed(struct_type))
         }
 
@@ -1243,6 +1247,18 @@ mod tests {
     #[test]
     fn test_create_one_missing_values() {
         let values = &["a".into()];
+        let schema = Arc::new(StructType::new([
+            StructField::nullable("col_1", DeltaDataTypes::INTEGER),
+            StructField::nullable("col_2", DeltaDataTypes::INTEGER),
+        ]));
+
+        let handler = ArrowExpressionHandler;
+        matches!(handler.create_one(schema, values), Err(Error::Generic(_)));
+    }
+
+    #[test]
+    fn test_create_one_extra_values() {
+        let values = &["a".into(), "b".into(), "c".into()];
         let schema = Arc::new(StructType::new([
             StructField::nullable("col_1", DeltaDataTypes::INTEGER),
             StructField::nullable("col_2", DeltaDataTypes::INTEGER),
