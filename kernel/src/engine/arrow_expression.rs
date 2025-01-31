@@ -1,5 +1,5 @@
 //! Expression handling based on arrow-rs compute kernels.
-use std::borrow::{Borrow, Cow};
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -34,9 +34,9 @@ use crate::expressions::{
 };
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
-    StructType,
 };
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
+use single_row_array_transform::SingleRowArrayTransform;
 
 // TODO leverage scalars / Datum
 
@@ -545,158 +545,192 @@ impl ExpressionHandler for ArrowExpressionHandler {
     }
 }
 
-/// [`SchemaTransform`] that will transform a [`Schema`] and an ordered list of leaf values (as
-/// Scalar slice) into an arrow Array with a single row of each literal.
-struct SingleRowArrayTransform<'a> {
-    /// Leaf-node values to insert in schema order.
-    scalars: &'a [Scalar],
-    /// Index into `scalars` for the next leaf we encounter.
-    next_scalar_idx: usize,
-    /// A stack of built arrays. After visiting children, we pop them off to
-    /// build the parent container, then push the parent back on.
-    stack: Vec<ArrayRef>,
-    /// If an error occurs, it will be stored here.
-    error: Option<Error>,
-}
+mod single_row_array_transform {
+    use std::borrow::Cow;
+    use std::sync::Arc;
 
-impl<'a> SingleRowArrayTransform<'a> {
-    fn new(scalars: &'a [Scalar]) -> Self {
-        Self {
-            scalars,
-            next_scalar_idx: 0,
-            stack: Vec::new(),
-            error: None,
+    use arrow_array::{ArrayRef, StructArray};
+    use arrow_schema::Field as ArrowField;
+    use itertools::Itertools;
+    use tracing::debug;
+
+    use crate::error::{DeltaResult, Error};
+    use crate::expressions::Scalar;
+    use crate::schema::{
+        ArrayType, DataType, MapType, PrimitiveType, SchemaTransform, StructField, StructType,
+    };
+
+    /// [`SchemaTransform`] that will transform a [`Schema`] and an ordered list of leaf values (as
+    /// Scalar slice) into an arrow Array with a single row of each literal.
+    #[derive(Debug, Default)]
+    pub(crate) struct SingleRowArrayTransform<'a> {
+        /// Leaf-node values to insert in schema order.
+        scalars: &'a [Scalar],
+        /// Index into `scalars` for the next leaf we encounter.
+        next_scalar_idx: usize,
+        /// A stack of built arrays. After visiting children, we pop them off to
+        /// build the parent container, then push the parent back on.
+        stack: Vec<ArrayRef>,
+        /// If an error occurs, it will be stored here.
+        error: Option<Error>,
+    }
+
+    impl<'a> SingleRowArrayTransform<'a> {
+        pub(crate) fn new(scalars: &'a [Scalar]) -> Self {
+            Self {
+                scalars,
+                ..Default::default()
+            }
+        }
+
+        /// return the single-row array (or propagate Error). the top of `stack` should be our
+        /// single-row struct array
+        pub(crate) fn into_array(mut self) -> DeltaResult<ArrayRef> {
+            if let Some(e) = self.error {
+                return Err(e);
+            }
+            match self.stack.pop() {
+                Some(array) => Ok(array),
+                None => Err(Error::generic("didn't build array")),
+            }
+        }
+
+        fn set_error(&mut self, e: Error) {
+            if let Some(err) = &self.error {
+                debug!("Overwriting error that was already set: {err}");
+            }
+            self.error = Some(e);
         }
     }
 
-    /// return the single-row array (or propagate Error). the top of `stack` should be our
-    /// single-row struct array
-    fn into_array(mut self) -> DeltaResult<ArrayRef> {
-        if let Some(e) = self.error {
-            return Err(e);
-        }
-        match self.stack.pop() {
-            Some(array) => Ok(array),
-            None => Err(Error::generic("didn't build array")),
-        }
-    }
-}
+    impl<'a> SchemaTransform<'a> for SingleRowArrayTransform<'a> {
+        fn transform_primitive(
+            &mut self,
+            prim_type: &'a PrimitiveType,
+        ) -> Option<Cow<'a, PrimitiveType>> {
+            // first always check error to terminate early if possible
+            if self.error.is_some() {
+                return None;
+            }
 
-impl<'a> SchemaTransform<'a> for SingleRowArrayTransform<'a> {
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        // first always check error to terminate early if possible
-        if self.error.is_some() {
+            if self.next_scalar_idx >= self.scalars.len() {
+                self.set_error(Error::generic(
+                    "Not enough scalars to create a single-row array",
+                ));
+                return None;
+            }
+
+            let scalar = &self.scalars[self.next_scalar_idx];
+            self.next_scalar_idx += 1;
+
+            match scalar.data_type() {
+                DataType::Primitive(scalar_type) => {
+                    if scalar_type != *prim_type {
+                        self.set_error(Error::Generic(format!(
+                        "Mismatched scalar type creating a single-row array: expected {}, got {}",
+                        prim_type, scalar_type
+                    )));
+                        return None;
+                    }
+                }
+                _ => {
+                    self.set_error(Error::generic(
+                        "Non-primitive scalar type {datatype} provided",
+                    ));
+                    return None;
+                }
+            }
+
+            let arr = match scalar.to_array(1) {
+                Ok(a) => a,
+                Err(e) => {
+                    self.set_error(e);
+                    return None;
+                }
+            };
+            self.stack.push(arr);
+
+            Some(Cow::Borrowed(prim_type))
+        }
+
+        fn transform_struct(&mut self, struct_type: &'a StructType) -> Option<Cow<'a, StructType>> {
+            // first always check error to terminate early if possible
+            if self.error.is_some() {
+                return None;
+            }
+
+            self.recurse_into_struct(struct_type)?;
+
+            let num_fields = struct_type.fields.len();
+            let stack_len = self.stack.len();
+            if stack_len < num_fields {
+                self.set_error(Error::Generic(format!(
+                    "Not enough child arrays to create a single-row struct: expected {}, got {}",
+                    num_fields, stack_len
+                )));
+                return None;
+            }
+
+            let mut child_arrays = Vec::with_capacity(num_fields);
+            for _ in 0..num_fields {
+                child_arrays.push(self.stack.pop().unwrap());
+            }
+            // reverse child_arrays since we popped them off the stack
+            child_arrays.reverse();
+
+            let fields = match struct_type.fields().map(ArrowField::try_from).try_collect() {
+                Ok(f) => f,
+                Err(e) => {
+                    self.set_error(Error::Arrow(e));
+                    return None;
+                }
+            };
+            let array = match StructArray::try_new(fields, child_arrays, None) {
+                Ok(arr) => arr,
+                Err(e) => {
+                    self.set_error(Error::Arrow(e));
+                    return None;
+                }
+            };
+            let array = Arc::new(array) as ArrayRef;
+            self.stack.push(array);
+            Some(Cow::Borrowed(struct_type))
+        }
+
+        fn transform_struct_field(
+            &mut self,
+            field: &'a StructField,
+        ) -> Option<Cow<'a, StructField>> {
+            // first always check error to terminate early if possible
+            if self.error.is_some() {
+                return None;
+            }
+            self.recurse_into_struct_field(field)
+        }
+
+        // arrays unsupported for now
+        fn transform_array(&mut self, _array_type: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
+            // first always check error to terminate early if possible
+            if self.error.is_some() {
+                return None;
+            }
+            self.set_error(Error::unsupported(
+                "ArrayType not yet supported for creating single-row array",
+            ));
             return None;
         }
 
-        // check bounds
-        if self.next_scalar_idx >= self.scalars.len() {
-            return None; // TODO
-        }
-        let scalar = &self.scalars[self.next_scalar_idx];
-        self.next_scalar_idx += 1;
-
-        let DataType::Primitive(scalar_type) = scalar.data_type() else {
-            return None; // FIXME
-        };
-        if scalar_type != *ptype {
-            self.error = Some(Error::generic(
-            "Mismatched scalar type when creating single-row array: expected {ptype}, got {scalar_type}"));
-            return None; // FIXME
-        }
-
-        let arr = match scalar.to_array(1) {
-            Ok(a) => a,
-            Err(_e) => return None, // or handle error
-        };
-        self.stack.push(arr);
-
-        Some(Cow::Borrowed(ptype))
-    }
-
-    fn transform_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
-        // first always check error to terminate early if possible
-        if self.error.is_some() {
+        // maps unsupported for now
+        fn transform_map(&mut self, _map_type: &'a MapType) -> Option<Cow<'a, MapType>> {
+            // first always check error to terminate early if possible
+            if self.error.is_some() {
+                return None;
+            }
+            self.set_error(Error::unsupported(
+                "MapType not yet supported for creating single-row array",
+            ));
             return None;
         }
-
-        self.recurse_into_struct(stype)?;
-
-        let n_fields = stype.fields.len();
-        if self.stack.len() < n_fields {
-            return None; // FIXME
-        }
-
-        // pop in reverse
-        let mut child_arrays = Vec::with_capacity(n_fields);
-        for _ in 0..n_fields {
-            child_arrays.push(self.stack.pop().unwrap());
-        }
-        child_arrays.reverse();
-
-        let field_refs: Vec<StructField> = stype
-            .fields()
-            .map(|f| StructField::new(f.name.clone(), f.data_type.clone(), f.nullable))
-            .collect(); // FIXME
-
-        // let struct_dt = DataType::Struct(Box::new(StructType::new(field_refs.clone())));
-
-        let arrow_fields = field_refs
-            .iter()
-            .map(|f| ArrowField::try_from(f))
-            .try_collect()
-            .unwrap(); // FIXME
-        let struct_arr = Arc::new(StructArray::new(arrow_fields, child_arrays, None)) as ArrayRef;
-
-        self.stack.push(struct_arr);
-        Some(Cow::Borrowed(stype))
-    }
-
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        // first always check error to terminate early if possible
-        if self.error.is_some() {
-            return None;
-        }
-
-        // FIXME
-        // struct field (or containing array/map) decides whether the child type is nullable (any
-        // nullable parent makes the field nullable)
-        self.recurse_into_struct_field(field)
-    }
-
-    // For arrays, do something similar:
-    fn transform_array(&mut self, atype: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
-        // first always check error to terminate early if possible
-        if self.error.is_some() {
-            return None;
-        }
-
-        // Recurse into child
-        self.recurse_into_array(atype)?;
-
-        // Once child is done, pop the child's single-row array from the stack
-        let child_array = self.stack.pop().unwrap();
-
-        unimplemented!();
-
-        Some(Cow::Borrowed(atype))
-    }
-
-    fn transform_map(&mut self, mtype: &'a MapType) -> Option<Cow<'a, MapType>> {
-        // first always check error to terminate early if possible
-        if self.error.is_some() {
-            return None;
-        }
-
-        self.recurse_into_map(mtype)?;
-
-        let value_arr = self.stack.pop().unwrap();
-        let key_arr = self.stack.pop().unwrap();
-
-        unimplemented!();
-
-        // build map, push
-        Some(Cow::Borrowed(mtype))
     }
 }
 
@@ -746,7 +780,7 @@ mod tests {
 
     use super::*;
     use crate::expressions::*;
-    use crate::schema::ArrayType;
+    use crate::schema::{ArrayType, StructType};
     use crate::DataType as DeltaDataTypes;
 
     #[test]
@@ -1040,92 +1074,65 @@ mod tests {
         assert_eq!(results.as_ref(), expected.as_ref());
     }
 
+    // helper to take values/schema to pass to `create_one` and assert the result = expected
+    fn assert_create_one(values: &[Scalar], schema: SchemaRef, expected: RecordBatch) {
+        let handler = ArrowExpressionHandler;
+        let actual = handler.create_one(schema, values).unwrap();
+        let actual_rb: RecordBatch = actual
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+        assert_eq!(actual_rb, expected);
+    }
+
     #[test]
     fn test_create_one() {
         let values: &[Scalar] = &[1.into(), 2.into(), 3.into()];
-        let schema = Arc::new(crate::schema::StructType::new([
+        let schema = Arc::new(StructType::new([
             StructField::new("a", DeltaDataTypes::INTEGER, true),
             StructField::new("b", DeltaDataTypes::INTEGER, true),
             StructField::new("c", DeltaDataTypes::INTEGER, true),
         ]));
 
-        let handler = ArrowExpressionHandler;
-        let actual = handler.create_one(schema, values).unwrap();
         let expected =
             record_batch!(("a", Int32, [1]), ("b", Int32, [2]), ("c", Int32, [3])).unwrap();
-        let actual_rb: RecordBatch = actual
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
-        assert_eq!(actual_rb, expected);
+        assert_create_one(values, schema, expected);
     }
 
     #[test]
     fn test_create_one_string() {
         let values = &["a".into()];
-        let schema = Arc::new(crate::schema::StructType::new([StructField::new(
+        let schema = Arc::new(StructType::new([StructField::new(
             "col_1",
             DeltaDataTypes::STRING,
             true,
         )]));
 
-        let handler = ArrowExpressionHandler;
-        let actual = handler.create_one(schema, values).unwrap();
         let expected = record_batch!(("col_1", Utf8, ["a"])).unwrap();
-        let actual_rb: RecordBatch = actual
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
-        assert_eq!(actual_rb, expected);
-    }
-
-    #[test]
-    fn test_create_one_incorrect_schema() {
-        let values = &["a".into()];
-        let schema = Arc::new(crate::schema::StructType::new([StructField::new(
-            "col_1",
-            DeltaDataTypes::INTEGER,
-            true,
-        )]));
-
-        let handler = ArrowExpressionHandler;
-        // FIXME check err
-        assert!(handler.create_one(schema, values).is_err())
+        assert_create_one(values, schema, expected);
     }
 
     #[test]
     fn test_create_one_null() {
         let values = &[Scalar::Null(DeltaDataTypes::INTEGER)];
-        let schema = Arc::new(crate::schema::StructType::new([StructField::new(
+        let schema = Arc::new(StructType::new([StructField::new(
             "col_1",
             DeltaDataTypes::INTEGER,
             true,
         )]));
-
-        let handler = ArrowExpressionHandler;
-        let actual = handler.create_one(schema, values).unwrap();
         let expected = record_batch!(("col_1", Int32, [None])).unwrap();
-        let actual_rb: RecordBatch = actual
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
-        assert_eq!(actual_rb, expected);
+        assert_create_one(values, schema, expected);
     }
 
     #[test]
     fn test_create_one_non_null() {
         let values: &[Scalar] = &[1.into()];
-        let schema = Arc::new(crate::schema::StructType::new([StructField::new(
+        let schema = Arc::new(StructType::new([StructField::new(
             "a",
             DeltaDataTypes::INTEGER,
             false,
         )]));
-
-        let handler = ArrowExpressionHandler;
-        let actual = handler.create_one(schema, values).unwrap();
         let expected_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
             "a",
             DataType::Int32,
@@ -1133,12 +1140,7 @@ mod tests {
         )]));
         let expected =
             RecordBatch::try_new(expected_schema, vec![create_array!(Int32, [1])]).unwrap();
-        let actual_rb: RecordBatch = actual
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
-        assert_eq!(actual_rb, expected);
+        assert_create_one(values, schema, expected);
     }
 
     #[test]
@@ -1152,9 +1154,6 @@ mod tests {
             ]),
             false,
         )]));
-
-        let handler = ArrowExpressionHandler;
-        let actual = handler.create_one(schema, values).unwrap();
         let expected_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
             "a",
             DataType::Struct(
@@ -1180,11 +1179,70 @@ mod tests {
             ]))],
         )
         .unwrap();
-        let actual_rb: RecordBatch = actual
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
-        assert_eq!(actual_rb, expected);
+        assert_create_one(values, schema, expected);
+    }
+
+    #[test]
+    fn test_create_one_nested_null() {
+        let values: &[Scalar] = &[Scalar::Null(DeltaDataTypes::INTEGER), 1.into()];
+        let schema = Arc::new(crate::schema::StructType::new([StructField::new(
+            "a",
+            DeltaDataTypes::struct_type([
+                StructField::new("b", DeltaDataTypes::INTEGER, true),
+                StructField::new("c", DeltaDataTypes::INTEGER, false),
+            ]),
+            false,
+        )]));
+        let expected_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+            "a",
+            DataType::Struct(
+                vec![
+                    Field::new("b", DataType::Int32, true),
+                    Field::new("c", DataType::Int32, false),
+                ]
+                .into(),
+            ),
+            false,
+        )]));
+        let expected = RecordBatch::try_new(
+            expected_schema,
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    Arc::new(Field::new("b", DataType::Int32, true)),
+                    create_array!(Int32, [None]) as ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new("c", DataType::Int32, false)),
+                    create_array!(Int32, [1]) as ArrayRef,
+                ),
+            ]))],
+        )
+        .unwrap();
+        assert_create_one(values, schema, expected);
+    }
+
+    #[test]
+    fn test_create_one_incorrect_schema() {
+        let values = &["a".into()];
+        let schema = Arc::new(StructType::new([StructField::new(
+            "col_1",
+            DeltaDataTypes::INTEGER,
+            true,
+        )]));
+
+        let handler = ArrowExpressionHandler;
+        matches!(handler.create_one(schema, values), Err(Error::Generic(_)));
+    }
+
+    #[test]
+    fn test_create_one_missing_values() {
+        let values = &["a".into()];
+        let schema = Arc::new(StructType::new([
+            StructField::new("col_1", DeltaDataTypes::INTEGER, true),
+            StructField::new("col_2", DeltaDataTypes::INTEGER, true),
+        ]));
+
+        let handler = ArrowExpressionHandler;
+        matches!(handler.create_one(schema, values), Err(Error::Generic(_)));
     }
 }
