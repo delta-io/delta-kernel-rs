@@ -717,7 +717,7 @@ mod single_row_array_transform {
             self.set_error(Error::unsupported(
                 "ArrayType not yet supported for creating single-row array",
             ));
-            return None;
+            None
         }
 
         // maps unsupported for now
@@ -729,7 +729,7 @@ mod single_row_array_transform {
             self.set_error(Error::unsupported(
                 "MapType not yet supported for creating single-row array",
             ));
-            return None;
+            None
         }
     }
 }
@@ -1090,9 +1090,9 @@ mod tests {
     fn test_create_one() {
         let values: &[Scalar] = &[1.into(), 2.into(), 3.into()];
         let schema = Arc::new(StructType::new([
-            StructField::new("a", DeltaDataTypes::INTEGER, true),
-            StructField::new("b", DeltaDataTypes::INTEGER, true),
-            StructField::new("c", DeltaDataTypes::INTEGER, true),
+            StructField::nullable("a", DeltaDataTypes::INTEGER),
+            StructField::nullable("b", DeltaDataTypes::INTEGER),
+            StructField::nullable("c", DeltaDataTypes::INTEGER),
         ]));
 
         let expected =
@@ -1103,10 +1103,9 @@ mod tests {
     #[test]
     fn test_create_one_string() {
         let values = &["a".into()];
-        let schema = Arc::new(StructType::new([StructField::new(
+        let schema = Arc::new(StructType::new([StructField::nullable(
             "col_1",
             DeltaDataTypes::STRING,
-            true,
         )]));
 
         let expected = record_batch!(("col_1", Utf8, ["a"])).unwrap();
@@ -1116,10 +1115,9 @@ mod tests {
     #[test]
     fn test_create_one_null() {
         let values = &[Scalar::Null(DeltaDataTypes::INTEGER)];
-        let schema = Arc::new(StructType::new([StructField::new(
+        let schema = Arc::new(StructType::new([StructField::nullable(
             "col_1",
             DeltaDataTypes::INTEGER,
-            true,
         )]));
         let expected = record_batch!(("col_1", Int32, [None])).unwrap();
         assert_create_one(values, schema, expected);
@@ -1128,10 +1126,9 @@ mod tests {
     #[test]
     fn test_create_one_non_null() {
         let values: &[Scalar] = &[1.into()];
-        let schema = Arc::new(StructType::new([StructField::new(
+        let schema = Arc::new(StructType::new([StructField::not_null(
             "a",
             DeltaDataTypes::INTEGER,
-            false,
         )]));
         let expected_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
             "a",
@@ -1146,15 +1143,14 @@ mod tests {
     #[test]
     fn test_create_one_nested() {
         let values: &[Scalar] = &[1.into(), 2.into()];
-        let schema = Arc::new(crate::schema::StructType::new([StructField::new(
+        let schema = Arc::new(StructType::new([StructField::not_null(
             "a",
             DeltaDataTypes::struct_type([
-                StructField::new("b", DeltaDataTypes::INTEGER, true),
-                StructField::new("c", DeltaDataTypes::INTEGER, false),
+                StructField::nullable("b", DeltaDataTypes::INTEGER),
+                StructField::not_null("c", DeltaDataTypes::INTEGER),
             ]),
-            false,
         )]));
-        let expected_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+        let expected_schema = Arc::new(Schema::new(vec![Field::new(
             "a",
             DataType::Struct(
                 vec![
@@ -1185,13 +1181,12 @@ mod tests {
     #[test]
     fn test_create_one_nested_null() {
         let values: &[Scalar] = &[Scalar::Null(DeltaDataTypes::INTEGER), 1.into()];
-        let schema = Arc::new(crate::schema::StructType::new([StructField::new(
+        let schema = Arc::new(StructType::new([StructField::not_null(
             "a",
             DeltaDataTypes::struct_type([
-                StructField::new("b", DeltaDataTypes::INTEGER, true),
-                StructField::new("c", DeltaDataTypes::INTEGER, false),
+                StructField::nullable("b", DeltaDataTypes::INTEGER),
+                StructField::not_null("c", DeltaDataTypes::INTEGER),
             ]),
-            false,
         )]));
         let expected_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
             "a",
@@ -1224,10 +1219,9 @@ mod tests {
     #[test]
     fn test_create_one_incorrect_schema() {
         let values = &["a".into()];
-        let schema = Arc::new(StructType::new([StructField::new(
+        let schema = Arc::new(StructType::new([StructField::nullable(
             "col_1",
             DeltaDataTypes::INTEGER,
-            true,
         )]));
 
         let handler = ArrowExpressionHandler;
@@ -1235,11 +1229,23 @@ mod tests {
     }
 
     #[test]
+    fn test_create_one_incorrect_null() {
+        let values = &[Scalar::Null(DeltaDataTypes::INTEGER)];
+        let schema = Arc::new(StructType::new([StructField::not_null(
+            "col_1",
+            DeltaDataTypes::INTEGER,
+        )]));
+
+        let handler = ArrowExpressionHandler;
+        matches!(handler.create_one(schema, values), Err(Error::Arrow(_)));
+    }
+
+    #[test]
     fn test_create_one_missing_values() {
         let values = &["a".into()];
         let schema = Arc::new(StructType::new([
-            StructField::new("col_1", DeltaDataTypes::INTEGER, true),
-            StructField::new("col_2", DeltaDataTypes::INTEGER, true),
+            StructField::nullable("col_1", DeltaDataTypes::INTEGER),
+            StructField::nullable("col_2", DeltaDataTypes::INTEGER),
         ]));
 
         let handler = ArrowExpressionHandler;
