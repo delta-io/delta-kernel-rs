@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use crate::actions::SIDECAR_NAME;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
@@ -12,7 +13,7 @@ use crate::{DeltaResult, Error};
 use super::deletion_vector::DeletionVectorDescriptor;
 use super::schemas::ToSchema as _;
 use super::{
-    Add, Cdc, Format, Metadata, Protocol, Remove, SetTransaction, ADD_NAME, CDC_NAME,
+    Add, Cdc, Format, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME, CDC_NAME,
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
 };
 
@@ -444,6 +445,51 @@ impl RowVisitor for SetTransactionVisitor {
     }
 }
 
+#[allow(unused)] //TODO: Remove once we implement V2 checkpoint file processing
+#[derive(Default)]
+struct SidecarVisitor {
+    sidecars: Vec<Sidecar>,
+}
+
+impl SidecarVisitor {
+    fn visit_sidecar<'a>(
+        row_index: usize,
+        path: String,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<Sidecar> {
+        Ok(Sidecar {
+            path,
+            size_in_bytes: getters[1].get(row_index, "sidecar.sizeInBytes")?,
+            modification_time: getters[2].get(row_index, "sidecar.modificationTime")?,
+            tags: getters[3].get_opt(row_index, "sidecar.tags")?,
+        })
+    }
+}
+
+impl RowVisitor for SidecarVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| Sidecar::to_schema().leaves(SIDECAR_NAME));
+        NAMES_AND_TYPES.as_ref()
+    }
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 4,
+            Error::InternalError(format!(
+                "Wrong number of SidecarVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        for i in 0..row_count {
+            // Since path column is required, use it to detect presence of a sidecar action
+            if let Some(path) = getters[0].get_opt(i, "sidecar.path")? {
+                self.sidecars.push(Self::visit_sidecar(i, path, getters)?);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Get a DV out of some engine data. The caller is responsible for slicing the `getters` slice such
 /// that the first element contains the `storageType` element of the deletion vector.
 pub(crate) fn visit_deletion_vector_at<'a>(
@@ -541,6 +587,36 @@ mod tests {
         };
 
         assert_eq!(&visitor.cdcs, &[expected]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_action_batch_with_sidecar_actions() -> DeltaResult<()> {
+        let engine = SyncEngine::new();
+        let json_handler = engine.get_json_handler();
+        let json_strings: StringArray = vec![
+            r#"{"sidecar":{"path":"016ae953-37a9-438e-8683-9a9a4a79a395.parquet","sizeInBytes":9268,"modificationTime":1714496113961,"tags": null}}"#,
+            r#"{"sidecar":{"path":"3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet","sizeInBytes":9268,"modificationTime":1714496113962,"tags": null}}"#,
+        ].into();
+
+        let output_schema = get_log_schema().clone();
+        let batch = json_handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        let mut visitor = SidecarVisitor::default();
+        visitor.visit_rows_of(batch.as_ref())?;
+
+        assert_eq!(visitor.sidecars.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_action_batch_without_sidecar_actions() -> DeltaResult<()> {
+        let data = action_batch();
+        let mut visitor = SidecarVisitor::default();
+        visitor.visit_rows_of(data.as_ref())?;
+
+        assert_eq!(visitor.sidecars.len(), 0);
         Ok(())
     }
 
