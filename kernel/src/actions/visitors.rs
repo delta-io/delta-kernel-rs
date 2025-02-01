@@ -19,8 +19,7 @@ use super::{
 
 #[derive(Default)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-struct MetadataVisitor {
+pub(crate) struct MetadataVisitor {
     pub(crate) metadata: Option<Metadata>,
 }
 
@@ -115,8 +114,7 @@ impl RowVisitor for SelectionVectorVisitor {
 
 #[derive(Default)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-struct ProtocolVisitor {
+pub(crate) struct ProtocolVisitor {
     pub(crate) protocol: Option<Protocol>,
 }
 
@@ -319,15 +317,13 @@ impl RowVisitor for RemoveVisitor {
 #[allow(unused)]
 #[derive(Default)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-struct CdcVisitor {
+pub(crate) struct CdcVisitor {
     pub(crate) cdcs: Vec<Cdc>,
 }
 
 impl CdcVisitor {
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-    fn visit_cdc<'a>(
+    pub(crate) fn visit_cdc<'a>(
         row_index: usize,
         path: String,
         getters: &[&'a dyn GetData<'a>],
@@ -378,7 +374,6 @@ pub type SetTransactionMap = HashMap<String, SetTransaction>;
 ///
 #[derive(Default, Debug)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
 pub(crate) struct SetTransactionVisitor {
     pub(crate) set_transactions: SetTransactionMap,
     pub(crate) application_id: Option<String>,
@@ -394,8 +389,7 @@ impl SetTransactionVisitor {
     }
 
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-    fn visit_txn<'a>(
+    pub(crate) fn visit_txn<'a>(
         row_index: usize,
         app_id: String,
         getters: &[&'a dyn GetData<'a>],
@@ -445,7 +439,7 @@ impl RowVisitor for SetTransactionVisitor {
     }
 }
 
-#[allow(unused)] //TODO: Remove once we implement V2 checkpoint file processing
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 #[derive(Default)]
 struct SidecarVisitor {
     sidecars: Vec<Sidecar>,
