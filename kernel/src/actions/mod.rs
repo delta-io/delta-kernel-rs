@@ -329,9 +329,8 @@ where
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
-struct CommitInfo {
+pub(crate) struct CommitInfo {
     /// The time this logical file was created, as milliseconds since the epoch.
     /// Read: optional, write: required (that is, kernel always writes).
     pub(crate) timestamp: Option<i64>,
@@ -420,9 +419,8 @@ impl Add {
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
-struct Remove {
+pub(crate) struct Remove {
     /// A relative path to a data file from the root of the table or an absolute path to a file
     /// that should be added to the table. The path is a URI as specified by
     /// [RFC 2396 URI Generic Syntax], which needs to be decoded to get the data file path.
@@ -471,9 +469,8 @@ struct Remove {
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
-struct Cdc {
+pub(crate) struct Cdc {
     /// A relative path to a change data file from the root of the table or an absolute path to a
     /// change data file that should be added to the table. The path is a URI as specified by
     /// [RFC 2396 URI Generic Syntax], which needs to be decoded to get the file path.
@@ -515,7 +512,8 @@ pub struct SetTransaction {
 }
 
 #[allow(unused)] //TODO: Remove once we implement V2 checkpoint file processing
-#[derive(Debug, Clone, Schema)]
+#[derive(Schema)]
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 struct Sidecar {
     /// A path to the sidecar file. Because sidecar files must always reside in the table's own
