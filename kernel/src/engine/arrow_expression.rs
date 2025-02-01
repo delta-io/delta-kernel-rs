@@ -538,9 +538,9 @@ impl ExpressionHandler for ArrowExpressionHandler {
         // about the 'transformed' type
         let _transformed = array_transform.transform(&datatype);
         let array = array_transform.into_struct_array()?;
-        let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap(); // FIXME
+        let struct_array = array.as_struct_opt().unwrap(); // FIXME
 
-        let record_batch: RecordBatch = struct_array.into(); // FIXME will panic for top-level null
+        let record_batch: RecordBatch = struct_array.into(); // FIXME
         Ok(Box::new(ArrowEngineData::new(record_batch)))
     }
 }
@@ -573,14 +573,40 @@ mod single_row_array_transform {
         stack: Vec<ArrayRef>,
         /// If an error occurs, it will be stored here.
         error: Option<Error>,
+        nullability_stack: Vec<bool>,
     }
 
+    ///// Any error for the single-row array transform.
+    //#[derive(thiserror::Error, Debug)]
+    //pub enum Error {
+    //    /// An error performing operations on arrow data
+    //    #[error(transparent)]
+    //    Arrow(arrow_schema::ArrowError),
+    //
+    //    /// A generic error with a message
+    //    #[error("Schema error: {0}")]
+    //    Schema(String),
+    //
+    //    /// TODO
+    //    #[error("stack error: {0}")]
+    //    Stack(String),
+    //}
+    //
+    //impl Error {
+    //    /// Create a generic error with a message
+    //    pub fn generic(msg: impl Into<String>) -> Self {
+    //        Self::Schema(msg.into())
+    //    }
+    //}
+    //
+    // TODO ERRORS
     impl<'a, T: Iterator<Item = &'a Scalar>> SingleRowArrayTransform<'a, T> {
         pub(crate) fn new(scalars: impl IntoIterator<Item = &'a Scalar, IntoIter = T>) -> Self {
             Self {
                 scalars: scalars.into_iter(),
                 stack: Vec::new(),
                 error: None,
+                nullability_stack: vec![false],
             }
         }
 
@@ -590,6 +616,13 @@ mod single_row_array_transform {
             if let Some(e) = self.error {
                 return Err(e);
             }
+
+            if self.scalars.next().is_some() {
+                return Err(Error::generic(
+                    "Excess scalars given to create a single-row array",
+                ));
+            }
+
             match self.stack.pop() {
                 Some(array) if self.stack.is_empty() => match array.data_type() {
                     ArrowDataType::Struct(_) => Ok(array),
@@ -688,8 +721,38 @@ mod single_row_array_transform {
                 }
             };
 
-            // TODO: null buffer is always none since we are purposely creating a single-row array,
-            // but if the literals are all null we should use the NullBuffer?
+            // TODO track if ancestor/me is nullable
+            // if yes, are any of my children _directly_ not nullable? if yes, check if values are
+            // null
+            //
+            // do i have direct children which are non nullable with value null.
+            // -> verify all other children are all null
+            // -> if not, error
+            // -> if yes, create a null for the struct
+
+            println!("transforming: {:?}", struct_type);
+
+            // check if any child array is null and has a non-nullable field
+            for (child, field) in child_arrays.iter().zip(struct_type.fields()) {
+                if !field.is_nullable() && child.is_null(0) {
+                    // if we have a null child array for a not-nullable field, either all other
+                    // children must be null (and we make a null struct) or error
+                    if child_arrays.iter().all(|c| c.is_null(0))
+                        && self.nullability_stack.iter().any(|n| *n)
+                    {
+                        self.stack.push(Arc::new(StructArray::new_null(fields, 1)));
+                        return Some(Cow::Borrowed(struct_type));
+                    } else {
+                        self.set_error(Error::Generic(format!(
+                            "Non-nullable field {} is null in single-row struct",
+                            field.name()
+                        )));
+                        return None;
+                    }
+                }
+            }
+
+            // null buffer is none since we catch the null struct case above
             let array = match StructArray::try_new(fields, child_arrays, None) {
                 Ok(arr) => arr,
                 Err(e) => {
@@ -709,7 +772,13 @@ mod single_row_array_transform {
             if self.error.is_some() {
                 return None;
             }
-            self.recurse_into_struct_field(field)
+
+            println!("transforming field: {:?}", field);
+            println!("nullable: {:?}", field.is_nullable());
+            self.nullability_stack.push(field.is_nullable());
+            self.recurse_into_struct_field(field);
+            self.nullability_stack.pop();
+            Some(Cow::Borrowed(field))
         }
 
         // arrays unsupported for now
@@ -1134,11 +1203,7 @@ mod tests {
             "a",
             DeltaDataTypes::INTEGER,
         )]));
-        let expected_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
-            "a",
-            DataType::Int32,
-            false,
-        )]));
+        let expected_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let expected =
             RecordBatch::try_new(expected_schema, vec![create_array!(Int32, [1])]).unwrap();
         assert_create_one(values, schema, expected);
@@ -1192,7 +1257,7 @@ mod tests {
                 StructField::not_null("c", DeltaDataTypes::INTEGER),
             ]),
         )]));
-        let expected_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+        let expected_schema = Arc::new(Schema::new(vec![Field::new(
             "a",
             DataType::Struct(
                 vec![
@@ -1220,6 +1285,106 @@ mod tests {
         assert_create_one(values, schema, expected);
     }
 
+    // critical case: struct(x) [nullable] with (a [non-null], b [nullable]) fields.
+    // for scalars (null, null) the _only_ solution here is struct(x) is null struct (not two null
+    // leaves)
+    //
+    // vs. if a and b are both nullable, we just leave them as null and the struct is non-null
+    //
+    // thus, we trigger the 'nullable struct' case only if it is required.
+    #[test]
+    fn test_create_one_null_struct() {
+        let values: &[Scalar] = &[
+            Scalar::Null(DeltaDataTypes::INTEGER),
+            Scalar::Null(DeltaDataTypes::INTEGER),
+        ];
+        let schema = Arc::new(StructType::new([StructField::nullable(
+            "a",
+            DeltaDataTypes::struct_type([
+                StructField::not_null("b", DeltaDataTypes::INTEGER),
+                StructField::nullable("c", DeltaDataTypes::INTEGER),
+            ]),
+        )]));
+        let struct_fields = vec![
+            Field::new("b", DataType::Int32, false),
+            Field::new("c", DataType::Int32, true),
+        ];
+        let expected_schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::Struct(struct_fields.clone().into()),
+            true,
+        )]));
+        // an array with one null struct
+        let expected = RecordBatch::try_new(
+            expected_schema,
+            vec![Arc::new(StructArray::new_null(struct_fields.into(), 1))],
+        )
+        .unwrap();
+        assert_create_one(values, schema.clone(), expected);
+
+        let err_values: &[Scalar] = &[Scalar::Null(DeltaDataTypes::INTEGER), 1.into()];
+        let handler = ArrowExpressionHandler;
+        assert!(handler.create_one(schema, err_values).is_err()); // FIXME
+    }
+
+    #[test]
+    fn test_create_one_null_fields() {
+        // vs if both fields are nullable, we just leave them as null
+        let values: &[Scalar] = &[
+            Scalar::Null(DeltaDataTypes::INTEGER),
+            Scalar::Null(DeltaDataTypes::INTEGER),
+        ];
+        let schema = Arc::new(StructType::new([StructField::nullable(
+            "a",
+            DeltaDataTypes::struct_type([
+                StructField::nullable("b", DeltaDataTypes::INTEGER),
+                StructField::nullable("c", DeltaDataTypes::INTEGER),
+            ]),
+        )]));
+        let struct_fields = vec![
+            Field::new("b", DataType::Int32, true),
+            Field::new("c", DataType::Int32, true),
+        ];
+        let expected_schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::Struct(struct_fields.clone().into()),
+            true,
+        )]));
+        // an array with one struct and two null fields
+        let expected = RecordBatch::try_new(
+            expected_schema,
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    Arc::new(Field::new("b", DataType::Int32, true)),
+                    create_array!(Int32, [None]) as ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new("c", DataType::Int32, true)),
+                    create_array!(Int32, [None]) as ArrayRef,
+                ),
+            ]))],
+        )
+        .unwrap();
+        assert_create_one(values, schema, expected);
+    }
+
+    #[test]
+    fn test_create_one_not_null_struct() {
+        let values: &[Scalar] = &[
+            Scalar::Null(DeltaDataTypes::INTEGER),
+            Scalar::Null(DeltaDataTypes::INTEGER),
+        ];
+        let schema = Arc::new(StructType::new([StructField::not_null(
+            "a",
+            DeltaDataTypes::struct_type([
+                StructField::not_null("b", DeltaDataTypes::INTEGER),
+                StructField::nullable("c", DeltaDataTypes::INTEGER),
+            ]),
+        )]));
+        let handler = ArrowExpressionHandler;
+        assert!(handler.create_one(schema, values).is_err()); // FIXME
+    }
+
     #[test]
     fn test_create_one_incorrect_schema() {
         let values = &["a".into()];
@@ -1233,7 +1398,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_one_incorrect_null() {
+    fn test_create_one_top_level_null() {
         let values = &[Scalar::Null(DeltaDataTypes::INTEGER)];
         let schema = Arc::new(StructType::new([StructField::not_null(
             "col_1",
@@ -1246,7 +1411,7 @@ mod tests {
 
     #[test]
     fn test_create_one_missing_values() {
-        let values = &["a".into()];
+        let values = &[1.into()];
         let schema = Arc::new(StructType::new([
             StructField::nullable("col_1", DeltaDataTypes::INTEGER),
             StructField::nullable("col_2", DeltaDataTypes::INTEGER),
@@ -1258,13 +1423,13 @@ mod tests {
 
     #[test]
     fn test_create_one_extra_values() {
-        let values = &["a".into(), "b".into(), "c".into()];
+        let values = &[1.into(), 2.into(), 3.into()];
         let schema = Arc::new(StructType::new([
             StructField::nullable("col_1", DeltaDataTypes::INTEGER),
             StructField::nullable("col_2", DeltaDataTypes::INTEGER),
         ]));
 
         let handler = ArrowExpressionHandler;
-        matches!(handler.create_one(schema, values), Err(Error::Generic(_)));
+        assert!(handler.create_one(schema, values).is_err());
     }
 }

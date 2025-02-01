@@ -286,13 +286,9 @@ impl StructType {
         self.fields.values()
     }
 
-    pub fn len(&self) -> usize {
+    pub fn fields_len(&self) -> usize {
         // O(1) for indexmap
         self.fields.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.fields.is_empty()
     }
 
     /// Extracts the name and type of all leaf columns, in schema order. Caller should pass Some
@@ -1211,5 +1207,25 @@ mod tests {
             MetadataValue::Other(array_json).to_string(),
             "[\"an\",\"array\"]"
         );
+    }
+
+    #[test]
+    fn test_fields_len() {
+        let schema = StructType::new([]);
+        assert!(schema.fields_len() == 0);
+        let schema = StructType::new([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", DataType::LONG),
+            StructField::nullable("c", DataType::LONG),
+            StructField::nullable("d", DataType::LONG),
+        ]);
+        assert_eq!(schema.fields_len(), 4);
+        let schema = StructType::new([
+            StructField::nullable("b", DataType::LONG),
+            StructField::not_null("b", DataType::LONG),
+            StructField::nullable("c", DataType::LONG),
+            StructField::nullable("c", DataType::LONG),
+        ]);
+        assert_eq!(schema.fields_len(), 2);
     }
 }
