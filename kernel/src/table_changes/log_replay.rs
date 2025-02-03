@@ -1,8 +1,8 @@
 //! This module handles the log replay for Change Data Feed. This is done in two phases:
 //! [`process_cdf_commit`], and [`cdf_commit_to_scan_batches`]. The first phase pre-processes the
-//! commit file to validate the [`TableConfiguration`] and to collect information about the commit
+//! commit file to validate the [`TableConfiguration`] and to collect information about the commit's
 //! timestamp and presence of cdc actions. Then [`TableChangesScanData`] are generated in the second
-//! phase. Note: As a consequence of the two phases, we will iterate over each action in the
+//! phase. Note: As a consequence of the two phases, we must iterate over each action in the
 //! commit twice. It also may use an unbounded amount of memory, proportional to the number of
 //! `add` + `remove` actions in the _single_ commit.
 use std::collections::{HashMap, HashSet};
@@ -77,14 +77,14 @@ pub(crate) fn table_changes_action_iter(
     Ok(result)
 }
 
-/// Represents a single commit file that's been processed by [`process_cdf_commit`] If successfully
-/// constructed, the [`ProcessedCdfCommit`] will encapsulate:
+/// Represents a single commit file that's been processed by [`process_cdf_commit`]. If successfully
+/// constructed, the [`ProcessedCdfCommit`] will hold:
 /// - The `timestamp` of the commit. Currently this is the file modification timestamp. When the
 ///   kernel supports in-commit timestamps, we will also have to inspect CommitInfo actions to find
 ///   the in-commit timestamp. These are generated when the incommit timestamps table property is
-///   enabled. This must be done in [`process_cdf_commit`] instead of the following phase
-///   because [`cdf_commit_to_scan_batches`] lazily transforms engine data with an extra timestamp
-///   column. Thus, the timestamp must be known before the next phase.
+///   enabled. This must be done in [`process_cdf_commit`] instead of the [`cdf_commit_to_scan_batches`]
+///   because it lazily transforms engine data with an extra timestamp column Thus, the timestamp must
+///   be known before the next phase.
 ///   See <https://github.com/delta-io/delta-kernel-rs/issues/559>
 /// - `remove_dvs`, a map from each remove action's path to its [`DvInfo`]. This will be used to
 ///   resolve the deletion vectors to find the rows that were changed this commit.
@@ -98,7 +98,7 @@ struct ProcessedCdfCommit {
     // A map from path to the deletion vector from the remove action. It is guaranteed that there
     // is an add action with the same path in this commit
     remove_dvs: HashMap<String, DvInfo>,
-    // The commit file that this replay scanner will operate on.
+    // The commit file that this [`ProcessedCdfCommit`] represents.
     commit_file: ParsedLogPath,
     // The timestamp associated with this commit. This is the file modification time
     // from the commit's [`FileMeta`].
@@ -112,17 +112,17 @@ struct ProcessedCdfCommit {
 }
 
 /// This processes a commit file to prepare for generating [`TableChangesScanData`]. To do so, it
-/// performs the following for the file:
-///     - Determine if there exist any `cdc` actions. We determine this in the first phase because
-///       the selection vectors for actions are lazily constructed in phase 2. We must know ahead
-///       of time whether to filter out add/remove actions.
-///     - Constructs the remove deletion vector map from paths belonging to `remove` actions to the
-///       action's corresponding [`DvInfo`]. This map will be filtered to only contain paths that
-///       exists in another `add` action _within the same commit_. We store the result in `remove_dvs`.
-///       Deletion vector resolution affects whether a remove action is selected in the second
-///       phase, so we must perform it ahead of time in phase 1.
+/// performs the following:
+///     - Determine if there exist any `cdc` actions. We determine this in this phase because the
+///       selection vectors for actions are lazily constructed in the following phase. We must know
+///       ahead of time whether to filter out add/remove actions.
+///     - Constructs the map from paths belonging to `remove` action's path to its [`DvInfo`]. This
+///       map will be filtered to only contain paths that exists in another `add` action _within the
+///       same commit_. We store the result in `remove_dvs`. Deletion vector resolution affects
+///       whether a remove action is selected in the second phase, so we must perform it before
+///       [`cdf_commit_to_scan_batches`].
 ///     - Ensure that reading is supported on any protocol updates.
-///     - Ensure that Change Data Feed is enabled for any metadata update. See  [`TableProperties`]
+///     - Ensure that Change Data Feed is enabled for any metadata update. See [`TableProperties`]
 ///     - Ensure that any schema update is compatible with the provided `schema`. Currently, schema
 ///       compatibility is checked through schema equality. This will be expanded in the future to
 ///       allow limited schema evolution.
@@ -275,7 +275,7 @@ fn cdf_commit_to_scan_batches(
     Ok(result)
 }
 
-// This is a visitor used in [`process_cdf_commit`]. See that for details
+// This is a visitor used in [`process_cdf_commit`].
 struct ProcessCdfCommitVisitor<'a> {
     protocol: Option<Protocol>,
     metadata: Option<Metadata>,
@@ -378,8 +378,8 @@ impl RowVisitor for ProcessCdfCommitVisitor<'_> {
     }
 }
 
-// This visitor generates selection vectors based on the rules specified in [`LogReplayScanner`].
-// See [`LogReplayScanner::into_scan_batches`] for usage.
+// This visitor is used in [`cdf_commit_to_scan_batches`] to generate selection vectors.
+// See [`cdf_commit_to_scan_batches`] for details.
 struct FileActionSelectionVisitor<'a> {
     selection_vector: Vec<bool>,
     has_cdc_action: bool,
