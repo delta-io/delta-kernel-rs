@@ -181,10 +181,10 @@ impl LogReplayScanner {
             }
             if let Some((schema, configuration)) = visitor.metadata_info {
                 let schema: StructType = serde_json::from_str(&schema)?;
-                require!(
-                    schema.can_read_as(table_schema).is_ok(),
-                    Error::change_data_feed_incompatible_schema(table_schema, &schema)
-                );
+
+                schema.can_read_as(table_schema).map_err(|err| {
+                    Error::change_data_feed_incompatible_schema(commit_file.version, err)
+                })?;
                 let table_properties = TableProperties::from(configuration);
                 check_cdf_table_properties(&table_properties)
                     .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;

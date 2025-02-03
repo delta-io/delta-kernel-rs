@@ -174,11 +174,11 @@ impl TableChanges {
 
         // Verify that the start and end schemas are compatible. We must still check schema
         // compatibility for each schema update in the CDF range.
-        if let Err(err) = start_snapshot.schema().can_read_as(end_snapshot.schema()) {
-            return Err(Error::generic(format!(
+        start_snapshot.schema().can_read_as(end_snapshot.schema()).map_err(|err|{
+            Error::generic(format!(
                 "Failed to build TableChanges: {}\n Found start version schema {:?} and end version schema {:?}", err, start_snapshot.schema(), end_snapshot.schema(),
-            )));
-        }
+            ))
+        })?;
 
         let schema = StructType::new(
             end_snapshot
