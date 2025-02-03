@@ -231,7 +231,6 @@ fn cdf_commit_to_scan_batches(
         has_cdc_action,
         remove_dvs,
         commit_file,
-        // TODO: Add the timestamp as a column with an expression
         timestamp,
     } = processed_commit;
     let remove_dvs = Arc::new(remove_dvs);
@@ -378,8 +377,8 @@ impl RowVisitor for ProcessCdfCommitVisitor<'_> {
     }
 }
 
-// This visitor is used in [`cdf_commit_to_scan_batches`] to generate selection vectors.
-// See [`cdf_commit_to_scan_batches`] for details.
+// This visitor generates selection vectors based on the rules specified in
+// [`cdf_commit_to_scan_batches`].
 struct FileActionSelectionVisitor<'a> {
     selection_vector: Vec<bool>,
     has_cdc_action: bool,
