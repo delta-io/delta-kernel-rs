@@ -512,26 +512,25 @@ pub struct SetTransaction {
 }
 
 #[allow(unused)] //TODO: Remove once we implement V2 checkpoint file processing
-#[derive(Schema)]
+#[derive(Schema, Debug, PartialEq)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
-struct Sidecar {
+pub(crate) struct Sidecar {
     /// A path to the sidecar file. Because sidecar files must always reside in the table's own
     ///  _delta_log/_sidecars directory, implementations are encouraged to store only the file's name.
     /// The path is a URI as specified by [RFC 2396 URI Generic Syntax], which needs to be decoded
     /// to get the data file path.
     ///
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
-    pub(crate) path: String,
+    pub path: String,
 
     /// The size of the sidecar file in bytes.
-    pub(crate) size_in_bytes: i64,
+    pub size_in_bytes: i64,
 
     /// The time this logical file was created, as milliseconds since the epoch.
-    pub(crate) modification_time: i64,
+    pub modification_time: i64,
 
     /// A map containing any additional metadata about the logicial file.
-    pub(crate) tags: Option<HashMap<String, String>>,
+    pub tags: Option<HashMap<String, String>>,
 }
 
 #[cfg(test)]
@@ -682,15 +681,14 @@ mod tests {
         let schema = get_log_schema()
             .project(&[SIDECAR_NAME])
             .expect("Couldn't get sidecar field");
-        let expected = Arc::new(StructType::new([StructField::new(
+        let expected = Arc::new(StructType::new([StructField::nullable(
             "sidecar",
             StructType::new([
-                StructField::new("path", DataType::STRING, false),
-                StructField::new("sizeInBytes", DataType::LONG, false),
-                StructField::new("modificationTime", DataType::LONG, false),
+                StructField::not_null("path", DataType::STRING),
+                StructField::not_null("sizeInBytes", DataType::LONG),
+                StructField::not_null("modificationTime", DataType::LONG),
                 tags_field(),
             ]),
-            true,
         )]));
         assert_eq!(schema, expected);
     }

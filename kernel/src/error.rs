@@ -195,6 +195,10 @@ pub enum Error {
     /// Invalid checkpoint files
     #[error("Invalid Checkpoint: {0}")]
     InvalidCheckpoint(String),
+
+    /// An error encountered when visiting rows of EngineData
+    #[error("Error encountered on visitation of rows: {0}")]
+    VisitorError(String),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -270,6 +274,10 @@ impl Error {
 
     pub fn invalid_checkpoint(msg: impl ToString) -> Self {
         Self::InvalidCheckpoint(msg.to_string())
+    }
+
+    pub fn visitor_error(msg: impl ToString) -> Self {
+        Self::VisitorError(msg.to_string())
     }
 
     // Capture a backtrace when the error is constructed.

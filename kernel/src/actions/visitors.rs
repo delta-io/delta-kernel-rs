@@ -1,8 +1,9 @@
 //! This module defines visitors that can be used to extract the various delta actions from
 //! [`crate::engine_data::EngineData`] types.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
+use tracing::warn;
 
 use crate::actions::SIDECAR_NAME;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
@@ -439,10 +440,12 @@ impl RowVisitor for SetTransactionVisitor {
     }
 }
 
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[allow(unused)] //TODO: Remove once we implement V2 checkpoint file processing
 #[derive(Default)]
-struct SidecarVisitor {
-    sidecars: Vec<Sidecar>,
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+pub(crate) struct SidecarVisitor {
+    pub(crate) sidecars: Vec<Sidecar>,
+    pub(crate) seen_paths: HashSet<String>,
 }
 
 impl SidecarVisitor {
@@ -477,7 +480,22 @@ impl RowVisitor for SidecarVisitor {
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of a sidecar action
             if let Some(path) = getters[0].get_opt(i, "sidecar.path")? {
-                self.sidecars.push(Self::visit_sidecar(i, path, getters)?);
+                if self.seen_paths.contains(path) {
+                    warn!("Duplicate sidecar path {} found during visiting", path);
+                    continue;
+                }
+
+                if path.contains('/') {
+                    // TODO: Implement full path support
+                    return Err(Error::visitor_error(format!(
+                        "Sidecar action path {} is a file path. Only file names are currently supported",
+                        path
+                    )));
+                }
+
+                self.seen_paths.insert(path.to_string());
+                self.sidecars
+                    .push(Self::visit_sidecar(i, path.to_string(), getters)?);
             }
         }
         Ok(())
@@ -541,7 +559,8 @@ mod tests {
             r#"{"commitInfo":{"timestamp":1677811178585,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isolationLevel":"WriteSerializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"10","numOutputBytes":"635"},"engineInfo":"Databricks-Runtime/<unknown>","txnId":"a6a94671-55ef-450e-9546-b8465b9147de"}}"#,
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none", "delta.enableChangeDataFeed":"true"},"createdTime":1677811175819}}"#,
-            r#"{"cdc":{"path":"_change_data/age=21/cdc-00000-93f7fceb-281a-446a-b221-07b88132d203.c000.snappy.parquet","partitionValues":{"age":"21"},"size":1033,"dataChange":false}}"#
+            r#"{"cdc":{"path":"_change_data/age=21/cdc-00000-93f7fceb-281a-446a-b221-07b88132d203.c000.snappy.parquet","partitionValues":{"age":"21"},"size":1033,"dataChange":false}}"#,
+            r#"{"sidecar":{"path":"016ae953-37a9-438e-8683-9a9a4a79a395.parquet","sizeInBytes":9268,"modificationTime":1714496113961,"tags":{"tag_foo":"tag_bar"}}}"#,
         ]
         .into();
         let output_schema = get_log_schema().clone();
@@ -585,12 +604,35 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_action_batch_with_sidecar_actions() -> DeltaResult<()> {
+    fn test_parse_action_batch_with_sidecar_action() -> DeltaResult<()> {
+        let data = action_batch();
+
+        let mut visitor = SidecarVisitor::default();
+        visitor.visit_rows_of(data.as_ref())?;
+
+        let sidecar1 = Sidecar {
+            path: "016ae953-37a9-438e-8683-9a9a4a79a395.parquet".into(),
+            size_in_bytes: 9268,
+            modification_time: 1714496113961,
+            tags: Some(HashMap::from([(
+                "tag_foo".to_string(),
+                "tag_bar".to_string(),
+            )])),
+        };
+
+        assert_eq!(visitor.sidecars.len(), 1);
+        assert_eq!(visitor.sidecars[0], sidecar1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_action_batch_with_duplicate_sidecar_actions() -> DeltaResult<()> {
         let engine = SyncEngine::new();
         let json_handler = engine.get_json_handler();
         let json_strings: StringArray = vec![
-            r#"{"sidecar":{"path":"016ae953-37a9-438e-8683-9a9a4a79a395.parquet","sizeInBytes":9268,"modificationTime":1714496113961,"tags": null}}"#,
-            r#"{"sidecar":{"path":"3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet","sizeInBytes":9268,"modificationTime":1714496113962,"tags": null}}"#,
+            r#"{"sidecar":{"path":"3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet","sizeInBytes":9268,"modificationTime":1714496113962,"tags":null}}"#,
+            r#"{"sidecar":{"path":"3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet","sizeInBytes":9268,"modificationTime":1714496113962,"tags":null}}"#,
         ].into();
 
         let output_schema = get_log_schema().clone();
@@ -600,17 +642,38 @@ mod tests {
         let mut visitor = SidecarVisitor::default();
         visitor.visit_rows_of(batch.as_ref())?;
 
-        assert_eq!(visitor.sidecars.len(), 2);
+        let sidecar1 = Sidecar {
+            path: "3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet".into(),
+            size_in_bytes: 9268,
+            modification_time: 1714496113962,
+            tags: None,
+        };
+
+        // The second sidecar is a duplicate of the first, so one is ignored
+        assert_eq!(visitor.sidecars.len(), 1);
+        assert_eq!(visitor.sidecars[0], sidecar1);
+
         Ok(())
     }
 
     #[test]
-    fn test_parse_action_batch_without_sidecar_actions() -> DeltaResult<()> {
-        let data = action_batch();
-        let mut visitor = SidecarVisitor::default();
-        visitor.visit_rows_of(data.as_ref())?;
+    fn test_parse_sidecar_action_with_full_file_path() -> DeltaResult<()> {
+        let engine = SyncEngine::new();
+        let json_handler = engine.get_json_handler();
+        let json_strings: StringArray = vec![
+            r#"{"sidecar":{"path":"_delta_log/_sidecars/3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet","sizeInBytes":9268,"modificationTime":1714496113962,"tags":null}}"#,
+        ].into();
 
-        assert_eq!(visitor.sidecars.len(), 0);
+        let output_schema = get_log_schema().clone();
+        let batch = json_handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        let mut visitor = SidecarVisitor::default();
+
+        // The visitor should error out when it encounters a full file path
+        let res = visitor.visit_rows_of(batch.as_ref()).unwrap_err();
+        assert!(matches!(res, Error::VisitorError(_)));
+
         Ok(())
     }
 
