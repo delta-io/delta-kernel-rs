@@ -28,7 +28,7 @@ void print_partition_info(struct EngineContext* context, const CStringMap* parti
   for (uintptr_t i = 0; i < context->partition_cols->len; i++) {
     char* col = context->partition_cols->cols[i];
     KernelStringSlice key = { col, strlen(col) };
-    char* partition_val = get_from_map(partition_values, key, allocate_string);
+    char* partition_val = get_from_string_map(partition_values, key, allocate_string);
     if (partition_val) {
       print_diag("  partition '%s' here: %s\n", col, partition_val);
       free(partition_val);
@@ -87,14 +87,15 @@ void scan_row_callback(
 void do_visit_scan_data(
   void* engine_context,
   ExclusiveEngineData* engine_data,
-  KernelBoolSlice selection_vec)
+  KernelBoolSlice selection_vec,
+  const CTransforms* transforms)
 {
   print_diag("\nScan iterator found some data to read\n  Of this data, here is "
              "a selection vector\n");
   print_selection_vector("    ", &selection_vec);
   // Ask kernel to iterate each individual file and call us back with extracted metadata
   print_diag("Asking kernel to call us back for each scan row (file to read)\n");
-  visit_scan_data(engine_data, selection_vec, engine_context, scan_row_callback);
+  visit_scan_data(engine_data, selection_vec, transforms, engine_context, scan_row_callback);
   free_bool_slice(selection_vec);
   free_engine_data(engine_data);
 }
