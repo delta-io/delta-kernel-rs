@@ -71,6 +71,7 @@ tokio = { version = "1.40", optional = true, features = ["rt-multi-thread"] }
 # Used in integration tests
 hdfs-native = { workspace = true, optional = true }
 walkdir = { workspace = true, optional = true }
+bigdecimal = "0.4.7"
 
 [features]
 arrow-conversion = ["arrow-schema"]
