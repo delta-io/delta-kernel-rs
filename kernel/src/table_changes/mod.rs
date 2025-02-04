@@ -151,7 +151,7 @@ impl TableChanges {
         // supported for every protocol action in the CDF range.
         let start_snapshot =
             Snapshot::try_new(table_root.as_url().clone(), engine, Some(start_version))?;
-        let end_snapshot = Snapshot::try_new(table_root.as_url().clone(), engine, end_version)?;
+        let end_snapshot = Snapshot::new_from(&start_snapshot, engine, end_version)?;
 
         // Verify CDF is enabled at the beginning and end of the interval using
         // [`check_cdf_table_properties`] to fail early. This also ensures that column mapping is
