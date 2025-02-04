@@ -515,10 +515,11 @@ pub struct SetTransaction {
 #[derive(Schema, Debug, PartialEq)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct Sidecar {
-    /// A path to the sidecar file. Because sidecar files must always reside in the table's own
-    ///  _delta_log/_sidecars directory, implementations are encouraged to store only the file's name.
+    /// A path to a sidecar file that can be either:
+    /// - A relative path (just the file name) within the `_delta_log/_sidecars` directory.  
+    /// - An absolute path
     /// The path is a URI as specified by [RFC 2396 URI Generic Syntax], which needs to be decoded
-    /// to get the data file path.
+    /// to get the file path.
     ///
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
     pub path: String,
