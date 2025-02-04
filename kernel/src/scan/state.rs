@@ -12,7 +12,6 @@ use crate::{
     actions::{deletion_vector::DeletionVectorDescriptor, visitors::visit_deletion_vector_at},
     engine_data::{GetData, RowVisitor, TypedGetData as _},
     schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef},
-    table_features::ColumnMappingMode,
     DeltaResult, Engine, EngineData, Error,
 };
 use roaring::RoaringTreemap;
@@ -28,7 +27,6 @@ pub struct GlobalScanState {
     pub partition_columns: Vec<String>,
     pub logical_schema: SchemaRef,
     pub physical_schema: SchemaRef,
-    pub column_mapping_mode: ColumnMappingMode,
 }
 
 /// this struct can be used by an engine to materialize a selection vector
