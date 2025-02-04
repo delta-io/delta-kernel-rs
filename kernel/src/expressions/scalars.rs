@@ -261,17 +261,9 @@ impl PartialOrd for Scalar {
             (Date(_), _) => None,
             (Binary(a), Binary(b)) => a.partial_cmp(b),
             (Binary(_), _) => None,
-            (Decimal(v1, p1, s1), Decimal(v2, p2, s2)) => {
-                use bigdecimal::{BigDecimal, FromPrimitive};
-
-                let lhs = BigDecimal::from_i128(*v1)?
-                    .with_prec(*p1 as u64)
-                    .with_scale(*s1 as i64);
-                let rhs = BigDecimal::from_i128(*v2)?
-                    .with_prec(*p2 as u64)
-                    .with_scale(*s2 as i64);
-                lhs.partial_cmp(&rhs)
-            }
+            (Decimal(v1, p1, s1), Decimal(v2, p2, s2)) => (s1.eq(s2) && p1.eq(p2))
+                .then(|| v1.partial_cmp(v2))
+                .flatten(),
             (Decimal(_, _, _), _) => None,
             (Null(_), _) => None, // NOTE: NULL values are incomparable by definition
             (Struct(_), _) => None, // TODO: Support Struct?
