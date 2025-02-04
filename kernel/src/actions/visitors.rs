@@ -1,9 +1,8 @@
 //! This module defines visitors that can be used to extract the various delta actions from
 //! [`crate::engine_data::EngineData`] types.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::LazyLock;
-use tracing::warn;
 
 use crate::actions::SIDECAR_NAME;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
@@ -588,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_action_batch_with_sidecar_action() -> DeltaResult<()> {
+    fn test_parse_sidecar() -> DeltaResult<()> {
         let data = action_batch();
 
         let mut visitor = SidecarVisitor::default();
