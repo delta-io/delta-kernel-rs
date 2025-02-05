@@ -10,6 +10,8 @@ pub(crate) mod arrow_conversion;
     any(feature = "default-engine-base", feature = "sync-engine")
 ))]
 pub mod arrow_expression;
+#[cfg(feature = "arrow-expression")]
+pub(crate) mod arrow_utils;
 
 #[cfg(feature = "default-engine-base")]
 pub mod default;
@@ -17,19 +19,11 @@ pub mod default;
 #[cfg(feature = "sync-engine")]
 pub mod sync;
 
-macro_rules! declare_modules {
-    ( $(($vis:vis, $module:ident)),*) => {
-        $(
-            $vis mod $module;
-        )*
-    };
-}
-
 #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
-declare_modules!(
-    (pub, arrow_data),
-    (pub, parquet_row_group_skipping),
-    (pub(crate), arrow_get_data),
-    (pub(crate), arrow_utils),
-    (pub(crate), ensure_data_types)
-);
+pub mod arrow_data;
+#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
+pub(crate) mod arrow_get_data;
+#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
+pub(crate) mod ensure_data_types;
+#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
+pub mod parquet_row_group_skipping;
