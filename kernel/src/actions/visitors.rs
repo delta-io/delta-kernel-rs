@@ -4,7 +4,6 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use crate::actions::SIDECAR_NAME;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
@@ -14,7 +13,7 @@ use super::deletion_vector::DeletionVectorDescriptor;
 use super::schemas::ToSchema as _;
 use super::{
     Add, Cdc, Format, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME, CDC_NAME,
-    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
+    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 
 #[derive(Default)]
