@@ -7,11 +7,11 @@ pub(crate) mod arrow_conversion;
 
 #[cfg(all(
     feature = "arrow-expression",
-    any(feature = "default-engine", feature = "sync-engine")
+    any(feature = "default-engine-base", feature = "sync-engine")
 ))]
 pub mod arrow_expression;
 
-#[cfg(feature = "default-engine")]
+#[cfg(feature = "default-engine-base")]
 pub mod default;
 
 #[cfg(feature = "sync-engine")]
@@ -25,11 +25,10 @@ macro_rules! declare_modules {
     };
 }
 
-#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
 declare_modules!(
     (pub, arrow_data),
     (pub, parquet_row_group_skipping),
-    (pub, parquet_stats_skipping),
     (pub(crate), arrow_get_data),
     (pub(crate), arrow_utils),
     (pub(crate), ensure_data_types)

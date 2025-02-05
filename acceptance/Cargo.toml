@@ -10,6 +10,9 @@ readme.workspace = true
 version.workspace = true
 rust-version.workspace = true
 
+[package.metadata.release]
+release = false
+
 [dependencies]
 arrow-array = { workspace = true }
 arrow-cast = { workspace = true }

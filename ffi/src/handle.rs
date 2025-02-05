@@ -2,8 +2,8 @@
 //! boundary.
 //!
 //! Creating a [`Handle<T>`] always implies some kind of ownership transfer. A mutable handle takes
-//! ownership of the object itself (analagous to [`Box<T>`]), while a non-mutable (shared) handle
-//! takes ownership of a shared reference to the object (analagous to [`std::sync::Arc<T>`]). Thus, a created
+//! ownership of the object itself (analogous to [`Box<T>`]), while a non-mutable (shared) handle
+//! takes ownership of a shared reference to the object (analogous to [`std::sync::Arc<T>`]). Thus, a created
 //! handle remains [valid][Handle#Validity], and its underlying object remains accessible, until the
 //! handle is explicitly dropped or consumed. Dropping a mutable handle always drops the underlying
 //! object as well; dropping a shared handle only drops the underlying object if the handle was the
@@ -165,6 +165,14 @@ mod private {
         pub unsafe fn drop_handle(self) {
             drop(self.into_inner())
         }
+
+        /// In testing code we want to simulate what c code can do where a pointer can be used
+        /// without consuming it. This creates a "new" handle just by copying the underlying pointer
+        /// without increasing the arc refcount. This is dangerous! Do not use outside testing code!
+        #[cfg(test)]
+        pub fn shallow_copy(&self) -> Self {
+            Handle { ptr: self.ptr }
+        }
     }
 
     // [`Handle`] operations applicable only to mutable handles, with implementations forwarded to
@@ -176,7 +184,6 @@ mod private {
     {
         /// Obtains a mutable reference to the handle's underlying object. Unsafe equivalent to
         /// [`AsMut::as_mut`].
-
         ///
         /// # Safety
         ///
@@ -365,10 +372,10 @@ mod private {
         type Raw = T;
 
         fn into_handle_ptr(val: Arc<T>) -> NonNull<T> {
-            let ptr = Arc::into_raw(val);
-            // Note: casting ptr as `*mut T` is needed for NonNull, and actually Arc::into_raw
-            // _does_ create a mutable pointer (via `Arc::as_ptr`), so this is an 'okay' cast.
-            unsafe { NonNull::new_unchecked(ptr as *mut T) } // into_raw guarantees non-null
+            // Note: casting ptr as mut is needed for NonNull, and actually Arc::into_raw _does_
+            // create a mutable pointer (via `Arc::as_ptr`), so this is an 'okay' cast.
+            let ptr = Arc::into_raw(val).cast_mut();
+            unsafe { NonNull::new_unchecked(ptr) } // into_raw guarantees non-null
         }
         unsafe fn as_ref<'a>(ptr: *const T) -> &'a T {
             &*ptr

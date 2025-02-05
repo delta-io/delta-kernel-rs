@@ -1,4 +1,4 @@
-//! Defintions of errors that the delta kernel can encounter
+//! Definitions of errors that the delta kernel can encounter
 
 use std::{
     backtrace::{Backtrace, BacktraceStatus},
@@ -6,7 +6,7 @@ use std::{
     str::Utf8Error,
 };
 
-use crate::schema::DataType;
+use crate::schema::{DataType, StructType};
 use crate::table_properties::ParseIntervalError;
 use crate::Version;
 
@@ -27,7 +27,7 @@ pub enum Error {
     },
 
     /// An error performing operations on arrow data
-    #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+    #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
     #[error(transparent)]
     Arrow(arrow_schema::ArrowError),
 
@@ -58,7 +58,7 @@ pub enum Error {
     #[error("Internal error {0}. This is a kernel bug, please report.")]
     InternalError(String),
 
-    /// An error enountered while working with parquet data
+    /// An error encountered while working with parquet data
     #[cfg(feature = "parquet")]
     #[error("Arrow error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
@@ -75,7 +75,7 @@ pub enum Error {
     #[error("Object store path error: {0}")]
     ObjectStorePath(#[from] object_store::path::Error),
 
-    #[cfg(feature = "default-engine")]
+    #[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
     #[error("Reqwest Error: {0}")]
     Reqwest(#[from] reqwest::Error),
 
@@ -99,7 +99,7 @@ pub enum Error {
     #[error("No table version found.")]
     MissingVersion,
 
-    /// An error occured while working with deletion vectors
+    /// An error occurred while working with deletion vectors
     #[error("Deletion Vector error: {0}")]
     DeletionVector(String),
 
@@ -188,6 +188,13 @@ pub enum Error {
 
     #[error("Change data feed is unsupported for the table at version {0}")]
     ChangeDataFeedUnsupported(Version),
+
+    #[error("Change data feed encountered incompatible schema. Expected {0}, got {1}")]
+    ChangeDataFeedIncompatibleSchema(String, String),
+
+    /// Invalid checkpoint files
+    #[error("Invalid Checkpoint: {0}")]
+    InvalidCheckpoint(String),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -254,6 +261,16 @@ impl Error {
     pub fn change_data_feed_unsupported(version: impl Into<Version>) -> Self {
         Self::ChangeDataFeedUnsupported(version.into())
     }
+    pub(crate) fn change_data_feed_incompatible_schema(
+        expected: &StructType,
+        actual: &StructType,
+    ) -> Self {
+        Self::ChangeDataFeedIncompatibleSchema(format!("{expected:?}"), format!("{actual:?}"))
+    }
+
+    pub fn invalid_checkpoint(msg: impl ToString) -> Self {
+        Self::InvalidCheckpoint(msg.to_string())
+    }
 
     // Capture a backtrace when the error is constructed.
     #[must_use]
@@ -286,7 +303,7 @@ from_with_backtrace!(
     (std::io::Error, IOError)
 );
 
-#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
 impl From<arrow_schema::ArrowError> for Error {
     fn from(value: arrow_schema::ArrowError) -> Self {
         Self::Arrow(value).with_backtrace()

@@ -1,18 +1,105 @@
 # Changelog
 
-## unreleased
+## [v0.6.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.6.1/) (2025-01-10)
 
-[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.5.0...HEAD)
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.6.0...v0.6.1)
+
+
+### 🚀 Features / new APIs
+
+1. New feature flag `default-engine-rustls` ([#572])
+
+### 🐛 Bug Fixes
+
+1. Allow partition value timestamp to be ISO8601 formatted string ([#622])
+2. Fix stderr output for handle tests ([#630])
+
+### ⚙️ Chores/CI
+
+1. Expand the arrow version range to allow arrow v54 ([#616])
+2. Update to CodeCov @v5 ([#608])
+
+### Other
+
+1. Fix msrv check by pinning `home` dependency ([#605])
+2. Add release script ([#636])
+
+
+[#605]: https://github.com/delta-io/delta-kernel-rs/pull/605
+[#608]: https://github.com/delta-io/delta-kernel-rs/pull/608
+[#622]: https://github.com/delta-io/delta-kernel-rs/pull/622
+[#630]: https://github.com/delta-io/delta-kernel-rs/pull/630
+[#572]: https://github.com/delta-io/delta-kernel-rs/pull/572
+[#616]: https://github.com/delta-io/delta-kernel-rs/pull/616
+[#636]: https://github.com/delta-io/delta-kernel-rs/pull/636
+
+
+## [v0.6.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.6.0/) (2024-12-17)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.5.0...v0.6.0)
 
 **API Changes**
 
 *Breaking*
+1. `Scan::execute` takes an `Arc<dyn EngineData>` now ([#553])
+2. `StructField::physical_name` no longer takes a `ColumnMapping` argument ([#543])
+3. removed `ColumnMappingMode` `Default` implementation ([#562])
+4. Remove lifetime requirement on `Scan::execute` ([#588])
+5. `scan::Scan::predicate` renamed as `physical_predicate` to eliminate ambiguity ([#512])
+6. `scan::log_replay::scan_action_iter` now takes fewer (and different) params. ([#512])
+7. `Expression::Unary`, `Expression::Binary`, and `Expression::Variadic` now wrap a struct of the
+   same name containing their fields ([#530])
+8. Moved `delta_kernel::engine::parquet_stats_skipping` module to
+   `delta_kernel::predicate::parquet_stats_skipping` ([#602])
+9. New `Error` variants `Error::ChangeDataFeedIncompatibleSchema` and `Error::InvalidCheckpoint`
+   ([#593])
 
 *Additions*
+1. Ability to read a table's change data feed with new TableChanges API! See new `table_changes`
+   module as well as the 'read-table-changes' example ([#597]). Changes include:
+  - Implement Log Replay for Change Data Feed ([#540])
+  - `ScanFile` expression and visitor for CDF ([#546])
+  - Resolve deletion vectors to find inserted and removed rows for CDF ([#568])
+  - Helper methods for CDF Physical to Logical Transformation ([#579])
+  - `TableChangesScan::execute` and end to end testing for CDF ([#580])
+  - `TableChangesScan::schema` method to get logical schema ([#589])
+2. Enable relaying log events via FFI ([#542])
 
 **Implemented enhancements:**
+- Define an ExpressionTransform trait ([#530])
+- [chore] appease clippy in rustc 1.83 ([#557])
+- Simplify column mapping mode handling ([#543])
+- Adding some more miri tests ([#503])
+- Data skipping correctly handles nested columns and column mapping ([#512])
+- Engines now return FileMeta with correct millisecond timestamps ([#565])
 
 **Fixed bugs:**
+- don't use std abs_diff, put it in test_utils instead, run tests with msrv in action ([#596])
+- (CDF) Add fix for sv extension ([#591])
+- minimal CI fixes in arrow integration test and semver check ([#548])
+
+[#503]: https://github.com/delta-io/delta-kernel-rs/pull/503
+[#512]: https://github.com/delta-io/delta-kernel-rs/pull/512
+[#530]: https://github.com/delta-io/delta-kernel-rs/pull/530
+[#540]: https://github.com/delta-io/delta-kernel-rs/pull/540
+[#542]: https://github.com/delta-io/delta-kernel-rs/pull/542
+[#543]: https://github.com/delta-io/delta-kernel-rs/pull/543
+[#546]: https://github.com/delta-io/delta-kernel-rs/pull/546
+[#548]: https://github.com/delta-io/delta-kernel-rs/pull/548
+[#553]: https://github.com/delta-io/delta-kernel-rs/pull/553
+[#557]: https://github.com/delta-io/delta-kernel-rs/pull/557
+[#562]: https://github.com/delta-io/delta-kernel-rs/pull/562
+[#565]: https://github.com/delta-io/delta-kernel-rs/pull/565
+[#568]: https://github.com/delta-io/delta-kernel-rs/pull/568
+[#579]: https://github.com/delta-io/delta-kernel-rs/pull/579
+[#580]: https://github.com/delta-io/delta-kernel-rs/pull/580
+[#588]: https://github.com/delta-io/delta-kernel-rs/pull/588
+[#589]: https://github.com/delta-io/delta-kernel-rs/pull/589
+[#591]: https://github.com/delta-io/delta-kernel-rs/pull/591
+[#593]: https://github.com/delta-io/delta-kernel-rs/pull/593
+[#596]: https://github.com/delta-io/delta-kernel-rs/pull/596
+[#597]: https://github.com/delta-io/delta-kernel-rs/pull/597
+[#602]: https://github.com/delta-io/delta-kernel-rs/pull/602
 
 
 ## [v0.5.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.5.0/) (2024-11-26)

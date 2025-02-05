@@ -1,0 +1,19 @@
+[package]
+name = "feature_tests"
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+version.workspace = true
+
+[package.metadata.release]
+release = false
+
+[dependencies]
+delta_kernel = { path = "../kernel" }
+
+[features]
+default-engine = [ "delta_kernel/default-engine" ]
+default-engine-rustls = [ "delta_kernel/default-engine-rustls" ]

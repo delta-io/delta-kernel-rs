@@ -68,7 +68,7 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
                         sender
                             .send(Ok(FileMeta {
                                 location,
-                                last_modified: meta.last_modified.timestamp(),
+                                last_modified: meta.last_modified.timestamp_millis(),
                                 size: meta.size,
                             }))
                             .ok();
@@ -155,10 +155,12 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use object_store::memory::InMemory;
     use object_store::{local::LocalFileSystem, ObjectStore};
 
-    use test_utils::delta_path_for_version;
+    use test_utils::{abs_diff, delta_path_for_version};
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngine;
@@ -216,6 +218,32 @@ mod tests {
         assert_eq!(data[2], Bytes::from("el-da"));
     }
 
+    #[tokio::test]
+    async fn test_file_meta_is_correct() {
+        let store = Arc::new(InMemory::new());
+
+        let begin_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+
+        let data = Bytes::from("kernel-data");
+        let name = delta_path_for_version(1, "json");
+        store.put(&name, data.clone().into()).await.unwrap();
+
+        let table_root = Url::parse("memory:///").expect("valid url");
+        let prefix = Path::from_url_path(table_root.path()).expect("Couldn't get path");
+        let engine = DefaultEngine::new(store, prefix, Arc::new(TokioBackgroundExecutor::new()));
+        let files: Vec<_> = engine
+            .get_file_system_client()
+            .list_from(&table_root)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+
+        assert!(!files.is_empty());
+        for meta in files.into_iter() {
+            let meta_time = Duration::from_millis(meta.last_modified.try_into().unwrap());
+            assert!(abs_diff(meta_time, begin_time) < Duration::from_secs(10));
+        }
+    }
     #[tokio::test]
     async fn test_default_engine_listing() {
         let tmp = tempfile::tempdir().unwrap();

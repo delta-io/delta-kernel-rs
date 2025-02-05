@@ -2,7 +2,7 @@
 //! files.
 
 use crate::actions::{get_log_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
-use crate::path::ParsedLogPath;
+use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::snapshot::CheckpointMetadata;
 use crate::utils::require;
@@ -10,7 +10,7 @@ use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, FileSystemClient, Version,
 };
 use itertools::Itertools;
-use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::convert::identity;
 use std::sync::{Arc, LazyLock};
 use tracing::warn;
@@ -68,7 +68,7 @@ impl LogSegment {
         {
             require!(
                 checkpoint_file.version + 1 == commit_file.version,
-                Error::generic(format!(
+                Error::InvalidCheckpoint(format!(
                     "Gap between checkpoint version {} and next commit {}",
                     checkpoint_file.version, commit_file.version,
                 ))
@@ -145,7 +145,6 @@ impl LogSegment {
     /// `start_version` and `end_version`: Its LogSegment is made of zero checkpoints and all commits
     /// between versions `start_version` (inclusive) and `end_version` (inclusive). If no `end_version`
     /// is specified it will be the most recent version by default.
-    #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn for_table_changes(
         fs_client: &dyn FileSystemClient,
@@ -310,35 +309,90 @@ fn list_log_files_with_version(
 ) -> DeltaResult<(Vec<ParsedLogPath>, Vec<ParsedLogPath>)> {
     // We expect 10 commit files per checkpoint, so start with that size. We could adjust this based
     // on config at some point
-    let mut commit_files = Vec::with_capacity(10);
-    let mut checkpoint_parts = vec![];
-    let mut max_checkpoint_version = start_version;
 
-    for parsed_path in list_log_files(fs_client, log_root, start_version, end_version)? {
-        let parsed_path = parsed_path?;
-        if parsed_path.is_commit() {
-            commit_files.push(parsed_path);
-        } else if parsed_path.is_checkpoint() {
-            let path_version = parsed_path.version;
-            match max_checkpoint_version {
-                None => {
-                    checkpoint_parts.push(parsed_path);
-                    max_checkpoint_version = Some(path_version);
+    let log_files = list_log_files(fs_client, log_root, start_version, end_version)?;
+
+    log_files.process_results(|iter| {
+        let mut commit_files = Vec::with_capacity(10);
+        let mut checkpoint_parts = vec![];
+
+        // Group log files by version
+        let log_files_per_version = iter.chunk_by(|x| x.version);
+
+        for (version, files) in &log_files_per_version {
+            let mut new_checkpoint_parts = vec![];
+            for file in files {
+                if file.is_commit() {
+                    commit_files.push(file);
+                } else if file.is_checkpoint() {
+                    new_checkpoint_parts.push(file);
+                } else {
+                    warn!(
+                        "Found a file with unknown file type {:?} at version {}",
+                        file.file_type, version
+                    );
                 }
-                Some(checkpoint_version) => match path_version.cmp(&checkpoint_version) {
-                    Ordering::Greater => {
-                        max_checkpoint_version = Some(path_version);
-                        checkpoint_parts.clear();
-                        checkpoint_parts.push(parsed_path);
-                    }
-                    Ordering::Equal => checkpoint_parts.push(parsed_path),
-                    Ordering::Less => {}
-                },
+            }
+
+            // Group and find the first complete checkpoint for this version.
+            // All checkpoints for the same version are equivalent, so we only take one.
+            if let Some((_, complete_checkpoint)) = group_checkpoint_parts(new_checkpoint_parts)
+                .into_iter()
+                // `num_parts` is guaranteed to be non-negative and within `usize` range
+                .find(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
+            {
+                checkpoint_parts = complete_checkpoint;
+                commit_files.clear(); // Log replay only uses commits after a complete checkpoint
             }
         }
-    }
+        (commit_files, checkpoint_parts)
+    })
+}
 
-    Ok((commit_files, checkpoint_parts))
+/// Groups all checkpoint parts according to the checkpoint they belong to.
+///
+/// NOTE: There could be a single-part and/or any number of uuid-based checkpoints. They
+/// are all equivalent, and this routine keeps only one of them (arbitrarily chosen).
+fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedLogPath>> {
+    let mut checkpoints: HashMap<u32, Vec<ParsedLogPath>> = HashMap::new();
+    for part_file in parts {
+        use LogPathFileType::*;
+        match &part_file.file_type {
+            SinglePartCheckpoint
+            | UuidCheckpoint(_)
+            | MultiPartCheckpoint {
+                part_num: 1,
+                num_parts: 1,
+            } => {
+                // All single-file checkpoints are equivalent, just keep one
+                checkpoints.insert(1, vec![part_file]);
+            }
+            MultiPartCheckpoint {
+                part_num: 1,
+                num_parts,
+            } => {
+                // Start a new multi-part checkpoint with at least 2 parts
+                checkpoints.insert(*num_parts, vec![part_file]);
+            }
+            MultiPartCheckpoint {
+                part_num,
+                num_parts,
+            } => {
+                // Continue a new multi-part checkpoint with at least 2 parts.
+                // Checkpoint parts are required to be in-order from log listing to build
+                // a multi-part checkpoint
+                if let Some(part_files) = checkpoints.get_mut(num_parts) {
+                    // `part_num` is guaranteed to be non-negative and within `usize` range
+                    if *part_num as usize == 1 + part_files.len() {
+                        // Safe to append because all previous parts exist
+                        part_files.push(part_file);
+                    }
+                }
+            }
+            Commit | CompactedCommit { .. } | Unknown => {}
+        }
+    }
+    checkpoints
 }
 
 /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that all
@@ -359,7 +413,7 @@ fn list_log_files_with_checkpoint(
 
     let Some(latest_checkpoint) = checkpoint_parts.last() else {
         // TODO: We could potentially recover here
-        return Err(Error::generic(
+        return Err(Error::invalid_checkpoint(
             "Had a _last_checkpoint hint but didn't find any checkpoints",
         ));
     };
@@ -370,7 +424,7 @@ fn list_log_files_with_checkpoint(
             latest_checkpoint.version
         );
     } else if checkpoint_parts.len() != checkpoint_metadata.parts.unwrap_or(1) {
-        return Err(Error::Generic(format!(
+        return Err(Error::InvalidCheckpoint(format!(
             "_last_checkpoint indicated that checkpoint should have {} parts, but it has {}",
             checkpoint_metadata.parts.unwrap_or(1),
             checkpoint_parts.len()

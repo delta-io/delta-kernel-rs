@@ -61,7 +61,7 @@ pub fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
-// Ensure that two schema have the same field names, and dict_id/ordering.
+// Ensure that two schema have the same field names, and dict_is_ordered
 // We ignore:
 //  - data type: This is checked already in `assert_columns_match`
 //  - nullability: parquet marks many things as nullable that we don't in our schema
@@ -71,10 +71,6 @@ fn assert_schema_fields_match(schema: &Schema, golden: &Schema) {
         assert!(
             schema_field.name() == golden_field.name(),
             "Field names don't match"
-        );
-        assert!(
-            schema_field.dict_id() == golden_field.dict_id(),
-            "Field dict_id doesn't match"
         );
         assert!(
             schema_field.dict_is_ordered() == golden_field.dict_is_ordered(),

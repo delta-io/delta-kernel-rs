@@ -47,6 +47,17 @@ pub enum BinaryOperator {
 }
 
 impl BinaryOperator {
+    /// True if this is a comparison for which NULL input always produces NULL output
+    pub(crate) fn is_null_intolerant_comparison(&self) -> bool {
+        use BinaryOperator::*;
+        match self {
+            Plus | Minus | Multiply | Divide => false, // not a comparison
+            LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual => true,
+            Equal | NotEqual => true,
+            Distinct | In | NotIn => false, // tolerates NULL input
+        }
+    }
+
     /// Returns `<op2>` (if any) such that `B <op2> A` is equivalent to `A <op> B`.
     pub(crate) fn commute(&self) -> Option<BinaryOperator> {
         use BinaryOperator::*;
@@ -248,7 +259,7 @@ impl Expression {
         Self::Literal(value.into())
     }
 
-    pub fn null_literal(data_type: DataType) -> Self {
+    pub const fn null_literal(data_type: DataType) -> Self {
         Self::Literal(Scalar::Null(data_type))
     }
 
@@ -737,7 +748,7 @@ mod tests {
             ),
         ]);
 
-        // Similer to ExpressionDepthChecker::check, but also returns call count
+        // Similar to ExpressionDepthChecker::check, but also returns call count
         let check_with_call_count =
             |depth_limit| ExpressionDepthChecker::check_with_call_count(&expr, depth_limit);
 

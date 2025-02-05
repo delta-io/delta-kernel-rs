@@ -10,7 +10,7 @@ use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::expressions::{column_expr, BinaryOperator, Expression};
+use delta_kernel::expressions::{column_expr, BinaryOperator, Expression, ExpressionRef};
 use delta_kernel::scan::state::{visit_scan_files, DvInfo, Stats};
 use delta_kernel::scan::{transform_to_logical, Scan};
 use delta_kernel::schema::{DataType, Schema};
@@ -318,33 +318,6 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-macro_rules! sort_lines {
-    ($lines: expr) => {{
-        // sort except for header + footer
-        let num_lines = $lines.len();
-        if num_lines > 3 {
-            $lines.as_mut_slice()[2..num_lines - 1].sort_unstable()
-        }
-    }};
-}
-
-// NB: expected_lines_sorted MUST be pre-sorted (via sort_lines!())
-macro_rules! assert_batches_sorted_eq {
-    ($expected_lines_sorted: expr, $CHUNKS: expr) => {
-        let formatted = arrow::util::pretty::pretty_format_batches($CHUNKS)
-            .unwrap()
-            .to_string();
-        // fix for windows: \r\n -->
-        let mut actual_lines: Vec<&str> = formatted.trim().lines().collect();
-        sort_lines!(actual_lines);
-        assert_eq!(
-            $expected_lines_sorted, actual_lines,
-            "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
-            $expected_lines_sorted, actual_lines
-        );
-    };
-}
-
 fn read_with_execute(
     engine: Arc<dyn Engine>,
     scan: &Scan,
@@ -375,6 +348,7 @@ fn scan_data_callback(
     size: i64,
     _stats: Option<Stats>,
     dv_info: DvInfo,
+    _transforms: Option<ExpressionRef>,
     partition_values: HashMap<String, String>,
 ) {
     batches.push(ScanFile {
@@ -396,8 +370,14 @@ fn read_with_scan_data(
     let scan_data = scan.scan_data(engine)?;
     let mut scan_files = vec![];
     for data in scan_data {
-        let (data, vec) = data?;
-        scan_files = visit_scan_files(data.as_ref(), &vec, scan_files, scan_data_callback)?;
+        let (data, vec, transforms) = data?;
+        scan_files = visit_scan_files(
+            data.as_ref(),
+            &vec,
+            &transforms,
+            scan_files,
+            scan_data_callback,
+        )?;
     }
 
     let mut batches = vec![];
@@ -416,8 +396,8 @@ fn read_with_scan_data(
             .get_parquet_handler()
             .read_parquet_files(
                 &[meta],
-                global_state.read_schema.clone(),
-                scan.predicate().clone(),
+                global_state.physical_schema.clone(),
+                scan.physical_predicate().clone(),
             )
             .unwrap();
 
@@ -484,6 +464,7 @@ fn read_table_data(
                 .map(|col| table_schema.field(col).cloned().unwrap());
             Arc::new(Schema::new(selected_fields))
         });
+        println!("Read {url:?} with schema {read_schema:#?} and predicate {predicate:#?}");
         let scan = snapshot
             .into_scan_builder()
             .with_schema_opt(read_schema)
@@ -852,6 +833,10 @@ fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (Expression::literal(false), table_for_numbers(vec![])),
         (
+            Expression::and(column_expr!("number"), false),
+            table_for_numbers(vec![]),
+        ),
+        (
             Expression::literal(true),
             table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
         ),
@@ -1041,17 +1026,17 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
     //    "+--------+",
     //    "+--------+",
     //];
-    let columns = &["chrono"];
+    let columns = &["chrono", "missing"];
     let expected = vec![
-        "+-------------------------------------------------------------------------------------------+",
-        "| chrono                                                                                    |",
-        "+-------------------------------------------------------------------------------------------+",
-        "| {date32: 1971-01-01, timestamp: 1970-02-01T08:00:00Z, timestamp_ntz: 1970-01-02T00:00:00} |",
-        "| {date32: 1971-01-02, timestamp: 1970-02-01T09:00:00Z, timestamp_ntz: 1970-01-02T00:01:00} |",
-        "| {date32: 1971-01-03, timestamp: 1970-02-01T10:00:00Z, timestamp_ntz: 1970-01-02T00:02:00} |",
-        "| {date32: 1971-01-04, timestamp: 1970-02-01T11:00:00Z, timestamp_ntz: 1970-01-02T00:03:00} |",
-        "| {date32: 1971-01-05, timestamp: 1970-02-01T12:00:00Z, timestamp_ntz: 1970-01-02T00:04:00} |",
-        "+-------------------------------------------------------------------------------------------+",
+        "+-------------------------------------------------------------------------------------------+---------+",
+        "| chrono                                                                                    | missing |",
+        "+-------------------------------------------------------------------------------------------+---------+",
+        "| {date32: 1971-01-01, timestamp: 1970-02-01T08:00:00Z, timestamp_ntz: 1970-01-02T00:00:00} |         |",
+        "| {date32: 1971-01-02, timestamp: 1970-02-01T09:00:00Z, timestamp_ntz: 1970-01-02T00:01:00} |         |",
+        "| {date32: 1971-01-03, timestamp: 1970-02-01T10:00:00Z, timestamp_ntz: 1970-01-02T00:02:00} |         |",
+        "| {date32: 1971-01-04, timestamp: 1970-02-01T11:00:00Z, timestamp_ntz: 1970-01-02T00:03:00} |         |",
+        "| {date32: 1971-01-05, timestamp: 1970-02-01T12:00:00Z, timestamp_ntz: 1970-01-02T00:04:00} |         |",
+        "+-------------------------------------------------------------------------------------------+---------+",
     ];
     let predicate = column_expr!("missing").lt(10i64);
     read_table_data_str(
@@ -1080,6 +1065,26 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
         Some(columns),
         Some(predicate),
         expected,
-    )?;
+    )
+    .expect_err("unknown column");
     Ok(())
+}
+
+// Note: This test is disabled for windows because it creates a directory with name
+// `time=1971-07-22T03:06:40.000000Z`. This is disallowed in windows due to having a `:` in
+// the name.
+#[cfg(not(windows))]
+#[test]
+fn timestamp_partitioned_table() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+----+-----+---+----------------------+",
+        "| id | x   | s | time                 |",
+        "+----+-----+---+----------------------+",
+        "| 1  | 0.5 |   | 1971-07-22T03:06:40Z |",
+        "+----+-----+---+----------------------+",
+    ];
+    let test_name = "timestamp-partitioned-table";
+    let test_dir = common::load_test_data("./tests/data", test_name).unwrap();
+    let test_path = test_dir.path().join(test_name);
+    read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
 }

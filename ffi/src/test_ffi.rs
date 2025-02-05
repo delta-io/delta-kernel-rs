@@ -12,7 +12,7 @@ use delta_kernel::{
 /// output expression can be found in `ffi/tests/test_expression_visitor/expected.txt`.
 ///
 /// # Safety
-/// The caller is responsible for freeing the retured memory, either by calling
+/// The caller is responsible for freeing the returned memory, either by calling
 /// [`free_kernel_predicate`], or [`Handle::drop_handle`]
 #[no_mangle]
 pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpression> {
@@ -25,18 +25,17 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
     let array_data = ArrayData::new(array_type.clone(), vec![Scalar::Short(5), Scalar::Short(0)]);
 
     let nested_fields = vec![
-        StructField::new("a", DataType::INTEGER, false),
-        StructField::new("b", array_type, false),
+        StructField::not_null("a", DataType::INTEGER),
+        StructField::not_null("b", array_type),
     ];
     let nested_values = vec![Scalar::Integer(500), Scalar::Array(array_data.clone())];
     let nested_struct = StructData::try_new(nested_fields.clone(), nested_values).unwrap();
     let nested_struct_type = StructType::new(nested_fields);
 
     let top_level_struct = StructData::try_new(
-        vec![StructField::new(
+        vec![StructField::nullable(
             "top",
             DataType::Struct(Box::new(nested_struct_type)),
-            true,
         )],
         vec![Scalar::Struct(nested_struct)],
     )

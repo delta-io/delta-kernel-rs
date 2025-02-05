@@ -1,12 +1,12 @@
 # delta-kernel-rs
 
-Delta-kernel-rs is an experimental [Delta][delta] implementation focused on
-interoperability with a wide range of query engines. It currently only supports
-reads.
+Delta-kernel-rs is an experimental [Delta][delta] implementation focused on interoperability with a
+wide range of query engines. It currently supports reads and (experimental) writes. Only blind
+appends are currently supported in the write path.
 
-The Delta Kernel project is a Rust and C library for building Delta connectors that can read (and
-soon, write) Delta tables without needing to understand the Delta [protocol
-details][delta-protocol]. This is the Rust/C equivalent of [Java Delta Kernel][java-kernel].
+The Delta Kernel project is a Rust and C library for building Delta connectors that can read and
+write Delta tables without needing to understand the Delta [protocol details][delta-protocol]. This
+is the Rust/C equivalent of [Java Delta Kernel][java-kernel].
 
 ## Crates
 
@@ -15,7 +15,7 @@ Delta-kernel-rs is split into a few different crates:
 - kernel: The actual core kernel crate
 - acceptance: Acceptance tests that validate correctness  via the [Delta Acceptance Tests][dat]
 - derive-macros: A crate for our [derive-macros] to live in
-- ffi: Functionallity that enables delta-kernel-rs to be used from `C` or `C++` See the [ffi](ffi)
+- ffi: Functionality that enables delta-kernel-rs to be used from `C` or `C++` See the [ffi](ffi)
   directory for more information.
 
 ## Building
@@ -33,18 +33,20 @@ the acceptance tests against it.
 
 In general, you will want to depend on `delta-kernel-rs` by adding it as a dependency to your
 `Cargo.toml`, (that is, for rust projects using cargo) for other projects please see the [FFI]
-module. The core kernel includes facilities for reading delta tables, but requires the consumer
-to implement the `Engine` trait in order to use the table-reading APIs. If there is no need to
-implement the consumer's own `Engine` trait, the kernel has a feature flag to enable a default,
-asynchronous `Engine` implementation built with [Arrow] and [Tokio].
+module. The core kernel includes facilities for reading and writing delta tables, and allows the
+consumer to implement their own `Engine` trait in order to build engine-specific implementations of
+the various `Engine` APIs that the kernel relies on (e.g. implement an engine-specific
+`read_json_files()` using the native engine JSON reader). If there is no need to implement the
+consumer's own `Engine` trait, the kernel has a feature flag to enable a default, asynchronous
+`Engine` implementation built with [Arrow] and [Tokio].
 
 ```toml
 # fewer dependencies, requires consumer to implement Engine trait.
 # allows consumers to implement their own in-memory format
-delta_kernel = "0.5"
+delta_kernel = "0.6.1"
 
 # or turn on the default engine, based on arrow
-delta_kernel = { version = "0.5", features = ["default-engine"] }
+delta_kernel = { version = "0.6.1", features = ["default-engine"] }
 ```
 
 ### Feature flags
@@ -64,12 +66,12 @@ are still unstable. We therefore may break APIs within minor releases (that is, 
 we will not break APIs in patch releases (`0.1.0` -> `0.1.1`).
 
 ## Arrow versioning
-If you enable the `default-engine` or `sync-engine` features, you get an implemenation of the
+If you enable the `default-engine` or `sync-engine` features, you get an implementation of the
 `Engine` trait that uses [Arrow] as its data format.
 
 The [`arrow crate`](https://docs.rs/arrow/latest/arrow/) tends to release new major versions rather
 quickly. To enable engines that already integrate arrow to also integrate kernel and not force them
-to track a specific version of arrow that kernel depends on, we take as broad dependecy on arrow
+to track a specific version of arrow that kernel depends on, we take as broad dependency on arrow
 versions as we can.
 
 This means you can force kernel to rely on the specific arrow version that your engine already uses,
@@ -94,7 +96,7 @@ arrow-schema = "53.0"
 parquet = "53.0"
 ```
 
-Note that unfortunatly patching in `cargo` requires that _exactly one_ version matches your
+Note that unfortunately patching in `cargo` requires that _exactly one_ version matches your
 specification. If only arrow "53.0.0" had been released the above will work, but if "53.0.1" where
 to be released, the specification will break and you will need to provide a more restrictive
 specification like `"=53.0.0"`.
@@ -109,7 +111,7 @@ and then checking what version of `object_store` it depends on.
 ## Documentation
 
 - [API Docs](https://docs.rs/delta_kernel/latest/delta_kernel/)
-- [arcitecture.md](doc/architecture.md) document describing the kernel architecture (currently wip)
+- [architecture.md](doc/architecture.md) document describing the kernel architecture (currently wip)
 
 ## Examples
 
@@ -126,12 +128,13 @@ projects.
 There are a few key concepts that will help in understanding kernel:
 
 1. The `Engine` trait encapsulates all the functionality and engine or connector needs to provide to
-   the Delta Kernel in order to read the Delta table.
+   the Delta Kernel in order to read/write the Delta table.
 2. The `DefaultEngine` is our default implementation of the the above trait. It lives in
    `engine/default`, and provides a reference implementation for all `Engine`
    functionality. `DefaultEngine` uses [arrow](https://docs.rs/arrow/latest/arrow/) as its in-memory
    data format.
 3. A `Scan` is the entrypoint for reading data from a table.
+4. A `Transaction` is the entrypoint for writing data to a table.
 
 ### Design Principles
 

@@ -13,6 +13,7 @@ use crate::utils::require;
 use crate::{DeltaResult, Error, FileSystemClient};
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[cfg_attr(test, derive(serde::Serialize), serde(rename_all = "camelCase"))]
 pub struct DeletionVectorDescriptor {
     /// A single character to indicate how to access the DV. Legal options are: ['u', 'i', 'p'].
     pub storage_type: String,
@@ -214,7 +215,19 @@ fn slice_to_u32(buf: &[u8], endian: Endian) -> DeltaResult<u32> {
 
 /// helper function to convert a treemap into a boolean vector where, for index i, if the bit is
 /// set, the vector will be false, and otherwise at index i the vector will be true
-pub(crate) fn treemap_to_bools(treemap: RoaringTreemap) -> Vec<bool> {
+pub(crate) fn deletion_treemap_to_bools(treemap: RoaringTreemap) -> Vec<bool> {
+    treemap_to_bools_with(treemap, false)
+}
+
+/// helper function to convert a treemap into a boolean vector where, for index i, if the bit is
+/// set, the vector will be true, and otherwise at index i the vector will be false
+pub(crate) fn selection_treemap_to_bools(treemap: RoaringTreemap) -> Vec<bool> {
+    treemap_to_bools_with(treemap, true)
+}
+
+/// helper function to generate vectors of bools from treemap. If `set_bit` is `true`, this is
+/// [`selection_treemap_to_bools`]. If `set_bit` is false, this is [`deletion_treemap_to_bools`]
+fn treemap_to_bools_with(treemap: RoaringTreemap, set_bit: bool) -> Vec<bool> {
     fn combine(high_bits: u32, low_bits: u32) -> usize {
         ((u64::from(high_bits) << 32) | u64::from(low_bits)) as usize
     }
@@ -223,12 +236,12 @@ pub(crate) fn treemap_to_bools(treemap: RoaringTreemap) -> Vec<bool> {
         Some(max) => {
             // there are values in the map
             //TODO(nick) panic if max is > MAX_USIZE
-            let mut result = vec![true; max as usize + 1];
+            let mut result = vec![!set_bit; max as usize + 1];
             let bitmaps = treemap.bitmaps();
             for (index, bitmap) in bitmaps {
                 for bit in bitmap.iter() {
                     let vec_index = combine(index, bit);
-                    result[vec_index] = false;
+                    result[vec_index] = set_bit;
                 }
             }
             result
@@ -379,7 +392,7 @@ mod tests {
     }
 
     // this test is ignored by default as it's expensive to allocate such big vecs full of `true`. you can run it via:
-    // cargo test actions::action_definitions::tests::test_dv_to_bools
+    // cargo test actions::deletion_vector::tests::test_dv_to_bools -- --ignored
     #[test]
     #[ignore]
     fn test_dv_to_bools() {
@@ -390,7 +403,7 @@ mod tests {
         rb.insert(30854);
         rb.insert(4294967297);
         rb.insert(4294967300);
-        let bools = super::treemap_to_bools(rb);
+        let bools = super::deletion_treemap_to_bools(rb);
         let mut expected = vec![true; 4294967301];
         expected[0] = false;
         expected[2] = false;
@@ -398,6 +411,29 @@ mod tests {
         expected[30854] = false;
         expected[4294967297] = false;
         expected[4294967300] = false;
+        assert_eq!(bools, expected);
+    }
+
+    // Unlike [`test_dv_to_bools`], this test is not ignored because the large zero-initialized selection vector is fast to allocate.
+    // It just gets a bunch of empty pages from the OS. [`tet_dv_to_bools`] is slow because we must
+    // set every element to `true`.
+    #[test]
+    fn test_sv_to_bools() {
+        let mut rb = RoaringTreemap::new();
+        rb.insert(0);
+        rb.insert(2);
+        rb.insert(7);
+        rb.insert(30854);
+        rb.insert(4294967297);
+        rb.insert(4294967300);
+        let bools = super::selection_treemap_to_bools(rb);
+        let mut expected = vec![false; 4294967301];
+        expected[0] = true;
+        expected[2] = true;
+        expected[7] = true;
+        expected[30854] = true;
+        expected[4294967297] = true;
+        expected[4294967300] = true;
         assert_eq!(bools, expected);
     }
 

@@ -41,6 +41,34 @@ jobs:
           cargo msrv --path derive-macros/ verify --all-features
           cargo msrv --path ffi/ verify --all-features
           cargo msrv --path ffi-proc-macros/ verify --all-features
+  msrv-run-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install minimal stable and cargo msrv
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: default
+          toolchain: stable
+          override: true
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-msrv
+        shell: bash
+        run: |
+          cargo install cargo-msrv --locked
+      - name: Get rust-version from Cargo.toml
+        id: rust-version
+        run: echo "RUST_VERSION=$(cargo msrv show --path kernel/ --output-format minimal)" >> $GITHUB_ENV
+      - name: Install specified rust version
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          profile: minimal
+      - name: run tests
+        run: |
+          pushd kernel
+          echo "Testing with $(cargo msrv show --output-format minimal)"
+          cargo +$(cargo msrv show --output-format minimal) test
   docs:
     runs-on: ubuntu-latest
     env:
@@ -73,10 +101,16 @@ jobs:
           toolchain: stable
           override: true
       - uses: Swatinem/rust-cache@v2
+      - name: check kernel builds with no-default-features
+        run: cargo build -p delta_kernel --no-default-features
       - name: build and lint with clippy
         run: cargo clippy --benches --tests --all-features -- -D warnings
       - name: lint without default features
         run: cargo clippy --no-default-features -- -D warnings
+      - name: check kernel builds with default-engine
+        run: cargo build -p feature_tests --features default-engine
+      - name: check kernel builds with default-engine-rustls
+        run: cargo build -p feature_tests --features default-engine-rustls
   test:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -145,7 +179,7 @@ jobs:
           cargo build
           popd
           pushd ffi
-          cargo b --features default-engine,sync-engine,test-ffi
+          cargo b --features default-engine,sync-engine,test-ffi,tracing
           popd
       - name: build and run read-table test
         run: |
@@ -177,7 +211,7 @@ jobs:
       - name: Test with Miri
         run: |
           pushd ffi
-          MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --features sync-engine
+          MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --features sync-engine,default-engine
 
   coverage:
     runs-on: ubuntu-latest
@@ -197,7 +231,7 @@ jobs:
       - name: Generate code coverage
         run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json -- --skip read_table_version_hdfs
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           files: codecov.json
           fail_ci_if_error: true

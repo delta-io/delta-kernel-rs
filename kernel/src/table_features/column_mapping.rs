@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use strum::EnumString;
 
 /// Modes of column mapping a table can be in
-#[derive(Debug, Default, EnumString, Serialize, Deserialize, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, EnumString, Serialize, Deserialize, Copy, Clone, PartialEq, Eq)]
 #[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
 pub enum ColumnMappingMode {
@@ -20,7 +20,6 @@ pub enum ColumnMappingMode {
     /// Columns are mapped by their field_id in parquet
     Id,
     /// Columns are mapped to a physical name
-    #[default]
     Name,
 }
 

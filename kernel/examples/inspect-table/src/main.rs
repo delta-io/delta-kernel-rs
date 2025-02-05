@@ -12,7 +12,7 @@ use delta_kernel::expressions::ColumnName;
 use delta_kernel::scan::state::{DvInfo, Stats};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
-use delta_kernel::{DeltaResult, Error, Table};
+use delta_kernel::{DeltaResult, Error, ExpressionRef, Table};
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -163,6 +163,7 @@ fn print_scan_file(
     size: i64,
     stats: Option<Stats>,
     dv_info: DvInfo,
+    transform: Option<ExpressionRef>,
     partition_values: HashMap<String, String>,
 ) {
     let num_record_str = if let Some(s) = stats {
@@ -176,6 +177,7 @@ fn print_scan_file(
               Size (bytes):\t{size}\n  \
               Num Records:\t{num_record_str}\n  \
               Has DV?:\t{}\n  \
+              Transform:\t{transform:?}\n  \
               Part Vals:\t{partition_values:?}",
         dv_info.has_vector()
     );
@@ -184,7 +186,7 @@ fn print_scan_file(
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
 
-    // build a table and get the lastest snapshot from it
+    // build a table and get the latest snapshot from it
     let table = Table::try_from_uri(&cli.path)?;
 
     let engine = DefaultEngine::try_new(
@@ -209,10 +211,11 @@ fn try_main() -> DeltaResult<()> {
             let scan = ScanBuilder::new(snapshot).build()?;
             let scan_data = scan.scan_data(&engine)?;
             for res in scan_data {
-                let (data, vector) = res?;
+                let (data, vector, transforms) = res?;
                 delta_kernel::scan::state::visit_scan_files(
                     data.as_ref(),
                     &vector,
+                    &transforms,
                     (),
                     print_scan_file,
                 )?;
@@ -220,7 +223,7 @@ fn try_main() -> DeltaResult<()> {
         }
         Commands::Actions { oldest_first } => {
             let log_schema = get_log_schema();
-            let actions = snapshot._log_segment().replay(
+            let actions = snapshot.log_segment().replay(
                 &engine,
                 log_schema.clone(),
                 log_schema.clone(),

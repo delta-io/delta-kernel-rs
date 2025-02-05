@@ -1,6 +1,7 @@
-use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
+
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 
 use crate::schema::{ArrayType, DataType, PrimitiveType, StructField};
 use crate::utils::require;
@@ -89,7 +90,7 @@ impl StructData {
 
 /// A single value, which can be null. Used for representing literal values
 /// in [Expressions][crate::expressions::Expression].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Scalar {
     /// 32bit integer
     Integer(i32),
@@ -150,6 +151,16 @@ impl Scalar {
     /// Returns true if this scalar is null.
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null(_))
+    }
+
+    /// Constructs a Scalar timestamp with no timezone from an `i64` millisecond since unix epoch
+    pub(crate) fn timestamp_ntz_from_millis(millis: i64) -> DeltaResult<Self> {
+        let Some(timestamp) = DateTime::from_timestamp_millis(millis) else {
+            return Err(Error::generic(format!(
+                "Failed to create millisecond timestamp from {millis}"
+            )));
+        };
+        Ok(Self::TimestampNtz(timestamp.timestamp_micros()))
     }
 }
 
@@ -214,6 +225,12 @@ impl Display for Scalar {
     }
 }
 
+impl PartialEq for Scalar {
+    fn eq(&self, other: &Scalar) -> bool {
+        self.partial_cmp(other) == Some(Ordering::Equal)
+    }
+}
+
 impl PartialOrd for Scalar {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         use Scalar::*;
@@ -244,10 +261,13 @@ impl PartialOrd for Scalar {
             (Date(_), _) => None,
             (Binary(a), Binary(b)) => a.partial_cmp(b),
             (Binary(_), _) => None,
-            (Decimal(_, _, _), _) => None, // TODO: Support Decimal
-            (Null(_), _) => None,          // NOTE: NULL values are incomparable by definition
-            (Struct(_), _) => None,        // TODO: Support Struct?
-            (Array(_), _) => None,         // TODO: Support Array?
+            (Decimal(v1, p1, s1), Decimal(v2, p2, s2)) => (s1.eq(s2) && p1.eq(p2))
+                .then(|| v1.partial_cmp(v2))
+                .flatten(),
+            (Decimal(_, _, _), _) => None,
+            (Null(_), _) => None, // NOTE: NULL values are incomparable by definition
+            (Struct(_), _) => None, // TODO: Support Struct?
+            (Array(_), _) => None, // TODO: Support Array?
         }
     }
 }
@@ -378,13 +398,22 @@ impl PrimitiveType {
                 let days = date.signed_duration_since(DateTime::UNIX_EPOCH).num_days() as i32;
                 Ok(Scalar::Date(days))
             }
-            // NOTE: Timestamp and TimestampNtz are parsed in the same way, as microsecond since unix epoch.
-            // The difference arrises mostly in how they are to be handled on the engine side - i.e. timestampNTZ
+            // NOTE: Timestamp and TimestampNtz are both parsed into microsecond since unix epoch.
+            // They may both have the format `{year}-{month}-{day} {hour}:{minute}:{second}`.
+            // Timestamps may additionally be encoded as a ISO 8601 formatted string such as
+            // `1970-01-01T00:00:00.123456Z`.
+            //
+            // The difference arises mostly in how they are to be handled on the engine side - i.e. timestampNTZ
             // is not adjusted to UTC, this is just so we can (de-)serialize it as a date sting.
             // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#partition-value-serialization
-            Timestamp | TimestampNtz => {
-                let timestamp = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
-                    .map_err(|_| self.parse_error(raw))?;
+            TimestampNtz | Timestamp => {
+                let mut timestamp = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f");
+
+                if timestamp.is_err() && *self == Timestamp {
+                    // Note: `%+` specifies the ISO 8601 / RFC 3339 format
+                    timestamp = NaiveDateTime::parse_from_str(raw, "%+");
+                }
+                let timestamp = timestamp.map_err(|_| self.parse_error(raw))?;
                 let timestamp = Utc.from_utc_datetime(&timestamp);
                 let micros = timestamp
                     .signed_duration_since(DateTime::UNIX_EPOCH)
@@ -565,5 +594,81 @@ mod tests {
         assert_eq!(&format!("{}", array_not_op), "10 NOT IN (1, 2, 3)");
         assert_eq!(&format!("{}", column_op), "3.1415927 IN Column(item)");
         assert_eq!(&format!("{}", column_not_op), "'Cool' NOT IN Column(item)");
+    }
+
+    #[test]
+    fn test_timestamp_parse() {
+        let assert_timestamp_eq = |scalar_string, micros| {
+            let scalar = PrimitiveType::Timestamp
+                .parse_scalar(scalar_string)
+                .unwrap();
+            assert_eq!(scalar, Scalar::Timestamp(micros));
+        };
+        assert_timestamp_eq("1971-07-22T03:06:40.678910Z", 49000000678910);
+        assert_timestamp_eq("1971-07-22T03:06:40Z", 49000000000000);
+        assert_timestamp_eq("2011-01-11 13:06:07", 1294751167000000);
+        assert_timestamp_eq("2011-01-11 13:06:07.123456", 1294751167123456);
+        assert_timestamp_eq("1970-01-01 00:00:00", 0);
+    }
+
+    #[test]
+    fn test_timestamp_ntz_parse() {
+        let assert_timestamp_eq = |scalar_string, micros| {
+            let scalar = PrimitiveType::TimestampNtz
+                .parse_scalar(scalar_string)
+                .unwrap();
+            assert_eq!(scalar, Scalar::TimestampNtz(micros));
+        };
+        assert_timestamp_eq("2011-01-11 13:06:07", 1294751167000000);
+        assert_timestamp_eq("2011-01-11 13:06:07.123456", 1294751167123456);
+        assert_timestamp_eq("1970-01-01 00:00:00", 0);
+    }
+
+    #[test]
+    fn test_timestamp_parse_fails() {
+        let assert_timestamp_fails = |p_type: &PrimitiveType, scalar_string| {
+            let res = p_type.parse_scalar(scalar_string);
+            assert!(res.is_err());
+        };
+
+        let p_type = PrimitiveType::TimestampNtz;
+        assert_timestamp_fails(&p_type, "1971-07-22T03:06:40.678910Z");
+        assert_timestamp_fails(&p_type, "1971-07-22T03:06:40Z");
+        assert_timestamp_fails(&p_type, "1971-07-22");
+
+        let p_type = PrimitiveType::Timestamp;
+        assert_timestamp_fails(&p_type, "1971-07-22");
+    }
+
+    #[test]
+    fn test_partial_cmp() {
+        let a = Scalar::Integer(1);
+        let b = Scalar::Integer(2);
+        let c = Scalar::Null(DataType::INTEGER);
+        assert_eq!(a.partial_cmp(&b), Some(Ordering::Less));
+        assert_eq!(b.partial_cmp(&a), Some(Ordering::Greater));
+        assert_eq!(a.partial_cmp(&a), Some(Ordering::Equal));
+        assert_eq!(b.partial_cmp(&b), Some(Ordering::Equal));
+        assert_eq!(a.partial_cmp(&c), None);
+        assert_eq!(c.partial_cmp(&a), None);
+
+        // assert that NULL values are incomparable
+        let null = Scalar::Null(DataType::INTEGER);
+        assert_eq!(null.partial_cmp(&null), None);
+    }
+
+    #[test]
+    fn test_partial_eq() {
+        let a = Scalar::Integer(1);
+        let b = Scalar::Integer(2);
+        let c = Scalar::Null(DataType::INTEGER);
+        assert!(!a.eq(&b));
+        assert!(a.eq(&a));
+        assert!(!a.eq(&c));
+        assert!(!c.eq(&a));
+
+        // assert that NULL values are incomparable
+        let null = Scalar::Null(DataType::INTEGER);
+        assert!(!null.eq(&null));
     }
 }
