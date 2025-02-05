@@ -939,7 +939,7 @@ mod tests {
         let expected_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let expected =
             RecordBatch::try_new(expected_schema, vec![create_array!(Int32, [1])]).unwrap();
-        assert_create_one(values, schema, expected.into());
+        assert_create_one(values, schema, expected);
     }
 
     #[test]
@@ -977,7 +977,7 @@ mod tests {
             ]))],
         )
         .unwrap();
-        assert_create_one(values, schema, expected.into());
+        assert_create_one(values, schema, expected);
     }
 
     #[test]
@@ -1015,7 +1015,7 @@ mod tests {
             ]))],
         )
         .unwrap();
-        assert_create_one(values, schema, expected.into());
+        assert_create_one(values, schema, expected);
     }
 
     // critical case: struct(x) [nullable] with (a [non-null], b [nullable]) fields.
@@ -1058,7 +1058,7 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_create_one(values, schema.clone(), expected.into());
+        assert_create_one(values, schema.clone(), expected);
 
         let err_values: &[Scalar] = &[Scalar::Null(DeltaDataTypes::INTEGER), 1.into()];
         let handler = ArrowExpressionHandler;
@@ -1122,7 +1122,7 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_create_one(values, schema.clone(), expected.into());
+        assert_create_one(values, schema.clone(), expected);
     }
 
     #[test]
