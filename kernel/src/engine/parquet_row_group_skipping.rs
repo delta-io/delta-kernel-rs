@@ -1,5 +1,7 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer stats.
-use crate::expressions::{ColumnName, Expression, Scalar, UnaryExpression, BinaryExpression, VariadicExpression};
+use crate::expressions::{
+    BinaryExpression, ColumnName, Expression, Scalar, UnaryExpression, VariadicExpression,
+};
 use crate::predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::schema::{DataType, PrimitiveType};
 use chrono::{DateTime, Days};
@@ -231,7 +233,9 @@ pub(crate) fn compute_field_indices(
             Column(name) => cols.extend([name.clone()]), // returns `()`, unlike `insert`
             Struct(fields) => fields.iter().for_each(recurse),
             Unary(UnaryExpression { expr, .. }) => recurse(expr),
-            Binary(BinaryExpression { left, right, .. }) => [left, right].iter().for_each(|e| recurse(e)),
+            Binary(BinaryExpression { left, right, .. }) => {
+                [left, right].iter().for_each(|e| recurse(e))
+            }
             Variadic(VariadicExpression { exprs, .. }) => exprs.iter().for_each(recurse),
         }
     }

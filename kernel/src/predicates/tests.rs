@@ -609,7 +609,7 @@ fn test_sql_where() {
     expect_eq!(null_filter.eval_sql_where(expr), Some(true), "{expr}");
     expect_eq!(empty_filter.eval_sql_where(expr), Some(true), "{expr}");
 
-    // Constrast normal vs SQL WHERE semantics - comparison
+    // Contrast normal vs SQL WHERE semantics - comparison
     let expr = &Expr::lt(col.clone(), VAL);
     expect_eq!(null_filter.eval(expr), None, "{expr}");
     expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
@@ -631,7 +631,7 @@ fn test_sql_where() {
     expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
     expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
 
-    // Constrast normal vs SQL WHERE semantics - comparison inside AND
+    // Contrast normal vs SQL WHERE semantics - comparison inside AND
     let expr = &Expr::and(TRUE, Expr::lt(col.clone(), VAL));
     expect_eq!(null_filter.eval(expr), None, "{expr}");
     expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
