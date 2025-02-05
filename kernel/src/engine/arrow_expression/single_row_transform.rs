@@ -90,7 +90,6 @@ impl<'a, I: Iterator<Item = &'a Scalar>> SingleRowTransform<'a, I> {
         }
     }
 
-    // TODO use check_error everywhere
     fn check_error<T, E: Into<Error>>(&mut self, result: Result<T, E>) -> Option<T> {
         match result {
             Ok(val) => Some(val),
@@ -224,6 +223,7 @@ mod tests {
     use arrow_array::cast::AsArray;
     use arrow_array::create_array;
     use arrow_schema::{DataType, Field};
+    use paste::paste;
 
     // helper to take values/schema to pass to `create_one` and assert the result = expected
     fn assert_single_row_transform(
@@ -252,145 +252,74 @@ mod tests {
         a_nullable: bool,
         b_nullable: bool,
     }
-    struct TestGroup {
-        schema: TestSchema,
-        expected: [Expected; 4],
-    }
+
     enum Expected {
         Noop,
         NullStruct,
         Null,
-        Error, // TODO we could check the actual error
+        Error, // TODO: we could check the actual error
     }
 
-    impl TestGroup {
-        fn run(self) {
-            let value_groups = [
-                (Some(1), Some(2)),
-                (None, Some(2)),
-                (Some(1), None),
-                (None, None),
-            ];
-            for (i, (a_val, b_val)) in value_groups.into_iter().enumerate() {
-                let a = match a_val {
-                    Some(v) => Scalar::Integer(v),
-                    None => Scalar::Null(DeltaDataTypes::INTEGER),
-                };
-                let b = match b_val {
-                    Some(v) => Scalar::Integer(v),
-                    None => Scalar::Null(DeltaDataTypes::INTEGER),
-                };
-                let values: &[Scalar] = &[a, b];
-                let schema = Arc::new(StructType::new([StructField::new(
-                    "x",
-                    DeltaDataTypes::struct_type([
-                        StructField::new("a", DeltaDataTypes::INTEGER, self.schema.a_nullable),
-                        StructField::new("b", DeltaDataTypes::INTEGER, self.schema.b_nullable),
-                    ]),
-                    self.schema.x_nullable,
-                )]));
+    fn run_test(schema: TestSchema, values: (Option<i32>, Option<i32>), expected: Expected) {
+        let (a_val, b_val) = values;
+        let a = match a_val {
+            Some(v) => Scalar::Integer(v),
+            None => Scalar::Null(DeltaDataTypes::INTEGER),
+        };
+        let b = match b_val {
+            Some(v) => Scalar::Integer(v),
+            None => Scalar::Null(DeltaDataTypes::INTEGER),
+        };
+        let values: &[Scalar] = &[a, b];
 
-                let struct_fields = vec![
-                    Field::new("a", DataType::Int32, self.schema.a_nullable),
-                    Field::new("b", DataType::Int32, self.schema.b_nullable),
-                ];
+        let x_children_fields = vec![
+            Field::new("a", DataType::Int32, schema.a_nullable),
+            Field::new("b", DataType::Int32, schema.b_nullable),
+        ];
+        let x_field = Arc::new(Field::new(
+            "x",
+            DataType::Struct(x_children_fields.clone().into()),
+            schema.x_nullable,
+        ));
 
-                let field_a = Arc::new(Field::new("a", DataType::Int32, self.schema.a_nullable));
-                let field_b = Arc::new(Field::new("b", DataType::Int32, self.schema.b_nullable));
-                let expected = match self.expected[i] {
-                    Expected::Noop => Ok(StructArray::from(vec![(
-                        Arc::new(Field::new(
-                            "x",
-                            DataType::Struct(struct_fields.into()),
-                            self.schema.x_nullable,
-                        )),
-                        Arc::new(StructArray::from(vec![
-                            (field_a, create_array!(Int32, [a_val]) as ArrayRef),
-                            (field_b, create_array!(Int32, [b_val]) as ArrayRef),
-                        ])) as ArrayRef,
-                    )])),
-                    Expected::Null => Ok(StructArray::new_null(
-                        vec![Field::new(
-                            "x",
-                            DataType::Struct(struct_fields.into()),
-                            self.schema.x_nullable,
-                        )]
-                        .into(),
-                        1,
-                    )),
-                    Expected::NullStruct => Ok(StructArray::from(vec![(
-                        Arc::new(Field::new(
-                            "x",
-                            DataType::Struct(struct_fields.into()),
-                            self.schema.x_nullable,
-                        )),
-                        Arc::new(StructArray::new_null(
-                            vec![field_a.clone(), field_b.clone()].into(),
-                            1,
-                        )) as ArrayRef,
-                    )])),
-                    Expected::Error => Err(()),
-                };
-                assert_single_row_transform(values, schema, expected);
+        let arrow_schema = Arc::new(StructType::new([StructField::new(
+            "x",
+            DeltaDataTypes::struct_type([
+                StructField::new("a", DeltaDataTypes::INTEGER, schema.a_nullable),
+                StructField::new("b", DeltaDataTypes::INTEGER, schema.b_nullable),
+            ]),
+            schema.x_nullable,
+        )]));
+
+        let field_a = Arc::new(x_children_fields[0].clone());
+        let field_b = Arc::new(x_children_fields[1].clone());
+
+        let expected_result = match expected {
+            Expected::Noop => {
+                let nested_struct = Arc::new(StructArray::from(vec![
+                    (field_a, create_array!(Int32, [a_val]) as ArrayRef),
+                    (field_b, create_array!(Int32, [b_val]) as ArrayRef),
+                ])) as ArrayRef;
+                Ok(StructArray::from(vec![(x_field.clone(), nested_struct)]))
             }
-        }
+            Expected::Null => Ok(StructArray::new_null(
+                vec![x_field.as_ref().clone()].into(),
+                1,
+            )),
+            Expected::NullStruct => {
+                let nested_null = Arc::new(StructArray::new_null(
+                    vec![field_a.clone(), field_b.clone()].into(),
+                    1,
+                )) as ArrayRef;
+                Ok(StructArray::from(vec![(x_field, nested_null)]))
+            }
+            Expected::Error => Err(()),
+        };
+
+        assert_single_row_transform(values, arrow_schema, expected_result);
     }
 
-    // test cases: x, a, b are nullable (n) or not-null (!). we have 6 interesting nullability
-    // combinations:
-    // 1. n { n, n }
-    // 2. n { n, ! }
-    // 3. n { !, ! }
-    // 4. ! { n, n }
-    // 5. ! { n, ! }
-    // 6. ! { !, ! }
-    //
-    // and for each we want to test the four combinations of values ("a" and "b" just chosen as
-    // abitrary scalars):
-    // 1. (a, b)
-    // 2. (N, b)
-    // 3. (a, N)
-    // 4. (N, N)
-    //
-    // here's the full list of test cases with expected output:
-    //
-    // n { n, n }
-    // 1. (a, b) -> x (a, b)
-    // 2. (N, b) -> x (N, b)
-    // 3. (a, N) -> x (a, N)
-    // 4. (N, N) -> x (N, N)
-    //
-    // n { n, ! }
-    // 1. (a, b) -> x (a, b)
-    // 2. (N, b) -> x (N, b)
-    // 3. (a, N) -> Err
-    // 4. (N, N) -> x NULL
-    //
-    // n { !, ! }
-    // 1. (a, b) -> x (a, b)
-    // 2. (N, b) -> Err
-    // 3. (a, N) -> Err
-    // 4. (N, N) -> x NULL
-    //
-    // ! { n, n }
-    // 1. (a, b) -> x (a, b)
-    // 2. (N, b) -> x (N, b)
-    // 3. (a, N) -> x (a, N)
-    // 4. (N, N) -> x (N, N)
-    //
-    // ! { n, ! }
-    // 1. (a, b) -> x (a, b)
-    // 2. (N, b) -> x (N, b)
-    // 3. (a, N) -> Err
-    // 4. (N, N) -> NULL
-    //
-    // ! { !, ! }
-    // 1. (a, b) -> x (a, b)
-    // 2. (N, b) -> Err
-    // 3. (a, N) -> Err
-    // 4. (N, N) -> NULL
-
-    // A helper macro to map the nullability specification to booleans
+    // helper to convert nullable/not_null to bool
     macro_rules! bool_from_nullable {
         (nullable) => {
             true
@@ -400,107 +329,164 @@ mod tests {
         };
     }
 
-    // The main macro: for each test case we list a test name, the values for x, a, b, and the expected outcomes.
-    macro_rules! test_nullability_combinations {
-    (
-        $(
-            $test_name:ident: {
-                x: $x:ident,
-                a: $a:ident,
-                b: $b:ident,
-                expected: [$($expected:expr),+ $(,)?]
-            }
-        ),+ $(,)?
-    ) => {
-        $(
-            #[test]
-            fn $test_name() {
-                let test_group = TestGroup {
-                    schema: TestSchema {
-                        x_nullable: bool_from_nullable!($x),
-                        a_nullable: bool_from_nullable!($a),
-                        b_nullable: bool_from_nullable!($b),
-                    },
-                    expected: [$($expected),+],
-                };
-                test_group.run();
-            }
-        )+
+    // helper to convert a/b/N to Some/Some/None (1 and 2 just arbitrary non-null ints)
+    macro_rules! parse_value {
+        (a) => {
+            Some(1)
+        };
+        (b) => {
+            Some(2)
+        };
+        (N) => {
+            None
         };
     }
 
+    macro_rules! test_nullability_combinations {
+    (
+        name = $name:ident,
+        schema = { x: $x:ident, a: $a:ident, b: $b:ident },
+        tests = {
+            ($ta1:tt, $tb1:tt) -> $expected1:ident,
+            ($ta2:tt, $tb2:tt) -> $expected2:ident,
+            ($ta3:tt, $tb3:tt) -> $expected3:ident,
+            ($ta4:tt, $tb4:tt) -> $expected4:ident $(,)?
+        }
+    ) => {
+        paste! {
+            #[test]
+            fn [<$name _ $ta1:lower _ $tb1:lower>]() {
+                let schema = TestSchema {
+                    x_nullable: bool_from_nullable!($x),
+                    a_nullable: bool_from_nullable!($a),
+                    b_nullable: bool_from_nullable!($b),
+                };
+                run_test(schema, (parse_value!($ta1), parse_value!($tb1)), Expected::$expected1);
+            }
+            #[test]
+            fn [<$name _ $ta2:lower _ $tb2:lower>]() {
+                let schema = TestSchema {
+                    x_nullable: bool_from_nullable!($x),
+                    a_nullable: bool_from_nullable!($a),
+                    b_nullable: bool_from_nullable!($b),
+                };
+                run_test(schema, (parse_value!($ta2), parse_value!($tb2)), Expected::$expected2);
+            }
+            #[test]
+            fn [<$name _ $ta3:lower _ $tb3:lower>]() {
+                let schema = TestSchema {
+                    x_nullable: bool_from_nullable!($x),
+                    a_nullable: bool_from_nullable!($a),
+                    b_nullable: bool_from_nullable!($b),
+                };
+                run_test(schema, (parse_value!($ta3), parse_value!($tb3)), Expected::$expected3);
+            }
+            #[test]
+            fn [<$name _ $ta4:lower _ $tb4:lower>]() {
+                let schema = TestSchema {
+                    x_nullable: bool_from_nullable!($x),
+                    a_nullable: bool_from_nullable!($a),
+                    b_nullable: bool_from_nullable!($b),
+                };
+                run_test(schema, (parse_value!($ta4), parse_value!($tb4)), Expected::$expected4);
+            }
+        }
+    }
+    }
+
+    // Group 1: nullable { nullable, nullable }
+    //  1. (a, b) -> x (a, b)
+    //  2. (N, b) -> x (N, b)
+    //  3. (a, N) -> x (a, N)
+    //  4. (N, N) -> x (N, N)
     test_nullability_combinations! {
-        // n { n, n } case: all nullable
-        test_all_nullable: {
-            x: nullable,
-            a: nullable,
-            b: nullable,
-            expected: [
-                Expected::Noop,
-                Expected::Noop,
-                Expected::Noop,
-                Expected::Noop,
-            ]
-        },
-        // n { n, ! } case: x and a are nullable, b is not-null
-        test_nullable_nullable_not_null: {
-            x: nullable,
-            a: nullable,
-            b: not_null,
-            expected: [
-                Expected::Noop,
-                Expected::Noop,
-                Expected::Error,
-                Expected::NullStruct,
-            ]
-        },
-        // n { !, ! } case: x is nullable; a and b are not-null
-        test_nullable_not_null_not_null: {
-            x: nullable,
-            a: not_null,
-            b: not_null,
-            expected: [
-                Expected::Noop,
-                Expected::Error,
-                Expected::Error,
-                Expected::NullStruct,
-            ]
-        },
-        // ! { n, n } case: x is not-null; a and b are nullable
-        test_not_null_nullable_nullable: {
-            x: not_null,
-            a: nullable,
-            b: nullable,
-            expected: [
-                Expected::Noop,
-                Expected::Noop,
-                Expected::Noop,
-                Expected::Noop,
-            ]
-        },
-        // ! { n, ! } case: x is not-null; a is nullable, b is not-null
-        test_not_null_nullable_not_null: {
-            x: not_null,
-            a: nullable,
-            b: not_null,
-            expected: [
-                Expected::Noop,
-                Expected::Noop,
-                Expected::Error,
-                Expected::Null,
-            ]
-        },
-        // ! { !, ! } case: all not-null (for a and b)
-        test_not_null_not_null_not_null: {
-            x: not_null,
-            a: not_null,
-            b: not_null,
-            expected: [
-                Expected::Noop,
-                Expected::Error,
-                Expected::Error,
-                Expected::Null,
-            ]
-        },
+        name = test_all_nullable,
+        schema = { x: nullable, a: nullable, b: nullable },
+        tests = {
+            (a, b) -> Noop,
+            (N, b) -> Noop,
+            (a, N) -> Noop,
+            (N, N) -> Noop,
+        }
+    }
+
+    // Group 2: nullable { nullable, not_null }
+    //  1. (a, b) -> x (a, b)
+    //  2. (N, b) -> x (N, b)
+    //  3. (a, N) -> Err
+    //  4. (N, N) -> x NULL
+    test_nullability_combinations! {
+        name = test_nullable_nullable_not_null,
+        schema = { x: nullable, a: nullable, b: not_null },
+        tests = {
+            (a, b) -> Noop,
+            (N, b) -> Noop,
+            (a, N) -> Error,
+            (N, N) -> NullStruct,
+        }
+    }
+
+    // Group 3: nullable { not_null, not_null }
+    //  1. (a, b) -> x (a, b)
+    //  2. (N, b) -> Err
+    //  3. (a, N) -> Err
+    //  4. (N, N) -> x NULL
+    test_nullability_combinations! {
+        name = test_nullable_not_null_not_null,
+        schema = { x: nullable, a: not_null, b: not_null },
+        tests = {
+            (a, b) -> Noop,
+            (N, b) -> Error,
+            (a, N) -> Error,
+            (N, N) -> NullStruct,
+        }
+    }
+
+    // Group 4: not_null { nullable, nullable }
+    //  1. (a, b) -> x (a, b)
+    //  2. (N, b) -> x (N, b)
+    //  3. (a, N) -> x (a, N)
+    //  4. (N, N) -> x (N, N)
+    test_nullability_combinations! {
+        name = test_not_null_nullable_nullable,
+        schema = { x: not_null, a: nullable, b: nullable },
+        tests = {
+            (a, b) -> Noop,
+            (N, b) -> Noop,
+            (a, N) -> Noop,
+            (N, N) -> Noop,
+        }
+    }
+
+    // Group 5: not_null { nullable, not_null }
+    //  1. (a, b) -> x (a, b)
+    //  2. (N, b) -> x (N, b)
+    //  3. (a, N) -> Err
+    //  4. (N, N) -> NULL
+    test_nullability_combinations! {
+        name = test_not_null_nullable_not_null,
+        schema = { x: not_null, a: nullable, b: not_null },
+        tests = {
+            (a, b) -> Noop,
+            (N, b) -> Noop,
+            (a, N) -> Error,
+            (N, N) -> Null,
+        }
+    }
+
+    // Group 6: not_null { not_null, not_null }
+    //  1. (a, b) -> x (a, b)
+    //  2. (N, b) -> Err
+    //  3. (a, N) -> Err
+    //  4. (N, N) -> NULL
+    test_nullability_combinations! {
+        name = test_all_not_null,
+        schema = { x: not_null, a: not_null, b: not_null },
+        tests = {
+            (a, b) -> Noop,
+            (N, b) -> Error,
+            (a, N) -> Error,
+            (N, N) -> Null,
+        }
     }
 }
