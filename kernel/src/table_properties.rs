@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
-use crate::Error;
+use crate::{Error, Version};
 
 use strum::EnumString;
 
@@ -145,7 +145,7 @@ pub struct TableProperties {
     pub enable_in_commit_timestamps: Option<bool>,
 
     /// The version of the table at which in-commit timestamps were enabled.
-    pub in_commit_timestamp_enablement_version: Option<u64>,
+    pub in_commit_timestamp_enablement_version: Option<Version>,
 
     /// The timestamp of the table at which in-commit timestamps were enabled. This must be the same
     /// as the inCommitTimestamp of the commit when this feature was enabled.
