@@ -117,7 +117,7 @@ fn test_default_partial_cmp_scalars() {
     }
 
     let expect_if_comparable_type = |s: &_, expect| match s {
-        Null(_) | Decimal(..) | Struct(_) | Array(_) => None,
+        Null(_) | Struct(_) | Array(_) => None,
         _ => Some(expect),
     };
 
