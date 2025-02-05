@@ -83,19 +83,27 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
             props.in_commit_timestamp_enablement_version = Some(parse_int(v)?)
         }
         "delta.inCommitTimestampEnablementTimestamp" => {
-            props.in_commit_timestamp_enablement_timestamp = Some(parse_int(v)?)
+            props.in_commit_timestamp_enablement_timestamp = Some(parse_int(v)?.try_into().ok()?)
         }
         _ => return None,
     }
     Some(())
 }
 
-/// Deserialize a string representing a positive integer into an `Option<u64>`. Returns `Some` if
-/// successfully parses, and `None` otherwise.
+/// Deserialize a string representing a positive (non-zero) integer into an `Option<u64>`. Returns
+/// `Some` if successfully parses, and `None` otherwise.
 pub(crate) fn parse_positive_int(s: &str) -> Option<NonZero<u64>> {
     // parse to i64 (then check n > 0) since java doesn't even allow u64
     let n: i64 = s.parse().ok()?;
     NonZero::new(n.try_into().ok()?)
+}
+
+/// Deserialize a string representing a positive integer into an `Option<u64>`. Returns `Some` if
+/// successfully parses, and `None` otherwise.
+pub(crate) fn parse_int(s: &str) -> Option<u64> {
+    // parse to i64 (then to u64) since java doesn't even allow u64
+    let n: i64 = s.parse().ok()?;
+    n.try_into().ok()
 }
 
 /// Deserialize a string representing a boolean into an `Option<bool>`. Returns `Some` if
@@ -212,6 +220,13 @@ mod tests {
         assert_eq!(parse_positive_int("123").unwrap().get(), 123);
         assert_eq!(parse_positive_int("0"), None);
         assert_eq!(parse_positive_int("-123"), None);
+    }
+
+    #[test]
+    fn test_parse_int() {
+        assert_eq!(parse_int("123").unwrap(), 123);
+        assert_eq!(parse_int("0").unwrap(), 0);
+        assert_eq!(parse_int("-123"), None);
     }
 
     #[test]
