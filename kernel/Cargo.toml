@@ -9,7 +9,7 @@ repository.workspace = true
 readme.workspace = true
 version.workspace = true
 # exclude golden tests + golden test data since they push us over 10MB crate size limit
-exclude = ["tests/golden_tables.rs", "tests/golden_data/" ]
+exclude = ["tests/golden_tables.rs", "tests/golden_data/"]
 rust-version.workspace = true
 
 [package.metadata.docs.rs]
@@ -17,10 +17,22 @@ all-features = true
 
 [package.metadata.release]
 pre-release-replacements = [
-  {file="../README.md", search="delta_kernel = \"[a-z0-9\\.-]+\"", replace="delta_kernel = \"{{version}}\""},
-  {file="../README.md", search="version = \"[a-z0-9\\.-]+\"", replace="version = \"{{version}}\""},
+  { file = "../README.md", search = "delta_kernel = \"[a-z0-9\\.-]+\"", replace = "delta_kernel = \"{{version}}\"" },
+  { file = "../README.md", search = "version = \"[a-z0-9\\.-]+\"", replace = "version = \"{{version}}\"" },
 ]
-pre-release-hook = ["git", "cliff", "--repository", "../", "--config", "../cliff.toml", "--unreleased", "--prepend", "../CHANGELOG.md", "--tag", "{{version}}" ]
+pre-release-hook = [
+  "git",
+  "cliff",
+  "--repository",
+  "../",
+  "--config",
+  "../cliff.toml",
+  "--unreleased",
+  "--prepend",
+  "../CHANGELOG.md",
+  "--tag",
+  "{{version}}",
+]
 
 [dependencies]
 bytes = "1.7"
@@ -74,7 +86,13 @@ walkdir = { workspace = true, optional = true }
 
 [features]
 arrow-conversion = ["arrow-schema"]
-arrow-expression = ["arrow-arith", "arrow-array", "arrow-buffer", "arrow-ord", "arrow-schema"]
+arrow-expression = [
+  "arrow-arith",
+  "arrow-array",
+  "arrow-buffer",
+  "arrow-ord",
+  "arrow-schema",
+]
 cloud = [
   "object_store/aws",
   "object_store/azure",
@@ -106,10 +124,7 @@ default-engine-base = [
 
 # the default-engine use the reqwest crate with default features which uses native-tls. if you want
 # to instead use rustls, use 'default-engine-rustls' which has no native-tls dependency
-default-engine = [
-  "default-engine-base",
-  "reqwest/default",
-]
+default-engine = ["default-engine-base", "reqwest/default"]
 
 default-engine-rustls = [
   "default-engine-base",
