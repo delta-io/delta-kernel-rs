@@ -1,6 +1,9 @@
 //! Helpers to ensure that kernel data types match arrow data types
 
-use std::{collections::{HashMap, HashSet}, ops::Deref};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Deref,
+};
 
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
 use itertools::Itertools;
@@ -29,7 +32,9 @@ pub(crate) fn ensure_data_types(
     arrow_type: &ArrowDataType,
     check_nullability_and_metadata: bool,
 ) -> DeltaResult<DataTypeCompat> {
-    let check = EnsureDataTypes { check_nullability_and_metadata };
+    let check = EnsureDataTypes {
+        check_nullability_and_metadata,
+    };
     check.ensure_data_types(kernel_type, arrow_type)
 }
 
@@ -61,41 +66,32 @@ impl EnsureDataTypes {
             }
             // strings, bools, and binary  aren't primitive in arrow
             (&DataType::BOOLEAN, ArrowDataType::Boolean)
-                | (&DataType::STRING, ArrowDataType::Utf8)
-                | (&DataType::BINARY, ArrowDataType::Binary) => {
-                    Ok(DataTypeCompat::Identical)
-                }
+            | (&DataType::STRING, ArrowDataType::Utf8)
+            | (&DataType::BINARY, ArrowDataType::Binary) => Ok(DataTypeCompat::Identical),
             (DataType::Array(inner_type), ArrowDataType::List(arrow_list_field)) => {
                 self.ensure_nullability(
                     "List",
                     inner_type.contains_null,
                     arrow_list_field.is_nullable(),
                 )?;
-                self.ensure_data_types(
-                    &inner_type.element_type,
-                    arrow_list_field.data_type(),
-                )
+                self.ensure_data_types(&inner_type.element_type, arrow_list_field.data_type())
             }
             (DataType::Map(kernel_map_type), ArrowDataType::Map(arrow_map_type, _)) => {
                 let ArrowDataType::Struct(fields) = arrow_map_type.data_type() else {
                     return Err(make_arrow_error("Arrow map type wasn't a struct."));
                 };
                 let [key_type, value_type] = fields.deref() else {
-                    return Err(make_arrow_error("Arrow map type didn't have expected key/value fields"));
+                    return Err(make_arrow_error(
+                        "Arrow map type didn't have expected key/value fields",
+                    ));
                 };
-                self.ensure_data_types(
-                    &kernel_map_type.key_type,
-                    key_type.data_type(),
-                )?;
+                self.ensure_data_types(&kernel_map_type.key_type, key_type.data_type())?;
                 self.ensure_nullability(
                     "Map",
                     kernel_map_type.value_contains_null,
                     value_type.is_nullable(),
                 )?;
-                self.ensure_data_types(
-                    &kernel_map_type.value_type,
-                    value_type.data_type(),
-                )?;
+                self.ensure_data_types(&kernel_map_type.value_type, value_type.data_type())?;
                 Ok(DataTypeCompat::Nested)
             }
             (DataType::Struct(kernel_fields), ArrowDataType::Struct(arrow_fields)) => {
@@ -109,10 +105,7 @@ impl EnsureDataTypes {
                 // ensure that for the fields that we found, the types match
                 for (kernel_field, arrow_field) in mapped_fields.zip(arrow_fields) {
                     self.ensure_nullability_and_metadata(kernel_field, arrow_field)?;
-                    self.ensure_data_types(
-                        &kernel_field.data_type,
-                        arrow_field.data_type(),
-                    )?;
+                    self.ensure_data_types(&kernel_field.data_type, arrow_field.data_type())?;
                     found_fields += 1;
                 }
 
@@ -146,11 +139,12 @@ impl EnsureDataTypes {
         kernel_field_is_nullable: bool,
         arrow_field_is_nullable: bool,
     ) -> DeltaResult<()> {
-        if self.check_nullability_and_metadata && kernel_field_is_nullable != arrow_field_is_nullable {
+        if self.check_nullability_and_metadata
+            && kernel_field_is_nullable != arrow_field_is_nullable
+        {
             Err(Error::Generic(format!(
                 "{desc} has nullablily {} in kernel and {} in arrow",
-                kernel_field_is_nullable,
-                arrow_field_is_nullable,
+                kernel_field_is_nullable, arrow_field_is_nullable,
             )))
         } else {
             Ok(())
@@ -160,10 +154,16 @@ impl EnsureDataTypes {
     fn ensure_nullability_and_metadata(
         &self,
         kernel_field: &StructField,
-        arrow_field: &ArrowField
+        arrow_field: &ArrowField,
     ) -> DeltaResult<()> {
-        self.ensure_nullability(&kernel_field.name, kernel_field.nullable, arrow_field.is_nullable())?;
-        if self.check_nullability_and_metadata && !metadata_eq(&kernel_field.metadata, arrow_field.metadata()) {
+        self.ensure_nullability(
+            &kernel_field.name,
+            kernel_field.nullable,
+            arrow_field.is_nullable(),
+        )?;
+        if self.check_nullability_and_metadata
+            && !metadata_eq(&kernel_field.metadata, arrow_field.metadata())
+        {
             Err(Error::Generic(format!(
                 "Field {} has metadata {:?} in kernel and {:?} in arrow",
                 kernel_field.name,

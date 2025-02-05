@@ -1,6 +1,6 @@
 use super::*;
+use crate::expressions::{column_expr, column_name};
 use crate::predicates::DataSkippingPredicateEvaluator as _;
-use crate::expressions::{column_name, column_expr};
 use crate::Expression;
 use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use std::fs::File;
@@ -63,7 +63,10 @@ fn test_get_stat_values() {
 
     // Only the BOOL column has any nulls
     assert_eq!(filter.get_nullcount_stat(&column_name!("bool")), Some(3));
-    assert_eq!(filter.get_nullcount_stat(&column_name!("varlen.utf8")), Some(0));
+    assert_eq!(
+        filter.get_nullcount_stat(&column_name!("varlen.utf8")),
+        Some(0)
+    );
 
     assert_eq!(
         filter.get_min_stat(&column_name!("varlen.utf8"), &DataType::STRING),
@@ -106,27 +109,18 @@ fn test_get_stat_values() {
     );
 
     assert_eq!(
-        filter.get_min_stat(
-            &column_name!("numeric.floats.float64"),
-            &DataType::DOUBLE
-        ),
+        filter.get_min_stat(&column_name!("numeric.floats.float64"), &DataType::DOUBLE),
         Some(1147f64.into())
     );
 
     // type widening!
     assert_eq!(
-        filter.get_min_stat(
-            &column_name!("numeric.floats.float32"),
-            &DataType::DOUBLE
-        ),
+        filter.get_min_stat(&column_name!("numeric.floats.float32"), &DataType::DOUBLE),
         Some(139f64.into())
     );
 
     assert_eq!(
-        filter.get_min_stat(
-            &column_name!("numeric.floats.float32"),
-            &DataType::FLOAT
-        ),
+        filter.get_min_stat(&column_name!("numeric.floats.float32"), &DataType::FLOAT),
         Some(139f32.into())
     );
 
@@ -216,10 +210,7 @@ fn test_get_stat_values() {
 
     // CHEAT: Interpret the timestamp_ntz column as a normal timestamp
     assert_eq!(
-        filter.get_min_stat(
-            &column_name!("chrono.timestamp_ntz"),
-            &DataType::TIMESTAMP
-        ),
+        filter.get_min_stat(&column_name!("chrono.timestamp_ntz"), &DataType::TIMESTAMP),
         Some(
             PrimitiveType::Timestamp
                 .parse_scalar("1970-01-02 00:00:00.000000")
@@ -241,10 +232,7 @@ fn test_get_stat_values() {
 
     // type widening!
     assert_eq!(
-        filter.get_min_stat(
-            &column_name!("chrono.date32"),
-            &DataType::TIMESTAMP_NTZ
-        ),
+        filter.get_min_stat(&column_name!("chrono.date32"), &DataType::TIMESTAMP_NTZ),
         Some(
             PrimitiveType::TimestampNtz
                 .parse_scalar("1971-01-01 00:00:00.000000")
@@ -293,27 +281,18 @@ fn test_get_stat_values() {
     );
 
     assert_eq!(
-        filter.get_max_stat(
-            &column_name!("numeric.floats.float64"),
-            &DataType::DOUBLE
-        ),
+        filter.get_max_stat(&column_name!("numeric.floats.float64"), &DataType::DOUBLE),
         Some(1125899906842747f64.into())
     );
 
     // type widening!
     assert_eq!(
-        filter.get_max_stat(
-            &column_name!("numeric.floats.float32"),
-            &DataType::DOUBLE
-        ),
+        filter.get_max_stat(&column_name!("numeric.floats.float32"), &DataType::DOUBLE),
         Some(1048699f64.into())
     );
 
     assert_eq!(
-        filter.get_max_stat(
-            &column_name!("numeric.floats.float32"),
-            &DataType::FLOAT
-        ),
+        filter.get_max_stat(&column_name!("numeric.floats.float32"), &DataType::FLOAT),
         Some(1048699f32.into())
     );
 
@@ -403,10 +382,7 @@ fn test_get_stat_values() {
 
     // CHEAT: Interpret the timestamp_ntz column as a normal timestamp
     assert_eq!(
-        filter.get_max_stat(
-            &column_name!("chrono.timestamp_ntz"),
-            &DataType::TIMESTAMP
-        ),
+        filter.get_max_stat(&column_name!("chrono.timestamp_ntz"), &DataType::TIMESTAMP),
         Some(
             PrimitiveType::Timestamp
                 .parse_scalar("1970-01-02 00:04:00.000000")
@@ -428,10 +404,7 @@ fn test_get_stat_values() {
 
     // type widening!
     assert_eq!(
-        filter.get_max_stat(
-            &column_name!("chrono.date32"),
-            &DataType::TIMESTAMP_NTZ
-        ),
+        filter.get_max_stat(&column_name!("chrono.date32"), &DataType::TIMESTAMP_NTZ),
         Some(
             PrimitiveType::TimestampNtz
                 .parse_scalar("1971-01-05 00:00:00.000000")
