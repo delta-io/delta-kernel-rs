@@ -108,17 +108,16 @@ pub fn transform_to_logical(
     logical_schema: &Schema,
     transform: &Option<ExpressionRef>,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    if let Some(ref transform) = transform {
-        engine
+    match transform {
+        Some(ref transform) => engine
             .get_expression_handler()
             .get_evaluator(
                 physical_schema.clone(),
                 transform.as_ref().clone(), // TODO: Maybe eval should take a ref
                 logical_schema.clone().into(),
             )
-            .evaluate(physical_data.as_ref())
-    } else {
-        Ok(physical_data)
+            .evaluate(physical_data.as_ref()),
+        None => Ok(physical_data),
     }
 }
 
@@ -140,6 +139,8 @@ pub type ScanCallback<T> = fn(
 /// * `path`: a `&str` which is the path to the file
 /// * `size`: an `i64` which is the size of the file
 /// * `dv_info`: a [`DvInfo`] struct, which allows getting the selection vector for this file
+/// * `transform`: An optional expression that, if present, _must_ be applied to physical data to convert it to
+///                the correct logical format
 /// * `partition_values`: a `HashMap<String, String>` which are partition values
 ///
 /// ## Context
