@@ -53,7 +53,7 @@ impl Snapshot {
     pub fn try_new(
         table_root: Url,
         engine: &dyn Engine,
-        version: Option<Version>,
+        version: impl Into<Option<Version>>,
     ) -> DeltaResult<Self> {
         let fs_client = engine.get_file_system_client();
         let log_root = table_root.join("_delta_log/")?;
@@ -137,6 +137,64 @@ impl Snapshot {
     pub fn into_scan_builder(self) -> ScanBuilder {
         ScanBuilder::new(self)
     }
+
+    /// Update the `Snapshot` to the target version.
+    ///
+    /// # Parameters
+    /// - `target_version`: desired version of the `Snapshot` after update, defaults to latest.
+    /// - `engine`: Implementation of [`Engine`] apis.
+    ///
+    /// # Returns
+    /// - boolean flag indicating if the `Snapshot` was updated.
+    pub fn update(
+        &mut self,
+        target_version: impl Into<Option<Version>>,
+        engine: &dyn Engine,
+    ) -> DeltaResult<bool> {
+        let fs_client = engine.get_file_system_client();
+        let log_root = self.table_root.join("_delta_log/")?;
+        let log_segment = match LogSegment::for_table_changes(
+            fs_client.as_ref(),
+            log_root,
+            self.version() + 1,
+            target_version,
+        ) {
+            Ok(segment) => segment,
+            Err(Error::FileNotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+
+        let (metadata, protocol) = log_segment.read_metadata_opt(engine)?;
+        if let Some(p) = &protocol {
+            p.ensure_read_supported()?;
+        }
+        let (schema, table_properties) = if let Some(m) = &metadata {
+            let schema = m.parse_schema()?;
+            let table_properties = m.parse_table_properties();
+            let column_mapping_mode = column_mapping_mode(
+                protocol.as_ref().unwrap_or(&self.protocol),
+                &table_properties,
+            );
+            validate_schema_column_mapping(&schema, column_mapping_mode)?;
+            (Some(schema), Some(table_properties))
+        } else {
+            (None, None)
+        };
+
+        // NOTE: we try to extend the log segment first, so that if it fails, we don't update the
+        // snapshot. Otherwise callers might end up with an inconsistent snapshot.
+        self.log_segment.extend(&log_segment)?;
+        if let Some(p) = protocol {
+            self.protocol = p;
+        }
+        if let (Some(m), Some(s), Some(t)) = (metadata, schema, table_properties) {
+            self.metadata = m;
+            self.schema = s;
+            self.table_properties = t;
+        }
+
+        Ok(true)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -202,7 +260,7 @@ mod tests {
     use crate::engine::default::filesystem::ObjectStoreFileSystemClient;
     use crate::engine::sync::SyncEngine;
     use crate::path::ParsedLogPath;
-    use crate::schema::StructType;
+    use crate::schema::{DataType, PrimitiveType, StructType};
 
     #[test]
     fn test_snapshot_read_metadata() {
@@ -332,5 +390,36 @@ mod tests {
             .version,
             3,
         );
+    }
+
+    #[test]
+    fn test_snapshot_update() {
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/type-widening/")).unwrap();
+
+        let location = url::Url::from_directory_path(path).unwrap();
+        let engine = SyncEngine::new();
+        let mut snapshot = Snapshot::try_new(location, &engine, 0).unwrap();
+
+        assert_eq!(snapshot.protocol().min_reader_version(), 1);
+        assert_eq!(snapshot.table_properties.enable_type_widening, None);
+
+        snapshot.update(1, &engine).unwrap();
+        assert_eq!(snapshot.protocol().min_reader_version(), 3);
+        assert_eq!(snapshot.table_properties.enable_type_widening, Some(true));
+        assert!(matches!(
+            snapshot.schema().field("int_decimal").unwrap().data_type(),
+            &DataType::Primitive(PrimitiveType::Integer)
+        ));
+
+        snapshot.update(None, &engine).unwrap();
+        assert_eq!(snapshot.protocol().min_reader_version(), 3);
+        assert_eq!(snapshot.table_properties.enable_type_widening, Some(true));
+        assert!(matches!(
+            snapshot.schema().field("int_decimal").unwrap().data_type(),
+            &DataType::Primitive(PrimitiveType::Decimal(11, 1))
+        ));
+
+        // update return false if no new version
+        assert!(!snapshot.update(None, &engine).unwrap());
     }
 }

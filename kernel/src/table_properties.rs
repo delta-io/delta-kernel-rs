@@ -137,6 +137,9 @@ pub struct TableProperties {
     /// whether to enable row tracking during writes.
     pub enable_row_tracking: Option<bool>,
 
+    /// whether to enable type widening
+    pub enable_type_widening: Option<bool>,
+
     /// any unrecognized properties are passed through and ignored by the parser
     pub unknown_properties: HashMap<String, String>,
 }
@@ -268,6 +271,7 @@ mod tests {
             ("delta.tuneFileSizesForRewrites", "true"),
             ("delta.checkpointPolicy", "v2"),
             ("delta.enableRowTracking", "true"),
+            ("delta.enableTypeWidening", "true"),
         ];
         let actual = TableProperties::from(properties.into_iter());
         let expected = TableProperties {
@@ -293,6 +297,7 @@ mod tests {
             tune_file_sizes_for_rewrites: Some(true),
             checkpoint_policy: Some(CheckpointPolicy::V2),
             enable_row_tracking: Some(true),
+            enable_type_widening: Some(true),
             unknown_properties: HashMap::new(),
         };
         assert_eq!(actual, expected);
