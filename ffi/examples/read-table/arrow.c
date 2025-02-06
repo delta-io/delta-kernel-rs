@@ -124,13 +124,13 @@ static ExclusiveEngineData* apply_transform(
       context->engine,
       &data,
       evaluator);
+    free_engine_data(data);
+    free_evaluator(evaluator);
     if (transformed_res.tag != OkHandleExclusiveEngineData) {
       print_error("Failed to transform read data.", (Error*)transformed_res.err);
       free_error((Error*)transformed_res.err);
       return NULL;
     }
-    free_engine_data(data);
-    free_evaluator(evaluator);
     return transformed_res.ok;
   }
 }
