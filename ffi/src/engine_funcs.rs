@@ -209,8 +209,8 @@ fn evaluate_impl(
 
 #[cfg(test)]
 mod tests {
-    use super::get_evaluator;
-    use crate::{free_engine, tests::get_default_engine};
+    use super::{get_evaluator, free_evaluator};
+    use crate::{free_engine, handle::Handle, scan::SharedSchema, tests::get_default_engine};
     use delta_kernel::{
         schema::{DataType, StructField, StructType},
         Expression,
@@ -226,15 +226,19 @@ mod tests {
             true,
         )]));
         let expr = Expression::literal(1);
-        let output_type = in_schema.clone();
+        let output_type: Handle<SharedSchema> = in_schema.clone().into();
+        let in_schema_handle: Handle<SharedSchema> = in_schema.into();
         unsafe {
-            get_evaluator(
+            let evaluator = get_evaluator(
                 engine.shallow_copy(),
-                in_schema.into(),
+                in_schema_handle.shallow_copy(),
                 &expr,
-                output_type.into(),
+                output_type.shallow_copy(),
             );
+            in_schema_handle.drop_handle();
+            output_type.drop_handle();
             free_engine(engine);
+            free_evaluator(evaluator);
         }
     }
 }
