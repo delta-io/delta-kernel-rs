@@ -5,13 +5,13 @@ use std::sync::LazyLock;
 
 use crate::actions::deletion_vector::deletion_treemap_to_bools;
 use crate::scan::get_transform_for_row;
+use crate::schema::Schema;
 use crate::utils::require;
 use crate::ExpressionRef;
 use crate::{
     actions::{deletion_vector::DeletionVectorDescriptor, visitors::visit_deletion_vector_at},
     engine_data::{GetData, RowVisitor, TypedGetData as _},
     schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef},
-    table_features::ColumnMappingMode,
     DeltaResult, Engine, EngineData, Error,
 };
 use roaring::RoaringTreemap;
@@ -27,7 +27,6 @@ pub struct GlobalScanState {
     pub partition_columns: Vec<String>,
     pub logical_schema: SchemaRef,
     pub physical_schema: SchemaRef,
-    pub column_mapping_mode: ColumnMappingMode,
 }
 
 /// this struct can be used by an engine to materialize a selection vector
@@ -100,6 +99,28 @@ impl DvInfo {
     }
 }
 
+/// utility function for applying a transform expression to convert data from physical to logical
+/// format
+pub fn transform_to_logical(
+    engine: &dyn Engine,
+    physical_data: Box<dyn EngineData>,
+    physical_schema: &SchemaRef,
+    logical_schema: &Schema,
+    transform: &Option<ExpressionRef>,
+) -> DeltaResult<Box<dyn EngineData>> {
+    match transform {
+        Some(ref transform) => engine
+            .get_expression_handler()
+            .get_evaluator(
+                physical_schema.clone(),
+                transform.as_ref().clone(), // TODO: Maybe eval should take a ref
+                logical_schema.clone().into(),
+            )
+            .evaluate(physical_data.as_ref()),
+        None => Ok(physical_data),
+    }
+}
+
 pub type ScanCallback<T> = fn(
     context: &mut T,
     path: &str,
@@ -118,6 +139,8 @@ pub type ScanCallback<T> = fn(
 /// * `path`: a `&str` which is the path to the file
 /// * `size`: an `i64` which is the size of the file
 /// * `dv_info`: a [`DvInfo`] struct, which allows getting the selection vector for this file
+/// * `transform`: An optional expression that, if present, _must_ be applied to physical data to convert it to
+///                the correct logical format
 /// * `partition_values`: a `HashMap<String, String>` which are partition values
 ///
 /// ## Context
