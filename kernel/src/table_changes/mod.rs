@@ -31,20 +31,16 @@
 //! let table_change_batches = table_changes_scan.execute(engine.clone())?;
 //! # Ok::<(), Error>(())
 //! ```
-use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use scan::TableChangesScanBuilder;
 use url::Url;
 
-use crate::actions::{ensure_supported_features, Protocol};
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::{DataType, Schema, StructField, StructType};
 use crate::snapshot::Snapshot;
-use crate::table_features::{ColumnMappingMode, ReaderFeatures};
-use crate::table_properties::TableProperties;
-use crate::utils::require;
+use crate::table_configuration::TableConfiguration;
 use crate::{DeltaResult, Engine, Error, Version};
 
 mod log_replay;
@@ -114,6 +110,7 @@ pub struct TableChanges {
     end_snapshot: Snapshot,
     start_version: Version,
     schema: Schema,
+    start_table_config: TableConfiguration,
 }
 
 impl TableChanges {
@@ -154,18 +151,13 @@ impl TableChanges {
         let end_snapshot = Snapshot::try_new(table_root.as_url().clone(), engine, end_version)?;
 
         // Verify CDF is enabled at the beginning and end of the interval using
-        // [`check_cdf_table_properties`] to fail early. This also ensures that column mapping is
-        // disabled.
-        //
-        // We also check the [`Protocol`] using [`ensure_cdf_read_supported`] to verify that
-        // we support CDF with those features enabled.
-        //
-        // Note: We must still check each metadata and protocol action in the CDF range.
+        // [`TableConfiguration::is_cdf_read_supported`] to fail early. This also ensures that
+        // column mapping is disabled.
         let check_table_config = |snapshot: &Snapshot| {
-            if snapshot.table_configuration().is_cdf_read_supported() {
-                Ok(())
+            if let Err(err) = snapshot.table_configuration().is_cdf_read_supported() {
+                Err(Error::change_data_feed_unsupported(snapshot.version(), err))
             } else {
-                Err(Error::change_data_feed_unsupported(snapshot.version()))
+                Ok(())
             }
         };
         check_table_config(&start_snapshot)?;
@@ -195,6 +187,7 @@ impl TableChanges {
             log_segment,
             start_version,
             schema,
+            start_table_config: start_snapshot.table_configuration().clone(),
         })
     }
 
@@ -220,7 +213,6 @@ impl TableChanges {
     pub(crate) fn partition_columns(&self) -> &Vec<String> {
         &self.end_snapshot.metadata().partition_columns
     }
-
     /// Create a [`TableChangesScanBuilder`] for an `Arc<TableChanges>`.
     pub fn scan_builder(self: Arc<Self>) -> TableChangesScanBuilder {
         TableChangesScanBuilder::new(self)
@@ -232,47 +224,13 @@ impl TableChanges {
     }
 }
 
-/// Ensures that change data feed is enabled in `table_properties`. See the documentation
-/// of [`TableChanges`] for more details.
-fn check_cdf_table_properties(table_properties: &TableProperties) -> DeltaResult<()> {
-    require!(
-        table_properties.enable_change_data_feed.unwrap_or(false),
-        Error::unsupported("Change data feed is not enabled")
-    );
-    require!(
-        matches!(
-            table_properties.column_mapping_mode,
-            None | Some(ColumnMappingMode::None)
-        ),
-        Error::unsupported("Change data feed not supported when column mapping is enabled")
-    );
-    Ok(())
-}
-
-/// Ensures that Change Data Feed is supported for a table with this [`Protocol`] .
-/// See the documentation of [`TableChanges`] for more details.
-fn ensure_cdf_read_supported(protocol: &Protocol) -> DeltaResult<()> {
-    static CDF_SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeatures>> =
-        LazyLock::new(|| HashSet::from([ReaderFeatures::DeletionVectors]));
-    match &protocol.reader_features() {
-        // if min_reader_version = 3 and all reader features are subset of supported => OK
-        Some(reader_features) if protocol.min_reader_version() == 3 => {
-            ensure_supported_features(reader_features, &CDF_SUPPORTED_READER_FEATURES)
-        }
-        // if min_reader_version = 1 and there are no reader features => OK
-        None if protocol.min_reader_version() == 1 => Ok(()),
-        // any other protocol is not supported
-        _ => Err(Error::unsupported(
-            "Change data feed not supported on this protocol",
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::schema::{DataType, StructField};
     use crate::table_changes::CDF_FIELDS;
+    use crate::table_configuration::SupportError;
+    use crate::table_properties::property_names::ENABLE_CHANGE_DATA_FEED;
     use crate::{Error, Table};
     use itertools::assert_equal;
 
@@ -295,7 +253,14 @@ mod tests {
         let invalid_ranges = [(0, 2), (1, 2), (2, 2), (2, 3)];
         for (start_version, end_version) in invalid_ranges {
             let res = table.table_changes(engine.as_ref(), start_version, end_version);
-            assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))))
+            let Err(Error::ChangeDataFeedUnsupported(
+                2,
+                SupportError::MissingTableProperty(property),
+            )) = res
+            else {
+                panic!("Expected CDF to fail in version range ({start_version}, {end_version})");
+            };
+            assert_eq!(property, ENABLE_CHANGE_DATA_FEED);
         }
     }
     #[test]

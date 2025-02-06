@@ -5,6 +5,7 @@
 use std::num::NonZero;
 use std::time::Duration;
 
+use super::property_names::*;
 use super::*;
 use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
@@ -38,44 +39,40 @@ where
 // was successfully parsed, and None otherwise.
 fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
     match k {
-        "delta.appendOnly" => props.append_only = Some(parse_bool(v)?),
-        "delta.autoOptimize.autoCompact" => props.auto_compact = Some(parse_bool(v)?),
-        "delta.autoOptimize.optimizeWrite" => props.optimize_write = Some(parse_bool(v)?),
-        "delta.checkpointInterval" => props.checkpoint_interval = Some(parse_positive_int(v)?),
-        "delta.checkpoint.writeStatsAsJson" => {
+        APPEND_ONLY => props.append_only = Some(parse_bool(v)?),
+        AUTO_COMPACT => props.auto_compact = Some(parse_bool(v)?),
+        OPTIMIZE_WRITE => props.optimize_write = Some(parse_bool(v)?),
+        CHECKPOINT_INTERVAL => props.checkpoint_interval = Some(parse_positive_int(v)?),
+        CHECKPOINT_WRITE_STATS_AS_JSON => {
             props.checkpoint_write_stats_as_json = Some(parse_bool(v)?)
         }
-        "delta.checkpoint.writeStatsAsStruct" => {
+        CHECKPOINT_WRITE_STATS_AS_STRUCT => {
             props.checkpoint_write_stats_as_struct = Some(parse_bool(v)?)
         }
-        "delta.columnMapping.mode" => {
-            props.column_mapping_mode = ColumnMappingMode::try_from(v).ok()
-        }
-        "delta.dataSkippingNumIndexedCols" => {
+        COLUMN_MAPPING_MODE => props.column_mapping_mode = ColumnMappingMode::try_from(v).ok(),
+        DATA_SKIPPING_NUM_INDEXED_COLS => {
             props.data_skipping_num_indexed_cols = DataSkippingNumIndexedCols::try_from(v).ok()
         }
-        "delta.dataSkippingStatsColumns" => {
+        DATA_SKIPPING_STATS_COLUMNS => {
             props.data_skipping_stats_columns = Some(parse_column_names(v)?)
         }
-        "delta.deletedFileRetentionDuration" => {
+        DELETED_FILE_RETENTION_DURATION => {
             props.deleted_file_retention_duration = Some(parse_interval(v)?)
         }
-        "delta.enableChangeDataFeed" => props.enable_change_data_feed = Some(parse_bool(v)?),
-        "delta.enableDeletionVectors" => props.enable_deletion_vectors = Some(parse_bool(v)?),
-        "delta.isolationLevel" => props.isolation_level = IsolationLevel::try_from(v).ok(),
-        "delta.logRetentionDuration" => props.log_retention_duration = Some(parse_interval(v)?),
-        "delta.enableExpiredLogCleanup" => props.enable_expired_log_cleanup = Some(parse_bool(v)?),
-        "delta.randomizeFilePrefixes" => props.randomize_file_prefixes = Some(parse_bool(v)?),
-        "delta.randomPrefixLength" => props.random_prefix_length = Some(parse_positive_int(v)?),
-        "delta.setTransactionRetentionDuration" => {
+        ENABLE_CHANGE_DATA_FEED => props.enable_change_data_feed = Some(parse_bool(v)?),
+        ENABLE_DELETION_VECTORS => props.enable_deletion_vectors = Some(parse_bool(v)?),
+        ISOLATION_LEVEL => props.isolation_level = IsolationLevel::try_from(v).ok(),
+        LOG_RETENTION_DURATION => props.log_retention_duration = Some(parse_interval(v)?),
+        ENABLE_EXPIRED_LOG_CLEANUP => props.enable_expired_log_cleanup = Some(parse_bool(v)?),
+        RANDOMIZE_FILE_PREFIXES => props.randomize_file_prefixes = Some(parse_bool(v)?),
+        RANDOM_PREFIX_LENGTH => props.random_prefix_length = Some(parse_positive_int(v)?),
+        SET_TRANSACTION_RETENTION_DURATION => {
             props.set_transaction_retention_duration = Some(parse_interval(v)?)
         }
-        "delta.targetFileSize" => props.target_file_size = Some(parse_positive_int(v)?),
-        "delta.tuneFileSizesForRewrites" => {
-            props.tune_file_sizes_for_rewrites = Some(parse_bool(v)?)
-        }
-        "delta.checkpointPolicy" => props.checkpoint_policy = CheckpointPolicy::try_from(v).ok(),
-        "delta.enableRowTracking" => props.enable_row_tracking = Some(parse_bool(v)?),
+        TARGET_FILE_SIZE => props.target_file_size = Some(parse_positive_int(v)?),
+        TUNE_FILE_SIZES_FOR_REWRITES => props.tune_file_sizes_for_rewrites = Some(parse_bool(v)?),
+        CHECKPOINT_POLICY => props.checkpoint_policy = CheckpointPolicy::try_from(v).ok(),
+        ENABLE_ROW_TRACKING => props.enable_row_tracking = Some(parse_bool(v)?),
         _ => return None,
     }
     Some(())

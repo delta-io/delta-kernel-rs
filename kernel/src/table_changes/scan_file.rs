@@ -244,12 +244,13 @@ mod tests {
 
     use super::{scan_data_to_scan_file, CdfScanFile, CdfScanFileType};
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
-    use crate::actions::{Add, Cdc, Remove};
+    use crate::actions::{Add, Cdc, Metadata, Protocol, Remove};
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
     use crate::scan::state::DvInfo;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::log_replay::table_changes_action_iter;
+    use crate::table_configuration::TableConfiguration;
     use crate::utils::test_utils::{Action, LocalMockTable};
     use crate::Engine;
 
@@ -333,15 +334,39 @@ mod tests {
             None,
         )
         .unwrap();
+
         let table_schema = StructType::new([
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),
         ]);
+
+        let schema_string = serde_json::to_string(&table_schema).unwrap();
+        let metadata = Metadata {
+            schema_string,
+            configuration: HashMap::from([
+                ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+                (
+                    "delta.enableDeletionVectors".to_string(),
+                    "true".to_string(),
+                ),
+                ("delta.columnMapping.mode".to_string(), "none".to_string()),
+            ]),
+            ..Default::default()
+        };
+        let protocol = Protocol::new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some::<Vec<String>>(vec![]),
+        );
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
         let scan_data = table_changes_action_iter(
             Arc::new(engine),
             log_segment.ascending_commit_files.clone(),
             table_schema.into(),
             None,
+            table_config,
         )
         .unwrap();
         let scan_files: Vec<_> = scan_data_to_scan_file(scan_data).try_collect().unwrap();
