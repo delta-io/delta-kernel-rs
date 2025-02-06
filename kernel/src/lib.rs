@@ -106,6 +106,9 @@ pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef};
 pub use table::Table;
 
+#[cfg(test)]
+use path::ParsedLogPath;
+
 #[cfg(any(
     feature = "default-engine",
     feature = "sync-engine",
@@ -182,6 +185,12 @@ impl FileMeta {
             last_modified,
             size,
         }
+    }
+
+    /// Create a ParsedLogPath from this FileMeta
+    #[cfg(test)]
+    fn to_parsed_log_path(&self) -> ParsedLogPath {
+        ParsedLogPath::try_from(self.clone()).unwrap().unwrap()
     }
 }
 
