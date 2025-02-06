@@ -4,12 +4,14 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use crate::actions::deletion_vector::deletion_treemap_to_bools;
+use crate::scan::get_transform_for_row;
+use crate::schema::Schema;
 use crate::utils::require;
+use crate::ExpressionRef;
 use crate::{
     actions::{deletion_vector::DeletionVectorDescriptor, visitors::visit_deletion_vector_at},
     engine_data::{GetData, RowVisitor, TypedGetData as _},
     schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef},
-    table_features::ColumnMappingMode,
     DeltaResult, Engine, EngineData, Error,
 };
 use roaring::RoaringTreemap;
@@ -25,7 +27,6 @@ pub struct GlobalScanState {
     pub partition_columns: Vec<String>,
     pub logical_schema: SchemaRef,
     pub physical_schema: SchemaRef,
-    pub column_mapping_mode: ColumnMappingMode,
 }
 
 /// this struct can be used by an engine to materialize a selection vector
@@ -98,12 +99,35 @@ impl DvInfo {
     }
 }
 
+/// utility function for applying a transform expression to convert data from physical to logical
+/// format
+pub fn transform_to_logical(
+    engine: &dyn Engine,
+    physical_data: Box<dyn EngineData>,
+    physical_schema: &SchemaRef,
+    logical_schema: &Schema,
+    transform: &Option<ExpressionRef>,
+) -> DeltaResult<Box<dyn EngineData>> {
+    match transform {
+        Some(ref transform) => engine
+            .get_expression_handler()
+            .get_evaluator(
+                physical_schema.clone(),
+                transform.as_ref().clone(), // TODO: Maybe eval should take a ref
+                logical_schema.clone().into(),
+            )
+            .evaluate(physical_data.as_ref()),
+        None => Ok(physical_data),
+    }
+}
+
 pub type ScanCallback<T> = fn(
     context: &mut T,
     path: &str,
     size: i64,
     stats: Option<Stats>,
     dv_info: DvInfo,
+    transform: Option<ExpressionRef>,
     partition_values: HashMap<String, String>,
 );
 
@@ -115,6 +139,8 @@ pub type ScanCallback<T> = fn(
 /// * `path`: a `&str` which is the path to the file
 /// * `size`: an `i64` which is the size of the file
 /// * `dv_info`: a [`DvInfo`] struct, which allows getting the selection vector for this file
+/// * `transform`: An optional expression that, if present, _must_ be applied to physical data to convert it to
+///                the correct logical format
 /// * `partition_values`: a `HashMap<String, String>` which are partition values
 ///
 /// ## Context
@@ -138,12 +164,14 @@ pub type ScanCallback<T> = fn(
 pub fn visit_scan_files<T>(
     data: &dyn EngineData,
     selection_vector: &[bool],
+    transforms: &[Option<ExpressionRef>],
     context: T,
     callback: ScanCallback<T>,
 ) -> DeltaResult<T> {
     let mut visitor = ScanFileVisitor {
         callback,
         selection_vector,
+        transforms,
         context,
     };
     visitor.visit_rows_of(data)?;
@@ -154,6 +182,7 @@ pub fn visit_scan_files<T>(
 struct ScanFileVisitor<'a, T> {
     callback: ScanCallback<T>,
     selection_vector: &'a [bool],
+    transforms: &'a [Option<ExpressionRef>],
     context: T,
 }
 impl<T> RowVisitor for ScanFileVisitor<'_, T> {
@@ -201,6 +230,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                     size,
                     stats,
                     dv_info,
+                    get_transform_for_row(row_index, self.transforms),
                     partition_values,
                 )
             }
@@ -214,6 +244,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
+    use crate::ExpressionRef;
 
     use super::{DvInfo, Stats};
 
@@ -228,6 +259,7 @@ mod tests {
         size: i64,
         stats: Option<Stats>,
         dv_info: DvInfo,
+        transform: Option<ExpressionRef>,
         part_vals: HashMap<String, String>,
     ) {
         assert_eq!(
@@ -242,6 +274,7 @@ mod tests {
         assert!(dv_info.deletion_vector.is_some());
         let dv = dv_info.deletion_vector.unwrap();
         assert_eq!(dv.unique_id(), "uvBn[lx{q8@P<9BNH/isA@1");
+        assert!(transform.is_none());
         assert_eq!(context.id, 2);
     }
 

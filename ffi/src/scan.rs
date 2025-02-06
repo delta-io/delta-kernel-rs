@@ -7,7 +7,7 @@ use delta_kernel::scan::state::{visit_scan_files, DvInfo, GlobalScanState};
 use delta_kernel::scan::{Scan, ScanData};
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{DeltaResult, Error};
+use delta_kernel::{DeltaResult, Error, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -211,6 +211,7 @@ pub unsafe extern "C" fn kernel_scan_data_next(
         engine_context: NullableCvoid,
         engine_data: Handle<ExclusiveEngineData>,
         selection_vector: KernelBoolSlice,
+        transforms: &CTransforms,
     ),
 ) -> ExternResult<bool> {
     let data = unsafe { data.as_ref() };
@@ -224,15 +225,17 @@ fn kernel_scan_data_next_impl(
         engine_context: NullableCvoid,
         engine_data: Handle<ExclusiveEngineData>,
         selection_vector: KernelBoolSlice,
+        transforms: &CTransforms,
     ),
 ) -> DeltaResult<bool> {
     let mut data = data
         .data
         .lock()
         .map_err(|_| Error::generic("poisoned mutex"))?;
-    if let Some((data, sel_vec, _transforms)) = data.next().transpose()? {
+    if let Some((data, sel_vec, transforms)) = data.next().transpose()? {
         let bool_slice = KernelBoolSlice::from(sel_vec);
-        (engine_visitor)(engine_context, data.into(), bool_slice);
+        let transform_map = CTransforms { transforms };
+        (engine_visitor)(engine_context, data.into(), bool_slice, &transform_map);
         Ok(true)
     } else {
         Ok(false)
@@ -288,7 +291,7 @@ impl From<HashMap<String, String>> for CStringMap {
 /// # Safety
 ///
 /// The engine is responsible for providing a valid [`CStringMap`] pointer and [`KernelStringSlice`]
-pub unsafe extern "C" fn get_from_map(
+pub unsafe extern "C" fn get_from_string_map(
     map: &CStringMap,
     key: KernelStringSlice,
     allocate_fn: AllocateStringFn,
@@ -298,6 +301,10 @@ pub unsafe extern "C" fn get_from_map(
     map.values
         .get(string_key.unwrap())
         .and_then(|v| allocate_fn(kernel_string_slice!(v)))
+}
+
+pub struct CTransforms {
+    transforms: Vec<Option<ExpressionRef>>,
 }
 
 /// Get a selection vector out of a [`DvInfo`] struct
@@ -362,6 +369,7 @@ fn rust_callback(
     size: i64,
     kernel_stats: Option<delta_kernel::scan::state::Stats>,
     dv_info: DvInfo,
+    _transform: Option<ExpressionRef>,
     partition_values: HashMap<String, String>,
 ) {
     let partition_map = CStringMap {
@@ -395,6 +403,7 @@ struct ContextWrapper {
 pub unsafe extern "C" fn visit_scan_data(
     data: Handle<ExclusiveEngineData>,
     selection_vec: KernelBoolSlice,
+    transforms: &CTransforms,
     engine_context: NullableCvoid,
     callback: CScanCallback,
 ) {
@@ -405,5 +414,12 @@ pub unsafe extern "C" fn visit_scan_data(
         callback,
     };
     // TODO: return ExternResult to caller instead of panicking?
-    visit_scan_files(data, selection_vec, context_wrapper, rust_callback).unwrap();
+    visit_scan_files(
+        data,
+        selection_vec,
+        &transforms.transforms,
+        context_wrapper,
+        rust_callback,
+    )
+    .unwrap();
 }
