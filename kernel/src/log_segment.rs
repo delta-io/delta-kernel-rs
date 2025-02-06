@@ -1,14 +1,20 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of  checkpoint and commit
 //! files.
 
-use crate::actions::{get_log_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
+use crate::actions::visitors::SidecarVisitor;
+use crate::actions::{
+    get_log_add_schema, get_log_schema, Metadata, Protocol, Sidecar, ADD_NAME, METADATA_NAME,
+    PROTOCOL_NAME, SIDECAR_NAME,
+};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::snapshot::CheckpointMetadata;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, FileSystemClient, Version,
+    DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, FileDataReadResultIterator,
+    FileMeta, FileSystemClient, ParquetHandler, RowVisitor, Version,
 };
+use itertools::Either::{Left, Right};
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::convert::identity;
@@ -218,12 +224,147 @@ impl LogSegment {
             .iter()
             .map(|f| f.location.clone())
             .collect();
-        let checkpoint_stream = engine
-            .get_parquet_handler()
-            .read_parquet_files(&checkpoint_parts, checkpoint_read_schema, meta_predicate)?
-            .map_ok(|batch| (batch, false));
+        let checkpoint_stream = if checkpoint_parts.is_empty() {
+            Left(None.into_iter())
+        } else {
+            Right(Self::create_checkpoint_stream(
+                self,
+                engine,
+                checkpoint_read_schema,
+                meta_predicate,
+                checkpoint_parts,
+            )?)
+        };
 
         Ok(commit_stream.chain(checkpoint_stream))
+    }
+
+    fn create_checkpoint_stream(
+        &self,
+        engine: &dyn Engine,
+        checkpoint_read_schema: SchemaRef,
+        meta_predicate: Option<ExpressionRef>,
+        checkpoint_parts: Vec<FileMeta>,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
+        // We checked that checkpoint_parts is not empty before calling this function
+        require!(
+            !checkpoint_parts.is_empty(),
+            Error::generic("Checkpoint parts should not be empty")
+        );
+        let is_json_checkpoint = checkpoint_parts[0].location.path().ends_with(".json");
+
+        let actions = Self::read_checkpoint_files(
+            engine,
+            checkpoint_parts,
+            checkpoint_read_schema.clone(),
+            meta_predicate,
+            is_json_checkpoint,
+        )?;
+
+        let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
+            && checkpoint_read_schema.contains(SIDECAR_NAME);
+
+        require!(
+            !(need_file_actions && !checkpoint_read_schema.contains(SIDECAR_NAME)),
+            Error::generic(
+                "If the checkpoint read schema contains file actions, it must contain the sidecar column"
+            )
+        );
+
+        let is_multi_part_checkpoint = self.checkpoint_parts.len() > 1; //maybe not self?
+        let log_root = self.log_root.clone();
+        let parquet_handler = engine.get_parquet_handler().clone();
+
+        // If the schema does not contain add/remove actions (e.g., metadata-only replay),
+        // then we return the checkpoint batch directly.
+        // - Multi-part checkpoints never have sidecar actions, so they are returned as-is.
+        // - Otherwise, we check for sidecar references and replace checkpoint batches accordingly.
+        let checkpoint_stream = if need_file_actions && !is_multi_part_checkpoint {
+            Left(
+                actions
+                    // Flatten the new batches returned. The new batches could be:
+                    // - the checkpoint batch itself if no sidecar actions are present in the batch
+                    // - 1 or more sidecar batches referenced in the checkpoint batch by sidecar actions
+                    .flat_map(move |batch_result| match batch_result {
+                        Ok(checkpoint_batch) => Right(
+                            Self::process_checkpoint_batch(
+                                parquet_handler.clone(),
+                                log_root.clone(),
+                                checkpoint_batch,
+                            )
+                            .map_or_else(|e| Left(std::iter::once(Err(e))), Right)
+                            .map_ok(|batch| (batch, false)),
+                        ),
+                        Err(e) => Left(std::iter::once(Err(e))),
+                    }),
+            )
+        } else {
+            Right(actions.map_ok(|batch| (batch, false)))
+        };
+
+        Ok(checkpoint_stream)
+    }
+
+    fn process_checkpoint_batch(
+        parquet_handler: Arc<dyn ParquetHandler>,
+        log_root: Url,
+        batch: Box<dyn EngineData>,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> {
+        let mut visitor = SidecarVisitor::default();
+
+        // Collect sidecars
+        visitor.visit_rows_of(batch.as_ref())?;
+
+        // If there are no sidecars, return the batch as is
+        if visitor.sidecars.is_empty() {
+            return Ok(Left(std::iter::once(Ok(batch))));
+        }
+
+        // Convert sidecar actions to sidecar file paths
+        let sidecar_files: Result<Vec<_>, _> = visitor
+            .sidecars
+            .iter()
+            .map(|sidecar| Self::sidecar_to_filemeta(sidecar, &log_root))
+            .collect();
+
+        let sidecar_read_schema = get_log_add_schema().clone();
+
+        // If sidecars files exist, read the sidecar files and return the iterator of sidecar batches
+        // to replace the checkpoint batch in the top level iterator
+        Ok(Right(parquet_handler.read_parquet_files(
+            &sidecar_files?,
+            sidecar_read_schema,
+            None,
+        )?))
+    }
+
+    // Helper function to read checkpoint files based on the file type
+    fn read_checkpoint_files(
+        engine: &dyn Engine,
+        checkpoint_parts: Vec<FileMeta>,
+        schema: SchemaRef,
+        predicate: Option<ExpressionRef>,
+        is_json: bool,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        if is_json {
+            engine
+                .get_json_handler()
+                .read_json_files(&checkpoint_parts, schema, predicate)
+        } else {
+            engine
+                .get_parquet_handler()
+                .read_parquet_files(&checkpoint_parts, schema, predicate)
+        }
+    }
+
+    // Helper function to convert a single sidecar action to a FileMeta
+    fn sidecar_to_filemeta(sidecar: &Sidecar, log_root: &Url) -> Result<FileMeta, Error> {
+        let location = log_root.join("_sidecars/")?.join(&sidecar.path)?;
+        Ok(FileMeta {
+            location,
+            last_modified: sidecar.modification_time,
+            size: sidecar.size_in_bytes as usize,
+        })
     }
 
     // Get the most up-to-date Protocol and Metadata actions
