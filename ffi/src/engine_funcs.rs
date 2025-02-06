@@ -139,6 +139,10 @@ fn read_parquet_file_impl(
 #[handle_descriptor(target=dyn ExpressionEvaluator, mutable=false)]
 pub struct SharedExpressionEvaluator;
 
+/// Get the evaluator as provided by the passed engines `ExpressionHandler`.
+///
+/// # Safety
+/// Caller is responsible for calling with a valid `Engine`, `Expression`, and `SharedSchema`s
 #[no_mangle]
 pub unsafe extern "C" fn get_evaluator(
     engine: Handle<SharedExternEngine>,
@@ -178,7 +182,10 @@ pub unsafe extern "C" fn free_evaluator(evaluator: Handle<SharedExpressionEvalua
     evaluator.drop_handle();
 }
 
-
+/// Use the passed `evaluator` to evaluate its expression against the passed `batch` data.
+///
+/// # Safety
+/// Caller is responsible for calling with a valid `Engine`, `ExclusiveEngineData`, and `Evaluator`
 #[no_mangle]
 pub unsafe extern "C" fn evaluate(
     engine: Handle<SharedExternEngine>,
