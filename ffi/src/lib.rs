@@ -462,7 +462,8 @@ pub unsafe extern "C" fn set_builder_option(
 }
 
 /// Consume the builder and return a `default` engine. After calling, the passed pointer is _no
-/// longer valid_.
+/// longer valid_. Note that this _consumes_ and frees the builder, so there is no need to
+/// drop/free it afterwards.
 ///
 ///
 /// # Safety
