@@ -108,7 +108,7 @@ fn build_log_with_paths_and_checkpoint(
 }
 
 #[test]
-fn build_snapshot_with_unsupported_uuid_checkpoint() {
+fn build_snapshot_with_uuid_checkpoint() {
     let (client, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -129,10 +129,10 @@ fn build_snapshot_with_unsupported_uuid_checkpoint() {
     let checkpoint_parts = log_segment.checkpoint_parts;
 
     assert_eq!(checkpoint_parts.len(), 1);
-    assert_eq!(checkpoint_parts[0].version, 3);
+    assert_eq!(checkpoint_parts[0].version, 5);
 
     let versions = commit_files.into_iter().map(|x| x.version).collect_vec();
-    let expected_versions = vec![4, 5, 6, 7];
+    let expected_versions = vec![6, 7];
     assert_eq!(versions, expected_versions);
 }
 

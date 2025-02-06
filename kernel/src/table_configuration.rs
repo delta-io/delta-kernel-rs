@@ -262,8 +262,8 @@ mod test {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::V2Checkpoint]),
-            Some([WriterFeatures::V2Checkpoint]),
+            Some([ReaderFeatures::UnsupportedFeature]),
+            Some([WriterFeatures::UnsupportedFeature]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();

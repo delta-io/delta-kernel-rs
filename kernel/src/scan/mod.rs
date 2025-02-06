@@ -11,7 +11,7 @@ use url::Url;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{get_log_add_schema, get_log_schema, ADD_NAME, REMOVE_NAME};
+use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, ExpressionTransform, Scalar};
 use crate::predicates::{DefaultPredicateEvaluator, EmptyColumnResolver};
 use crate::scan::state::{DvInfo, Stats};
@@ -428,7 +428,7 @@ impl Scan {
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
         let commit_read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?;
-        let checkpoint_read_schema = get_log_add_schema().clone();
+        let checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.

@@ -286,6 +286,10 @@ impl StructType {
         self.fields.values()
     }
 
+    pub fn contains(&self, name: impl AsRef<str>) -> bool {
+        self.fields.contains_key(name.as_ref())
+    }
+
     /// Extracts the name and type of all leaf columns, in schema order. Caller should pass Some
     /// `own_name` if this schema is embedded in a larger struct (e.g. `add.*`) and None if the
     /// schema is a top-level result (e.g. `*`).
