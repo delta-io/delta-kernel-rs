@@ -40,6 +40,7 @@ chrono = { version = "0.4" }
 fix-hidden-lifetime-bug = "0.2"
 indexmap = "2.5.0"
 itertools = "0.13"
+paste = "1.0"
 roaring = "0.10.6"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
@@ -159,7 +160,6 @@ rustc_version = "0.4.1"
 arrow = { workspace = true, features = ["json", "prettyprint"] }
 delta_kernel = { path = ".", features = ["default-engine", "sync-engine"] }
 test_utils = { path = "../test-utils" }
-paste = "1.0"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 tempfile = "3"
 tar = "0.4"
