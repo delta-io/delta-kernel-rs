@@ -246,6 +246,126 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_create_one_top_level_null() {
+        let values = &[Scalar::Null(DeltaDataTypes::INTEGER)];
+
+        let schema = Arc::new(StructType::new([StructField::not_null(
+            "col_1",
+            DeltaDataTypes::INTEGER,
+        )]));
+        let expected =
+            StructArray::new_null(vec![Field::new("col_1", DataType::Int32, false)].into(), 1);
+        assert_single_row_transform(values, schema, Ok(expected));
+
+        let schema = Arc::new(StructType::new([StructField::nullable(
+            "col_1",
+            DeltaDataTypes::INTEGER,
+        )]));
+        let expected = StructArray::from(vec![(
+            Arc::new(Field::new("col_1", DataType::Int32, true)),
+            create_array!(Int32, [None]) as ArrayRef,
+        )]);
+        assert_single_row_transform(values, schema, Ok(expected));
+    }
+
+    #[test]
+    fn test_create_one_missing_values() {
+        let values = &[1.into()];
+        let schema = Arc::new(StructType::new([
+            StructField::nullable("col_1", DeltaDataTypes::INTEGER),
+            StructField::nullable("col_2", DeltaDataTypes::INTEGER),
+        ]));
+        assert_single_row_transform(values, schema, Err(()));
+    }
+
+    #[test]
+    fn test_create_one_extra_values() {
+        let values = &[1.into(), 2.into(), 3.into()];
+        let schema = Arc::new(StructType::new([
+            StructField::nullable("col_1", DeltaDataTypes::INTEGER),
+            StructField::nullable("col_2", DeltaDataTypes::INTEGER),
+        ]));
+        assert_single_row_transform(values, schema, Err(()));
+    }
+
+    #[test]
+    fn test_create_one_incorrect_schema() {
+        let values = &["a".into()];
+        let schema = Arc::new(StructType::new([StructField::nullable(
+            "col_1",
+            DeltaDataTypes::INTEGER,
+        )]));
+        assert_single_row_transform(values, schema, Err(()));
+    }
+
+    // useful test to make sure that we correctly process the stack
+    #[test]
+    fn test_many_structs() {
+        let values: &[Scalar] = &[1.into(), 2.into(), 3.into(), 4.into()];
+        let schema = Arc::new(StructType::new([
+            StructField::nullable(
+                "x",
+                DeltaDataTypes::struct_type([
+                    StructField::not_null("a", DeltaDataTypes::INTEGER),
+                    StructField::nullable("b", DeltaDataTypes::INTEGER),
+                ]),
+            ),
+            StructField::nullable(
+                "y",
+                DeltaDataTypes::struct_type([
+                    StructField::not_null("c", DeltaDataTypes::INTEGER),
+                    StructField::nullable("d", DeltaDataTypes::INTEGER),
+                ]),
+            ),
+        ]));
+        let struct_fields_1 = vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, true),
+        ];
+        let struct_fields_2 = vec![
+            Field::new("c", DataType::Int32, false),
+            Field::new("d", DataType::Int32, true),
+        ];
+        let expected = StructArray::from(vec![
+            (
+                Arc::new(Field::new(
+                    "x",
+                    DataType::Struct(struct_fields_1.clone().into()),
+                    true,
+                )),
+                Arc::new(StructArray::from(vec![
+                    (
+                        Arc::new(struct_fields_1[0].clone()),
+                        create_array!(Int32, [1]) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(struct_fields_1[1].clone()),
+                        create_array!(Int32, [2]) as ArrayRef,
+                    ),
+                ])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new(
+                    "y",
+                    DataType::Struct(struct_fields_2.clone().into()),
+                    true,
+                )),
+                Arc::new(StructArray::from(vec![
+                    (
+                        Arc::new(struct_fields_2[0].clone()),
+                        create_array!(Int32, [3]) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(struct_fields_2[1].clone()),
+                        create_array!(Int32, [4]) as ArrayRef,
+                    ),
+                ])) as ArrayRef,
+            ),
+        ]);
+        assert_single_row_transform(values, schema, Ok(expected));
+    }
+
     #[derive(Clone, Copy)]
     struct TestSchema {
         x_nullable: bool,

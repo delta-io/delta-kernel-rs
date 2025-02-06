@@ -592,7 +592,7 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
 mod tests {
     use std::ops::{Add, Div, Mul, Sub};
 
-    use arrow_array::{create_array, record_batch, GenericStringArray, Int32Array};
+    use arrow_array::{create_array, GenericStringArray, Int32Array};
     use arrow_buffer::ScalarBuffer;
     use arrow_schema::{DataType, Field, Fields, Schema};
 
@@ -915,30 +915,26 @@ mod tests {
         let schema = Arc::new(StructType::new([
             StructField::nullable("a", DeltaDataTypes::INTEGER),
             StructField::nullable("b", DeltaDataTypes::STRING),
-            StructField::nullable("c", DeltaDataTypes::INTEGER),
+            StructField::not_null("c", DeltaDataTypes::INTEGER),
             StructField::nullable("d", DeltaDataTypes::INTEGER),
         ]));
 
-        let expected = record_batch!(
-            ("a", Int32, [1]),
-            ("b", Utf8, ["B"]),
-            ("c", Int32, [3]),
-            ("d", Int32, [None])
+        let expected_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("c", DataType::Int32, false),
+            Field::new("d", DataType::Int32, true),
+        ]));
+        let expected = RecordBatch::try_new(
+            expected_schema,
+            vec![
+                create_array!(Int32, [1]),
+                create_array!(Utf8, ["B"]),
+                create_array!(Int32, [3]),
+                create_array!(Int32, [None]),
+            ],
         )
         .unwrap();
-        assert_create_one(values, schema, expected.into());
-    }
-
-    #[test]
-    fn test_create_one_non_null() {
-        let values: &[Scalar] = &[1.into()];
-        let schema = Arc::new(StructType::new([StructField::not_null(
-            "a",
-            DeltaDataTypes::INTEGER,
-        )]));
-        let expected_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let expected =
-            RecordBatch::try_new(expected_schema, vec![create_array!(Int32, [1])]).unwrap();
         assert_create_one(values, schema, expected);
     }
 
@@ -1018,113 +1014,6 @@ mod tests {
         assert_create_one(values, schema, expected);
     }
 
-    // critical case: struct(x) [nullable] with (a [non-null], b [nullable]) fields.
-    // for scalars (null, null) the _only_ solution here is struct(x) is null struct (not two null
-    // leaves)
-    //
-    // vs. if a and b are both nullable, we just leave them as null and the struct is non-null
-    //
-    // thus, we trigger the 'nullable struct' case only if it is required.
-    #[test]
-    fn test_create_one_null_struct() {
-        let values: &[Scalar] = &[
-            1.into(), // need an int here so everything doesn't collapse into only one null struct
-            Scalar::Null(DeltaDataTypes::INTEGER),
-            Scalar::Null(DeltaDataTypes::INTEGER),
-        ];
-        let schema = Arc::new(StructType::new([
-            StructField::nullable("a", DeltaDataTypes::INTEGER),
-            StructField::nullable(
-                "x",
-                DeltaDataTypes::struct_type([
-                    StructField::not_null("b", DeltaDataTypes::INTEGER),
-                    StructField::nullable("c", DeltaDataTypes::INTEGER),
-                ]),
-            ),
-        ]));
-        let struct_fields = vec![
-            Field::new("b", DataType::Int32, false),
-            Field::new("c", DataType::Int32, true),
-        ];
-        let expected_schema = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int32, true),
-            Field::new("x", DataType::Struct(struct_fields.clone().into()), true),
-        ]));
-        let expected = RecordBatch::try_new(
-            expected_schema,
-            vec![
-                Arc::new(Int32Array::from(vec![1])),
-                Arc::new(StructArray::new_null(struct_fields.into(), 1)),
-            ],
-        )
-        .unwrap();
-        assert_create_one(values, schema.clone(), expected);
-
-        let err_values: &[Scalar] = &[Scalar::Null(DeltaDataTypes::INTEGER), 1.into()];
-        let handler = ArrowExpressionHandler;
-        assert!(handler.create_one(schema, err_values).is_err()); // FIXME
-    }
-
-    #[test]
-    fn test_create_one_many_structs() {
-        let values: &[Scalar] = &[1.into(), 2.into(), 3.into(), 4.into()];
-        let schema = Arc::new(StructType::new([
-            StructField::nullable(
-                "x",
-                DeltaDataTypes::struct_type([
-                    StructField::not_null("a", DeltaDataTypes::INTEGER),
-                    StructField::nullable("b", DeltaDataTypes::INTEGER),
-                ]),
-            ),
-            StructField::nullable(
-                "y",
-                DeltaDataTypes::struct_type([
-                    StructField::not_null("c", DeltaDataTypes::INTEGER),
-                    StructField::nullable("d", DeltaDataTypes::INTEGER),
-                ]),
-            ),
-        ]));
-        let struct_fields_1 = vec![
-            Field::new("a", DataType::Int32, false),
-            Field::new("b", DataType::Int32, true),
-        ];
-        let struct_fields_2 = vec![
-            Field::new("c", DataType::Int32, false),
-            Field::new("d", DataType::Int32, true),
-        ];
-        let expected_schema = Arc::new(Schema::new(vec![
-            Field::new("x", DataType::Struct(struct_fields_1.clone().into()), true),
-            Field::new("y", DataType::Struct(struct_fields_2.clone().into()), true),
-        ]));
-        let expected = RecordBatch::try_new(
-            expected_schema,
-            vec![
-                Arc::new(StructArray::from(vec![
-                    (
-                        Arc::new(Field::new("a", DataType::Int32, false)),
-                        create_array!(Int32, [1]) as ArrayRef,
-                    ),
-                    (
-                        Arc::new(Field::new("b", DataType::Int32, true)),
-                        create_array!(Int32, [2]) as ArrayRef,
-                    ),
-                ])),
-                Arc::new(StructArray::from(vec![
-                    (
-                        Arc::new(Field::new("c", DataType::Int32, false)),
-                        create_array!(Int32, [3]) as ArrayRef,
-                    ),
-                    (
-                        Arc::new(Field::new("d", DataType::Int32, true)),
-                        create_array!(Int32, [4]) as ArrayRef,
-                    ),
-                ])),
-            ],
-        )
-        .unwrap();
-        assert_create_one(values, schema.clone(), expected);
-    }
-
     #[test]
     fn test_create_one_not_null_struct() {
         let values: &[Scalar] = &[
@@ -1139,19 +1028,7 @@ mod tests {
             ]),
         )]));
         let handler = ArrowExpressionHandler;
-        assert!(handler.create_one(schema, values).is_err()); // FIXME
-    }
-
-    #[test]
-    fn test_create_one_incorrect_schema() {
-        let values = &["a".into()];
-        let schema = Arc::new(StructType::new([StructField::nullable(
-            "col_1",
-            DeltaDataTypes::INTEGER,
-        )]));
-
-        let handler = ArrowExpressionHandler;
-        matches!(handler.create_one(schema, values), Err(Error::Generic(_)));
+        assert!(handler.create_one(schema, values).is_err());
     }
 
     #[test]
@@ -1163,36 +1040,9 @@ mod tests {
             "col_1",
             DeltaDataTypes::INTEGER,
         )]));
-        matches!(handler.create_one(schema, values), Err(Error::Arrow(_)));
-
-        let schema = Arc::new(StructType::new([StructField::nullable(
-            "col_1",
-            DeltaDataTypes::INTEGER,
-        )]));
-        matches!(handler.create_one(schema, values), Err(Error::Arrow(_)));
-    }
-
-    #[test]
-    fn test_create_one_missing_values() {
-        let values = &[1.into()];
-        let schema = Arc::new(StructType::new([
-            StructField::nullable("col_1", DeltaDataTypes::INTEGER),
-            StructField::nullable("col_2", DeltaDataTypes::INTEGER),
-        ]));
-
-        let handler = ArrowExpressionHandler;
-        matches!(handler.create_one(schema, values), Err(Error::Generic(_)));
-    }
-
-    #[test]
-    fn test_create_one_extra_values() {
-        let values = &[1.into(), 2.into(), 3.into()];
-        let schema = Arc::new(StructType::new([
-            StructField::nullable("col_1", DeltaDataTypes::INTEGER),
-            StructField::nullable("col_2", DeltaDataTypes::INTEGER),
-        ]));
-
-        let handler = ArrowExpressionHandler;
-        assert!(handler.create_one(schema, values).is_err());
+        assert!(matches!(
+            handler.create_one(schema, values),
+            Err(Error::Generic(_))
+        ));
     }
 }
