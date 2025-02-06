@@ -239,6 +239,16 @@ impl LogSegment {
         Ok(commit_stream.chain(checkpoint_stream))
     }
 
+    /// Returns an iterator over checkpoint data, processing sidecar files when necessary.
+    ///
+    /// Checkpoint data is returned directly if:
+    /// - Processing multi-part checkpoints
+    /// - Schema doesn't contain file actions
+    ///
+    /// For single-part checkpoints, any referenced sidecar files are processed. These
+    /// sidecar files contain the actual add/remove actions that would otherwise be
+    /// stored directly in the checkpoint, providing a more efficient storage mechanism
+    /// for large change sets.
     fn create_checkpoint_stream(
         &self,
         engine: &dyn Engine,
@@ -251,8 +261,17 @@ impl LogSegment {
             !checkpoint_parts.is_empty(),
             Error::generic("Checkpoint parts should not be empty")
         );
-        let is_json_checkpoint = checkpoint_parts[0].location.path().ends_with(".json");
 
+        let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
+            && checkpoint_read_schema.contains(SIDECAR_NAME);
+        require!(
+            !need_file_actions || checkpoint_read_schema.contains(SIDECAR_NAME),
+            Error::generic(
+                "If the checkpoint read schema contains file actions, it must contain the sidecar column"
+            )
+        );
+
+        let is_json_checkpoint = checkpoint_parts[0].location.path().ends_with(".json");
         let actions = Self::read_checkpoint_files(
             engine,
             checkpoint_parts,
@@ -261,51 +280,39 @@ impl LogSegment {
             is_json_checkpoint,
         )?;
 
-        let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
-            && checkpoint_read_schema.contains(SIDECAR_NAME);
+        // 1. In the case where the schema does not contain add/remove actions, we return the checkpoint
+        // batch directly as sidecar files only have to be read when the schema contains add/remove actions.
+        // 2. Multi-part checkpoint batches never have sidecar actions, so the batch is returned as-is.
+        if !need_file_actions || self.checkpoint_parts.len() > 1 {
+            return Ok(Left(actions.map_ok(|batch| (batch, false))));
+        }
 
-        require!(
-            !(need_file_actions && !checkpoint_read_schema.contains(SIDECAR_NAME)),
-            Error::generic(
-                "If the checkpoint read schema contains file actions, it must contain the sidecar column"
-            )
-        );
-
-        let is_multi_part_checkpoint = self.checkpoint_parts.len() > 1; //maybe not self?
         let log_root = self.log_root.clone();
         let parquet_handler = engine.get_parquet_handler().clone();
 
-        // If the schema does not contain add/remove actions (e.g., metadata-only replay),
-        // then we return the checkpoint batch directly.
-        // - Multi-part checkpoints never have sidecar actions, so they are returned as-is.
-        // - Otherwise, we check for sidecar references and replace checkpoint batches accordingly.
-        let checkpoint_stream = if need_file_actions && !is_multi_part_checkpoint {
-            Left(
-                actions
-                    // Flatten the new batches returned. The new batches could be:
-                    // - the checkpoint batch itself if no sidecar actions are present in the batch
-                    // - 1 or more sidecar batches referenced in the checkpoint batch by sidecar actions
-                    .flat_map(move |batch_result| match batch_result {
-                        Ok(checkpoint_batch) => Right(
-                            Self::process_checkpoint_batch(
-                                parquet_handler.clone(),
-                                log_root.clone(),
-                                checkpoint_batch,
-                            )
-                            .map_or_else(|e| Left(std::iter::once(Err(e))), Right)
-                            .map_ok(|batch| (batch, false)),
-                        ),
-                        Err(e) => Left(std::iter::once(Err(e))),
-                    }),
-            )
-        } else {
-            Right(actions.map_ok(|batch| (batch, false)))
-        };
-
-        Ok(checkpoint_stream)
+        // Process checkpoint batches with potential sidecar file references that need to be read
+        // to extract add/remove actions from the sidecar files.
+        Ok(Right(
+            actions
+                // Flatten the new batches returned. The new batches could be:
+                // - the checkpoint batch itself if no sidecar actions are present in the batch
+                // - one or more sidecar batches read from the sidecar files if sidecar actions are present
+                .flat_map(move |batch_result| match batch_result {
+                    Ok(checkpoint_batch) => Right(
+                        Self::process_single_checkpoint_batch(
+                            parquet_handler.clone(),
+                            log_root.clone(),
+                            checkpoint_batch,
+                        )
+                        .map_or_else(|e| Left(std::iter::once(Err(e))), Right)
+                        .map_ok(|batch| (batch, false)),
+                    ),
+                    Err(e) => Left(std::iter::once(Err(e))),
+                }),
+        ))
     }
 
-    fn process_checkpoint_batch(
+    fn process_single_checkpoint_batch(
         parquet_handler: Arc<dyn ParquetHandler>,
         log_root: Url,
         batch: Box<dyn EngineData>,
