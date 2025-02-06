@@ -1,6 +1,6 @@
-use arrow::compute::filter_record_batch;
-use arrow::record_batch::RecordBatch;
-use arrow::util::pretty::pretty_format_batches;
+use delta_kernel::arrow::compute::filter_record_batch;
+use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use itertools::Itertools;
 
 use crate::ArrowEngineData;
@@ -24,7 +24,7 @@ macro_rules! sort_lines {
 #[macro_export]
 macro_rules! assert_batches_sorted_eq {
     ($expected_lines_sorted: expr, $CHUNKS: expr) => {
-        let formatted = arrow::util::pretty::pretty_format_batches($CHUNKS)
+        let formatted = delta_kernel::arrow::util::pretty::pretty_format_batches($CHUNKS)
             .unwrap()
             .to_string();
         // fix for windows: \r\n -->

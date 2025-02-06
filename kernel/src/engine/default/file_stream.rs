@@ -5,8 +5,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
-use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef as ArrowSchemaRef;
+use crate::arrow::array::RecordBatch;
+use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use futures::FutureExt;

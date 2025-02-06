@@ -3,23 +3,23 @@
 //! Data (golden tables) are stored in tests/golden_data/<table_name>.tar.zst
 //! Each table directory has a table/ and expected/ subdirectory with the input/output respectively
 
-use arrow::array::AsArray;
-use arrow::{compute::filter_record_batch, record_batch::RecordBatch};
-use arrow_ord::sort::{lexsort_to_indices, SortColumn};
-use arrow_schema::{FieldRef, Schema};
-use arrow_select::{concat::concat_batches, take::take};
+use delta_kernel::arrow::array::{Array, AsArray, StructArray};
+use delta_kernel::arrow::compute::{concat_batches, take};
+use delta_kernel::arrow::compute::{lexsort_to_indices, SortColumn};
+use delta_kernel::arrow::datatypes::{DataType, FieldRef, Schema};
+use delta_kernel::arrow::{compute::filter_record_batch, record_batch::RecordBatch};
 use itertools::Itertools;
 use paste::paste;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use delta_kernel::parquet::arrow::async_reader::{
+    ParquetObjectReader, ParquetRecordBatchStreamBuilder,
+};
 use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Table};
 use futures::{stream::TryStreamExt, StreamExt};
 use object_store::{local::LocalFileSystem, ObjectStore};
-use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 
-use arrow_array::{Array, StructArray};
-use arrow_schema::DataType;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 

@@ -5,7 +5,7 @@ use std::{
     ops::Deref,
 };
 
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
+use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use itertools::Itertools;
 
 use crate::{
@@ -256,7 +256,7 @@ fn metadata_eq(
 
 #[cfg(test)]
 mod tests {
-    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
 
     use crate::{
         engine::ensure_data_types::ensure_data_types,
@@ -276,8 +276,8 @@ mod tests {
         assert!(can_upcast_to_decimal(&Decimal128(5, 1), 6u8, 2i8));
         assert!(can_upcast_to_decimal(
             &Decimal128(10, 5),
-            arrow_schema::DECIMAL128_MAX_PRECISION,
-            arrow_schema::DECIMAL128_MAX_SCALE - 5
+            crate::arrow::datatypes::DECIMAL128_MAX_PRECISION,
+            crate::arrow::datatypes::DECIMAL128_MAX_SCALE - 5
         ));
 
         assert!(can_upcast_to_decimal(&Int8, 3u8, 0i8));

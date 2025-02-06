@@ -1,7 +1,7 @@
 use std::{error, sync::Arc};
 
-use arrow::compute::filter_record_batch;
-use arrow_array::RecordBatch;
+use delta_kernel::arrow::array::RecordBatch;
+use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::engine::sync::SyncEngine;
 use itertools::Itertools;
 
