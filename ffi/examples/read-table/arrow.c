@@ -110,24 +110,29 @@ static GArrowBooleanArray* slice_to_arrow_bool_array(const KernelBoolSlice slice
 static ExclusiveEngineData* apply_transform(
   struct EngineContext* context,
   ExclusiveEngineData* data) {
-  print_diag("  Applying transform\n");
-  SharedExpressionEvaluator* evaluator = get_evaluator(
-    context->engine,
-    context->read_schema, // input schema
-    context->arrow_context->cur_transform,
-    context->logical_schema); // output schema
-  ExternResultHandleExclusiveEngineData transformed_res = evaluate(
-    context->engine,
-    &data,
-    evaluator);
-  if (transformed_res.tag != OkHandleExclusiveEngineData) {
-    print_error("Failed to transform read data.", (Error*)transformed_res.err);
-    free_error((Error*)transformed_res.err);
-    return NULL;
+  if (!context->arrow_context->cur_transform) {
+    print_diag("  No transform needed");
+    return data;
+  } else {
+    print_diag("  Applying transform\n");
+    SharedExpressionEvaluator* evaluator = get_evaluator(
+      context->engine,
+      context->read_schema, // input schema
+      context->arrow_context->cur_transform,
+      context->logical_schema); // output schema
+    ExternResultHandleExclusiveEngineData transformed_res = evaluate(
+      context->engine,
+      &data,
+      evaluator);
+    if (transformed_res.tag != OkHandleExclusiveEngineData) {
+      print_error("Failed to transform read data.", (Error*)transformed_res.err);
+      free_error((Error*)transformed_res.err);
+      return NULL;
+    }
+    free_engine_data(data);
+    free_evaluator(evaluator);
+    return transformed_res.ok;
   }
-  free_engine_data(data);
-  free_evaluator(evaluator);
-  return transformed_res.ok;
 }
 
 // This is the callback that will be called for each chunk of data read from the parquet file

@@ -331,11 +331,11 @@ pub struct CTransforms {
 /// # Safety
 ///
 /// The engine is responsible for providing a valid [`CTransformMap`] pointer
-pub unsafe extern "C" fn get_from_transform_map(
-    transform_map: &CTransformMap,
+pub unsafe extern "C" fn get_transform_for_row(
     row: usize,
+    transforms: &CTransforms,
 ) -> Handle<SharedExpression> {
-    if let Some(transform) = transform_map.transforms.get(&row).cloned() {
+    if let Some(transform) = transforms.transforms.get(row).cloned().flatten() {
         transform.into()
     } else {
         panic!("Hrmm");
