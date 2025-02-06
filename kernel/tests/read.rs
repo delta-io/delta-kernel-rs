@@ -11,8 +11,8 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{column_expr, BinaryOperator, Expression, ExpressionRef};
-use delta_kernel::scan::state::{visit_scan_files, DvInfo, Stats};
-use delta_kernel::scan::{transform_to_logical, Scan};
+use delta_kernel::scan::state::{transform_to_logical, visit_scan_files, DvInfo, Stats};
+use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, Schema};
 use delta_kernel::{Engine, FileMeta, Table};
 use object_store::{memory::InMemory, path::Path, ObjectStore};
@@ -339,7 +339,7 @@ struct ScanFile {
     path: String,
     size: i64,
     dv_info: DvInfo,
-    partition_values: HashMap<String, String>,
+    transform: Option<ExpressionRef>,
 }
 
 fn scan_data_callback(
@@ -348,14 +348,14 @@ fn scan_data_callback(
     size: i64,
     _stats: Option<Stats>,
     dv_info: DvInfo,
-    _transforms: Option<ExpressionRef>,
-    partition_values: HashMap<String, String>,
+    transform: Option<ExpressionRef>,
+    _: HashMap<String, String>,
 ) {
     batches.push(ScanFile {
         path: path.to_string(),
         size,
         dv_info,
-        partition_values,
+        transform,
     });
 }
 
@@ -404,16 +404,15 @@ fn read_with_scan_data(
         for read_result in read_results {
             let read_result = read_result.unwrap();
             let len = read_result.len();
-
-            // ask the kernel to transform the physical data into the correct logical form
+            // to transform the physical data into the correct logical form
             let logical = transform_to_logical(
                 engine,
                 read_result,
-                &global_state,
-                &scan_file.partition_values,
+                &global_state.physical_schema,
+                &global_state.logical_schema,
+                &scan_file.transform,
             )
             .unwrap();
-
             let record_batch = to_arrow(logical).unwrap();
             let rest = split_vector(selection_vector.as_mut(), len, Some(true));
             let batch = if let Some(mask) = selection_vector.clone() {

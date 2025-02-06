@@ -445,7 +445,6 @@ impl Scan {
             partition_columns: self.snapshot.metadata().partition_columns.clone(),
             logical_schema: self.logical_schema.clone(),
             physical_schema: self.physical_schema.clone(),
-            column_mapping_mode: self.snapshot.column_mapping_mode(),
         }
     }
 
@@ -465,7 +464,7 @@ impl Scan {
             path: String,
             size: i64,
             dv_info: DvInfo,
-            partition_values: HashMap<String, String>,
+            transform: Option<ExpressionRef>,
         }
         fn scan_data_callback(
             batches: &mut Vec<ScanFile>,
@@ -473,14 +472,14 @@ impl Scan {
             size: i64,
             _: Option<Stats>,
             dv_info: DvInfo,
-            _transform: Option<ExpressionRef>,
-            partition_values: HashMap<String, String>,
+            transform: Option<ExpressionRef>,
+            _: HashMap<String, String>,
         ) {
             batches.push(ScanFile {
                 path: path.to_string(),
                 size,
                 dv_info,
-                partition_values,
+                transform,
             });
         }
 
@@ -492,8 +491,6 @@ impl Scan {
         let global_state = Arc::new(self.global_scan_state());
         let table_root = self.snapshot.table_root().clone();
         let physical_predicate = self.physical_predicate();
-        let all_fields = self.all_fields.clone();
-        let have_partition_cols = self.have_partition_cols;
 
         let scan_data = self.scan_data(engine.as_ref())?;
         let scan_files_iter = scan_data
@@ -537,17 +534,15 @@ impl Scan {
                 // Arc clones
                 let engine = engine.clone();
                 let global_state = global_state.clone();
-                let all_fields = all_fields.clone();
                 Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
                     let read_result = read_result?;
-                    // to transform the physical data into the correct logical form
-                    let logical = transform_to_logical_internal(
+                    // transform the physical data into the correct logical form
+                    let logical = state::transform_to_logical(
                         engine.as_ref(),
                         read_result,
-                        &global_state,
-                        &scan_file.partition_values,
-                        &all_fields,
-                        have_partition_cols,
+                        &global_state.physical_schema,
+                        &global_state.logical_schema,
+                        &scan_file.transform,
                     );
                     let len = logical.as_ref().map_or(0, |res| res.len());
                     // need to split the dv_mask. what's left in dv_mask covers this result, and rest
@@ -663,73 +658,6 @@ pub fn selection_vector(
     let fs_client = engine.get_file_system_client();
     let dv_treemap = descriptor.read(fs_client, table_root)?;
     Ok(deletion_treemap_to_bools(dv_treemap))
-}
-
-/// Transform the raw data read from parquet into the correct logical form, based on the provided
-/// global scan state and partition values
-pub fn transform_to_logical(
-    engine: &dyn Engine,
-    data: Box<dyn EngineData>,
-    global_state: &GlobalScanState,
-    partition_values: &HashMap<String, String>,
-) -> DeltaResult<Box<dyn EngineData>> {
-    let state_info = get_state_info(
-        &global_state.logical_schema,
-        &global_state.partition_columns,
-    )?;
-    transform_to_logical_internal(
-        engine,
-        data,
-        global_state,
-        partition_values,
-        &state_info.all_fields,
-        state_info.have_partition_cols,
-    )
-}
-
-// We have this function because `execute` can save `all_fields` and `have_partition_cols` in the
-// scan, and then reuse them for each batch transform
-fn transform_to_logical_internal(
-    engine: &dyn Engine,
-    data: Box<dyn EngineData>,
-    global_state: &GlobalScanState,
-    partition_values: &std::collections::HashMap<String, String>,
-    all_fields: &[ColumnType],
-    have_partition_cols: bool,
-) -> DeltaResult<Box<dyn EngineData>> {
-    let physical_schema = global_state.physical_schema.clone();
-    if !have_partition_cols && global_state.column_mapping_mode == ColumnMappingMode::None {
-        return Ok(data);
-    }
-    // need to add back partition cols and/or fix-up mapped columns
-    let all_fields = all_fields
-        .iter()
-        .map(|field| match field {
-            ColumnType::Partition(field_idx) => {
-                let field = global_state.logical_schema.fields.get_index(*field_idx);
-                let Some((_, field)) = field else {
-                    return Err(Error::generic(
-                        "logical schema did not contain expected field, can't transform data",
-                    ));
-                };
-                let name = field.physical_name();
-                let value_expression =
-                    parse_partition_value(partition_values.get(name), field.data_type())?;
-                Ok(value_expression.into())
-            }
-            ColumnType::Selected(field_name) => Ok(ColumnName::new([field_name]).into()),
-        })
-        .try_collect()?;
-    let read_expression = Expression::Struct(all_fields);
-    let result = engine
-        .get_expression_handler()
-        .get_evaluator(
-            physical_schema,
-            read_expression,
-            global_state.logical_schema.clone().into(),
-        )
-        .evaluate(data.as_ref())?;
-    Ok(result)
 }
 
 // some utils that are used in file_stream.rs and state.rs tests
