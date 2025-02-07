@@ -106,6 +106,8 @@ pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef};
 pub use table::Table;
 
+use expressions::Scalar;
+
 #[cfg(any(
     feature = "default-engine",
     feature = "sync-engine",
@@ -338,6 +340,12 @@ pub trait ExpressionHandler: AsAny {
         expression: Expression,
         output_type: DataType,
     ) -> Arc<dyn ExpressionEvaluator>;
+
+    /// Create a single-row [`EngineData`] by applying the given schema to the leaf-values given in
+    /// `values`.
+    // Note: we will stick with a Schema instead of DataType (more constrained can expand in
+    // future)
+    fn create_one(&self, schema: SchemaRef, values: &[Scalar]) -> DeltaResult<Box<dyn EngineData>>;
 }
 
 /// Provides file system related functionalities to Delta Kernel.
