@@ -290,6 +290,7 @@ mod tests {
     use crate::{
         actions::{get_log_schema, Metadata, Protocol},
         engine::sync::SyncEngine,
+        table_features::{ReaderFeatures, WriterFeatures},
         DeltaResult, Engine, EngineData,
         table_features::{ReaderFeatures, WriterFeatures}
     };

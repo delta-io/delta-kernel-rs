@@ -2,7 +2,7 @@
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
 use std::collections::{HashMap, HashSet};
-use std::fmt::{Debug };
+use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::LazyLock;
 
