@@ -292,7 +292,6 @@ mod tests {
         engine::sync::SyncEngine,
         table_features::{ReaderFeatures, WriterFeatures},
         DeltaResult, Engine, EngineData,
-        table_features::{ReaderFeatures, WriterFeatures}
     };
 
     use super::ArrowEngineData;
@@ -333,12 +332,15 @@ mod tests {
         ]
         .into();
         let output_schema = get_log_schema().project(&["protocol"])?;
-        let parsed = handler
-            .parse_json(string_array_to_engine_data(json_strings), output_schema)?;
+        let parsed =
+            handler.parse_json(string_array_to_engine_data(json_strings), output_schema)?;
         let protocol = Protocol::try_new_from_data(parsed.as_ref())?.unwrap();
         assert_eq!(protocol.min_reader_version(), 3);
         assert_eq!(protocol.min_writer_version(), 7);
-        assert_eq!(protocol.reader_features(), Some([ReaderFeatures::DeletionVectors].as_slice()));
+        assert_eq!(
+            protocol.reader_features(),
+            Some([ReaderFeatures::DeletionVectors].as_slice())
+        );
         assert_eq!(
             protocol.writer_features(),
             Some([WriterFeatures::Invariants, WriterFeatures::AppendOnly].as_slice())
