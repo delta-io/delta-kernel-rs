@@ -162,6 +162,7 @@ mod tests {
             (ReaderFeatures::TypeWideningPreview, "typeWidening-preview"),
             (ReaderFeatures::V2Checkpoint, "v2Checkpoint"),
             (ReaderFeatures::VacuumProtocolCheck, "vacuumProtocolCheck"),
+            (ReaderFeatures::UnsupportedFeature, "unsupportedFeature"),
         ];
 
         assert_eq!(ReaderFeatures::VARIANTS.len() - 1, cases.len());
@@ -201,6 +202,7 @@ mod tests {
             (WriterFeatures::IcebergCompatV1, "icebergCompatV1"),
             (WriterFeatures::IcebergCompatV2, "icebergCompatV2"),
             (WriterFeatures::VacuumProtocolCheck, "vacuumProtocolCheck"),
+            (WriterFeatures::UnsupportedFeature, "unsupportedFeature"),
         ];
 
         assert_eq!(WriterFeatures::VARIANTS.len() - 1, cases.len());

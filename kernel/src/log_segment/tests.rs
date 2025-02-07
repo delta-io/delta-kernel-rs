@@ -1191,7 +1191,8 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         "sidecarfile2.parquet",
     )?;
 
-    let checkpoint_file_path = log_root
+    let checkpoint_one_file = mock_table
+        .log_root()
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
 
