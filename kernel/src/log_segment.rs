@@ -228,11 +228,11 @@ impl LogSegment {
             Left(None.into_iter())
         } else {
             Right(Self::create_checkpoint_stream(
-                self,
                 engine,
                 checkpoint_read_schema,
                 meta_predicate,
                 checkpoint_parts,
+                self.log_root.clone(),
             )?)
         };
 
@@ -250,11 +250,11 @@ impl LogSegment {
     /// stored directly in the checkpoint, providing a more efficient storage mechanism
     /// for large change sets.
     fn create_checkpoint_stream(
-        &self,
         engine: &dyn Engine,
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<ExpressionRef>,
         checkpoint_parts: Vec<FileMeta>,
+        log_root: Url,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
         // We checked that checkpoint_parts is not empty before calling this function
         require!(
@@ -262,8 +262,7 @@ impl LogSegment {
             Error::generic("Checkpoint parts should not be empty")
         );
 
-        let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
-            && checkpoint_read_schema.contains(SIDECAR_NAME);
+        let need_file_actions = checkpoint_read_schema.contains(ADD_NAME);
         require!(
             !need_file_actions || checkpoint_read_schema.contains(SIDECAR_NAME),
             Error::generic(
@@ -274,7 +273,7 @@ impl LogSegment {
         let is_json_checkpoint = checkpoint_parts[0].location.path().ends_with(".json");
         let actions = Self::read_checkpoint_files(
             engine,
-            checkpoint_parts,
+            checkpoint_parts.clone(),
             checkpoint_read_schema.clone(),
             meta_predicate,
             is_json_checkpoint,
@@ -283,11 +282,10 @@ impl LogSegment {
         // 1. In the case where the schema does not contain add/remove actions, we return the checkpoint
         // batch directly as sidecar files only have to be read when the schema contains add/remove actions.
         // 2. Multi-part checkpoint batches never have sidecar actions, so the batch is returned as-is.
-        if !need_file_actions || self.checkpoint_parts.len() > 1 {
+        if !need_file_actions || checkpoint_parts.len() > 1 {
             return Ok(Left(actions.map_ok(|batch| (batch, false))));
         }
 
-        let log_root = self.log_root.clone();
         let parquet_handler = engine.get_parquet_handler().clone();
 
         // Process checkpoint batches with potential sidecar file references that need to be read
