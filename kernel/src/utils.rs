@@ -155,9 +155,13 @@ pub(crate) mod test_utils {
 
     /// Try to convert an `EngineData` into a `RecordBatch`. Panics if not using `ArrowEngineData` from
     /// the default module
-    pub(crate) fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
+    fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
         ArrowEngineData::try_from_engine_data(engine_data)
             .unwrap()
             .into()
+    }
+
+    pub(crate) fn assert_batch_matches(actual: Box<dyn EngineData>, expected: Box<dyn EngineData>) {
+        assert_eq!(into_record_batch(actual), into_record_batch(expected));
     }
 }
