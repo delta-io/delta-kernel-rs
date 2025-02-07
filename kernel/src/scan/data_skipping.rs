@@ -9,7 +9,7 @@ use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
 use crate::expressions::{
     column_expr, joined_column_expr, BinaryOperator, ColumnName, Expression as Expr, ExpressionRef,
-    Scalar, VariadicOperator,
+    OpaqueOperatorRef, Scalar, VariadicOperator,
 };
 use crate::predicates::{
     DataSkippingPredicateEvaluator, PredicateEvaluator, PredicateEvaluatorDefaults,
@@ -266,5 +266,13 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
             })
             .collect();
         Some(Expr::variadic(op, exprs))
+    }
+
+    fn finish_eval_opaque(
+        &self,
+        _op: &OpaqueOperatorRef,
+        _exprs: impl IntoIterator<Item = Option<Expr>>,
+    ) -> Option<Expr> {
+        None // Not supported
     }
 }

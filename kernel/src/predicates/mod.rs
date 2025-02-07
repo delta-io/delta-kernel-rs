@@ -1,11 +1,13 @@
 use crate::expressions::{
-    BinaryExpression, BinaryOperator, ColumnName, Expression as Expr, Scalar, UnaryExpression,
-    UnaryOperator, VariadicExpression, VariadicOperator,
+    BinaryExpression, BinaryOperator, ColumnName, Expression as Expr, OpaqueExpression,
+    OpaqueOperatorRef, Scalar, UnaryExpression, UnaryOperator, VariadicExpression,
+    VariadicOperator,
 };
 use crate::schema::DataType;
 
+use itertools::Itertools as _;
 use std::cmp::Ordering;
-use tracing::debug;
+use tracing::{debug, warn};
 
 pub(crate) mod parquet_stats_skipping;
 
@@ -127,6 +129,13 @@ pub(crate) trait PredicateEvaluator {
         inverted: bool,
     ) -> Option<Self::Output>;
 
+    /// Completes evaluation of an opaque expression, using already-evaluated input arguments.
+    fn finish_eval_opaque(
+        &self,
+        op: &OpaqueOperatorRef,
+        exprs: impl IntoIterator<Item = Option<Self::Output>>,
+    ) -> Option<Self::Output>;
+
     // ==================== PROVIDED METHODS ====================
 
     /// A (possibly inverted) boolean column access, e.g. `[NOT] <col>`.
@@ -235,6 +244,11 @@ pub(crate) trait PredicateEvaluator {
         self.finish_eval_variadic(op, exprs, inverted)
     }
 
+    /// Dispatches an opaque operation, leveraging each implementation's [`finish_eval_opaque`].
+    fn eval_opaque(&self, op: &OpaqueOperatorRef, exprs: &[Expr]) -> Option<Self::Output> {
+        self.finish_eval_opaque(op, exprs.iter().map(|expr| self.eval(expr)))
+    }
+
     /// Dispatches an expression to the specific implementation for each expression variant.
     ///
     /// NOTE: [`Expression::Struct`] is not supported and always evaluates to `None`.
@@ -249,6 +263,9 @@ pub(crate) trait PredicateEvaluator {
                 self.eval_binary(*op, left, right, inverted)
             }
             Variadic(VariadicExpression { op, exprs }) => self.eval_variadic(*op, exprs, inverted),
+            Opaque(_) if inverted => None, // not supported (we don't know what semantics NOT has)
+            Opaque(OpaqueExpression { op, exprs }) => self.eval_opaque(op, exprs),
+            Unsupported(_) => None, // not supported by definition
         }
     }
 
@@ -415,7 +432,6 @@ pub(crate) trait PredicateEvaluator {
     }
 
     /// A convenient non-inverted wrapper for [`eval_expr`]
-    #[cfg(test)]
     fn eval(&self, expr: &Expr) -> Option<Self::Output> {
         self.eval_expr(expr, false)
     }
@@ -507,6 +523,23 @@ impl PredicateEvaluatorDefaults {
             None => Some(dominator), // (1) short circuit, dominant found
             Some(false) => Some(!dominator),
             Some(true) => None, // (2) null found, dominant not found
+        }
+    }
+
+    /// Finishes evaluating an opaque operation. See [`PredicateEvaluator::finish_eval_opaque`].
+    pub(crate) fn finish_eval_opaque(
+        op: &OpaqueOperatorRef,
+        exprs: impl IntoIterator<Item = Option<bool>>,
+    ) -> Option<bool> {
+        let into_scalar = |o: Option<bool>| o.map(Scalar::from);
+        match op.eval_scalar(&exprs.into_iter().map(into_scalar).collect_vec()) {
+            Ok(Some(Scalar::Boolean(value))) => Some(value),
+            Ok(_) => None, // Either None or Some non-boolean result
+            Err(err) => {
+                // Log the error but otherwise treat it like an unsupported expression
+                warn!("Scalar evaluation of {:?} failed: {err}", op.as_ref());
+                None
+            }
         }
     }
 }
@@ -634,6 +667,14 @@ impl<R: ResolveColumnAsScalar> PredicateEvaluator for DefaultPredicateEvaluator<
     ) -> Option<bool> {
         PredicateEvaluatorDefaults::finish_eval_variadic(op, exprs, inverted)
     }
+
+    fn finish_eval_opaque(
+        &self,
+        op: &OpaqueOperatorRef,
+        exprs: impl IntoIterator<Item = Option<Self::Output>>,
+    ) -> Option<Self::Output> {
+        PredicateEvaluatorDefaults::finish_eval_opaque(op, exprs)
+    }
 }
 
 /// A predicate evaluator that implements data skipping semantics over various column stats. For
@@ -690,6 +731,13 @@ pub(crate) trait DataSkippingPredicateEvaluator {
         op: VariadicOperator,
         exprs: impl IntoIterator<Item = Option<Self::Output>>,
         inverted: bool,
+    ) -> Option<Self::Output>;
+
+    /// See [`PredicateEvaluator::finish_eval_opaque`]
+    fn finish_eval_opaque(
+        &self,
+        op: &OpaqueOperatorRef,
+        exprs: impl IntoIterator<Item = Option<Self::Output>>,
     ) -> Option<Self::Output>;
 
     /// Helper method that performs a (possibly inverted) partial comparison between a typed column
@@ -857,5 +905,13 @@ impl<T: DataSkippingPredicateEvaluator> PredicateEvaluator for T {
         inverted: bool,
     ) -> Option<Self::Output> {
         self.finish_eval_variadic(op, exprs, inverted)
+    }
+
+    fn finish_eval_opaque(
+        &self,
+        op: &OpaqueOperatorRef,
+        exprs: impl IntoIterator<Item = Option<Self::Output>>,
+    ) -> Option<Self::Output> {
+        self.finish_eval_opaque(op, exprs)
     }
 }
