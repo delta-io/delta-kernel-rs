@@ -792,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v2_checkpoint_supported() {
+    fn test_v2_checkpoint_unsupported() {
         let protocol = Protocol::try_new(
             3,
             7,
@@ -800,7 +800,7 @@ mod tests {
             Some([ReaderFeatures::V2Checkpoint]),
         )
         .unwrap();
-        assert!(protocol.ensure_read_supported().is_ok());
+        assert!(protocol.ensure_read_supported().is_err());
 
         let protocol = Protocol::try_new(
             4,
@@ -830,7 +830,7 @@ mod tests {
             Some(&empty_features),
         )
         .unwrap();
-        assert!(protocol.ensure_read_supported().is_ok());
+        assert!(protocol.ensure_read_supported().is_err());
 
         let protocol = Protocol::try_new(
             3,
@@ -848,7 +848,7 @@ mod tests {
             Some([WriterFeatures::V2Checkpoint]),
         )
         .unwrap();
-        assert!(protocol.ensure_read_supported().is_ok());
+        assert!(protocol.ensure_read_supported().is_err());
 
         let protocol = Protocol {
             min_reader_version: 1,

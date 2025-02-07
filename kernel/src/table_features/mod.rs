@@ -48,8 +48,6 @@ pub enum ReaderFeatures {
     /// vacuumProtocolCheck ReaderWriter feature ensures consistent application of reader and writer
     /// protocol checks during VACUUM operations
     VacuumProtocolCheck,
-    /// A dummy variant used to represent an unsupported feature for testing purposes
-    UnsupportedFeature,
 }
 
 /// Similar to reader features, writer features communicate capabilities that must be implemented
@@ -111,8 +109,6 @@ pub enum WriterFeatures {
     /// vacuumProtocolCheck ReaderWriter feature ensures consistent application of reader and writer
     /// protocol checks during VACUUM operations
     VacuumProtocolCheck,
-    /// A dummy variant used to represent an unsupported feature for testing purposes
-    UnsupportedFeature,
 }
 
 impl From<ReaderFeatures> for String {
@@ -137,7 +133,6 @@ pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeatures>> =
             ReaderFeatures::TypeWidening,
             ReaderFeatures::TypeWideningPreview,
             ReaderFeatures::VacuumProtocolCheck,
-            ReaderFeatures::V2Checkpoint,
         ])
     });
 
@@ -159,7 +154,6 @@ mod tests {
             (ReaderFeatures::TypeWideningPreview, "typeWidening-preview"),
             (ReaderFeatures::V2Checkpoint, "v2Checkpoint"),
             (ReaderFeatures::VacuumProtocolCheck, "vacuumProtocolCheck"),
-            (ReaderFeatures::UnsupportedFeature, "unsupportedFeature"),
         ];
 
         assert_eq!(ReaderFeatures::VARIANTS.len(), cases.len());
@@ -198,7 +192,6 @@ mod tests {
             (WriterFeatures::IcebergCompatV1, "icebergCompatV1"),
             (WriterFeatures::IcebergCompatV2, "icebergCompatV2"),
             (WriterFeatures::VacuumProtocolCheck, "vacuumProtocolCheck"),
-            (WriterFeatures::UnsupportedFeature, "unsupportedFeature"),
         ];
 
         assert_eq!(WriterFeatures::VARIANTS.len(), cases.len());

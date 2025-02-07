@@ -115,7 +115,7 @@ fn build_log_with_paths_and_checkpoint(
 }
 
 #[test]
-fn build_snapshot_with_uuid_checkpoint_parquet() {
+fn build_snapshot_with_unsupported_uuid_checkpoint() {
     let (client, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -130,88 +130,18 @@ fn build_snapshot_with_uuid_checkpoint_parquet() {
         ],
         None,
     );
-
     let log_segment = LogSegment::for_snapshot(client.as_ref(), log_root, None, None).unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
     assert_eq!(checkpoint_parts.len(), 1);
-    assert_eq!(checkpoint_parts[0].version, 5);
+    assert_eq!(checkpoint_parts[0].version, 3);
 
     let versions = commit_files.into_iter().map(|x| x.version).collect_vec();
-    let expected_versions = vec![6, 7];
+    let expected_versions = vec![4, 5, 6, 7];
     assert_eq!(versions, expected_versions);
 }
 
-#[test]
-fn build_snapshot_with_uuid_checkpoint_json() {
-    let (client, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "checkpoint.parquet"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_version(5, "json"),
-            delta_path_for_version(5, "checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json"),
-            delta_path_for_version(6, "json"),
-            delta_path_for_version(7, "json"),
-        ],
-        None,
-    );
-
-    let log_segment = LogSegment::for_snapshot(client.as_ref(), log_root, None, None).unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
-
-    assert_eq!(checkpoint_parts.len(), 1);
-    assert_eq!(checkpoint_parts[0].version, 5);
-
-    let versions = commit_files.into_iter().map(|x| x.version).collect_vec();
-    let expected_versions = vec![6, 7];
-    assert_eq!(versions, expected_versions);
-}
-
-#[test]
-fn build_snapshot_with_correct_last_uuid_checkpoint() {
-    let checkpoint_metadata = CheckpointMetadata {
-        version: 5,
-        size: 10,
-        parts: Some(1),
-        size_in_bytes: None,
-        num_of_add_files: None,
-        checkpoint_schema: None,
-        checksum: None,
-    };
-
-    let (client, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(1, "checkpoint.parquet"),
-            delta_path_for_version(1, "json"),
-            delta_path_for_version(2, "json"),
-            delta_path_for_version(3, "checkpoint.parquet"),
-            delta_path_for_version(3, "json"),
-            delta_path_for_version(4, "json"),
-            delta_path_for_version(5, "checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet"),
-            delta_path_for_version(5, "json"),
-            delta_path_for_version(6, "json"),
-            delta_path_for_version(7, "json"),
-        ],
-        Some(&checkpoint_metadata),
-    );
-
-    let log_segment =
-        LogSegment::for_snapshot(client.as_ref(), log_root, checkpoint_metadata, None).unwrap();
-    let commit_files = log_segment.ascending_commit_files;
-    let checkpoint_parts = log_segment.checkpoint_parts;
-
-    assert_eq!(checkpoint_parts.len(), 1);
-    assert_eq!(commit_files.len(), 2);
-    assert_eq!(checkpoint_parts[0].version, 5);
-    assert_eq!(commit_files[0].version, 6);
-    assert_eq!(commit_files[1].version, 7);
-}
 #[test]
 fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
     let (client, log_root) = build_log_with_paths_and_checkpoint(
@@ -711,6 +641,8 @@ fn test_sidecar_to_filemeta() -> DeltaResult<()> {
         // This forms a valid URL but represents an invalid path since sidecar files
         // are restricted to the `_delta_log/_sidecars` directory.
         // Attempting to read this file will fail because it does not exist.
+
+        // TODO: Catch this error earlier to return a more informative error message.
         (
             "test/test/example.parquet",
             "file:///var/_delta_log/_sidecars/test/test/example.parquet",
@@ -884,7 +816,7 @@ fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_actio
 }
 
 // TODO: Use a batch of sidecar actions to test that we do not visit batches when the schema has no file actions
-// View multi_part checkpoint test for more details.
+// View multi-part checkpoint test for more details.
 #[tokio::test]
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
 ) -> DeltaResult<()> {
@@ -1078,7 +1010,8 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch() -> DeltaRes
 // More integration test than unit test below:
 
 // Encapsulates logic that has already been tested but tests the interaction between the functions,
-// such as performing a map operation on the returned sidecar batches to include the is_log_batch flag
+// such as performing a map operation on the returned sidecar batches from `process_single_checkpoint_batch`
+// to include the is_log_batch flag
 #[tokio::test]
 async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
 ) -> DeltaResult<()> {
@@ -1109,7 +1042,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         )
         .await;
 
-    let checkpoint_one_file = mock_table
+    let checkpoint_file_path = mock_table
         .log_root()
         .join("00001.checkpoint.parquet")?
         .to_string();
@@ -1118,7 +1051,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         &engine,
         v2_checkpoint_read_schema.clone(),
         None,
-        vec![create_file_meta(&checkpoint_one_file)],
+        vec![create_file_meta(&checkpoint_file_path)],
         mock_table.log_root(),
     )?
     .into_iter();
