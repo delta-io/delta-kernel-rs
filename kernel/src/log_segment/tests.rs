@@ -882,6 +882,8 @@ fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_actio
     }
 }
 
+// TODO: Use a batch of sidecar actions to test that we do not visit batches when the schema has no file actions
+// View multi_part checkpoint test for more details.
 #[tokio::test]
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
 ) {
