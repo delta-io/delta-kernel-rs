@@ -176,7 +176,6 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
     #[allow(dead_code)] // currently only used in tests, which don't "count"
     fn is_unknown(&self) -> bool {
-        // TODO: Stop treating UuidCheckpoint as unknown once we support v2 checkpoints
         matches!(self.file_type, LogPathFileType::Unknown)
     }
 }
