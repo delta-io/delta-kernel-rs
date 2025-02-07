@@ -512,6 +512,7 @@ pub(crate) fn visit_deletion_vector_at<'a>(
 
 #[cfg(test)]
 mod tests {
+    use crate::table_features::{ReaderFeatures, WriterFeatures};
     use std::sync::Arc;
 
     use arrow_array::{RecordBatch, StringArray};
@@ -559,8 +560,8 @@ mod tests {
         let expected = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
-            reader_features: Some(vec!["deletionVectors".into()]),
-            writer_features: Some(vec!["deletionVectors".into()]),
+            reader_features: Some(vec![ReaderFeatures::DeletionVectors]),
+            writer_features: Some(vec![WriterFeatures::DeletionVectors]),
         };
         assert_eq!(parsed, expected);
         Ok(())

@@ -88,7 +88,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         let filename = url
             .path_segments()
             .ok_or_else(|| Error::invalid_log_path(url))?
-            .last()
+            .next_back()
             .unwrap() // "the iterator always contains at least one string (which may be empty)"
             .to_string();
         if filename.is_empty() {
