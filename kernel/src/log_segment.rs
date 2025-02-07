@@ -242,13 +242,13 @@ impl LogSegment {
     /// Returns an iterator over checkpoint data, processing sidecar files when necessary.
     ///
     /// Checkpoint data is returned directly if:
-    /// - Processing multi-part checkpoints
-    /// - Schema doesn't contain file actions
+    /// - Processing a multi-part checkpoint
+    /// - Schema does not contain file actions
     ///
     /// For single-part checkpoints, any referenced sidecar files are processed. These
     /// sidecar files contain the actual add/remove actions that would otherwise be
-    /// stored directly in the checkpoint, providing a more efficient storage mechanism
-    /// for large change sets.
+    /// stored directly in the checkpoint. The sidecar file batches replace the checkpoint
+    /// batch in the top level iterator to be returned.
     fn create_checkpoint_stream(
         engine: &dyn Engine,
         checkpoint_read_schema: SchemaRef,

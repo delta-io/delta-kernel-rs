@@ -166,9 +166,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         // TODO: Include UuidCheckpoint once we actually support v2 checkpoints
         matches!(
             self.file_type,
-            LogPathFileType::SinglePartCheckpoint
-                | LogPathFileType::MultiPartCheckpoint { .. }
-                | LogPathFileType::UuidCheckpoint(_)
+            LogPathFileType::SinglePartCheckpoint | LogPathFileType::MultiPartCheckpoint { .. }
         )
     }
 
@@ -176,7 +174,11 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
     #[allow(dead_code)] // currently only used in tests, which don't "count"
     fn is_unknown(&self) -> bool {
-        matches!(self.file_type, LogPathFileType::Unknown)
+        // TODO: Stop treating UuidCheckpoint as unknown once we support v2 checkpoints
+        matches!(
+            self.file_type,
+            LogPathFileType::Unknown | LogPathFileType::UuidCheckpoint(_)
+        )
     }
 }
 
@@ -355,7 +357,10 @@ mod tests {
             LogPathFileType::UuidCheckpoint(ref u) if u == "3a0d65cd-4056-49b8-937b-95f9e3ee90e5",
         ));
         assert!(!log_path.is_commit());
-        assert!(log_path.is_checkpoint());
+
+        // TODO: Support v2 checkpoints! Until then we can't treat these as checkpoint files.
+        assert!(!log_path.is_checkpoint());
+        assert!(log_path.is_unknown());
 
         let log_path = table_log_dir
             .join("00000000000000000002.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json")
@@ -372,7 +377,10 @@ mod tests {
             LogPathFileType::UuidCheckpoint(ref u) if u == "3a0d65cd-4056-49b8-937b-95f9e3ee90e5",
         ));
         assert!(!log_path.is_commit());
-        assert!(log_path.is_checkpoint());
+
+        // TODO: Support v2 checkpoints! Until then we can't treat these as checkpoint files.
+        assert!(!log_path.is_checkpoint());
+        assert!(log_path.is_unknown());
 
         let log_path = table_log_dir
             .join("00000000000000000002.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.foo")

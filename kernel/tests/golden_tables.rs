@@ -409,8 +409,8 @@ golden_test!("time-travel-start", latest_snapshot_test);
 golden_test!("time-travel-start-start20", latest_snapshot_test);
 golden_test!("time-travel-start-start20-start40", latest_snapshot_test);
 
-golden_test!("v2-checkpoint-json", latest_snapshot_test);
-golden_test!("v2-checkpoint-parquet", latest_snapshot_test);
+skip_test!("v2-checkpoint-json": "v2 checkpoint not supported");
+skip_test!("v2-checkpoint-parquet": "v2 checkpoint not supported");
 // BUG:
 // - AddFile: 'file:/some/unqualified/absolute/path'
 // - RemoveFile: '/some/unqualified/absolute/path'
