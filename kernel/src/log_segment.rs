@@ -224,17 +224,19 @@ impl LogSegment {
             .iter()
             .map(|f| f.location.clone())
             .collect();
-        let checkpoint_stream = if checkpoint_parts.is_empty() {
-            Left(None.into_iter())
-        } else {
-            Right(Self::create_checkpoint_stream(
-                engine,
-                checkpoint_read_schema,
-                meta_predicate,
-                checkpoint_parts,
-                self.log_root.clone(),
-            )?)
-        };
+        let checkpoint_stream = (!checkpoint_parts.is_empty())
+            .then(|| {
+                Self::create_checkpoint_stream(
+                    engine,
+                    checkpoint_read_schema,
+                    meta_predicate,
+                    checkpoint_parts,
+                    self.log_root.clone(),
+                )
+            })
+            .transpose()?
+            .into_iter()
+            .flatten();
 
         Ok(commit_stream.chain(checkpoint_stream))
     }
@@ -290,24 +292,27 @@ impl LogSegment {
 
         // Process checkpoint batches with potential sidecar file references that need to be read
         // to extract add/remove actions from the sidecar files.
-        Ok(Right(
-            actions
-                // Flatten the new batches returned. The new batches could be:
-                // - the checkpoint batch itself if no sidecar actions are present in the batch
-                // - one or more sidecar batches read from the sidecar files if sidecar actions are present
-                .flat_map(move |batch_result| match batch_result {
-                    Ok(checkpoint_batch) => Right(
-                        Self::process_single_checkpoint_batch(
-                            parquet_handler.clone(),
-                            log_root.clone(),
-                            checkpoint_batch,
-                        )
-                        .map_or_else(|e| Left(std::iter::once(Err(e))), Right)
-                        .map_ok(|batch| (batch, false)),
-                    ),
+        let actions_iter = actions
+            // Flatten the new batches returned. The new batches could be:
+            // - the checkpoint batch itself if no sidecar actions are present in the batch
+            // - one or more sidecar batches read from the sidecar files if sidecar actions are present
+            .flat_map(move |batch_result| {
+                let checkpoint_batch = match batch_result {
+                    Ok(batch) => batch,
+                    Err(e) => return Left(std::iter::once(Err(e))),
+                };
+
+                match Self::process_single_checkpoint_batch(
+                    parquet_handler.clone(),
+                    log_root.clone(),
+                    checkpoint_batch,
+                ) {
+                    Ok(iter) => Right(iter.map(|result| result.map(|batch| (batch, false)))),
                     Err(e) => Left(std::iter::once(Err(e))),
-                }),
-        ))
+                }
+            });
+
+        return Ok(Right(actions_iter));
     }
 
     fn process_single_checkpoint_batch(
@@ -326,18 +331,18 @@ impl LogSegment {
         }
 
         // Convert sidecar actions to sidecar file paths
-        let sidecar_files: Result<Vec<_>, _> = visitor
+        let sidecar_files: Vec<_> = visitor
             .sidecars
             .iter()
             .map(|sidecar| Self::sidecar_to_filemeta(sidecar, &log_root))
-            .collect();
+            .try_collect()?;
 
         let sidecar_read_schema = get_log_add_schema().clone();
 
         // If sidecars files exist, read the sidecar files and return the iterator of sidecar batches
         // to replace the checkpoint batch in the top level iterator
         Ok(Right(parquet_handler.read_parquet_files(
-            &sidecar_files?,
+            &sidecar_files,
             sidecar_read_schema,
             None,
         )?))
