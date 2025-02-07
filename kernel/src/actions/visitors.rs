@@ -476,11 +476,12 @@ impl RowVisitor for SidecarVisitor {
         );
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of a sidecar action
-            if let Some(path) = getters[0].get_opt(i, "sidecar.path")? {
+            let opt_path: Option<String> = getters[0].get_opt(i, "sidecar.path")?;
+            if let Some(path) = opt_path {
                 // We read checkpoint batches with the sidecar action. This results in empty paths
                 // if a row is not a sidecar action. We do not want to create a sidecar action for
                 // these rows.
-                if path == "" {
+                if path.is_empty() {
                     continue;
                 }
                 self.sidecars.push(Self::visit_sidecar(i, path, getters)?);
