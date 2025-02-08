@@ -296,21 +296,19 @@ impl LogSegment {
             // Flatten the new batches returned. The new batches could be:
             // - the checkpoint batch itself if no sidecar actions are present in the batch
             // - one or more sidecar batches read from the sidecar files if sidecar actions are present
-            .flat_map(move |batch_result| {
-                let checkpoint_batch = match batch_result {
-                    Ok(batch) => batch,
-                    Err(e) => return Left(std::iter::once(Err(e))),
-                };
+            // After flattenning, perform a map operation to return the actions and a boolean flag indicating
+            // that the batch was not read from a log file.
+            .map(move |batch_result| {
+                let checkpoint_batch = batch_result?;
 
-                match Self::process_single_checkpoint_batch(
+                Self::process_single_checkpoint_batch(
                     parquet_handler.clone(),
                     log_root.clone(),
                     checkpoint_batch,
-                ) {
-                    Ok(iter) => Right(iter.map(|result| result.map(|batch| (batch, false)))),
-                    Err(e) => Left(std::iter::once(Err(e))),
-                }
-            });
+                )
+            })
+            .flatten_ok()
+            .map(|result| result.and_then(|inner| inner.map(|actions| (actions, false))));
 
         return Ok(Right(actions_iter));
     }
