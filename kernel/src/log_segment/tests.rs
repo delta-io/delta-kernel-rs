@@ -16,7 +16,9 @@ use crate::scan::test_utils::{
     add_batch_simple, add_batch_with_remove, sidecar_batch_with_given_paths,
 };
 use crate::snapshot::CheckpointMetadata;
-use crate::utils::test_utils::{assert_batch_matches, Action, LocalMockTable};
+use crate::utils::test_utils::{
+    assert_batch_matches, assert_error_contains, Action, LocalMockTable,
+};
 use crate::{DeltaResult, Engine, FileMeta, FileSystemClient, Table};
 use test_utils::delta_path_for_version;
 
@@ -628,7 +630,7 @@ fn table_changes_fails_with_larger_start_version_than_end() {
     assert!(log_segment_res.is_err());
 }
 #[test]
-fn test_sidecar_to_filemeta() -> DeltaResult<()> {
+fn test_sidecar_to_filemeta_valid_paths() -> DeltaResult<()> {
     let log_root = Url::parse("file:///var/_delta_log/")?;
     let test_cases = [
         (
@@ -639,42 +641,31 @@ fn test_sidecar_to_filemeta() -> DeltaResult<()> {
             "file:///var/_delta_log/_sidecars/example.parquet",
             "file:///var/_delta_log/_sidecars/example.parquet",
         ),
-        // This forms a valid URL but represents an invalid path since sidecar files
-        // are restricted to the `_delta_log/_sidecars` directory.
-        // Attempting to read this file will fail because it does not exist.
     ];
-    for (input_path, expected_url) in test_cases {
-        let sidecar = Sidecar {
-            path: input_path.into(),
-            modification_time: 0,
-            size_in_bytes: 1000,
-            tags: None,
-        };
 
-        let result = LogSegment::sidecar_to_filemeta(&sidecar, &log_root)?;
-
+    for (input_path, expected_url) in test_cases.iter() {
+        let sidecar = create_sidecar(*input_path);
+        let filemeta = LogSegment::sidecar_to_filemeta(&sidecar, &log_root)?;
         assert_eq!(
-            result.location.as_str(),
-            expected_url,
+            filemeta.location.as_str(),
+            *expected_url,
             "Mismatch for input path: {}",
             input_path
         );
     }
+    Ok(())
+}
 
-    let bad_sidecar = Sidecar {
-        // This is an invalid sidecar path because it is not in the `_delta_log/_sidecars` directory
-        path: "test/test/example.parquet".into(),
-        modification_time: 0,
-        size_in_bytes: 1000,
-        tags: None,
-    };
+#[test]
+fn test_sidecar_to_filemeta_invalid_path() -> DeltaResult<()> {
+    let log_root = Url::parse("file:///var/_delta_log/")?;
+    let bad_sidecar = create_sidecar("test/test/example.parquet");
     let result = LogSegment::sidecar_to_filemeta(&bad_sidecar, &log_root);
 
-    assert!(result.is_err());
-    if let Err(e) = result {
-        assert!(e.to_string().contains("Sidecar path 'test/test/example.parquet' is invalid: sidecar files must be in the `_delta_log/_sidecars/` directory as a file name only"));
-    }
-
+    assert_error_contains(
+            result,
+            "Sidecar path 'test/test/example.parquet' is invalid: sidecar files must be in the `_delta_log/_sidecars/` directory",
+        );
     Ok(())
 }
 
@@ -764,10 +755,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
     .flatten();
 
     // Assert that an error is returned when trying to read sidecar files that do not exist
-    let _ = iter.next().unwrap().is_err();
-    if let Err(e) = iter.next().unwrap() {
-        assert!(e.to_string().contains("No such file or directory"));
-    }
+    assert_error_contains(iter.next().unwrap(), "No such file or directory");
 
     Ok(())
 }
@@ -792,16 +780,6 @@ fn test_create_checkpoint_stream_returns_none_if_checkpoint_parts_is_empty() -> 
     Ok(())
 }
 
-fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
-    ParsedLogPath::try_from(FileMeta {
-        location: Url::parse(path).expect("Invalid file URL"),
-        last_modified: 0,
-        size: 0,
-    })
-    .unwrap()
-    .unwrap()
-}
-
 #[test]
 fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_action(
 ) -> DeltaResult<()> {
@@ -816,13 +794,10 @@ fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_actio
         Url::parse("s3://example-bucket/logs/")?,
     );
 
-    assert!(result.is_err(), "Expected an error, but got an Ok value.");
-
-    if let Err(e) = result {
-        assert!(e
-            .to_string()
-            .contains("If the checkpoint read schema contains file actions, it must contain the sidecar column"));
-    };
+    assert_error_contains(
+        result,
+        "If the checkpoint read schema contains file actions, it must contain the sidecar column",
+    );
 
     Ok(())
 }
@@ -1092,4 +1067,24 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     assert!(iter.next().is_none());
 
     Ok(())
+}
+
+/// Creates a Sidecar instance with default modification time, file size and no tags.
+fn create_sidecar<P: Into<String>>(path: P) -> Sidecar {
+    Sidecar {
+        path: path.into(),
+        modification_time: 0,
+        size_in_bytes: 1000,
+        tags: None,
+    }
+}
+
+fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
+    ParsedLogPath::try_from(FileMeta {
+        location: Url::parse(path).expect("Invalid file URL"),
+        last_modified: 0,
+        size: 0,
+    })
+    .unwrap()
+    .unwrap()
 }
