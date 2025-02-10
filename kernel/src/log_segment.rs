@@ -259,7 +259,7 @@ impl LogSegment {
 
         let checkpoint_file_meta: Vec<FileMeta> = checkpoint_parts
             .iter()
-            .map(|log| log.location.clone())
+            .map(|f: &ParsedLogPath| f.location.clone())
             .collect();
 
         let actions = if checkpoint_parts
@@ -320,6 +320,8 @@ impl LogSegment {
         batch: &dyn EngineData,
         skip_sidecar_search: bool,
     ) -> DeltaResult<Option<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>> {
+        // If the schema does not contain add/remove actions or we have a multi-part checkpoint,
+        // we return early as sidecar files are not needed.
         if skip_sidecar_search {
             return Ok(None);
         }
@@ -328,11 +330,11 @@ impl LogSegment {
         let mut visitor = SidecarVisitor::default();
         visitor.visit_rows_of(batch)?;
 
+        // If there are no sidecar files, return early
         if visitor.sidecars.is_empty() {
             return Ok(None);
         }
 
-        // Convert sidecar records to FileMeta for reading
         let sidecar_files: Vec<_> = visitor
             .sidecars
             .iter()
