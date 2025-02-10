@@ -138,7 +138,7 @@ pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeatures>> =
 
 // write support wip: no table features are supported yet
 pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<HashSet<WriterFeatures>> =
-    LazyLock::new(|| HashSet::from([]));
+    LazyLock::new(|| HashSet::from([WriterFeatures::AppendOnly]));
 
 #[cfg(test)]
 mod tests {
