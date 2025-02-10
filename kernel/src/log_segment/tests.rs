@@ -830,8 +830,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None,
         vec![create_log_path(&checkpoint_one_file)],
         mock_table.log_root(),
-    )?
-    .into_iter();
+    )?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let (first_batch, is_log_batch) = iter.next().unwrap()?;
@@ -893,8 +892,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
             create_log_path(&checkpoint_two_file),
         ],
         mock_table.log_root(),
-    )?
-    .into_iter();
+    )?;
 
     // Assert the correctness of batches returned
     for expected_sidecar in ["sidecar1.parquet", "sidecar2.parquet"].iter() {
@@ -984,12 +982,14 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch() -> DeltaRes
         None,
         vec![create_log_path(&checkpoint_one_file)],
         mock_table.log_root(),
-    )?
-    .into_iter();
+    )?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let (_first_batch, is_log_batch) = iter.next().unwrap()?;
     assert!(!is_log_batch);
+    // Although we do not assert the contents, we know the JSON checkpoint is read correctly as
+    // a single batch is returned and no errors are thrown.
+
     // TODO: Convert JSON checkpoint to RecordBatch and assert that it is as expected
     assert!(iter.next().is_none());
 
@@ -1040,8 +1040,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         None,
         vec![create_log_path(&checkpoint_file_path)],
         mock_table.log_root(),
-    )?
-    .into_iter();
+    )?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let (first_batch, is_log_batch) = iter.next().unwrap()?;
