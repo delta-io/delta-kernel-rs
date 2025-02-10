@@ -92,7 +92,7 @@ pub(crate) mod test_utils {
                 .map(|action| serde_json::to_string(&action).unwrap())
                 .join("\n");
 
-            let path = format!("_delta_log/{filename:020}");
+            let path = format!("_delta_log/{filename}");
 
             self.store
                 .put(&path::Path::from(path), data.into())
@@ -115,7 +115,7 @@ pub(crate) mod test_utils {
             writer.write(record_batch).unwrap();
             writer.close().unwrap(); // writer must be closed to write footer
 
-            let path = format!("_delta_log/{filename:020}");
+            let path = format!("_delta_log/{filename}");
 
             self.store
                 .put(&path::Path::from(path), buffer.into())

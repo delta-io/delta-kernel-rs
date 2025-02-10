@@ -701,8 +701,7 @@ pub(crate) mod test_utils {
         .iter()
         .map(|path| {
             format!(
-                r#"{{"sidecar":{{"path":"{}","sizeInBytes":9268,"modificationTime":1714496113961,"tags":{{"tag_foo":"tag_bar"}}}}}}"#,
-                path
+                r#"{{"sidecar":{{"path":"{path}","sizeInBytes":9268,"modificationTime":1714496113961,"tags":{{"tag_foo":"tag_bar"}}}}}}"#,
             )
         })
         .collect::<Vec<_>>()
