@@ -259,7 +259,7 @@ impl LogSegment {
 
         let checkpoint_file_meta: Vec<FileMeta> = checkpoint_parts
             .iter()
-            .map(|f: &ParsedLogPath| f.location.clone())
+            .map(|f| f.location.clone())
             .collect();
 
         let actions = if checkpoint_parts
