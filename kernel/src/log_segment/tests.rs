@@ -641,6 +641,10 @@ fn test_sidecar_to_filemeta_valid_paths() -> DeltaResult<()> {
             "file:///var/_delta_log/_sidecars/example.parquet",
             "file:///var/_delta_log/_sidecars/example.parquet",
         ),
+        (
+            "test/test/example.parquet",
+            "file:///var/_delta_log/_sidecars/test/test/example.parquet",
+        ),
     ];
 
     for (input_path, expected_url) in test_cases.iter() {
@@ -653,19 +657,6 @@ fn test_sidecar_to_filemeta_valid_paths() -> DeltaResult<()> {
             input_path
         );
     }
-    Ok(())
-}
-
-#[test]
-fn test_sidecar_to_filemeta_invalid_path() -> DeltaResult<()> {
-    let log_root = Url::parse("file:///var/_delta_log/")?;
-    let bad_sidecar = create_sidecar("test/test/example.parquet");
-    let result = LogSegment::sidecar_to_filemeta(&bad_sidecar, &log_root);
-
-    assert_error_contains(
-            result,
-            "Sidecar path 'test/test/example.parquet' is invalid: sidecar files must be in the `_delta_log/_sidecars/` directory",
-        );
     Ok(())
 }
 

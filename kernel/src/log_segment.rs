@@ -17,7 +17,6 @@ use crate::{
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::convert::identity;
-use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use tracing::warn;
 use url::Url;
@@ -307,6 +306,7 @@ impl LogSegment {
                 })
             })
             .flatten_ok()
+            // Map converts Result<Result<Box<dyn EngineData>, _>,_> to Result<Box<dyn EngineData>, _>
             .map(|result| result?))
     }
 
@@ -355,29 +355,9 @@ impl LogSegment {
     ///
     /// This helper first builds the URL by joining the provided log_root with
     /// the "_sidecars/" folder and the given sidecar path.
-    ///
-    /// To catch a possible error earlier, if the sidecar.path is relative then
-    /// it is checked to ensure it is simply a file name (no directory components).
     fn sidecar_to_filemeta(sidecar: &Sidecar, log_root: &Url) -> DeltaResult<FileMeta> {
-        // If sidecar.path is relative (does not contain "://"), require that it is
-        // just a file name. This will catch cases like "test/test/example.parquet".
-        if !sidecar.path.contains("://") {
-            let path = Path::new(&sidecar.path);
-            // If there is any parent (i.e. directory component), consider it invalid.
-            if let Some(parent) = path.parent() {
-                // If the parent is not empty, then we have extra components.
-                if parent != Path::new("") {
-                    return Err(Error::Generic(format!(
-                        "Sidecar path '{}' is invalid: sidecar files must be in the `_delta_log/_sidecars/` directory as a file name only",
-                        sidecar.path
-                    )));
-                }
-            }
-        }
-        // Now build the full location by joining log_root, "_sidecars/", and the given path.
-        let location = log_root.join("_sidecars/")?.join(&sidecar.path)?;
         Ok(FileMeta {
-            location,
+            location: log_root.join("_sidecars/")?.join(&sidecar.path)?,
             last_modified: sidecar.modification_time,
             size: sidecar.size_in_bytes as usize,
         })
