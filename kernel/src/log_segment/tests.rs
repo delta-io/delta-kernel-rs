@@ -921,14 +921,15 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
 // empty-string path fields after visiting the batch with the SidecarVisitor due to the batch being read with
 // the schema which includes the Sidecar column.
 #[tokio::test]
-async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch() -> DeltaResult<()> {
+async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars(
+) -> DeltaResult<()> {
     let engine = SyncEngine::new();
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
     let mut mock_table = LocalMockTable::new();
 
     mock_table
         .parquet_checkpoint(
-            add_batch_simple(v2_checkpoint_read_schema.clone()),
+            add_batch_simple(get_log_add_schema().clone()),
             "00000000000000000001.checkpoint.parquet",
         )
         .await;
@@ -959,7 +960,8 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch() -> Delta
 }
 
 #[tokio::test]
-async fn test_create_checkpoint_stream_reads_json_checkpoint_batch() -> DeltaResult<()> {
+async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars(
+) -> DeltaResult<()> {
     let engine = SyncEngine::new();
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
     let mut mock_table = LocalMockTable::new();
