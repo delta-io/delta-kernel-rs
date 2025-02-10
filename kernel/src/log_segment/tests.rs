@@ -755,7 +755,12 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
     .flatten();
 
     // Assert that an error is returned when trying to read sidecar files that do not exist
-    assert_error_contains(iter.next().unwrap(), "No such file or directory");
+    let err = iter.next().unwrap();
+    if cfg!(windows) {
+        assert_error_contains(err, "The system cannot find the path specified");
+    } else {
+        assert_error_contains(err, "No such file or directory");
+    }
 
     Ok(())
 }
