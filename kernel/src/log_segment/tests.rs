@@ -939,8 +939,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch() -> Delta
         None,
         vec![create_log_path(&checkpoint_one_file)],
         mock_table.log_root(),
-    )?
-    .into_iter();
+    )?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let (first_batch, is_log_batch) = iter.next().unwrap()?;
