@@ -11,6 +11,7 @@ use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreFileSystemClient;
 use crate::engine::sync::SyncEngine;
 use crate::log_segment::LogSegment;
+use crate::path::ParsedLogPath;
 use crate::scan::test_utils::{
     add_batch_simple, add_batch_with_remove, sidecar_batch_with_given_paths,
 };
@@ -641,12 +642,6 @@ fn test_sidecar_to_filemeta() -> DeltaResult<()> {
         // This forms a valid URL but represents an invalid path since sidecar files
         // are restricted to the `_delta_log/_sidecars` directory.
         // Attempting to read this file will fail because it does not exist.
-
-        // TODO: Catch this error earlier to return a more informative error message.
-        (
-            "test/test/example.parquet",
-            "file:///var/_delta_log/_sidecars/test/test/example.parquet",
-        ),
     ];
     for (input_path, expected_url) in test_cases {
         let sidecar = Sidecar {
@@ -666,27 +661,39 @@ fn test_sidecar_to_filemeta() -> DeltaResult<()> {
         );
     }
 
+    let bad_sidecar = Sidecar {
+        // This is an invalid sidecar path because it is not in the `_delta_log/_sidecars` directory
+        path: "test/test/example.parquet".into(),
+        modification_time: 0,
+        size_in_bytes: 1000,
+        tags: None,
+    };
+    let result = LogSegment::sidecar_to_filemeta(&bad_sidecar, &log_root);
+
+    assert!(result.is_err());
+    if let Err(e) = result {
+        assert!(e.to_string().contains("Sidecar path 'test/test/example.parquet' is invalid: sidecar files must be in the `_delta_log/_sidecars/` directory as a file name only"));
+    }
+
     Ok(())
 }
 
 #[test]
-fn test_checkpoint_batch_with_no_sidecars_returns_checkpoint_batch_as_is() -> DeltaResult<()> {
+fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
     let engine = Arc::new(SyncEngine::new());
     let log_root = Url::parse("s3://example-bucket/logs/")?;
     let checkpoint_batch = add_batch_simple(get_log_schema().clone());
 
-    let mut iter = LogSegment::process_single_checkpoint_batch(
+    let mut iter = LogSegment::process_sidecars(
         engine.get_parquet_handler(),
         log_root,
-        checkpoint_batch,
+        checkpoint_batch.as_ref(),
+        false,
     )?
-    .into_iter();
+    .into_iter()
+    .flatten();
 
-    // Assert the correctness of batches returned
-    assert_batch_matches(
-        iter.next().unwrap()?,
-        add_batch_simple(get_log_schema().clone()),
-    );
+    // Assert no batches are returned
     assert!(iter.next().is_none());
 
     Ok(())
@@ -715,12 +722,14 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaR
         get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?,
     );
 
-    let mut iter = LogSegment::process_single_checkpoint_batch(
+    let mut iter = LogSegment::process_sidecars(
         engine.get_parquet_handler(),
         mock_table.log_root(),
-        checkpoint_batch,
+        checkpoint_batch.as_ref(),
+        false,
     )?
-    .into_iter();
+    .into_iter()
+    .flatten();
 
     // Assert the correctness of batches returned
     assert_batch_matches(
@@ -745,13 +754,14 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
         get_log_schema().clone(),
     );
 
-    let result = LogSegment::process_single_checkpoint_batch(
+    let mut iter = LogSegment::process_sidecars(
         engine.get_parquet_handler(),
         mock_table.log_root(),
-        checkpoint_batch,
-    )?;
-
-    let mut iter = result.into_iter();
+        checkpoint_batch.as_ref(),
+        false,
+    )?
+    .into_iter()
+    .flatten();
 
     // Assert that an error is returned when trying to read sidecar files that do not exist
     let _ = iter.next().unwrap().is_err();
@@ -763,33 +773,33 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 }
 
 #[test]
-fn test_create_checkpoint_stream_errors_when_checkpoint_parts_is_empty() -> DeltaResult<()> {
+fn test_create_checkpoint_stream_returns_none_if_checkpoint_parts_is_empty() -> DeltaResult<()> {
     let engine = SyncEngine::new();
 
-    let stream = LogSegment::create_checkpoint_stream(
+    let mut iter = LogSegment::create_checkpoint_stream(
         &engine,
         get_log_schema().clone(),
         None,
         vec![],
         Url::parse("s3://example-bucket/logs/")?,
-    );
+    )
+    .into_iter()
+    .flatten();
 
-    assert!(stream.is_err());
-    if let Err(e) = stream {
-        assert!(e
-            .to_string()
-            .contains("Checkpoint parts should not be empty"));
-    }
+    // Assert no batches are returned
+    assert!(iter.next().is_none());
 
     Ok(())
 }
 
-fn create_file_meta(path: &str) -> FileMeta {
-    FileMeta {
+fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
+    ParsedLogPath::try_from(FileMeta {
         location: Url::parse(path).expect("Invalid file URL"),
         last_modified: 0,
         size: 0,
-    }
+    })
+    .unwrap()
+    .unwrap()
 }
 
 #[test]
@@ -797,26 +807,26 @@ fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_actio
 ) -> DeltaResult<()> {
     let engine = SyncEngine::new();
 
-    let stream = LogSegment::create_checkpoint_stream(
+    // Create the stream over checkpoint batches.
+    let result = LogSegment::create_checkpoint_stream(
         &engine,
         get_log_add_schema().clone(),
         None,
-        vec![create_file_meta("file:///1.parquet")],
+        vec![create_log_path("file:///00000000000000000001.parquet")],
         Url::parse("s3://example-bucket/logs/")?,
     );
 
-    assert!(stream.is_err());
-    if let Err(e) = stream {
+    assert!(result.is_err(), "Expected an error, but got an Ok value.");
+
+    if let Err(e) = result {
         assert!(e
             .to_string()
             .contains("If the checkpoint read schema contains file actions, it must contain the sidecar column"));
-    }
+    };
 
     Ok(())
 }
 
-// TODO: Use a batch of sidecar actions to test that we do not visit batches when the schema has no file actions
-// View multi-part checkpoint test for more details.
 #[tokio::test]
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
 ) -> DeltaResult<()> {
@@ -825,21 +835,25 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
     let mut mock_table = LocalMockTable::new();
     mock_table
         .parquet_checkpoint(
-            add_batch_simple(v2_checkpoint_read_schema.clone()),
-            "00001.checkpoint.parquet",
+            // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are not read.
+            sidecar_batch_with_given_paths(
+                vec!["sidecar1.parquet"],
+                v2_checkpoint_read_schema.clone(),
+            ),
+            "00000000000000000001.checkpoint.parquet",
         )
         .await;
 
     let checkpoint_one_file = mock_table
         .log_root()
-        .join("00001.checkpoint.parquet")?
+        .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
 
     let mut iter = LogSegment::create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None,
-        vec![create_file_meta(&checkpoint_one_file)],
+        vec![create_log_path(&checkpoint_one_file)],
         mock_table.log_root(),
     )?
     .into_iter();
@@ -849,7 +863,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
     assert!(!is_log_batch);
     assert_batch_matches(
         first_batch,
-        add_batch_simple(v2_checkpoint_read_schema.clone()),
+        sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], v2_checkpoint_read_schema.clone()),
     );
     assert!(iter.next().is_none());
 
@@ -864,15 +878,15 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
     let mut mock_table = LocalMockTable::new();
 
     // Multi-part checkpoints can never have sidecar actions.
-    // We place batches with sidecar actions present in multi-part checkpoints to verify we do not read the actions,
-    // as we should short-circuit and return the checkpoint batches as-is when encountering multi-part checkpoints.
+    // We place batches with sidecar actions in multi-part checkpoints to verify we do not read the actions, as we
+    // should instead short-circuit and return the checkpoint batches as-is when encountering multi-part checkpoints.
     mock_table
         .parquet_checkpoint(
             sidecar_batch_with_given_paths(
                 vec!["sidecar1.parquet"],
                 v2_checkpoint_read_schema.clone(),
             ),
-            "00001.checkpoint.1.2.parquet",
+            "00000000000000000001.checkpoint.0000000001.0000000002.parquet",
         )
         .await;
     mock_table
@@ -881,18 +895,18 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
                 vec!["sidecar2.parquet"],
                 v2_checkpoint_read_schema.clone(),
             ),
-            "00001.checkpoint.2.2.parquet",
+            "00000000000000000001.checkpoint.0000000002.0000000002.parquet",
         )
         .await;
 
     let checkpoint_one_file = mock_table
         .log_root()
-        .join("00001.checkpoint.1.2.parquet")?
+        .join("00000000000000000001.checkpoint.0000000001.0000000002.parquet")?
         .to_string();
 
     let checkpoint_two_file = mock_table
         .log_root()
-        .join("00001.checkpoint.2.2.parquet")?
+        .join("00000000000000000001.checkpoint.0000000002.0000000002.parquet")?
         .to_string();
 
     let mut iter = LogSegment::create_checkpoint_stream(
@@ -900,8 +914,8 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         v2_checkpoint_read_schema.clone(),
         None,
         vec![
-            create_file_meta(&checkpoint_one_file),
-            create_file_meta(&checkpoint_two_file),
+            create_log_path(&checkpoint_one_file),
+            create_log_path(&checkpoint_two_file),
         ],
         mock_table.log_root(),
     )?
@@ -925,7 +939,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
 }
 
 // Test showcases weird behavior where reading a batch with a missing column causes the reader to
-// insert the empty-string in string fields. This is seen in this test where we find two instance of Sidecars with
+// insert the empty-string in string fields. This is seen in this test where we find two instances of Sidecars with
 // empty-string path fields after visiting the batch with the SidecarVisitor due to the batch being read with
 // the schema which includes the Sidecar column.
 #[tokio::test]
@@ -937,20 +951,20 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch() -> Delta
     mock_table
         .parquet_checkpoint(
             add_batch_simple(v2_checkpoint_read_schema.clone()),
-            "00001.checkpoint.parquet",
+            "00000000000000000001.checkpoint.parquet",
         )
         .await;
 
     let checkpoint_one_file = mock_table
         .log_root()
-        .join("00001.checkpoint.parquet")?
+        .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
 
     let mut iter = LogSegment::create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None,
-        vec![create_file_meta(&checkpoint_one_file)],
+        vec![create_log_path(&checkpoint_one_file)],
         mock_table.log_root(),
     )?
     .into_iter();
@@ -980,20 +994,20 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch() -> DeltaRes
                 data_change: true,
                 ..Default::default()
             })],
-            "00001.checkpoint.json",
+            "00000000000000000001.checkpoint.json",
         )
         .await;
 
     let checkpoint_one_file = mock_table
         .log_root()
-        .join("00001.checkpoint.json")?
+        .join("00000000000000000001.checkpoint.json")?
         .to_string();
 
     let mut iter = LogSegment::create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None,
-        vec![create_file_meta(&checkpoint_one_file)],
+        vec![create_log_path(&checkpoint_one_file)],
         mock_table.log_root(),
     )?
     .into_iter();
@@ -1007,10 +1021,8 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch() -> DeltaRes
     Ok(())
 }
 
-// More integration test than unit test below:
-
 // Encapsulates logic that has already been tested but tests the interaction between the functions,
-// such as performing a map operation on the returned sidecar batches from `process_single_checkpoint_batch`
+// such as performing a map operation on the returned sidecar batches from `process_sidecars`
 // to include the is_log_batch flag
 #[tokio::test]
 async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
@@ -1026,7 +1038,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
                 vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
                 get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?,
             ),
-            "00001.checkpoint.parquet",
+            "00000000000000000001.checkpoint.parquet",
         )
         .await;
     mock_table
@@ -1044,27 +1056,38 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
 
     let checkpoint_file_path = mock_table
         .log_root()
-        .join("00001.checkpoint.parquet")?
+        .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
 
     let mut iter = LogSegment::create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None,
-        vec![create_file_meta(&checkpoint_file_path)],
+        vec![create_log_path(&checkpoint_file_path)],
         mock_table.log_root(),
     )?
     .into_iter();
 
-    // Assert that the first batch returned is from reading sidecarfile1
+    // Assert that the first batch returned is from reading checkpoint file 1
     let (first_batch, is_log_batch) = iter.next().unwrap()?;
     assert!(!is_log_batch);
-    assert_batch_matches(first_batch, add_batch_simple(sidecar_schema.clone()));
+    assert_batch_matches(
+        first_batch,
+        sidecar_batch_with_given_paths(
+            vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
+            get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?,
+        ),
+    );
 
-    // Assert that the second batch returned is from reading sidecarfile2
+    // Assert that the second batch returned is from reading sidecarfile1
     let (second_batch, is_log_batch) = iter.next().unwrap()?;
     assert!(!is_log_batch);
-    assert_batch_matches(second_batch, add_batch_with_remove(sidecar_schema.clone()));
+    assert_batch_matches(second_batch, add_batch_simple(sidecar_schema.clone()));
+
+    // Assert that the second batch returned is from reading sidecarfile2
+    let (third_batch, is_log_batch) = iter.next().unwrap()?;
+    assert!(!is_log_batch);
+    assert_batch_matches(third_batch, add_batch_with_remove(sidecar_schema.clone()));
 
     assert!(iter.next().is_none());
 

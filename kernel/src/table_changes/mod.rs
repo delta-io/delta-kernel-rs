@@ -117,7 +117,7 @@ pub struct TableChanges {
 }
 
 impl TableChanges {
-/// Creates a new [`TableChanges`] instance for the given version range. This function checks
+    /// Creates a new [`TableChanges`] instance for the given version range. This function checks
     /// these properties:
     /// - The change data feed table feature must be enabled in both the start or end versions.
     /// - Other than the deletion vector reader feature, no other reader features are enabled for the table.
