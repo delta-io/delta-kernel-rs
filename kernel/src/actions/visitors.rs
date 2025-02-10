@@ -438,7 +438,6 @@ impl RowVisitor for SetTransactionVisitor {
     }
 }
 
-#[allow(unused)] //TODO: Remove once we implement V2 checkpoint file processing
 #[derive(Default)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct SidecarVisitor {
@@ -476,14 +475,7 @@ impl RowVisitor for SidecarVisitor {
         );
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of a sidecar action
-            let opt_path: Option<String> = getters[0].get_opt(i, "sidecar.path")?;
-            if let Some(path) = opt_path {
-                // We read checkpoint batches with the sidecar action. This results in empty paths
-                // if a row is not a sidecar action. We do not want to create a sidecar action for
-                // these rows.
-                if path.is_empty() {
-                    continue;
-                }
+            if let Some(path) = getters[0].get_opt(i, "cdc.path")? {
                 self.sidecars.push(Self::visit_sidecar(i, path, getters)?);
             }
         }
@@ -607,37 +599,6 @@ mod tests {
                 "tag_foo".to_string(),
                 "tag_bar".to_string(),
             )])),
-        };
-
-        assert_eq!(visitor.sidecars.len(), 1);
-        assert_eq!(visitor.sidecars[0], sidecar1);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_parse_sidecar_with_empty_string_as_path() -> DeltaResult<()> {
-        let engine = SyncEngine::new();
-        let json_handler = engine.get_json_handler();
-        let json_strings: StringArray = vec![
-            r#"{"sidecar":{"path":"","sizeInBytes":9268,"modificationTime":1714496113961,"tags":null}}"#,
-            r#"{"sidecar":{"path":"016ae953-37a9-438e-8683-9a9a4a79a395.parquet","sizeInBytes":9268,"modificationTime":1714496113961,"tags":null}}"#,
-
-        ]
-        .into();
-        let output_schema = get_log_schema().clone();
-        let batch = json_handler
-            .parse_json(string_array_to_engine_data(json_strings), output_schema)
-            .unwrap();
-
-        let mut visitor = SidecarVisitor::default();
-        visitor.visit_rows_of(batch.as_ref())?;
-
-        let sidecar1 = Sidecar {
-            path: "016ae953-37a9-438e-8683-9a9a4a79a395.parquet".into(),
-            size_in_bytes: 9268,
-            modification_time: 1714496113961,
-            tags: None,
         };
 
         assert_eq!(visitor.sidecars.len(), 1);
