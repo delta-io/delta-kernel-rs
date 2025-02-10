@@ -161,7 +161,27 @@ pub(crate) mod test_utils {
             .into()
     }
 
+    /// Checks that two `EngineData` objects are equal by converting them to `RecordBatch` and comparing
     pub(crate) fn assert_batch_matches(actual: Box<dyn EngineData>, expected: Box<dyn EngineData>) {
         assert_eq!(into_record_batch(actual), into_record_batch(expected));
+    }
+
+    /// Checks that the error message from a Result contains the expected substring.
+    pub(crate) fn assert_error_contains<T, E: ToString>(result: Result<T, E>, expected: &str) {
+        match result {
+            Ok(_) => panic!(
+                "Expected an error containing \"{}\", but the result was Ok",
+                expected
+            ),
+            Err(e) => {
+                let err_str = e.to_string();
+                if !err_str.contains(expected) {
+                    panic!(
+                        "Error \"{}\" did not contain expected substring \"{}\"",
+                        err_str, expected
+                    );
+                }
+            }
+        }
     }
 }
