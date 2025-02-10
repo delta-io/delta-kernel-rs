@@ -291,6 +291,7 @@ impl LogSegment {
                     // This closure maps the checkpoint batch to an iterator of batches
                     // by chaining the checkpoint batch with sidecar batches if they exist.
                     let sidecar_content = Self::process_sidecars(
+                        // cheap Arc clone
                         parquet_handler.clone(),
                         log_root.clone(),
                         checkpoint_batch.as_ref(),
@@ -309,6 +310,10 @@ impl LogSegment {
             .map(|result| result?))
     }
 
+    /// Processes sidecar files for the given checkpoint batch.
+    ///
+    /// This function extracts any sidecar file references from the provided batch.
+    /// Each sidecar file is read and an iterator of sidecar file batches is returned
     fn process_sidecars(
         parquet_handler: Arc<dyn ParquetHandler>,
         log_root: Url,
@@ -319,15 +324,15 @@ impl LogSegment {
             return Ok(None);
         }
 
+        // Visit the rows of the checkpoint batch to extract sidecar file references
         let mut visitor = SidecarVisitor::default();
         visitor.visit_rows_of(batch)?;
 
-        // If there are no sidecars, return None
         if visitor.sidecars.is_empty() {
             return Ok(None);
         }
 
-        // Convert sidecar actions to sidecar file paths
+        // Convert sidecar records to FileMeta for reading
         let sidecar_files: Vec<_> = visitor
             .sidecars
             .iter()
@@ -336,7 +341,7 @@ impl LogSegment {
 
         let sidecar_read_schema = get_log_add_schema().clone();
 
-        // Read sidecar files and return as Some(Iterator)
+        // Read the sidecar files and return an iterator of sidecar file batches
         Ok(Some(parquet_handler.read_parquet_files(
             &sidecar_files,
             sidecar_read_schema,
