@@ -515,7 +515,6 @@ pub struct SetTransaction {
 /// file actions. This action is only allowed in checkpoints following the V2 spec.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-file-information
-#[allow(unused)] //TODO: Remove once we implement V2 checkpoint file processing
 #[derive(Schema, Debug, PartialEq)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct Sidecar {
