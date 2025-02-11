@@ -15,14 +15,12 @@ pub(crate) use require;
 pub(crate) mod test_utils {
     use arrow_array::RecordBatch;
     use itertools::Itertools;
+    use object_store::local::LocalFileSystem;
     use object_store::ObjectStore;
-    use object_store::{local::LocalFileSystem, path};
-    use parquet::arrow::ArrowWriter;
     use serde::Serialize;
     use std::{path::Path, sync::Arc};
     use tempfile::TempDir;
     use test_utils::delta_path_for_version;
-    use url::Url;
 
     use crate::{
         actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove},
@@ -81,75 +79,9 @@ pub(crate) mod test_utils {
                 .expect("put log file in store");
         }
 
-        /// Writes all `actions` to a new json checkpoint in the log
-        pub(crate) async fn json_checkpoint(
-            &mut self,
-            actions: impl IntoIterator<Item = Action>,
-            filename: &str,
-        ) {
-            let data = actions
-                .into_iter()
-                .map(|action| serde_json::to_string(&action).unwrap())
-                .join("\n");
-
-            let path = format!("_delta_log/{filename}");
-
-            self.store
-                .put(&path::Path::from(path), data.into())
-                .await
-                .expect("put log file in store");
-        }
-
-        /// Writes all `actions` to a new parquet checkpoint in the log
-        pub(crate) async fn parquet_checkpoint(
-            &mut self,
-            data: Box<dyn EngineData>,
-            filename: &str,
-        ) {
-            let batch: Box<_> = ArrowEngineData::try_from_engine_data(data).unwrap();
-            let record_batch = batch.record_batch();
-
-            let mut buffer = vec![];
-            let mut writer =
-                ArrowWriter::try_new(&mut buffer, record_batch.schema(), None).unwrap();
-            writer.write(record_batch).unwrap();
-            writer.close().unwrap(); // writer must be closed to write footer
-
-            let path = format!("_delta_log/{filename}");
-
-            self.store
-                .put(&path::Path::from(path), buffer.into())
-                .await
-                .expect("put sidecar file in store");
-        }
-
-        /// Writes all `actions` as EngineData to a new sidecar file in the `_delta_log/_sidecars` directory
-        pub(crate) async fn sidecar(&mut self, data: Box<dyn EngineData>, filename: &str) {
-            let batch: Box<_> = ArrowEngineData::try_from_engine_data(data).unwrap();
-            let record_batch = batch.record_batch();
-
-            let mut buffer = vec![];
-            let mut writer =
-                ArrowWriter::try_new(&mut buffer, record_batch.schema(), None).unwrap();
-            writer.write(record_batch).unwrap();
-            writer.close().unwrap(); // writer must be closed to write footer
-
-            let path = format!("_delta_log/_sidecars/{filename:020}");
-
-            self.store
-                .put(&path::Path::from(path), buffer.into())
-                .await
-                .expect("put sidecar file in store");
-        }
-
         /// Get the path to the root of the table.
         pub(crate) fn table_root(&self) -> &Path {
             self.dir.path()
-        }
-
-        /// Get the path to the root of the log in the table.
-        pub(crate) fn log_root(&self) -> Url {
-            Url::from_directory_path(self.dir.path().join("_delta_log")).unwrap()
         }
     }
 
@@ -164,24 +96,5 @@ pub(crate) mod test_utils {
     /// Checks that two `EngineData` objects are equal by converting them to `RecordBatch` and comparing
     pub(crate) fn assert_batch_matches(actual: Box<dyn EngineData>, expected: Box<dyn EngineData>) {
         assert_eq!(into_record_batch(actual), into_record_batch(expected));
-    }
-
-    /// Checks that the error message from a Result contains the expected substring.
-    pub(crate) fn assert_error_contains<T, E: ToString>(result: Result<T, E>, expected: &str) {
-        match result {
-            Ok(_) => panic!(
-                "Expected an error containing \"{}\", but the result was Ok",
-                expected
-            ),
-            Err(e) => {
-                let err_str = e.to_string();
-                if !err_str.contains(expected) {
-                    panic!(
-                        "Error \"{}\" did not contain expected substring \"{}\"",
-                        err_str, expected
-                    );
-                }
-            }
-        }
     }
 }

@@ -224,9 +224,7 @@ impl LogSegment {
             meta_predicate,
             self.checkpoint_parts.clone(),
             self.log_root.clone(),
-        )
-        .into_iter()
-        .flatten();
+        )?;
 
         Ok(commit_stream.chain(checkpoint_stream))
     }
@@ -238,7 +236,7 @@ impl LogSegment {
     /// - Schema does not contain file actions
     ///
     /// For single-part checkpoints, any referenced sidecar files are processed. These
-    /// sidecar files contain the actual add/remove actions that would otherwise be
+    /// sidecar files contain the actual add actions that would otherwise be
     /// stored directly in the checkpoint. The sidecar file batches are chained to the
     /// checkpoint batch in the top level iterator to be returned.
     fn create_checkpoint_stream(
@@ -248,9 +246,9 @@ impl LogSegment {
         checkpoint_parts: Vec<ParsedLogPath>,
         log_root: Url,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
-        let need_file_actions = checkpoint_read_schema.contains(ADD_NAME);
+        let need_add_actions = checkpoint_read_schema.contains(ADD_NAME);
         require!(
-            !need_file_actions || checkpoint_read_schema.contains(SIDECAR_NAME),
+            !need_add_actions || checkpoint_read_schema.contains(SIDECAR_NAME),
             Error::generic(
                 "If the checkpoint read schema contains file actions, it must contain the sidecar column"
             )
@@ -278,24 +276,26 @@ impl LogSegment {
             )?
         };
 
-        // 1. In the case where the schema does not contain add/remove actions, we return the checkpoint
-        // batch directly as sidecar files only have to be read when the schema contains add/remove actions.
-        // 2. Multi-part checkpoint batches never have sidecar actions, so the batch is returned as-is.
-        let skip_sidecar_search = !need_file_actions || checkpoint_parts.len() > 1;
-
         let parquet_handler = engine.get_parquet_handler();
         Ok(actions
             .map(move |batch_result| {
                 batch_result.and_then(|checkpoint_batch| {
                     // This closure maps the checkpoint batch to an iterator of batches
                     // by chaining the checkpoint batch with sidecar batches if they exist.
-                    let sidecar_content = Self::process_sidecars(
-                        // cheap Arc clone
-                        parquet_handler.clone(),
-                        log_root.clone(),
-                        checkpoint_batch.as_ref(),
-                        skip_sidecar_search,
-                    )?;
+
+                    // 1. In the case where the schema does not contain add/remove actions, we return the checkpoint
+                    // batch directly as sidecar files only have to be read when the schema contains add/remove actions.
+                    // 2. Multi-part checkpoint batches never have sidecar actions, so the batch is returned as-is.
+                    let sidecar_content = if !need_add_actions || checkpoint_parts.len() > 1 {
+                        None
+                    } else {
+                        Self::process_sidecars(
+                            // cheap Arc clone
+                            parquet_handler.clone(),
+                            log_root.clone(),
+                            checkpoint_batch.as_ref(),
+                        )?
+                    };
 
                     Ok(std::iter::once(Ok((checkpoint_batch, false))).chain(
                         sidecar_content
@@ -318,14 +318,7 @@ impl LogSegment {
         parquet_handler: Arc<dyn ParquetHandler>,
         log_root: Url,
         batch: &dyn EngineData,
-        skip_sidecar_search: bool,
     ) -> DeltaResult<Option<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>> {
-        // If the schema does not contain add/remove actions or we have a multi-part checkpoint,
-        // we return early as sidecar files are not needed.
-        if skip_sidecar_search {
-            return Ok(None);
-        }
-
         // Visit the rows of the checkpoint batch to extract sidecar file references
         let mut visitor = SidecarVisitor::default();
         visitor.visit_rows_of(batch)?;
