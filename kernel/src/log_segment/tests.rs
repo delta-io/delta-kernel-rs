@@ -1000,7 +1000,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
     Ok(())
 }
 
-// TODO: arrow v53.3 introduces bug surrounding nullabilty of fields in schema projection.
+// TODO: Fix https://github.com/apache/arrow-rs/issues/7119
 // Once addressed, pass the `v2_checkpoint_read_schema` to `add_batch_simple` instead of `get_log_add_schema()`
 // to ensure the issue is fixed
 #[test]
