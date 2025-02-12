@@ -1,5 +1,4 @@
 #![cfg_attr(rustfmt, rustfmt_skip)]
-use std::convert::identity;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
