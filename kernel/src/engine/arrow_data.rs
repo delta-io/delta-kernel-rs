@@ -12,7 +12,13 @@ use tracing::debug;
 
 use std::collections::{HashMap, HashSet};
 
-/// ArrowEngineData holds an Arrow RecordBatch, implements `EngineData` so the kernel can extract from it.
+pub use crate::engine::arrow_utils::fix_nested_null_masks;
+
+/// ArrowEngineData holds an Arrow `RecordBatch`, implements `EngineData` so the kernel can extract from it.
+///
+/// WARNING: Row visitors require that all leaf columns of the record batch have correctly computed
+/// NULL masks. The arrow parquet reader is known to produce incomplete NULL masks, for
+/// example. When in doubt, call [`fix_nested_null_masks`] first.
 pub struct ArrowEngineData {
     data: RecordBatch,
 }
@@ -40,6 +46,12 @@ impl ArrowEngineData {
 impl From<RecordBatch> for ArrowEngineData {
     fn from(value: RecordBatch) -> Self {
         ArrowEngineData::new(value)
+    }
+}
+
+impl From<StructArray> for ArrowEngineData {
+    fn from(value: StructArray) -> Self {
+        ArrowEngineData::new(value.into())
     }
 }
 
