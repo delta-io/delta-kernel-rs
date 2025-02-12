@@ -347,6 +347,7 @@ mod tests {
         size: i64,
         stats: Option<Stats>,
         _: DvInfo,
+        _: Option<ExpressionRef>,
         part_vals: HashMap<String, String>,
     ) {
         assert_eq!(

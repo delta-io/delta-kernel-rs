@@ -66,7 +66,7 @@ static GArrowRecordBatch* add_partition_columns(
     char* col = partition_cols->cols[i];
     guint pos = cols + i;
     KernelStringSlice key = { col, strlen(col) };
-    char* partition_val = get_from_map(partition_values, key, allocate_string);
+    char* partition_val = get_from_string_map(partition_values, key, allocate_string);
     print_diag(
       "  Adding partition column '%s' with value '%s' at column %u\n",
       col,
