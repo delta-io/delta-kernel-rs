@@ -691,31 +691,39 @@ pub(crate) mod test_utils {
         Box::new(ArrowEngineData::new(batch))
     }
 
-    // simple sidecar
+    // Generates a batch of sidecar actions with the given paths.
+    // The schema is provided as null columns affect equality checks.
     pub(crate) fn sidecar_batch_with_given_paths(
         paths: Vec<&str>,
         output_schema: SchemaRef,
     ) -> Box<ArrowEngineData> {
         let handler = SyncJsonHandler {};
 
-        let json_strings: StringArray = paths
+        let mut json_strings: Vec<String> = paths
         .iter()
         .map(|path| {
             format!(
-                r#"{{"sidecar":{{"path":"{path}","sizeInBytes":9268,"modificationTime":1714496113961,"tags":{{"tag_foo":"tag_bar"}}}}}}"#,
+                r#"{{"sidecar":{{"path":"{path}","sizeInBytes":9268,"modificationTime":1714496113961,"tags":{{"tag_foo":"tag_bar"}}}}}}"#
             )
         })
-        .collect_vec()
-        .into();
+        .collect();
+        json_strings.push(r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#.to_string());
+
+        let json_strings_array: StringArray =
+            json_strings.iter().map(|s| s.as_str()).collect_vec().into();
 
         let parsed = handler
-            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .parse_json(
+                string_array_to_engine_data(json_strings_array),
+                output_schema,
+            )
             .unwrap();
 
         ArrowEngineData::try_from_engine_data(parsed).unwrap()
     }
 
-    // A simple add batch parsed with the schema provided
+    // Generates a batch with an add action.
+    // The schema is provided as null columns affect equality checks.
     pub(crate) fn add_batch_simple(output_schema: SchemaRef) -> Box<ArrowEngineData> {
         let handler = SyncJsonHandler {};
         let json_strings: StringArray = vec![
