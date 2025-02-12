@@ -197,7 +197,6 @@ impl TableConfiguration {
     /// - The table must have a writer version between 2 and 7 (inclusive)
     /// - If the table is on writer version 7, it must have the [`WriterFeatures::AppendOnly`]
     ///   writer feature.
-    #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn is_append_only_supported(&self) -> bool {
         let protocol = &self.protocol;
