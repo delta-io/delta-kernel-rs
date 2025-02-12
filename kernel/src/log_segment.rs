@@ -249,7 +249,7 @@ impl LogSegment {
         let need_add_actions = checkpoint_read_schema.contains(ADD_NAME);
         require!(
             !need_add_actions || checkpoint_read_schema.contains(SIDECAR_NAME),
-            Error::generic(
+        Error::invalid_checkpoint(
                 "If the checkpoint read schema contains file actions, it must contain the sidecar column"
             )
         );
@@ -333,12 +333,10 @@ impl LogSegment {
             .map(|sidecar| Self::sidecar_to_filemeta(sidecar, &log_root))
             .try_collect()?;
 
-        let sidecar_read_schema = get_log_add_schema().clone();
-
         // Read the sidecar files and return an iterator of sidecar file batches
         Ok(Some(parquet_handler.read_parquet_files(
             &sidecar_files,
-            sidecar_read_schema,
+            get_log_add_schema().clone(),
             None,
         )?))
     }
