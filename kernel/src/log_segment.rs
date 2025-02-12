@@ -277,37 +277,36 @@ impl LogSegment {
         };
 
         let parquet_handler = engine.get_parquet_handler();
-        Ok(actions
-            .map(move |batch_result| {
-                batch_result.and_then(|checkpoint_batch| {
-                    // This closure maps the checkpoint batch to an iterator of batches
-                    // by chaining the checkpoint batch with sidecar batches if they exist.
+        let actions_iter = actions
+            .map(move |batch_result| -> DeltaResult<_> {
+                let checkpoint_batch = batch_result?;
+                // This closure maps the checkpoint batch to an iterator of batches
+                // by chaining the checkpoint batch with sidecar batches if they exist.
 
-                    // 1. In the case where the schema does not contain add/remove actions, we return the checkpoint
-                    // batch directly as sidecar files only have to be read when the schema contains add/remove actions.
-                    // 2. Multi-part checkpoint batches never have sidecar actions, so the batch is returned as-is.
-                    let sidecar_content = if !need_add_actions || checkpoint_parts.len() > 1 {
-                        None
-                    } else {
-                        Self::process_sidecars(
-                            // cheap Arc clone
-                            parquet_handler.clone(),
-                            log_root.clone(),
-                            checkpoint_batch.as_ref(),
-                        )?
-                    };
+                // 1. In the case where the schema does not contain add/remove actions, we return the checkpoint
+                // batch directly as sidecar files only have to be read when the schema contains add/remove actions.
+                // 2. Multi-part checkpoint batches never have sidecar actions, so the batch is returned as-is.
+                let sidecar_content = if !need_add_actions || checkpoint_parts.len() > 1 {
+                    None
+                } else {
+                    Self::process_sidecars(
+                        parquet_handler.clone(), // cheap Arc clone
+                        log_root.clone(),
+                        checkpoint_batch.as_ref(),
+                    )?
+                };
 
-                    Ok(std::iter::once(Ok((checkpoint_batch, false))).chain(
-                        sidecar_content
-                            .into_iter()
-                            .flatten()
-                            .map_ok(|sidecar_batch| (sidecar_batch, false)),
-                    ))
-                })
+                let combined_batches = std::iter::once(Ok(checkpoint_batch))
+                    .chain(sidecar_content.into_iter().flatten())
+                    .map_ok(|sidecar_batch| (sidecar_batch, false));
+
+                Ok(combined_batches)
             })
             .flatten_ok()
             // Map converts Result<Result<Box<dyn EngineData>, _>,_> to Result<Box<dyn EngineData>, _>
-            .map(|result| result?))
+            .map(|result| result?);
+
+        Ok(actions_iter)
     }
 
     /// Processes sidecar files for the given checkpoint batch.
