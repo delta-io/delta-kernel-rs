@@ -438,7 +438,6 @@ impl RowVisitor for SetTransactionVisitor {
     }
 }
 
-#[allow(unused)] //TODO: Remove once we implement V2 checkpoint file processing
 #[derive(Default)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct SidecarVisitor {
