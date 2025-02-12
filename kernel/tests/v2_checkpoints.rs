@@ -1,3 +1,4 @@
+// rustfmt::skip
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
