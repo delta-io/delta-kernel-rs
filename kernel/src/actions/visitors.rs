@@ -475,7 +475,14 @@ impl RowVisitor for SidecarVisitor {
         );
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of a sidecar action
-            if let Some(path) = getters[0].get_opt(i, "sidecar.path")? {
+            let opt_path: Option<String> = getters[0].get_opt(i, "sidecar.path")?;
+            if let Some(path) = opt_path {
+                // TODO: Known issue here https://github.com/apache/arrow-rs/issues/7119
+                // Once https://github.com/delta-io/delta-kernel-rs/pull/692 is merged, remove empty path check.
+                // This is a workaround to avoid constructing a sidecar action with an empty path for testing.
+                if path.is_empty() {
+                    continue;
+                }
                 self.sidecars.push(Self::visit_sidecar(i, path, getters)?);
             }
         }
