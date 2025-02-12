@@ -1,4 +1,5 @@
-// rustfmt::skip
+#![cfg_attr(rustfmt, rustfmt_skip)]
+use std::convert::identity;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -9,6 +10,7 @@ use delta_kernel::{DeltaResult, Table};
 
 mod common;
 use common::{load_test_data, read_scan};
+use itertools::Itertools;
 
 fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
@@ -24,7 +26,7 @@ fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<Recor
 }
 
 fn test_v2_checkpoints(table_name: &str) -> DeltaResult<()> {
-    let num_of_max_digits = 999.to_string().len();
+    let max_width = 3; // Max width of id column in the table (used for formatting)
     let batches = read_v2_checkpoint_table(table_name)?;
 
     fn generate_rows(count: usize, width: usize) -> Vec<String> {
@@ -33,26 +35,25 @@ fn test_v2_checkpoints(table_name: &str) -> DeltaResult<()> {
             .collect()
     }
 
-    let mut expected = vec![
+    // Generate rows of expected table in the same manner as delta-spark creates them
+    let header = vec![
         "+-----+".to_string(),
         "| id  |".to_string(),
         "+-----+".to_string(),
     ];
 
-    // Generate rows of expected table in the same manner as delta-spark creates them
-    expected.extend(vec!["| 0   |".to_string(); 3]);
-    let all_batches = [
-        generate_rows(30, num_of_max_digits),
-        generate_rows(100, num_of_max_digits),
-        generate_rows(100, num_of_max_digits),
-        generate_rows(1000, num_of_max_digits),
-    ];
-    
-    for batch in all_batches {
-        expected.extend(batch);
-    }
-
-    expected.push("+-----+".to_string());
+    let mut expected = [
+        header,
+        vec!["| 0   |".to_string(); 3],
+        generate_rows(30, max_width),
+        generate_rows(100, max_width),
+        generate_rows(100, max_width),
+        generate_rows(1000, max_width),
+        vec!["+-----+".to_string()],
+    ]
+    .into_iter()
+    .flat_map(identity)
+    .collect_vec();
 
     sort_lines!(expected);
     assert_batches_sorted_eq!(expected, &batches);
