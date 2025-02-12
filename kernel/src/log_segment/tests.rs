@@ -5,6 +5,7 @@ use object_store::{memory::InMemory, path::Path, ObjectStore};
 use parquet::arrow::ArrowWriter;
 use url::Url;
 
+use crate::actions::visitors::AddVisitor;
 use crate::actions::{
     get_log_add_schema, get_log_schema, Add, Sidecar, ADD_NAME, METADATA_NAME, SIDECAR_NAME,
 };
@@ -20,7 +21,7 @@ use crate::scan::test_utils::{
 };
 use crate::snapshot::CheckpointMetadata;
 use crate::utils::test_utils::{assert_batch_matches, Action};
-use crate::{DeltaResult, Engine, EngineData, FileMeta, FileSystemClient, Table};
+use crate::{DeltaResult, Engine, EngineData, FileMeta, FileSystemClient, RowVisitor, Table};
 use test_utils::delta_path_for_version;
 
 // NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
@@ -130,7 +131,7 @@ fn new_in_memory_store() -> (Arc<InMemory>, Url) {
 }
 
 // Writes a record batch obtained from engine data to the in-memory store at a given path.
-fn write_record_batch_to_store(
+fn write_parquet_to_store(
     store: &Arc<InMemory>,
     path: String,
     data: Box<dyn EngineData>,
@@ -163,7 +164,7 @@ fn add_checkpoint_to_store(
     filename: &str,
 ) -> DeltaResult<()> {
     let path = format!("_delta_log/{}", filename);
-    write_record_batch_to_store(store, path, data)
+    write_parquet_to_store(store, path, data)
 }
 
 /// Writes all actions to a _delta_log/_sidecars file in the store.
@@ -174,12 +175,12 @@ fn add_sidecar_to_store(
     filename: &str,
 ) -> DeltaResult<()> {
     let path = format!("_delta_log/_sidecars/{}", filename);
-    write_record_batch_to_store(store, path, data)
+    write_parquet_to_store(store, path, data)
 }
 
 /// Writes all actions to a _delta_log json checkpoint file in the store.
 /// This function formats the provided filename into the _delta_log directory.
-fn add_json_checkpoint_to_store(
+fn write_json_to_store(
     store: &Arc<InMemory>,
     actions: Vec<Action>,
     filename: &str,
@@ -1054,7 +1055,7 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
     );
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
-    add_json_checkpoint_to_store(
+    write_json_to_store(
         &store,
         vec![Action::Add(Add {
             path: "fake_path_1".into(),
@@ -1077,12 +1078,13 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
     )?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
-    let (_first_batch, is_log_batch) = iter.next().unwrap()?;
+    let (first_batch, is_log_batch) = iter.next().unwrap()?;
     assert!(!is_log_batch);
-    // Although we do not assert the contents, we know the JSON checkpoint is read correctly as
-    // a single batch is returned and no errors are thrown.
+    let mut visitor = AddVisitor::default();
+    visitor.visit_rows_of(&*first_batch)?;
+    assert!(visitor.adds.len() == 1);
+    assert!(visitor.adds[0].path == "fake_path_1");
 
-    // TODO: Convert JSON checkpoint to RecordBatch and assert that it is as expected for better testing
     assert!(iter.next().is_none());
 
     Ok(())
