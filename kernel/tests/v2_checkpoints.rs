@@ -52,7 +52,7 @@ fn test_v2_checkpoints(table_name: &str) -> DeltaResult<()> {
         vec!["+-----+".to_string()],
     ]
     .into_iter()
-    .flat_map(identity)
+    .flatten()
     .collect_vec();
 
     sort_lines!(expected);
