@@ -37,6 +37,9 @@ where
 // attempt to parse a key-value pair into a `TableProperties` struct. Returns Some(()) if the key
 // was successfully parsed, and None otherwise.
 fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
+    // NOTE!! we do Some(parse(v)?) instead of just parse(v) because we want to return None if the
+    // parsing fails. If we simply call 'parse(v)', then we would (incorrectly) return Some(()) and
+    // just set the property to None.
     match k {
         "delta.appendOnly" => props.append_only = Some(parse_bool(v)?),
         "delta.autoOptimize.autoCompact" => props.auto_compact = Some(parse_bool(v)?),
@@ -76,17 +79,36 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         }
         "delta.checkpointPolicy" => props.checkpoint_policy = CheckpointPolicy::try_from(v).ok(),
         "delta.enableRowTracking" => props.enable_row_tracking = Some(parse_bool(v)?),
+        "delta.enableInCommitTimestamps" => {
+            props.enable_in_commit_timestamps = Some(parse_bool(v)?)
+        }
+        "delta.inCommitTimestampEnablementVersion" => {
+            props.in_commit_timestamp_enablement_version = Some(parse_non_negative(v)?)
+        }
+        "delta.inCommitTimestampEnablementTimestamp" => {
+            props.in_commit_timestamp_enablement_timestamp = Some(parse_non_negative(v)?)
+        }
         _ => return None,
     }
     Some(())
 }
 
-/// Deserialize a string representing a positive integer into an `Option<u64>`. Returns `Some` if
-/// successfully parses, and `None` otherwise.
+/// Deserialize a string representing a positive (> 0) integer into an `Option<u64>`. Returns `Some`
+/// if successfully parses, and `None` otherwise.
 pub(crate) fn parse_positive_int(s: &str) -> Option<NonZero<u64>> {
-    // parse to i64 (then check n > 0) since java doesn't even allow u64
-    let n: i64 = s.parse().ok()?;
-    NonZero::new(n.try_into().ok()?)
+    // parse as non-negative and verify the result is non-zero
+    NonZero::new(parse_non_negative(s)?)
+}
+
+/// Deserialize a string representing a non-negative integer into an `Option<u64>`. Returns `Some` if
+/// successfully parses, and `None` otherwise.
+pub(crate) fn parse_non_negative<T>(s: &str) -> Option<T>
+where
+    i64: TryInto<T>,
+{
+    // parse to i64 since java doesn't even allow u64
+    let n: i64 = s.parse().ok().filter(|&i| i >= 0)?;
+    n.try_into().ok()
 }
 
 /// Deserialize a string representing a boolean into an `Option<bool>`. Returns `Some` if
@@ -199,10 +221,16 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_positive_int() {
-        assert_eq!(parse_positive_int("123").unwrap().get(), 123);
+    fn test_parse_int() {
+        assert_eq!(parse_positive_int("12").unwrap().get(), 12);
         assert_eq!(parse_positive_int("0"), None);
-        assert_eq!(parse_positive_int("-123"), None);
+        assert_eq!(parse_positive_int("-12"), None);
+        assert_eq!(parse_non_negative::<u64>("12").unwrap(), 12);
+        assert_eq!(parse_non_negative::<u64>("0").unwrap(), 0);
+        assert_eq!(parse_non_negative::<u64>("-12"), None);
+        assert_eq!(parse_non_negative::<i64>("12").unwrap(), 12);
+        assert_eq!(parse_non_negative::<i64>("0").unwrap(), 0);
+        assert_eq!(parse_non_negative::<i64>("-12"), None);
     }
 
     #[test]
