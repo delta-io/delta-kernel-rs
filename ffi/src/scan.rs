@@ -7,7 +7,7 @@ use delta_kernel::scan::state::{visit_scan_files, DvInfo, GlobalScanState};
 use delta_kernel::scan::{Scan, ScanData};
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{DeltaResult, Error, ExpressionRef};
+use delta_kernel::{DeltaResult, Error, Expression, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
@@ -15,6 +15,7 @@ use url::Url;
 use crate::expressions::engine::{
     unwrap_kernel_expression, EnginePredicate, KernelExpressionVisitorState,
 };
+use crate::expressions::SharedExpression;
 use crate::{
     kernel_string_slice, AllocateStringFn, ExclusiveEngineData, ExternEngine, ExternResult,
     IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice, NullableCvoid,
@@ -99,12 +100,25 @@ pub unsafe extern "C" fn get_global_read_schema(
     state.physical_schema.clone().into()
 }
 
-/// Free a global read schema
+/// Get the kernel view of the physical read schema that an engine should read from parquet file in
+/// a scan
+///
+/// # Safety
+/// Engine is responsible for providing a valid GlobalScanState pointer
+#[no_mangle]
+pub unsafe extern "C" fn get_global_logical_schema(
+    state: Handle<SharedGlobalScanState>,
+) -> Handle<SharedSchema> {
+    let state = unsafe { state.as_ref() };
+    state.logical_schema.clone().into()
+}
+
+/// Free a schema
 ///
 /// # Safety
 /// Engine is responsible for providing a valid schema obtained via [`get_global_read_schema`]
 #[no_mangle]
-pub unsafe extern "C" fn free_global_read_schema(schema: Handle<SharedSchema>) {
+pub unsafe extern "C" fn free_schema(schema: Handle<SharedSchema>) {
     schema.drop_handle();
 }
 
@@ -263,12 +277,23 @@ pub struct Stats {
     pub num_records: u64,
 }
 
+/// This callback will be invoked for each valid file that needs to be read for a scan.
+///
+/// The arguments to the callback are:
+/// * `context`: a `void*` context this can be anything that engine needs to pass through to each call
+/// * `path`: a `KernelStringSlice` which is the path to the file
+/// * `size`: an `i64` which is the size of the file
+/// * `dv_info`: a [`DvInfo`] struct, which allows getting the selection vector for this file
+/// * `transform`: An optional expression that, if not `NULL`, _must_ be applied to physical data to
+///                convert it to the correct logical format. If this is `NULL`, no transform is needed.
+/// * `partition_values`: [DEPRECATED] a `HashMap<String, String>` which are partition values
 type CScanCallback = extern "C" fn(
     engine_context: NullableCvoid,
     path: KernelStringSlice,
     size: i64,
     stats: Option<&Stats>,
     dv_info: &DvInfo,
+    transform: Option<&Expression>,
     partition_map: &CStringMap,
 );
 
@@ -303,8 +328,38 @@ pub unsafe extern "C" fn get_from_string_map(
         .and_then(|v| allocate_fn(kernel_string_slice!(v)))
 }
 
+/// Transformation expressions that need to be applied to each row `i` in ScanData. You can use
+/// [`get_transform_for_row`] to get the transform for a particular row. If that returns an
+/// associated expression, it _must_ be applied to the data read from the file specified by the
+/// row. The resultant schema for this expression is guaranteed to be `Scan.schema()`. If
+/// `get_transform_for_row` returns `NULL` no expression need be applied and the data read from disk
+/// is already in the correct logical state.
+///
+/// NB: If you are using `visit_scan_data` you don't need to worry about dealing with probing
+/// `CTransforms`. The callback will be invoked with the correct transform for you.
 pub struct CTransforms {
     transforms: Vec<Option<ExpressionRef>>,
+}
+
+#[no_mangle]
+/// Allow getting the transform for a particular row. If the requested row is outside the range of
+/// the passed `CTransforms` returns `NULL`, otherwise returns the element at the index of the
+/// specified row. See also [`CTransforms`] above.
+///
+/// # Safety
+///
+/// The engine is responsible for providing a valid [`CTransforms`] pointer, and for checking if the
+/// return value is `NULL` or not.
+pub unsafe extern "C" fn get_transform_for_row(
+    row: usize,
+    transforms: &CTransforms,
+) -> Option<Handle<SharedExpression>> {
+    transforms
+        .transforms
+        .get(row)
+        .cloned()
+        .flatten()
+        .map(Into::into)
 }
 
 /// Get a selection vector out of a [`DvInfo`] struct
@@ -369,9 +424,10 @@ fn rust_callback(
     size: i64,
     kernel_stats: Option<delta_kernel::scan::state::Stats>,
     dv_info: DvInfo,
-    _transform: Option<ExpressionRef>,
+    transform: Option<ExpressionRef>,
     partition_values: HashMap<String, String>,
 ) {
+    let transform = transform.map(|e| e.as_ref().clone());
     let partition_map = CStringMap {
         values: partition_values,
     };
@@ -384,6 +440,7 @@ fn rust_callback(
         size,
         stats.as_ref(),
         &dv_info,
+        transform.as_ref(),
         &partition_map,
     );
 }
