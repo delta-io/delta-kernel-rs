@@ -112,15 +112,15 @@ void visit_partition(void* context, const KernelStringSlice partition)
 }
 
 // Build a list of partition column names.
-PartitionList* get_partition_list(SharedSnapshot* state)
+PartitionList* get_partition_list(SharedSnapshot* snapshot)
 {
   print_diag("Building list of partition columns\n");
-  uintptr_t count = get_partition_column_count(state);
+  uintptr_t count = get_partition_column_count(snapshot);
   PartitionList* list = malloc(sizeof(PartitionList));
   // We set the `len` to 0 here and use it to track how many items we've added to the list
   list->len = 0;
   list->cols = malloc(sizeof(char*) * count);
-  StringSliceIterator* part_iter = get_partition_columns(state);
+  StringSliceIterator* part_iter = get_partition_columns(snapshot);
   for (;;) {
     bool has_next = string_slice_next(part_iter, list, visit_partition);
     if (!has_next) {
