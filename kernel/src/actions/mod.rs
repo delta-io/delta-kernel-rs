@@ -287,11 +287,11 @@ impl Protocol {
                 ))
             }
             None => {
-                // no features, just ensure we're then not on version 7
+                // no features, we currently only support version 1 in this case
                 require!(
-                    self.min_writer_version != 7,
-                    Error::invalid_protocol(
-                        "If min_writer_version == 7, writer_features _must_ be present"
+                    self.min_writer_version == 1,
+                    Error::unsupported(
+                        "Currently delta-kernel-rs can only write to tables with min_writer_version = 1 or 7"
                     )
                 );
                 Ok(())
