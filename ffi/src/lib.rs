@@ -612,7 +612,7 @@ pub unsafe extern "C" fn version(snapshot: Handle<SharedSnapshot>) -> u64 {
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid handle.
+/// Caller is responsible for passing a valid snapshot handle.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_table_root(
     snapshot: Handle<SharedSnapshot>,
@@ -633,10 +633,10 @@ pub unsafe extern "C" fn get_partition_column_count(snapshot: Handle<SharedSnaps
     snapshot.metadata().partition_columns.len()
 }
 
-/// Get an iterator of the list of partition columns for this scan.
+/// Get an iterator of the list of partition columns for this snapshot.
 ///
 /// # Safety
-/// Caller is responsible for passing a valid global scan pointer.
+/// Caller is responsible for passing a valid snapshot handle.
 #[no_mangle]
 pub unsafe extern "C" fn get_partition_columns(
     snapshot: Handle<SharedSnapshot>,
