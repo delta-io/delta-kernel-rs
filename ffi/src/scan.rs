@@ -359,7 +359,7 @@ pub unsafe extern "C" fn get_transform_for_row(
         .get(row)
         .cloned()
         .flatten()
-        .map(|transform| transform.into())
+        .map(Into::into)
 }
 
 /// Get a selection vector out of a [`DvInfo`] struct

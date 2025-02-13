@@ -113,26 +113,25 @@ static ExclusiveEngineData* apply_transform(
   if (!context->arrow_context->cur_transform) {
     print_diag("  No transform needed");
     return data;
-  } else {
-    print_diag("  Applying transform\n");
-    SharedExpressionEvaluator* evaluator = get_evaluator(
-      context->engine,
-      context->read_schema, // input schema
-      context->arrow_context->cur_transform,
-      context->logical_schema); // output schema
-    ExternResultHandleExclusiveEngineData transformed_res = evaluate(
-      context->engine,
-      &data,
-      evaluator);
-    free_engine_data(data);
-    free_evaluator(evaluator);
-    if (transformed_res.tag != OkHandleExclusiveEngineData) {
-      print_error("Failed to transform read data.", (Error*)transformed_res.err);
-      free_error((Error*)transformed_res.err);
-      return NULL;
-    }
-    return transformed_res.ok;
   }
+  print_diag("  Applying transform\n");
+  SharedExpressionEvaluator* evaluator = get_evaluator(
+    context->engine,
+    context->read_schema, // input schema
+    context->arrow_context->cur_transform,
+    context->logical_schema); // output schema
+  ExternResultHandleExclusiveEngineData transformed_res = evaluate(
+    context->engine,
+    &data,
+    evaluator);
+  free_engine_data(data);
+  free_evaluator(evaluator);
+  if (transformed_res.tag != OkHandleExclusiveEngineData) {
+    print_error("Failed to transform read data.", (Error*)transformed_res.err);
+    free_error((Error*)transformed_res.err);
+    return NULL;
+  }
+  return transformed_res.ok;
 }
 
 // This is the callback that will be called for each chunk of data read from the parquet file
@@ -142,7 +141,6 @@ static void visit_read_data(void* vcontext, ExclusiveEngineData* data)
   struct EngineContext* context = vcontext;
   ExclusiveEngineData* transformed = apply_transform(context, data);
   if (!transformed) {
-    // TODO: What?
     exit(-1);
   }
   ExternResultArrowFFIData arrow_res = get_raw_arrow_data(transformed, context->engine);

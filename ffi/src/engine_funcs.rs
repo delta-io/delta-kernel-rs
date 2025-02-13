@@ -203,8 +203,7 @@ fn evaluate_impl(
     batch: &dyn EngineData,
     evaluator: &dyn ExpressionEvaluator,
 ) -> DeltaResult<Handle<ExclusiveEngineData>> {
-    let res = evaluator.evaluate(batch);
-    res.map(|d| d.into())
+    evaluator.evaluate(batch).map(Into::into)
 }
 
 #[cfg(test)]
