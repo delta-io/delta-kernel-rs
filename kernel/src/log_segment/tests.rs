@@ -143,15 +143,10 @@ fn write_parquet_to_store(
     let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
     writer.write(record_batch)?;
     writer.close()?;
-    println!("Writing to path: {}", path);
 
     tokio::runtime::Runtime::new()
         .expect("create tokio runtime")
-        .block_on(async {
-            if let Err(e) = store.put(&Path::from(path), buffer.into()).await {
-                eprintln!("Error writing to store: {}", e);
-            }
-        });
+        .block_on(async { store.put(&Path::from(path), buffer.into()).await })?;
 
     Ok(())
 }
