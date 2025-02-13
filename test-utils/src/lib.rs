@@ -16,22 +16,38 @@ pub const METADATA: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operatio
 {"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
 {"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 
+/// A common useful initial metadata and protocol. Also includes a single commitInfo
+pub const METADATA_WITH_PARTITION_COLS: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
+{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
+{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["val"],"configuration":{},"createdTime":1587968585495}}"#;
+
 pub enum TestAction {
     Add(String),
     Remove(String),
     Metadata,
 }
 
-/// Convert a vector of actions into a newline delimited json string
+// TODO: We need a better way to mock tables :)
+
+/// Convert a vector of actions into a newline delimited json string, with standard metadata
 pub fn actions_to_string(actions: Vec<TestAction>) -> String {
+    actions_to_string_with_metadata(actions, METADATA)
+}
+
+/// Convert a vector of actions into a newline delimited json string, with metadata including a partition column
+pub fn actions_to_string_partitioned(actions: Vec<TestAction>) -> String {
+    actions_to_string_with_metadata(actions, METADATA_WITH_PARTITION_COLS)
+}
+
+fn actions_to_string_with_metadata(actions: Vec<TestAction>, metadata: &str) -> String {
     actions
-            .into_iter()
-            .map(|test_action| match test_action {
-                TestAction::Add(path) => format!(r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 1}},\"maxValues\":{{\"id\":3}}}}"}}}}"#),
-                TestAction::Remove(path) => format!(r#"{{"remove":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true}}}}"#),
-                TestAction::Metadata => METADATA.into(),
-            })
-            .join("\n")
+        .into_iter()
+        .map(|test_action| match test_action {
+            TestAction::Add(path) => format!(r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 1}},\"maxValues\":{{\"id\":3}}}}"}}}}"#),
+            TestAction::Remove(path) => format!(r#"{{"remove":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true}}}}"#),
+            TestAction::Metadata => metadata.into(),
+        })
+        .join("\n")
 }
 
 /// convert a RecordBatch into a vector of bytes. We can't use `From` since these are both foreign

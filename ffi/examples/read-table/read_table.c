@@ -112,7 +112,7 @@ void visit_partition(void* context, const KernelStringSlice partition)
 }
 
 // Build a list of partition column names.
-PartitionList* get_partition_list(SharedGlobalScanState* state)
+PartitionList* get_partition_list(SharedSnapshot* state)
 {
   print_diag("Building list of partition columns\n");
   uintptr_t count = get_partition_column_count(state);
@@ -263,6 +263,8 @@ int main(int argc, char* argv[])
   char* table_root = snapshot_table_root(snapshot, allocate_string);
   print_diag("Table root: %s\n", table_root);
 
+  PartitionList* partition_cols = get_partition_list(snapshot);
+
   print_diag("Starting table scan\n\n");
 
   ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL);
@@ -274,7 +276,6 @@ int main(int argc, char* argv[])
   SharedScan* scan = scan_res.ok;
   SharedGlobalScanState* global_state = get_global_scan_state(scan);
   SharedSchema* read_schema = get_global_read_schema(global_state);
-  PartitionList* partition_cols = get_partition_list(global_state);
   struct EngineContext context = {
     global_state,
     read_schema,
