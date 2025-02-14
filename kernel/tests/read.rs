@@ -58,7 +58,6 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngine::new(
         storage.clone(),
-        Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
     ));
 
@@ -113,11 +112,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine = DefaultEngine::new(
-        storage.clone(),
-        Path::from("/"),
-        Arc::new(TokioBackgroundExecutor::new()),
-    );
+    let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
     let table = Table::new(location);
     let expected_data = vec![batch.clone(), batch];
@@ -171,11 +166,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine = DefaultEngine::new(
-        storage.clone(),
-        Path::from("/"),
-        Arc::new(TokioBackgroundExecutor::new()),
-    );
+    let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
     let table = Table::new(location);
     let expected_data = vec![batch];
@@ -249,7 +240,6 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     let location = Url::parse("memory:///").unwrap();
     let engine = Arc::new(DefaultEngine::new(
         storage.clone(),
-        Path::from(""),
         Arc::new(TokioBackgroundExecutor::new()),
     ));
 

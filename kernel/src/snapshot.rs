@@ -249,11 +249,9 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let store = Arc::new(LocalFileSystem::new());
-        let prefix = Path::from(url.path());
         let client = ObjectStoreFileSystemClient::new(
             store,
             false, // don't have ordered listing
-            prefix,
             Arc::new(TokioBackgroundExecutor::new()),
         );
         let cp = read_last_checkpoint(&client, &url).unwrap();
@@ -291,7 +289,6 @@ mod tests {
         let client = ObjectStoreFileSystemClient::new(
             store,
             false, // don't have ordered listing
-            Path::from("/"),
             Arc::new(TokioBackgroundExecutor::new()),
         );
         let url = Url::parse("memory:///valid/").expect("valid url");
