@@ -32,8 +32,13 @@ use crate::expressions::{
     BinaryExpression, BinaryOperator, Expression, Scalar, UnaryExpression, UnaryOperator,
     VariadicExpression, VariadicOperator,
 };
-use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField};
+use crate::schema::{
+    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
+};
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
+
+pub(crate) mod single_row_transform;
+use single_row_transform::SingleRowTransform;
 
 // TODO leverage scalars / Datum
 
@@ -526,6 +531,25 @@ impl ExpressionHandler for ArrowExpressionHandler {
             output_type,
         })
     }
+
+    /// TODO
+    fn create_one(&self, schema: SchemaRef, values: &[Scalar]) -> DeltaResult<Box<dyn EngineData>> {
+        let mut array_transform = SingleRowTransform::new(values);
+        let datatype = schema.into();
+        // we build up the array within the `SingleRowArrayTransform` - we don't actually care
+        // about the 'transformed' type
+        let _transformed = array_transform.transform(&datatype);
+        let array = array_transform.into_struct_array()?;
+        let struct_array = array.as_struct_opt().unwrap(); // FIXME
+
+        // detect top-level null
+        if struct_array.is_null(0) {
+            return Err(Error::generic("Top-level null in single-row array"));
+        }
+
+        let record_batch: RecordBatch = struct_array.into(); // FIXME
+        Ok(Box::new(ArrowEngineData::new(record_batch)))
+    }
 }
 
 #[derive(Debug)]
@@ -568,13 +592,13 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
 mod tests {
     use std::ops::{Add, Div, Mul, Sub};
 
-    use arrow_array::{GenericStringArray, Int32Array};
+    use arrow_array::{create_array, GenericStringArray, Int32Array};
     use arrow_buffer::ScalarBuffer;
     use arrow_schema::{DataType, Field, Fields, Schema};
 
     use super::*;
     use crate::expressions::*;
-    use crate::schema::ArrayType;
+    use crate::schema::{ArrayType, StructType};
     use crate::DataType as DeltaDataTypes;
 
     #[test]
@@ -866,5 +890,159 @@ mod tests {
                 .unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
+    }
+
+    // helper to take values/schema to pass to `create_one` and assert the result = expected
+    fn assert_create_one(values: &[Scalar], schema: SchemaRef, expected: RecordBatch) {
+        let handler = ArrowExpressionHandler;
+        let actual = handler.create_one(schema, values).unwrap();
+        let actual_rb: RecordBatch = actual
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+        assert_eq!(actual_rb, expected);
+    }
+
+    #[test]
+    fn test_create_one() {
+        let values: &[Scalar] = &[
+            1.into(),
+            "B".into(),
+            3.into(),
+            Scalar::Null(DeltaDataTypes::INTEGER),
+        ];
+        let schema = Arc::new(StructType::new([
+            StructField::nullable("a", DeltaDataTypes::INTEGER),
+            StructField::nullable("b", DeltaDataTypes::STRING),
+            StructField::not_null("c", DeltaDataTypes::INTEGER),
+            StructField::nullable("d", DeltaDataTypes::INTEGER),
+        ]));
+
+        let expected_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("c", DataType::Int32, false),
+            Field::new("d", DataType::Int32, true),
+        ]));
+        let expected = RecordBatch::try_new(
+            expected_schema,
+            vec![
+                create_array!(Int32, [1]),
+                create_array!(Utf8, ["B"]),
+                create_array!(Int32, [3]),
+                create_array!(Int32, [None]),
+            ],
+        )
+        .unwrap();
+        assert_create_one(values, schema, expected);
+    }
+
+    #[test]
+    fn test_create_one_nested() {
+        let values: &[Scalar] = &[1.into(), 2.into()];
+        let schema = Arc::new(StructType::new([StructField::not_null(
+            "a",
+            DeltaDataTypes::struct_type([
+                StructField::nullable("b", DeltaDataTypes::INTEGER),
+                StructField::not_null("c", DeltaDataTypes::INTEGER),
+            ]),
+        )]));
+        let expected_schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::Struct(
+                vec![
+                    Field::new("b", DataType::Int32, true),
+                    Field::new("c", DataType::Int32, false),
+                ]
+                .into(),
+            ),
+            false,
+        )]));
+        let expected = RecordBatch::try_new(
+            expected_schema,
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    Arc::new(Field::new("b", DataType::Int32, true)),
+                    create_array!(Int32, [1]) as ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new("c", DataType::Int32, false)),
+                    create_array!(Int32, [2]) as ArrayRef,
+                ),
+            ]))],
+        )
+        .unwrap();
+        assert_create_one(values, schema, expected);
+    }
+
+    #[test]
+    fn test_create_one_nested_null() {
+        let values: &[Scalar] = &[Scalar::Null(DeltaDataTypes::INTEGER), 1.into()];
+        let schema = Arc::new(StructType::new([StructField::not_null(
+            "a",
+            DeltaDataTypes::struct_type([
+                StructField::nullable("b", DeltaDataTypes::INTEGER),
+                StructField::not_null("c", DeltaDataTypes::INTEGER),
+            ]),
+        )]));
+        let expected_schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::Struct(
+                vec![
+                    Field::new("b", DataType::Int32, true),
+                    Field::new("c", DataType::Int32, false),
+                ]
+                .into(),
+            ),
+            false,
+        )]));
+        let expected = RecordBatch::try_new(
+            expected_schema,
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    Arc::new(Field::new("b", DataType::Int32, true)),
+                    create_array!(Int32, [None]) as ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new("c", DataType::Int32, false)),
+                    create_array!(Int32, [1]) as ArrayRef,
+                ),
+            ]))],
+        )
+        .unwrap();
+        assert_create_one(values, schema, expected);
+    }
+
+    #[test]
+    fn test_create_one_not_null_struct() {
+        let values: &[Scalar] = &[
+            Scalar::Null(DeltaDataTypes::INTEGER),
+            Scalar::Null(DeltaDataTypes::INTEGER),
+        ];
+        let schema = Arc::new(StructType::new([StructField::not_null(
+            "a",
+            DeltaDataTypes::struct_type([
+                StructField::not_null("b", DeltaDataTypes::INTEGER),
+                StructField::nullable("c", DeltaDataTypes::INTEGER),
+            ]),
+        )]));
+        let handler = ArrowExpressionHandler;
+        assert!(handler.create_one(schema, values).is_err());
+    }
+
+    #[test]
+    fn test_create_one_top_level_null() {
+        let values = &[Scalar::Null(DeltaDataTypes::INTEGER)];
+        let handler = ArrowExpressionHandler;
+
+        let schema = Arc::new(StructType::new([StructField::not_null(
+            "col_1",
+            DeltaDataTypes::INTEGER,
+        )]));
+        assert!(matches!(
+            handler.create_one(schema, values),
+            Err(Error::Generic(_))
+        ));
     }
 }
