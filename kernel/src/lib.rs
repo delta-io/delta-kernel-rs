@@ -346,8 +346,11 @@ pub trait ExpressionHandler: AsAny {
 /// file system where the Delta table is present. Connector implementation of
 /// this trait can hide filesystem specific details from Delta Kernel.
 pub trait FileSystemClient: AsAny {
-    /// List the paths in the same directory that are lexicographically greater or equal to
+    /// List the paths in the same directory that are lexicographically greater than
     /// (UTF-8 sorting) the given `path`. The result should also be sorted by the file name.
+    ///
+    /// If the path is directory-like (ends with '/'), the result should contain
+    /// all the files in the directory.
     fn list_from(&self, path: &Url)
         -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
 
