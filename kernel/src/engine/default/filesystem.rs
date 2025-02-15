@@ -46,14 +46,18 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
         let url = path.clone();
         let offset = Path::from(path.path());
-        let parts = offset.parts().collect_vec();
-        if parts.is_empty() {
-            return Err(Error::generic(format!(
-                "Offset path must not be a root directory. Got: '{}'",
-                url.as_str()
-            )));
-        }
-        let prefix = Path::from_iter(parts[..parts.len() - 1].iter().cloned());
+        let prefix = if url.path().ends_with('/') {
+            offset.clone()
+        } else {
+            let parts = offset.parts().collect_vec();
+            if parts.is_empty() {
+                return Err(Error::generic(format!(
+                    "Offset path must not be a root directory. Got: '{}'",
+                    url.as_str()
+                )));
+            }
+            Path::from_iter(parts[..parts.len() - 1].iter().cloned())
+        };
 
         let store = self.inner.clone();
 

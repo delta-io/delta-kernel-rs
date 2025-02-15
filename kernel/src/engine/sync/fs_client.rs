@@ -39,7 +39,7 @@ impl FileSystemClient for SyncFilesystemClient {
             let all_ents: Vec<_> = std::fs::read_dir(path_to_read)?
                 .filter(|ent_res| {
                     match (ent_res, min_file_name) {
-                        (Ok(ent), Some(min_file_name)) => ent.file_name() >= *min_file_name,
+                        (Ok(ent), Some(min_file_name)) => ent.file_name() > *min_file_name,
                         _ => true, // Keep unfiltered and/or error entries
                     }
                 })

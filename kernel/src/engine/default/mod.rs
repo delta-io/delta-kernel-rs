@@ -157,3 +157,20 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
         self.parquet.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::executor::tokio::TokioBackgroundExecutor;
+    use super::*;
+    use crate::engine::tests::test_arrow_engine;
+    use object_store::local::LocalFileSystem;
+
+    #[test]
+    fn test_default_engine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let store = Arc::new(LocalFileSystem::new());
+        let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        test_arrow_engine(&engine, &url);
+    }
+}
