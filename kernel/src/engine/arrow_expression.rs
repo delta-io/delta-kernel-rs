@@ -6,18 +6,15 @@ use std::sync::Arc;
 use arrow_arith::boolean::{and_kleene, is_null, not, or_kleene};
 use arrow_arith::numeric::{add, div, mul, sub};
 use arrow_array::cast::AsArray;
-use arrow_array::{types::*, MapArray};
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, RecordBatch,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, MapArray, RecordBatch,
     StringArray, StructArray, TimestampMicrosecondArray,
 };
 use arrow_buffer::OffsetBuffer;
 use arrow_ord::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq};
-use arrow_ord::comparison::in_list_utf8;
 use arrow_schema::{
-    ArrowError, DataType as ArrowDataType, Field as ArrowField, Fields, IntervalUnit,
-    Schema as ArrowSchema, TimeUnit,
+    ArrowError, DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
 };
 use arrow_select::concat::concat;
 use itertools::Itertools;
@@ -25,7 +22,6 @@ use itertools::Itertools;
 use super::arrow_conversion::LIST_ARRAY_ROOT;
 use super::arrow_utils::make_arrow_error;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::prim_array_cmp;
 use crate::engine::ensure_data_types::ensure_data_types;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
@@ -34,6 +30,8 @@ use crate::expressions::{
 };
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField};
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
+
+mod in_list;
 
 // TODO leverage scalars / Datum
 
@@ -219,7 +217,7 @@ fn evaluate_expression(
             Ok(Arc::new(result))
         }
         (Struct(_), _) => Err(Error::generic(
-            "Data type is required to evaluate struct expressions",
+            "Result type is required to evaluate struct expressions",
         )),
         (Unary(UnaryExpression { op, expr }), _) => {
             let arr = evaluate_expression(expr.as_ref(), batch, None)?;
@@ -234,74 +232,26 @@ fn evaluate_expression(
                 left,
                 right,
             }),
-            _,
-        ) => match (left.as_ref(), right.as_ref()) {
-            (Literal(_), Column(_)) => {
-                let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
-                let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
-                if let Some(string_arr) = left_arr.as_string_opt::<i32>() {
-                    if let Some(right_arr) = right_arr.as_list_opt::<i32>() {
-                        return in_list_utf8(string_arr, right_arr)
-                            .map(wrap_comparison_result)
-                            .map_err(Error::generic_err);
-                    }
-                }
-                prim_array_cmp! {
-                    left_arr, right_arr,
-                    (ArrowDataType::Int8, Int8Type),
-                    (ArrowDataType::Int16, Int16Type),
-                    (ArrowDataType::Int32, Int32Type),
-                    (ArrowDataType::Int64, Int64Type),
-                    (ArrowDataType::UInt8, UInt8Type),
-                    (ArrowDataType::UInt16, UInt16Type),
-                    (ArrowDataType::UInt32, UInt32Type),
-                    (ArrowDataType::UInt64, UInt64Type),
-                    (ArrowDataType::Float16, Float16Type),
-                    (ArrowDataType::Float32, Float32Type),
-                    (ArrowDataType::Float64, Float64Type),
-                    (ArrowDataType::Timestamp(TimeUnit::Second, _), TimestampSecondType),
-                    (ArrowDataType::Timestamp(TimeUnit::Millisecond, _), TimestampMillisecondType),
-                    (ArrowDataType::Timestamp(TimeUnit::Microsecond, _), TimestampMicrosecondType),
-                    (ArrowDataType::Timestamp(TimeUnit::Nanosecond, _), TimestampNanosecondType),
-                    (ArrowDataType::Date32, Date32Type),
-                    (ArrowDataType::Date64, Date64Type),
-                    (ArrowDataType::Time32(TimeUnit::Second), Time32SecondType),
-                    (ArrowDataType::Time32(TimeUnit::Millisecond), Time32MillisecondType),
-                    (ArrowDataType::Time64(TimeUnit::Microsecond), Time64MicrosecondType),
-                    (ArrowDataType::Time64(TimeUnit::Nanosecond), Time64NanosecondType),
-                    (ArrowDataType::Duration(TimeUnit::Second), DurationSecondType),
-                    (ArrowDataType::Duration(TimeUnit::Millisecond), DurationMillisecondType),
-                    (ArrowDataType::Duration(TimeUnit::Microsecond), DurationMicrosecondType),
-                    (ArrowDataType::Duration(TimeUnit::Nanosecond), DurationNanosecondType),
-                    (ArrowDataType::Interval(IntervalUnit::DayTime), IntervalDayTimeType),
-                    (ArrowDataType::Interval(IntervalUnit::YearMonth), IntervalYearMonthType),
-                    (ArrowDataType::Interval(IntervalUnit::MonthDayNano), IntervalMonthDayNanoType),
-                    (ArrowDataType::Decimal128(_, _), Decimal128Type),
-                    (ArrowDataType::Decimal256(_, _), Decimal256Type)
-                }
-            }
-            (Literal(lit), Literal(Scalar::Array(ad))) => {
-                #[allow(deprecated)]
-                let exists = ad.array_elements().contains(lit);
-                Ok(Arc::new(BooleanArray::from(vec![exists])))
-            }
-            (l, r) => Err(Error::invalid_expression(format!(
-                "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
-            ))),
-        },
+            None | Some(&DataType::BOOLEAN),
+        ) => in_list::eval_in_list(batch, left, right),
         (
             Binary(BinaryExpression {
                 op: NotIn,
                 left,
                 right,
             }),
-            _,
+            None | Some(&DataType::BOOLEAN),
         ) => {
             let reverse_op = Expression::binary(In, *left.clone(), *right.clone());
             let reverse_expr = evaluate_expression(&reverse_op, batch, None)?;
             not(reverse_expr.as_boolean())
                 .map(wrap_comparison_result)
                 .map_err(Error::generic_err)
+        }
+        (Binary(BinaryExpression { op: In | NotIn, .. }), Some(_)) => {
+            Err(Error::invalid_expression(format!(
+                "(NOT) IN expression is expected to return boolean results, got: {result_type:?}"
+            )))
         }
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
@@ -382,8 +332,8 @@ fn new_field_with_metadata(
 
 // A helper that is a wrapper over `transform_field_and_col`. This will take apart the passed struct
 // and use that method to transform each column and then put the struct back together. Target types
-// and names for each column should be passed in `target_types_and_names`. The number of elements in
-// the `target_types_and_names` iterator _must_ be the same as the number of columns in
+// and names for each column should be passed in `target_fields`. The number of elements in
+// the `target_fields` iterator _must_ be the same as the number of columns in
 // `struct_array`. The transformation is ordinal. That is, the order of fields in `target_fields`
 // _must_ match the order of the columns in `struct_array`.
 fn transform_struct(
@@ -590,13 +540,11 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
         let not_op = Expression::binary(BinaryOperator::NotIn, 5, column_expr!("item"));
-
-        let in_op = Expression::binary(BinaryOperator::In, 5, column_expr!("item"));
-
         let result = evaluate_expression(&not_op, &batch, None).unwrap();
         let expected = BooleanArray::from(vec![true, false, true]);
         assert_eq!(result.as_ref(), &expected);
 
+        let in_op = Expression::binary(BinaryOperator::In, 5, column_expr!("item"));
         let in_result = evaluate_expression(&in_op, &batch, None).unwrap();
         let in_expected = BooleanArray::from(vec![false, true, false]);
         assert_eq!(in_result.as_ref(), &in_expected);
@@ -616,12 +564,12 @@ mod tests {
         assert!(in_result.is_err());
         assert_eq!(
             in_result.unwrap_err().to_string(),
-            "Invalid expression evaluation: Cannot cast to list array: Int32"
+            "Invalid expression evaluation: Expected right hand side to be list column, got: Int32"
         );
     }
 
     #[test]
-    fn test_literal_type_array() {
+    fn test_literal_type_array_empty() {
         let field = Arc::new(Field::new("item", DataType::Int32, true));
         let schema = Schema::new([field.clone()]);
         let batch = RecordBatch::new_empty(Arc::new(schema));
@@ -636,7 +584,7 @@ mod tests {
         );
 
         let in_result = evaluate_expression(&in_op, &batch, None).unwrap();
-        let in_expected = BooleanArray::from(vec![true]);
+        let in_expected = BooleanArray::from(Vec::<Option<bool>>::new());
         assert_eq!(in_result.as_ref(), &in_expected);
     }
 
@@ -661,10 +609,6 @@ mod tests {
         let in_result = evaluate_expression(&in_op, &batch, None);
 
         assert!(in_result.is_err());
-        assert_eq!(
-            in_result.unwrap_err().to_string(),
-            "Invalid expression evaluation: Invalid right value for (NOT) IN comparison, left is: Column(item) right is: Column(item)".to_string()
-        )
     }
 
     #[test]
@@ -689,6 +633,262 @@ mod tests {
 
         let in_result = evaluate_expression(&str_not_op, &batch, None).unwrap();
         let in_expected = BooleanArray::from(vec![false, false, false]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+    }
+
+    #[test]
+    fn test_str_arrays_with_null() {
+        let values = GenericStringArray::<i32>::from(vec![
+            Some("one"),
+            None,
+            Some("two"),
+            None,
+            Some("one"),
+            Some("two"),
+        ]);
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 4, 6]));
+        let field = Arc::new(Field::new("item", DataType::Utf8, true));
+        let arr_field = Arc::new(Field::new("item", DataType::List(field.clone()), true));
+        let schema = Schema::new([arr_field.clone()]);
+        let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
+
+        let in_op = Expression::binary(BinaryOperator::In, "one", column_expr!("item"));
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        let in_expected = BooleanArray::from(vec![Some(true), None, Some(true)]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        let in_op = Expression::binary(BinaryOperator::In, "two", column_expr!("item"));
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        let in_expected = BooleanArray::from(vec![None, Some(true), Some(true)]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        let in_op = Expression::binary(BinaryOperator::In, "three", column_expr!("item"));
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        let in_expected = BooleanArray::from(vec![None, None, Some(false)]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        let in_op = Expression::binary(
+            BinaryOperator::In,
+            Scalar::Null(DeltaDataTypes::STRING),
+            column_expr!("item"),
+        );
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        let in_expected = BooleanArray::from(vec![None, None, None]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+    }
+
+    #[test]
+    fn test_arrays_with_null() {
+        let values = Int32Array::from(vec![Some(1), None, Some(2), None, Some(1), Some(2)]);
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 4, 6]));
+        let field = Arc::new(Field::new("item", DataType::Int32, true));
+        let arr_field = Arc::new(Field::new("item", DataType::List(field.clone()), true));
+        let schema = Schema::new([arr_field.clone()]);
+        let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
+
+        let in_op = Expression::binary(BinaryOperator::In, 1, column_expr!("item"));
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        let in_expected = BooleanArray::from(vec![Some(true), None, Some(true)]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        let in_op = Expression::binary(BinaryOperator::In, 2, column_expr!("item"));
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        let in_expected = BooleanArray::from(vec![None, Some(true), Some(true)]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        let in_op = Expression::binary(BinaryOperator::In, 3, column_expr!("item"));
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        let in_expected = BooleanArray::from(vec![None, None, Some(false)]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        let in_op = Expression::binary(
+            BinaryOperator::In,
+            Scalar::Null(DeltaDataTypes::INTEGER),
+            column_expr!("item"),
+        );
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        let in_expected = BooleanArray::from(vec![None, None, None]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+    }
+
+    #[test]
+    fn test_column_in_array() {
+        let values = Int32Array::from(vec![0, 1, 2, 3]);
+        let field = Arc::new(Field::new("item", DataType::Int32, true));
+        let rhs = Expression::literal(Scalar::Array(ArrayData::new(
+            ArrayType::new(PrimitiveType::Integer.into(), false),
+            [Scalar::Integer(1), Scalar::Integer(3)],
+        )));
+        let schema = Schema::new([field.clone()]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
+
+        let in_op = Expression::binary(BinaryOperator::In, column_expr!("item"), rhs.clone());
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        let in_expected = BooleanArray::from(vec![false, true, false, true]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        let not_in_op = Expression::binary(BinaryOperator::NotIn, column_expr!("item"), rhs);
+        let not_in_result =
+            evaluate_expression(&not_in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        let not_in_expected = BooleanArray::from(vec![true, false, true, false]);
+        assert_eq!(not_in_result.as_ref(), &not_in_expected);
+
+        let in_expected = BooleanArray::from(vec![false, true, false, true]);
+
+        // Date arrays
+        let values = Date32Array::from(vec![0, 1, 2, 3]);
+        let field = Arc::new(Field::new("item", DataType::Date32, true));
+        let rhs = Expression::literal(Scalar::Array(ArrayData::new(
+            ArrayType::new(PrimitiveType::Date.into(), false),
+            [Scalar::Date(1), Scalar::Date(3)],
+        )));
+        let schema = Schema::new([field.clone()]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
+        let in_op = Expression::binary(BinaryOperator::In, column_expr!("item"), rhs.clone());
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        // Timestamp arrays
+        let values = TimestampMicrosecondArray::from(vec![0, 1, 2, 3]).with_timezone("UTC");
+        let field = Arc::new(Field::new(
+            "item",
+            (&DeltaDataTypes::TIMESTAMP).try_into().unwrap(),
+            true,
+        ));
+        let rhs = Expression::literal(Scalar::Array(ArrayData::new(
+            ArrayType::new(PrimitiveType::Timestamp.into(), false),
+            [Scalar::Timestamp(1), Scalar::Timestamp(3)],
+        )));
+        let schema = Schema::new([field.clone()]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
+        let in_op = Expression::binary(BinaryOperator::In, column_expr!("item"), rhs.clone());
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        // Timestamp NTZ arrays
+        let values = TimestampMicrosecondArray::from(vec![0, 1, 2, 3]);
+        let field = Arc::new(Field::new(
+            "item",
+            (&DeltaDataTypes::TIMESTAMP_NTZ).try_into().unwrap(),
+            true,
+        ));
+        let rhs = Expression::literal(Scalar::Array(ArrayData::new(
+            ArrayType::new(PrimitiveType::TimestampNtz.into(), false),
+            [Scalar::TimestampNtz(1), Scalar::TimestampNtz(3)],
+        )));
+        let schema = Schema::new([field.clone()]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
+        let in_op = Expression::binary(BinaryOperator::In, column_expr!("item"), rhs.clone());
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        assert_eq!(in_result.as_ref(), &in_expected);
+    }
+
+    #[test]
+    fn test_column_in_array_with_null() {
+        let field = Arc::new(Field::new("item", DataType::Int32, true));
+        let values = Int32Array::from(vec![Some(1), Some(2), None]);
+        let schema = Schema::new([field.clone()]);
+        let batch =
+            RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values.clone())]).unwrap();
+
+        let rhs = Expression::literal(Scalar::Array(ArrayData::new(
+            ArrayType::new(PrimitiveType::Integer.into(), true),
+            [Scalar::Integer(1), Scalar::Null(DeltaDataTypes::INTEGER)],
+        )));
+
+        // item IN (1, NULL) -- TRUE, NULL, NULL
+        let in_op = Expression::binary(BinaryOperator::In, column_expr!("item"), rhs.clone());
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        let in_expected = BooleanArray::from(vec![Some(true), None, None]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        // 1 IN (1, NULL) -- TRUE
+        let in_op = Expression::binary(BinaryOperator::In, Scalar::Integer(1), rhs.clone());
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        let in_expected = BooleanArray::from(vec![Some(true), Some(true), Some(true)]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        // 1 NOT IN (1, NULL) -- FALSE
+        let in_op = Expression::binary(BinaryOperator::NotIn, Scalar::Integer(1), rhs.clone());
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        let in_expected = BooleanArray::from(vec![Some(false), Some(false), Some(false)]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        let rhs = Expression::literal(Scalar::Array(ArrayData::new(
+            ArrayType::new(PrimitiveType::Integer.into(), true),
+            [Scalar::Integer(2), Scalar::Null(DeltaDataTypes::INTEGER)],
+        )));
+
+        // item IN (2, NULL) -- NULL, TRUE, NULL
+        let in_op = Expression::binary(BinaryOperator::In, column_expr!("item"), rhs.clone());
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        let in_expected = BooleanArray::from(vec![None, Some(true), None]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        let in_expected = BooleanArray::from(vec![None, None, None]);
+
+        // 1 IN (2, NULL) -- NULL
+        let in_op = Expression::binary(BinaryOperator::In, Scalar::Integer(1), rhs.clone());
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        // 1 NOT IN (2, NULL) -- NULL
+        let in_op = Expression::binary(BinaryOperator::NotIn, Scalar::Integer(1), rhs.clone());
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        let rhs = Expression::literal(Scalar::Array(ArrayData::new(
+            ArrayType::new(PrimitiveType::Integer.into(), true),
+            [Scalar::Integer(1), Scalar::Integer(2)],
+        )));
+
+        // item IN (1, 2) -- TRUE, TRUE, NULL
+        let in_op = Expression::binary(BinaryOperator::In, column_expr!("item"), rhs.clone());
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        let in_expected = BooleanArray::from(vec![Some(true), Some(true), None]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        let in_expected = BooleanArray::from(vec![None, None, None]);
+
+        // NULL IN (1, 2) -- NULL
+        let in_op = Expression::binary(
+            BinaryOperator::In,
+            Scalar::Null(DeltaDataTypes::INTEGER),
+            rhs.clone(),
+        );
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        // NULL NOT IN (1, 2) -- NULL
+        let in_op = Expression::binary(
+            BinaryOperator::NotIn,
+            Scalar::Null(DeltaDataTypes::INTEGER),
+            rhs.clone(),
+        );
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
         assert_eq!(in_result.as_ref(), &in_expected);
     }
 
@@ -841,29 +1041,25 @@ mod tests {
 
         let expression = column_a.clone().and(column_b.clone());
         let results =
-            evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN))
-                .unwrap();
+            evaluate_expression(&expression, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![false, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
         let expression = column_a.clone().and(true);
         let results =
-            evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN))
-                .unwrap();
+            evaluate_expression(&expression, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
         let expression = column_a.clone().or(column_b);
         let results =
-            evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN))
-                .unwrap();
+            evaluate_expression(&expression, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, true]));
         assert_eq!(results.as_ref(), expected.as_ref());
 
         let expression = column_a.clone().or(false);
         let results =
-            evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN))
-                .unwrap();
+            evaluate_expression(&expression, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
     }

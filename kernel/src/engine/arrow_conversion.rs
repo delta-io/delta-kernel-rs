@@ -207,11 +207,7 @@ impl TryFrom<&ArrowDataType> for DataType {
             ArrowDataType::Date32 => Ok(DataType::DATE),
             ArrowDataType::Date64 => Ok(DataType::DATE),
             ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => Ok(DataType::TIMESTAMP_NTZ),
-            ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(tz))
-                if tz.eq_ignore_ascii_case("utc") =>
-            {
-                Ok(DataType::TIMESTAMP)
-            }
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_)) => Ok(DataType::TIMESTAMP),
             ArrowDataType::Struct(fields) => {
                 DataType::try_struct_type(fields.iter().map(|field| field.as_ref().try_into()))
             }
