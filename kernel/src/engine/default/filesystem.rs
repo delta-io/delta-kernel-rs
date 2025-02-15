@@ -45,7 +45,7 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
         path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
         let url = path.clone();
-        let offset = Path::from(path.path());
+        let offset = Path::from_url_path(path.path())?;
         let prefix = if url.path().ends_with('/') {
             offset.clone()
         } else {
