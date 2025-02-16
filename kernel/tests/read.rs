@@ -15,6 +15,7 @@ use delta_kernel::scan::state::{transform_to_logical, visit_scan_files, DvInfo, 
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, Schema};
 use delta_kernel::{Engine, FileMeta, Table};
+use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use test_utils::{
     actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
@@ -903,6 +904,69 @@ fn with_predicate_and_removes() -> Result<(), Box<dyn std::error::Error>> {
         Some(Expression::gt(column_expr!("value"), 3)),
         expected,
     )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn predicate_on_non_nullable_partition_col() -> Result<(), Box<dyn std::error::Error>> {
+    // Test for https://github.com/delta-io/delta-kernel-rs/issues/698
+    let batch_1 = generate_batch(vec![
+        ("id", vec![1, 1, 1].into_array()),
+        ("val", vec!["a", "b", "c"].into_array()),
+    ])?;
+    let batch_2 = generate_batch(vec![
+        ("id", vec![2, 2, 2].into_array()),
+        ("val", vec!["d", "e", "f"].into_array()),
+    ])?;
+
+    let storage = Arc::new(InMemory::new());
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[\"id\"]"},"isBlindAppend":true}}"#.to_string(),
+        r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["id"],"configuration":{},"createdTime":1587968585495}}"#.to_string(),
+        format!(r#"{{"add":{{"path":"{PARQUET_FILE1}","partitionValues":{{"id":"1"}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":3,\"nullCount\":{{\"val\":0}},\"minValues\":{{\"val\":\"a\"}},\"maxValues\":{{\"val\":\"c\"}}}}"}}}}"#),
+        format!(r#"{{"add":{{"path":"{PARQUET_FILE2}","partitionValues":{{"id":"2"}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":3,\"nullCount\":{{\"val\":0}},\"minValues\":{{\"val\":\"d\"}},\"maxValues\":{{\"val\":\"f\"}}}}"}}}}"#),
+    ];
+
+    add_commit(storage.as_ref(), 0, actions.iter().join("\n")).await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE1),
+            record_batch_to_bytes(&batch_1).into(),
+        )
+        .await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE2),
+            record_batch_to_bytes(&batch_2).into(),
+        )
+        .await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngine::new(
+        storage.clone(),
+        Path::from("/"),
+        Arc::new(TokioBackgroundExecutor::new()),
+    ));
+
+    let table = Table::new(location);
+    let snapshot = Arc::new(table.snapshot(engine.as_ref(), None)?);
+
+    let predicate = Expression::eq(column_expr!("id"), 2);
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+
+    let stream = scan.execute(engine)?;
+
+    let mut files_scanned = 0;
+    for batch in stream {
+        let raw_data = batch?.raw_data?;
+        assert_eq!(into_record_batch(raw_data), batch_2.clone());
+        files_scanned += 1;
+    }
+    assert_eq!(1, files_scanned);
     Ok(())
 }
 
