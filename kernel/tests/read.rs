@@ -962,8 +962,10 @@ async fn predicate_on_non_nullable_partition_col() -> Result<(), Box<dyn std::er
 
     let mut files_scanned = 0;
     for batch in stream {
-        let raw_data = batch?.raw_data?;
-        assert_eq!(into_record_batch(raw_data), batch_2.clone());
+        let result_batch = into_record_batch(batch?.raw_data?);
+        // Convert schema so that nullability matches the Delta table schema
+        let expected = batch_2.clone().with_schema(result_batch.schema())?;
+        assert_eq!(expected, result_batch);
         files_scanned += 1;
     }
     assert_eq!(1, files_scanned);
