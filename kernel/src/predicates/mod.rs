@@ -534,8 +534,6 @@ impl ResolveColumnAsScalar for EmptyColumnResolver {
     }
 }
 
-// In testing, it is convenient to just build a hashmap of scalar values.
-#[cfg(test)]
 impl ResolveColumnAsScalar for std::collections::HashMap<ColumnName, Scalar> {
     fn resolve_column(&self, col: &ColumnName) -> Option<Scalar> {
         self.get(col).cloned()
