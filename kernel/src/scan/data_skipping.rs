@@ -85,18 +85,10 @@ impl DataSkippingFilter {
             ) -> Option<Cow<'a, StructField>> {
                 use Cow::*;
                 let field = match self.transform(&field.data_type)? {
-                    Borrowed(data_type) => match field.is_nullable() {
-                        true => Borrowed(field),
-                        false => Owned(StructField {
-                            name: field.name.clone(),
-                            data_type: data_type.clone(),
-                            nullable: true,
-                            metadata: field.metadata.clone(),
-                        }),
-                    },
-                    Owned(data_type) => Owned(StructField {
+                    Borrowed(_) if field.is_nullable() => Borrowed(field),
+                    data_type => Owned(StructField {
                         name: field.name.clone(),
-                        data_type,
+                        data_type: data_type.into_owned(),
                         nullable: true,
                         metadata: field.metadata.clone(),
                     }),
