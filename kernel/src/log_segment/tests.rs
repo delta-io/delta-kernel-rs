@@ -7,7 +7,8 @@ use url::Url;
 
 use crate::actions::visitors::AddVisitor;
 use crate::actions::{
-    get_log_add_schema, get_log_schema, Add, Sidecar, ADD_NAME, METADATA_NAME, SIDECAR_NAME,
+    get_log_add_schema, get_log_schema, Add, Sidecar, ADD_NAME, METADATA_NAME, REMOVE_NAME,
+    SIDECAR_NAME,
 };
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
@@ -788,12 +789,12 @@ fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<
 
     add_sidecar_to_store(
         &store,
-        add_batch_simple(get_log_schema().clone()),
+        add_batch_simple(get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?),
         "sidecarfile1.parquet",
     )?;
     add_sidecar_to_store(
         &store,
-        add_batch_with_remove(get_log_schema().clone()),
+        add_batch_with_remove(get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?),
         "sidecarfile2.parquet",
     )?;
 
@@ -1084,9 +1085,12 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
     Ok(())
 }
 
-// Encapsulates logic that has already been tested but tests the interaction between the functions,
-// such as performing a map operation on the returned sidecar batches from `process_sidecars`
-// to include the is_log_batch flag
+// Tests the end-to-end process of creating a checkpoint stream.
+// Verifies that:
+// - The checkpoint file is read and produces batches containing references to sidecar files.
+// - As sidecar references are present, the corresponding sidecar files are processed correctly.
+// - Batches from both the checkpoint file and sidecar files are returned.
+// - Each returned batch is correctly flagged with is_log_batch set to false
 #[test]
 fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
 ) -> DeltaResult<()> {
@@ -1108,12 +1112,12 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
 
     add_sidecar_to_store(
         &store,
-        add_batch_simple(get_log_schema().clone()),
+        add_batch_simple(get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?),
         "sidecarfile1.parquet",
     )?;
     add_sidecar_to_store(
         &store,
-        add_batch_with_remove(get_log_schema().clone()),
+        add_batch_with_remove(get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?),
         "sidecarfile2.parquet",
     )?;
 
