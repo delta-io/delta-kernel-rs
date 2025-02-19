@@ -352,7 +352,7 @@ impl RowVisitor for CdcVisitor {
             ))
         );
         for i in 0..row_count {
-            // Since path column is required, use it to detect presence of an Cdc action
+            // Since path column is required, use it to detect presence of a Cdc action
             if let Some(path) = getters[0].get_opt(i, "cdc.path")? {
                 self.cdcs.push(Self::visit_cdc(i, path, getters)?);
             }
