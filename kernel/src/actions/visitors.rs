@@ -474,7 +474,7 @@ impl RowVisitor for SidecarVisitor {
             ))
         );
         for i in 0..row_count {
-            // Since path column is required, use it to detect presence of an Sidecar action
+            // Since path column is required, use it to detect presence of a Sidecar action
             if let Some(path) = getters[0].get_opt(i, "sidecar.path")? {
                 self.sidecars.push(Self::visit_sidecar(i, path, getters)?);
             }
