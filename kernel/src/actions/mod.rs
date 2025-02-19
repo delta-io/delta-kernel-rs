@@ -515,7 +515,6 @@ pub struct SetTransaction {
 /// file actions. This action is only allowed in checkpoints following the V2 spec.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-file-information
-#[allow(unused)] //TODO: Remove once we implement V2 checkpoint file processing
 #[derive(Schema, Debug, PartialEq)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct Sidecar {
@@ -783,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v2_checkpoint_unsupported() {
+    fn test_v2_checkpoint_supported() {
         let protocol = Protocol::try_new(
             3,
             7,
@@ -791,7 +790,7 @@ mod tests {
             Some([ReaderFeatures::V2Checkpoint]),
         )
         .unwrap();
-        assert!(protocol.ensure_read_supported().is_err());
+        assert!(protocol.ensure_read_supported().is_ok());
 
         let protocol = Protocol::try_new(
             4,
@@ -821,7 +820,7 @@ mod tests {
             Some(&empty_features),
         )
         .unwrap();
-        assert!(protocol.ensure_read_supported().is_err());
+        assert!(protocol.ensure_read_supported().is_ok());
 
         let protocol = Protocol::try_new(
             3,
@@ -839,7 +838,7 @@ mod tests {
             Some([WriterFeatures::V2Checkpoint]),
         )
         .unwrap();
-        assert!(protocol.ensure_read_supported().is_err());
+        assert!(protocol.ensure_read_supported().is_ok());
 
         let protocol = Protocol {
             min_reader_version: 1,
