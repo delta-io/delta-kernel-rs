@@ -231,9 +231,10 @@ impl LogSegment {
 
     /// Returns an iterator over checkpoint data, processing sidecar files when necessary.
     ///
-    /// Checkpoint data is returned directly if:
-    /// - Processing a multi-part checkpoint
-    /// - Schema does not contain file actions
+    /// By default, `create_checkpoint_stream` checks for the presence of sidecar files, and
+    /// reads their contents if present. Checking for sidecar files is skipped if:
+    /// - The checkpoint is a multi-part checkpoint
+    /// - The checkpoint read schema does not contain the add action
     ///
     /// For single-part checkpoints, any referenced sidecar files are processed. These
     /// sidecar files contain the actual add actions that would otherwise be
@@ -288,8 +289,8 @@ impl LogSegment {
                 // This closure maps the checkpoint batch to an iterator of batches
                 // by chaining the checkpoint batch with sidecar batches if they exist.
 
-                // 1. In the case where the schema does not contain add/remove actions, we return the checkpoint
-                // batch directly as sidecar files only have to be read when the schema contains add/remove actions.
+                // 1. In the case where the schema does not contain the add action, we return the checkpoint
+                // batch directly as sidecar files only have to be read when the schema contains the add action.
                 // 2. Multi-part checkpoint batches never have sidecar actions, so the batch is returned as-is.
                 let sidecar_content = if need_add_actions && checkpoint_parts.len() == 1 {
                     Self::process_sidecars(
