@@ -259,6 +259,12 @@ impl LogSegment {
             .map(|f| f.location.clone())
             .collect();
 
+        let parquet_handler = engine.get_parquet_handler();
+
+        // Historically, we had a shared file reader trait for JSON and Parquet handlers,
+        // but it was removed to avoid unnecessary coupling. This is a concrete case
+        // where it *could* have been useful, but for now, we're keeping them separate.
+        // If similar patterns start appearing elsewhere, we should reconsider that decision.
         let actions = if checkpoint_parts
             .first()
             .is_some_and(|p| p.extension == "json")
@@ -269,14 +275,13 @@ impl LogSegment {
                 meta_predicate,
             )?
         } else {
-            engine.get_parquet_handler().read_parquet_files(
+            parquet_handler.read_parquet_files(
                 &checkpoint_file_meta,
                 checkpoint_read_schema,
                 meta_predicate,
             )?
         };
 
-        let parquet_handler = engine.get_parquet_handler();
         let actions_iter = actions
             .map(move |batch_result| -> DeltaResult<_> {
                 let checkpoint_batch = batch_result?;
@@ -286,14 +291,14 @@ impl LogSegment {
                 // 1. In the case where the schema does not contain add/remove actions, we return the checkpoint
                 // batch directly as sidecar files only have to be read when the schema contains add/remove actions.
                 // 2. Multi-part checkpoint batches never have sidecar actions, so the batch is returned as-is.
-                let sidecar_content = if !need_add_actions || checkpoint_parts.len() > 1 {
-                    None
-                } else {
+                let sidecar_content = if need_add_actions && checkpoint_parts.len() == 1 {
                     Self::process_sidecars(
                         parquet_handler.clone(), // cheap Arc clone
                         log_root.clone(),
                         checkpoint_batch.as_ref(),
                     )?
+                } else {
+                    None
                 };
 
                 let combined_batches = std::iter::once(Ok(checkpoint_batch))
@@ -303,8 +308,7 @@ impl LogSegment {
                 Ok(combined_batches)
             })
             .flatten_ok()
-            // Map converts Result<Result<Box<dyn EngineData>, _>,_> to Result<Box<dyn EngineData>, _>
-            .map(|result| result?);
+            .map(|result| result?); // result-result to result
 
         Ok(actions_iter)
     }
