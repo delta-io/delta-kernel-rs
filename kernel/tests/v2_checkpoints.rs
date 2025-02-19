@@ -25,12 +25,11 @@ fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<Recor
 }
 
 fn test_v2_checkpoints(table_name: &str) -> DeltaResult<()> {
-    let max_width = 3; // Max width of id column in the table (used for formatting)
     let batches = read_v2_checkpoint_table(table_name)?;
 
-    fn generate_rows(count: usize, width: usize) -> Vec<String> {
+    fn generate_rows(count: usize) -> Vec<String> {
         (0..count)
-            .map(|id| format!("| {:<width$} |", id, width = width))
+            .map(|id| format!("| {:<max_width$} |", id, max_width = 3))
             .collect()
     }
 
@@ -41,20 +40,19 @@ fn test_v2_checkpoints(table_name: &str) -> DeltaResult<()> {
         "+-----+".to_string(),
     ];
 
-    let mut expected = [
+    let expected = [
         header,
         vec!["| 0   |".to_string(); 3],
-        generate_rows(30, max_width),
-        generate_rows(100, max_width),
-        generate_rows(100, max_width),
-        generate_rows(1000, max_width),
+        generate_rows(30),
+        generate_rows(100),
+        generate_rows(100),
+        generate_rows(1000),
         vec!["+-----+".to_string()],
     ]
     .into_iter()
     .flatten()
     .collect_vec();
 
-    sort_lines!(expected);
     assert_batches_sorted_eq!(expected, &batches);
     Ok(())
 }
@@ -72,7 +70,7 @@ fn v2_checkpoints_parquet_with_sidecars() -> DeltaResult<()> {
 #[test]
 fn v2_checkpoints_json_without_sidecars() -> DeltaResult<()> {
     let batches = read_v2_checkpoint_table("v2-checkpoints-json-without-sidecars")?;
-    let mut expected = vec![
+    let expected = vec![
         "+------+",
         "| id   |",
         "+------+",
@@ -89,7 +87,6 @@ fn v2_checkpoints_json_without_sidecars() -> DeltaResult<()> {
         "| 2718 |",
         "+------+",
     ];
-    sort_lines!(expected);
     assert_batches_sorted_eq!(expected, &batches);
     Ok(())
 }
@@ -97,7 +94,7 @@ fn v2_checkpoints_json_without_sidecars() -> DeltaResult<()> {
 #[test]
 fn v2_checkpoints_parquet_without_sidecars() -> DeltaResult<()> {
     let batches = read_v2_checkpoint_table("v2-checkpoints-json-without-sidecars")?;
-    let mut expected = vec![
+    let expected = vec![
         "+------+",
         "| id   |",
         "+------+",
@@ -114,7 +111,6 @@ fn v2_checkpoints_parquet_without_sidecars() -> DeltaResult<()> {
         "| 2718 |",
         "+------+",
     ];
-    sort_lines!(expected);
     assert_batches_sorted_eq!(expected, &batches);
     Ok(())
 }
@@ -122,7 +118,7 @@ fn v2_checkpoints_parquet_without_sidecars() -> DeltaResult<()> {
 #[test]
 fn v2_classic_checkpoint_json() -> DeltaResult<()> {
     let batches = read_v2_checkpoint_table("v2-classic-checkpoint-json")?;
-    let mut expected = vec![
+    let expected = vec![
         "+----+",
         "| id |",
         "+----+",
@@ -148,7 +144,6 @@ fn v2_classic_checkpoint_json() -> DeltaResult<()> {
         "| 19 |",
         "+----+",
     ];
-    sort_lines!(expected);
     assert_batches_sorted_eq!(expected, &batches);
     Ok(())
 }
@@ -156,7 +151,7 @@ fn v2_classic_checkpoint_json() -> DeltaResult<()> {
 #[test]
 fn v2_classic_checkpoint_parquet() -> DeltaResult<()> {
     let batches = read_v2_checkpoint_table("v2-classic-checkpoint-parquet")?;
-    let mut expected = vec![
+    let expected = vec![
         "+----+",
         "| id |",
         "+----+",
@@ -182,7 +177,6 @@ fn v2_classic_checkpoint_parquet() -> DeltaResult<()> {
         "| 19 |",
         "+----+",
     ];
-    sort_lines!(expected);
     assert_batches_sorted_eq!(expected, &batches);
     Ok(())
 }
@@ -190,7 +184,7 @@ fn v2_classic_checkpoint_parquet() -> DeltaResult<()> {
 #[test]
 fn v2_checkpoints_parquet_with_last_checkpoint() -> DeltaResult<()> {
     let batches = read_v2_checkpoint_table("v2-checkpoints-parquet-with-last-checkpoint")?;
-    let mut expected = vec![
+    let expected = vec![
         "+----+",
         "| id |",
         "+----+",
@@ -206,7 +200,6 @@ fn v2_checkpoints_parquet_with_last_checkpoint() -> DeltaResult<()> {
         "| 9  |",
         "+----+",
     ];
-    sort_lines!(expected);
     assert_batches_sorted_eq!(expected, &batches);
     Ok(())
 }
@@ -214,7 +207,7 @@ fn v2_checkpoints_parquet_with_last_checkpoint() -> DeltaResult<()> {
 #[test]
 fn v2_checkpoints_json_with_last_checkpoint() -> DeltaResult<()> {
     let batches = read_v2_checkpoint_table("v2-checkpoints-json-with-last-checkpoint")?;
-    let mut expected = vec![
+    let expected = vec![
         "+----+",
         "| id |",
         "+----+",
@@ -230,7 +223,6 @@ fn v2_checkpoints_json_with_last_checkpoint() -> DeltaResult<()> {
         "| 9  |",
         "+----+",
     ];
-    sort_lines!(expected);
     assert_batches_sorted_eq!(expected, &batches);
     Ok(())
 }
