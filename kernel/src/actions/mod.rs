@@ -276,17 +276,26 @@ impl Protocol {
     /// support the specified protocol writer version and all enabled writer features?
     pub fn ensure_write_supported(&self) -> DeltaResult<()> {
         match &self.writer_features {
-            // if min_reader_version = 3 and min_writer_version = 7 and all writer features are
-            // supported => OK
-            Some(writer_features)
-                if self.min_reader_version == 3 && self.min_writer_version == 7 =>
-            {
+            Some(writer_features) if self.min_writer_version == 7 => {
+                // if we're on version 7, make sure we support all the specified features
                 ensure_supported_features(writer_features, &SUPPORTED_WRITER_FEATURES)
             }
-            // otherwise not supported
-            _ => Err(Error::unsupported(
-                "Only tables with min reader version 3 and min writer version 7 with no table features are supported."
-            )),
+            Some(_) => {
+                // there are features, but we're not on 7, so the protocol is actually broken
+                Err(Error::unsupported(
+                    "Tables with min writer version != 7 should not have table features.",
+                ))
+            }
+            None => {
+                // no features, we currently only support version 1 in this case
+                require!(
+                    self.min_writer_version == 1,
+                    Error::unsupported(
+                        "Currently delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1 or 7"
+                    )
+                );
+                Ok(())
+            }
         }
     }
 }
