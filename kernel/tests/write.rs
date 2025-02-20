@@ -317,7 +317,7 @@ async fn test_invalid_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// // check that the timestamps in commit_info and add actions are within 10s of SystemTime::now()
+// check that the timestamps in commit_info and add actions are within 10s of SystemTime::now()
 fn check_action_timestamps<'a>(
     parsed_commits: impl Iterator<Item = &'a serde_json::Value>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -354,8 +354,8 @@ fn set_value(
     Ok(())
 }
 
-// // list all the files at `path` and check that all parquet files have the same size, and return
-// // that size
+// list all the files at `path` and check that all parquet files have the same size, and return
+// that size
 async fn get_and_check_all_parquet_sizes(store: Arc<dyn ObjectStore>, path: &str) -> u64 {
     use futures::stream::StreamExt;
     let files: Vec<_> = store.list(Some(&Path::from(path))).collect().await;

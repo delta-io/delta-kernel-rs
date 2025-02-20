@@ -291,7 +291,7 @@ impl Protocol {
                 require!(
                     self.min_writer_version == 1,
                     Error::unsupported(
-                        "Currently delta-kernel-rs can only write to tables with min_writer_version = 1 or 7"
+                        "Currently delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1 or 7"
                     )
                 );
                 Ok(())
