@@ -53,9 +53,17 @@ fn actions_to_string_with_metadata(actions: Vec<TestAction>, metadata: &str) -> 
 /// convert a RecordBatch into a vector of bytes. We can't use `From` since these are both foreign
 /// types
 pub fn record_batch_to_bytes(batch: &RecordBatch) -> Vec<u8> {
-    let mut data: Vec<u8> = Vec::new();
     let props = WriterProperties::builder().build();
-    let mut writer = ArrowWriter::try_new(&mut data, batch.schema(), Some(props)).unwrap();
+    record_batch_to_bytes_with_props(batch, props)
+}
+
+pub fn record_batch_to_bytes_with_props(
+    batch: &RecordBatch,
+    writer_properties: WriterProperties,
+) -> Vec<u8> {
+    let mut data: Vec<u8> = Vec::new();
+    let mut writer =
+        ArrowWriter::try_new(&mut data, batch.schema(), Some(writer_properties)).unwrap();
     writer.write(batch).expect("Writing batch");
     // writer must be closed to write footer
     writer.close().unwrap();
