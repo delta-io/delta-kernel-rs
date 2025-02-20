@@ -514,8 +514,8 @@ pub(crate) fn visit_deletion_vector_at<'a>(
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use crate::arrow::array::{RecordBatch, StringArray};
+    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 
     use super::*;
     use crate::{

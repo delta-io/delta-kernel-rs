@@ -5,8 +5,8 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::task::{ready, Poll};
 
-use arrow_json::ReaderBuilder;
-use arrow_schema::SchemaRef as ArrowSchemaRef;
+use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use crate::arrow::json::ReaderBuilder;
 use bytes::{Buf, Bytes};
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
@@ -201,8 +201,8 @@ impl FileOpener for JsonOpener {
 mod tests {
     use std::path::PathBuf;
 
-    use arrow::array::{AsArray, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use crate::arrow::array::{AsArray, RecordBatch, StringArray};
+    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use itertools::Itertools;
     use object_store::{local::LocalFileSystem, ObjectStore};
 
