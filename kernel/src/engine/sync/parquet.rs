@@ -1,7 +1,7 @@
 use std::fs::File;
 
-use arrow_schema::SchemaRef as ArrowSchemaRef;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
+use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 
 use super::read_files;
 use crate::engine::arrow_data::ArrowEngineData;

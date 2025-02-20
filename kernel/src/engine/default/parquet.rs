@@ -4,16 +4,16 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use arrow_array::{BooleanArray, Int64Array, RecordBatch, StringArray};
+use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
+use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
+use crate::parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
+use crate::parquet::arrow::arrow_writer::ArrowWriter;
+use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::DynObjectStore;
-use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
-};
-use parquet::arrow::arrow_writer::ArrowWriter;
-use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
@@ -361,8 +361,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use arrow_array::array::Array;
-    use arrow_array::RecordBatch;
+    use crate::arrow::array::{Array, RecordBatch};
     use object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
     use url::Url;
 

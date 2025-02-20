@@ -87,6 +87,8 @@ pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
 
+pub mod arrow;
+pub mod parquet;
 pub(crate) mod predicates;
 pub(crate) mod utils;
 

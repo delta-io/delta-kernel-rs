@@ -1,8 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
-use arrow::{compute::filter_record_batch, util::pretty::print_batches};
-use arrow_array::RecordBatch;
 use clap::Parser;
+use delta_kernel::arrow::array::RecordBatch;
+use delta_kernel::arrow::{compute::filter_record_batch, util::pretty::print_batches};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;

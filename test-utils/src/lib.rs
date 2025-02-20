@@ -2,14 +2,14 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
-use arrow_schema::ArrowError;
+use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
+use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::EngineData;
 use itertools::Itertools;
 use object_store::{path::Path, ObjectStore};
-use parquet::arrow::arrow_writer::ArrowWriter;
-use parquet::file::properties::WriterProperties;
 
 /// A common useful initial metadata and protocol. Also includes a single commitInfo
 pub const METADATA: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}

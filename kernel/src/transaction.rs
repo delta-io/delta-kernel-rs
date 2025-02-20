@@ -339,11 +339,11 @@ mod tests {
     use crate::schema::MapType;
     use crate::{ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler};
 
-    use arrow::json::writer::LineDelimitedWriter;
-    use arrow::record_batch::RecordBatch;
-    use arrow_array::builder::StringBuilder;
-    use arrow_schema::Schema as ArrowSchema;
-    use arrow_schema::{DataType as ArrowDataType, Field};
+    use crate::arrow::array::{MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use crate::arrow::error::ArrowError;
+    use crate::arrow::json::writer::LineDelimitedWriter;
+    use crate::arrow::record_batch::RecordBatch;
 
     struct ExprEngine(Arc<dyn ExpressionHandler>);
 
@@ -371,16 +371,15 @@ mod tests {
         }
     }
 
-    fn build_map(entries: Vec<(&str, &str)>) -> arrow_array::MapArray {
+    fn build_map(entries: Vec<(&str, &str)>) -> MapArray {
         let key_builder = StringBuilder::new();
         let val_builder = StringBuilder::new();
-        let names = arrow_array::builder::MapFieldNames {
+        let names = MapFieldNames {
             entry: "entries".to_string(),
             key: "key".to_string(),
             value: "value".to_string(),
         };
-        let mut builder =
-            arrow_array::builder::MapBuilder::new(Some(names), key_builder, val_builder);
+        let mut builder = MapBuilder::new(Some(names), key_builder, val_builder);
         for (key, val) in entries {
             builder.keys().append_value(key);
             builder.values().append_value(val);
@@ -494,7 +493,7 @@ mod tests {
             engine_commit_info_schema,
             vec![
                 Arc::new(map_array),
-                Arc::new(arrow_array::StringArray::from(vec!["some_string"])),
+                Arc::new(StringArray::from(vec!["some_string"])),
             ],
         )?;
 
@@ -533,7 +532,7 @@ mod tests {
         )]));
         let commit_info_batch = RecordBatch::try_new(
             engine_commit_info_schema,
-            vec![Arc::new(arrow_array::StringArray::new_null(1))],
+            vec![Arc::new(StringArray::new_null(1))],
         )?;
 
         let _ = generate_commit_info(
@@ -542,12 +541,9 @@ mod tests {
             &ArrowEngineData::new(commit_info_batch),
         )
         .map_err(|e| match e {
-            Error::Arrow(arrow_schema::ArrowError::SchemaError(_)) => (),
+            Error::Arrow(ArrowError::SchemaError(_)) => (),
             Error::Backtraced { source, .. }
-                if matches!(
-                    &*source,
-                    Error::Arrow(arrow_schema::ArrowError::SchemaError(_))
-                ) => {}
+                if matches!(&*source, Error::Arrow(ArrowError::SchemaError(_))) => {}
             _ => panic!("expected arrow schema error error, got {:?}", e),
         });
 
@@ -564,7 +560,7 @@ mod tests {
         )]));
         let commit_info_batch = RecordBatch::try_new(
             engine_commit_info_schema,
-            vec![Arc::new(arrow_array::StringArray::new_null(1))],
+            vec![Arc::new(StringArray::new_null(1))],
         )?;
 
         let _ = generate_commit_info(
@@ -573,12 +569,9 @@ mod tests {
             &ArrowEngineData::new(commit_info_batch),
         )
         .map_err(|e| match e {
-            Error::Arrow(arrow_schema::ArrowError::InvalidArgumentError(_)) => (),
+            Error::Arrow(ArrowError::InvalidArgumentError(_)) => (),
             Error::Backtraced { source, .. }
-                if matches!(
-                    &*source,
-                    Error::Arrow(arrow_schema::ArrowError::InvalidArgumentError(_))
-                ) => {}
+                if matches!(&*source, Error::Arrow(ArrowError::InvalidArgumentError(_))) => {}
             _ => panic!("expected arrow invalid arg error, got {:?}", e),
         });
 
@@ -644,16 +637,16 @@ mod tests {
                 ),
                 true,
             )]));
-            use arrow_array::builder::StringBuilder;
+
             let key_builder = StringBuilder::new();
             let val_builder = StringBuilder::new();
-            let names = arrow_array::builder::MapFieldNames {
+            let names = crate::arrow::array::MapFieldNames {
                 entry: "entries".to_string(),
                 key: "key".to_string(),
                 value: "value".to_string(),
             };
             let mut builder =
-                arrow_array::builder::MapBuilder::new(Some(names), key_builder, val_builder);
+                crate::arrow::array::MapBuilder::new(Some(names), key_builder, val_builder);
             builder.append(is_null).unwrap();
             let array = builder.finish();
 

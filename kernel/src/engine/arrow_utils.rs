@@ -12,19 +12,19 @@ use crate::{
     DeltaResult, EngineData, Error,
 };
 
-use arrow_array::{
+use crate::arrow::array::{
     cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray,
     OffsetSizeTrait, RecordBatch, StringArray, StructArray,
 };
-use arrow_buffer::NullBuffer;
-use arrow_json::{LineDelimitedWriter, ReaderBuilder};
-use arrow_schema::{
+use crate::arrow::buffer::NullBuffer;
+use crate::arrow::compute::concat_batches;
+use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef, Fields,
     SchemaRef as ArrowSchemaRef,
 };
-use arrow_select::concat::concat_batches;
+use crate::arrow::json::{LineDelimitedWriter, ReaderBuilder};
+use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 use itertools::Itertools;
-use parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 use tracing::debug;
 
 macro_rules! prim_array_cmp {
@@ -41,7 +41,7 @@ macro_rules! prim_array_cmp {
                         .ok_or(Error::invalid_expression(
                             format!("Cannot cast to list array: {}", $right_arr.data_type()))
                         )?;
-                arrow_ord::comparison::in_list(prim_array, list_array).map(wrap_comparison_result)
+                crate::arrow::compute::kernels::comparison::in_list(prim_array, list_array).map(wrap_comparison_result)
             }
         )+
             _ => Err(ArrowError::CastError(
@@ -60,7 +60,10 @@ pub(crate) use prim_array_cmp;
 /// returns a tuples of (mask_indices: Vec<parquet_schema_index>, reorder_indices:
 /// Vec<requested_index>). `mask_indices` is used for generating the mask for reading from the
 pub(crate) fn make_arrow_error(s: impl Into<String>) -> Error {
-    Error::Arrow(arrow_schema::ArrowError::InvalidArgumentError(s.into())).with_backtrace()
+    Error::Arrow(crate::arrow::error::ArrowError::InvalidArgumentError(
+        s.into(),
+    ))
+    .with_backtrace()
 }
 
 /// Applies post-processing to data read from parquet files. This includes `reorder_struct_array` to
@@ -516,7 +519,7 @@ pub(crate) fn reorder_struct_array(
             match &reorder_index.transform {
                 ReorderIndexTransform::Cast(target) => {
                     let col = input_cols[parquet_position].as_ref();
-                    let col = Arc::new(arrow_cast::cast::cast(col, target)?);
+                    let col = Arc::new(crate::arrow::compute::cast(col, target)?);
                     let new_field = Arc::new(
                         input_fields[parquet_position]
                             .as_ref()
@@ -742,16 +745,16 @@ pub(crate) fn to_json_bytes(
 mod tests {
     use std::sync::Arc;
 
-    use arrow::{
-        array::AsArray,
-        buffer::{OffsetBuffer, ScalarBuffer},
-    };
-    use arrow_array::{
+    use crate::arrow::array::{
         Array, ArrayRef as ArrowArrayRef, BooleanArray, GenericListArray, Int32Array, StructArray,
     };
-    use arrow_schema::{
+    use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
         SchemaRef as ArrowSchemaRef,
+    };
+    use crate::arrow::{
+        array::AsArray,
+        buffer::{OffsetBuffer, ScalarBuffer},
     };
 
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
@@ -1498,9 +1501,9 @@ mod tests {
 
     #[test]
     fn test_arrow_broken_nested_null_masks() {
+        use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
         use crate::engine::arrow_utils::fix_nested_null_masks;
-        use arrow::datatypes::{DataType, Field, Fields, Schema};
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
         // Parse some JSON into a nested schema
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -1532,7 +1535,7 @@ mod tests {
 { "outer" : { "inner_non_null" : { "leaf_non_null" : 4 }, "inner_nullable" : { "leaf_non_null" : 5 } } }
 { "outer" : { "inner_non_null" : { "leaf_non_null" : 6 }, "inner_nullable" : { "leaf_non_null" : 7, "leaf_nullable": 8 } } }
 "#;
-        let batch1 = arrow::json::ReaderBuilder::new(schema.clone())
+        let batch1 = crate::arrow::json::ReaderBuilder::new(schema.clone())
             .build(json_string.as_bytes())
             .unwrap()
             .next()
@@ -1567,7 +1570,7 @@ mod tests {
         // Write the batch to a parquet file and read it back
         let mut buffer = vec![];
         let mut writer =
-            parquet::arrow::ArrowWriter::try_new(&mut buffer, schema.clone(), None).unwrap();
+            crate::parquet::arrow::ArrowWriter::try_new(&mut buffer, schema.clone(), None).unwrap();
         writer.write(&batch1).unwrap();
         writer.close().unwrap(); // writer must be closed to write footer
         let batch2 = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(buffer))
