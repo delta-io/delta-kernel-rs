@@ -22,21 +22,13 @@ tracing-core = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [ "json" ] }
 url = "2"
 delta_kernel = { path = "../kernel", default-features = false, features = [
+  "arrow",
   "developer-visibility",
 ] }
 delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.6.1" }
 
-# used if we use the default engine to be able to move arrow data into the c-ffi format
-arrow-schema = { version = ">=53, <55", default-features = false, features = [
-  "ffi",
-], optional = true }
-arrow-data = { version = ">=53, <55", default-features = false, features = [
-  "ffi",
-], optional = true }
-arrow-array = { version = ">=53, <55", default-features = false, optional = true }
-
 [build-dependencies]
-cbindgen = "0.27.0"
+cbindgen = "0.28"
 libc = "0.2.158"
 
 [dev-dependencies]
@@ -52,9 +44,6 @@ default = ["default-engine"]
 cloud = ["delta_kernel/cloud"]
 default-engine = [
   "delta_kernel/default-engine",
-  "arrow-array",
-  "arrow-data",
-  "arrow-schema",
 ]
 tracing = [ "tracing-core", "tracing-subscriber" ]
 sync-engine = ["delta_kernel/sync-engine"]

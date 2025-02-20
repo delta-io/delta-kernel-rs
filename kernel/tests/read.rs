@@ -3,21 +3,20 @@ use std::ops::Not;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::compute::filter_record_batch;
-use arrow_schema::SchemaRef as ArrowSchemaRef;
-use arrow_select::concat::concat_batches;
 use delta_kernel::actions::deletion_vector::split_vector;
+use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
+use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{column_expr, BinaryOperator, Expression, ExpressionRef};
+use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::scan::state::{transform_to_logical, visit_scan_files, DvInfo, Stats};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, Schema};
 use delta_kernel::{Engine, FileMeta, Table};
 use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use test_utils::{
     actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
     record_batch_to_bytes, record_batch_to_bytes_with_props, IntoArray, TestAction, METADATA,

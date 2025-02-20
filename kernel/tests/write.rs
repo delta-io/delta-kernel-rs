@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Int32Array, StringArray};
-use arrow::record_batch::RecordBatch;
-use arrow_schema::Schema as ArrowSchema;
-use arrow_schema::{DataType as ArrowDataType, Field};
+use delta_kernel::arrow::array::{
+    Int32Array, MapBuilder, MapFieldNames, StringArray, StringBuilder,
+};
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+use delta_kernel::arrow::error::ArrowError;
+use delta_kernel::arrow::record_batch::RecordBatch;
 use itertools::Itertools;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
@@ -120,15 +122,14 @@ fn new_commit_info() -> DeltaResult<Box<ArrowEngineData>> {
         false,
     )]));
 
-    use arrow_array::builder::StringBuilder;
     let key_builder = StringBuilder::new();
     let val_builder = StringBuilder::new();
-    let names = arrow_array::builder::MapFieldNames {
+    let names = MapFieldNames {
         entry: "entries".to_string(),
         key: "key".to_string(),
         value: "value".to_string(),
     };
-    let mut builder = arrow_array::builder::MapBuilder::new(Some(names), key_builder, val_builder);
+    let mut builder = MapBuilder::new(Some(names), key_builder, val_builder);
     builder.keys().append_value("engineInfo");
     builder.values().append_value("default engine");
     builder.append(true).unwrap();
@@ -349,7 +350,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
     let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
         let data = RecordBatch::try_new(
             Arc::new(schema.as_ref().try_into()?),
-            vec![Arc::new(arrow::array::Int32Array::from(data.to_vec()))],
+            vec![Arc::new(Int32Array::from(data.to_vec()))],
         )?;
         Ok(Box::new(ArrowEngineData::new(data)))
     });
@@ -441,9 +442,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
     test_read(
         &ArrowEngineData::new(RecordBatch::try_new(
             Arc::new(schema.as_ref().try_into()?),
-            vec![Arc::new(arrow::array::Int32Array::from(vec![
-                1, 2, 3, 4, 5, 6,
-            ]))],
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
         )?),
         &table,
         engine,
@@ -487,7 +486,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
         let data = RecordBatch::try_new(
             Arc::new(data_schema.as_ref().try_into()?),
-            vec![Arc::new(arrow::array::Int32Array::from(data.to_vec()))],
+            vec![Arc::new(Int32Array::from(data.to_vec()))],
         )?;
         Ok(Box::new(ArrowEngineData::new(data)))
     });
@@ -627,7 +626,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
     let append_data = [["a", "b"], ["c", "d"]].map(|data| -> DeltaResult<_> {
         let data = RecordBatch::try_new(
             Arc::new(data_schema.as_ref().try_into()?),
-            vec![Arc::new(arrow::array::StringArray::from(data.to_vec()))],
+            vec![Arc::new(StringArray::from(data.to_vec()))],
         )?;
         Ok(Box::new(ArrowEngineData::new(data)))
     });
@@ -653,12 +652,9 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 
     let mut write_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
     assert!(write_metadata.all(|res| match res {
-        Err(KernelError::Arrow(arrow_schema::ArrowError::SchemaError(_))) => true,
+        Err(KernelError::Arrow(ArrowError::SchemaError(_))) => true,
         Err(KernelError::Backtraced { source, .. })
-            if matches!(
-                &*source,
-                KernelError::Arrow(arrow_schema::ArrowError::SchemaError(_))
-            ) =>
+            if matches!(&*source, KernelError::Arrow(ArrowError::SchemaError(_))) =>
             true,
         _ => false,
     }));
