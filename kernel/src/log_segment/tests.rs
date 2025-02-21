@@ -2,7 +2,6 @@ use std::{path::PathBuf, sync::Arc};
 
 use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
-use parquet::arrow::ArrowWriter;
 use url::Url;
 
 use crate::actions::visitors::AddVisitor;
@@ -16,6 +15,7 @@ use crate::engine::default::filesystem::ObjectStoreFileSystemClient;
 use crate::engine::default::DefaultEngine;
 use crate::engine::sync::SyncEngine;
 use crate::log_segment::LogSegment;
+use crate::parquet::arrow::ArrowWriter;
 use crate::path::ParsedLogPath;
 use crate::scan::test_utils::{
     add_batch_simple, add_batch_with_remove, sidecar_batch_with_given_paths,

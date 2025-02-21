@@ -13,7 +13,7 @@ pub(crate) use require;
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use arrow_array::RecordBatch;
+    use crate::arrow::array::RecordBatch;
     use itertools::Itertools;
     use object_store::local::LocalFileSystem;
     use object_store::ObjectStore;
