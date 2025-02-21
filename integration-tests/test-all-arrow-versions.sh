@@ -8,8 +8,16 @@ test_arrow_version() {
   cargo clean
   rm -f Cargo.lock
   cargo update
+  echo "Cargo.toml is:"
   cat Cargo.toml
-  cargo run --features ${ARROW_VERSION}
+  echo ""
+  if [ "$ARROW_VERSION" = "ALL_ENABLED" ]; then
+    echo "testing with --all-features"
+    cargo run --all-features
+  else
+    echo "testing with --features ${ARROW_VERSION}"
+    cargo run --features ${ARROW_VERSION}
+  fi
 }
 
 FEATURES=$(cat ../kernel/Cargo.toml | grep -e ^arrow_ | awk '{ print $1 }' | sort -u)
@@ -23,4 +31,7 @@ do
   test_arrow_version $ARROW_VERSION
 done
 
-git checkout Cargo.toml
+test_arrow_version "ALL_ENABLED"
+
+git checkout HEAD Cargo.toml
+
