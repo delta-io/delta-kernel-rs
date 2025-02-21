@@ -37,7 +37,7 @@ jobs:
           cargo install cargo-msrv --locked
       - name: verify-msrv
         run: |
-          cargo msrv --path kernel/ verify --all-features
+          cargo msrv --path kernel/ verify --features $(cat .github/workflows/default-kernel-features)
           cargo msrv --path derive-macros/ verify --all-features
           cargo msrv --path ffi/ verify --all-features
           cargo msrv --path ffi-proc-macros/ verify --all-features
@@ -104,7 +104,7 @@ jobs:
       - name: check kernel builds with no-default-features
         run: cargo build -p delta_kernel --no-default-features
       - name: build and lint with clippy
-        run: cargo clippy --benches --tests --all-features -- -D warnings
+        run: cargo clippy --benches --tests --features $(cat .github/workflows/default-kernel-features) -- -D warnings
       - name: lint without default features
         run: cargo clippy --no-default-features -- -D warnings
       - name: check kernel builds with default-engine
@@ -129,7 +129,7 @@ jobs:
           override: true
       - uses: Swatinem/rust-cache@v2
       - name: test
-        run: cargo test --workspace --verbose --all-features -- --skip read_table_version_hdfs
+        run: cargo test --workspace --verbose --features $(cat .github/workflows/default-kernel-features) -- --skip read_table_version_hdfs
 
   ffi_test:
     runs-on: ${{ matrix.os }}
@@ -229,7 +229,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
       - name: Generate code coverage
-        run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json -- --skip read_table_version_hdfs
+        run: cargo llvm-cov --features $(cat .github/workflows/default-kernel-features) --workspace --codecov --output-path codecov.json -- --skip read_table_version_hdfs
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
