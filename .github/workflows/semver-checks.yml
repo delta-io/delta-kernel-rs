@@ -40,7 +40,7 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          cargo semver-checks --features $(cat .github/workflows/default-kernel-features) --baseline-rev ${{ github.event.pull_request.base.sha }}
+          cargo semver-checks --all-features --baseline-rev ${{ github.event.pull_request.base.sha }}
       - name: On Failure
         id: set_failure
         if: ${{ steps.check.outcome == 'failure' }}
