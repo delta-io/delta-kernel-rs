@@ -4,7 +4,7 @@
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
     get_log_add_schema, get_log_schema, Metadata, Protocol, Sidecar, ADD_NAME, METADATA_NAME,
-    PROTOCOL_NAME, SIDECAR_NAME,
+    PROTOCOL_NAME, REMOVE_NAME, SIDECAR_NAME,
 };
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::SchemaRef;
@@ -218,13 +218,8 @@ impl LogSegment {
             .read_json_files(&commit_files, commit_read_schema, meta_predicate.clone())?
             .map_ok(|batch| (batch, true));
 
-        let checkpoint_stream = Self::create_checkpoint_stream(
-            engine,
-            checkpoint_read_schema,
-            meta_predicate,
-            self.checkpoint_parts.clone(),
-            self.log_root.clone(),
-        )?;
+        let checkpoint_stream =
+            self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate)?;
 
         Ok(commit_stream.chain(checkpoint_stream))
     }
@@ -241,21 +236,22 @@ impl LogSegment {
     /// stored directly in the checkpoint. The sidecar file batches are chained to the
     /// checkpoint batch in the top level iterator to be returned.
     fn create_checkpoint_stream(
+        &self,
         engine: &dyn Engine,
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<ExpressionRef>,
-        checkpoint_parts: Vec<ParsedLogPath>,
-        log_root: Url,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
-        let need_add_actions = checkpoint_read_schema.contains(ADD_NAME);
+        let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
+            | checkpoint_read_schema.contains(REMOVE_NAME);
         require!(
-            !need_add_actions || checkpoint_read_schema.contains(SIDECAR_NAME),
+            !need_file_actions || checkpoint_read_schema.contains(SIDECAR_NAME),
         Error::invalid_checkpoint(
                 "If the checkpoint read schema contains file actions, it must contain the sidecar column"
             )
         );
 
-        let checkpoint_file_meta: Vec<FileMeta> = checkpoint_parts
+        let checkpoint_file_meta: Vec<_> = self
+            .checkpoint_parts
             .iter()
             .map(|f| f.location.clone())
             .collect();
@@ -266,7 +262,8 @@ impl LogSegment {
         // but it was removed to avoid unnecessary coupling. This is a concrete case
         // where it *could* have been useful, but for now, we're keeping them separate.
         // If similar patterns start appearing elsewhere, we should reconsider that decision.
-        let actions = if checkpoint_parts
+        let actions = if self
+            .checkpoint_parts
             .first()
             .is_some_and(|p| p.extension == "json")
         {
@@ -282,17 +279,18 @@ impl LogSegment {
                 meta_predicate,
             )?
         };
+        let log_root = self.log_root.clone();
 
         let actions_iter = actions
-            .map(move |batch_result| -> DeltaResult<_> {
-                let checkpoint_batch = batch_result?;
+            .map(move |checkpoint_batch_result| -> DeltaResult<_> {
+                let checkpoint_batch = checkpoint_batch_result?;
                 // This closure maps the checkpoint batch to an iterator of batches
                 // by chaining the checkpoint batch with sidecar batches if they exist.
 
                 // 1. In the case where the schema does not contain the add action, we return the checkpoint
                 // batch directly as sidecar files only have to be read when the schema contains the add action.
                 // 2. Multi-part checkpoint batches never have sidecar actions, so the batch is returned as-is.
-                let sidecar_content = if need_add_actions && checkpoint_parts.len() == 1 {
+                let sidecar_content = if need_file_actions && checkpoint_file_meta.len() == 1 {
                     Self::process_sidecars(
                         parquet_handler.clone(), // cheap Arc clone
                         log_root.clone(),
@@ -304,6 +302,7 @@ impl LogSegment {
 
                 let combined_batches = std::iter::once(Ok(checkpoint_batch))
                     .chain(sidecar_content.into_iter().flatten())
+                    // The boolean flag indicates whether the batch originated from a commit file (true) or a checkpoint file (false).
                     .map_ok(|sidecar_batch| (sidecar_batch, false));
 
                 Ok(combined_batches)
@@ -354,7 +353,12 @@ impl LogSegment {
         Ok(FileMeta {
             location: log_root.join("_sidecars/")?.join(&sidecar.path)?,
             last_modified: sidecar.modification_time,
-            size: sidecar.size_in_bytes as usize,
+            size: sidecar.size_in_bytes.try_into().map_err(|_| {
+                Error::generic(format!(
+                    "Failed to convert sidecar size {} to usize",
+                    sidecar.size_in_bytes
+                ))
+            })?,
         })
     }
 

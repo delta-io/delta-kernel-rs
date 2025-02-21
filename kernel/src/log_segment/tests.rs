@@ -856,21 +856,26 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 }
 
 #[test]
-fn test_create_checkpoint_stream_returns_none_if_checkpoint_parts_is_empty() -> DeltaResult<()> {
+fn test_create_checkpoint_stream_errors_when_schema_has_remove_but_no_sidecar_action(
+) -> DeltaResult<()> {
     let engine = SyncEngine::new();
+    let log_root = Url::parse("s3://example-bucket/logs/")?;
 
-    let mut iter = LogSegment::create_checkpoint_stream(
-        &engine,
-        get_log_schema().clone(),
-        None,
+    // Create the stream over checkpoint batches.
+    let log_segment = LogSegment::try_new(
         vec![],
-        Url::parse("s3://example-bucket/logs/")?,
-    )
-    .into_iter()
-    .flatten();
+        vec![create_log_path("file:///00000000000000000001.parquet")],
+        log_root,
+        None,
+    )?;
+    let result = log_segment.create_checkpoint_stream(
+        &engine,
+        get_log_schema().project(&[REMOVE_NAME])?,
+        None,
+    );
 
-    // Assert no batches are returned
-    assert!(iter.next().is_none());
+    // Errors because the schema has an REMOVE action but no SIDECAR action.
+    assert!(result.is_err());
 
     Ok(())
 }
@@ -879,15 +884,16 @@ fn test_create_checkpoint_stream_returns_none_if_checkpoint_parts_is_empty() -> 
 fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_action(
 ) -> DeltaResult<()> {
     let engine = SyncEngine::new();
+    let log_root = Url::parse("s3://example-bucket/logs/")?;
 
     // Create the stream over checkpoint batches.
-    let result = LogSegment::create_checkpoint_stream(
-        &engine,
-        get_log_add_schema().clone(),
-        None,
+    let log_segment = LogSegment::try_new(
+        vec![],
         vec![create_log_path("file:///00000000000000000001.parquet")],
-        Url::parse("s3://example-bucket/logs/")?,
-    );
+        log_root,
+        None,
+    )?;
+    let result = log_segment.create_checkpoint_stream(&engine, get_log_add_schema().clone(), None);
 
     // Errors because the schema has an ADD action but no SIDECAR action.
     assert!(result.is_err());
@@ -917,13 +923,14 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
 
     let v2_checkpoint_read_schema = get_log_schema().project(&[METADATA_NAME])?;
 
-    let mut iter = LogSegment::create_checkpoint_stream(
-        &engine,
-        v2_checkpoint_read_schema.clone(),
-        None,
+    let log_segment = LogSegment::try_new(
+        vec![],
         vec![create_log_path(&checkpoint_one_file)],
         log_root,
+        None,
     )?;
+    let mut iter =
+        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let (first_batch, is_log_batch) = iter.next().unwrap()?;
@@ -969,16 +976,17 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
 
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
-    let mut iter = LogSegment::create_checkpoint_stream(
-        &engine,
-        v2_checkpoint_read_schema.clone(),
-        None,
+    let log_segment = LogSegment::try_new(
+        vec![],
         vec![
             create_log_path(&checkpoint_one_file),
             create_log_path(&checkpoint_two_file),
         ],
         log_root,
+        None,
     )?;
+    let mut iter =
+        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert the correctness of batches returned
     for expected_sidecar in ["sidecar1.parquet", "sidecar2.parquet"].iter() {
@@ -1019,13 +1027,14 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
 
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
-    let mut iter = LogSegment::create_checkpoint_stream(
-        &engine,
-        v2_checkpoint_read_schema.clone(),
-        None,
+    let log_segment = LogSegment::try_new(
+        vec![],
         vec![create_log_path(&checkpoint_one_file)],
         log_root,
+        None,
     )?;
+    let mut iter =
+        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let (first_batch, is_log_batch) = iter.next().unwrap()?;
@@ -1064,13 +1073,14 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
 
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
-    let mut iter = LogSegment::create_checkpoint_stream(
-        &engine,
-        v2_checkpoint_read_schema.clone(),
-        None,
+    let log_segment = LogSegment::try_new(
+        vec![],
         vec![create_log_path(&checkpoint_one_file)],
         log_root,
+        None,
     )?;
+    let mut iter =
+        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let (first_batch, is_log_batch) = iter.next().unwrap()?;
@@ -1127,13 +1137,14 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
 
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
-    let mut iter = LogSegment::create_checkpoint_stream(
-        &engine,
-        v2_checkpoint_read_schema.clone(),
-        None,
+    let log_segment = LogSegment::try_new(
+        vec![],
         vec![create_log_path(&checkpoint_file_path)],
         log_root,
+        None,
     )?;
+    let mut iter =
+        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let (first_batch, is_log_batch) = iter.next().unwrap()?;
