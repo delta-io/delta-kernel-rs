@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 
 use delta_kernel::scan::state::{visit_scan_files, DvInfo, GlobalScanState};
 use delta_kernel::scan::{Scan, ScanData};
-use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Error, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -18,7 +17,8 @@ use crate::expressions::engine::{
 use crate::{
     kernel_string_slice, AllocateStringFn, ExclusiveEngineData, ExternEngine, ExternResult,
     IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice, NullableCvoid,
-    SharedExternEngine, SharedSnapshot, StringIter, StringSliceIterator, TryFromStringSlice,
+    SharedExternEngine, SharedSchema, SharedSnapshot, StringIter, StringSliceIterator,
+    TryFromStringSlice,
 };
 
 use super::handle::Handle;
@@ -70,8 +70,6 @@ fn scan_impl(
 
 #[handle_descriptor(target=GlobalScanState, mutable=false, sized=true)]
 pub struct SharedGlobalScanState;
-#[handle_descriptor(target=Schema, mutable=false, sized=true)]
-pub struct SharedSchema;
 
 /// Get the global state for a scan. See the docs for [`delta_kernel::scan::state::GlobalScanState`]
 /// for more information.
@@ -97,15 +95,6 @@ pub unsafe extern "C" fn get_global_read_schema(
 ) -> Handle<SharedSchema> {
     let state = unsafe { state.as_ref() };
     state.physical_schema.clone().into()
-}
-
-/// Free a global read schema
-///
-/// # Safety
-/// Engine is responsible for providing a valid schema obtained via [`get_global_read_schema`]
-#[no_mangle]
-pub unsafe extern "C" fn free_global_read_schema(schema: Handle<SharedSchema>) {
-    schema.drop_handle();
 }
 
 /// Get a count of the number of partition columns for this scan

@@ -321,7 +321,7 @@ int main(int argc, char* argv[])
 
   free_kernel_scan_data(data_iter);
   free_scan(scan);
-  free_global_read_schema(read_schema);
+  free_schema(read_schema);
   free_global_scan_state(global_state);
   free_snapshot(snapshot);
   free_engine(engine);
