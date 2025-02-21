@@ -2,6 +2,15 @@
 
 set -eu -o pipefail
 
+clean_up () {
+  CODE=$?
+  git checkout HEAD Cargo.toml
+  exit $CODE
+}
+
+# ensure we checkout the clean version of Cargo.toml no matter how we exit
+trap clean_up EXIT
+
 test_arrow_version() {
   ARROW_VERSION="$1"
   echo "== Testing version $ARROW_VERSION =="
@@ -32,6 +41,4 @@ do
 done
 
 test_arrow_version "ALL_ENABLED"
-
-git checkout HEAD Cargo.toml
 
