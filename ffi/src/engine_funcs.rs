@@ -209,7 +209,7 @@ fn evaluate_impl(
 #[cfg(test)]
 mod tests {
     use super::{free_evaluator, get_evaluator};
-    use crate::{free_engine, handle::Handle, scan::SharedSchema, tests::get_default_engine};
+    use crate::{free_engine, handle::Handle, tests::get_default_engine, SharedSchema};
     use delta_kernel::{
         schema::{DataType, StructField, StructType},
         Expression,
