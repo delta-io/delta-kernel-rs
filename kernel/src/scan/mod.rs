@@ -663,11 +663,10 @@ pub fn selection_vector(
 // some utils that are used in file_stream.rs and state.rs tests
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use std::sync::Arc;
-
-    use arrow_array::{RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use crate::arrow::array::{RecordBatch, StringArray};
+    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use itertools::Itertools;
+    use std::sync::Arc;
 
     use crate::{
         actions::get_log_schema,
