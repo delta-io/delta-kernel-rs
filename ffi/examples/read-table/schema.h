@@ -282,5 +282,6 @@ void print_schema(SharedSnapshot* snapshot)
   printf("Schema:\n");
   print_list(&builder, schema_list_id, 0, 0);
   printf("\n");
+  free_schema(schema);
   free_builder(builder);
 }

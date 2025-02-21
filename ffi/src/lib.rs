@@ -625,7 +625,7 @@ pub unsafe extern "C" fn logical_schema(snapshot: Handle<SharedSnapshot>) -> Han
 /// Free a schema
 ///
 /// # Safety
-/// Engine is responsible for providing a valid schema obtained via [`get_global_read_schema`]
+/// Engine is responsible for providing a valid schema handle.
 #[no_mangle]
 pub unsafe extern "C" fn free_schema(schema: Handle<SharedSchema>) {
     schema.drop_handle();

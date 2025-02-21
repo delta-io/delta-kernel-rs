@@ -2,11 +2,11 @@
 
 use std::sync::Arc;
 
+use delta_kernel::schema::{DataType, Schema, SchemaRef};
+use delta_kernel_ffi_macros::handle_descriptor;
 use delta_kernel::{
-    schema::{DataType, Schema, SchemaRef},
     DeltaResult, EngineData, Expression, ExpressionEvaluator, FileDataReadResultIterator,
 };
-use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
 

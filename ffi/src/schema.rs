@@ -1,8 +1,8 @@
 use std::os::raw::c_void;
 
+use crate::handle::Handle;
 use crate::scan::CStringMap;
-use crate::SharedSchema;
-use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
+use crate::{kernel_string_slice, KernelStringSlice, SharedSchema};
 use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
 
 /// The `EngineSchemaVisitor` defines a visitor system to allow engines to build their own
