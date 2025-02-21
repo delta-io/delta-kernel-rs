@@ -6,6 +6,14 @@ Schema:
 ├─ number: long
 └─ a_float: double
 
+letter:  [
+  "a",
+  "e",
+  "f",
+  "a",
+  "b",
+  "c"
+]
 number:  [
   4,
   5,
@@ -21,12 +29,4 @@ a_float:  [
   1.1,
   2.2,
   3.3
-]
-letter:  [
-  "a",
-  "e",
-  "f",
-  "a",
-  "b",
-  "c"
 ]
