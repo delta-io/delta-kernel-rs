@@ -94,8 +94,8 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
 
         self.task_executor.spawn(async move {
             let file_futures: Vec<_> = files
-                .iter()
-                .map(|file| file_opener.open(file.clone(), None))
+                .into_iter()
+                .map(|file| file_opener.open(file, None))
                 .collect::<DeltaResult<Vec<_>>>()
                 .expect("Error creating file futures");
 
