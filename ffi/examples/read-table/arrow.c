@@ -107,6 +107,8 @@ static GArrowBooleanArray* slice_to_arrow_bool_array(const KernelBoolSlice slice
   return (GArrowBooleanArray*)ret;
 }
 
+// This will apply the transform in the context to the specified data. This consumes the passed
+// ExclusiveEngineData and return a new transformed one
 static ExclusiveEngineData* apply_transform(
   struct EngineContext* context,
   ExclusiveEngineData* data) {
