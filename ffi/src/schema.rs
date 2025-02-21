@@ -1,7 +1,8 @@
 use std::os::raw::c_void;
 
-use crate::scan::{CStringMap, SharedSchema};
-use crate::{handle::Handle, kernel_string_slice, KernelStringSlice, SharedSnapshot};
+use crate::handle::Handle;
+use crate::scan::CStringMap;
+use crate::{kernel_string_slice, KernelStringSlice, SharedSchema};
 use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
 
 /// The `EngineSchemaVisitor` defines a visitor system to allow engines to build their own
@@ -190,23 +191,6 @@ pub struct EngineSchemaVisitor {
         is_nullable: bool,
         metadata: &CStringMap,
     ),
-}
-
-/// Visit the schema of the passed `SnapshotHandle`, using the provided `visitor`. See the
-/// documentation of [`EngineSchemaVisitor`] for a description of how this visitor works.
-///
-/// This method returns the id of the list allocated to hold the top level schema columns.
-///
-/// # Safety
-///
-/// Caller is responsible for passing a valid snapshot handle and schema visitor.
-#[no_mangle]
-pub unsafe extern "C" fn visit_snapshot_schema(
-    snapshot: Handle<SharedSnapshot>,
-    visitor: &mut EngineSchemaVisitor,
-) -> usize {
-    let snapshot = unsafe { snapshot.as_ref() };
-    visit_schema_impl(snapshot.schema(), visitor)
 }
 
 /// Visit the given `schema` using the provided `visitor`. See the documentation of

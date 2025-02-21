@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tracing::debug;
 use url::Url;
 
+use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Engine, EngineData, Table};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -561,6 +562,9 @@ pub unsafe extern "C" fn free_engine(engine: Handle<SharedExternEngine>) {
     engine.drop_handle();
 }
 
+#[handle_descriptor(target=Schema, mutable=false, sized=true)]
+pub struct SharedSchema;
+
 #[handle_descriptor(target=Snapshot, mutable=false, sized=true)]
 pub struct SharedSnapshot;
 
@@ -605,6 +609,26 @@ pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
 pub unsafe extern "C" fn version(snapshot: Handle<SharedSnapshot>) -> u64 {
     let snapshot = unsafe { snapshot.as_ref() };
     snapshot.version()
+}
+
+/// Get the logical schema of the specified snapshot
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn logical_schema(snapshot: Handle<SharedSnapshot>) -> Handle<SharedSchema> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    Arc::new(snapshot.schema().clone()).into()
+}
+
+/// Free a schema
+///
+/// # Safety
+/// Engine is responsible for providing a valid schema handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_schema(schema: Handle<SharedSchema>) {
+    schema.drop_handle();
 }
 
 /// Get the resolved root of the table. This should be used in any future calls that require
