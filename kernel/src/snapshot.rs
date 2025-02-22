@@ -98,6 +98,7 @@ impl Snapshot {
     }
 
     /// Table [`Schema`] at this `Snapshot`s version.
+    // TODO should this return SchemaRef?
     pub fn schema(&self) -> &Schema {
         self.table_configuration.schema()
     }
