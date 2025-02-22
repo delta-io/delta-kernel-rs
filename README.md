@@ -84,6 +84,10 @@ Note that if more than one `arrow_x` feature is enabled, kernel will default to 
 specified flag. This also means that if you use `--all-features` you will get the lowest version of
 arrow that kernel supports.
 
+If no arrow feature is enabled, but are least one of `default-engine`, `sync-engine`,
+`arrow-conversion` or, `arrow-expression` is enabled, the lowest supported arrow version will be
+enabled.
+
 ### Object Store
 You may also need to patch the `object_store` version used if the version of `parquet` you depend on
 depends on a different version of `object_store`. This can be done by including `object_store` in
