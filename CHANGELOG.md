@@ -10,9 +10,9 @@
     - Adds a new `scan::state::transform_to_logical` function that encapsulates the boilerplate of applying the transform expression
     - Removes `scan_action_iter` API and `logical_to_physical` API
     - Removes `column_mapping_mode` from `GlobalScanState`
-    - ffi: Removes `add_partition_columns` in arrow.c
     - ffi: exposes methods to get an expression evaluator and evaluate an expression from c
-    - ffi: adds an `apply_transform` function in arrow.c
+    - read-table example: Removes `add_partition_columns` in arrow.c
+    - read-table example: adds an `apply_transform` function in arrow.c
 2. ffi: support field nullability in schema visitor ([#656])
 3. ffi: expose metadata in SchemaEngineVisitor ffi api ([#659])
 4. ffi: new `visit_schema` FFI now operates on a `Schema` instead of a `Snapshot` ([#683], [#709])
