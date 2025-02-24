@@ -4,31 +4,39 @@
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.6.1...v0.7.0)
 
+### 🏗️ Breaking changes
+1. Read transforms are now communicated via expressions ([#607], [#612], [#613], [#614]) This includes:
+    - `ScanData` now includes a third tuple field: a row-indexed vector of transforms to apply to the `EngineData`.
+    - Adds a new `scan::state::transform_to_logical` function that encapsulates the boilerplate of applying the transform expression
+    - Removes `scan_action_iter` API and `logical_to_physical` API
+    - Removes `column_mapping_mode` from `GlobalScanState`
+    - ffi: Removes `add_partition_columns` in arrow.c
+    - ffi: exposes methods to get an expression evaluator and evaluate an expression from c
+    - ffi: adds an `apply_transform` function in arrow.c
+2. ffi: support field nullability in schema visitor ([#656])
+3. ffi: expose metadata in SchemaEngineVisitor ffi api ([#659])
+4. ffi: new `visit_schema` FFI now operates on a `Schema` instead of a `Snapshot` ([#683], [#709])
+5. Introduced feature flags (`arrow_54` and `arrow_53`) to select major arrow versions ([#654], [#708])
 
 ### 🚀 Features / new APIs
 
 1. Read `partition_values` in `RemoveVisitor` and remove `break` in `RowVisitor` for `RemoveVisitor` ([#633])
 2. Add the in-commit timestamp field to CommitInfo ([#581])
 3. Support NOT and column expressions in eval_sql_where ([#653])
-4. Feat!(ffi): support field nullability in schema visitor ([#656])
-5. Add check for schema read compatibility ([#554])
-6. Introduce `TableConfiguration` to jointly manage metadata, protocol, and table properties ([#644])
-7. Feat!(ffi): expose metadata in SchemaEngineVisitor ffi api ([#659])
-8. Add visitor `SidecarVisitor` and `Sidecar` action struct  ([#673])
-9. Add in-commit timestamps table properties ([#558])
-10. Feat!(ffi): new visit_schema FFI and rename old visit_schema to visit_snapshot_schema ([#683])
-11. Introduce feature flags to select major arrow versions ([#654])
-12. Support writing to not only 3/7 protocol ([#693])
-13. Feat!(ffi): remove `visit_snapshot_schema`, add `logical_schema` ([#709])
+4. Add check for schema read compatibility ([#554])
+5. Introduce `TableConfiguration` to jointly manage metadata, protocol, and table properties ([#644])
+6. Add visitor `SidecarVisitor` and `Sidecar` action struct  ([#673])
+7. Add in-commit timestamps table properties ([#558])
+8. Support writing to writer version 1 ([#693])
+9. ffi: new `logical_schema` FFI to get the logical schema of a snapshot ([#709])
 
 ### 🐛 Bug Fixes
 
-1. Release script publishing fixes ([#638])
-2. Incomplete multi-part checkpoint handling when no hint is provided ([#641])
-3. Consistent PartialEq for Scalar ([#677])
-4. Cargo fmt does not handle mods defined in macros ([#676])
-5. Ensure properly nested null masks for parquet reads ([#692])
-6. Handle predicates on non-nullable columns without stats ([#700])
+1. Incomplete multi-part checkpoint handling when no hint is provided ([#641])
+2. Consistent PartialEq for Scalar ([#677])
+3. Cargo fmt does not handle mods defined in macros ([#676])
+4. Ensure properly nested null masks for parquet reads ([#692])
+5. Handle predicates on non-nullable columns without stats ([#700])
 
 ### 📚 Documentation
 
@@ -38,6 +46,7 @@
 ### 🚜 Refactor
 
 1. Make [non] nullable struct fields easier to create ([#646])
+2. Make eval_sql_where available to DefaultPredicateEvaluator ([#627])
 
 ### 🧪 Testing
 
@@ -46,16 +55,7 @@
 ### ⚙️ Chores/CI
 
 1. Fix some typos ([#643])
-
-### Other
-
-1. Make eval_sql_where available to DefaultPredicateEvaluator ([#627])
-2. Part 1, Read transforms via expressions: Just compute the expression and return it. ([#607])
-3. Part 2: propagate transform in visit_scan_files ([#612])
-4. Part 3 of expression based transform: Use computed transform ([#613])
-5. Part 4: read_table.c uses transform in ffi ([#614])
-6. Support --all-features again ([#708])
-
+2. Release script publishing fixes ([#638])
 
 [#638]: https://github.com/delta-io/delta-kernel-rs/pull/638
 [#643]: https://github.com/delta-io/delta-kernel-rs/pull/643
