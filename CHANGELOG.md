@@ -1,5 +1,94 @@
 # Changelog
 
+## [v0.7.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.7.0/) (2025-02-24)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.6.1...v0.7.0)
+
+
+### 🚀 Features / new APIs
+
+1. Read `partition_values` in `RemoveVisitor` and remove `break` in `RowVisitor` for `RemoveVisitor` ([#633])
+2. Add the in-commit timestamp field to CommitInfo ([#581])
+3. Support NOT and column expressions in eval_sql_where ([#653])
+4. Feat!(ffi): support field nullability in schema visitor ([#656])
+5. Add check for schema read compatibility ([#554])
+6. Introduce `TableConfiguration` to jointly manage metadata, protocol, and table properties ([#644])
+7. Feat!(ffi): expose metadata in SchemaEngineVisitor ffi api ([#659])
+8. Add visitor `SidecarVisitor` and `Sidecar` action struct  ([#673])
+9. Add in-commit timestamps table properties ([#558])
+10. Feat!(ffi): new visit_schema FFI and rename old visit_schema to visit_snapshot_schema ([#683])
+11. Introduce feature flags to select major arrow versions ([#654])
+12. Support writing to not only 3/7 protocol ([#693])
+13. Feat!(ffi): remove `visit_snapshot_schema`, add `logical_schema` ([#709])
+
+### 🐛 Bug Fixes
+
+1. Release script publishing fixes ([#638])
+2. Incomplete multi-part checkpoint handling when no hint is provided ([#641])
+3. Consistent PartialEq for Scalar ([#677])
+4. Cargo fmt does not handle mods defined in macros ([#676])
+5. Ensure properly nested null masks for parquet reads ([#692])
+6. Handle predicates on non-nullable columns without stats ([#700])
+
+### 📚 Documentation
+
+1. Update readme to reflect tracing feature is needed for read-table ([#619])
+2. Clarify `JsonHandler` semantics on EngineData ordering ([#635])
+
+### 🚜 Refactor
+
+1. Make [non] nullable struct fields easier to create ([#646])
+
+### 🧪 Testing
+
+1. Port cdf tests from delta-spark to kernel ([#611])
+
+### ⚙️ Chores/CI
+
+1. Fix some typos ([#643])
+
+### Other
+
+1. Make eval_sql_where available to DefaultPredicateEvaluator ([#627])
+2. Part 1, Read transforms via expressions: Just compute the expression and return it. ([#607])
+3. Part 2: propagate transform in visit_scan_files ([#612])
+4. Part 3 of expression based transform: Use computed transform ([#613])
+5. Part 4: read_table.c uses transform in ffi ([#614])
+6. Support --all-features again ([#708])
+
+
+[#638]: https://github.com/delta-io/delta-kernel-rs/pull/638
+[#643]: https://github.com/delta-io/delta-kernel-rs/pull/643
+[#619]: https://github.com/delta-io/delta-kernel-rs/pull/619
+[#635]: https://github.com/delta-io/delta-kernel-rs/pull/635
+[#633]: https://github.com/delta-io/delta-kernel-rs/pull/633
+[#611]: https://github.com/delta-io/delta-kernel-rs/pull/611
+[#581]: https://github.com/delta-io/delta-kernel-rs/pull/581
+[#646]: https://github.com/delta-io/delta-kernel-rs/pull/646
+[#627]: https://github.com/delta-io/delta-kernel-rs/pull/627
+[#641]: https://github.com/delta-io/delta-kernel-rs/pull/641
+[#653]: https://github.com/delta-io/delta-kernel-rs/pull/653
+[#607]: https://github.com/delta-io/delta-kernel-rs/pull/607
+[#656]: https://github.com/delta-io/delta-kernel-rs/pull/656
+[#554]: https://github.com/delta-io/delta-kernel-rs/pull/554
+[#644]: https://github.com/delta-io/delta-kernel-rs/pull/644
+[#659]: https://github.com/delta-io/delta-kernel-rs/pull/659
+[#612]: https://github.com/delta-io/delta-kernel-rs/pull/612
+[#677]: https://github.com/delta-io/delta-kernel-rs/pull/677
+[#676]: https://github.com/delta-io/delta-kernel-rs/pull/676
+[#673]: https://github.com/delta-io/delta-kernel-rs/pull/673
+[#613]: https://github.com/delta-io/delta-kernel-rs/pull/613
+[#558]: https://github.com/delta-io/delta-kernel-rs/pull/558
+[#692]: https://github.com/delta-io/delta-kernel-rs/pull/692
+[#700]: https://github.com/delta-io/delta-kernel-rs/pull/700
+[#683]: https://github.com/delta-io/delta-kernel-rs/pull/683
+[#654]: https://github.com/delta-io/delta-kernel-rs/pull/654
+[#693]: https://github.com/delta-io/delta-kernel-rs/pull/693
+[#614]: https://github.com/delta-io/delta-kernel-rs/pull/614
+[#709]: https://github.com/delta-io/delta-kernel-rs/pull/709
+[#708]: https://github.com/delta-io/delta-kernel-rs/pull/708
+
+
 ## [v0.6.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.6.1/) (2025-01-10)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.6.0...v0.6.1)
