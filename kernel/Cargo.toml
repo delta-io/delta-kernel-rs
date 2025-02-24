@@ -94,8 +94,9 @@ arrow_53 = ["dep:arrow_53", "dep:parquet_53"]
 
 arrow_54 = ["dep:arrow_54", "dep:parquet_54"]
 
-arrow-conversion = []
-arrow-expression = []
+need_arrow = []
+arrow-conversion = ["need_arrow"]
+arrow-expression = ["need_arrow"]
 
 cloud = [
   "object_store/aws",
@@ -112,6 +113,7 @@ default-engine-base = [
   "arrow-conversion",
   "arrow-expression",
   "futures",
+  "need_arrow",
   "object_store",
   "tokio",
   "uuid/v4",
@@ -130,6 +132,7 @@ default-engine-rustls = [
 
 developer-visibility = []
 sync-engine = [
+  "need_arrow",
   "tempfile",
 ]
 integration-test = [

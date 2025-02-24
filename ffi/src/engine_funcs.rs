@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
+use delta_kernel::schema::{DataType, Schema, SchemaRef};
 use delta_kernel::{
-    schema::{DataType, Schema, SchemaRef},
     DeltaResult, EngineData, Expression, ExpressionEvaluator, FileDataReadResultIterator,
 };
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -11,8 +11,8 @@ use tracing::debug;
 use url::Url;
 
 use crate::{
-    scan::SharedSchema, ExclusiveEngineData, ExternEngine, ExternResult, IntoExternResult,
-    KernelStringSlice, NullableCvoid, SharedExternEngine, TryFromStringSlice,
+    ExclusiveEngineData, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
+    NullableCvoid, SharedExternEngine, SharedSchema, TryFromStringSlice,
 };
 
 use super::handle::Handle;
@@ -209,7 +209,7 @@ fn evaluate_impl(
 #[cfg(test)]
 mod tests {
     use super::{free_evaluator, get_evaluator};
-    use crate::{free_engine, handle::Handle, scan::SharedSchema, tests::get_default_engine};
+    use crate::{free_engine, handle::Handle, tests::get_default_engine, SharedSchema};
     use delta_kernel::{
         schema::{DataType, StructField, StructType},
         Expression,
