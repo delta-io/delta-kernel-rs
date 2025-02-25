@@ -26,13 +26,16 @@ use crate::{
     JsonHandler,
 };
 
+const DEFAULT_BUFFER_SIZE: usize = 1000;
+const DEFAULT_BATCH_SIZE: usize = 1024 * 128;
+
 #[derive(Debug)]
 pub struct DefaultJsonHandler<E: TaskExecutor> {
     /// The object store to read files from
     store: Arc<DynObjectStore>,
     /// The executor to run async tasks on
     task_executor: Arc<E>,
-    /// The maximum number of batches to read ahead
+    /// The maximum number of read requests to buffer in memory at once
     buffer_size: usize,
     /// The number of rows to read per batch
     batch_size: usize,
@@ -43,22 +46,35 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
         Self {
             store,
             task_executor,
-            buffer_size: 1000,
-            batch_size: 1024 * 128,
+            buffer_size: DEFAULT_BUFFER_SIZE,
+            batch_size: DEFAULT_BATCH_SIZE,
         }
     }
 
-    /// Set the maximum number of batches to read ahead during [Self::read_json_files()].
+    /// Deprecated: use [Self::with_buffer_size()].
     ///
-    /// Defaults to 10.
+    /// Set the maximum number read requests to buffer in memory at once in
+    /// [Self::read_json_files()].
+    ///
+    /// Defaults to 1000.
+    #[deprecated(note = "use with_buffer_size() instead")]
     pub fn with_readahead(mut self, readahead: usize) -> Self {
         self.buffer_size = readahead;
         self
     }
 
+    /// Set the maximum number read requests to buffer in memory at once in
+    /// [Self::read_json_files()].
+    ///
+    /// Defaults to 1000.
+    pub fn with_buffer_size(mut self, buffer_size: usize) -> Self {
+        self.buffer_size = buffer_size;
+        self
+    }
+
     /// Set the number of rows to read per batch during [Self::parse_json()].
     ///
-    /// Defaults to 1024.
+    /// Defaults to 128kB.
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self
