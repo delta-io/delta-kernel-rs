@@ -31,8 +31,8 @@ use crate::engine::arrow_utils::prim_array_cmp;
 use crate::engine::ensure_data_types::ensure_data_types;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
-    BinaryExpression, BinaryOperator, Expression, Scalar, UnaryExpression, UnaryOperator,
-    VariadicExpression, VariadicOperator,
+    ArrayData, BinaryExpression, BinaryOperator, Expression, OpaqueExpression, OpaqueOperator,
+    Scalar, UnaryExpression, UnaryOperator, VariadicExpression, VariadicOperator,
 };
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField};
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
@@ -133,6 +133,78 @@ impl Scalar {
         };
         Ok(arr)
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ArrowOpaqueOperator {
+    InList(ArrayData),
+    NotInList(ArrayData),
+}
+
+impl OpaqueOperator for ArrowOpaqueOperator {
+    fn eval_scalar(&self, values: &[Option<Scalar>]) -> DeltaResult<Option<Scalar>> {
+        use ArrowOpaqueOperator::*;
+        match self {
+            InList(ad) => eval_scalar_in_list(values, ad, false),
+            NotInList(ad) => eval_scalar_in_list(values, ad, true),
+        }
+    }
+}
+
+fn eval_opaque(
+    opaque: &OpaqueExpression,
+    batch: &RecordBatch,
+    result_type: Option<&DataType>,
+) -> DeltaResult<ArrayRef> {
+    // Only evaluate the children if we actually know how to evaluate the requested operation.
+    let op = opaque
+        .op
+        .any_ref()
+        .downcast_ref::<ArrowOpaqueOperator>()
+        .ok_or_else(|| Error::generic(format!("Unsupported opaque expression: {:?}", opaque.op)))?;
+
+    let arrays = opaque
+        .exprs
+        .iter()
+        .map(|expr| evaluate_expression(expr, batch, result_type))
+        .try_collect()?;
+
+    use ArrowOpaqueOperator::*;
+    let result = match op {
+        InList(ad) => Arc::new(eval_in_list(arrays, ad, result_type)?),
+        NotInList(ad) => Arc::new(not(&eval_in_list(arrays, ad, result_type)?)?),
+    };
+    Ok(result)
+}
+
+fn eval_scalar_in_list(
+    values: &[Option<Scalar>],
+    inlist: &ArrayData,
+    inverted: bool,
+) -> DeltaResult<Option<Scalar>> {
+    let [ref arg] = values[..] else {
+        return Err(Error::generic(format!(
+            "Invalid inlist arg count: expected 1, got {}",
+            values.len()
+        )));
+    };
+    let Some(arg) = arg else {
+        return Ok(None);
+    };
+    todo!()
+}
+fn eval_in_list(
+    arrays: Vec<ArrayRef>,
+    inlist: &ArrayData,
+    result_type: Option<&DataType>,
+) -> DeltaResult<BooleanArray> {
+    let [ref arg] = arrays[..] else {
+        return Err(Error::generic(format!(
+            "Invalid inlist arg count: expected 1, got {}",
+            arrays.len()
+        )));
+    };
+    todo!()
 }
 
 fn wrap_comparison_result(arr: BooleanArray) -> ArrayRef {
@@ -351,6 +423,8 @@ fn evaluate_expression(
                 "Variadic {expression:?} is expected to return boolean results, got {result_type:?}"
             )))
         }
+        (Opaque(o), _) => eval_opaque(o, batch, result_type),
+        (Unsupported(name), _) => Err(Error::generic(format!("Unsupported expression: {name:?}"))),
     }
 }
 
