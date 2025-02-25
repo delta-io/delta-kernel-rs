@@ -14,4 +14,4 @@ pub use arrow_54::*;
     not(feature = "arrow_53"),
     not(feature = "arrow_54")
 ))]
-pub use arrow_53::*;
+compile_error!("Requested a feature that needs arrow without enabling arrow. Please enable the `arrow_53` or `arrow_54` feature");
