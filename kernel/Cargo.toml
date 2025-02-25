@@ -159,4 +159,4 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "fmt",
 ] }
-async-trait = "0.1"
+async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implementation

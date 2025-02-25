@@ -135,7 +135,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     }
 }
 
-/// A [`FileOpener`] that opens a JSON file and yields a [`FileOpenFuture`]
+/// Opens JSON files and returns a stream of record batches
 #[allow(missing_debug_implementations)]
 pub struct JsonOpener {
     batch_size: usize,
