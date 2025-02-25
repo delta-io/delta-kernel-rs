@@ -16,7 +16,7 @@
 2. ffi: support field nullability in schema visitor ([#656])
 3. ffi: expose metadata in SchemaEngineVisitor ffi api ([#659])
 4. ffi: new `visit_schema` FFI now operates on a `Schema` instead of a `Snapshot` ([#683], [#709])
-5. Introduced feature flags (`arrow_54` and `arrow_53`) to select major arrow versions ([#654], [#708])
+5. Introduced feature flags (`arrow_54` and `arrow_53`) to select major arrow versions ([#654], [#708], [#717])
 
 ### 🚀 Features / new APIs
 
@@ -87,6 +87,7 @@
 [#614]: https://github.com/delta-io/delta-kernel-rs/pull/614
 [#709]: https://github.com/delta-io/delta-kernel-rs/pull/709
 [#708]: https://github.com/delta-io/delta-kernel-rs/pull/708
+[#717]: https://github.com/delta-io/delta-kernel-rs/pull/717
 
 
 ## [v0.6.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.6.1/) (2025-01-10)
