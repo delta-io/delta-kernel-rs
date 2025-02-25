@@ -138,13 +138,21 @@ jobs:
         os:
           - macOS-latest
           - ubuntu-latest
+          - windows-latest
     steps:
       - uses: actions/checkout@v4
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
         with:
           cmake-version: '3.30.x'
+      - name: install msys2 and arrow on windows
+        if: matrix.os == 'windows-latest'
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          install: mingw-w64-ucrt-x86_64-arrow
       - name: Install arrow-glib
+        shell: bash
         run: |
           if [ "$RUNNER_OS" == "Linux" ]; then
               sudo apt update
@@ -160,6 +168,8 @@ jobs:
           elif [ "$RUNNER_OS" == "macOS" ]; then
               brew install apache-arrow
               brew install apache-arrow-glib
+          elif [ "$RUNNER_OS" == "Windows" ]; then
+              echo "Handled by previous step"
           else
               echo "$RUNNER_OS not supported"
               exit 1
