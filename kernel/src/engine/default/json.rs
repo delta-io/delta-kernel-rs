@@ -3,19 +3,19 @@
 use std::io::BufReader;
 use std::ops::Range;
 use std::sync::{mpsc, Arc};
-use std::task::{ready, Poll};
+use std::task::Poll;
 
 use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::arrow::json::ReaderBuilder;
+use crate::arrow::record_batch::RecordBatch;
 use bytes::{Buf, Bytes};
-use futures::stream;
+use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{DynObjectStore, GetResultPayload};
 use url::Url;
 
 use super::executor::TaskExecutor;
-use super::file_stream::{FileOpenFuture, FileOpener};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::parse_json as arrow_parse_json;
 use crate::engine::arrow_utils::to_json_bytes;
@@ -83,8 +83,6 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             return Ok(Box::new(std::iter::empty()));
         }
 
-        println!("Reading {} files", files.len());
-
         let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
         let file_opener = JsonOpener::new(self.batch_size, schema.clone(), self.store.clone());
 
@@ -93,11 +91,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         let readahead = self.readahead;
 
         self.task_executor.spawn(async move {
-            let file_futures: Vec<_> = files
-                .into_iter()
-                .map(|file| file_opener.open(file, None))
-                .collect::<DeltaResult<Vec<_>>>()
-                .expect("Error creating file futures");
+            let file_futures = files.into_iter().map(|file| file_opener.open(file, None));
 
             let mut stream = stream::iter(file_futures)
                 .buffered(readahead)
@@ -150,73 +144,74 @@ pub struct JsonOpener {
 }
 
 impl JsonOpener {
-    /// Returns a  [`JsonOpener`]
+    /// Returns a [`JsonOpener`]
     pub fn new(
         batch_size: usize,
         projected_schema: ArrowSchemaRef,
-        // file_compression_type: FileCompressionType,
         object_store: Arc<DynObjectStore>,
     ) -> Self {
         Self {
             batch_size,
             projected_schema,
-            // file_compression_type,
             object_store,
         }
     }
 }
 
-impl FileOpener for JsonOpener {
-    fn open(&self, file_meta: FileMeta, _: Option<Range<i64>>) -> DeltaResult<FileOpenFuture> {
+impl JsonOpener {
+    pub async fn open(
+        &self,
+        file_meta: FileMeta,
+        _: Option<Range<i64>>,
+    ) -> DeltaResult<BoxStream<'static, DeltaResult<RecordBatch>>> {
         let store = self.object_store.clone();
         let schema = self.projected_schema.clone();
         let batch_size = self.batch_size;
 
-        Ok(Box::pin(async move {
-            let path = Path::from_url_path(file_meta.location.path())?;
-            match store.get(&path).await?.payload {
-                GetResultPayload::File(file, _) => {
-                    let reader = ReaderBuilder::new(schema)
-                        .with_batch_size(batch_size)
-                        .build(BufReader::new(file))?;
-                    Ok(futures::stream::iter(reader).map_err(Error::from).boxed())
-                }
-                GetResultPayload::Stream(s) => {
-                    let mut decoder = ReaderBuilder::new(schema)
-                        .with_batch_size(batch_size)
-                        .build_decoder()?;
-
-                    let mut input = s.map_err(Error::from);
-                    let mut buffered = Bytes::new();
-
-                    let s = futures::stream::poll_fn(move |cx| {
-                        loop {
-                            if buffered.is_empty() {
-                                buffered = match ready!(input.poll_next_unpin(cx)) {
-                                    Some(Ok(b)) => b,
-                                    Some(Err(e)) => return Poll::Ready(Some(Err(e))),
-                                    None => break,
-                                };
-                            }
-                            let read = buffered.len();
-
-                            let decoded = match decoder.decode(buffered.as_ref()) {
-                                Ok(decoded) => decoded,
-                                Err(e) => return Poll::Ready(Some(Err(e.into()))),
-                            };
-
-                            buffered.advance(decoded);
-                            if decoded != read {
-                                break;
-                            }
-                        }
-
-                        Poll::Ready(decoder.flush().map_err(Error::from).transpose())
-                    });
-                    Ok(s.map_err(Error::from).boxed())
-                }
+        let path = Path::from_url_path(file_meta.location.path())?;
+        let get_result = store.get(&path).await?;
+        match get_result.payload {
+            GetResultPayload::File(file, _) => {
+                let reader = ReaderBuilder::new(schema)
+                    .with_batch_size(batch_size)
+                    .build(BufReader::new(file))?;
+                Ok(futures::stream::iter(reader).map_err(Error::from).boxed())
             }
-        }))
+            GetResultPayload::Stream(s) => {
+                let mut decoder = ReaderBuilder::new(schema)
+                    .with_batch_size(batch_size)
+                    .build_decoder()?;
+
+                let mut input = s.map_err(Error::from);
+                let mut buffered = Bytes::new();
+
+                let stream = futures::stream::poll_fn(move |cx| {
+                    loop {
+                        if buffered.is_empty() {
+                            buffered = match futures::ready!(input.poll_next_unpin(cx)) {
+                                Some(Ok(b)) => b,
+                                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                                None => break,
+                            };
+                        }
+                        let read = buffered.len();
+
+                        let decoded = match decoder.decode(buffered.as_ref()) {
+                            Ok(decoded) => decoded,
+                            Err(e) => return Poll::Ready(Some(Err(e.into()))),
+                        };
+
+                        buffered.advance(decoded);
+                        if decoded != read {
+                            break;
+                        }
+                    }
+
+                    Poll::Ready(decoder.flush().map_err(Error::from).transpose())
+                });
+                Ok(stream.map_err(Error::from).boxed())
+            }
+        }
     }
 }
 
@@ -234,6 +229,131 @@ mod tests {
         actions::get_log_schema, engine::arrow_data::ArrowEngineData,
         engine::default::executor::tokio::TokioBackgroundExecutor,
     };
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOpts,
+        PutOptions, PutPayload, PutResult, Result,
+    };
+
+    /// Store wrapper that wraps an inner store to purposefully delay GET requests of certain keys.
+    #[derive(Debug)]
+    struct SlowGetStore<T> {
+        inner: T,
+        wait_keys: Arc<Mutex<HashMap<Path, Duration>>>,
+    }
+
+    impl<T> SlowGetStore<T> {
+        fn new(inner: T, wait_keys: HashMap<Path, Duration>) -> Self {
+            Self {
+                inner,
+                wait_keys: Arc::new(Mutex::new(wait_keys)),
+            }
+        }
+    }
+
+    impl<T: ObjectStore> std::fmt::Display for SlowGetStore<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SlowGetStore({:?})", self.wait_keys)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<T: ObjectStore> ObjectStore for SlowGetStore<T> {
+        async fn put(&self, location: &Path, payload: PutPayload) -> Result<PutResult> {
+            self.inner.put(location, payload).await
+        }
+
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart(location).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOpts,
+        ) -> Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get(&self, location: &Path) -> Result<GetResult> {
+            let wait_time = {
+                let guard = self.wait_keys.lock().expect("lock key map");
+                guard.get(location).copied()
+            };
+
+            if let Some(duration) = wait_time {
+                tokio::time::sleep(duration).await;
+            }
+
+            self.inner.get(location).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_range(&self, location: &Path, range: Range<usize>) -> Result<Bytes> {
+            self.inner.get_range(location, range).await
+        }
+
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        async fn head(&self, location: &Path) -> Result<ObjectMeta> {
+            self.inner.head(location).await
+        }
+
+        async fn delete(&self, location: &Path) -> Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'_, Result<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+            self.inner.rename(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+
+        async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
+            self.inner.rename_if_not_exists(from, to).await
+        }
+    }
 
     fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
         let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
@@ -325,5 +445,69 @@ mod tests {
 
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].num_rows(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_read_json_files_ordering() {
+        let paths = [
+            "./tests/data/table-with-dv-small/_delta_log/00000000000000000000.json",
+            "./tests/data/table-with-dv-small/_delta_log/00000000000000000001.json",
+        ];
+        let paths = paths.map(|p| std::fs::canonicalize(PathBuf::from(p)).unwrap());
+
+        // Convert &std::path::Path to object_store::path::Path
+        let path_string = paths[0].to_string_lossy().to_string();
+        let object_store_path = Path::from(path_string);
+        let key_map = (object_store_path, Duration::from_secs(1));
+
+        let store = Arc::new(SlowGetStore::new(
+            LocalFileSystem::new(),
+            vec![key_map].into_iter().collect(),
+        ));
+
+        // Create a vector of futures, then await them all
+        use futures::future;
+
+        let file_futures: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                let store = store.clone();
+                async move {
+                    let url = url::Url::from_file_path(path).unwrap();
+                    let location = Path::from(url.path());
+                    let meta = store.head(&location).await.unwrap();
+                    FileMeta {
+                        location: url.clone(),
+                        last_modified: meta.last_modified.timestamp_millis(),
+                        size: meta.size,
+                    }
+                }
+            })
+            .collect();
+
+        // Await all futures to get a Vec<FileMeta>
+        let files = future::join_all(file_futures).await;
+
+        // Same as before, but now files is a Vec<FileMeta>
+        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let physical_schema = Arc::new(ArrowSchema::try_from(get_log_schema().as_ref()).unwrap());
+        let data: Vec<RecordBatch> = handler
+            .read_json_files(&files, Arc::new(physical_schema.try_into().unwrap()), None)
+            .unwrap()
+            .map(|ed_res| {
+                // TODO(nick) make this easier
+                ed_res.and_then(|ed| {
+                    ed.into_any()
+                        .downcast::<ArrowEngineData>()
+                        .map_err(|_| Error::engine_data_type("ArrowEngineData"))
+                        .map(|sd| sd.into())
+                })
+            })
+            .try_collect()
+            .unwrap();
+        assert_eq!(data.len(), 2);
+        // check for ordering: first commit has 4 actions, second commit has 3 actions
+        assert_eq!(data[0].num_rows(), 4);
+        assert_eq!(data[1].num_rows(), 3);
     }
 }

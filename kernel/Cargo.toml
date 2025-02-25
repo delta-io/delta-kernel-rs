@@ -159,3 +159,4 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "fmt",
 ] }
+async-trait = "0.1"
