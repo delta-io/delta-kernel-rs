@@ -302,7 +302,7 @@ mod tests {
         }
 
         // Register a waker for a specific path
-        fn register_waker(&self, path: &Path, waker: std::task::Waker) {
+        fn register_waker(&self, path: &Path, waker: Waker) {
             self.wakers
                 .lock()
                 .unwrap()
@@ -366,7 +366,7 @@ mod tests {
         // - if no, register the waker and wait
         async fn get(&self, location: &Path) -> Result<GetResult> {
             // we implement a future which only resolves once the requested path is next in order
-            futures::future::poll_fn(move |cx| {
+            future::poll_fn(move |cx| {
                 let mut ordered_keys = self.ordered_keys.lock().unwrap();
                 match ordered_keys.front() {
                     Some(key) if key == location => {
