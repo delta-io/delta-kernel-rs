@@ -27,7 +27,7 @@ use crate::{
 };
 
 const DEFAULT_BUFFER_SIZE: usize = 1000;
-const DEFAULT_BATCH_SIZE: usize = 10_000;
+const DEFAULT_BATCH_SIZE: usize = 1000;
 
 #[derive(Debug)]
 pub struct DefaultJsonHandler<E: TaskExecutor> {
@@ -35,9 +35,12 @@ pub struct DefaultJsonHandler<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
     /// The executor to run async tasks on
     task_executor: Arc<E>,
-    /// The maximum number of read requests to buffer in memory at once
+    /// The maximum number of read requests to buffer in memory at once. Note that this actually
+    /// controls two things: the number of concurrent requests (done by `buffered`) and the size of
+    /// the buffer (via our `sync_channel`).
     buffer_size: usize,
-    /// The number of rows to read per batch
+    /// Limit the number of rows per batch. That is, for batch_size = N, then each RecordBatch
+    /// yielded by the stream will have at most N rows.
     batch_size: usize,
 }
 
@@ -67,14 +70,25 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
     /// [Self::read_json_files()].
     ///
     /// Defaults to 1000.
+    ///
+    /// Memory constraints can be imposed by constraining the buffer size and batch size. Note that
+    /// overall memory usage is proportional to the product of these two values.
+    /// 1. Batch size governs the size of RecordBatches yielded in each iteration of the stream
+    /// 2. Buffer size governs the number of concurrent tasks (which equals the size of the buffer
     pub fn with_buffer_size(mut self, buffer_size: usize) -> Self {
         self.buffer_size = buffer_size;
         self
     }
 
-    /// Set the number of rows to read per batch during [Self::parse_json()].
+    /// Limit the number of rows per batch. That is, for batch_size = N, then each RecordBatch
+    /// yielded by the stream will have at most N rows.
     ///
-    /// Defaults to 10_000 rows.
+    /// Defaults to 1000 rows (json objects).
+    ///
+    /// See [Decoder::with_buffer_size] for details on constraining memory usage with buffer size
+    /// and batch size.
+    ///
+    /// [Decoder]: arrow::json::reader::Decoder
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self
@@ -111,7 +125,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             // an iterator of futures that open each file
             let file_futures = files.into_iter().map(|file| file_opener.open(file, None));
 
-            // create a stream from that iterator which buffers up to `readahead` futures at a time
+            // create a stream from that iterator which buffers up to `buffer_size` futures at a time
             let mut stream = stream::iter(file_futures)
                 .buffered(buffer_size)
                 .try_flatten()
@@ -217,6 +231,12 @@ impl JsonOpener {
                         }
                         let read = buffered.len();
 
+                        // NB (from Decoder::decode docs):
+                        // Read JSON objects from `buf` (param), returning the number of bytes read
+                        //
+                        // This method returns once `batch_size` objects have been parsed since the
+                        // last call to [`Self::flush`], or `buf` is exhausted. Any remaining bytes
+                        // should be included in the next call to [`Self::decode`]
                         let decoded = match decoder.decode(buffered.as_ref()) {
                             Ok(decoded) => decoded,
                             Err(e) => return Poll::Ready(Some(Err(e.into()))),
@@ -240,7 +260,7 @@ impl JsonOpener {
 mod tests {
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
     use std::task::Waker;
 
     use crate::actions::get_log_schema;
@@ -268,7 +288,9 @@ mod tests {
 
     use super::*;
 
-    /// Store wrapper that wraps an inner store to guarantee the ordering of GET requests.
+    /// Store wrapper that wraps an inner store to guarantee the ordering of GET requests. Note
+    /// that since the keys are resolved in order, requests to subsequent keys in the order will
+    /// block until the earlier keys are requested.
     ///
     /// WARN: Does not handle duplicate keys, and will fail on duplicate requests of the same key.
     ///
@@ -279,7 +301,7 @@ mod tests {
         // The ObjectStore we are wrapping
         inner: T,
         // Combined state: queue and wakers, protected by a single mutex
-        state: Arc<Mutex<KeysAndWakers>>,
+        state: Mutex<KeysAndWakers>,
     }
 
     #[derive(Debug, Default)]
@@ -287,7 +309,7 @@ mod tests {
         // Queue of paths in order which they will resolve
         ordered_keys: VecDeque<Path>,
         // Map of paths to wakers for pending get requests
-        wakers: HashMap<Path, Vec<Waker>>,
+        wakers: HashMap<Path, Waker>,
     }
 
     impl<T: ObjectStore> OrderedGetStore<T> {
@@ -308,23 +330,7 @@ mod tests {
 
             Self {
                 inner,
-                state: Arc::new(Mutex::new(state)),
-            }
-        }
-
-        // Wake the wakers for the next path in order, if any
-        fn wake_next(&self) {
-            let mut state = self.state.lock().unwrap();
-            // If we have a next key, get its wakers and wake them
-            if let Some(next_key) = state.ordered_keys.front().cloned() {
-                if let Some(path_wakers) = state.wakers.remove(&next_key) {
-                    // We need to release the lock before waking wakers to prevent
-                    // any potential reentrant lock attempts
-                    drop(state);
-                    for waker in path_wakers {
-                        waker.wake();
-                    }
-                }
+                state: Mutex::new(state),
             }
         }
     }
@@ -368,36 +374,60 @@ mod tests {
         //   next path in order
         // - if no, register the waker and wait
         async fn get(&self, location: &Path) -> Result<GetResult> {
+            // Do the actual GET request first, then introduce any artificial ordering delays as needed
+            let result = self.inner.get(location).await;
+
             // we implement a future which only resolves once the requested path is next in order
             future::poll_fn(move |cx| {
                 let mut state = self.state.lock().unwrap();
-                match state.ordered_keys.front() {
-                    Some(key) if key == location => {
-                        // this key is next: remove it and return Ready so we proceed to do the GET
-                        state.ordered_keys.pop_front();
-                        Poll::Ready(())
+                let Some(next_key) = state.ordered_keys.front() else {
+                    panic!("Ran out of keys before {location}");
+                };
+                if next_key == location {
+                    // We are next in line. Nobody else can remove our key, and our successor
+                    // cannot race with us to register itself because we hold the lock.
+                    //
+                    // first, remove our key from the queue.
+                    //
+                    // note: safe to unwrap because we just checked that the front key exists (and
+                    // is the same as our requested location)
+                    state.ordered_keys.pop_front().unwrap();
+
+                    // there are three possible cases, either:
+                    // 1. the next key has a waker already registered, in which case we wake it up
+                    // 2. the next key has no waker registered, in which case we do nothing, and
+                    //    whenever the request for said key is made, it will either be next in line
+                    //    or a waker will be registered - either case ensuring that the request is
+                    //    completed
+                    // 3. the next key is the last key in the queue, in which case there is nothing
+                    //    left to do (no need to wake anyone)
+                    if let Some(next_key) = state.ordered_keys.front().cloned() {
+                        if let Some(waker) = state.wakers.remove(&next_key) {
+                            waker.wake(); // NOTE: Not async, returns instantly.
+                        }
                     }
-                    Some(_) => {
-                        // this key isn't next: register our waker and return Pending
-                        state
-                            .wakers
-                            .entry(location.clone())
-                            .or_insert_with(Vec::new)
-                            .push(cx.waker().clone());
-                        Poll::Pending
+                    Poll::Ready(())
+                } else {
+                    // We are not next in line, so wait on our key. Nobody can race to remove it
+                    // because we own it; nobody can race to wake us because we hold the lock.
+                    if state
+                        .wakers
+                        .insert(location.clone(), cx.waker().clone())
+                        .is_some()
+                    {
+                        panic!("Somebody else is already waiting on {location}");
                     }
-                    None => {
-                        // empty: someone asked for a key not in the order
-                        panic!("Key ordering not specified for {}", location);
-                    }
+                    Poll::Pending
                 }
             })
             .await;
 
-            // after doing our GET request, wake the next path in order
-            let result = self.inner.get(location).await;
-            self.wake_next();
-            return result;
+            // When we return this result, the future succeeds instantly. Any pending wake() call
+            // will not be processed before the next time we yield -- unless our executor is
+            // multi-threaded and happens to have another thread available. In that case, the
+            // serialization point is the moment our next-key poll_fn issues the wake call (or
+            // proves no wake is needed).
+            result
         }
 
         async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
@@ -527,7 +557,11 @@ mod tests {
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
         let physical_schema = Arc::new(ArrowSchema::try_from(get_log_schema().as_ref()).unwrap());
         let data: Vec<RecordBatch> = handler
-            .read_json_files(files, Arc::new(physical_schema.try_into().unwrap()), None)
+            .read_json_files(
+                files,
+                Arc::new(physical_schema.clone().try_into().unwrap()),
+                None,
+            )
             .unwrap()
             .map_ok(into_record_batch)
             .try_collect()
@@ -535,58 +569,76 @@ mod tests {
 
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].num_rows(), 4);
+
+        // limit batch size
+        let handler = handler.with_batch_size(2);
+        let data: Vec<RecordBatch> = handler
+            .read_json_files(files, Arc::new(physical_schema.try_into().unwrap()), None)
+            .unwrap()
+            .map_ok(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0].num_rows(), 2);
+        assert_eq!(data[1].num_rows(), 2);
     }
 
-    // this test creates an OrderedGetStore with 1000 paths that resolve in REVERSE order. it
-    // spawns 1000 tasks to read the paths in natural order (0, 1, 2, ...) and checks that they
-    // complete in reverse.
     #[tokio::test]
     async fn test_ordered_get_store() {
         let num_paths = 1000;
-        let paths: Vec<Path> = (0..num_paths)
+        let ordered_paths: Vec<Path> = (0..num_paths)
             .map(|i| Path::from(format!("/test/path{}", i)))
+            .collect();
+        let jumbled_paths: Vec<_> = ordered_paths[100..400]
+            .iter()
+            .chain(ordered_paths[400..].iter().rev())
+            .chain(ordered_paths[..100].iter())
+            .cloned()
             .collect();
 
         let memory_store = InMemory::new();
-        for (i, path) in paths.iter().enumerate() {
+        for (i, path) in ordered_paths.iter().enumerate() {
             memory_store
                 .put(path, Bytes::from(format!("content_{}", i)).into())
                 .await
                 .unwrap();
         }
 
-        // Create ordered store with REVERSE order (999, 998, ...)
-        let rev_paths: VecDeque<Path> = paths.iter().rev().cloned().collect();
-        let ordered_store = Arc::new(OrderedGetStore::new(memory_store.fork(), rev_paths.clone()));
+        // Create ordered store with natural order (0, 1, 2, ...)
+        let ordered_store = Arc::new(OrderedGetStore::new(
+            memory_store.fork(),
+            ordered_paths.clone(),
+        ));
 
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = mpsc::channel();
 
-        // Spawn tasks to GET each path in the natural order (0, 1, 2, ...)
-        // They should complete in the REVERSE order (999, 998, ...) due to OrderedGetStore
-        let handles: Vec<_> = paths
-            .iter()
-            .cloned()
-            .map(|path| {
-                let store = ordered_store.clone();
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let _ = store.get(&path).await.unwrap();
-                    tx.send(path).unwrap();
-                })
+        // Spawn tasks to GET each path in our somewhat jumbled order
+        // They should complete in order (0, 1, 2, ...) due to OrderedGetStore
+        let handles = jumbled_paths.into_iter().map(|path| {
+            let store = ordered_store.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let _ = store.get(&path).await.unwrap();
+                tx.send(path).unwrap();
             })
-            .collect();
+        });
 
-        let _ = future::join_all(handles).await;
+        // note: we need to join all the handles otherwise the
+        future::join_all(handles).await;
+        drop(tx);
+
+        // NB (from mpsc::IntoIter): This iterator will block whenever next is called, waiting for
+        // a new message, and None will be returned if the corresponding channel has hung up.
         let mut completed = Vec::new();
-        while let Ok(path) = rx.try_recv() {
+        while let Ok(path) = rx.recv() {
             completed.push(path);
         }
 
-        // Expected order is reversed (999, 998, ..., 1, 0)
         assert_eq!(
             completed,
-            rev_paths.into_iter().collect_vec(),
-            "Expected paths to complete in reverse order"
+            ordered_paths.into_iter().collect_vec(),
+            "Expected paths to complete in order"
         );
     }
 
@@ -599,11 +651,11 @@ mod tests {
         let paths = paths.map(|p| std::fs::canonicalize(PathBuf::from(p)).unwrap());
 
         // object store will resolve GETs to paths in reverse: 0001.json, 0000.json
-        let reverse_paths = paths
+        let reverse_paths: Vec<_> = paths
             .iter()
             .rev()
             .map(|p| Path::from(p.to_string_lossy().to_string()))
-            .collect::<VecDeque<_>>();
+            .collect();
         let store = Arc::new(OrderedGetStore::new(LocalFileSystem::new(), reverse_paths));
 
         let file_futures: Vec<_> = paths
