@@ -264,7 +264,7 @@ mod tests {
     use std::task::Waker;
 
     use crate::actions::get_log_schema;
-    use crate::arrow::array::{AsArray, RecordBatch, StringArray};
+    use crate::arrow::array::{AsArray, Int32Array, RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::{
@@ -544,7 +544,7 @@ mod tests {
             "./tests/data/table-with-dv-small/_delta_log/00000000000000000000.json",
         ))
         .unwrap();
-        let url = url::Url::from_file_path(path).unwrap();
+        let url = Url::from_file_path(path).unwrap();
         let location = Path::from(url.path());
         let meta = store.head(&location).await.unwrap();
 
@@ -586,6 +586,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ordered_get_store() {
+        // note we don't want to go over 1000 since we only buffer 1000 requests at a time
         let num_paths = 1000;
         let ordered_paths: Vec<Path> = (0..num_paths)
             .map(|i| Path::from(format!("/test/path{}", i)))
@@ -644,30 +645,43 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn test_read_json_files_ordering() {
-        let paths = [
-            "./tests/data/table-with-dv-small/_delta_log/00000000000000000000.json",
-            "./tests/data/table-with-dv-small/_delta_log/00000000000000000001.json",
-        ];
-        let paths = paths.map(|p| std::fs::canonicalize(PathBuf::from(p)).unwrap());
-
-        // object store will resolve GETs to paths in reverse: 0001.json, 0000.json
-        let reverse_paths: Vec<_> = paths
-            .iter()
-            .rev()
-            .map(|p| Path::from(p.to_string_lossy().to_string()))
+        // this test checks that the read_json_files method returns the files in order in the
+        // presence of an ObjectStore (OrderedGetStore) that resolves paths in a jumbled order:
+        // 1. we set up a list of FileMetas (and some random JSON content) in order
+        // 2. we then set up an ObjectStore to resolves those paths in a jumbled order
+        // 3. then call read_json_files and check that the results are in order
+        //
+        // note we don't want to go over 1000 since we only buffer 1000 requests at a time
+        let ordered_paths: Vec<Path> = (0..1000)
+            .map(|i| Path::from(format!("test/path{}", i)))
             .collect();
-        let store = Arc::new(OrderedGetStore::new(LocalFileSystem::new(), reverse_paths));
+        let jumbled_paths: Vec<_> = ordered_paths[100..400]
+            .iter()
+            .chain(ordered_paths[400..].iter().rev())
+            .chain(ordered_paths[..100].iter())
+            .cloned()
+            .collect();
+        let memory_store = InMemory::new();
+        for (i, path) in ordered_paths.iter().enumerate() {
+            memory_store
+                .put(path, Bytes::from(format!("{{\"val\": {i}}}")).into())
+                .await
+                .unwrap();
+        }
+        // set up our ObjectStore to resolve paths in a jumbled order
+        let store = Arc::new(OrderedGetStore::new(memory_store, jumbled_paths));
 
-        let file_futures: Vec<_> = paths
+        // convert the paths to FileMeta
+        let ordered_file_meta: Vec<_> = ordered_paths
             .iter()
             .map(|path| {
                 let store = store.clone();
                 async move {
-                    let url = url::Url::from_file_path(path).unwrap();
-                    let location = Path::from(url.path());
+                    let url = Url::parse(&format!("memory:/{}", path)).unwrap();
+                    let location = Path::from(path.as_ref());
                     let meta = store.head(&location).await.unwrap();
                     FileMeta {
-                        location: url.clone(),
+                        location: url,
                         last_modified: meta.last_modified.timestamp_millis(),
                         size: meta.size,
                     }
@@ -676,24 +690,38 @@ mod tests {
             .collect();
 
         // note: join_all is ordered
-        let files = future::join_all(file_futures).await;
+        let files = future::join_all(ordered_file_meta).await;
 
+        // fire off the read_json_files call (for all the files in order)
         let handler = DefaultJsonHandler::new(
             store,
             Arc::new(TokioMultiThreadExecutor::new(
                 tokio::runtime::Handle::current(),
             )),
         );
-        let physical_schema = Arc::new(ArrowSchema::try_from(get_log_schema().as_ref()).unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![Arc::new(Field::new(
+            "val",
+            DataType::Int32,
+            true,
+        ))]));
+        let physical_schema = Arc::new(schema.try_into().unwrap());
         let data: Vec<RecordBatch> = handler
-            .read_json_files(&files, Arc::new(physical_schema.try_into().unwrap()), None)
+            .read_json_files(&files, physical_schema, None)
             .unwrap()
             .map_ok(into_record_batch)
             .try_collect()
             .unwrap();
-        assert_eq!(data.len(), 2);
-        // check for ordering: first commit has 4 actions, second commit has 3 actions
-        assert_eq!(data[0].num_rows(), 4);
-        assert_eq!(data[1].num_rows(), 3);
+
+        // check the order
+        let all_values: Vec<i32> = data
+            .iter()
+            .flat_map(|batch| {
+                let val_col: &Int32Array = batch.column(0).as_primitive();
+                (0..val_col.len())
+                    .map(|i| val_col.value(i))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(all_values, (0..1000).collect_vec());
     }
 }
