@@ -273,7 +273,8 @@ void print_schema(SharedSnapshot* snapshot)
     .visit_timestamp = visit_timestamp,
     .visit_timestamp_ntz = visit_timestamp_ntz,
   };
-  uintptr_t schema_list_id = visit_schema(snapshot, &visitor);
+  SharedSchema* schema = logical_schema(snapshot);
+  uintptr_t schema_list_id = visit_schema(schema, &visitor);
 #ifdef VERBOSE
   printf("Schema returned in list %" PRIxPTR "\n", schema_list_id);
 #endif
@@ -281,5 +282,6 @@ void print_schema(SharedSnapshot* snapshot)
   printf("Schema:\n");
   print_list(&builder, schema_list_id, 0, 0);
   printf("\n");
+  free_schema(schema);
   free_builder(builder);
 }

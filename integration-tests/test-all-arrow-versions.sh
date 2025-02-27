@@ -2,38 +2,43 @@
 
 set -eu -o pipefail
 
-is_version_le() {
-    [  "$1" = "$(echo -e "$1\n$2" | sort -V | head -n1)" ]
+clean_up () {
+  CODE=$?
+  git checkout HEAD Cargo.toml
+  exit $CODE
 }
 
-is_version_lt() {
-  if [ "$1" = "$2" ]
-  then
-    return 1
-  else
-    is_version_le "$1" "$2"
-  fi
-}
+# ensure we checkout the clean version of Cargo.toml no matter how we exit
+trap clean_up EXIT
 
 test_arrow_version() {
   ARROW_VERSION="$1"
   echo "== Testing version $ARROW_VERSION =="
-  sed -i'' -e "s/\(arrow[^\"]*=[^\"]*\).*/\1\"=$ARROW_VERSION\"/" Cargo.toml
-  sed -i'' -e "s/\(parquet[^\"]*\).*/\1\"=$ARROW_VERSION\"/" Cargo.toml
   cargo clean
   rm -f Cargo.lock
   cargo update
+  echo "Cargo.toml is:"
   cat Cargo.toml
-  cargo run
+  echo ""
+  if [ "$ARROW_VERSION" = "ALL_ENABLED" ]; then
+    echo "testing with --all-features"
+    cargo run --all-features
+  else
+    echo "testing with --features ${ARROW_VERSION}"
+    cargo run --features ${ARROW_VERSION}
+  fi
 }
 
-MIN_ARROW_VER="53.0.0"
-MAX_ARROW_VER="54.0.0"
+FEATURES=$(cat ../kernel/Cargo.toml | grep -e ^arrow_ | awk '{ print $1 }' | sort -u)
 
-for ARROW_VERSION in $(curl -s https://crates.io/api/v1/crates/arrow | jq -r '.versions[].num' | tr -d '\r')
+
+echo "[features]" >> Cargo.toml
+
+for ARROW_VERSION in ${FEATURES}
 do
-  if ! is_version_lt "$ARROW_VERSION" "$MIN_ARROW_VER" && is_version_lt "$ARROW_VERSION" "$MAX_ARROW_VER"
-  then
-    test_arrow_version "$ARROW_VERSION"
-  fi
+  echo "${ARROW_VERSION} = [\"delta_kernel/${ARROW_VERSION}\"]" >> Cargo.toml
+  test_arrow_version $ARROW_VERSION
 done
+
+test_arrow_version "ALL_ENABLED"
+

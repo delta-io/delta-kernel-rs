@@ -6,19 +6,4 @@ edition = "2021"
 [workspace]
 
 [dependencies]
-arrow = "=53.0.0"
-delta_kernel = { path = "../kernel", features = ["arrow-conversion", "arrow-expression", "default-engine", "sync-engine"] }
-
-[patch.'file:///../kernel']
-arrow = "=53.0.0"
-arrow-arith = "=53.0.0"
-arrow-array = "=53.0.0"
-arrow-buffer = "=53.0.0"
-arrow-cast = "=53.0.0"
-arrow-data = "=53.0.0"
-arrow-ord = "=53.0.0"
-arrow-json = "=53.0.0"
-arrow-select = "=53.0.0"
-arrow-schema = "=53.0.0"
-parquet = "=53.0.0"
-object_store = "=0.11.1"
+delta_kernel = { path = "../kernel", features = ["default-engine", "sync-engine"] }

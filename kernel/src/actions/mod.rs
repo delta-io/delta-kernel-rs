@@ -289,10 +289,22 @@ impl Protocol {
             {
                 ensure_writer_supported_features(writer_features, SUPPORTED_WRITER_FEATURES.clone())
             }
-            // otherwise not supported
-            _ => Err(Error::unsupported(
-                "Only tables with min reader version 3 and min writer version 7 with no table features are supported."
-            )),
+            Some(_) => {
+                // there are features, but we're not on 7, so the protocol is actually broken
+                Err(Error::unsupported(
+                    "Tables with min writer version != 7 should not have table features.",
+                ))
+            }
+            None => {
+                // no features, we currently only support version 1 in this case
+                require!(
+                    self.min_writer_version == 1,
+                    Error::unsupported(
+                        "Currently delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1 or 7"
+                    )
+                );
+                Ok(())
+            }
         }
     }
 }

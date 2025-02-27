@@ -5,10 +5,11 @@ edition = "2021"
 publish = false
 
 [dependencies]
-arrow = { workspace = true, features = ["prettyprint", "chrono-tz"] }
+arrow = { version = "53", features = ["prettyprint", "chrono-tz"] }
 clap = { version = "4.5", features = ["derive"] }
 delta_kernel = { path = "../../../kernel", features = [
   "cloud",
+  "arrow_53",
   "default-engine",
   "sync-engine",
   "developer-visibility",

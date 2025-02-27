@@ -5,11 +5,11 @@ edition = "2021"
 publish = false
 
 [dependencies]
-arrow-array = { workspace = true }
-arrow-schema = { workspace = true }
+arrow = "53"
 clap = { version = "4.5", features = ["derive"] }
 delta_kernel = { path = "../../../kernel", features = [
   "cloud",
+  "arrow_53",
   "default-engine",
   "developer-visibility",
 ] }
