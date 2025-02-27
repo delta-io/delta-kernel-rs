@@ -278,15 +278,22 @@ mod tests {
     struct OrderedGetStore<T: ObjectStore> {
         // The ObjectStore we are wrapping
         inner: T,
+        // Combined state: queue and wakers, protected by a single mutex
+        state: Arc<Mutex<KeysAndWakers>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct KeysAndWakers {
         // Queue of paths in order which they will resolve
-        ordered_keys: Arc<Mutex<VecDeque<Path>>>,
+        ordered_keys: VecDeque<Path>,
         // Map of paths to wakers for pending get requests
-        wakers: Arc<Mutex<HashMap<Path, Vec<Waker>>>>,
+        wakers: HashMap<Path, Vec<Waker>>,
     }
 
     impl<T: ObjectStore> OrderedGetStore<T> {
         fn new(inner: T, ordered_keys: impl Into<VecDeque<Path>>) -> Self {
             let ordered_keys = ordered_keys.into();
+            // Check for duplicates
             let mut seen = HashSet::new();
             for key in ordered_keys.iter() {
                 if !seen.insert(key) {
@@ -294,31 +301,26 @@ mod tests {
                 }
             }
 
+            let state = KeysAndWakers {
+                ordered_keys,
+                wakers: HashMap::new(),
+            };
+
             Self {
                 inner,
-                ordered_keys: Arc::new(Mutex::new(ordered_keys)),
-                wakers: Arc::new(Mutex::new(HashMap::new())),
+                state: Arc::new(Mutex::new(state)),
             }
-        }
-
-        // Register a waker for a specific path
-        fn register_waker(&self, path: &Path, waker: Waker) {
-            self.wakers
-                .lock()
-                .unwrap()
-                .entry(path.clone())
-                .or_insert_with(Vec::new)
-                .push(waker);
         }
 
         // Wake the wakers for the next path in order, if any
         fn wake_next(&self) {
-            let ordered_keys = self.ordered_keys.lock().unwrap();
-            // get the next key
-            if let Some(next_key) = ordered_keys.front() {
-                let mut wakers = self.wakers.lock().unwrap();
-                // remove the wakers for the next key and wake them
-                if let Some(path_wakers) = wakers.remove(next_key) {
+            let mut state = self.state.lock().unwrap();
+            // If we have a next key, get its wakers and wake them
+            if let Some(next_key) = state.ordered_keys.front().cloned() {
+                if let Some(path_wakers) = state.wakers.remove(&next_key) {
+                    // We need to release the lock before waking wakers to prevent
+                    // any potential reentrant lock attempts
+                    drop(state);
                     for waker in path_wakers {
                         waker.wake();
                     }
@@ -329,7 +331,8 @@ mod tests {
 
     impl<T: ObjectStore> std::fmt::Display for OrderedGetStore<T> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "OrderedGetStore({:?})", self.ordered_keys)
+            let state = self.state.lock().unwrap();
+            write!(f, "OrderedGetStore({:?})", state.ordered_keys)
         }
     }
 
@@ -367,16 +370,20 @@ mod tests {
         async fn get(&self, location: &Path) -> Result<GetResult> {
             // we implement a future which only resolves once the requested path is next in order
             future::poll_fn(move |cx| {
-                let mut ordered_keys = self.ordered_keys.lock().unwrap();
-                match ordered_keys.front() {
+                let mut state = self.state.lock().unwrap();
+                match state.ordered_keys.front() {
                     Some(key) if key == location => {
                         // this key is next: remove it and return Ready so we proceed to do the GET
-                        ordered_keys.pop_front();
+                        state.ordered_keys.pop_front();
                         Poll::Ready(())
                     }
                     Some(_) => {
                         // this key isn't next: register our waker and return Pending
-                        self.register_waker(&location, cx.waker().clone());
+                        state
+                            .wakers
+                            .entry(location.clone())
+                            .or_insert_with(Vec::new)
+                            .push(cx.waker().clone());
                         Poll::Pending
                     }
                     None => {
