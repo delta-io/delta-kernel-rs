@@ -393,7 +393,8 @@ mod tests {
                     state.ordered_keys.pop_front().unwrap();
 
                     // there are three possible cases, either:
-                    // 1. the next key has a waker already registered, in which case we wake it up
+                    // 1. the key has already been requested, hence there is a waker waiting, and we
+                    //    need to wake it up
                     // 2. the next key has no waker registered, in which case we do nothing, and
                     //    whenever the request for said key is made, it will either be next in line
                     //    or a waker will be registered - either case ensuring that the request is
