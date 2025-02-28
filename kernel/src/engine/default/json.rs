@@ -88,7 +88,7 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
     /// See [Decoder::with_buffer_size] for details on constraining memory usage with buffer size
     /// and batch size.
     ///
-    /// [Decoder]: arrow::json::reader::Decoder
+    /// [Decoder::with_buffer_size]: crate::arrow::json::reader::Decoder
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self
@@ -625,7 +625,8 @@ mod tests {
             })
         });
 
-        // note: we need to join all the handles otherwise the
+        // TODO(zach): we need to join all the handles otherwise none of the tasks run? despite the
+        // docs?
         future::join_all(handles).await;
         drop(tx);
 
