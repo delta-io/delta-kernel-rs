@@ -36,7 +36,7 @@ pre-release-hook = [
 
 [dependencies]
 bytes = "1.7"
-chrono = { version = "0.4" }
+chrono = "=0.4.39"
 fix-hidden-lifetime-bug = "0.2"
 indexmap = "2.5.0"
 itertools = "0.13"
