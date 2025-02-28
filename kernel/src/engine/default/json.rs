@@ -664,7 +664,7 @@ mod tests {
             (
                 4, // buffer_size
                 (0..250)
-                    .map(|i| {
+                    .flat_map(|i| {
                         [
                             ordered_paths[1 + 4 * i].clone(),
                             ordered_paths[4 * i].clone(),
@@ -672,7 +672,6 @@ mod tests {
                             ordered_paths[2 + 4 * i].clone(),
                         ]
                     })
-                    .flatten()
                     .collect_vec(),
             ),
         ];
