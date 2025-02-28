@@ -313,7 +313,7 @@ mod tests {
 
     impl<T: ObjectStore> OrderedGetStore<T> {
         fn new(inner: T, ordered_keys: &[Path]) -> Self {
-            let ordered_keys: Vec<Path> = ordered_keys.to_vec();
+            let ordered_keys = ordered_keys.to_vec();
             // Check for duplicates
             let mut seen = HashSet::new();
             for key in ordered_keys.iter() {
