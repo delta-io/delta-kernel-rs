@@ -636,7 +636,7 @@ pub unsafe extern "C" fn free_schema(schema: Handle<SharedSchema>) {
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid handle.
+/// Caller is responsible for passing a valid snapshot handle.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_table_root(
     snapshot: Handle<SharedSnapshot>,
@@ -645,6 +645,29 @@ pub unsafe extern "C" fn snapshot_table_root(
     let snapshot = unsafe { snapshot.as_ref() };
     let table_root = snapshot.table_root().to_string();
     allocate_fn(kernel_string_slice!(table_root))
+}
+
+/// Get a count of the number of partition columns for this snapshot
+///
+/// # Safety
+/// Caller is responsible for passing a valid snapshot handle
+#[no_mangle]
+pub unsafe extern "C" fn get_partition_column_count(snapshot: Handle<SharedSnapshot>) -> usize {
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot.metadata().partition_columns.len()
+}
+
+/// Get an iterator of the list of partition columns for this snapshot.
+///
+/// # Safety
+/// Caller is responsible for passing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn get_partition_columns(
+    snapshot: Handle<SharedSnapshot>,
+) -> Handle<StringSliceIterator> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    let iter: Box<StringIter> = Box::new(snapshot.metadata().partition_columns.clone().into_iter());
+    iter.into()
 }
 
 type StringIter = dyn Iterator<Item = String> + Send;
@@ -743,7 +766,7 @@ impl<T> Default for ReferenceSet<T> {
 mod tests {
     use delta_kernel::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
     use object_store::{memory::InMemory, path::Path};
-    use test_utils::{actions_to_string, add_commit, TestAction};
+    use test_utils::{actions_to_string, actions_to_string_partitioned, add_commit, TestAction};
 
     use super::*;
     use crate::error::{EngineError, KernelError};
@@ -835,6 +858,46 @@ mod tests {
         let s = recover_string(table_root.unwrap());
         assert_eq!(&s, path);
 
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_partition_cols() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            storage.as_ref(),
+            0,
+            actions_to_string_partitioned(vec![TestAction::Metadata]),
+        )
+        .await?;
+        let engine = DefaultEngine::new(
+            storage.clone(),
+            Path::from("/"),
+            Arc::new(TokioBackgroundExecutor::new()),
+        );
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let path = "memory:///";
+
+        let snapshot =
+            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+
+        let partition_count = unsafe { get_partition_column_count(snapshot.shallow_copy()) };
+        assert_eq!(partition_count, 1, "Should have one partition");
+
+        let partition_iter = unsafe { get_partition_columns(snapshot.shallow_copy()) };
+
+        #[no_mangle]
+        extern "C" fn visit_partition(_context: NullableCvoid, slice: KernelStringSlice) {
+            let s = unsafe { String::try_from_slice(&slice) }.unwrap();
+            assert_eq!(s.as_str(), "val", "Partition col should be 'val'");
+        }
+        while unsafe { string_slice_next(partition_iter.shallow_copy(), None, visit_partition) } {
+            // validate happens inside visit_partition
+        }
+
+        unsafe { free_string_slice_data(partition_iter) }
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
         Ok(())
