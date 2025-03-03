@@ -98,7 +98,6 @@ fn build_log_with_paths_and_checkpoint(
     let client = ObjectStoreFileSystemClient::new(
         store,
         false, // don't have ordered listing
-        Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
     );
 
