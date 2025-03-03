@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tracing::debug;
 use url::Url;
 
+use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Engine, EngineData, Table};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -330,7 +331,7 @@ pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
 /// an opaque struct that encapsulates data read by an engine. this handle can be passed back into
 /// some kernel calls to operate on the data, or can be converted into the raw data as read by the
 /// [`delta_kernel::Engine`] by calling [`get_raw_engine_data`]
-#[handle_descriptor(target=dyn EngineData, mutable=true, sized=false)]
+#[handle_descriptor(target=dyn EngineData, mutable=true)]
 pub struct ExclusiveEngineData;
 
 /// Drop an `ExclusiveEngineData`.
@@ -561,6 +562,9 @@ pub unsafe extern "C" fn free_engine(engine: Handle<SharedExternEngine>) {
     engine.drop_handle();
 }
 
+#[handle_descriptor(target=Schema, mutable=false, sized=true)]
+pub struct SharedSchema;
+
 #[handle_descriptor(target=Snapshot, mutable=false, sized=true)]
 pub struct SharedSnapshot;
 
@@ -605,6 +609,26 @@ pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
 pub unsafe extern "C" fn version(snapshot: Handle<SharedSnapshot>) -> u64 {
     let snapshot = unsafe { snapshot.as_ref() };
     snapshot.version()
+}
+
+/// Get the logical schema of the specified snapshot
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn logical_schema(snapshot: Handle<SharedSnapshot>) -> Handle<SharedSchema> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    Arc::new(snapshot.schema().clone()).into()
+}
+
+/// Free a schema
+///
+/// # Safety
+/// Engine is responsible for providing a valid schema handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_schema(schema: Handle<SharedSchema>) {
+    schema.drop_handle();
 }
 
 /// Get the resolved root of the table. This should be used in any future calls that require
@@ -791,7 +815,7 @@ mod tests {
         }
     }
 
-    fn get_default_engine() -> Handle<SharedExternEngine> {
+    pub(crate) fn get_default_engine() -> Handle<SharedExternEngine> {
         let path = "memory:///doesntmatter/foo";
         let path = kernel_string_slice!(path);
         let builder = unsafe { ok_or_panic(get_engine_builder(path, allocate_err)) };
