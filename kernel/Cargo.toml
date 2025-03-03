@@ -150,6 +150,7 @@ rustc_version = "0.4.1"
 [dev-dependencies]
 delta_kernel = { path = ".", features = ["arrow", "default-engine", "sync-engine"] }
 test_utils = { path = "../test-utils" }
+async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implementation
 paste = "1.0"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 tempfile = "3"
