@@ -54,18 +54,6 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
         }
     }
 
-    /// Deprecated: use [Self::with_buffer_size()].
-    ///
-    /// Set the maximum number read requests to buffer in memory at once in
-    /// [Self::read_json_files()].
-    ///
-    /// Defaults to 1000.
-    #[deprecated(note = "use with_buffer_size() instead")]
-    pub fn with_readahead(mut self, readahead: usize) -> Self {
-        self.buffer_size = readahead;
-        self
-    }
-
     /// Set the maximum number read requests to buffer in memory at once in
     /// [Self::read_json_files()].
     ///
