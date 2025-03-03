@@ -18,8 +18,7 @@ use crate::expressions::SharedExpression;
 use crate::{
     kernel_string_slice, AllocateStringFn, ExclusiveEngineData, ExternEngine, ExternResult,
     IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice, NullableCvoid,
-    SharedExternEngine, SharedSchema, SharedSnapshot, StringIter, StringSliceIterator,
-    TryFromStringSlice,
+    SharedExternEngine, SharedSchema, SharedSnapshot, TryFromStringSlice,
 };
 
 use super::handle::Handle;
@@ -109,29 +108,6 @@ pub unsafe extern "C" fn get_global_logical_schema(
 ) -> Handle<SharedSchema> {
     let state = unsafe { state.as_ref() };
     state.logical_schema.clone().into()
-}
-
-/// Get a count of the number of partition columns for this scan
-///
-/// # Safety
-/// Caller is responsible for passing a valid global scan pointer.
-#[no_mangle]
-pub unsafe extern "C" fn get_partition_column_count(state: Handle<SharedGlobalScanState>) -> usize {
-    let state = unsafe { state.as_ref() };
-    state.partition_columns.len()
-}
-
-/// Get an iterator of the list of partition columns for this scan.
-///
-/// # Safety
-/// Caller is responsible for passing a valid global scan pointer.
-#[no_mangle]
-pub unsafe extern "C" fn get_partition_columns(
-    state: Handle<SharedGlobalScanState>,
-) -> Handle<StringSliceIterator> {
-    let state = unsafe { state.as_ref() };
-    let iter: Box<StringIter> = Box::new(state.partition_columns.clone().into_iter());
-    iter.into()
 }
 
 /// # Safety

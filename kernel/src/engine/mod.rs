@@ -30,13 +30,13 @@ pub mod parquet_row_group_skipping;
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{RecordBatch, StringArray};
-    use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use itertools::Itertools;
     use object_store::path::Path;
     use std::sync::Arc;
     use url::Url;
 
+    use crate::arrow::array::{RecordBatch, StringArray};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::{Engine, EngineData};
 
