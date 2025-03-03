@@ -146,7 +146,7 @@ void print_tree_helper(ExpressionItem ref, int depth) {
           struct Decimal* dec = &lit->value.decimal;
           printf("Decimal(%lld,%llu,%d,%d)\n",
                  (long long)dec->hi,
-                 (unsigned long long)dec->ho,
+                 (unsigned long long)dec->lo,
                  dec->precision,
                  dec->scale);
           break;
