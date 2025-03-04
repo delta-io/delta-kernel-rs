@@ -229,10 +229,10 @@ impl LogSegment {
     /// By default, `create_checkpoint_stream` checks for the presence of sidecar files, and
     /// reads their contents if present. Checking for sidecar files is skipped if:
     /// - The checkpoint is a multi-part checkpoint
-    /// - The checkpoint read schema does not contain the add action
+    /// - The checkpoint read schema does not contain a file action
     ///
     /// For single-part checkpoints, any referenced sidecar files are processed. These
-    /// sidecar files contain the actual add actions that would otherwise be
+    /// sidecar files contain the actual file actions that would otherwise be
     /// stored directly in the checkpoint. The sidecar file batches are chained to the
     /// checkpoint batch in the top level iterator to be returned.
     fn create_checkpoint_stream(
@@ -242,7 +242,7 @@ impl LogSegment {
         meta_predicate: Option<ExpressionRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
         let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
-            | checkpoint_read_schema.contains(REMOVE_NAME);
+            || checkpoint_read_schema.contains(REMOVE_NAME);
         require!(
             !need_file_actions || checkpoint_read_schema.contains(SIDECAR_NAME),
         Error::invalid_checkpoint(
