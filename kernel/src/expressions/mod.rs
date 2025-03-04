@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
 use itertools::Itertools;
 
@@ -10,7 +11,7 @@ pub use self::column_names::{
     column_expr, column_name, joined_column_expr, joined_column_name, ColumnName,
 };
 pub use self::scalars::{ArrayData, Scalar, StructData};
-use crate::DataType;
+use crate::{AsAny, DataType, DeltaResult, DynPartialEq};
 
 mod column_names;
 mod scalars;
@@ -166,6 +167,42 @@ impl VariadicExpression {
     }
 }
 
+/// An opaque operation (ie defined and implemented by the engine).
+pub trait OpaqueOperator: DynPartialEq + std::fmt::Debug {
+    /// Attempts to apply this operation to a set of scalar values.
+    ///
+    /// An input of None means kernel was unable to evaluate that particular input arg. Otherwise,
+    /// Some(Scalar) is the result of that evaluation (possibly `Scalar::Null` if NULL).
+    ///
+    /// An output of `Err` indicates an incorrect invocation (e.g. wrong number and/or types of
+    /// arguments). Otherwise, `Ok(None)` means scalar evaluation is not supported, possibly due to
+    /// a missing/None input, while `Ok(Some)` means evaluation was successful.
+    ///
+    /// NOTE: `Some(Ok(Scalar::Null))` means the operation actually produced a NULL output.
+    fn eval_scalar(&self, values: &[Option<Scalar>]) -> DeltaResult<Option<Scalar>>;
+}
+
+/// A shared reference to an [`OpaqueOperator`] instance.
+pub type OpaqueOperatorRef = Arc<dyn OpaqueOperator>;
+
+#[derive(Clone, Debug)]
+pub struct OpaqueExpression {
+    pub op: OpaqueOperatorRef,
+    pub exprs: Vec<Expression>,
+}
+
+impl OpaqueExpression {
+    fn new(op: OpaqueOperatorRef, exprs: Vec<Expression>) -> Self {
+        Self { op, exprs }
+    }
+}
+
+impl PartialEq for OpaqueExpression {
+    fn eq(&self, other: &Self) -> bool {
+        self.op.dyn_eq(other.op.any_ref()) && self.exprs == other.exprs
+    }
+}
+
 /// A SQL expression.
 ///
 /// These expressions do not track or validate data types, other than the type
@@ -185,7 +222,16 @@ pub enum Expression {
     Binary(BinaryExpression),
     /// A variadic operation.
     Variadic(VariadicExpression),
-    // TODO: support more expressions, such as IS IN, LIKE, etc.
+    /// An opaque operation (ie defined and implemented by the engine). The expression is not
+    /// eligible for data skipping, but can participate in partition pruning if it provides scalar
+    /// evaluation.
+    Opaque(OpaqueExpression),
+    /// An unsupported expression (ie one that the engine does not attempt to present to
+    /// kernel). Kernel's predicate evaluation implementations treat such expressions just like any
+    /// other predicate that doesn't support data skipping, but engines should refuse to evaluate
+    /// expression trees containing unsupported expressions. Use an `Expression::Opaque` for
+    /// expressions kernel doesn't understand but which engine can still evaluate.
+    Unsupported(String),
 }
 
 impl<T: Into<Scalar>> From<T> for Expression {
@@ -202,32 +248,36 @@ impl From<ColumnName> for Expression {
 
 impl Display for Expression {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        fn fmt_list(exprs: &[Expression]) -> String {
+            exprs.iter().map(|e| format!("{e}")).join(", ")
+        }
+
+        use Expression::*;
         match self {
-            Self::Literal(l) => write!(f, "{l}"),
-            Self::Column(name) => write!(f, "Column({name})"),
-            Self::Struct(exprs) => write!(
-                f,
-                "Struct({})",
-                &exprs.iter().map(|e| format!("{e}")).join(", ")
-            ),
-            Self::Binary(BinaryExpression {
+            Literal(l) => write!(f, "{l}"),
+            Column(name) => write!(f, "Column({name})"),
+            Struct(exprs) => write!(f, "Struct({})", fmt_list(exprs)),
+            Binary(BinaryExpression {
                 op: BinaryOperator::Distinct,
                 left,
                 right,
             }) => write!(f, "DISTINCT({left}, {right})"),
-            Self::Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
-            Self::Unary(UnaryExpression { op, expr }) => match op {
+            Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
+            Unary(UnaryExpression { op, expr }) => match op {
                 UnaryOperator::Not => write!(f, "NOT {expr}"),
                 UnaryOperator::IsNull => write!(f, "{expr} IS NULL"),
             },
-            Self::Variadic(VariadicExpression { op, exprs }) => {
-                let exprs = &exprs.iter().map(|e| format!("{e}")).join(", ");
+            Variadic(VariadicExpression { op, exprs }) => {
                 let op = match op {
                     VariadicOperator::And => "AND",
                     VariadicOperator::Or => "OR",
                 };
-                write!(f, "{op}({exprs})")
+                write!(f, "{op}({})", fmt_list(exprs))
             }
+            Opaque(OpaqueExpression { op, exprs }) => {
+                write!(f, "{op:?}({})", fmt_list(exprs))
+            }
+            Unsupported(name) => write!(f, "<unsupported: {name}>"),
         }
     }
 }
@@ -385,6 +435,8 @@ impl Expression {
                     stack.push(right);
                 }
                 Variadic(VariadicExpression { exprs, .. }) => stack.extend(exprs),
+                Opaque(OpaqueExpression { exprs, .. }) => stack.extend(exprs),
+                Unsupported(_) => {}
             }
             Some(expr)
         })
@@ -453,34 +505,56 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_variadic(expr)
     }
 
+    /// Called for each [`OpaqueExpression`] encountered during the traversal. Implementations can
+    /// call [`Self::recurse_into_opaque`] if they wish to recursively transform the children.
+    fn transform_opaque(
+        &mut self,
+        exprs: &'a OpaqueExpression,
+    ) -> Option<Cow<'a, OpaqueExpression>> {
+        self.recurse_into_opaque(exprs)
+    }
+
+    /// Called for each [`Unsupported`] expression encountered during the traversal.
+    fn transform_unsupported(&mut self, name: &'a String) -> Option<Cow<'a, String>> {
+        Some(Cow::Borrowed(name))
+    }
+
     /// General entry point for transforming an expression. This method will dispatch to the
     /// specific transform for each expression variant. Also invoked internally in order to recurse
     /// on the child(ren) of non-leaf variants.
     fn transform(&mut self, expr: &'a Expression) -> Option<Cow<'a, Expression>> {
-        use Cow::*;
+        use {Cow::*, Expression::*};
         let expr = match expr {
-            Expression::Literal(s) => match self.transform_literal(s)? {
-                Owned(s) => Owned(Expression::Literal(s)),
+            Literal(s) => match self.transform_literal(s)? {
+                Owned(s) => Owned(Literal(s)),
                 Borrowed(_) => Borrowed(expr),
             },
-            Expression::Column(c) => match self.transform_column(c)? {
-                Owned(c) => Owned(Expression::Column(c)),
+            Column(c) => match self.transform_column(c)? {
+                Owned(c) => Owned(Column(c)),
                 Borrowed(_) => Borrowed(expr),
             },
-            Expression::Struct(s) => match self.transform_struct(s)? {
-                Owned(s) => Owned(Expression::Struct(s)),
+            Struct(s) => match self.transform_struct(s)? {
+                Owned(s) => Owned(Struct(s)),
                 Borrowed(_) => Borrowed(expr),
             },
-            Expression::Unary(u) => match self.transform_unary(u)? {
-                Owned(u) => Owned(Expression::Unary(u)),
+            Unary(u) => match self.transform_unary(u)? {
+                Owned(u) => Owned(Unary(u)),
                 Borrowed(_) => Borrowed(expr),
             },
-            Expression::Binary(b) => match self.transform_binary(b)? {
-                Owned(b) => Owned(Expression::Binary(b)),
+            Binary(b) => match self.transform_binary(b)? {
+                Owned(b) => Owned(Binary(b)),
                 Borrowed(_) => Borrowed(expr),
             },
-            Expression::Variadic(v) => match self.transform_variadic(v)? {
-                Owned(v) => Owned(Expression::Variadic(v)),
+            Variadic(v) => match self.transform_variadic(v)? {
+                Owned(v) => Owned(Variadic(v)),
+                Borrowed(_) => Borrowed(expr),
+            },
+            Opaque(o) => match self.transform_opaque(o)? {
+                Owned(v) => Owned(Opaque(v)),
+                Borrowed(_) => Borrowed(expr),
+            },
+            Unsupported(name) => match self.transform_unsupported(name)? {
+                Owned(n) => Owned(Unsupported(n)),
                 Borrowed(_) => Borrowed(expr),
             },
         };
@@ -561,6 +635,18 @@ pub trait ExpressionTransform<'a> {
             Borrowed(_) => Borrowed(v),
         };
         Some(v)
+    }
+
+    fn recurse_into_opaque(
+        &mut self,
+        o: &'a OpaqueExpression,
+    ) -> Option<Cow<'a, OpaqueExpression>> {
+        use Cow::*;
+        let o = match self.recurse_into_struct(&o.exprs)? {
+            Owned(exprs) => Owned(OpaqueExpression::new(o.op.clone(), exprs)),
+            Borrowed(_) => Borrowed(o),
+        };
+        Some(o)
     }
 }
 
