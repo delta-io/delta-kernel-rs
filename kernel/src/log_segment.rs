@@ -267,14 +267,14 @@ impl LogSegment {
                 engine.get_json_handler().read_json_files(
                     &checkpoint_file_meta,
                     checkpoint_read_schema.clone(),
-                    meta_predicate,
+                    meta_predicate.clone(),
                 )?
             }
             Some(parsed_log_path) if parsed_log_path.extension == "parquet" => parquet_handler
                 .read_parquet_files(
                     &checkpoint_file_meta,
                     checkpoint_read_schema.clone(),
-                    meta_predicate,
+                    meta_predicate.clone(),
                 )?,
             Some(parsed_log_path) => {
                 return Err(Error::generic(format!(
@@ -282,6 +282,8 @@ impl LogSegment {
                     parsed_log_path.extension,
                 )));
             }
+            // This is the case when there are no checkpoints in the log segment
+            // so we return an empty iterator
             None => Box::new(std::iter::empty()),
         };
 
@@ -304,6 +306,7 @@ impl LogSegment {
                         log_root.clone(),
                         checkpoint_batch.as_ref(),
                         checkpoint_read_schema.clone(),
+                        meta_predicate.clone(),
                     )?
                 } else {
                     None
@@ -332,6 +335,7 @@ impl LogSegment {
         log_root: Url,
         batch: &dyn EngineData,
         checkpoint_read_schema: SchemaRef,
+        meta_predicate: Option<ExpressionRef>,
     ) -> DeltaResult<Option<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>> {
         // Visit the rows of the checkpoint batch to extract sidecar file references
         let mut visitor = SidecarVisitor::default();
@@ -352,7 +356,7 @@ impl LogSegment {
         Ok(Some(parquet_handler.read_parquet_files(
             &sidecar_files,
             checkpoint_read_schema,
-            None,
+            meta_predicate,
         )?))
     }
 

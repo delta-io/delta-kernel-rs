@@ -1,5 +1,7 @@
+use std::sync::LazyLock;
 use std::{path::PathBuf, sync::Arc};
 
+use futures::executor::block_on;
 use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use url::Url;
@@ -22,7 +24,10 @@ use crate::scan::test_utils::{
 };
 use crate::snapshot::CheckpointMetadata;
 use crate::utils::test_utils::{assert_batch_matches, Action};
-use crate::{DeltaResult, Engine, EngineData, FileMeta, FileSystemClient, RowVisitor, Table};
+use crate::{
+    DeltaResult, Engine, EngineData, Expression, ExpressionRef, FileMeta, FileSystemClient,
+    RowVisitor, Table,
+};
 use test_utils::delta_path_for_version;
 
 // NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
@@ -86,27 +91,25 @@ fn build_log_with_paths_and_checkpoint(
     let data = bytes::Bytes::from("kernel-data");
 
     // add log files to store
-    tokio::runtime::Runtime::new()
-        .expect("create tokio runtime")
-        .block_on(async {
-            for path in paths {
-                store
-                    .put(path, data.clone().into())
-                    .await
-                    .expect("put log file in store");
-            }
-            if let Some(checkpoint_metadata) = checkpoint_metadata {
-                let checkpoint_str =
-                    serde_json::to_string(checkpoint_metadata).expect("Serialize checkpoint");
-                store
-                    .put(
-                        &Path::from("_delta_log/_last_checkpoint"),
-                        checkpoint_str.into(),
-                    )
-                    .await
-                    .expect("Write _last_checkpoint");
-            }
-        });
+    block_on(async {
+        for path in paths {
+            store
+                .put(path, data.clone().into())
+                .await
+                .expect("put log file in store");
+        }
+        if let Some(checkpoint_metadata) = checkpoint_metadata {
+            let checkpoint_str =
+                serde_json::to_string(checkpoint_metadata).expect("Serialize checkpoint");
+            store
+                .put(
+                    &Path::from("_delta_log/_last_checkpoint"),
+                    checkpoint_str.into(),
+                )
+                .await
+                .expect("Write _last_checkpoint");
+        }
+    });
 
     let client = ObjectStoreFileSystemClient::new(
         store,
@@ -145,9 +148,7 @@ fn write_parquet_to_store(
     writer.write(record_batch)?;
     writer.close()?;
 
-    tokio::runtime::Runtime::new()
-        .expect("create tokio runtime")
-        .block_on(async { store.put(&Path::from(path), buffer.into()).await })?;
+    block_on(async { store.put(&Path::from(path), buffer.into()).await })?;
 
     Ok(())
 }
@@ -768,7 +769,8 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
         engine.get_parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
-        get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?,
+        get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?,
+        None,
     )?
     .into_iter()
     .flatten();
@@ -810,6 +812,7 @@ fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<
         log_root,
         checkpoint_batch.as_ref(),
         read_schema.clone(),
+        None,
     )?
     .into_iter()
     .flatten();
@@ -840,7 +843,8 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
         engine.get_parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
-        get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?,
+        get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?,
+        None,
     )?
     .into_iter()
     .flatten();
@@ -848,6 +852,49 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
     // Assert that an error is returned when trying to read sidecar files that do not exist
     let err = iter.next().unwrap();
     assert!(err.is_err());
+
+    Ok(())
+}
+
+#[test]
+fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = DefaultEngine::new(
+        store.clone(),
+        Path::from("/"),
+        Arc::new(TokioBackgroundExecutor::new()),
+    );
+    let read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
+
+    let checkpoint_batch =
+        sidecar_batch_with_given_paths(vec!["sidecarfile1.parquet"], read_schema.clone());
+
+    // Add a sidecar file with only add actions
+    add_sidecar_to_store(
+        &store,
+        add_batch_simple(read_schema.clone()),
+        "sidecarfile1.parquet",
+    )?;
+
+    // Filter out sidecar files that do not contain remove actions
+    let remove_predicate: LazyLock<Option<ExpressionRef>> = LazyLock::new(|| {
+        Some(Arc::new(
+            Expression::column([REMOVE_NAME, "path"]).is_not_null(),
+        ))
+    });
+
+    let mut iter = LogSegment::process_sidecars(
+        engine.get_parquet_handler(),
+        log_root,
+        checkpoint_batch.as_ref(),
+        read_schema.clone(),
+        remove_predicate.clone(),
+    )?
+    .into_iter()
+    .flatten();
+
+    // As the sidecar batch contains only add actions, the batch should be filtered out
+    assert!(iter.next().is_none());
 
     Ok(())
 }

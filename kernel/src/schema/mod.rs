@@ -286,7 +286,8 @@ impl StructType {
         self.fields.values()
     }
 
-    pub fn contains(&self, name: impl AsRef<str>) -> bool {
+    // Checks if the `StructType` contains a field with the specified name.
+    pub(crate) fn contains(&self, name: impl AsRef<str>) -> bool {
         self.fields.contains_key(name.as_ref())
     }
 
