@@ -787,7 +787,7 @@ fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
     );
-    let read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?;
+    let read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     add_sidecar_to_store(
         &store,
@@ -802,7 +802,7 @@ fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<
 
     let checkpoint_batch = sidecar_batch_with_given_paths(
         vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
-        get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?,
+        read_schema.clone(),
     );
 
     let mut iter = LogSegment::process_sidecars(
@@ -951,9 +951,12 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
         Arc::new(TokioBackgroundExecutor::new()),
     );
 
-    // Multi-part checkpoints can never have sidecar actions.
-    // We place batches with sidecar actions in multi-part checkpoints to verify we do not read the actions, as we
-    // should instead short-circuit and return the checkpoint batches as-is when encountering multi-part checkpoints.
+    // Multi-part checkpoints should never contain sidecar actions.
+    // This test intentionally includes batches with sidecar actions in multi-part checkpoints
+    // to verify that the reader does not process them. Instead, the reader should short-circuit
+    // and return the checkpoint batches as-is when encountering a multi-part checkpoint.
+    // Note: This is a test-only scenario; real tables should never have multi-part
+    // checkpoints with sidecar actions.
     let checkpoint_part_1 = "00000000000000000001.checkpoint.0000000001.0000000002.parquet";
     let checkpoint_part_2 = "00000000000000000001.checkpoint.0000000002.0000000002.parquet";
 
