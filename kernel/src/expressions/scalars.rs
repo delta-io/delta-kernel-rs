@@ -265,6 +265,13 @@ impl PartialOrd for Scalar {
                 .then(|| v1.partial_cmp(v2))
                 .flatten(),
             (Decimal(_, _, _), _) => None,
+            (Null(a), Null(b)) => {
+                if a == b {
+                    Some(Ordering::Equal)
+                } else {
+                    None
+                }
+            }
             (Null(_), _) => None, // NOTE: NULL values are incomparable by definition
             (Struct(_), _) => None, // TODO: Support Struct?
             (Array(_), _) => None, // TODO: Support Array?
@@ -652,9 +659,9 @@ mod tests {
         assert_eq!(a.partial_cmp(&c), None);
         assert_eq!(c.partial_cmp(&a), None);
 
-        // assert that NULL values are incomparable
-        let null = Scalar::Null(DataType::INTEGER);
-        assert_eq!(null.partial_cmp(&null), None);
+        let a = Scalar::Null(DataType::INTEGER);
+        let b = Scalar::Null(DataType::STRING);
+        assert_eq!(a.partial_cmp(&b), None);
     }
 
     #[test]
@@ -667,8 +674,13 @@ mod tests {
         assert!(!a.eq(&c));
         assert!(!c.eq(&a));
 
+        let a = Scalar::Null(DataType::STRING);
+        let b = Scalar::Null(DataType::STRING);
+        assert_eq!(a, b);
+
         // assert that NULL values are incomparable
-        let null = Scalar::Null(DataType::INTEGER);
-        assert!(!null.eq(&null));
+        let a = Scalar::Null(DataType::INTEGER);
+        let b = Scalar::Null(DataType::STRING);
+        assert_ne!(a, b);
     }
 }
