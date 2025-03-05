@@ -16,7 +16,8 @@ use crate::table_features::{
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{DeltaResult, EngineData, Error, RowVisitor as _};
+use crate::{DeltaResult, EngineData, Error, FileMeta, RowVisitor as _};
+use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use delta_kernel_derive::Schema;
@@ -524,7 +525,6 @@ pub struct SetTransaction {
 /// file actions. This action is only allowed in checkpoints following the V2 spec.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-file-information
-#[allow(unused)] //TODO: Remove once we implement V2 checkpoint file processing
 #[derive(Schema, Debug, PartialEq)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct Sidecar {
@@ -545,6 +545,25 @@ pub(crate) struct Sidecar {
 
     /// A map containing any additional metadata about the logicial file.
     pub tags: Option<HashMap<String, String>>,
+}
+
+impl Sidecar {
+    /// Convert a Sidecar record to a FileMeta.
+    ///
+    /// This helper first builds the URL by joining the provided log_root with
+    /// the "_sidecars/" folder and the given sidecar path.
+    pub(crate) fn to_filemeta(&self, log_root: &Url) -> DeltaResult<FileMeta> {
+        Ok(FileMeta {
+            location: log_root.join("_sidecars/")?.join(&self.path)?,
+            last_modified: self.modification_time,
+            size: self.size_in_bytes.try_into().map_err(|_| {
+                Error::generic(format!(
+                    "Failed to convert sidecar size {} to usize",
+                    self.size_in_bytes
+                ))
+            })?,
+        })
+    }
 }
 
 #[cfg(test)]
