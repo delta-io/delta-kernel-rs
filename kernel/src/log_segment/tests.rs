@@ -747,7 +747,7 @@ fn test_sidecar_to_filemeta_valid_paths() -> DeltaResult<()> {
             tags: None,
         };
 
-        let filemeta = LogSegment::sidecar_to_filemeta(&sidecar, &log_root)?;
+        let filemeta = sidecar.to_filemeta(&log_root)?;
         assert_eq!(
             filemeta.location.as_str(),
             expected_url,
@@ -768,6 +768,7 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
         engine.get_parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
+        get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?,
     )?
     .into_iter()
     .flatten();
@@ -786,15 +787,16 @@ fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
     );
+    let read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?;
 
     add_sidecar_to_store(
         &store,
-        add_batch_simple(get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?),
+        add_batch_simple(read_schema.clone()),
         "sidecarfile1.parquet",
     )?;
     add_sidecar_to_store(
         &store,
-        add_batch_with_remove(get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?),
+        add_batch_with_remove(read_schema.clone()),
         "sidecarfile2.parquet",
     )?;
 
@@ -807,20 +809,14 @@ fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<
         engine.get_parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
+        read_schema.clone(),
     )?
     .into_iter()
     .flatten();
 
     // Assert the correctness of batches returned
-    let sidecar_schema = get_log_add_schema().clone();
-    assert_batch_matches(
-        iter.next().unwrap()?,
-        add_batch_simple(sidecar_schema.clone()),
-    );
-    assert_batch_matches(
-        iter.next().unwrap()?,
-        add_batch_with_remove(sidecar_schema.clone()),
-    );
+    assert_batch_matches(iter.next().unwrap()?, add_batch_simple(read_schema.clone()));
+    assert_batch_matches(iter.next().unwrap()?, add_batch_with_remove(read_schema));
     assert!(iter.next().is_none());
 
     Ok(())
@@ -844,6 +840,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
         engine.get_parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
+        get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?,
     )?
     .into_iter()
     .flatten();
@@ -937,7 +934,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
     assert!(!is_log_batch);
     assert_batch_matches(
         first_batch,
-        sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], v2_checkpoint_read_schema.clone()),
+        sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], v2_checkpoint_read_schema),
     );
     assert!(iter.next().is_none());
 
@@ -1039,10 +1036,7 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
     // Assert that the first batch returned is from reading checkpoint file 1
     let (first_batch, is_log_batch) = iter.next().unwrap()?;
     assert!(!is_log_batch);
-    assert_batch_matches(
-        first_batch,
-        add_batch_simple(v2_checkpoint_read_schema.clone()),
-    );
+    assert_batch_matches(first_batch, add_batch_simple(v2_checkpoint_read_schema));
     assert!(iter.next().is_none());
 
     Ok(())
@@ -1080,7 +1074,7 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
         None,
     )?;
     let mut iter =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
+        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema, None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let (first_batch, is_log_batch) = iter.next().unwrap()?;
@@ -1157,15 +1151,20 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         ),
     );
     // Assert that the second batch returned is from reading sidecarfile1
-    let sidecar_schema = get_log_add_schema();
     let (second_batch, is_log_batch) = iter.next().unwrap()?;
     assert!(!is_log_batch);
-    assert_batch_matches(second_batch, add_batch_simple(sidecar_schema.clone()));
+    assert_batch_matches(
+        second_batch,
+        add_batch_simple(v2_checkpoint_read_schema.clone()),
+    );
 
     // Assert that the second batch returned is from reading sidecarfile2
     let (third_batch, is_log_batch) = iter.next().unwrap()?;
     assert!(!is_log_batch);
-    assert_batch_matches(third_batch, add_batch_with_remove(sidecar_schema.clone()));
+    assert_batch_matches(
+        third_batch,
+        add_batch_with_remove(v2_checkpoint_read_schema),
+    );
 
     assert!(iter.next().is_none());
 
