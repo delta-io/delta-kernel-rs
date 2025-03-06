@@ -1,8 +1,11 @@
 //! Scan related ffi code
 
 use std::collections::HashMap;
+use std::ffi::c_void;
+use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
+use delta_kernel::actions::deletion_vector::DeletionVectorDescriptor;
 use delta_kernel::scan::state::{visit_scan_files, DvInfo, GlobalScanState};
 use delta_kernel::scan::{Scan, ScanData};
 use delta_kernel::snapshot::Snapshot;
@@ -287,10 +290,13 @@ pub unsafe extern "C" fn get_from_string_map(
     allocate_fn: AllocateStringFn,
 ) -> NullableCvoid {
     // TODO: Return ExternResult to caller instead of panicking?
-    let string_key = unsafe { TryFromStringSlice::try_from_slice(&key) };
-    map.values
-        .get(string_key.unwrap())
-        .and_then(|v| allocate_fn(kernel_string_slice!(v)))
+    let string_key: String = unsafe { TryFromStringSlice::try_from_slice(&key) }.unwrap();
+    let value = map
+        .values
+        .get(&string_key)
+        .and_then(|v| allocate_fn(kernel_string_slice!(v)));
+
+    value
 }
 
 /// Transformation expressions that need to be applied to each row `i` in ScanData. You can use
@@ -327,6 +333,32 @@ pub unsafe extern "C" fn get_transform_for_row(
         .map(Into::into)
 }
 
+type DvDescriptorVisitor = extern "C" fn(
+    storageType: KernelStringSlice,
+    pathOrInlineDv: KernelStringSlice,
+    offset: Option<&i32>,
+    sizeInBytes: i32,
+    cardinality: i64,
+);
+
+///
+/// # Safety
+/// Don't mutate or mess up
+#[no_mangle]
+pub unsafe extern "C" fn visit_dv_if_present(dv_info: &DvInfo, callback: DvDescriptorVisitor) {
+    if let Some(dv_descriptor) = &dv_info.deletion_vector {
+        let storage_type = &dv_descriptor.storage_type;
+        let path_or_inline_dv = &dv_descriptor.path_or_inline_dv;
+        callback(
+            kernel_string_slice!(storage_type),
+            kernel_string_slice!(path_or_inline_dv),
+            dv_descriptor.offset.as_ref(),
+            dv_descriptor.size_in_bytes,
+            dv_descriptor.cardinality,
+        )
+    }
+}
+
 /// Get a selection vector out of a [`DvInfo`] struct
 ///
 /// # Safety
@@ -339,7 +371,8 @@ pub unsafe extern "C" fn selection_vector_from_dv(
 ) -> ExternResult<KernelBoolSlice> {
     let state = unsafe { state.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    selection_vector_from_dv_impl(dv_info, engine, state).into_extern_result(&engine)
+    let out = selection_vector_from_dv_impl(dv_info, engine, state);
+    out.into_extern_result(&engine)
 }
 
 fn selection_vector_from_dv_impl(
