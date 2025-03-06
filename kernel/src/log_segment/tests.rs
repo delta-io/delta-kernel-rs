@@ -4,7 +4,6 @@ use std::{path::PathBuf, sync::Arc};
 use futures::executor::block_on;
 use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
-use parquet::arrow::ArrowWriter;
 use url::Url;
 
 use crate::actions::visitors::AddVisitor;

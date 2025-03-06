@@ -112,9 +112,6 @@ pub enum WriterFeatures {
     /// vacuumProtocolCheck ReaderWriter feature ensures consistent application of reader and writer
     /// protocol checks during VACUUM operations
     VacuumProtocolCheck,
-    /// A dummy variant used to represent an unsupported feature for testing purposes
-    #[cfg(test)]
-    UnrecognizedWriterFeature(String),
 }
 
 impl From<ReaderFeatures> for String {
@@ -150,7 +147,6 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<HashSet<WriterFeatures>> =
 mod tests {
     use super::*;
 
-    // TODO: Test the UnrecognizedReaderFeature variant
     #[test]
     fn test_roundtrip_reader_features() {
         let cases = [
@@ -161,10 +157,9 @@ mod tests {
             (ReaderFeatures::TypeWideningPreview, "typeWidening-preview"),
             (ReaderFeatures::V2Checkpoint, "v2Checkpoint"),
             (ReaderFeatures::VacuumProtocolCheck, "vacuumProtocolCheck"),
-            (ReaderFeatures::UnsupportedFeature, "unsupportedFeature"),
         ];
 
-        assert_eq!(ReaderFeatures::VARIANTS.len() - 1, cases.len());
+        assert_eq!(ReaderFeatures::VARIANTS.len(), cases.len());
 
         for ((feature, expected), name) in cases.into_iter().zip(ReaderFeatures::VARIANTS) {
             assert_eq!(*name, expected);
@@ -180,7 +175,6 @@ mod tests {
         }
     }
 
-    // TODO: Test the UnrecognizedWriterFeature variant
     #[test]
     fn test_roundtrip_writer_features() {
         let cases = [
@@ -201,10 +195,9 @@ mod tests {
             (WriterFeatures::IcebergCompatV1, "icebergCompatV1"),
             (WriterFeatures::IcebergCompatV2, "icebergCompatV2"),
             (WriterFeatures::VacuumProtocolCheck, "vacuumProtocolCheck"),
-            (WriterFeatures::UnsupportedFeature, "unsupportedFeature"),
         ];
 
-        assert_eq!(WriterFeatures::VARIANTS.len() - 1, cases.len());
+        assert_eq!(WriterFeatures::VARIANTS.len(), cases.len());
 
         for ((feature, expected), name) in cases.into_iter().zip(WriterFeatures::VARIANTS) {
             assert_eq!(*name, expected);
