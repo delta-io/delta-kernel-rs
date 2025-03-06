@@ -129,7 +129,6 @@ impl From<WriterFeatures> for String {
     }
 }
 
-// we support everything except V2 checkpoints
 pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeatures>> =
     LazyLock::new(|| {
         HashSet::from([

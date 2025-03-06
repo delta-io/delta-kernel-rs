@@ -2,12 +2,12 @@ use crate::engine_data::{EngineData, EngineList, EngineMap, GetData, RowVisitor}
 use crate::schema::{ColumnName, DataType};
 use crate::{DeltaResult, Error};
 
-use arrow_array::cast::AsArray;
-use arrow_array::types::{Int32Type, Int64Type};
-use arrow_array::{
+use crate::arrow::array::cast::AsArray;
+use crate::arrow::array::types::{Int32Type, Int64Type};
+use crate::arrow::array::{
     Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray,
 };
-use arrow_schema::{DataType as ArrowDataType, FieldRef};
+use crate::arrow::datatypes::{DataType as ArrowDataType, FieldRef};
 use tracing::debug;
 
 use std::collections::{HashMap, HashSet};
@@ -296,8 +296,8 @@ impl ArrowEngineData {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use crate::arrow::array::{RecordBatch, StringArray};
+    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 
     use crate::{
         actions::{get_log_schema, Metadata, Protocol},

@@ -163,7 +163,6 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
     fn is_checkpoint(&self) -> bool {
-        // TODO: Include UuidCheckpoint once we actually support v2 checkpoints
         matches!(
             self.file_type,
             LogPathFileType::SinglePartCheckpoint

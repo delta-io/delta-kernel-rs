@@ -1,5 +1,7 @@
+use std::sync::LazyLock;
 use std::{path::PathBuf, sync::Arc};
 
+use futures::executor::block_on;
 use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use parquet::arrow::ArrowWriter;
@@ -16,13 +18,17 @@ use crate::engine::default::filesystem::ObjectStoreFileSystemClient;
 use crate::engine::default::DefaultEngine;
 use crate::engine::sync::SyncEngine;
 use crate::log_segment::LogSegment;
+use crate::parquet::arrow::ArrowWriter;
 use crate::path::ParsedLogPath;
 use crate::scan::test_utils::{
     add_batch_simple, add_batch_with_remove, sidecar_batch_with_given_paths,
 };
 use crate::snapshot::CheckpointMetadata;
 use crate::utils::test_utils::{assert_batch_matches, Action};
-use crate::{DeltaResult, Engine, EngineData, FileMeta, FileSystemClient, RowVisitor, Table};
+use crate::{
+    DeltaResult, Engine, EngineData, Expression, ExpressionRef, FileMeta, FileSystemClient,
+    RowVisitor, Table,
+};
 use test_utils::delta_path_for_version;
 
 // NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
@@ -86,27 +92,25 @@ fn build_log_with_paths_and_checkpoint(
     let data = bytes::Bytes::from("kernel-data");
 
     // add log files to store
-    tokio::runtime::Runtime::new()
-        .expect("create tokio runtime")
-        .block_on(async {
-            for path in paths {
-                store
-                    .put(path, data.clone().into())
-                    .await
-                    .expect("put log file in store");
-            }
-            if let Some(checkpoint_metadata) = checkpoint_metadata {
-                let checkpoint_str =
-                    serde_json::to_string(checkpoint_metadata).expect("Serialize checkpoint");
-                store
-                    .put(
-                        &Path::from("_delta_log/_last_checkpoint"),
-                        checkpoint_str.into(),
-                    )
-                    .await
-                    .expect("Write _last_checkpoint");
-            }
-        });
+    block_on(async {
+        for path in paths {
+            store
+                .put(path, data.clone().into())
+                .await
+                .expect("put log file in store");
+        }
+        if let Some(checkpoint_metadata) = checkpoint_metadata {
+            let checkpoint_str =
+                serde_json::to_string(checkpoint_metadata).expect("Serialize checkpoint");
+            store
+                .put(
+                    &Path::from("_delta_log/_last_checkpoint"),
+                    checkpoint_str.into(),
+                )
+                .await
+                .expect("Write _last_checkpoint");
+        }
+    });
 
     let client = ObjectStoreFileSystemClient::new(
         store,
@@ -145,9 +149,7 @@ fn write_parquet_to_store(
     writer.write(record_batch)?;
     writer.close()?;
 
-    tokio::runtime::Runtime::new()
-        .expect("create tokio runtime")
-        .block_on(async { store.put(&Path::from(path), buffer.into()).await })?;
+    block_on(async { store.put(&Path::from(path), buffer.into()).await })?;
 
     Ok(())
 }
@@ -817,7 +819,7 @@ fn test_sidecar_to_filemeta_valid_paths() -> DeltaResult<()> {
             tags: None,
         };
 
-        let filemeta = LogSegment::sidecar_to_filemeta(&sidecar, &log_root)?;
+        let filemeta = sidecar.to_filemeta(&log_root)?;
         assert_eq!(
             filemeta.location.as_str(),
             expected_url,
@@ -838,6 +840,8 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
         engine.get_parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
+        get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?,
+        None,
     )?
     .into_iter()
     .flatten();
@@ -856,41 +860,37 @@ fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
     );
+    let read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     add_sidecar_to_store(
         &store,
-        add_batch_simple(get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?),
+        add_batch_simple(read_schema.clone()),
         "sidecarfile1.parquet",
     )?;
     add_sidecar_to_store(
         &store,
-        add_batch_with_remove(get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?),
+        add_batch_with_remove(read_schema.clone()),
         "sidecarfile2.parquet",
     )?;
 
     let checkpoint_batch = sidecar_batch_with_given_paths(
         vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
-        get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?,
+        read_schema.clone(),
     );
 
     let mut iter = LogSegment::process_sidecars(
         engine.get_parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
+        read_schema.clone(),
+        None,
     )?
     .into_iter()
     .flatten();
 
     // Assert the correctness of batches returned
-    let sidecar_schema = get_log_add_schema().clone();
-    assert_batch_matches(
-        iter.next().unwrap()?,
-        add_batch_simple(sidecar_schema.clone()),
-    );
-    assert_batch_matches(
-        iter.next().unwrap()?,
-        add_batch_with_remove(sidecar_schema.clone()),
-    );
+    assert_batch_matches(iter.next().unwrap()?, add_batch_simple(read_schema.clone()));
+    assert_batch_matches(iter.next().unwrap()?, add_batch_with_remove(read_schema));
     assert!(iter.next().is_none());
 
     Ok(())
@@ -914,6 +914,8 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
         engine.get_parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
+        get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?,
+        None,
     )?
     .into_iter()
     .flatten();
@@ -926,21 +928,69 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 }
 
 #[test]
-fn test_create_checkpoint_stream_returns_none_if_checkpoint_parts_is_empty() -> DeltaResult<()> {
-    let engine = SyncEngine::new();
+fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
+    let (store, log_root) = new_in_memory_store();
+    let engine = DefaultEngine::new(
+        store.clone(),
+        Path::from("/"),
+        Arc::new(TokioBackgroundExecutor::new()),
+    );
+    let read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
-    let mut iter = LogSegment::create_checkpoint_stream(
-        &engine,
-        get_log_schema().clone(),
-        None,
-        vec![],
-        Url::parse("s3://example-bucket/logs/")?,
-    )
+    let checkpoint_batch =
+        sidecar_batch_with_given_paths(vec!["sidecarfile1.parquet"], read_schema.clone());
+
+    // Add a sidecar file with only add actions
+    add_sidecar_to_store(
+        &store,
+        add_batch_simple(read_schema.clone()),
+        "sidecarfile1.parquet",
+    )?;
+
+    // Filter out sidecar files that do not contain remove actions
+    let remove_predicate: LazyLock<Option<ExpressionRef>> = LazyLock::new(|| {
+        Some(Arc::new(
+            Expression::column([REMOVE_NAME, "path"]).is_not_null(),
+        ))
+    });
+
+    let mut iter = LogSegment::process_sidecars(
+        engine.get_parquet_handler(),
+        log_root,
+        checkpoint_batch.as_ref(),
+        read_schema.clone(),
+        remove_predicate.clone(),
+    )?
     .into_iter()
     .flatten();
 
-    // Assert no batches are returned
+    // As the sidecar batch contains only add actions, the batch should be filtered out
     assert!(iter.next().is_none());
+
+    Ok(())
+}
+
+#[test]
+fn test_create_checkpoint_stream_errors_when_schema_has_remove_but_no_sidecar_action(
+) -> DeltaResult<()> {
+    let engine = SyncEngine::new();
+    let log_root = Url::parse("s3://example-bucket/logs/")?;
+
+    // Create the stream over checkpoint batches.
+    let log_segment = LogSegment::try_new(
+        vec![],
+        vec![create_log_path("file:///00000000000000000001.parquet")],
+        log_root,
+        None,
+    )?;
+    let result = log_segment.create_checkpoint_stream(
+        &engine,
+        get_log_schema().project(&[REMOVE_NAME])?,
+        None,
+    );
+
+    // Errors because the schema has an REMOVE action but no SIDECAR action.
+    assert!(result.is_err());
 
     Ok(())
 }
@@ -949,15 +999,16 @@ fn test_create_checkpoint_stream_returns_none_if_checkpoint_parts_is_empty() -> 
 fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_action(
 ) -> DeltaResult<()> {
     let engine = SyncEngine::new();
+    let log_root = Url::parse("s3://example-bucket/logs/")?;
 
     // Create the stream over checkpoint batches.
-    let result = LogSegment::create_checkpoint_stream(
-        &engine,
-        get_log_add_schema().clone(),
-        None,
+    let log_segment = LogSegment::try_new(
+        vec![],
         vec![create_log_path("file:///00000000000000000001.parquet")],
-        Url::parse("s3://example-bucket/logs/")?,
-    );
+        log_root,
+        None,
+    )?;
+    let result = log_segment.create_checkpoint_stream(&engine, get_log_add_schema().clone(), None);
 
     // Errors because the schema has an ADD action but no SIDECAR action.
     assert!(result.is_err());
@@ -987,20 +1038,21 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
 
     let v2_checkpoint_read_schema = get_log_schema().project(&[METADATA_NAME])?;
 
-    let mut iter = LogSegment::create_checkpoint_stream(
-        &engine,
-        v2_checkpoint_read_schema.clone(),
-        None,
+    let log_segment = LogSegment::try_new(
+        vec![],
         vec![create_log_path(&checkpoint_one_file)],
         log_root,
+        None,
     )?;
+    let mut iter =
+        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let (first_batch, is_log_batch) = iter.next().unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(
         first_batch,
-        sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], v2_checkpoint_read_schema.clone()),
+        sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], v2_checkpoint_read_schema),
     );
     assert!(iter.next().is_none());
 
@@ -1017,9 +1069,12 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
         Arc::new(TokioBackgroundExecutor::new()),
     );
 
-    // Multi-part checkpoints can never have sidecar actions.
-    // We place batches with sidecar actions in multi-part checkpoints to verify we do not read the actions, as we
-    // should instead short-circuit and return the checkpoint batches as-is when encountering multi-part checkpoints.
+    // Multi-part checkpoints should never contain sidecar actions.
+    // This test intentionally includes batches with sidecar actions in multi-part checkpoints
+    // to verify that the reader does not process them. Instead, the reader should short-circuit
+    // and return the checkpoint batches as-is when encountering a multi-part checkpoint.
+    // Note: This is a test-only scenario; real tables should never have multi-part
+    // checkpoints with sidecar actions.
     let checkpoint_part_1 = "00000000000000000001.checkpoint.0000000001.0000000002.parquet";
     let checkpoint_part_2 = "00000000000000000001.checkpoint.0000000002.0000000002.parquet";
 
@@ -1039,16 +1094,17 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
 
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
-    let mut iter = LogSegment::create_checkpoint_stream(
-        &engine,
-        v2_checkpoint_read_schema.clone(),
-        None,
+    let log_segment = LogSegment::try_new(
+        vec![],
         vec![
             create_log_path(&checkpoint_one_file),
             create_log_path(&checkpoint_two_file),
         ],
         log_root,
+        None,
     )?;
+    let mut iter =
+        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert the correctness of batches returned
     for expected_sidecar in ["sidecar1.parquet", "sidecar2.parquet"].iter() {
@@ -1089,21 +1145,19 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
 
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
-    let mut iter = LogSegment::create_checkpoint_stream(
-        &engine,
-        v2_checkpoint_read_schema.clone(),
-        None,
+    let log_segment = LogSegment::try_new(
+        vec![],
         vec![create_log_path(&checkpoint_one_file)],
         log_root,
+        None,
     )?;
+    let mut iter =
+        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let (first_batch, is_log_batch) = iter.next().unwrap()?;
     assert!(!is_log_batch);
-    assert_batch_matches(
-        first_batch,
-        add_batch_simple(v2_checkpoint_read_schema.clone()),
-    );
+    assert_batch_matches(first_batch, add_batch_simple(v2_checkpoint_read_schema));
     assert!(iter.next().is_none());
 
     Ok(())
@@ -1134,13 +1188,14 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
 
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
-    let mut iter = LogSegment::create_checkpoint_stream(
-        &engine,
-        v2_checkpoint_read_schema.clone(),
-        None,
+    let log_segment = LogSegment::try_new(
+        vec![],
         vec![create_log_path(&checkpoint_one_file)],
         log_root,
+        None,
     )?;
+    let mut iter =
+        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema, None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let (first_batch, is_log_batch) = iter.next().unwrap()?;
@@ -1191,20 +1246,20 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         "sidecarfile2.parquet",
     )?;
 
-    let checkpoint_one_file = mock_table
-        .log_root()
+    let checkpoint_file_path = log_root
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
 
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
-    let mut iter = LogSegment::create_checkpoint_stream(
-        &engine,
-        v2_checkpoint_read_schema.clone(),
-        None,
+    let log_segment = LogSegment::try_new(
+        vec![],
         vec![create_log_path(&checkpoint_file_path)],
         log_root,
+        None,
     )?;
+    let mut iter =
+        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let (first_batch, is_log_batch) = iter.next().unwrap()?;
@@ -1217,15 +1272,20 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         ),
     );
     // Assert that the second batch returned is from reading sidecarfile1
-    let sidecar_schema = get_log_add_schema();
     let (second_batch, is_log_batch) = iter.next().unwrap()?;
     assert!(!is_log_batch);
-    assert_batch_matches(second_batch, add_batch_simple(sidecar_schema.clone()));
+    assert_batch_matches(
+        second_batch,
+        add_batch_simple(v2_checkpoint_read_schema.clone()),
+    );
 
     // Assert that the second batch returned is from reading sidecarfile2
     let (third_batch, is_log_batch) = iter.next().unwrap()?;
     assert!(!is_log_batch);
-    assert_batch_matches(third_batch, add_batch_with_remove(sidecar_schema.clone()));
+    assert_batch_matches(
+        third_batch,
+        add_batch_with_remove(v2_checkpoint_read_schema),
+    );
 
     assert!(iter.next().is_none());
 

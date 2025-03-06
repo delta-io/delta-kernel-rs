@@ -16,7 +16,8 @@ use crate::table_features::{
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{DeltaResult, EngineData, Error, RowVisitor as _};
+use crate::{DeltaResult, EngineData, Error, FileMeta, RowVisitor as _};
+use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use delta_kernel_derive::Schema;
@@ -276,17 +277,26 @@ impl Protocol {
     /// support the specified protocol writer version and all enabled writer features?
     pub fn ensure_write_supported(&self) -> DeltaResult<()> {
         match &self.writer_features {
-            // if min_reader_version = 3 and min_writer_version = 7 and all writer features are
-            // supported => OK
-            Some(writer_features)
-                if self.min_reader_version == 3 && self.min_writer_version == 7 =>
-            {
+            Some(writer_features) if self.min_writer_version == 7 => {
+                // if we're on version 7, make sure we support all the specified features
                 ensure_supported_features(writer_features, &SUPPORTED_WRITER_FEATURES)
             }
-            // otherwise not supported
-            _ => Err(Error::unsupported(
-                "Only tables with min reader version 3 and min writer version 7 with no table features are supported."
-            )),
+            Some(_) => {
+                // there are features, but we're not on 7, so the protocol is actually broken
+                Err(Error::unsupported(
+                    "Tables with min writer version != 7 should not have table features.",
+                ))
+            }
+            None => {
+                // no features, we currently only support version 1 in this case
+                require!(
+                    self.min_writer_version == 1,
+                    Error::unsupported(
+                        "Currently delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1 or 7"
+                    )
+                );
+                Ok(())
+            }
         }
     }
 }
@@ -535,6 +545,25 @@ pub(crate) struct Sidecar {
 
     /// A map containing any additional metadata about the logicial file.
     pub tags: Option<HashMap<String, String>>,
+}
+
+impl Sidecar {
+    /// Convert a Sidecar record to a FileMeta.
+    ///
+    /// This helper first builds the URL by joining the provided log_root with
+    /// the "_sidecars/" folder and the given sidecar path.
+    pub(crate) fn to_filemeta(&self, log_root: &Url) -> DeltaResult<FileMeta> {
+        Ok(FileMeta {
+            location: log_root.join("_sidecars/")?.join(&self.path)?,
+            last_modified: self.modification_time,
+            size: self.size_in_bytes.try_into().map_err(|_| {
+                Error::generic(format!(
+                    "Failed to convert sidecar size {} to usize",
+                    self.size_in_bytes
+                ))
+            })?,
+        })
+    }
 }
 
 #[cfg(test)]

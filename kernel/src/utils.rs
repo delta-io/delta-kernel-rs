@@ -13,7 +13,7 @@ pub(crate) use require;
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use arrow_array::RecordBatch;
+    use crate::arrow::array::RecordBatch;
     use itertools::Itertools;
     use object_store::local::LocalFileSystem;
     use object_store::ObjectStore;
@@ -22,9 +22,11 @@ pub(crate) mod test_utils {
     use tempfile::TempDir;
     use test_utils::delta_path_for_version;
 
-    use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
-    use crate::engine::arrow_data::ArrowEngineData;
-    use crate::EngineData;
+    use crate::{
+        actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove},
+        engine::arrow_data::ArrowEngineData,
+        EngineData,
+    };
 
     #[derive(Serialize)]
     pub(crate) enum Action {

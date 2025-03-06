@@ -43,10 +43,10 @@ consumer's own `Engine` trait, the kernel has a feature flag to enable a default
 ```toml
 # fewer dependencies, requires consumer to implement Engine trait.
 # allows consumers to implement their own in-memory format
-delta_kernel = "0.6.1"
+delta_kernel = "0.8.0"
 
 # or turn on the default engine, based on arrow
-delta_kernel = { version = "0.6.1", features = ["default-engine"] }
+delta_kernel = { version = "0.8.0", features = ["default-engine"] }
 ```
 
 ### Feature flags
@@ -74,32 +74,19 @@ quickly. To enable engines that already integrate arrow to also integrate kernel
 to track a specific version of arrow that kernel depends on, we take as broad dependency on arrow
 versions as we can.
 
-This means you can force kernel to rely on the specific arrow version that your engine already uses,
-as long as it falls in that range. You can see the range in the `Cargo.toml` in the same folder as
-this `README.md`.
+We allow selecting the version of arrow to use via feature flags. Currently we support the following
+flags:
 
-For example, although arrow 53.1.0 has been released, you can force kernel to compile on 53.0 by
-putting the following in your project's `Cargo.toml`:
+- `arrow_53`: Use arrow version 53
+- `arrow_54`: Use arrow version 54
 
-```toml
-[patch.crates-io]
-arrow = "53.0"
-arrow-arith = "53.0"
-arrow-array = "53.0"
-arrow-buffer = "53.0"
-arrow-cast = "53.0"
-arrow-data = "53.0"
-arrow-ord = "53.0"
-arrow-json = "53.0"
-arrow-select = "53.0"
-arrow-schema = "53.0"
-parquet = "53.0"
-```
+Note that if more than one `arrow_x` feature is enabled, kernel will default to the _lowest_
+specified flag. This also means that if you use `--all-features` you will get the lowest version of
+arrow that kernel supports.
 
-Note that unfortunately patching in `cargo` requires that _exactly one_ version matches your
-specification. If only arrow "53.0.0" had been released the above will work, but if "53.0.1" where
-to be released, the specification will break and you will need to provide a more restrictive
-specification like `"=53.0.0"`.
+If no arrow feature is enabled, but are least one of `default-engine`, `sync-engine`,
+`arrow-conversion` or, `arrow-expression` is enabled, the lowest supported arrow version will be
+enabled.
 
 ### Object Store
 You may also need to patch the `object_store` version used if the version of `parquet` you depend on
