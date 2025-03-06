@@ -211,7 +211,7 @@ fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
 }
 
 #[test]
-fn build_snapshot_with_unsupported_uuid_checkpoint() {
+fn build_snapshot_with_uuid_checkpoint_parquet() {
     let (client, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -226,18 +226,88 @@ fn build_snapshot_with_unsupported_uuid_checkpoint() {
         ],
         None,
     );
+
     let log_segment = LogSegment::for_snapshot(client.as_ref(), log_root, None, None).unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
     assert_eq!(checkpoint_parts.len(), 1);
-    assert_eq!(checkpoint_parts[0].version, 3);
+    assert_eq!(checkpoint_parts[0].version, 5);
 
     let versions = commit_files.into_iter().map(|x| x.version).collect_vec();
-    let expected_versions = vec![4, 5, 6, 7];
+    let expected_versions = vec![6, 7];
     assert_eq!(versions, expected_versions);
 }
 
+#[test]
+fn build_snapshot_with_uuid_checkpoint_json() {
+    let (client, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "checkpoint.parquet"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "checkpoint.parquet"),
+            delta_path_for_version(4, "json"),
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(5, "checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json"),
+            delta_path_for_version(6, "json"),
+            delta_path_for_version(7, "json"),
+        ],
+        None,
+    );
+
+    let log_segment = LogSegment::for_snapshot(client.as_ref(), log_root, None, None).unwrap();
+    let commit_files = log_segment.ascending_commit_files;
+    let checkpoint_parts = log_segment.checkpoint_parts;
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(checkpoint_parts[0].version, 5);
+
+    let versions = commit_files.into_iter().map(|x| x.version).collect_vec();
+    let expected_versions = vec![6, 7];
+    assert_eq!(versions, expected_versions);
+}
+
+#[test]
+fn build_snapshot_with_correct_last_uuid_checkpoint() {
+    let checkpoint_metadata = CheckpointMetadata {
+        version: 5,
+        size: 10,
+        parts: Some(1),
+        size_in_bytes: None,
+        num_of_add_files: None,
+        checkpoint_schema: None,
+        checksum: None,
+    };
+
+    let (client, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "checkpoint.parquet"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "checkpoint.parquet"),
+            delta_path_for_version(3, "json"),
+            delta_path_for_version(4, "json"),
+            delta_path_for_version(5, "checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet"),
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(6, "json"),
+            delta_path_for_version(7, "json"),
+        ],
+        Some(&checkpoint_metadata),
+    );
+
+    let log_segment =
+        LogSegment::for_snapshot(client.as_ref(), log_root, checkpoint_metadata, None).unwrap();
+    let commit_files = log_segment.ascending_commit_files;
+    let checkpoint_parts = log_segment.checkpoint_parts;
+
+    assert_eq!(checkpoint_parts.len(), 1);
+    assert_eq!(commit_files.len(), 2);
+    assert_eq!(checkpoint_parts[0].version, 5);
+    assert_eq!(commit_files[0].version, 6);
+    assert_eq!(commit_files[1].version, 7);
+}
 #[test]
 fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
     let (client, log_root) = build_log_with_paths_and_checkpoint(
