@@ -48,9 +48,6 @@ pub enum ReaderFeatures {
     /// vacuumProtocolCheck ReaderWriter feature ensures consistent application of reader and writer
     /// protocol checks during VACUUM operations
     VacuumProtocolCheck,
-    /// A dummy variant used to represent an unsupported feature for testing purposes
-    #[cfg(test)]
-    UnrecognizedReaderFeature(String),
 }
 
 /// Similar to reader features, writer features communicate capabilities that must be implemented
