@@ -54,7 +54,7 @@ impl JsonHandler for SyncJsonHandler {
         &self,
         path: &Url,
         data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + '_>,
-        _overwrite: bool,
+        overwrite: bool,
     ) -> DeltaResult<()> {
         let path = path
             .to_file_path()
@@ -71,18 +71,23 @@ impl JsonHandler for SyncJsonHandler {
         let buf = to_json_bytes(data)?;
         tmp_file.write_all(&buf)?;
         tmp_file.flush()?;
-
-        // use 'persist_noclobber' to atomically rename tmp file to final path
-        tmp_file
-            .persist_noclobber(path.clone())
-            .map_err(|e| match e {
-                tempfile::PersistError { error, .. }
-                    if error.kind() == std::io::ErrorKind::AlreadyExists =>
-                {
-                    Error::FileAlreadyExists(path.to_string_lossy().to_string())
-                }
-                e => Error::IOError(e.into()),
-            })?;
+        if overwrite {
+            tmp_file
+                .persist(path)
+                .map_err(|e| Error::IOError(e.into()))?;
+        } else {
+            // use 'persist_noclobber' to atomically rename tmp file to final path
+            tmp_file
+                .persist_noclobber(path.clone())
+                .map_err(|e| match e {
+                    tempfile::PersistError { error, .. }
+                        if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                    {
+                        Error::FileAlreadyExists(path.to_string_lossy().to_string())
+                    }
+                    e => Error::IOError(e.into()),
+                })?;
+        }
         Ok(())
     }
 }

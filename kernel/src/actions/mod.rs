@@ -68,6 +68,18 @@ static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     .into()
 });
 
+static V1_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    StructType::new([
+        Option::<Metadata>::get_struct_field(METADATA_NAME),
+        Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
+        Option::<SetTransaction>::get_struct_field(SET_TRANSACTION_NAME),
+        Option::<Add>::get_struct_field(ADD_NAME),
+        Option::<Remove>::get_struct_field(REMOVE_NAME),
+        Option::<Sidecar>::get_struct_field(SIDECAR_NAME),
+    ])
+    .into()
+});
+
 static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     StructType::new([Option::<CommitInfo>::get_struct_field(COMMIT_INFO_NAME)]).into()
 });
@@ -82,6 +94,18 @@ fn get_log_schema() -> &'static SchemaRef {
 #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
 fn get_log_add_schema() -> &'static SchemaRef {
     &LOG_ADD_SCHEMA
+}
+
+// #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+// #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
+// fn get_log_add_and_remove_schema() -> &'static SchemaRef {
+//     &LOG_ADD_AND_REMOVE_SCHEMA
+// }
+
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
+fn get_v1_checkpoint_schema() -> &'static SchemaRef {
+    &V1_CHECKPOINT_SCHEMA
 }
 
 pub(crate) fn get_log_commit_info_schema() -> &'static SchemaRef {

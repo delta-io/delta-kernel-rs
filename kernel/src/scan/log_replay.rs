@@ -18,12 +18,12 @@ use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator};
 /// The subset of file action fields that uniquely identifies it in the log, used for deduplication
 /// of adds and removes during log replay.
 #[derive(Debug, Hash, Eq, PartialEq)]
-struct FileActionKey {
-    path: String,
-    dv_unique_id: Option<String>,
+pub(crate) struct FileActionKey {
+    pub(crate) path: String,
+    pub(crate) dv_unique_id: Option<String>,
 }
 impl FileActionKey {
-    fn new(path: impl Into<String>, dv_unique_id: Option<String>) -> Self {
+    pub(crate) fn new(path: impl Into<String>, dv_unique_id: Option<String>) -> Self {
         let path = path.into();
         Self { path, dv_unique_id }
     }
@@ -42,13 +42,13 @@ struct LogReplayScanner {
 /// replay visits actions newest-first, so once we've seen a file action for a given (path, dvId)
 /// pair, we should ignore all subsequent (older) actions for that same (path, dvId) pair. If the
 /// first action for a given file is a remove, then that file does not show up in the result at all.
-struct AddRemoveDedupVisitor<'seen> {
-    seen: &'seen mut HashSet<FileActionKey>,
-    selection_vector: Vec<bool>,
-    logical_schema: SchemaRef,
-    transform: Option<Arc<Transform>>,
-    row_transform_exprs: Vec<Option<ExpressionRef>>,
-    is_log_batch: bool,
+pub(crate) struct AddRemoveDedupVisitor<'seen> {
+    pub(crate) seen: &'seen mut HashSet<FileActionKey>,
+    pub(crate) selection_vector: Vec<bool>,
+    pub(crate) logical_schema: SchemaRef,
+    pub(crate) transform: Option<Arc<Transform>>,
+    pub(crate) row_transform_exprs: Vec<Option<ExpressionRef>>,
+    pub(crate) is_log_batch: bool,
 }
 
 impl AddRemoveDedupVisitor<'_> {
