@@ -199,7 +199,7 @@ pub enum Error {
     /// Error while creating a new single-row array
     #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
     #[error(transparent)]
-    SingleRowTransformError(#[from] crate::engine::arrow_expression::single_row_transform::Error),
+    SingleRowTransformError(#[from] crate::expressions::single_row_transform::Error),
 }
 
 // Convenience constructors for Error types that take a String argument

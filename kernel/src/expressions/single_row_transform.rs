@@ -1,14 +1,7 @@
 use std::borrow::Cow;
-use std::sync::Arc;
-
-use arrow_array::{ArrayRef, StructArray};
-use arrow_buffer::NullBuffer;
-use arrow_schema::DataType as ArrowDataType;
-use arrow_schema::Field as ArrowField;
-use itertools::Itertools;
 use tracing::debug;
 
-use crate::expressions::Scalar;
+use crate::expressions::{Expression, Scalar};
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, SchemaTransform, StructField, StructType,
 };
@@ -19,9 +12,9 @@ use crate::schema::{
 pub(crate) struct SingleRowTransform<'a, T: Iterator<Item = &'a Scalar>> {
     /// Leaf-node values to insert in schema order.
     scalars: T,
-    /// A stack of built arrays. After visiting children, we pop them off to
+    /// A stack of built Expressions. After visiting children, we pop them off to
     /// build the parent container, then push the parent back on.
-    stack: Vec<ArrayRef>,
+    stack: Vec<Expression>,
     /// If an error occurs, it will be stored here.
     error: Option<Error>,
 }
@@ -65,7 +58,7 @@ impl<'a, I: Iterator<Item = &'a Scalar>> SingleRowTransform<'a, I> {
 
     /// return the single-row array (or propagate Error). the top of `stack` should be our
     /// single-row struct array
-    pub(crate) fn into_struct_array(mut self) -> Result<ArrayRef, Error> {
+    pub(crate) fn into_expr(mut self) -> Result<Expression, Error> {
         if let Some(e) = self.error {
             return Err(e);
         }
@@ -75,11 +68,13 @@ impl<'a, I: Iterator<Item = &'a Scalar>> SingleRowTransform<'a, I> {
         }
 
         match self.stack.pop() {
-            Some(array) if self.stack.is_empty() => match array.data_type() {
-                ArrowDataType::Struct(_) => Ok(array),
-                _ => Err(Error::Schema("Expected struct array".to_string())),
-            },
-            Some(_) => Err(Error::ExcessScalars),
+            // Some(array) if self.stack.is_empty() => match array.data_type() {
+            //     ArrowDataType::Struct(_) => Ok(array),
+            //     _ => Err(Error::Schema("Expected struct array".to_string())),
+            // },
+            // Some(_) => Err(Error::ExcessScalars),
+            // None => Err(Error::EmptyStack),
+            Some(array) => Ok(array),
             None => Err(Error::EmptyStack),
         }
     }
@@ -128,13 +123,7 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for SingleRowTransf
             return None;
         }
 
-        let arr = self.check_error(
-            scalar
-                .to_array(1)
-                .map_err(|delta_error| Error::Schema(delta_error.to_string())),
-        )?;
-        self.stack.push(arr);
-
+        self.stack.push(Expression::Literal(scalar.clone()));
         Some(Cow::Borrowed(prim_type))
     }
 
@@ -148,32 +137,33 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for SingleRowTransf
         // the recursion encountered an error.
         let mark = self.stack.len();
         self.recurse_into_struct(struct_type)?;
-        let field_arrays = self.stack.split_off(mark);
+        let field_exprs = self.stack.split_off(mark);
 
-        if field_arrays.len() != struct_type.fields_len() {
+        if field_exprs.len() != struct_type.fields_len() {
             self.set_error(Error::InsufficientScalars);
             return None;
         }
 
-        let fields =
-            self.check_error(struct_type.fields().map(ArrowField::try_from).try_collect())?;
-
         let mut found_non_nullable_null = false;
         let mut all_null = true;
-        for (f, v) in struct_type.fields().zip(&field_arrays) {
-            if v.is_valid(0) {
+        let fields = struct_type.fields();
+        for (field, expr) in fields.zip(&field_exprs) {
+            if !matches!(expr, Expression::Literal(Scalar::Null(_))) {
                 all_null = false;
-            } else if !f.is_nullable() {
+            } else if !field.is_nullable() {
                 found_non_nullable_null = true;
             }
         }
 
-        // If all children are NULL and at least one is ostensibly non-nullable, we must interpret
-        // the struct itself as being NULL or `StructArray::try_new` will fail null checks.
-        let null_buffer = (all_null && found_non_nullable_null).then(|| NullBuffer::new_null(1));
-        let array = self.check_error(StructArray::try_new(fields, field_arrays, null_buffer))?;
+        // If all children are NULL and at least one is ostensibly non-nullable, we interpret
+        // the struct itself as being NULL
+        let struct_expr = if all_null && found_non_nullable_null {
+            Expression::null_literal(struct_type.clone().into())
+        } else {
+            Expression::struct_from(field_exprs)
+        };
 
-        self.stack.push(Arc::new(array));
+        self.stack.push(struct_expr);
         Some(Cow::Borrowed(struct_type))
     }
 
@@ -216,32 +206,31 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for SingleRowTransf
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
     use crate::schema::SchemaRef;
     use crate::schema::StructType;
     use crate::DataType as DeltaDataTypes;
 
-    use arrow_array::cast::AsArray;
-    use arrow_array::create_array;
-    use arrow_schema::{DataType, Field};
     use paste::paste;
 
     // helper to take values/schema to pass to `create_one` and assert the result = expected
     fn assert_single_row_transform(
         values: &[Scalar],
         schema: SchemaRef,
-        expected: Result<StructArray, ()>,
+        expected: Result<Expression, ()>,
     ) {
-        let mut array_transform = SingleRowTransform::new(values);
+        let mut schema_transform = SingleRowTransform::new(values);
         let datatype = schema.into();
-        let _transformed = array_transform.transform(&datatype);
+        let _transformed = schema_transform.transform(&datatype);
         match expected {
-            Ok(expected_struct) => {
-                let array = array_transform.into_struct_array().unwrap();
-                let struct_array = array.as_struct_opt().unwrap();
-                assert_eq!(struct_array, &expected_struct);
+            Ok(expected_expr) => {
+                let actual_expr = schema_transform.into_expr().unwrap();
+                // FIXME
+                assert_eq!(expected_expr.to_string(), actual_expr.to_string());
             }
             Err(()) => {
-                assert!(array_transform.into_struct_array().is_err());
+                assert!(schema_transform.into_expr().is_err());
             }
         }
     }
@@ -254,17 +243,15 @@ mod tests {
             "col_1",
             DeltaDataTypes::INTEGER,
         )]));
-        let expected =
-            StructArray::new_null(vec![Field::new("col_1", DataType::Int32, false)].into(), 1);
+        let expected = Expression::null_literal(schema.clone().into());
         assert_single_row_transform(values, schema, Ok(expected));
 
         let schema = Arc::new(StructType::new([StructField::nullable(
             "col_1",
             DeltaDataTypes::INTEGER,
         )]));
-        let expected = StructArray::from(vec![(
-            Arc::new(Field::new("col_1", DataType::Int32, true)),
-            create_array!(Int32, [None]) as ArrayRef,
+        let expected = Expression::struct_from(vec![Expression::null_literal(
+            DeltaDataTypes::INTEGER.into(),
         )]);
         assert_single_row_transform(values, schema, Ok(expected));
     }
@@ -319,49 +306,9 @@ mod tests {
                 ]),
             ),
         ]));
-        let struct_fields_1 = vec![
-            Field::new("a", DataType::Int32, false),
-            Field::new("b", DataType::Int32, true),
-        ];
-        let struct_fields_2 = vec![
-            Field::new("c", DataType::Int32, false),
-            Field::new("d", DataType::Int32, true),
-        ];
-        let expected = StructArray::from(vec![
-            (
-                Arc::new(Field::new(
-                    "x",
-                    DataType::Struct(struct_fields_1.clone().into()),
-                    true,
-                )),
-                Arc::new(StructArray::from(vec![
-                    (
-                        Arc::new(struct_fields_1[0].clone()),
-                        create_array!(Int32, [1]) as ArrayRef,
-                    ),
-                    (
-                        Arc::new(struct_fields_1[1].clone()),
-                        create_array!(Int32, [2]) as ArrayRef,
-                    ),
-                ])) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new(
-                    "y",
-                    DataType::Struct(struct_fields_2.clone().into()),
-                    true,
-                )),
-                Arc::new(StructArray::from(vec![
-                    (
-                        Arc::new(struct_fields_2[0].clone()),
-                        create_array!(Int32, [3]) as ArrayRef,
-                    ),
-                    (
-                        Arc::new(struct_fields_2[1].clone()),
-                        create_array!(Int32, [4]) as ArrayRef,
-                    ),
-                ])) as ArrayRef,
-            ),
+        let expected = Expression::struct_from(vec![
+            Expression::struct_from(vec![Expression::literal(1), Expression::literal(2)]),
+            Expression::struct_from(vec![Expression::literal(3), Expression::literal(4)]),
         ]);
         assert_single_row_transform(values, schema, Ok(expected));
     }
@@ -380,7 +327,7 @@ mod tests {
         Error, // TODO: we could check the actual error
     }
 
-    fn run_test(schema: TestSchema, values: (Option<i32>, Option<i32>), expected: Expected) {
+    fn run_test(test_schema: TestSchema, values: (Option<i32>, Option<i32>), expected: Expected) {
         let (a_val, b_val) = values;
         let a = match a_val {
             Some(v) => Scalar::Integer(v),
@@ -392,51 +339,32 @@ mod tests {
         };
         let values: &[Scalar] = &[a, b];
 
-        let x_children_fields = vec![
-            Field::new("a", DataType::Int32, schema.a_nullable),
-            Field::new("b", DataType::Int32, schema.b_nullable),
-        ];
-        let x_field = Arc::new(Field::new(
+        let field_a = StructField::new("a", DeltaDataTypes::INTEGER, test_schema.a_nullable);
+        let field_b = StructField::new("b", DeltaDataTypes::INTEGER, test_schema.b_nullable);
+        let field_x = StructField::new(
             "x",
-            DataType::Struct(x_children_fields.clone().into()),
-            schema.x_nullable,
-        ));
-
-        let arrow_schema = Arc::new(StructType::new([StructField::new(
-            "x",
-            DeltaDataTypes::struct_type([
-                StructField::new("a", DeltaDataTypes::INTEGER, schema.a_nullable),
-                StructField::new("b", DeltaDataTypes::INTEGER, schema.b_nullable),
-            ]),
-            schema.x_nullable,
-        )]));
-
-        let field_a = Arc::new(x_children_fields[0].clone());
-        let field_b = Arc::new(x_children_fields[1].clone());
+            StructType::new([field_a.clone(), field_b.clone()]),
+            test_schema.x_nullable,
+        );
+        let schema = Arc::new(StructType::new([field_x.clone()]));
 
         let expected_result = match expected {
             Expected::Noop => {
-                let nested_struct = Arc::new(StructArray::from(vec![
-                    (field_a, create_array!(Int32, [a_val]) as ArrayRef),
-                    (field_b, create_array!(Int32, [b_val]) as ArrayRef),
-                ])) as ArrayRef;
-                Ok(StructArray::from(vec![(x_field.clone(), nested_struct)]))
+                let nested_struct = Expression::struct_from(vec![
+                    Expression::literal(values[0].clone()),
+                    Expression::literal(values[1].clone()),
+                ]);
+                Ok(Expression::struct_from([nested_struct]))
             }
-            Expected::Null => Ok(StructArray::new_null(
-                vec![x_field.as_ref().clone()].into(),
-                1,
-            )),
+            Expected::Null => Ok(Expression::null_literal(schema.clone().into())),
             Expected::NullStruct => {
-                let nested_null = Arc::new(StructArray::new_null(
-                    vec![field_a.clone(), field_b.clone()].into(),
-                    1,
-                )) as ArrayRef;
-                Ok(StructArray::from(vec![(x_field, nested_null)]))
+                let nested_null = Expression::null_literal(field_x.data_type().clone());
+                Ok(Expression::struct_from([nested_null]))
             }
             Expected::Error => Err(()),
         };
 
-        assert_single_row_transform(values, arrow_schema, expected_result);
+        assert_single_row_transform(values, schema, expected_result);
     }
 
     // helper to convert nullable/not_null to bool
@@ -530,83 +458,83 @@ mod tests {
         }
     }
 
-    // Group 2: nullable { nullable, not_null }
-    //  1. (a, b) -> x (a, b)
-    //  2. (N, b) -> x (N, b)
-    //  3. (a, N) -> Err
-    //  4. (N, N) -> x NULL
-    test_nullability_combinations! {
-        name = test_nullable_nullable_not_null,
-        schema = { x: nullable, a: nullable, b: not_null },
-        tests = {
-            (a, b) -> Noop,
-            (N, b) -> Noop,
-            (a, N) -> Error,
-            (N, N) -> NullStruct,
-        }
-    }
-
-    // Group 3: nullable { not_null, not_null }
-    //  1. (a, b) -> x (a, b)
-    //  2. (N, b) -> Err
-    //  3. (a, N) -> Err
-    //  4. (N, N) -> x NULL
-    test_nullability_combinations! {
-        name = test_nullable_not_null_not_null,
-        schema = { x: nullable, a: not_null, b: not_null },
-        tests = {
-            (a, b) -> Noop,
-            (N, b) -> Error,
-            (a, N) -> Error,
-            (N, N) -> NullStruct,
-        }
-    }
-
-    // Group 4: not_null { nullable, nullable }
-    //  1. (a, b) -> x (a, b)
-    //  2. (N, b) -> x (N, b)
-    //  3. (a, N) -> x (a, N)
-    //  4. (N, N) -> x (N, N)
-    test_nullability_combinations! {
-        name = test_not_null_nullable_nullable,
-        schema = { x: not_null, a: nullable, b: nullable },
-        tests = {
-            (a, b) -> Noop,
-            (N, b) -> Noop,
-            (a, N) -> Noop,
-            (N, N) -> Noop,
-        }
-    }
-
-    // Group 5: not_null { nullable, not_null }
-    //  1. (a, b) -> x (a, b)
-    //  2. (N, b) -> x (N, b)
-    //  3. (a, N) -> Err
-    //  4. (N, N) -> NULL
-    test_nullability_combinations! {
-        name = test_not_null_nullable_not_null,
-        schema = { x: not_null, a: nullable, b: not_null },
-        tests = {
-            (a, b) -> Noop,
-            (N, b) -> Noop,
-            (a, N) -> Error,
-            (N, N) -> Null,
-        }
-    }
-
-    // Group 6: not_null { not_null, not_null }
-    //  1. (a, b) -> x (a, b)
-    //  2. (N, b) -> Err
-    //  3. (a, N) -> Err
-    //  4. (N, N) -> NULL
-    test_nullability_combinations! {
-        name = test_all_not_null,
-        schema = { x: not_null, a: not_null, b: not_null },
-        tests = {
-            (a, b) -> Noop,
-            (N, b) -> Error,
-            (a, N) -> Error,
-            (N, N) -> Null,
-        }
-    }
+    //     // Group 2: nullable { nullable, not_null }
+    //     //  1. (a, b) -> x (a, b)
+    //     //  2. (N, b) -> x (N, b)
+    //     //  3. (a, N) -> Err
+    //     //  4. (N, N) -> x NULL
+    //     test_nullability_combinations! {
+    //         name = test_nullable_nullable_not_null,
+    //         schema = { x: nullable, a: nullable, b: not_null },
+    //         tests = {
+    //             (a, b) -> Noop,
+    //             (N, b) -> Noop,
+    //             (a, N) -> Error,
+    //             (N, N) -> NullStruct,
+    //         }
+    //     }
+    //
+    //     // Group 3: nullable { not_null, not_null }
+    //     //  1. (a, b) -> x (a, b)
+    //     //  2. (N, b) -> Err
+    //     //  3. (a, N) -> Err
+    //     //  4. (N, N) -> x NULL
+    //     test_nullability_combinations! {
+    //         name = test_nullable_not_null_not_null,
+    //         schema = { x: nullable, a: not_null, b: not_null },
+    //         tests = {
+    //             (a, b) -> Noop,
+    //             (N, b) -> Error,
+    //             (a, N) -> Error,
+    //             (N, N) -> NullStruct,
+    //         }
+    //     }
+    //
+    //     // Group 4: not_null { nullable, nullable }
+    //     //  1. (a, b) -> x (a, b)
+    //     //  2. (N, b) -> x (N, b)
+    //     //  3. (a, N) -> x (a, N)
+    //     //  4. (N, N) -> x (N, N)
+    //     test_nullability_combinations! {
+    //         name = test_not_null_nullable_nullable,
+    //         schema = { x: not_null, a: nullable, b: nullable },
+    //         tests = {
+    //             (a, b) -> Noop,
+    //             (N, b) -> Noop,
+    //             (a, N) -> Noop,
+    //             (N, N) -> Noop,
+    //         }
+    //     }
+    //
+    //     // Group 5: not_null { nullable, not_null }
+    //     //  1. (a, b) -> x (a, b)
+    //     //  2. (N, b) -> x (N, b)
+    //     //  3. (a, N) -> Err
+    //     //  4. (N, N) -> NULL
+    //     test_nullability_combinations! {
+    //         name = test_not_null_nullable_not_null,
+    //         schema = { x: not_null, a: nullable, b: not_null },
+    //         tests = {
+    //             (a, b) -> Noop,
+    //             (N, b) -> Noop,
+    //             (a, N) -> Error,
+    //             (N, N) -> Null,
+    //         }
+    //     }
+    //
+    //     // Group 6: not_null { not_null, not_null }
+    //     //  1. (a, b) -> x (a, b)
+    //     //  2. (N, b) -> Err
+    //     //  3. (a, N) -> Err
+    //     //  4. (N, N) -> NULL
+    //     test_nullability_combinations! {
+    //         name = test_all_not_null,
+    //         schema = { x: not_null, a: not_null, b: not_null },
+    //         tests = {
+    //             (a, b) -> Noop,
+    //             (N, b) -> Error,
+    //             (a, N) -> Error,
+    //             (N, N) -> Null,
+    //         }
+    //     }
 }

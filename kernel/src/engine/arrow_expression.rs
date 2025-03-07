@@ -32,13 +32,8 @@ use crate::expressions::{
     BinaryExpression, BinaryOperator, Expression, Scalar, UnaryExpression, UnaryOperator,
     VariadicExpression, VariadicOperator,
 };
-use crate::schema::{
-    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
-};
+use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField};
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
-
-pub(crate) mod single_row_transform;
-use single_row_transform::SingleRowTransform;
 
 // TODO leverage scalars / Datum
 
@@ -367,6 +362,13 @@ fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<RecordBatch
         ));
     };
     let applied = apply_schema_to_struct(array, struct_schema)?;
+    // arrow just panics if we attempt to convery a StructArray to a RecordBatch with top-level
+    // nulls, so we check for that and just error if that's the case here
+    if applied.null_count() > 0 {
+        return Err(Error::invalid_struct_data(
+            "Top-level nulls in struct are not supported",
+        ));
+    }
     Ok(applied.into())
 }
 
@@ -532,23 +534,19 @@ impl ExpressionHandler for ArrowExpressionHandler {
         })
     }
 
-    /// TODO
-    fn create_one(&self, schema: SchemaRef, values: &[Scalar]) -> DeltaResult<Box<dyn EngineData>> {
-        let mut array_transform = SingleRowTransform::new(values);
-        let datatype = schema.into();
-        // we build up the array within the `SingleRowArrayTransform` - we don't actually care
-        // about the 'transformed' type
-        let _transformed = array_transform.transform(&datatype);
-        let array = array_transform.into_struct_array()?;
-        let struct_array = array.as_struct_opt().unwrap(); // FIXME
-
-        // detect top-level null
-        if struct_array.is_null(0) {
-            return Err(Error::generic("Top-level null in single-row array"));
-        }
-
-        let record_batch: RecordBatch = struct_array.into(); // FIXME
-        Ok(Box::new(ArrowEngineData::new(record_batch)))
+    /// Docs TODO
+    // NOTE: we should actually probably allow output_type to be a DataType instead of Schema
+    fn null_row(&self) -> DeltaResult<(Box<dyn EngineData>, SchemaRef)> {
+        use crate::schema::StructType;
+        let output_schema = Arc::new(StructType::new(vec![StructField::new(
+            "output",
+            DataType::INTEGER,
+            true,
+        )]));
+        let array = Scalar::Null(DataType::INTEGER).to_array(1)?;
+        let record_batch =
+            RecordBatch::try_new(Arc::new(output_schema.as_ref().try_into()?), vec![array])?;
+        Ok((Box::new(ArrowEngineData::new(record_batch)), output_schema))
     }
 }
 
@@ -1042,7 +1040,7 @@ mod tests {
         )]));
         assert!(matches!(
             handler.create_one(schema, values),
-            Err(Error::Generic(_))
+            Err(Error::InvalidStructData(_))
         ));
     }
 }

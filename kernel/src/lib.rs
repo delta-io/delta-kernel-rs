@@ -106,7 +106,9 @@ pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef};
 pub use table::Table;
 
+use expressions::single_row_transform::SingleRowTransform;
 use expressions::Scalar;
+use schema::SchemaTransform;
 
 #[cfg(any(
     feature = "default-engine",
@@ -341,11 +343,24 @@ pub trait ExpressionHandler: AsAny {
         output_type: DataType,
     ) -> Arc<dyn ExpressionEvaluator>;
 
+    /// Create a single-row null-value [`EngineData`] of a single column of type `output_type`.
+    fn null_row(&self) -> DeltaResult<(Box<dyn EngineData>, SchemaRef)>;
+
     /// Create a single-row [`EngineData`] by applying the given schema to the leaf-values given in
     /// `values`.
     // Note: we will stick with a Schema instead of DataType (more constrained can expand in
     // future)
-    fn create_one(&self, schema: SchemaRef, values: &[Scalar]) -> DeltaResult<Box<dyn EngineData>>;
+    fn create_one(&self, schema: SchemaRef, values: &[Scalar]) -> DeltaResult<Box<dyn EngineData>> {
+        let (null_row, null_row_schema) = self.null_row()?;
+
+        // Convert schema and leaf values to an expression
+        let mut schema_transform = SingleRowTransform::new(values);
+        schema_transform.transform_struct(schema.as_ref());
+        let row_expr = schema_transform.into_expr()?;
+
+        let eval = self.get_evaluator(null_row_schema, row_expr, schema.into());
+        eval.evaluate(null_row.as_ref())
+    }
 }
 
 /// Provides file system related functionalities to Delta Kernel.
