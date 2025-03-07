@@ -1,4 +1,3 @@
-#![cfg_attr(rustfmt, rustfmt_skip)]
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::RecordBatch;
@@ -68,6 +67,7 @@ fn v2_checkpoints_parquet_with_sidecars() -> DeltaResult<()> {
     test_v2_checkpoints("v2-checkpoints-parquet-with-sidecars")
 }
 
+#[rustfmt::skip]
 #[test]
 fn v2_checkpoints_json_without_sidecars() -> DeltaResult<()> {
     let batches = read_v2_checkpoint_table("v2-checkpoints-json-without-sidecars")?;
@@ -93,6 +93,7 @@ fn v2_checkpoints_json_without_sidecars() -> DeltaResult<()> {
     Ok(())
 }
 
+#[rustfmt::skip]
 #[test]
 fn v2_checkpoints_parquet_without_sidecars() -> DeltaResult<()> {
     let batches = read_v2_checkpoint_table("v2-checkpoints-json-without-sidecars")?;
@@ -118,6 +119,7 @@ fn v2_checkpoints_parquet_without_sidecars() -> DeltaResult<()> {
     Ok(())
 }
 
+#[rustfmt::skip]
 #[test]
 fn v2_classic_checkpoint_json() -> DeltaResult<()> {
     let batches = read_v2_checkpoint_table("v2-classic-checkpoint-json")?;
@@ -152,6 +154,7 @@ fn v2_classic_checkpoint_json() -> DeltaResult<()> {
     Ok(())
 }
 
+#[rustfmt::skip]
 #[test]
 fn v2_classic_checkpoint_parquet() -> DeltaResult<()> {
     let batches = read_v2_checkpoint_table("v2-classic-checkpoint-parquet")?;
@@ -186,6 +189,7 @@ fn v2_classic_checkpoint_parquet() -> DeltaResult<()> {
     Ok(())
 }
 
+#[rustfmt::skip]
 #[test]
 fn v2_checkpoints_parquet_with_last_checkpoint() -> DeltaResult<()> {
     let batches = read_v2_checkpoint_table("v2-checkpoints-parquet-with-last-checkpoint")?;
@@ -210,6 +214,7 @@ fn v2_checkpoints_parquet_with_last_checkpoint() -> DeltaResult<()> {
     Ok(())
 }
 
+#[rustfmt::skip]
 #[test]
 fn v2_checkpoints_json_with_last_checkpoint() -> DeltaResult<()> {
     let batches = read_v2_checkpoint_table("v2-checkpoints-json-with-last-checkpoint")?;
