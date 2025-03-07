@@ -1,7 +1,8 @@
 use std::os::raw::c_void;
 
+use crate::handle::Handle;
 use crate::scan::CStringMap;
-use crate::{handle::Handle, kernel_string_slice, KernelStringSlice, SharedSnapshot};
+use crate::{kernel_string_slice, KernelStringSlice, SharedSchema};
 use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
 
 /// The `EngineSchemaVisitor` defines a visitor system to allow engines to build their own
@@ -192,20 +193,24 @@ pub struct EngineSchemaVisitor {
     ),
 }
 
-/// Visit the schema of the passed `SnapshotHandle`, using the provided `visitor`. See the
-/// documentation of [`EngineSchemaVisitor`] for a description of how this visitor works.
+/// Visit the given `schema` using the provided `visitor`. See the documentation of
+/// [`EngineSchemaVisitor`] for a description of how this visitor works.
 ///
 /// This method returns the id of the list allocated to hold the top level schema columns.
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid snapshot handle and schema visitor.
+/// Caller is responsible for passing a valid schema handle and schema visitor.
 #[no_mangle]
 pub unsafe extern "C" fn visit_schema(
-    snapshot: Handle<SharedSnapshot>,
+    schema: Handle<SharedSchema>,
     visitor: &mut EngineSchemaVisitor,
 ) -> usize {
-    let snapshot = unsafe { snapshot.as_ref() };
+    let schema = unsafe { schema.as_ref() };
+    visit_schema_impl(schema, visitor)
+}
+
+fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> usize {
     // Visit all the fields of a struct and return the list of children
     fn visit_struct_fields(visitor: &EngineSchemaVisitor, s: &StructType) -> usize {
         let child_list_id = (visitor.make_field_list)(visitor.data, s.fields.len());
@@ -316,5 +321,5 @@ pub unsafe extern "C" fn visit_schema(
         }
     }
 
-    visit_struct_fields(visitor, snapshot.schema())
+    visit_struct_fields(visitor, schema)
 }

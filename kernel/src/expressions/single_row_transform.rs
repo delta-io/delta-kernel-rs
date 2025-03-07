@@ -24,7 +24,7 @@ pub(crate) struct SingleRowTransform<'a, T: Iterator<Item = &'a Scalar>> {
 pub enum Error {
     /// An error performing operations on arrow data
     #[error(transparent)]
-    Arrow(#[from] arrow_schema::ArrowError),
+    Arrow(#[from] crate::arrow::error::ArrowError),
 
     /// Schema mismatch error
     #[error("Schema error: {0}")]

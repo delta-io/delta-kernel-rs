@@ -352,7 +352,7 @@ impl RowVisitor for CdcVisitor {
             ))
         );
         for i in 0..row_count {
-            // Since path column is required, use it to detect presence of an Add action
+            // Since path column is required, use it to detect presence of a Cdc action
             if let Some(path) = getters[0].get_opt(i, "cdc.path")? {
                 self.cdcs.push(Self::visit_cdc(i, path, getters)?);
             }
@@ -438,7 +438,6 @@ impl RowVisitor for SetTransactionVisitor {
     }
 }
 
-#[allow(unused)] //TODO: Remove once we implement V2 checkpoint file processing
 #[derive(Default)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct SidecarVisitor {
@@ -475,7 +474,7 @@ impl RowVisitor for SidecarVisitor {
             ))
         );
         for i in 0..row_count {
-            // Since path column is required, use it to detect presence of a sidecar action
+            // Since path column is required, use it to detect presence of a Sidecar action
             if let Some(path) = getters[0].get_opt(i, "sidecar.path")? {
                 self.sidecars.push(Self::visit_sidecar(i, path, getters)?);
             }
@@ -514,8 +513,8 @@ pub(crate) fn visit_deletion_vector_at<'a>(
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use crate::arrow::array::{RecordBatch, StringArray};
+    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 
     use super::*;
     use crate::{

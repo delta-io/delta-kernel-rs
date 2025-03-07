@@ -1,4 +1,4 @@
-use arrow_array::{
+use crate::arrow::array::{
     types::{GenericStringType, Int32Type, Int64Type},
     Array, BooleanArray, GenericByteArray, GenericListArray, MapArray, OffsetSizeTrait,
     PrimitiveArray,

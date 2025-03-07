@@ -75,6 +75,28 @@ impl DataSkippingFilter {
         let (predicate, referenced_schema) = physical_predicate?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
 
+        // Convert all fields into nullable, as stats may not be available for all columns
+        // (and usually aren't for partition columns).
+        struct NullableStatsTransform;
+        impl<'a> SchemaTransform<'a> for NullableStatsTransform {
+            fn transform_struct_field(
+                &mut self,
+                field: &'a StructField,
+            ) -> Option<Cow<'a, StructField>> {
+                use Cow::*;
+                let field = match self.transform(&field.data_type)? {
+                    Borrowed(_) if field.is_nullable() => Borrowed(field),
+                    data_type => Owned(StructField {
+                        name: field.name.clone(),
+                        data_type: data_type.into_owned(),
+                        nullable: true,
+                        metadata: field.metadata.clone(),
+                    }),
+                };
+                Some(field)
+            }
+        }
+
         // Convert a min/max stats schema into a nullcount schema (all leaf fields are LONG)
         struct NullCountStatsTransform;
         impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
@@ -85,14 +107,19 @@ impl DataSkippingFilter {
                 Some(Cow::Owned(PrimitiveType::Long))
             }
         }
-        let nullcount_schema = NullCountStatsTransform
+
+        let stats_schema = NullableStatsTransform
             .transform_struct(&referenced_schema)?
+            .into_owned();
+
+        let nullcount_schema = NullCountStatsTransform
+            .transform_struct(&stats_schema)?
             .into_owned();
         let stats_schema = Arc::new(StructType::new([
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", nullcount_schema),
-            StructField::nullable("minValues", referenced_schema.clone()),
-            StructField::nullable("maxValues", referenced_schema),
+            StructField::nullable("minValues", stats_schema.clone()),
+            StructField::nullable("maxValues", stats_schema),
         ]));
 
         // Skipping happens in several steps:

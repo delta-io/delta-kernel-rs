@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
-use crate::Error;
+use crate::{Error, Version};
 
 use strum::EnumString;
 
@@ -136,6 +136,20 @@ pub struct TableProperties {
 
     /// whether to enable row tracking during writes.
     pub enable_row_tracking: Option<bool>,
+
+    /// Whether to enable [In-Commit Timestamps]. The in-commit timestamps writer feature strongly
+    /// associates a monotonically increasing timestamp with each commit by storing it in the
+    /// commit's metadata.
+    ///
+    /// [In-Commit Timestamps]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#in-commit-timestamps
+    pub enable_in_commit_timestamps: Option<bool>,
+
+    /// The version of the table at which in-commit timestamps were enabled.
+    pub in_commit_timestamp_enablement_version: Option<Version>,
+
+    /// The timestamp of the table at which in-commit timestamps were enabled. This must be the same
+    /// as the inCommitTimestamp of the commit when this feature was enabled.
+    pub in_commit_timestamp_enablement_timestamp: Option<i64>,
 
     /// any unrecognized properties are passed through and ignored by the parser
     pub unknown_properties: HashMap<String, String>,
@@ -268,6 +282,9 @@ mod tests {
             ("delta.tuneFileSizesForRewrites", "true"),
             ("delta.checkpointPolicy", "v2"),
             ("delta.enableRowTracking", "true"),
+            ("delta.enableInCommitTimestamps", "true"),
+            ("delta.inCommitTimestampEnablementVersion", "15"),
+            ("delta.inCommitTimestampEnablementTimestamp", "1612345678"),
         ];
         let actual = TableProperties::from(properties.into_iter());
         let expected = TableProperties {
@@ -293,6 +310,9 @@ mod tests {
             tune_file_sizes_for_rewrites: Some(true),
             checkpoint_policy: Some(CheckpointPolicy::V2),
             enable_row_tracking: Some(true),
+            enable_in_commit_timestamps: Some(true),
+            in_commit_timestamp_enablement_version: Some(15),
+            in_commit_timestamp_enablement_timestamp: Some(1_612_345_678),
             unknown_properties: HashMap::new(),
         };
         assert_eq!(actual, expected);
