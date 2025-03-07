@@ -5,8 +5,8 @@ use std::ffi::c_void;
 
 use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
 use delta_kernel::expressions::{
-    ArrayData, BinaryExpression, BinaryOperator, Expression, Scalar, StructData, UnaryExpression,
-    UnaryOperator, VariadicExpression, VariadicOperator,
+    ArrayData, BinaryExpression, BinaryOperator, Expression, OpaqueExpression, OpaqueOperatorRef,
+    Scalar, StructData, UnaryExpression, UnaryOperator, VariadicExpression, VariadicOperator,
 };
 
 /// Free the memory the passed SharedExpression
@@ -284,6 +284,26 @@ pub fn visit_expression_internal(
         };
         visit_fn(visitor.data, sibling_list_id, child_list_id);
     }
+    fn visit_expression_opaque(
+        visitor: &mut EngineExpressionVisitor,
+        op: &OpaqueOperatorRef,
+        exprs: &[Expression],
+        sibling_list_id: usize,
+    ) {
+        let child_list_id = call!(visitor, make_field_list, exprs.len());
+        for expr in exprs {
+            visit_expression_impl(visitor, expr, child_list_id);
+        }
+        // How to convert the OpaqueOperatorRef into something the engine can actually work with? It
+        // could be the engine's own opaque operator, or it could be the default implementation's
+        // `ArrowOpaqueO`. Tho I guess if the engine obtained one of those, it would have to be
+        // through some FFI method that wraps it up as an `EngineOpaqueOperator`.
+        todo!()
+    }
+    fn visit_expression_unsupported(visitor: &mut EngineExpressionVisitor, name: &str) {
+        // Not really anything the engine can do, other than note the name of the unsupported op.
+        todo!()
+    }
     fn visit_expression_scalar(
         visitor: &mut EngineExpressionVisitor,
         scalar: &Scalar,
@@ -385,6 +405,10 @@ pub fn visit_expression_internal(
             Expression::Variadic(VariadicExpression { op, exprs }) => {
                 visit_expression_variadic(visitor, op, exprs, sibling_list_id)
             }
+            Expression::Opaque(OpaqueExpression { op, exprs }) => {
+                visit_expression_opaque(visitor, op, exprs, sibling_list_id)
+            }
+            Expression::Unsupported(name) => visit_expression_unsupported(visitor, name),
         }
     }
     let top_level = call!(visitor, make_field_list, 1);
