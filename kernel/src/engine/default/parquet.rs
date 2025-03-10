@@ -97,7 +97,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         Self {
             store,
             task_executor,
-            readahead: 10,
+            readahead: 2048,
         }
     }
 
