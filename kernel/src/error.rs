@@ -200,7 +200,6 @@ pub enum Error {
     InvalidCheckpoint(String),
 
     /// Error while creating a new single-row array
-    #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
     #[error(transparent)]
     SingleRowTransformError(#[from] crate::expressions::single_row_transform::Error),
 }
