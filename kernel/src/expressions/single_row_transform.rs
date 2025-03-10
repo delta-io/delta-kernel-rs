@@ -64,12 +64,6 @@ impl<'a, I: Iterator<Item = &'a Scalar>> SingleRowTransform<'a, I> {
         }
 
         match self.stack.pop() {
-            // Some(array) if self.stack.is_empty() => match array.data_type() {
-            //     ArrowDataType::Struct(_) => Ok(array),
-            //     _ => Err(Error::Schema("Expected struct array".to_string())),
-            // },
-            // Some(_) => Err(Error::ExcessScalars),
-            // None => Err(Error::EmptyStack),
             Some(array) => Ok(array),
             None => Err(Error::EmptyStack),
         }
@@ -155,6 +149,12 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for SingleRowTransf
         // the struct itself as being NULL
         let struct_expr = if all_null && found_non_nullable_null {
             Expression::null_literal(struct_type.clone().into())
+        } else if found_non_nullable_null {
+            // we found a non_nullable NULL, but other siblings are non-null: error
+            self.set_error(Error::Schema(
+                "NULL value for non-nullable struct field with non-NULL siblings".to_string(),
+            ));
+            return None;
         } else {
             Expression::struct_from(field_exprs)
         };
@@ -222,7 +222,8 @@ mod tests {
         match expected {
             Ok(expected_expr) => {
                 let actual_expr = schema_transform.into_expr().unwrap();
-                // FIXME
+                // TODO: we can't compare NULLs so we convert with .to_string to workaround
+                // see: https://github.com/delta-io/delta-kernel-rs/pull/677
                 assert_eq!(expected_expr.to_string(), actual_expr.to_string());
             }
             Err(()) => {
@@ -246,9 +247,8 @@ mod tests {
             "col_1",
             DeltaDataTypes::INTEGER,
         )]));
-        let expected = Expression::struct_from(vec![Expression::null_literal(
-            DeltaDataTypes::INTEGER.into(),
-        )]);
+        let expected =
+            Expression::struct_from(vec![Expression::null_literal(DeltaDataTypes::INTEGER)]);
         assert_single_row_transform(values, schema, Ok(expected));
     }
 
@@ -454,83 +454,83 @@ mod tests {
         }
     }
 
-    //     // Group 2: nullable { nullable, not_null }
-    //     //  1. (a, b) -> x (a, b)
-    //     //  2. (N, b) -> x (N, b)
-    //     //  3. (a, N) -> Err
-    //     //  4. (N, N) -> x NULL
-    //     test_nullability_combinations! {
-    //         name = test_nullable_nullable_not_null,
-    //         schema = { x: nullable, a: nullable, b: not_null },
-    //         tests = {
-    //             (a, b) -> Noop,
-    //             (N, b) -> Noop,
-    //             (a, N) -> Error,
-    //             (N, N) -> NullStruct,
-    //         }
-    //     }
-    //
-    //     // Group 3: nullable { not_null, not_null }
-    //     //  1. (a, b) -> x (a, b)
-    //     //  2. (N, b) -> Err
-    //     //  3. (a, N) -> Err
-    //     //  4. (N, N) -> x NULL
-    //     test_nullability_combinations! {
-    //         name = test_nullable_not_null_not_null,
-    //         schema = { x: nullable, a: not_null, b: not_null },
-    //         tests = {
-    //             (a, b) -> Noop,
-    //             (N, b) -> Error,
-    //             (a, N) -> Error,
-    //             (N, N) -> NullStruct,
-    //         }
-    //     }
-    //
-    //     // Group 4: not_null { nullable, nullable }
-    //     //  1. (a, b) -> x (a, b)
-    //     //  2. (N, b) -> x (N, b)
-    //     //  3. (a, N) -> x (a, N)
-    //     //  4. (N, N) -> x (N, N)
-    //     test_nullability_combinations! {
-    //         name = test_not_null_nullable_nullable,
-    //         schema = { x: not_null, a: nullable, b: nullable },
-    //         tests = {
-    //             (a, b) -> Noop,
-    //             (N, b) -> Noop,
-    //             (a, N) -> Noop,
-    //             (N, N) -> Noop,
-    //         }
-    //     }
-    //
-    //     // Group 5: not_null { nullable, not_null }
-    //     //  1. (a, b) -> x (a, b)
-    //     //  2. (N, b) -> x (N, b)
-    //     //  3. (a, N) -> Err
-    //     //  4. (N, N) -> NULL
-    //     test_nullability_combinations! {
-    //         name = test_not_null_nullable_not_null,
-    //         schema = { x: not_null, a: nullable, b: not_null },
-    //         tests = {
-    //             (a, b) -> Noop,
-    //             (N, b) -> Noop,
-    //             (a, N) -> Error,
-    //             (N, N) -> Null,
-    //         }
-    //     }
-    //
-    //     // Group 6: not_null { not_null, not_null }
-    //     //  1. (a, b) -> x (a, b)
-    //     //  2. (N, b) -> Err
-    //     //  3. (a, N) -> Err
-    //     //  4. (N, N) -> NULL
-    //     test_nullability_combinations! {
-    //         name = test_all_not_null,
-    //         schema = { x: not_null, a: not_null, b: not_null },
-    //         tests = {
-    //             (a, b) -> Noop,
-    //             (N, b) -> Error,
-    //             (a, N) -> Error,
-    //             (N, N) -> Null,
-    //         }
-    //     }
+    // Group 2: nullable { nullable, not_null }
+    //  1. (a, b) -> x (a, b)
+    //  2. (N, b) -> x (N, b)
+    //  3. (a, N) -> Err
+    //  4. (N, N) -> x NULL
+    test_nullability_combinations! {
+        name = test_nullable_nullable_not_null,
+        schema = { x: nullable, a: nullable, b: not_null },
+        tests = {
+            (a, b) -> Noop,
+            (N, b) -> Noop,
+            (a, N) -> Error,
+            (N, N) -> NullStruct,
+        }
+    }
+
+    // Group 3: nullable { not_null, not_null }
+    //  1. (a, b) -> x (a, b)
+    //  2. (N, b) -> Err
+    //  3. (a, N) -> Err
+    //  4. (N, N) -> x NULL
+    test_nullability_combinations! {
+        name = test_nullable_not_null_not_null,
+        schema = { x: nullable, a: not_null, b: not_null },
+        tests = {
+            (a, b) -> Noop,
+            (N, b) -> Error,
+            (a, N) -> Error,
+            (N, N) -> NullStruct,
+        }
+    }
+
+    // Group 4: not_null { nullable, nullable }
+    //  1. (a, b) -> x (a, b)
+    //  2. (N, b) -> x (N, b)
+    //  3. (a, N) -> x (a, N)
+    //  4. (N, N) -> x (N, N)
+    test_nullability_combinations! {
+        name = test_not_null_nullable_nullable,
+        schema = { x: not_null, a: nullable, b: nullable },
+        tests = {
+            (a, b) -> Noop,
+            (N, b) -> Noop,
+            (a, N) -> Noop,
+            (N, N) -> Noop,
+        }
+    }
+
+    // Group 5: not_null { nullable, not_null }
+    //  1. (a, b) -> x (a, b)
+    //  2. (N, b) -> x (N, b)
+    //  3. (a, N) -> Err
+    //  4. (N, N) -> NULL
+    test_nullability_combinations! {
+        name = test_not_null_nullable_not_null,
+        schema = { x: not_null, a: nullable, b: not_null },
+        tests = {
+            (a, b) -> Noop,
+            (N, b) -> Noop,
+            (a, N) -> Error,
+            (N, N) -> Null,
+        }
+    }
+
+    // Group 6: not_null { not_null, not_null }
+    //  1. (a, b) -> x (a, b)
+    //  2. (N, b) -> Err
+    //  3. (a, N) -> Err
+    //  4. (N, N) -> NULL
+    test_nullability_combinations! {
+        name = test_all_not_null,
+        schema = { x: not_null, a: not_null, b: not_null },
+        tests = {
+            (a, b) -> Noop,
+            (N, b) -> Error,
+            (a, N) -> Error,
+            (N, N) -> Null,
+        }
+    }
 }
