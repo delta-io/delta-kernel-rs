@@ -364,14 +364,18 @@ fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<RecordBatch
         ));
     };
     let applied = apply_schema_to_struct(array, struct_schema)?;
-    // arrow just panics if we attempt to convery a StructArray to a RecordBatch with top-level
-    // nulls, so we check for that and just error if that's the case here
-    if applied.null_count() > 0 {
-        return Err(Error::invalid_struct_data(
-            "Top-level nulls in struct are not supported",
-        ));
+    let (fields, columns, nulls) = applied.into_parts();
+    if let Some(nulls) = nulls {
+        if nulls.null_count() != 0 {
+            return Err(Error::invalid_struct_data(
+                "Top-level nulls in struct are not supported",
+            ));
+        }
     }
-    Ok(applied.into())
+    Ok(RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(fields)),
+        columns,
+    )?)
 }
 
 // helper to transform an arrow field+col into the specified target type. If `rename` is specified
