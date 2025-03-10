@@ -7,7 +7,7 @@ use crate::schema::{
 };
 
 /// [`SchemaTransform`] that will transform a [`Schema`] and an ordered list of leaf values (as
-/// Scalar slice) into an arrow Array with a single row of each literal.
+/// Scalar slice) into an Expression with a literal value for each leaf.
 #[derive(Debug)]
 pub(crate) struct SingleRowTransform<'a, T: Iterator<Item = &'a Scalar>> {
     /// Leaf-node values to insert in schema order.
@@ -22,10 +22,6 @@ pub(crate) struct SingleRowTransform<'a, T: Iterator<Item = &'a Scalar>> {
 /// Any error for the single-row array transform.
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    /// An error performing operations on arrow data
-    #[error(transparent)]
-    Arrow(#[from] crate::arrow::error::ArrowError),
-
     /// Schema mismatch error
     #[error("Schema error: {0}")]
     Schema(String),
