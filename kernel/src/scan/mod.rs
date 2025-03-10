@@ -473,7 +473,6 @@ impl Scan {
             _: Option<Stats>,
             dv_info: DvInfo,
             transform: Option<ExpressionRef>,
-            _: HashMap<String, String>,
         ) {
             batches.push(ScanFile {
                 path: path.to_string(),

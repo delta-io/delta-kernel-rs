@@ -262,7 +262,6 @@ type CScanCallback = extern "C" fn(
     stats: Option<&Stats>,
     dv_info: &DvInfo,
     transform: Option<&Expression>,
-    partition_map: &CStringMap,
 );
 
 #[derive(Default)]
@@ -423,12 +422,8 @@ fn rust_callback(
     kernel_stats: Option<delta_kernel::scan::state::Stats>,
     dv_info: DvInfo,
     transform: Option<ExpressionRef>,
-    partition_values: HashMap<String, String>,
 ) {
     let transform = transform.map(|e| e.as_ref().clone());
-    let partition_map = CStringMap {
-        values: partition_values,
-    };
     let stats = kernel_stats.map(|ks| Stats {
         num_records: ks.num_records,
     });
@@ -439,7 +434,6 @@ fn rust_callback(
         stats.as_ref(),
         &dv_info,
         transform.as_ref(),
-        &partition_map,
     );
 }
 

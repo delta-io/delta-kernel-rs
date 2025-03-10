@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use std::time::SystemTime;
 
 use crate::actions::deletion_vector::deletion_treemap_to_bools;
 use crate::scan::get_transform_for_row;
@@ -14,6 +15,7 @@ use crate::{
     schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef},
     DeltaResult, Engine, EngineData, Error,
 };
+use chrono::{NaiveTime, Utc};
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -128,7 +130,6 @@ pub type ScanCallback<T> = fn(
     stats: Option<Stats>,
     dv_info: DvInfo,
     transform: Option<ExpressionRef>,
-    partition_values: HashMap<String, String>,
 );
 
 /// Request that the kernel call a callback on each valid file that needs to be read for the
@@ -174,7 +175,14 @@ pub fn visit_scan_files<T>(
         transforms,
         context,
     };
+    //let start_time: NaiveTime = Utc::now().time();
     visitor.visit_rows_of(data)?;
+    //let end_time: NaiveTime = Utc::now().time();
+    //println!(
+    //    "time to visit {} rows : {:?}",
+    //    data.len(),
+    //    (end_time - start_time).num_milliseconds()
+    //);
     Ok(visitor.context)
 }
 
@@ -222,8 +230,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                     .ok_or_else(|| Error::missing_column("deletionVector"))?;
                 let deletion_vector = visit_deletion_vector_at(row_index, &getters[dv_index..])?;
                 let dv_info = DvInfo { deletion_vector };
-                let partition_values =
-                    getters[9].get(row_index, "scanFile.fileConstantValues.partitionValues")?;
+                //getters[9].get(row_index, "scanFile.fileConstantValues.partitionValues")?;
                 (self.callback)(
                     &mut self.context,
                     path,
@@ -231,7 +238,6 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                     stats,
                     dv_info,
                     get_transform_for_row(row_index, self.transforms),
-                    partition_values,
                 )
             }
         }
