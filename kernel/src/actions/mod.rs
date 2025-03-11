@@ -888,12 +888,13 @@ mod tests {
 
     #[test]
     fn test_ensure_write_supported() {
-        let protocol = Protocol {
-            min_reader_version: 3,
-            min_writer_version: 7,
-            reader_features: Some(vec![]),
-            writer_features: Some(vec![]),
-        };
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some(vec![WriterFeatures::AppendOnly]),
+        )
+        .unwrap();
         assert!(protocol.ensure_write_supported().is_ok());
 
         let protocol = Protocol::try_new(
