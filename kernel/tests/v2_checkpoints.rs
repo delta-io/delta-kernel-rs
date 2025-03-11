@@ -70,6 +70,7 @@ fn generate_sidecar_expected_data() -> Vec<String> {
     .collect_vec()
 }
 
+// Rustfmt is disabled to maintain the readability of the expected table
 #[rustfmt::skip]
 fn get_simple_id_table() -> Vec<String> {
     to_string_vec(vec![
@@ -90,6 +91,7 @@ fn get_simple_id_table() -> Vec<String> {
     ])
 }
 
+// Rustfmt is disabled to maintain the readability of the expected table
 #[rustfmt::skip]
 fn get_classic_checkpoint_table() -> Vec<String> {
     to_string_vec(vec![
@@ -120,6 +122,7 @@ fn get_classic_checkpoint_table() -> Vec<String> {
     ])
 }
 
+// Rustfmt is disabled to maintain the readability of the expected table
 #[rustfmt::skip]
 fn get_without_sidecars_table() -> Vec<String> {
     to_string_vec(vec![
