@@ -96,7 +96,7 @@ pub struct EngineExpressionVisitor {
     pub visit_literal_decimal: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
-        value_ms: u64,
+        value_ms: i64,
         value_ls: u64,
         precision: u8,
         scale: u8,
@@ -188,6 +188,29 @@ pub struct EngineExpressionVisitor {
 #[no_mangle]
 pub unsafe extern "C" fn visit_expression(
     expression: &Handle<SharedExpression>,
+    visitor: &mut EngineExpressionVisitor,
+) -> usize {
+    visit_expression_internal(expression.as_ref(), visitor)
+}
+
+/// Visit the expression of the passed [`Expression`] pointer using the provided `visitor`.  See the
+/// documentation of [`EngineExpressionVisitor`] for a description of how this visitor works.
+///
+/// This method returns the id that the engine generated for the top level expression
+///
+/// # Safety
+///
+/// The caller must pass a valid Expression pointer and expression visitor
+#[no_mangle]
+pub unsafe extern "C" fn visit_expression_ref(
+    expression: &Expression,
+    visitor: &mut EngineExpressionVisitor,
+) -> usize {
+    visit_expression_internal(expression, visitor)
+}
+
+pub fn visit_expression_internal(
+    expression: &Expression,
     visitor: &mut EngineExpressionVisitor,
 ) -> usize {
     macro_rules! call {
@@ -295,14 +318,12 @@ pub unsafe extern "C" fn visit_expression(
                 buf.len()
             ),
             Scalar::Decimal(value, precision, scale) => {
-                let ms: u64 = (value >> 64) as u64;
-                let ls: u64 = *value as u64;
                 call!(
                     visitor,
                     visit_literal_decimal,
                     sibling_list_id,
-                    ms,
-                    ls,
+                    (value >> 64) as i64,
+                    *value as u64,
                     *precision,
                     *scale
                 )
@@ -367,6 +388,6 @@ pub unsafe extern "C" fn visit_expression(
         }
     }
     let top_level = call!(visitor, make_field_list, 1);
-    visit_expression_impl(visitor, expression.as_ref(), top_level);
+    visit_expression_impl(visitor, expression, top_level);
     top_level
 }

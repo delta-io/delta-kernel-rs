@@ -3,24 +3,26 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_arith::boolean::{and_kleene, is_null, not, or_kleene};
-use arrow_arith::numeric::{add, div, mul, sub};
-use arrow_array::cast::AsArray;
-use arrow_array::{types::*, MapArray};
-use arrow_array::{
+use crate::arrow::array::AsArray;
+use crate::arrow::array::{types::*, MapArray};
+use crate::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum, Decimal128Array, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, RecordBatch,
     StringArray, StructArray, TimestampMicrosecondArray,
 };
-use arrow_buffer::OffsetBuffer;
-use arrow_ord::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq};
-use arrow_ord::comparison::in_list_utf8;
-use arrow_schema::{
-    ArrowError, DataType as ArrowDataType, Field as ArrowField, Fields, IntervalUnit,
-    Schema as ArrowSchema, TimeUnit,
+use crate::arrow::buffer::OffsetBuffer;
+use crate::arrow::compute::concat;
+use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq};
+use crate::arrow::compute::kernels::comparison::in_list_utf8;
+use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
+use crate::arrow::compute::{and_kleene, is_null, not, or_kleene};
+use crate::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Fields, IntervalUnit, Schema as ArrowSchema,
+    TimeUnit,
 };
-use arrow_select::concat::concat;
+use crate::arrow::error::ArrowError;
 use itertools::Itertools;
+use tracing::debug;
 
 use super::arrow_conversion::LIST_ARRAY_ROOT;
 use super::arrow_utils::make_arrow_error;
@@ -537,6 +539,10 @@ pub struct DefaultExpressionEvaluator {
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+        debug!(
+            "Arrow evaluator evaluating: {:#?}",
+            self.expression.as_ref()
+        );
         let batch = batch
             .any_ref()
             .downcast_ref::<ArrowEngineData>()
@@ -568,9 +574,9 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
 mod tests {
     use std::ops::{Add, Div, Mul, Sub};
 
-    use arrow_array::{GenericStringArray, Int32Array};
-    use arrow_buffer::ScalarBuffer;
-    use arrow_schema::{DataType, Field, Fields, Schema};
+    use crate::arrow::array::{GenericStringArray, Int32Array};
+    use crate::arrow::buffer::ScalarBuffer;
+    use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
 
     use super::*;
     use crate::expressions::*;

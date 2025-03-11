@@ -323,6 +323,7 @@ pub(crate) fn scan_action_iter(
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
+    use crate::actions::get_log_schema;
     use crate::expressions::{column_name, Scalar};
     use crate::scan::state::{DvInfo, Stats};
     use crate::scan::test_utils::{
@@ -364,7 +365,7 @@ mod tests {
     #[test]
     fn test_scan_action_iter() {
         run_with_validate_callback(
-            vec![add_batch_simple()],
+            vec![add_batch_simple(get_log_schema().clone())],
             None, // not testing schema
             None, // not testing transform
             &[true, false],
@@ -376,7 +377,7 @@ mod tests {
     #[test]
     fn test_scan_action_iter_with_remove() {
         run_with_validate_callback(
-            vec![add_batch_with_remove()],
+            vec![add_batch_with_remove(get_log_schema().clone())],
             None, // not testing schema
             None, // not testing transform
             &[false, false, true, false],
@@ -387,7 +388,7 @@ mod tests {
 
     #[test]
     fn test_no_transforms() {
-        let batch = vec![add_batch_simple()];
+        let batch = vec![add_batch_simple(get_log_schema().clone())];
         let logical_schema = Arc::new(crate::schema::StructType::new(vec![]));
         let iter = scan_action_iter(
             &SyncEngine::new(),

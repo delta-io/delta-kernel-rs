@@ -3,23 +3,23 @@
 //! Data (golden tables) are stored in tests/golden_data/<table_name>.tar.zst
 //! Each table directory has a table/ and expected/ subdirectory with the input/output respectively
 
-use arrow::array::AsArray;
-use arrow::{compute::filter_record_batch, record_batch::RecordBatch};
-use arrow_ord::sort::{lexsort_to_indices, SortColumn};
-use arrow_schema::{FieldRef, Schema};
-use arrow_select::{concat::concat_batches, take::take};
+use delta_kernel::arrow::array::{Array, AsArray, StructArray};
+use delta_kernel::arrow::compute::{concat_batches, take};
+use delta_kernel::arrow::compute::{lexsort_to_indices, SortColumn};
+use delta_kernel::arrow::datatypes::{DataType, FieldRef, Schema};
+use delta_kernel::arrow::{compute::filter_record_batch, record_batch::RecordBatch};
 use itertools::Itertools;
 use paste::paste;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use delta_kernel::parquet::arrow::async_reader::{
+    ParquetObjectReader, ParquetRecordBatchStreamBuilder,
+};
 use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Table};
 use futures::{stream::TryStreamExt, StreamExt};
 use object_store::{local::LocalFileSystem, ObjectStore};
-use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 
-use arrow_array::{Array, StructArray};
-use arrow_schema::DataType;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 
@@ -408,9 +408,8 @@ golden_test!("time-travel-schema-changes-b", latest_snapshot_test);
 golden_test!("time-travel-start", latest_snapshot_test);
 golden_test!("time-travel-start-start20", latest_snapshot_test);
 golden_test!("time-travel-start-start20-start40", latest_snapshot_test);
-
-skip_test!("v2-checkpoint-json": "v2 checkpoint not supported");
-skip_test!("v2-checkpoint-parquet": "v2 checkpoint not supported");
+golden_test!("v2-checkpoint-json", latest_snapshot_test);
+golden_test!("v2-checkpoint-parquet", latest_snapshot_test);
 
 // BUG:
 // - AddFile: 'file:/some/unqualified/absolute/path'

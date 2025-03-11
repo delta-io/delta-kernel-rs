@@ -87,7 +87,8 @@ struct BinaryData {
   uintptr_t len;
 };
 struct Decimal {
-  uint64_t value[2];
+  int64_t hi;
+  uint64_t lo;
   uint8_t precision;
   uint8_t scale;
 };
@@ -202,15 +203,15 @@ void visit_expr_string_literal(void* data, uintptr_t sibling_list_id, KernelStri
 }
 void visit_expr_decimal_literal(void* data,
                                 uintptr_t sibling_list_id,
-                                uint64_t value_ms,
+                                int64_t value_ms,
                                 uint64_t value_ls,
                                 uint8_t precision,
                                 uint8_t scale) {
   struct Literal* literal = malloc(sizeof(struct Literal));
   literal->type = Decimal;
   struct Decimal* dec = &literal->value.decimal;
-  dec->value[0] = value_ms;
-  dec->value[1] = value_ls;
+  dec->hi = value_ms;
+  dec->lo = value_ls;
   dec->precision = precision;
   dec->scale = scale;
   put_expr_item(data, sibling_list_id, literal, Literal);

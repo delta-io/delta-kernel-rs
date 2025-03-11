@@ -2,10 +2,11 @@
 
 use std::sync::Arc;
 
-use arrow_schema::{
-    ArrowError, DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+use crate::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
+use crate::arrow::error::ArrowError;
 use itertools::Itertools;
 
 use crate::error::Error;

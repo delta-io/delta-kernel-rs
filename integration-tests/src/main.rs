@@ -1,15 +1,16 @@
-fn create_arrow_schema() -> arrow::datatypes::Schema {
-    use arrow::datatypes::{DataType, Field, Schema};
+use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
+
+fn create_arrow_schema() -> Schema {
     let field_a = Field::new("a", DataType::Int64, false);
     let field_b = Field::new("b", DataType::Boolean, false);
     Schema::new(vec![field_a, field_b])
 }
 
 fn create_kernel_schema() -> delta_kernel::schema::Schema {
-    use delta_kernel::schema::{DataType, Schema, StructField};
+    use delta_kernel::schema::{DataType, StructField};
     let field_a = StructField::not_null("a", DataType::LONG);
     let field_b = StructField::not_null("b", DataType::BOOLEAN);
-    Schema::new(vec![field_a, field_b])
+    delta_kernel::schema::Schema::new(vec![field_a, field_b])
 }
 
 fn main() {

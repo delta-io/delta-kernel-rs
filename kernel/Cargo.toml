@@ -30,13 +30,15 @@ pre-release-hook = [
   "--unreleased",
   "--prepend",
   "../CHANGELOG.md",
+  "--include-path",
+  "*",
   "--tag",
   "{{version}}",
 ]
 
 [dependencies]
 bytes = "1.7"
-chrono = { version = "0.4" }
+chrono = "=0.4.39"
 fix-hidden-lifetime-bug = "0.2"
 indexmap = "2.5.0"
 itertools = "0.13"
@@ -51,27 +53,29 @@ uuid = "1.10.0"
 z85 = "3.0.5"
 
 # bring in our derive macros
-delta_kernel_derive = { path = "../derive-macros", version = "0.6.1" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.8.0" }
 
 # used for developer-visibility
 visibility = "0.1.1"
 
 # Used in the sync engine
 tempfile = { version = "3", optional = true }
+
+# Arrow supported versions
+## 53
 # Used in default engine
-arrow-buffer = { workspace = true, optional = true }
-arrow-array = { workspace = true, optional = true, features = ["chrono-tz"] }
-arrow-select = { workspace = true, optional = true }
-arrow-arith = { workspace = true, optional = true }
-arrow-cast = { workspace = true, optional = true }
-arrow-json = { workspace = true, optional = true }
-arrow-ord = { workspace = true, optional = true }
-arrow-schema = { workspace = true, optional = true }
+arrow_53 = { package = "arrow", version = "53", features = ["chrono-tz", "ffi", "json", "prettyprint"], optional = true }
+# Used in default and sync engine
+parquet_53 = { package = "parquet", version = "53", features = ["async", "object_store"] , optional = true }
+######
+## 54
+arrow_54 = { package = "arrow", version = "54", features = ["chrono-tz", "ffi", "json", "prettyprint"], optional = true }
+parquet_54 = { package = "parquet", version = "54", features = ["async", "object_store"] , optional = true }
+######
+
 futures = { version = "0.3", optional = true }
 object_store = { workspace = true, optional = true }
 hdfs-native-object-store = { workspace = true, optional = true }
-# Used in default and sync engine
-parquet = { workspace = true, optional = true }
 # Used for fetching direct urls (like pre-signed urls)
 reqwest = { version = "0.12.8", default-features = false, optional = true }
 strum = { version = "0.26", features = ["derive"] }
@@ -85,14 +89,17 @@ hdfs-native = { workspace = true, optional = true }
 walkdir = { workspace = true, optional = true }
 
 [features]
-arrow-conversion = ["arrow-schema"]
-arrow-expression = [
-  "arrow-arith",
-  "arrow-array",
-  "arrow-buffer",
-  "arrow-ord",
-  "arrow-schema",
-]
+# The default version to be expected
+arrow = ["arrow_53"]
+
+arrow_53 = ["dep:arrow_53", "dep:parquet_53"]
+
+arrow_54 = ["dep:arrow_54", "dep:parquet_54"]
+
+need_arrow = []
+arrow-conversion = ["need_arrow"]
+arrow-expression = ["need_arrow"]
+
 cloud = [
   "object_store/aws",
   "object_store/azure",
@@ -107,16 +114,9 @@ default = []
 default-engine-base = [
   "arrow-conversion",
   "arrow-expression",
-  "arrow-array",
-  "arrow-buffer",
-  "arrow-cast",
-  "arrow-json",
-  "arrow-schema",
-  "arrow-select",
   "futures",
+  "need_arrow",
   "object_store",
-  "parquet/async",
-  "parquet/object_store",
   "tokio",
   "uuid/v4",
   "uuid/fast-rng",
@@ -134,13 +134,7 @@ default-engine-rustls = [
 
 developer-visibility = []
 sync-engine = [
-  "arrow-cast",
-  "arrow-conversion",
-  "arrow-expression",
-  "arrow-array",
-  "arrow-json",
-  "arrow-select",
-  "parquet",
+  "need_arrow",
   "tempfile",
 ]
 integration-test = [
@@ -156,9 +150,9 @@ version = "=0.5.9"
 rustc_version = "0.4.1"
 
 [dev-dependencies]
-arrow = { workspace = true, features = ["json", "prettyprint"] }
-delta_kernel = { path = ".", features = ["default-engine", "sync-engine"] }
+delta_kernel = { path = ".", features = ["arrow", "default-engine", "sync-engine"] }
 test_utils = { path = "../test-utils" }
+async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implementation
 paste = "1.0"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 tempfile = "3"

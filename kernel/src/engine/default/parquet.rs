@@ -4,21 +4,21 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use arrow_array::{BooleanArray, Int64Array, RecordBatch, StringArray};
+use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
+use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
+use crate::parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
+use crate::parquet::arrow::arrow_writer::ArrowWriter;
+use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::DynObjectStore;
-use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
-};
-use parquet::arrow::arrow_writer::ArrowWriter;
-use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::{generate_mask, get_requested_indices, reorder_struct_array};
+use crate::engine::arrow_utils::{fixup_parquet_read, generate_mask, get_requested_indices};
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
@@ -281,12 +281,7 @@ impl FileOpener for ParquetOpener {
 
             let stream = builder.with_batch_size(batch_size).build()?;
 
-            let stream = stream.map(move |rbr| {
-                // re-order each batch if needed
-                rbr.map_err(Error::Parquet).and_then(|rb| {
-                    reorder_struct_array(rb.into(), &requested_ordering).map(Into::into)
-                })
-            });
+            let stream = stream.map(move |rbr| fixup_parquet_read(rbr?, &requested_ordering));
             Ok(stream.boxed())
         }))
     }
@@ -355,12 +350,7 @@ impl FileOpener for PresignedUrlOpener {
             let reader = builder.with_batch_size(batch_size).build()?;
 
             let stream = futures::stream::iter(reader);
-            let stream = stream.map(move |rbr| {
-                // re-order each batch if needed
-                rbr.map_err(Error::Arrow).and_then(|rb| {
-                    reorder_struct_array(rb.into(), &requested_ordering).map(Into::into)
-                })
-            });
+            let stream = stream.map(move |rbr| fixup_parquet_read(rbr?, &requested_ordering));
             Ok(stream.boxed())
         }))
     }
@@ -371,8 +361,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use arrow_array::array::Array;
-    use arrow_array::RecordBatch;
+    use crate::arrow::array::{Array, RecordBatch};
     use object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
     use url::Url;
 

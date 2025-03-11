@@ -1,5 +1,9 @@
 //! EngineData related ffi code
 
+use delta_kernel::arrow::array::{
+    ffi::{FFI_ArrowArray, FFI_ArrowSchema},
+    ArrayData, StructArray,
+};
 use delta_kernel::{DeltaResult, EngineData};
 use std::ffi::c_void;
 
@@ -45,8 +49,8 @@ unsafe fn get_raw_engine_data_impl(data: &mut Handle<ExclusiveEngineData>) -> &m
 #[cfg(feature = "default-engine")]
 #[repr(C)]
 pub struct ArrowFFIData {
-    pub array: arrow_data::ffi::FFI_ArrowArray,
-    pub schema: arrow_schema::ffi::FFI_ArrowSchema,
+    pub array: FFI_ArrowArray,
+    pub schema: FFI_ArrowSchema,
 }
 
 // TODO: This should use a callback to avoid having to have the engine free the struct
@@ -71,16 +75,16 @@ pub unsafe extern "C" fn get_raw_arrow_data(
 // TODO: This method leaks the returned pointer memory. How will the engine free it?
 #[cfg(feature = "default-engine")]
 fn get_raw_arrow_data_impl(data: Box<dyn EngineData>) -> DeltaResult<*mut ArrowFFIData> {
-    let record_batch: arrow_array::RecordBatch = data
+    let record_batch: delta_kernel::arrow::array::RecordBatch = data
         .into_any()
         .downcast::<delta_kernel::engine::arrow_data::ArrowEngineData>()
         .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
         .into();
-    let sa: arrow_array::StructArray = record_batch.into();
-    let array_data: arrow_data::ArrayData = sa.into();
+    let sa: StructArray = record_batch.into();
+    let array_data: ArrayData = sa.into();
     // these call `clone`. is there a way to not copy anything and what exactly are they cloning?
-    let array = arrow_data::ffi::FFI_ArrowArray::new(&array_data);
-    let schema = arrow_schema::ffi::FFI_ArrowSchema::try_from(array_data.data_type())?;
+    let array = FFI_ArrowArray::new(&array_data);
+    let schema = FFI_ArrowSchema::try_from(array_data.data_type())?;
     let ret_data = Box::new(ArrowFFIData { array, schema });
     Ok(Box::leak(ret_data))
 }

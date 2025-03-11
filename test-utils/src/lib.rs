@@ -2,19 +2,24 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
-use arrow_schema::ArrowError;
+use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
+use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::EngineData;
 use itertools::Itertools;
 use object_store::{path::Path, ObjectStore};
-use parquet::arrow::arrow_writer::ArrowWriter;
-use parquet::file::properties::WriterProperties;
 
 /// A common useful initial metadata and protocol. Also includes a single commitInfo
 pub const METADATA: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
 {"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
 {"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+
+/// A common useful initial metadata and protocol. Also includes a single commitInfo
+pub const METADATA_WITH_PARTITION_COLS: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
+{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
+{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["val"],"configuration":{},"createdTime":1587968585495}}"#;
 
 pub enum TestAction {
     Add(String),
@@ -22,24 +27,43 @@ pub enum TestAction {
     Metadata,
 }
 
-/// Convert a vector of actions into a newline delimited json string
+// TODO: We need a better way to mock tables :)
+
+/// Convert a vector of actions into a newline delimited json string, with standard metadata
 pub fn actions_to_string(actions: Vec<TestAction>) -> String {
+    actions_to_string_with_metadata(actions, METADATA)
+}
+
+/// Convert a vector of actions into a newline delimited json string, with metadata including a partition column
+pub fn actions_to_string_partitioned(actions: Vec<TestAction>) -> String {
+    actions_to_string_with_metadata(actions, METADATA_WITH_PARTITION_COLS)
+}
+
+fn actions_to_string_with_metadata(actions: Vec<TestAction>, metadata: &str) -> String {
     actions
-            .into_iter()
-            .map(|test_action| match test_action {
-                TestAction::Add(path) => format!(r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 1}},\"maxValues\":{{\"id\":3}}}}"}}}}"#),
-                TestAction::Remove(path) => format!(r#"{{"remove":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true}}}}"#),
-                TestAction::Metadata => METADATA.into(),
-            })
-            .join("\n")
+        .into_iter()
+        .map(|test_action| match test_action {
+            TestAction::Add(path) => format!(r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 1}},\"maxValues\":{{\"id\":3}}}}"}}}}"#),
+            TestAction::Remove(path) => format!(r#"{{"remove":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true}}}}"#),
+            TestAction::Metadata => metadata.into(),
+        })
+        .join("\n")
 }
 
 /// convert a RecordBatch into a vector of bytes. We can't use `From` since these are both foreign
 /// types
 pub fn record_batch_to_bytes(batch: &RecordBatch) -> Vec<u8> {
-    let mut data: Vec<u8> = Vec::new();
     let props = WriterProperties::builder().build();
-    let mut writer = ArrowWriter::try_new(&mut data, batch.schema(), Some(props)).unwrap();
+    record_batch_to_bytes_with_props(batch, props)
+}
+
+pub fn record_batch_to_bytes_with_props(
+    batch: &RecordBatch,
+    writer_properties: WriterProperties,
+) -> Vec<u8> {
+    let mut data: Vec<u8> = Vec::new();
+    let mut writer =
+        ArrowWriter::try_new(&mut data, batch.schema(), Some(writer_properties)).unwrap();
     writer.write(batch).expect("Writing batch");
     // writer must be closed to write footer
     writer.close().unwrap();
