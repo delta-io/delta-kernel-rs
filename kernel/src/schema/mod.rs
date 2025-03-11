@@ -1053,9 +1053,6 @@ mod tests {
         let id_start = field
             .get_metadata_value(&ColumnMetadataKey::IdentityStart)
             .unwrap();
-        let id_start = field
-            .get_metadata_value(&ColumnMetadataKey::IdentityStart)
-            .unwrap();
         assert!(matches!(col_id, MetadataValue::Number(num) if *num == 4));
         assert!(matches!(id_start, MetadataValue::Number(num) if *num == 2147483648i64));
         assert_eq!(
