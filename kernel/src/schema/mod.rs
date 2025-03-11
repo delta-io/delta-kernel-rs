@@ -1040,15 +1040,18 @@ mod tests {
             "metadata": {
                 "delta.columnMapping.id": 4,
                 "delta.columnMapping.physicalName": "col-5f422f40-de70-45b2-88ab-1d5c90e94db1",
-                "delta.identity.start": 2147483648 
+                "delta.identity.start": 2147483648
             }
         }
         "#;
-        
+
         let field: StructField = serde_json::from_str(data).unwrap();
 
         let col_id = field
             .get_metadata_value(&ColumnMetadataKey::ColumnMappingId)
+            .unwrap();
+        let id_start = field
+            .get_metadata_value(&ColumnMetadataKey::IdentityStart)
             .unwrap();
         let id_start = field.get_metadata_value(&ColumnMetadataKey::IdentityStart).unwrap();
         assert!(matches!(col_id, MetadataValue::Number(num) if *num == 4));
