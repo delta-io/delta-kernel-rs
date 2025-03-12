@@ -406,7 +406,7 @@ impl Scan {
         // for other transforms as we support them)
         let static_transform = (self.have_partition_cols
             || self.snapshot.column_mapping_mode() != ColumnMappingMode::None)
-            .then_some(Arc::new(Scan::get_static_transform(&self.all_fields)));
+            .then(|| Arc::new(Scan::get_static_transform(&self.all_fields)));
         let physical_predicate = match self.physical_predicate.clone() {
             PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),
             PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
