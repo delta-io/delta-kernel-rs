@@ -540,18 +540,20 @@ impl ExpressionHandler for ArrowExpressionHandler {
         })
     }
 
-    /// Create a single-row int array with a null value.
-    fn null_row(&self) -> DeltaResult<(Box<dyn EngineData>, SchemaRef)> {
-        use crate::schema::StructType;
-        let output_schema = Arc::new(StructType::new(vec![StructField::new(
-            "output",
-            DataType::INTEGER,
-            true,
-        )]));
-        let array = Scalar::Null(DataType::INTEGER).to_array(1)?;
+    /// Create a single-row array with all-null leaf values. Note that if a nested struct is
+    /// included in the `output_type`, the entire struct will be NULL (instead of a not-null struct
+    /// with NULL fields).
+    fn null_row(&self, output_type: SchemaRef) -> DeltaResult<Box<dyn EngineData>> {
+        let fields = output_type.fields();
+        let arrays = fields
+            .map(|field| {
+                let data_type = field.data_type();
+                Scalar::Null(data_type.clone()).to_array(1)
+            })
+            .try_collect()?;
         let record_batch =
-            RecordBatch::try_new(Arc::new(output_schema.as_ref().try_into()?), vec![array])?;
-        Ok((Box::new(ArrowEngineData::new(record_batch)), output_schema))
+            RecordBatch::try_new(Arc::new(output_type.as_ref().try_into()?), arrays)?;
+        Ok(Box::new(ArrowEngineData::new(record_batch)))
     }
 }
 
@@ -897,6 +899,54 @@ mod tests {
                 .unwrap();
         let expected = Arc::new(BooleanArray::from(vec![true, false]));
         assert_eq!(results.as_ref(), expected.as_ref());
+    }
+
+    #[test]
+    fn test_null_row() {
+        // note that we _allow_ nested nulls, since the top-level struct can be NULL
+        let schema = Arc::new(StructType::new(vec![
+            StructField::nullable(
+                "x",
+                StructType::new([
+                    StructField::nullable("a", crate::schema::DataType::INTEGER),
+                    StructField::not_null("b", crate::schema::DataType::STRING),
+                ]),
+            ),
+            StructField::nullable("c", crate::schema::DataType::STRING),
+        ]));
+        let handler = ArrowExpressionHandler;
+        let result = handler.null_row(schema.clone()).unwrap();
+        let expected = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into().unwrap()),
+            vec![
+                Arc::new(StructArray::new_null(
+                    [
+                        Arc::new(Field::new("a", DataType::Int32, true)),
+                        Arc::new(Field::new("b", DataType::Utf8, false)),
+                    ]
+                    .into(),
+                    1,
+                )),
+                create_array!(Utf8, [None::<String>]),
+            ],
+        )
+        .unwrap();
+        let result: RecordBatch = result
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_null_row_err() {
+        let not_null_schema = Arc::new(StructType::new(vec![StructField::not_null(
+            "a",
+            crate::schema::DataType::STRING,
+        )]));
+        let handler = ArrowExpressionHandler;
+        assert!(handler.null_row(not_null_schema).is_err());
     }
 
     // helper to take values/schema to pass to `create_one` and assert the result = expected

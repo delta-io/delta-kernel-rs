@@ -110,7 +110,7 @@ pub use table::Table;
 
 use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
-use schema::SchemaTransform;
+use schema::{SchemaTransform, StructField, StructType};
 
 #[cfg(any(
     feature = "default-engine",
@@ -346,14 +346,21 @@ pub trait ExpressionHandler: AsAny {
     ) -> Arc<dyn ExpressionEvaluator>;
 
     /// Create a single-row null-value [`EngineData`] of a single column of type `output_type`.
-    fn null_row(&self) -> DeltaResult<(Box<dyn EngineData>, SchemaRef)>;
+    // NOTE: we should probably allow DataType instead of SchemaRef, but can expand that in the
+    // future.
+    fn null_row(&self, output_type: SchemaRef) -> DeltaResult<Box<dyn EngineData>>;
 
     /// Create a single-row [`EngineData`] by applying the given schema to the leaf-values given in
     /// `values`.
     // Note: we will stick with a Schema instead of DataType (more constrained can expand in
     // future)
     fn create_one(&self, schema: SchemaRef, values: &[Scalar]) -> DeltaResult<Box<dyn EngineData>> {
-        let (null_row, null_row_schema) = self.null_row()?;
+        // just get a single int column (arbitrary)
+        let null_row_schema = Arc::new(StructType::new(vec![StructField::nullable(
+            "null_col",
+            DataType::INTEGER,
+        )]));
+        let null_row = self.null_row(null_row_schema.clone())?;
 
         // Convert schema and leaf values to an expression
         let mut schema_transform = LiteralExpressionTransform::new(values);
