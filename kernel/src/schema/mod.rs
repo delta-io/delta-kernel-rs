@@ -145,7 +145,7 @@ impl StructField {
         self
     }
 
-    pub fn get_metadata_value(&self, key: &ColumnMetadataKey) -> Option<&MetadataValue> {
+    pub fn get_config_value(&self, key: &ColumnMetadataKey) -> Option<&MetadataValue> {
         self.metadata.get(key.as_ref())
     }
 
@@ -1048,10 +1048,10 @@ mod tests {
         let field: StructField = serde_json::from_str(data).unwrap();
 
         let col_id = field
-            .get_metadata_value(&ColumnMetadataKey::ColumnMappingId)
+            .get_config_value(&ColumnMetadataKey::ColumnMappingId)
             .unwrap();
         let id_start = field
-            .get_metadata_value(&ColumnMetadataKey::IdentityStart)
+            .get_config_value(&ColumnMetadataKey::IdentityStart)
             .unwrap();
         assert!(matches!(col_id, MetadataValue::Number(num) if *num == 4));
         assert!(matches!(id_start, MetadataValue::Number(num) if *num == 2147483648i64));
