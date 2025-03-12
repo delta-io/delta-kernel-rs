@@ -159,6 +159,13 @@ impl TableConfiguration {
         );
         protocol_supported && cdf_enabled && column_mapping_disabled
     }
+
+    pub(crate) fn is_v2_checkpoints_write_supported(&self) -> bool {
+        self.protocol.min_writer_version() == 7
+            && self
+                .protocol
+                .has_writer_feature(&WriterFeatures::V2Checkpoint)
+    }
     /// Returns `true` if deletion vectors is supported on this table. To support deletion vectors,
     /// a table must support reader version 3, writer version 7, and the deletionVectors feature in
     /// both the protocol's readerFeatures and writerFeatures.

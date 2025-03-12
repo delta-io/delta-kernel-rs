@@ -1,10 +1,13 @@
 //! This module defines visitors that can be used to extract the various delta actions from
 //! [`crate::engine_data::EngineData`] types.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
+use tracing::debug;
+
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::scan::log_replay::FileActionKey;
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
@@ -483,6 +486,431 @@ impl RowVisitor for SidecarVisitor {
     }
 }
 
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+pub(crate) struct CheckpointsVisitor<'seen> {
+    pub(crate) seen_file_keys: &'seen mut HashSet<FileActionKey>,
+    pub(crate) seen_protocol: bool,
+    pub(crate) seen_metadata: bool,
+    // Seen AppIds
+    pub(crate) seen_txns: &'seen mut HashSet<String>,
+    pub(crate) selection_vector: Vec<bool>,
+    pub(crate) is_log_batch: bool,
+    pub(crate) total_actions: usize,
+    pub(crate) total_add_actions: usize,
+    pub(crate) minimum_file_retention_timestamp: i64,
+}
+
+impl CheckpointsVisitor<'_> {
+    /// Checks if log replay already processed this logical file (in which case the current action
+    /// should be ignored). If not already seen, register it so we can recognize future duplicates.
+    /// Returns `true` if we have seen the file and should ignore it, `false` if we have not seen it
+    /// and should process it.
+    ///
+    /// Unlike `AddRemoveDedupVisitor`, this visitor also selects `remove` actions with
+    /// logical files that have not been seen before. This ensures that checkpoints retain
+    /// unexpired tombstones for VACUUM operations.
+    fn check_and_record_seen(&mut self, key: FileActionKey) -> bool {
+        // Note: each (add.path + add.dv_unique_id()) pair has a
+        // unique Add + Remove pair in the log. For example:
+        // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
+
+        if self.seen_file_keys.contains(&key) {
+            debug!(
+                "Ignoring duplicate ({}, {:?}) in scan, is log {}",
+                key.path, key.dv_unique_id, self.is_log_batch
+            );
+            true
+        } else {
+            debug!(
+                "Including ({}, {:?}) in scan, is log {}",
+                key.path, key.dv_unique_id, self.is_log_batch
+            );
+            if self.is_log_batch {
+                // Remember file actions from this batch so we can ignore duplicates as we process
+                // batches from older commit and/or checkpoint files. We don't track checkpoint
+                // batches because they are already the oldest actions and never replace anything.
+                self.seen_file_keys.insert(key);
+            }
+
+            false
+        }
+    }
+
+    // Check if a tombstone is expired
+    fn is_expired_tombstone<'a>(&self, i: usize, getter: &'a dyn GetData<'a>) -> DeltaResult<bool> {
+        // Default is zero. Not sure if this the correct way, but it is same Delta Spark.
+        // Ideally this should never be zero, but we are following the same behavior as Delta
+        // Spark and Java Kernel here.
+        let mut deletion_timestamp: i64 = 0;
+        if let Some(ts) = getter.get_opt(i, "remove.deletionTimestamp")? {
+            deletion_timestamp = ts;
+        }
+        Ok(deletion_timestamp > self.minimum_file_retention_timestamp)
+    }
+
+    /// True if this row contains a file action to include in the checkpoint.
+    fn is_valid_file_action<'a>(
+        &mut self,
+        i: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<bool> {
+        // Add will have a path at index 0 if it is valid; otherwise, if it is a log batch, we may
+        // have a remove with a path at index 4. In either case, extract the three dv getters at
+        // indexes that immediately follow a valid path index.
+        let (path, dv_getters, is_add) = if let Some(path) = getters[0].get_str(i, "add.path")? {
+            (path, &getters[1..4], true)
+        } else if let Some(path) = getters[4].get_opt(i, "remove.path")? {
+            (path, &getters[6..9], false)
+        } else {
+            return Ok(false);
+        };
+
+        let dv_unique_id = match dv_getters[0].get_opt(i, "deletionVector.storageType")? {
+            Some(storage_type) => Some(DeletionVectorDescriptor::unique_id_from_parts(
+                storage_type,
+                dv_getters[1].get(i, "deletionVector.pathOrInlineDv")?,
+                dv_getters[2].get_opt(i, "deletionVector.offset")?,
+            )),
+            None => None,
+        };
+
+        let file_key = FileActionKey::new(path, dv_unique_id);
+        if self.check_and_record_seen(file_key) {
+            return Ok(false);
+        }
+
+        // If the Remove action is an expired tombstone, do not include it in the checkpoint.
+        if !is_add && self.is_expired_tombstone(i, getters[5])? {
+            return Ok(false);
+        }
+
+        self.total_add_actions += 1;
+        Ok(true)
+    }
+
+    /// True if this row contains a protocol action to include in the checkpoint.
+    fn is_valid_protocol_action<'a>(
+        &mut self,
+        i: usize,
+        getter: &'a dyn GetData<'a>,
+    ) -> DeltaResult<bool> {
+        // Since minReaderVersion column is required, use it to detect presence of a Protocol action
+        if let Some(_) = getter.get_int(i, "protocol.minReaderVersion")? {
+            self.seen_protocol = true;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// True if this row contains a metadata action to include in the checkpoint.
+    fn is_valid_metadata_action<'a>(
+        &mut self,
+        i: usize,
+        getter: &'a dyn GetData<'a>,
+    ) -> DeltaResult<bool> {
+        // Since id column is required, use it to detect presence of a metadata action
+        if let Some(_) = getter.get_str(i, "metadata.id")? {
+            self.seen_metadata = true;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// True if this row contains a txn action to include in the checkpoint.
+    fn is_valid_txn_action<'a>(
+        &mut self,
+        i: usize,
+        getter: &'a dyn GetData<'a>,
+    ) -> DeltaResult<bool> {
+        let app_id = match getter.get_str(i, "txn.appId")? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+
+        // We only need to track the first txn action for each app id.
+        Ok(self.seen_txns.insert(app_id.to_string()))
+    }
+}
+
+impl RowVisitor for CheckpointsVisitor<'_> {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        // NOTE: This visitor assumes a data schema with the following columns in this order:
+        // 1. METADATA
+        // 2. PROTOCOL
+        // 3. TXN
+        // 4. ADD
+        // 5. REMOVE
+        // TODO: weird that order matters?
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            const STRING: DataType = DataType::STRING;
+            const INTEGER: DataType = DataType::INTEGER;
+            let types_and_names = vec![
+                (STRING, column_name!("metaData.id")),
+                (INTEGER, column_name!("protocol.minReaderVersion")),
+                (STRING, column_name!("txn.appId")),
+                (STRING, column_name!("add.path")),
+                (STRING, column_name!("add.deletionVector.storageType")),
+                (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
+                (INTEGER, column_name!("add.deletionVector.offset")),
+                (STRING, column_name!("remove.path")),
+                (DataType::LONG, column_name!("remove.deletionTimestamp")),
+                (STRING, column_name!("remove.deletionVector.storageType")),
+                (STRING, column_name!("remove.deletionVector.pathOrInlineDv")),
+                (INTEGER, column_name!("remove.deletionVector.offset")),
+            ];
+            let (types, names) = types_and_names.into_iter().unzip();
+            (names, types).into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 12,
+            Error::InternalError(format!(
+                "Wrong number of visitor getters: {}",
+                getters.len()
+            ))
+        );
+
+        for i in 0..row_count {
+            let should_select = self.is_valid_file_action(i, &getters[3..12])?
+                || self.is_valid_metadata_action(i, getters[0])?
+                || self.is_valid_protocol_action(i, getters[1])?
+                || self.is_valid_txn_action(i, getters[2])?;
+
+            self.selection_vector[i] = should_select;
+            if should_select {
+                self.total_actions += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+pub(crate) struct FileActionsVisitor<'seen> {
+    // File actions state
+    pub(crate) seen_file_keys: &'seen mut HashSet<FileActionKey>,
+    pub(crate) selection_vector: Vec<bool>,
+    pub(crate) is_log_batch: bool,
+    pub(crate) total_actions: usize,
+    pub(crate) total_add_actions: usize,
+    pub(crate) minimum_file_retention_timestamp: i64,
+}
+
+impl FileActionsVisitor<'_> {
+    /// Checks if this file action has already been seen.
+    fn check_and_record_seen(&mut self, key: FileActionKey) -> bool {
+        if self.seen_file_keys.contains(&key) {
+            debug!(
+                "Ignoring duplicate ({}, {:?}) in scan, is log {}",
+                key.path, key.dv_unique_id, self.is_log_batch
+            );
+            true
+        } else {
+            debug!(
+                "Including ({}, {:?}) in scan, is log {}",
+                key.path, key.dv_unique_id, self.is_log_batch
+            );
+            if self.is_log_batch {
+                self.seen_file_keys.insert(key);
+            }
+            false
+        }
+    }
+
+    /// Checks if a tombstone is expired.
+    fn is_expired_tombstone<'a>(&self, i: usize, getter: &'a dyn GetData<'a>) -> DeltaResult<bool> {
+        let mut deletion_timestamp: i64 = 0;
+        if let Some(ts) = getter.get_opt(i, "remove.deletionTimestamp")? {
+            deletion_timestamp = ts;
+        }
+        Ok(deletion_timestamp > self.minimum_file_retention_timestamp)
+    }
+
+    /// Returns true if the row contains a valid file action.
+    fn is_valid_file_action<'a>(
+        &mut self,
+        i: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<bool> {
+        // For an ADD, expect a valid path at index 0; for a REMOVE, check index 4.
+        let (path, dv_getters, is_add) = if let Some(path) = getters[0].get_str(i, "add.path")? {
+            (path, &getters[1..4], true)
+        } else if let Some(path) = getters[4].get_opt(i, "remove.path")? {
+            (path, &getters[6..9], false)
+        } else {
+            return Ok(false);
+        };
+
+        let dv_unique_id = match dv_getters[0].get_opt(i, "deletionVector.storageType")? {
+            Some(storage_type) => Some(DeletionVectorDescriptor::unique_id_from_parts(
+                storage_type,
+                dv_getters[1].get(i, "deletionVector.pathOrInlineDv")?,
+                dv_getters[2].get_opt(i, "deletionVector.offset")?,
+            )),
+            None => None,
+        };
+
+        let file_key = FileActionKey::new(path, dv_unique_id);
+        if self.check_and_record_seen(file_key) {
+            return Ok(false);
+        }
+
+        // For REMOVE actions, ignore expired tombstones.
+        if !is_add && self.is_expired_tombstone(i, getters[5])? {
+            return Ok(false);
+        }
+
+        self.total_add_actions += 1;
+        Ok(true)
+    }
+}
+
+impl RowVisitor for FileActionsVisitor<'_> {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        // Define only the file action columns (for ADD and REMOVE)
+        static FILE_ACTION_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            const STRING: DataType = DataType::STRING;
+            const INTEGER: DataType = DataType::INTEGER;
+            let types_and_names = vec![
+                // ADD columns
+                (STRING, column_name!("add.path")),
+                (STRING, column_name!("add.deletionVector.storageType")),
+                (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
+                (INTEGER, column_name!("add.deletionVector.offset")),
+                // REMOVE columns
+                (STRING, column_name!("remove.path")),
+                (DataType::LONG, column_name!("remove.deletionTimestamp")),
+                (STRING, column_name!("remove.deletionVector.storageType")),
+                (STRING, column_name!("remove.deletionVector.pathOrInlineDv")),
+                (INTEGER, column_name!("remove.deletionVector.offset")),
+            ];
+            let (types, names) = types_and_names.into_iter().unzip();
+            (names, types).into()
+        });
+        let (names, types) = FILE_ACTION_COLUMNS.as_ref();
+        (names, types)
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 9,
+            Error::InternalError(format!(
+                "Wrong number of visitor getters: {}",
+                getters.len()
+            ))
+        );
+
+        for i in 0..row_count {
+            let should_select = self.is_valid_file_action(i, getters)?;
+
+            self.selection_vector[i] = should_select;
+            if should_select {
+                self.total_actions += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+pub(crate) struct NonFileActionsVisitor<'seen> {
+    // Non-file actions state
+    pub(crate) seen_protocol: bool,
+    pub(crate) seen_metadata: bool,
+    pub(crate) seen_txns: &'seen mut HashSet<String>,
+    pub(crate) selection_vector: Vec<bool>,
+    pub(crate) total_actions: usize,
+}
+
+impl NonFileActionsVisitor<'_> {
+    /// Returns true if the row contains a protocol action.
+    fn is_valid_protocol_action<'a>(
+        &mut self,
+        i: usize,
+        getter: &'a dyn GetData<'a>,
+    ) -> DeltaResult<bool> {
+        if let Some(_) = getter.get_int(i, "protocol.minReaderVersion")? {
+            self.seen_protocol = true;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Returns true if the row contains a metadata action.
+    fn is_valid_metadata_action<'a>(
+        &mut self,
+        i: usize,
+        getter: &'a dyn GetData<'a>,
+    ) -> DeltaResult<bool> {
+        if let Some(_) = getter.get_str(i, "metadata.id")? {
+            self.seen_metadata = true;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Returns true if the row contains a txn action that we haven’t seen yet.
+    fn is_valid_txn_action<'a>(
+        &mut self,
+        i: usize,
+        getter: &'a dyn GetData<'a>,
+    ) -> DeltaResult<bool> {
+        let app_id = match getter.get_str(i, "txn.appId")? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+
+        Ok(self.seen_txns.insert(app_id.to_string()))
+    }
+}
+
+impl RowVisitor for NonFileActionsVisitor<'_> {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        // Define only the columns needed for protocol, metadata, and txn actions.
+        static NON_FILE_ACTION_COLUMNS: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            const STRING: DataType = DataType::STRING;
+            const INTEGER: DataType = DataType::INTEGER;
+            let types_and_names = vec![
+                (STRING, column_name!("metaData.id")),
+                (INTEGER, column_name!("protocol.minReaderVersion")),
+                (STRING, column_name!("txn.appId")),
+            ];
+            let (types, names) = types_and_names.into_iter().unzip();
+            (names, types).into()
+        });
+        NON_FILE_ACTION_COLUMNS.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 3,
+            Error::InternalError(format!(
+                "Wrong number of visitor getters: {}",
+                getters.len()
+            ))
+        );
+
+        for i in 0..row_count {
+            let should_select = self.is_valid_metadata_action(i, getters[0])?
+                || self.is_valid_protocol_action(i, getters[1])?
+                || self.is_valid_txn_action(i, getters[2])?;
+
+            self.selection_vector[i] = should_select;
+            if should_select {
+                self.total_actions += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Get a DV out of some engine data. The caller is responsible for slicing the `getters` slice such
 /// that the first element contains the `storageType` element of the deletion vector.
 pub(crate) fn visit_deletion_vector_at<'a>(
@@ -515,6 +943,7 @@ mod tests {
 
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use crate::scan::log_replay::AddRemoveDedupVisitor;
 
     use super::*;
     use crate::{
@@ -545,6 +974,32 @@ mod tests {
         ]
         .into();
         let output_schema = get_log_schema().clone();
+        let parsed = handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        ArrowEngineData::try_from_engine_data(parsed).unwrap()
+    }
+
+    fn checkpoint_batch() -> Box<ArrowEngineData> {
+        let handler = SyncJsonHandler {};
+        let json_strings: StringArray = vec![
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
+            r#"{"commitInfo":{"timestamp":1677811178585,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isolationLevel":"WriteSerializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"10","numOutputBytes":"635"},"engineInfo":"Databricks-Runtime/<unknown>","txnId":"a6a94671-55ef-450e-9546-b8465b9147de"}}"#,
+            r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
+            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none", "delta.enableChangeDataFeed":"true"},"createdTime":1677811175819}}"#,
+            r#"{"cdc":{"path":"_change_data/age=21/cdc-00000-93f7fceb-281a-446a-b221-07b88132d203.c000.snappy.parquet","partitionValues":{"age":"21"},"size":1033,"dataChange":false}}"#,
+            r#"{"sidecar":{"path":"016ae953-37a9-438e-8683-9a9a4a79a395.parquet","sizeInBytes":9268,"modificationTime":1714496113961,"tags":{"tag_foo":"tag_bar"}}}"#,
+        ]
+        .into();
+        let output_schema = get_log_schema()
+            .project(&[
+                METADATA_NAME,
+                PROTOCOL_NAME,
+                SET_TRANSACTION_NAME,
+                ADD_NAME,
+                REMOVE_NAME,
+            ])
+            .unwrap();
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
@@ -770,5 +1225,87 @@ mod tests {
                 last_updated: None,
             })
         );
+    }
+
+    #[test]
+    fn test_parse_add_remove_dedup_visitor() -> DeltaResult<()> {
+        let data = checkpoint_batch();
+        let mut visitor = AddRemoveDedupVisitor {
+            seen: &mut HashSet::new(),
+            selection_vector: vec![true; 6],
+            is_log_batch: true,
+            logical_schema: get_log_schema().clone(),
+            row_transform_exprs: Vec::new(),
+            transform: None,
+        };
+
+        visitor.visit_rows_of(data.as_ref())?;
+
+        let expected = [true, false, false, false, false, false];
+
+        assert_eq!(visitor.selection_vector, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_checkpoint_visitor() -> DeltaResult<()> {
+        let data = checkpoint_batch();
+        let mut visitor = CheckpointsVisitor {
+            seen_file_keys: &mut HashSet::new(),
+            seen_protocol: false,
+            seen_metadata: false,
+            seen_txns: &mut HashSet::new(),
+            selection_vector: vec![false; 6],
+            is_log_batch: true,
+            total_actions: 0,
+            total_add_actions: 0,
+            minimum_file_retention_timestamp: 0,
+        };
+
+        visitor.visit_rows_of(data.as_ref())?;
+
+        let expected = [true, false, true, true, false, false];
+
+        assert_eq!(visitor.selection_vector, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_file_action_visitor() -> DeltaResult<()> {
+        let data = checkpoint_batch();
+        let mut visitor = FileActionsVisitor {
+            seen_file_keys: &mut HashSet::new(),
+            selection_vector: vec![false; 6],
+            is_log_batch: true,
+            total_actions: 0,
+            total_add_actions: 0,
+            minimum_file_retention_timestamp: 0,
+        };
+
+        visitor.visit_rows_of(data.as_ref())?;
+
+        let expected = [true, false, false, false, false, false];
+
+        assert_eq!(visitor.selection_vector, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_non_file_action_visitor() -> DeltaResult<()> {
+        let data = checkpoint_batch();
+        let mut visitor = NonFileActionsVisitor {
+            seen_protocol: false,
+            seen_metadata: false,
+            seen_txns: &mut HashSet::new(),
+            selection_vector: vec![false; 6],
+            total_actions: 0,
+        };
+
+        visitor.visit_rows_of(data.as_ref())?;
+
+        let expected = [false, false, true, true, false, false];
+
+        assert_eq!(visitor.selection_vector, expected);
+        Ok(())
     }
 }

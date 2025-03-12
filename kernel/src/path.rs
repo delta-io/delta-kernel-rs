@@ -196,6 +196,23 @@ impl ParsedLogPath<Url> {
         }
         Ok(path)
     }
+
+    /// Create a new ParsedCommitPath<Url> for a new parquet v1 checkpoint file at the specified version
+    pub(crate) fn new_v1_checkpoint(
+        table_root: &Url,
+        version: Version,
+    ) -> DeltaResult<ParsedLogPath<Url>> {
+        let filename = format!("{:020}.checkpoint.parquet", version);
+        let location = table_root.join("_delta_log/")?.join(&filename)?;
+        let path = Self::try_from(location)?
+            .ok_or_else(|| Error::internal_error("attempted to create invalid checkpoint path"))?;
+        if !path.is_checkpoint() {
+            return Err(Error::internal_error(
+                "ParsedLogPath::new_commit created a non-checkpoint path",
+            ));
+        }
+        Ok(path)
+    }
 }
 
 #[cfg(test)]
