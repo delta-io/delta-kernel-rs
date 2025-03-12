@@ -540,8 +540,7 @@ impl ExpressionHandler for ArrowExpressionHandler {
         })
     }
 
-    /// Docs TODO
-    // NOTE: we should actually probably allow output_type to be a DataType instead of Schema
+    /// Create a single-row int array with a null value.
     fn null_row(&self) -> DeltaResult<(Box<dyn EngineData>, SchemaRef)> {
         use crate::schema::StructType;
         let output_schema = Arc::new(StructType::new(vec![StructField::new(

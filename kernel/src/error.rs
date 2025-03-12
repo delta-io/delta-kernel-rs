@@ -199,9 +199,11 @@ pub enum Error {
     #[error("Invalid Checkpoint: {0}")]
     InvalidCheckpoint(String),
 
-    /// Error while creating a new single-row array
+    /// Error while transforming a schema + leaves into an Expression of literals
     #[error(transparent)]
-    SingleRowTransformError(#[from] crate::expressions::single_row_transform::Error),
+    LiteralExpressionTransformError(
+        #[from] crate::expressions::literal_expression_transform::Error,
+    ),
 }
 
 // Convenience constructors for Error types that take a String argument

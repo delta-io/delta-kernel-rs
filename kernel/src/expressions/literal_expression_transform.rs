@@ -1,3 +1,6 @@
+//! The [`LiteralExpressionTransform`] is a [`SchemaTransform`] that transforms a [`Schema`] and an
+//! ordered list of leaf values (scalars) into an [`Expression`] with a literal value for each leaf.
+
 use std::borrow::Cow;
 use tracing::debug;
 
@@ -9,7 +12,7 @@ use crate::schema::{
 /// [`SchemaTransform`] that will transform a [`Schema`] and an ordered list of leaf values (as
 /// Scalar slice) into an Expression with a literal value for each leaf.
 #[derive(Debug)]
-pub(crate) struct SingleRowTransform<'a, T: Iterator<Item = &'a Scalar>> {
+pub(crate) struct LiteralExpressionTransform<'a, T: Iterator<Item = &'a Scalar>> {
     /// Leaf-node values to insert in schema order.
     scalars: T,
     /// A stack of built Expressions. After visiting children, we pop them off to
@@ -19,23 +22,23 @@ pub(crate) struct SingleRowTransform<'a, T: Iterator<Item = &'a Scalar>> {
     error: Option<Error>,
 }
 
-/// Any error for the single-row array transform.
+/// Any error for the single-row transform.
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     /// Schema mismatch error
     #[error("Schema error: {0}")]
     Schema(String),
 
-    /// Insufficient number of scalars (too many) to create a single-row array
-    #[error("Too many scalars given create a single-row array")]
+    /// Insufficient number of scalars (too many) to create a single-row expression
+    #[error("Too many scalars given for single-row transform")]
     ExcessScalars,
 
-    /// Insufficient number of scalars (too few) to create a single-row array
-    #[error("Too few scalars given create a single-row array")]
+    /// Insufficient number of scalars (too few) to create a single-row expression
+    #[error("Too few scalars given for single-row transform")]
     InsufficientScalars,
 
-    /// Empty array after performing the transform
-    #[error("No arrays were created after performing the transform")]
+    /// Empty expression stack after performing the transform
+    #[error("No Expression was created after performing the transform")]
     EmptyStack,
 
     /// Unsupported operation
@@ -43,7 +46,7 @@ pub enum Error {
     Unsupported(String),
 }
 
-impl<'a, I: Iterator<Item = &'a Scalar>> SingleRowTransform<'a, I> {
+impl<'a, I: Iterator<Item = &'a Scalar>> LiteralExpressionTransform<'a, I> {
     pub(crate) fn new(scalars: impl IntoIterator<Item = &'a Scalar, IntoIter = I>) -> Self {
         Self {
             scalars: scalars.into_iter(),
@@ -52,8 +55,8 @@ impl<'a, I: Iterator<Item = &'a Scalar>> SingleRowTransform<'a, I> {
         }
     }
 
-    /// return the single-row array (or propagate Error). the top of `stack` should be our
-    /// single-row struct array
+    /// return the Expression we just built (or propagate Error). the top of `stack` should be our
+    /// final Expression
     pub(crate) fn into_expr(mut self) -> Result<Expression, Error> {
         if let Some(e) = self.error {
             return Err(e);
@@ -64,7 +67,7 @@ impl<'a, I: Iterator<Item = &'a Scalar>> SingleRowTransform<'a, I> {
         }
 
         match self.stack.pop() {
-            Some(array) => Ok(array),
+            Some(expr) => Ok(expr),
             None => Err(Error::EmptyStack),
         }
     }
@@ -86,7 +89,7 @@ impl<'a, I: Iterator<Item = &'a Scalar>> SingleRowTransform<'a, I> {
     }
 }
 
-impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for SingleRowTransform<'a, T> {
+impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressionTransform<'a, T> {
     fn transform_primitive(
         &mut self,
         prim_type: &'a PrimitiveType,
@@ -107,7 +110,7 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for SingleRowTransf
         };
         if scalar_type != *prim_type {
             self.set_error(Error::Schema(format!(
-                "Mismatched scalar type creating a single-row array: expected {}, got {}",
+                "Mismatched scalar type while creating Expression: expected {}, got {}",
                 prim_type, scalar_type
             )));
             return None;
@@ -180,7 +183,7 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for SingleRowTransf
             return None;
         }
         self.set_error(Error::Unsupported(
-            "ArrayType not yet supported for creating single-row array".to_string(),
+            "ArrayType not yet supported in TODO".to_string(),
         ));
         None
     }
@@ -192,7 +195,7 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for SingleRowTransf
             return None;
         }
         self.set_error(Error::Unsupported(
-            "MapType not yet supported for creating single-row array".to_string(),
+            "MapType not yet supported in TODO".to_string(),
         ));
         None
     }
@@ -216,7 +219,7 @@ mod tests {
         schema: SchemaRef,
         expected: Result<Expression, ()>,
     ) {
-        let mut schema_transform = SingleRowTransform::new(values);
+        let mut schema_transform = LiteralExpressionTransform::new(values);
         let datatype = schema.into();
         let _transformed = schema_transform.transform(&datatype);
         match expected {

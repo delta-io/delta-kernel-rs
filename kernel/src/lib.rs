@@ -108,7 +108,7 @@ pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef};
 pub use table::Table;
 
-use expressions::single_row_transform::SingleRowTransform;
+use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
 use schema::SchemaTransform;
 
@@ -356,7 +356,7 @@ pub trait ExpressionHandler: AsAny {
         let (null_row, null_row_schema) = self.null_row()?;
 
         // Convert schema and leaf values to an expression
-        let mut schema_transform = SingleRowTransform::new(values);
+        let mut schema_transform = LiteralExpressionTransform::new(values);
         schema_transform.transform_struct(schema.as_ref());
         let row_expr = schema_transform.into_expr()?;
 
