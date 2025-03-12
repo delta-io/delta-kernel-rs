@@ -892,7 +892,10 @@ mod tests {
             3,
             7,
             Some::<Vec<String>>(vec![]),
-            Some(vec![WriterFeatures::AppendOnly, WriterFeatures::DeletionVectors]),
+            Some(vec![
+                WriterFeatures::AppendOnly,
+                WriterFeatures::DeletionVectors,
+            ]),
         )
         .unwrap();
         assert!(protocol.ensure_write_supported().is_ok());
