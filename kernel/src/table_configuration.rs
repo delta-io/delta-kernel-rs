@@ -192,6 +192,23 @@ impl TableConfiguration {
                 .enable_deletion_vectors
                 .unwrap_or(false)
     }
+
+    /// Returns `true` if the table supports the appendOnly table feature. To support this feature:
+    /// - The table must have a writer version between 2 and 7 (inclusive)
+    /// - If the table is on writer version 7, it must have the [`WriterFeatures::AppendOnly`]
+    ///   writer feature.
+    pub(crate) fn is_append_only_supported(&self) -> bool {
+        let protocol = &self.protocol;
+        match protocol.min_writer_version() {
+            7 if protocol.has_writer_feature(&WriterFeatures::AppendOnly) => true,
+            version => (2..=6).contains(&version),
+        }
+    }
+
+    #[allow(unused)]
+    pub(crate) fn is_append_only_enabled(&self) -> bool {
+        self.is_append_only_supported() && self.table_properties.append_only.unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
@@ -259,16 +276,10 @@ mod test {
             schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
             ..Default::default()
         };
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([ReaderFeatures::V2Checkpoint]),
-            Some([WriterFeatures::V2Checkpoint]),
-        )
-        .unwrap();
+        let protocol = Protocol::try_new(3, 7, Some(["unknown"]), Some(["unknown"])).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         TableConfiguration::try_new(metadata, protocol, table_root, 0)
-            .expect_err("V2 checkpoint is not supported in kernel");
+            .expect_err("Unknown feature is not supported in kernel");
     }
     #[test]
     fn dv_not_supported() {

@@ -123,7 +123,6 @@ impl From<WriterFeatures> for String {
     }
 }
 
-// we support everything except V2 checkpoints
 pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeatures>> =
     LazyLock::new(|| {
         HashSet::from([
@@ -133,12 +132,13 @@ pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeatures>> =
             ReaderFeatures::TypeWidening,
             ReaderFeatures::TypeWideningPreview,
             ReaderFeatures::VacuumProtocolCheck,
+            ReaderFeatures::V2Checkpoint,
         ])
     });
 
-// write support wip: no table features are supported yet
+// currently the only writer feature supported is `AppendOnly`
 pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<HashSet<WriterFeatures>> =
-    LazyLock::new(|| HashSet::from([]));
+    LazyLock::new(|| HashSet::from([WriterFeatures::AppendOnly]));
 
 #[cfg(test)]
 mod tests {

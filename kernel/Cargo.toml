@@ -30,13 +30,15 @@ pre-release-hook = [
   "--unreleased",
   "--prepend",
   "../CHANGELOG.md",
+  "--include-path",
+  "*",
   "--tag",
   "{{version}}",
 ]
 
 [dependencies]
 bytes = "1.7"
-chrono = { version = "0.4" }
+chrono = "=0.4.39"
 fix-hidden-lifetime-bug = "0.2"
 indexmap = "2.5.0"
 itertools = "0.13"
@@ -51,7 +53,7 @@ uuid = "1.10.0"
 z85 = "3.0.5"
 
 # bring in our derive macros
-delta_kernel_derive = { path = "../derive-macros", version = "0.6.1" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.8.0" }
 
 # used for developer-visibility
 visibility = "0.1.1"
@@ -94,8 +96,9 @@ arrow_53 = ["dep:arrow_53", "dep:parquet_53"]
 
 arrow_54 = ["dep:arrow_54", "dep:parquet_54"]
 
-arrow-conversion = []
-arrow-expression = []
+need_arrow = []
+arrow-conversion = ["need_arrow"]
+arrow-expression = ["need_arrow"]
 
 cloud = [
   "object_store/aws",
@@ -112,6 +115,7 @@ default-engine-base = [
   "arrow-conversion",
   "arrow-expression",
   "futures",
+  "need_arrow",
   "object_store",
   "tokio",
   "uuid/v4",
@@ -130,6 +134,7 @@ default-engine-rustls = [
 
 developer-visibility = []
 sync-engine = [
+  "need_arrow",
   "tempfile",
 ]
 integration-test = [
@@ -147,6 +152,7 @@ rustc_version = "0.4.1"
 [dev-dependencies]
 delta_kernel = { path = ".", features = ["arrow", "default-engine", "sync-engine"] }
 test_utils = { path = "../test-utils" }
+async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implementation
 paste = "1.0"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 tempfile = "3"
