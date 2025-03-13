@@ -577,6 +577,26 @@ fn table_for_numbers(nums: Vec<u32>) -> Vec<String> {
     res
 }
 
+// get the basic_partitioned table for a set of expected letters
+fn table_for_letters(letters: &[char]) -> Vec<String> {
+    let mut res: Vec<String> = vec![
+        "+--------+--------+",
+        "| letter | number |",
+        "+--------+--------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    let rows = vec![(1, 'a'), (2, 'b'), (3, 'c'), (4, 'a'), (5, 'e')];
+    for (num, letter) in rows {
+        if letters.contains(&letter) {
+            res.push(format!("| {letter}      | {num}      |"));
+        }
+    }
+    res.push("+--------+--------+".to_string());
+    res
+}
+
 #[test]
 fn predicate_on_number() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
@@ -607,6 +627,118 @@ fn predicate_on_number() -> Result<(), Box<dyn std::error::Error>> {
         read_table_data(
             "./tests/data/basic_partitioned",
             Some(&["a_float", "number"]),
+            Some(expr),
+            expected,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn predicate_on_letter() -> Result<(), Box<dyn std::error::Error>> {
+    // Test basic column pruning. Note that the actual expression machinery is already well-tested,
+    // so we're just testing wiring here.
+    let null_row_table: Vec<String> = vec![
+        "+--------+--------+",
+        "| letter | number |",
+        "+--------+--------+",
+        "|        | 6      |",
+        "+--------+--------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    let cases = vec![
+        (column_expr!("letter").is_null(), null_row_table),
+        (
+            column_expr!("letter").is_not_null(),
+            table_for_letters(&['a', 'b', 'c', 'e']),
+        ),
+        (
+            column_expr!("letter").lt("c"),
+            table_for_letters(&['a', 'b']),
+        ),
+        (
+            column_expr!("letter").le("c"),
+            table_for_letters(&['a', 'b', 'c']),
+        ),
+        (column_expr!("letter").gt("c"), table_for_letters(&['e'])),
+        (
+            column_expr!("letter").ge("c"),
+            table_for_letters(&['c', 'e']),
+        ),
+        (column_expr!("letter").eq("c"), table_for_letters(&['c'])),
+        (
+            column_expr!("letter").ne("c"),
+            table_for_letters(&['a', 'b', 'e']),
+        ),
+    ];
+
+    for (expr, expected) in cases {
+        read_table_data(
+            "./tests/data/basic_partitioned",
+            Some(&["letter", "number"]),
+            Some(expr),
+            expected,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn predicate_on_letter_and_number() -> Result<(), Box<dyn std::error::Error>> {
+    // Partition skipping and file skipping are currently implemented separately. Mixing them in an
+    // AND clause will evaulate each separately, but mixing them in an OR clause disables both.
+    let full_table: Vec<String> = vec![
+        "+--------+--------+",
+        "| letter | number |",
+        "+--------+--------+",
+        "|        | 6      |",
+        "| a      | 1      |",
+        "| a      | 4      |",
+        "| b      | 2      |",
+        "| c      | 3      |",
+        "| e      | 5      |",
+        "+--------+--------+",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    let cases = vec![
+        (
+            Expression::or(
+                // No pruning power
+                column_expr!("letter").gt("a"),
+                column_expr!("number").gt(3i64),
+            ),
+            full_table,
+        ),
+        (
+            Expression::and(
+                column_expr!("letter").gt("a"),  // numbers 2, 3, 5
+                column_expr!("number").gt(3i64), // letters a, e
+            ),
+            table_for_letters(&['e']),
+        ),
+        (
+            Expression::and(
+                column_expr!("letter").gt("a"), // numbers 2, 3, 5
+                Expression::or(
+                    // No pruning power
+                    column_expr!("letter").eq("c"),
+                    column_expr!("number").eq(3i64),
+                ),
+            ),
+            table_for_letters(&['b', 'c', 'e']),
+        ),
+    ];
+
+    for (expr, expected) in cases {
+        read_table_data(
+            "./tests/data/basic_partitioned",
+            Some(&["letter", "number"]),
             Some(expr),
             expected,
         )?;
@@ -960,8 +1092,7 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
         assert_eq!(&batch, &result_batch);
         files_scanned += 1;
     }
-    // Partition pruning is not yet implemented, so we still read the data for both partitions
-    assert_eq!(2, files_scanned);
+    assert_eq!(1, files_scanned);
     Ok(())
 }
 
