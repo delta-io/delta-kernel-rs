@@ -529,7 +529,7 @@ pub struct SetTransaction {
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct Sidecar {
     /// A path to a sidecar file that can be either:
-    /// - A relative path (just the file name) within the `_delta_log/_sidecars` directory.  
+    /// - A relative path (just the file name) within the `_delta_log/_sidecars` directory.
     /// - An absolute path
     /// The path is a URI as specified by [RFC 2396 URI Generic Syntax], which needs to be decoded
     /// to get the file path.
@@ -892,7 +892,10 @@ mod tests {
             3,
             7,
             Some::<Vec<String>>(vec![]),
-            Some(vec![WriterFeatures::AppendOnly]),
+            Some(vec![
+                WriterFeatures::AppendOnly,
+                WriterFeatures::DeletionVectors,
+            ]),
         )
         .unwrap();
         assert!(protocol.ensure_write_supported().is_ok());
@@ -901,7 +904,7 @@ mod tests {
             3,
             7,
             Some([ReaderFeatures::DeletionVectors]),
-            Some([WriterFeatures::DeletionVectors]),
+            Some([WriterFeatures::RowTracking]),
         )
         .unwrap();
         assert!(protocol.ensure_write_supported().is_err());
