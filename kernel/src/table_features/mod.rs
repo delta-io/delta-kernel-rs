@@ -136,9 +136,8 @@ pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeatures>> =
         ])
     });
 
-// currently the only writer feature supported is `AppendOnly`
 pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<HashSet<WriterFeatures>> =
-    LazyLock::new(|| HashSet::from([WriterFeatures::AppendOnly]));
+    LazyLock::new(|| HashSet::from([WriterFeatures::AppendOnly, WriterFeatures::DeletionVectors]));
 
 #[cfg(test)]
 mod tests {
