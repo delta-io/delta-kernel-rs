@@ -35,6 +35,8 @@ use crate::expressions::{
     VariadicExpression, VariadicOperator,
 };
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField};
+#[allow(unused_imports)]
+use crate::ExpressionHandlerExtension as _;
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
 
 // TODO leverage scalars / Datum
@@ -543,8 +545,8 @@ impl ExpressionHandler for ArrowExpressionHandler {
     /// Create a single-row array with all-null leaf values. Note that if a nested struct is
     /// included in the `output_type`, the entire struct will be NULL (instead of a not-null struct
     /// with NULL fields).
-    fn null_row(&self, output_type: SchemaRef) -> DeltaResult<Box<dyn EngineData>> {
-        let fields = output_type.fields();
+    fn null_row(&self, output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>> {
+        let fields = output_schema.fields();
         let arrays = fields
             .map(|field| {
                 let data_type = field.data_type();
@@ -552,7 +554,7 @@ impl ExpressionHandler for ArrowExpressionHandler {
             })
             .try_collect()?;
         let record_batch =
-            RecordBatch::try_new(Arc::new(output_type.as_ref().try_into()?), arrays)?;
+            RecordBatch::try_new(Arc::new(output_schema.as_ref().try_into()?), arrays)?;
         Ok(Box::new(ArrowEngineData::new(record_batch)))
     }
 }

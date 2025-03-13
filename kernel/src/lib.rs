@@ -345,11 +345,18 @@ pub trait ExpressionHandler: AsAny {
         output_type: DataType,
     ) -> Arc<dyn ExpressionEvaluator>;
 
-    /// Create a single-row null-value [`EngineData`] of a single column of type `output_type`.
+    /// Create a single-row all-null-value [`EngineData`] with the schema specified by
+    /// `output_schema`.
     // NOTE: we should probably allow DataType instead of SchemaRef, but can expand that in the
     // future.
-    fn null_row(&self, output_type: SchemaRef) -> DeltaResult<Box<dyn EngineData>>;
+    fn null_row(&self, output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>>;
+}
 
+/// Internal trait to allow us to have a private `create_one` API that's implemented for all
+/// ExpressionHandlers.
+// For some reason rustc doesn't detect it's usage so we allow(dead_code) here...
+#[allow(dead_code)]
+trait ExpressionHandlerExtension: ExpressionHandler {
     /// Create a single-row [`EngineData`] by applying the given schema to the leaf-values given in
     /// `values`.
     // Note: we will stick with a Schema instead of DataType (more constrained can expand in
@@ -371,6 +378,9 @@ pub trait ExpressionHandler: AsAny {
         eval.evaluate(null_row.as_ref())
     }
 }
+
+// Auto-implement the extension trait for all ExpressionHandlers
+impl<T: ExpressionHandler> ExpressionHandlerExtension for T {}
 
 /// Provides file system related functionalities to Delta Kernel.
 ///
