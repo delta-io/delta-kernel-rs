@@ -1,6 +1,7 @@
 use std::sync::{mpsc, mpsc::Receiver, Arc};
 
 use crate::arrow::array::RecordBatch;
+use crate::scan::RUNTIME;
 use futures::future::join_all;
 use futures::StreamExt;
 use object_store::DynObjectStore;
@@ -25,7 +26,7 @@ pub struct AsyncParquetHandler {
 impl AsyncParquetHandler {
     pub fn new(object_store: Arc<DynObjectStore>) -> Self {
         // default multi-threaded (with thread per core) runtime with work-stealing scheduler
-        let tokio_runtime = Arc::new(Runtime::new().unwrap());
+        let tokio_runtime = RUNTIME.clone();
         Self {
             object_store,
             tokio_runtime,
@@ -81,8 +82,6 @@ fn read_files(
     // let semaphore = Arc::new(Semaphore::new(TASK_LIMIT));
     let (tx, rx) = mpsc::channel();
 
-    println!("files len: {:?}", files.len());
-
     let file_opener: Arc<dyn FileOpener + Send + Sync> = Arc::from(file_opener);
     let len = files.len();
     runtime.block_on(async {
@@ -94,12 +93,10 @@ fn read_files(
             let tx_clone = tx.clone();
 
             let f = file_opener.clone();
-            println!("file: {:?}", file);
             let handle = runtime.spawn(async move {
                 // read the file as stream
                 let mut stream = f.open(file.clone(), None).unwrap().await.unwrap();
                 // tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                println!("HERE");
                 while let Some(result) = stream.next().await {
                     let _ = tx_clone.send(result);
                 }

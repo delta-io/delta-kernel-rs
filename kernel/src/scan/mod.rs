@@ -2,9 +2,10 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
+use tokio::runtime::{self, Runtime};
 use tracing::debug;
 use url::Url;
 
@@ -29,6 +30,9 @@ use self::state::GlobalScanState;
 pub(crate) mod data_skipping;
 pub mod log_replay;
 pub mod state;
+
+pub static RUNTIME: LazyLock<Arc<Runtime>> =
+    LazyLock::new(|| Arc::new(runtime::Builder::new_multi_thread().build().unwrap()));
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {

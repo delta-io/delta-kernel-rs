@@ -535,12 +535,13 @@ fn get_default_engine_impl(
     options: HashMap<String, String>,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
-    use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use delta_kernel::engine::default::executor::tokio::TokioMultiThreadExecutor;
     use delta_kernel::engine::default::DefaultEngine;
-    let engine = DefaultEngine::<TokioBackgroundExecutor>::try_new(
+    use delta_kernel::scan::RUNTIME;
+    let engine = DefaultEngine::<TokioMultiThreadExecutor>::try_new(
         &url,
         options,
-        Arc::new(TokioBackgroundExecutor::new()),
+        TokioMultiThreadExecutor::new(RUNTIME.handle().clone()).into(),
     );
     Ok(engine_to_handle(Arc::new(engine?), allocate_error))
 }

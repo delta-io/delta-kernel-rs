@@ -1,18 +1,19 @@
 use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::mpsc::Sender;
-use std::sync::{mpsc, Arc};
-use std::thread;
+use std::sync::Arc;
 
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
-use arrow::util::pretty::print_batches;
 use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::tokio::{
+    TokioBackgroundExecutor, TokioMultiThreadExecutor,
+};
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::sync::SyncEngine;
 use delta_kernel::scan::state::{self, transform_to_logical, DvInfo, GlobalScanState, Stats};
+use delta_kernel::scan::RUNTIME;
 use delta_kernel::schema::Schema;
 use delta_kernel::{DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Table};
 
@@ -76,54 +77,8 @@ fn main() -> ExitCode {
     }
 }
 
-// the way we as a connector represent data to scan. this is computed from the raw data returned
-// from the scan, and could be any format the engine chooses to use to facilitate distributing work.
-struct ScanFile {
-    path: String,
-    size: i64,
-    transform: Option<ExpressionRef>,
-    dv_info: DvInfo,
-}
-
-// we know we're using arrow under the hood, so cast an EngineData into something we can work with
-fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
-    Ok(data
-        .into_any()
-        .downcast::<ArrowEngineData>()
-        .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
-        .into())
-}
-
-// truncate a batch to the specified number of rows
-fn truncate_batch(batch: RecordBatch, rows: usize) -> RecordBatch {
-    let cols = batch
-        .columns()
-        .iter()
-        .map(|col| col.slice(0, rows))
-        .collect();
-    RecordBatch::try_new(batch.schema(), cols).unwrap()
-}
-
-// This is the callback that will be called for each valid scan row
-fn send_scan_file(
-    scan_tx: &mut spmc::Sender<ScanFile>,
-    path: &str,
-    size: i64,
-    _stats: Option<Stats>,
-    dv_info: DvInfo,
-    transform: Option<ExpressionRef>,
-    _: HashMap<String, String>,
-) {
-    let scan_file = ScanFile {
-        path: path.to_string(),
-        size,
-        transform,
-        dv_info,
-    };
-    scan_tx.send(scan_file).unwrap();
-}
 #[no_mangle]
-fn no_mangle_to_stop_optimizer<T>(val: T) {}
+fn no_mangle_to_stop_optimizer<T>(_val: T) {}
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
 
@@ -145,7 +100,7 @@ fn try_main() -> DeltaResult<()> {
             Arc::new(DefaultEngine::try_new(
                 table.location(),
                 options,
-                Arc::new(TokioBackgroundExecutor::new()),
+                Arc::new(TokioMultiThreadExecutor::new(RUNTIME.handle().clone())),
             )?)
         }
         EngineType::Sync => Arc::new(SyncEngine::new()),
@@ -188,7 +143,7 @@ fn try_main() -> DeltaResult<()> {
 
     // have handed out all copies needed, drop so record_batch_rx will exit when the last thread is
     // done sending
-
+    #[allow(unused)]
     struct ScanFile {
         path: String,
         size: i64,
@@ -202,7 +157,6 @@ fn try_main() -> DeltaResult<()> {
         _: Option<Stats>,
         dv_info: DvInfo,
         transform: Option<ExpressionRef>,
-        _: HashMap<String, String>,
     ) {
         batches.push(ScanFile {
             path: path.to_string(),
@@ -231,78 +185,4 @@ fn try_main() -> DeltaResult<()> {
     }
 
     Ok(())
-}
-
-// this is the work each thread does
-fn do_work(
-    engine: Arc<dyn Engine>,
-    scan_state: Arc<GlobalScanState>,
-    record_batch_tx: Sender<RecordBatch>,
-    scan_file_rx: spmc::Receiver<ScanFile>,
-) {
-    // get the type for the function calls
-    let engine: &dyn Engine = engine.as_ref();
-    // in a loop, try and get a ScanFile. Note that `recv` will return an `Err` when the other side
-    // hangs up, which indicates there's no more data to process.
-    while let Ok(scan_file) = scan_file_rx.recv() {
-        // we got a scan file, let's process it
-        let root_url = Url::parse(&scan_state.table_root).unwrap();
-
-        // get the selection vector (i.e. deletion vector)
-        let mut selection_vector = scan_file
-            .dv_info
-            .get_selection_vector(engine, &root_url)
-            .unwrap();
-
-        // build the required metadata for our parquet handler to read this file
-        let location = root_url.join(&scan_file.path).unwrap();
-        let meta = FileMeta {
-            last_modified: 0,
-            size: scan_file.size as usize,
-            location,
-        };
-
-        // this example uses the parquet_handler from the engine, but an engine could
-        // choose to use whatever method it might want to read a parquet file. The reader
-        // could, for example, fill in the partition columns, or apply deletion vectors. Here
-        // we assume a more naive parquet reader and fix the data up after the fact.
-        // further parallelism would also be possible here as we could read the parquet file
-        // in chunks where each thread reads one chunk. The engine would need to ensure
-        // enough meta-data was passed to each thread to correctly apply the selection
-        // vector
-        let read_results = engine
-            .get_parquet_handler()
-            .read_parquet_files(&[meta], scan_state.physical_schema.clone(), None)
-            .unwrap();
-
-        for read_result in read_results {
-            let read_result = read_result.unwrap();
-            let len = read_result.len();
-            // transform the physical data into the correct logical form
-            let logical = transform_to_logical(
-                engine,
-                read_result,
-                &scan_state.physical_schema,
-                &scan_state.logical_schema,
-                &scan_file.transform,
-            )
-            .unwrap();
-
-            let record_batch = to_arrow(logical).unwrap();
-
-            // need to split the dv_mask. what's left in dv_mask covers this result, and rest
-            // will cover the following results
-            let rest = split_vector(selection_vector.as_mut(), len, Some(true));
-            let batch = if let Some(mask) = selection_vector.clone() {
-                // apply the selection vector
-                filter_record_batch(&record_batch, &mask.into()).unwrap()
-            } else {
-                record_batch
-            };
-            selection_vector = rest;
-
-            // send back the processed result
-            record_batch_tx.send(batch).unwrap();
-        }
-    }
 }
