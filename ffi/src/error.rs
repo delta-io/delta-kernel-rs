@@ -52,6 +52,7 @@ pub enum KernelError {
     ChangeDataFeedUnsupported,
     ChangeDataFeedIncompatibleSchema,
     InvalidCheckpoint,
+    LiteralExpressionTransformError,
 }
 
 impl From<Error> for KernelError {
@@ -110,6 +111,9 @@ impl From<Error> for KernelError {
                 KernelError::ChangeDataFeedIncompatibleSchema
             }
             Error::InvalidCheckpoint(_) => KernelError::InvalidCheckpoint,
+            Error::LiteralExpressionTransformError(_) => {
+                KernelError::LiteralExpressionTransformError
+            }
         }
     }
 }
