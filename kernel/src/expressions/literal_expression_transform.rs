@@ -9,20 +9,20 @@ use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, SchemaTransform, StructField, StructType,
 };
 
-/// [`SchemaTransform`] that will transform a [`Schema`] and an ordered list of leaf values (as
-/// Scalar slice) into an Expression with a literal value for each leaf.
+/// [`SchemaTransform`] that will transform a [`Schema`] and an ordered list of leaf values
+/// (Scalars) into an Expression with a [`Literal`] expr for each leaf.
 #[derive(Debug)]
 pub(crate) struct LiteralExpressionTransform<'a, T: Iterator<Item = &'a Scalar>> {
-    /// Leaf-node values to insert in schema order.
+    /// Leaf values to insert in schema order.
     scalars: T,
     /// A stack of built Expressions. After visiting children, we pop them off to
     /// build the parent container, then push the parent back on.
     stack: Vec<Expression>,
-    /// If an error occurs, it will be stored here.
+    /// Since schema transforms are infallible we keep track of errors here
     error: Option<Error>,
 }
 
-/// Any error for the single-row transform.
+/// Any error for [`LiteralExpressionTransform`]
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     /// Schema mismatch error
@@ -30,11 +30,11 @@ pub enum Error {
     Schema(String),
 
     /// Insufficient number of scalars (too many) to create a single-row expression
-    #[error("Too many scalars given for single-row transform")]
+    #[error("Too many scalars given for literal expression transform")]
     ExcessScalars,
 
     /// Insufficient number of scalars (too few) to create a single-row expression
-    #[error("Too few scalars given for single-row transform")]
+    #[error("Too few scalars given for literal expression transform")]
     InsufficientScalars,
 
     /// Empty expression stack after performing the transform
