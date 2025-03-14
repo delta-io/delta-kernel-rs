@@ -210,7 +210,8 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                 continue;
             }
             // Since path column is required, use it to detect presence of an Add action
-            if let Some(path) = getters[0].get_opt(row_index, "scanFile.path")? {
+            let path: Option<String> = getters[0].get_opt(row_index, "scanFile.path")?;
+            if let Some(path) = path {
                 let size = getters[1].get(row_index, "scanFile.size")?;
                 let stats: Option<String> = getters[3].get_opt(row_index, "scanFile.stats")?;
                 let stats: Option<Stats> =
@@ -230,7 +231,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                 //getters[9].get(row_index, "scanFile.fileConstantValues.partitionValues")?;
                 (self.callback)(
                     &mut self.context,
-                    path,
+                    &path,
                     size,
                     stats,
                     dv_info,
