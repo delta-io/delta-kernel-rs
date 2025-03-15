@@ -119,7 +119,8 @@ impl AddRemoveDedupVisitor<'_> {
         // Add will have a path at index 0 if it is valid; otherwise, if it is a log batch, we may
         // have a remove with a path at index 4. In either case, extract the three dv getters at
         // indexes that immediately follow a valid path index.
-        let (path, dv_getters, is_add) = if let Some(path) = getters[0].get_str(i, "add.path")? {
+        let add_path: Option<String> = getters[0].get_opt(i, "add.path")?;
+        let (path, dv_getters, is_add) = if let Some(path) = add_path {
             (path, &getters[2..5], true)
         } else if !self.is_log_batch {
             return Ok(false);
