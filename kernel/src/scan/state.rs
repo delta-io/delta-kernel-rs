@@ -198,7 +198,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 10,
+            getters.len() == 7,
             Error::InternalError(format!(
                 "Wrong number of ScanFileVisitor getters: {}",
                 getters.len()
@@ -213,15 +213,16 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
             let path: Option<String> = getters[0].get_opt(row_index, "scanFile.path")?;
             if let Some(path) = path {
                 let size = getters[1].get(row_index, "scanFile.size")?;
-                let stats: Option<String> = getters[3].get_opt(row_index, "scanFile.stats")?;
-                let stats: Option<Stats> =
-                    stats.and_then(|json| match serde_json::from_str(json.as_str()) {
-                        Ok(stats) => Some(stats),
-                        Err(e) => {
-                            warn!("Invalid stats string in Add file {json}: {}", e);
-                            None
-                        }
-                    });
+                //let stats: Option<String> = getters[3].get_opt(row_index, "scanFile.stats")?;
+                //let stats: Option<Stats> =
+                //    stats.and_then(|json| match serde_json::from_str(json.as_str()) {
+                //        Ok(stats) => Some(stats),
+                //        Err(e) => {
+                //            warn!("Invalid stats string in Add file {json}: {}", e);
+                //            None
+                //        }
+                //    });
+                let stats = None;
 
                 let dv_index = SCAN_ROW_SCHEMA
                     .index_of("deletionVector")

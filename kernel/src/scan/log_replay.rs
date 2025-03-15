@@ -213,9 +213,9 @@ impl RowVisitor for AddRemoveDedupVisitor<'_> {
 // indexes will be off, and [`get_add_transform_expr`] below to match it.
 pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| {
     // Note that fields projected out of a nullable struct must be nullable
-    let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-    let file_constant_values =
-        StructType::new([StructField::nullable("partitionValues", partition_values)]);
+    //let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
+    //let file_constant_values =
+    //    StructType::new([StructField::nullable("partitionValues", partition_values)]);
     let deletion_vector = StructType::new([
         StructField::nullable("storageType", DataType::STRING),
         StructField::nullable("pathOrInlineDv", DataType::STRING),
@@ -226,10 +226,10 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
     Arc::new(StructType::new([
         StructField::nullable("path", DataType::STRING),
         StructField::nullable("size", DataType::LONG),
-        StructField::nullable("modificationTime", DataType::LONG),
-        StructField::nullable("stats", DataType::STRING),
+        //StructField::nullable("modificationTime", DataType::LONG),
+        //StructField::nullable("stats", DataType::STRING),
         StructField::nullable("deletionVector", deletion_vector),
-        StructField::nullable("fileConstantValues", file_constant_values),
+        //StructField::nullable("fileConstantValues", file_constant_values),
     ]))
 });
 
@@ -240,10 +240,10 @@ fn get_add_transform_expr() -> Expression {
     Expression::Struct(vec![
         column_expr!("add.path"),
         column_expr!("add.size"),
-        column_expr!("add.modificationTime"),
-        column_expr!("add.stats"),
+        //column_expr!("add.modificationTime"),
+        //column_expr!("add.stats"),
         column_expr!("add.deletionVector"),
-        Expression::Struct(vec![column_expr!("add.partitionValues")]),
+        //Expression::Struct(vec![column_expr!("add.partitionValues")]),
     ])
 }
 

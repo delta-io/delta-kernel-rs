@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
+use std::thread::available_parallelism;
 
 use itertools::Itertools;
 use tokio::runtime::{self, Runtime};
@@ -31,8 +32,14 @@ pub(crate) mod data_skipping;
 pub mod log_replay;
 pub mod state;
 
-pub static RUNTIME: LazyLock<Arc<Runtime>> =
-    LazyLock::new(|| Arc::new(runtime::Builder::new_multi_thread().build().unwrap()));
+pub static RUNTIME: LazyLock<Arc<Runtime>> = LazyLock::new(|| {
+    Arc::new(
+        runtime::Builder::new_multi_thread()
+            .worker_threads(available_parallelism().unwrap().get())
+            .build()
+            .unwrap(),
+    )
+});
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
