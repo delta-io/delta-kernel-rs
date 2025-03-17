@@ -226,6 +226,11 @@ impl StructField {
             .unwrap()
             .into_owned()
     }
+
+    fn has_invariants(&self) -> bool {
+        self.metadata
+            .contains_key(ColumnMetadataKey::Invariants.as_ref())
+    }
 }
 
 /// A struct is used to represent both the top-level schema of the table
@@ -302,6 +307,34 @@ impl StructType {
         let mut get_leaves = GetSchemaLeaves::new(own_name.into());
         let _ = get_leaves.transform_struct(self);
         (get_leaves.names, get_leaves.types).into()
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct InvariantChecker {
+    has_invariants: bool,
+}
+
+impl<'a> SchemaTransform<'a> for InvariantChecker {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        if field.has_invariants() {
+            self.has_invariants = true;
+        } else if !self.has_invariants {
+            let _ = self.recurse_into_struct_field(field);
+        }
+        Some(Cow::Borrowed(field))
+    }
+}
+
+impl InvariantChecker {
+    /// Checks if any column in the schema (including nested columns) has invariants defined.
+    ///
+    /// This traverses the entire schema to check for the presence of the "delta.invariants"
+    /// metadata key.
+    pub(crate) fn has_invariants(schema: &Schema) -> bool {
+        let mut checker = InvariantChecker::default();
+        let _ = checker.transform_struct(schema);
+        checker.has_invariants
     }
 }
 
@@ -1207,5 +1240,92 @@ mod tests {
             MetadataValue::Other(array_json).to_string(),
             "[\"an\",\"array\"]"
         );
+    }
+
+    #[test]
+    fn test_has_invariants() {
+        // Schema with no invariants
+        let schema = StructType::new([
+            StructField::nullable("a", DataType::STRING),
+            StructField::nullable("b", DataType::INTEGER),
+        ]);
+        assert!(!InvariantChecker::has_invariants(&schema));
+
+        // Schema with top-level invariant
+        let mut field = StructField::nullable("c", DataType::STRING);
+        field.metadata.insert(
+            ColumnMetadataKey::Invariants.as_ref().to_string(),
+            MetadataValue::String("c > 0".to_string()),
+        );
+
+        let schema = StructType::new([StructField::nullable("a", DataType::STRING), field]);
+        assert!(InvariantChecker::has_invariants(&schema));
+
+        // Schema with nested invariant in a struct
+        let nested_field = StructField::nullable(
+            "nested_c",
+            DataType::struct_type([{
+                let mut field = StructField::nullable("d", DataType::INTEGER);
+                field.metadata.insert(
+                    ColumnMetadataKey::Invariants.as_ref().to_string(),
+                    MetadataValue::String("d > 0".to_string()),
+                );
+                field
+            }]),
+        );
+
+        let schema = StructType::new([
+            StructField::nullable("a", DataType::STRING),
+            StructField::nullable("b", DataType::INTEGER),
+            nested_field,
+        ]);
+        assert!(InvariantChecker::has_invariants(&schema));
+
+        // Schema with nested invariant in an array of structs
+        let array_field = StructField::nullable(
+            "array_field",
+            ArrayType::new(
+                DataType::struct_type([{
+                    let mut field = StructField::nullable("d", DataType::INTEGER);
+                    field.metadata.insert(
+                        ColumnMetadataKey::Invariants.as_ref().to_string(),
+                        MetadataValue::String("d > 0".to_string()),
+                    );
+                    field
+                }]),
+                true,
+            ),
+        );
+
+        let schema = StructType::new([
+            StructField::nullable("a", DataType::STRING),
+            StructField::nullable("b", DataType::INTEGER),
+            array_field,
+        ]);
+        assert!(InvariantChecker::has_invariants(&schema));
+
+        // Schema with nested invariant in a map value that's a struct
+        let map_field = StructField::nullable(
+            "map_field",
+            MapType::new(
+                DataType::STRING,
+                DataType::struct_type([{
+                    let mut field = StructField::nullable("d", DataType::INTEGER);
+                    field.metadata.insert(
+                        ColumnMetadataKey::Invariants.as_ref().to_string(),
+                        MetadataValue::String("d > 0".to_string()),
+                    );
+                    field
+                }]),
+                true,
+            ),
+        );
+
+        let schema = StructType::new([
+            StructField::nullable("a", DataType::STRING),
+            StructField::nullable("b", DataType::INTEGER),
+            map_field,
+        ]);
+        assert!(InvariantChecker::has_invariants(&schema));
     }
 }

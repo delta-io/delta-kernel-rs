@@ -288,11 +288,11 @@ impl Protocol {
                 ))
             }
             None => {
-                // no features, we currently only support version 1 in this case
+                // no features, we currently only support version 1 or 2 in this case
                 require!(
-                    self.min_writer_version == 1,
+                    self.min_writer_version == 1 || self.min_writer_version == 2,
                     Error::unsupported(
-                        "Currently delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1 or 7"
+                        "Currently delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1, 2, or 7"
                     )
                 );
                 Ok(())
@@ -325,6 +325,8 @@ where
         .iter()
         .map(|s| T::from_str(s).map_err(|_| error(vec![s.to_string()], "Unknown")))
         .collect::<Result<_, Error>>()?;
+
+    // check that parsed features are a subset of supported features
     parsed_features
         .is_subset(supported_features)
         .then_some(())
@@ -895,6 +897,7 @@ mod tests {
             Some(vec![
                 WriterFeatures::AppendOnly,
                 WriterFeatures::DeletionVectors,
+                WriterFeatures::Invariants,
             ]),
         )
         .unwrap();
