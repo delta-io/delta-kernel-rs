@@ -137,7 +137,16 @@ pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeatures>> =
     });
 
 pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<HashSet<WriterFeatures>> =
-    LazyLock::new(|| HashSet::from([WriterFeatures::AppendOnly, WriterFeatures::DeletionVectors]));
+    // note: we 'support' Invariants, but only insofar as we check that they are not present.
+    // we support writing to tables that have Invariants enabled but not used. similarly, we only
+    // support DeletionVectors in that we never write them (no DML).
+    LazyLock::new(|| {
+            HashSet::from([
+                WriterFeatures::AppendOnly,
+                WriterFeatures::DeletionVectors,
+                WriterFeatures::Invariants,
+            ])
+        });
 
 #[cfg(test)]
 mod tests {

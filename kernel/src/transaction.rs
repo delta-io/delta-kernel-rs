@@ -78,7 +78,9 @@ impl Transaction {
         let read_snapshot = snapshot.into();
 
         // important! before a read/write to the table we must check it is supported
-        read_snapshot.protocol().ensure_write_supported()?;
+        read_snapshot
+            .table_configuration()
+            .ensure_write_supported()?;
 
         Ok(Transaction {
             read_snapshot,
