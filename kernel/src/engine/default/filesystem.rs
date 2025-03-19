@@ -239,7 +239,7 @@ mod tests {
         let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
         let files: Vec<_> = engine
             .get_file_system_client()
-            .list_from(&table_root.join("_delta_log/0").unwrap())
+            .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap())
             .unwrap()
             .try_collect()
             .unwrap();
@@ -270,7 +270,7 @@ mod tests {
         let client = engine.get_file_system_client();
 
         let files = client
-            .list_from(&url.join("_delta_log/0").unwrap())
+            .list_from(&url.join("_delta_log").unwrap().join("0").unwrap())
             .unwrap();
         let mut len = 0;
         for (file, expected) in files.zip(expected_names.iter()) {
