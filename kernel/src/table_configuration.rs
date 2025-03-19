@@ -183,6 +183,7 @@ impl TableConfiguration {
     ///
     /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors>
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[allow(unused)] // needed to compile w/o default features
     pub(crate) fn is_deletion_vector_supported(&self) -> bool {
         let read_supported = self
             .protocol()
@@ -201,6 +202,7 @@ impl TableConfiguration {
     ///
     /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors>
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[allow(unused)] // needed to compile w/o default features
     pub(crate) fn is_deletion_vector_enabled(&self) -> bool {
         self.is_deletion_vector_supported()
             && self
