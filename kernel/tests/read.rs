@@ -1062,7 +1062,6 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
 
     let engine = Arc::new(DefaultEngine::new(
         storage.clone(),
-        Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
     ));
     let snapshot = Arc::new(table.snapshot(engine.as_ref(), None)?);
@@ -1126,7 +1125,6 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
 
     let engine = Arc::new(DefaultEngine::new(
         storage.clone(),
-        Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
     ));
     let snapshot = Arc::new(table.snapshot(engine.as_ref(), None)?);
