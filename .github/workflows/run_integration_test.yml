@@ -18,17 +18,11 @@ jobs:
       - name: Skip job for pull requests on Windows
         if: ${{ matrix.skip }}
         run: echo "Skipping job for pull requests on Windows."
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         if: ${{ !matrix.skip }}
-      - name: Install minimal stable rust
+      - name: Setup rust toolchain
         if: ${{ !matrix.skip }}
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: default
-          toolchain: stable
-          override: true
-      - uses: Swatinem/rust-cache@v2
-        if: ${{ !matrix.skip }}
+        uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Run integration tests
         if: ${{ !matrix.skip }}
         shell: bash
