@@ -22,7 +22,7 @@ pub type SchemaRef = Arc<StructType>;
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 #[serde(untagged)]
 pub enum MetadataValue {
-    Number(i32),
+    Number(i64),
     String(String),
     Boolean(bool),
     // The [PROTOCOL](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#struct-field) states
@@ -32,8 +32,8 @@ pub enum MetadataValue {
     Other(serde_json::Value),
 }
 
-impl std::fmt::Display for MetadataValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for MetadataValue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             MetadataValue::Number(n) => write!(f, "{n}"),
             MetadataValue::String(s) => write!(f, "{s}"),
@@ -61,8 +61,8 @@ impl From<&str> for MetadataValue {
     }
 }
 
-impl From<i32> for MetadataValue {
-    fn from(value: i32) -> Self {
+impl From<i64> for MetadataValue {
+    fn from(value: i64) -> Self {
         Self::Number(value)
     }
 }
@@ -1072,16 +1072,22 @@ mod tests {
             "nullable": true,
             "metadata": {
                 "delta.columnMapping.id": 4,
-                "delta.columnMapping.physicalName": "col-5f422f40-de70-45b2-88ab-1d5c90e94db1"
+                "delta.columnMapping.physicalName": "col-5f422f40-de70-45b2-88ab-1d5c90e94db1",
+                "delta.identity.start": 2147483648
             }
         }
         "#;
+
         let field: StructField = serde_json::from_str(data).unwrap();
 
         let col_id = field
             .get_config_value(&ColumnMetadataKey::ColumnMappingId)
             .unwrap();
+        let id_start = field
+            .get_config_value(&ColumnMetadataKey::IdentityStart)
+            .unwrap();
         assert!(matches!(col_id, MetadataValue::Number(num) if *num == 4));
+        assert!(matches!(id_start, MetadataValue::Number(num) if *num == 2147483648i64));
         assert_eq!(
             field.physical_name(),
             "col-5f422f40-de70-45b2-88ab-1d5c90e94db1"
