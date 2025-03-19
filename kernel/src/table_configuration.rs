@@ -14,13 +14,13 @@ use std::sync::{Arc, LazyLock};
 use url::Url;
 
 use crate::actions::{ensure_supported_features, Metadata, Protocol};
-use crate::schema::{Schema, SchemaRef};
+use crate::schema::{InvariantChecker, Schema, SchemaRef};
 use crate::table_features::{
     column_mapping_mode, validate_schema_column_mapping, ColumnMappingMode, ReaderFeatures,
     WriterFeatures,
 };
 use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Version};
+use crate::{DeltaResult, Error, Version};
 
 /// Holds all the configuration for a table at a specific version. This includes the supported
 /// reader and writer features, table properties, schema, version, and table root. This can be used
@@ -88,49 +88,66 @@ impl TableConfiguration {
             version,
         })
     }
+
     /// The [`Metadata`] for this table at this version.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn metadata(&self) -> &Metadata {
         &self.metadata
     }
+
     /// The [`Protocol`] of this table at this version.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn protocol(&self) -> &Protocol {
         &self.protocol
     }
+
     /// The [`Schema`] of for this table at this version.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn schema(&self) -> &Schema {
         self.schema.as_ref()
     }
+
     /// The [`TableProperties`] of this table at this version.
-    #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn table_properties(&self) -> &TableProperties {
         &self.table_properties
     }
+
     /// The [`ColumnMappingMode`] for this table at this version.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn column_mapping_mode(&self) -> ColumnMappingMode {
         self.column_mapping_mode
     }
+
     /// The [`Url`] of the table this [`TableConfiguration`] belongs to
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn table_root(&self) -> &Url {
         &self.table_root
     }
+
     /// The [`Version`] which this [`TableConfiguration`] belongs to.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn version(&self) -> Version {
         self.version
     }
+
     /// Returns `true` if the kernel supports writing to this table. This checks that the
     /// protocol's writer features are all supported.
-    #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    pub(crate) fn is_write_supported(&self) -> bool {
-        self.protocol.ensure_write_supported().is_ok()
+    pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
+        self.protocol.ensure_write_supported()?;
+
+        // for now we don't allow invariants so although we support writer version 2 and the
+        // ColumnInvariant TableFeature we _must_ check here that they are not actually in use
+        if self.is_invariants_supported() && InvariantChecker::has_invariants(self.schema()) {
+            return Err(Error::unsupported(
+                "Column invariants are not yet supported",
+            ));
+        }
+
+        Ok(())
     }
+
     /// Returns `true` if kernel supports reading Change Data Feed on this table.
     /// See the documentation of [`TableChanges`] for more details.
     ///
@@ -159,12 +176,12 @@ impl TableConfiguration {
         );
         protocol_supported && cdf_enabled && column_mapping_disabled
     }
+
     /// Returns `true` if deletion vectors is supported on this table. To support deletion vectors,
     /// a table must support reader version 3, writer version 7, and the deletionVectors feature in
     /// both the protocol's readerFeatures and writerFeatures.
     ///
     /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors>
-    #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn is_deletion_vector_supported(&self) -> bool {
         let read_supported = self
@@ -183,7 +200,6 @@ impl TableConfiguration {
     /// table property is set to `true`.
     ///
     /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors>
-    #[allow(unused)]
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn is_deletion_vector_enabled(&self) -> bool {
         self.is_deletion_vector_supported()
@@ -208,6 +224,15 @@ impl TableConfiguration {
     #[allow(unused)]
     pub(crate) fn is_append_only_enabled(&self) -> bool {
         self.is_append_only_supported() && self.table_properties.append_only.unwrap_or(false)
+    }
+
+    /// Returns `true` if the table supports the column invariant table feature.
+    pub(crate) fn is_invariants_supported(&self) -> bool {
+        let protocol = &self.protocol;
+        match protocol.min_writer_version() {
+            7 if protocol.has_writer_feature(&WriterFeatures::Invariants) => true,
+            version => (2..=6).contains(&version),
+        }
     }
 }
 
