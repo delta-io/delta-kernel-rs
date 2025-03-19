@@ -60,7 +60,7 @@ impl SetTransactionScanner {
             ))
         });
         self.snapshot
-            .log_segment
+            .log_segment()
             .replay(engine, schema.clone(), schema, META_PREDICATE.clone())
     }
 
@@ -80,7 +80,7 @@ impl SetTransactionScanner {
     }
 }
 
-#[cfg(all(test, feature = "default-engine"))]
+#[cfg(all(test, feature = "sync-engine"))]
 mod tests {
     use std::path::PathBuf;
 

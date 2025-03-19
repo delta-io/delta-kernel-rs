@@ -2,10 +2,11 @@
 
 use std::sync::Arc;
 
-use arrow_schema::{
-    ArrowError, DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+use crate::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
+use crate::arrow::error::ArrowError;
 use itertools::Itertools;
 
 use crate::error::Error;
@@ -263,8 +264,7 @@ mod tests {
     fn test_metadata_string_conversion() -> DeltaResult<()> {
         let mut metadata = HashMap::new();
         metadata.insert("description", "hello world".to_owned());
-        let struct_field =
-            StructField::new("name", DataType::STRING, false).with_metadata(metadata);
+        let struct_field = StructField::not_null("name", DataType::STRING).with_metadata(metadata);
 
         let arrow_field = ArrowField::try_from(&struct_field)?;
         let new_metadata = arrow_field.metadata();

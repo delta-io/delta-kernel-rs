@@ -51,6 +51,7 @@ pub enum KernelError {
     ParseIntervalError,
     ChangeDataFeedUnsupported,
     ChangeDataFeedIncompatibleSchema,
+    InvalidCheckpoint,
 }
 
 impl From<Error> for KernelError {
@@ -108,6 +109,7 @@ impl From<Error> for KernelError {
             Error::ChangeDataFeedIncompatibleSchema(_, _) => {
                 KernelError::ChangeDataFeedIncompatibleSchema
             }
+            Error::InvalidCheckpoint(_) => KernelError::InvalidCheckpoint,
         }
     }
 }

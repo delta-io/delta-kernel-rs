@@ -10,12 +10,16 @@
 //!
 //! A full `rust` example for reading table data using the default engine can be found in the
 //! [read-table-single-threaded] example (and for a more complex multi-threaded reader see the
-//! [read-table-multi-threaded] example).
+//! [read-table-multi-threaded] example). An example for reading the table changes for a table
+//! using the default engine can be found in the [read-table-changes] example.
+//!
 //!
 //! [read-table-single-threaded]:
 //! https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/examples/read-table-single-threaded
 //! [read-table-multi-threaded]:
 //! https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/examples/read-table-multi-threaded
+//! [read-table-changes]:
+//! https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/examples/read-table-changes
 //!
 //! Simple write examples can be found in the [`write.rs`] integration tests. Standalone write
 //! examples are coming soon!
@@ -78,10 +82,13 @@ pub mod schema;
 pub mod snapshot;
 pub mod table;
 pub mod table_changes;
+pub mod table_configuration;
 pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
 
+pub mod arrow;
+pub mod parquet;
 pub(crate) mod predicates;
 pub(crate) mod utils;
 
@@ -198,7 +205,7 @@ impl FileMeta {
 /// let b: Arc<Bar> = a.downcast().unwrap();
 /// ```
 ///
-/// In contrast, very similer code that relies only on `Any` would fail to compile:
+/// In contrast, very similar code that relies only on `Any` would fail to compile:
 ///
 /// ```fail_compile
 /// # use std::any::Any;
@@ -367,8 +374,20 @@ pub trait JsonHandler: AsAny {
         output_schema: SchemaRef,
     ) -> DeltaResult<Box<dyn EngineData>>;
 
-    /// Read and parse the JSON format file at given locations and return
-    /// the data as EngineData with the columns requested by physical schema.
+    /// Read and parse the JSON format file at given locations and return the data as EngineData with
+    /// the columns requested by physical schema. Note: The [`FileDataReadResultIterator`] must emit
+    /// data from files in the order that `files` is given. For example if files ["a", "b"] is provided,
+    /// then the engine data iterator must first return all the engine data from file "a", _then_ all
+    /// the engine data from file "b". Moreover, for a given file, all of its [`EngineData`] and
+    /// constituent rows must be in order that they occur in the file. Consider a file with rows
+    /// (1, 2, 3). The following are legal iterator batches:
+    ///    iter: [EngineData(1, 2), EngineData(3)]
+    ///    iter: [EngineData(1), EngineData(2, 3)]
+    ///    iter: [EngineData(1, 2, 3)]
+    /// The following are illegal batches:
+    ///    iter: [EngineData(3), EngineData(1, 2)]
+    ///    iter: [EngineData(1), EngineData(3, 2)]
+    ///    iter: [EngineData(2, 1, 3)]
     ///
     /// # Parameters
     ///
@@ -400,7 +419,7 @@ pub trait JsonHandler: AsAny {
     ///
     /// - `path` - URL specifying the location to write the JSON file
     /// - `data` - Iterator of EngineData to write to the JSON file. Each row should be written as
-    ///   a new JSON object appended to the file. (that is, the file is newline-delimeted JSON, and
+    ///   a new JSON object appended to the file. (that is, the file is newline-delimited JSON, and
     ///   each row is a JSON object on a single line)
     /// - `overwrite` - If true, overwrite the file if it exists. If false, the call must fail if
     ///   the file exists.
@@ -452,3 +471,15 @@ pub trait Engine: AsAny {
     /// Get the connector provided [`ParquetHandler`].
     fn get_parquet_handler(&self) -> Arc<dyn ParquetHandler>;
 }
+
+// we have an 'internal' feature flag: default-engine-base, which is actually just the shared
+// pieces of default-engine and default-engine-rustls. the crate can't compile with _only_
+// default-engine-base, so we give a friendly error here.
+#[cfg(all(
+    feature = "default-engine-base",
+    not(any(feature = "default-engine", feature = "default-engine-rustls",))
+))]
+compile_error!(
+    "The default-engine-base feature flag is not meant to be used directly. \
+    Please use either default-engine or default-engine-rustls."
+);

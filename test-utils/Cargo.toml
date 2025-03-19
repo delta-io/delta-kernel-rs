@@ -8,10 +8,10 @@ repository.workspace = true
 readme.workspace = true
 version.workspace = true
 
+[package.metadata.release]
+release = false
+
 [dependencies]
-arrow-array = { workspace = true, features = ["chrono-tz"] }
-arrow-schema = { workspace = true }
-delta_kernel = { path = "../kernel", features = [ "default-engine" ] }
+delta_kernel = { path = "../kernel", features = [  "default-engine", "arrow" ] }
 itertools = "0.13.0"
 object_store = { workspace = true }
-parquet = { workspace = true }

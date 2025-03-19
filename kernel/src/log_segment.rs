@@ -1,16 +1,21 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of  checkpoint and commit
 //! files.
 
-use crate::actions::{get_log_schema, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME};
-use crate::path::ParsedLogPath;
+use crate::actions::visitors::SidecarVisitor;
+use crate::actions::{
+    get_log_schema, Metadata, Protocol, ADD_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
+    SIDECAR_NAME,
+};
+use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::snapshot::CheckpointMetadata;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, FileSystemClient, Version,
+    DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, FileSystemClient,
+    ParquetHandler, RowVisitor, Version,
 };
 use itertools::Itertools;
-use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::convert::identity;
 use std::sync::{Arc, LazyLock};
 use tracing::warn;
@@ -68,7 +73,7 @@ impl LogSegment {
         {
             require!(
                 checkpoint_file.version + 1 == commit_file.version,
-                Error::generic(format!(
+                Error::InvalidCheckpoint(format!(
                     "Gap between checkpoint version {} and next commit {}",
                     checkpoint_file.version, commit_file.version,
                 ))
@@ -213,17 +218,146 @@ impl LogSegment {
             .read_json_files(&commit_files, commit_read_schema, meta_predicate.clone())?
             .map_ok(|batch| (batch, true));
 
-        let checkpoint_parts: Vec<_> = self
+        let checkpoint_stream =
+            self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate)?;
+
+        Ok(commit_stream.chain(checkpoint_stream))
+    }
+
+    /// Returns an iterator over checkpoint data, processing sidecar files when necessary.
+    ///
+    /// By default, `create_checkpoint_stream` checks for the presence of sidecar files, and
+    /// reads their contents if present. Checking for sidecar files is skipped if:
+    /// - The checkpoint is a multi-part checkpoint
+    /// - The checkpoint read schema does not contain a file action
+    ///
+    /// For single-part checkpoints, any referenced sidecar files are processed. These
+    /// sidecar files contain the actual file actions that would otherwise be
+    /// stored directly in the checkpoint. The sidecar file batches are chained to the
+    /// checkpoint batch in the top level iterator to be returned.
+    fn create_checkpoint_stream(
+        &self,
+        engine: &dyn Engine,
+        checkpoint_read_schema: SchemaRef,
+        meta_predicate: Option<ExpressionRef>,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
+        let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
+            || checkpoint_read_schema.contains(REMOVE_NAME);
+        require!(
+            !need_file_actions || checkpoint_read_schema.contains(SIDECAR_NAME),
+            Error::invalid_checkpoint(
+                "If the checkpoint read schema contains file actions, it must contain the sidecar column"
+            )
+        );
+
+        let checkpoint_file_meta: Vec<_> = self
             .checkpoint_parts
             .iter()
             .map(|f| f.location.clone())
             .collect();
-        let checkpoint_stream = engine
-            .get_parquet_handler()
-            .read_parquet_files(&checkpoint_parts, checkpoint_read_schema, meta_predicate)?
-            .map_ok(|batch| (batch, false));
 
-        Ok(commit_stream.chain(checkpoint_stream))
+        let parquet_handler = engine.get_parquet_handler();
+
+        // Historically, we had a shared file reader trait for JSON and Parquet handlers,
+        // but it was removed to avoid unnecessary coupling. This is a concrete case
+        // where it *could* have been useful, but for now, we're keeping them separate.
+        // If similar patterns start appearing elsewhere, we should reconsider that decision.
+        let actions = match self.checkpoint_parts.first() {
+            Some(parsed_log_path) if parsed_log_path.extension == "json" => {
+                engine.get_json_handler().read_json_files(
+                    &checkpoint_file_meta,
+                    checkpoint_read_schema.clone(),
+                    meta_predicate.clone(),
+                )?
+            }
+            Some(parsed_log_path) if parsed_log_path.extension == "parquet" => parquet_handler
+                .read_parquet_files(
+                    &checkpoint_file_meta,
+                    checkpoint_read_schema.clone(),
+                    meta_predicate.clone(),
+                )?,
+            Some(parsed_log_path) => {
+                return Err(Error::generic(format!(
+                    "Unsupported checkpoint file type: {}",
+                    parsed_log_path.extension,
+                )));
+            }
+            // This is the case when there are no checkpoints in the log segment
+            // so we return an empty iterator
+            None => Box::new(std::iter::empty()),
+        };
+
+        let log_root = self.log_root.clone();
+
+        let actions_iter = actions
+            .map(move |checkpoint_batch_result| -> DeltaResult<_> {
+                let checkpoint_batch = checkpoint_batch_result?;
+                // This closure maps the checkpoint batch to an iterator of batches
+                // by chaining the checkpoint batch with sidecar batches if they exist.
+
+                // 1. In the case where the schema does not contain file actions, we return the
+                //    checkpoint batch directly as sidecar files only have to be read when the
+                //    schema contains add/remove action.
+                // 2. Multi-part checkpoint batches never have sidecar actions, so the batch is
+                //    returned as-is.
+                let sidecar_content = if need_file_actions && checkpoint_file_meta.len() == 1 {
+                    Self::process_sidecars(
+                        parquet_handler.clone(), // cheap Arc clone
+                        log_root.clone(),
+                        checkpoint_batch.as_ref(),
+                        checkpoint_read_schema.clone(),
+                        meta_predicate.clone(),
+                    )?
+                } else {
+                    None
+                };
+
+                let combined_batches = std::iter::once(Ok(checkpoint_batch))
+                    .chain(sidecar_content.into_iter().flatten())
+                    // The boolean flag indicates whether the batch originated from a commit file
+                    // (true) or a checkpoint file (false).
+                    .map_ok(|sidecar_batch| (sidecar_batch, false));
+
+                Ok(combined_batches)
+            })
+            .flatten_ok()
+            .map(|result| result?); // result-result to result
+
+        Ok(actions_iter)
+    }
+
+    /// Processes sidecar files for the given checkpoint batch.
+    ///
+    /// This function extracts any sidecar file references from the provided batch.
+    /// Each sidecar file is read and an iterator of file action batches is returned
+    fn process_sidecars(
+        parquet_handler: Arc<dyn ParquetHandler>,
+        log_root: Url,
+        batch: &dyn EngineData,
+        checkpoint_read_schema: SchemaRef,
+        meta_predicate: Option<ExpressionRef>,
+    ) -> DeltaResult<Option<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>> {
+        // Visit the rows of the checkpoint batch to extract sidecar file references
+        let mut visitor = SidecarVisitor::default();
+        visitor.visit_rows_of(batch)?;
+
+        // If there are no sidecar files, return early
+        if visitor.sidecars.is_empty() {
+            return Ok(None);
+        }
+
+        let sidecar_files: Vec<_> = visitor
+            .sidecars
+            .iter()
+            .map(|sidecar| sidecar.to_filemeta(&log_root))
+            .try_collect()?;
+
+        // Read the sidecar files and return an iterator of sidecar file batches
+        Ok(Some(parquet_handler.read_parquet_files(
+            &sidecar_files,
+            checkpoint_read_schema,
+            meta_predicate,
+        )?))
     }
 
     // Get the most up-to-date Protocol and Metadata actions
@@ -309,35 +443,90 @@ fn list_log_files_with_version(
 ) -> DeltaResult<(Vec<ParsedLogPath>, Vec<ParsedLogPath>)> {
     // We expect 10 commit files per checkpoint, so start with that size. We could adjust this based
     // on config at some point
-    let mut commit_files = Vec::with_capacity(10);
-    let mut checkpoint_parts = vec![];
-    let mut max_checkpoint_version = start_version;
 
-    for parsed_path in list_log_files(fs_client, log_root, start_version, end_version)? {
-        let parsed_path = parsed_path?;
-        if parsed_path.is_commit() {
-            commit_files.push(parsed_path);
-        } else if parsed_path.is_checkpoint() {
-            let path_version = parsed_path.version;
-            match max_checkpoint_version {
-                None => {
-                    checkpoint_parts.push(parsed_path);
-                    max_checkpoint_version = Some(path_version);
+    let log_files = list_log_files(fs_client, log_root, start_version, end_version)?;
+
+    log_files.process_results(|iter| {
+        let mut commit_files = Vec::with_capacity(10);
+        let mut checkpoint_parts = vec![];
+
+        // Group log files by version
+        let log_files_per_version = iter.chunk_by(|x| x.version);
+
+        for (version, files) in &log_files_per_version {
+            let mut new_checkpoint_parts = vec![];
+            for file in files {
+                if file.is_commit() {
+                    commit_files.push(file);
+                } else if file.is_checkpoint() {
+                    new_checkpoint_parts.push(file);
+                } else {
+                    warn!(
+                        "Found a file with unknown file type {:?} at version {}",
+                        file.file_type, version
+                    );
                 }
-                Some(checkpoint_version) => match path_version.cmp(&checkpoint_version) {
-                    Ordering::Greater => {
-                        max_checkpoint_version = Some(path_version);
-                        checkpoint_parts.clear();
-                        checkpoint_parts.push(parsed_path);
-                    }
-                    Ordering::Equal => checkpoint_parts.push(parsed_path),
-                    Ordering::Less => {}
-                },
+            }
+
+            // Group and find the first complete checkpoint for this version.
+            // All checkpoints for the same version are equivalent, so we only take one.
+            if let Some((_, complete_checkpoint)) = group_checkpoint_parts(new_checkpoint_parts)
+                .into_iter()
+                // `num_parts` is guaranteed to be non-negative and within `usize` range
+                .find(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
+            {
+                checkpoint_parts = complete_checkpoint;
+                commit_files.clear(); // Log replay only uses commits after a complete checkpoint
             }
         }
-    }
+        (commit_files, checkpoint_parts)
+    })
+}
 
-    Ok((commit_files, checkpoint_parts))
+/// Groups all checkpoint parts according to the checkpoint they belong to.
+///
+/// NOTE: There could be a single-part and/or any number of uuid-based checkpoints. They
+/// are all equivalent, and this routine keeps only one of them (arbitrarily chosen).
+fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedLogPath>> {
+    let mut checkpoints: HashMap<u32, Vec<ParsedLogPath>> = HashMap::new();
+    for part_file in parts {
+        use LogPathFileType::*;
+        match &part_file.file_type {
+            SinglePartCheckpoint
+            | UuidCheckpoint(_)
+            | MultiPartCheckpoint {
+                part_num: 1,
+                num_parts: 1,
+            } => {
+                // All single-file checkpoints are equivalent, just keep one
+                checkpoints.insert(1, vec![part_file]);
+            }
+            MultiPartCheckpoint {
+                part_num: 1,
+                num_parts,
+            } => {
+                // Start a new multi-part checkpoint with at least 2 parts
+                checkpoints.insert(*num_parts, vec![part_file]);
+            }
+            MultiPartCheckpoint {
+                part_num,
+                num_parts,
+            } => {
+                // Continue a new multi-part checkpoint with at least 2 parts.
+                // Checkpoint parts are required to be in-order from log listing to build
+                // a multi-part checkpoint
+                if let Some(part_files) = checkpoints.get_mut(num_parts) {
+                    // `part_num` is guaranteed to be non-negative and within `usize` range
+                    if *part_num as usize == 1 + part_files.len() {
+                        // Safe to append because all previous parts exist
+                        part_files.push(part_file);
+                    }
+                }
+            }
+            Commit | CompactedCommit { .. } | Unknown => {}
+        }
+    }
+    checkpoints
 }
 
 /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that all
@@ -358,7 +547,7 @@ fn list_log_files_with_checkpoint(
 
     let Some(latest_checkpoint) = checkpoint_parts.last() else {
         // TODO: We could potentially recover here
-        return Err(Error::generic(
+        return Err(Error::invalid_checkpoint(
             "Had a _last_checkpoint hint but didn't find any checkpoints",
         ));
     };
@@ -369,7 +558,7 @@ fn list_log_files_with_checkpoint(
             latest_checkpoint.version
         );
     } else if checkpoint_parts.len() != checkpoint_metadata.parts.unwrap_or(1) {
-        return Err(Error::Generic(format!(
+        return Err(Error::InvalidCheckpoint(format!(
             "_last_checkpoint indicated that checkpoint should have {} parts, but it has {}",
             checkpoint_metadata.parts.unwrap_or(1),
             checkpoint_parts.len()

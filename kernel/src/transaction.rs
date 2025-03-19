@@ -78,7 +78,9 @@ impl Transaction {
         let read_snapshot = snapshot.into();
 
         // important! before a read/write to the table we must check it is supported
-        read_snapshot.protocol().ensure_write_supported()?;
+        read_snapshot
+            .table_configuration()
+            .ensure_write_supported()?;
 
         Ok(Transaction {
             read_snapshot,
@@ -241,7 +243,7 @@ impl WriteContext {
 /// Result after committing a transaction. If 'committed', the version is the new version written
 /// to the log. If 'conflict', the transaction is returned so the caller can resolve the conflict
 /// (along with the version which conflicted).
-// TODO(zach): in order to make the returning of a transcation useful, we need to add APIs to
+// TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
 // update the transaction to a new version etc.
 #[derive(Debug)]
 pub enum CommitResult {
@@ -277,10 +279,9 @@ fn generate_commit_info(
         // HACK (part 1/2): since we don't have proper map support, we create a literal struct with
         // one null field to create data that serializes as "operationParameters": {}
         Expression::literal(Scalar::Struct(StructData::try_new(
-            vec![StructField::new(
+            vec![StructField::nullable(
                 "operation_parameter_int",
                 DataType::INTEGER,
-                true,
             )],
             vec![Scalar::Null(DataType::INTEGER)],
         )?)),
@@ -304,10 +305,9 @@ fn generate_commit_info(
     };
     let engine_commit_info_schema =
         commit_info_data_type.project_as_struct(&["engineCommitInfo"])?;
-    let hack_data_type = DataType::Struct(Box::new(StructType::new(vec![StructField::new(
+    let hack_data_type = DataType::Struct(Box::new(StructType::new(vec![StructField::nullable(
         "hack_operation_parameter_int",
         DataType::INTEGER,
-        true,
     )])));
 
     commit_info_data_type
@@ -315,6 +315,12 @@ fn generate_commit_info(
         .get_mut("operationParameters")
         .ok_or_else(|| Error::missing_column("operationParameters"))?
         .data_type = hack_data_type;
+
+    // Since writing in-commit timestamps is not supported, we remove the field so it is not
+    // written to the log
+    commit_info_data_type
+        .fields
+        .shift_remove("inCommitTimestamp");
     commit_info_field.data_type = DataType::Struct(commit_info_data_type);
 
     let commit_info_evaluator = engine.get_expression_handler().get_evaluator(
@@ -335,11 +341,11 @@ mod tests {
     use crate::schema::MapType;
     use crate::{ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler};
 
-    use arrow::json::writer::LineDelimitedWriter;
-    use arrow::record_batch::RecordBatch;
-    use arrow_array::builder::StringBuilder;
-    use arrow_schema::Schema as ArrowSchema;
-    use arrow_schema::{DataType as ArrowDataType, Field};
+    use crate::arrow::array::{MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use crate::arrow::error::ArrowError;
+    use crate::arrow::json::writer::LineDelimitedWriter;
+    use crate::arrow::record_batch::RecordBatch;
 
     struct ExprEngine(Arc<dyn ExpressionHandler>);
 
@@ -367,16 +373,15 @@ mod tests {
         }
     }
 
-    fn build_map(entries: Vec<(&str, &str)>) -> arrow_array::MapArray {
+    fn build_map(entries: Vec<(&str, &str)>) -> MapArray {
         let key_builder = StringBuilder::new();
         let val_builder = StringBuilder::new();
-        let names = arrow_array::builder::MapFieldNames {
+        let names = MapFieldNames {
             entry: "entries".to_string(),
             key: "key".to_string(),
             value: "value".to_string(),
         };
-        let mut builder =
-            arrow_array::builder::MapBuilder::new(Some(names), key_builder, val_builder);
+        let mut builder = MapBuilder::new(Some(names), key_builder, val_builder);
         for (key, val) in entries {
             builder.keys().append_value(key);
             builder.values().append_value(val);
@@ -490,7 +495,7 @@ mod tests {
             engine_commit_info_schema,
             vec![
                 Arc::new(map_array),
-                Arc::new(arrow_array::StringArray::from(vec!["some_string"])),
+                Arc::new(StringArray::from(vec!["some_string"])),
             ],
         )?;
 
@@ -529,7 +534,7 @@ mod tests {
         )]));
         let commit_info_batch = RecordBatch::try_new(
             engine_commit_info_schema,
-            vec![Arc::new(arrow_array::StringArray::new_null(1))],
+            vec![Arc::new(StringArray::new_null(1))],
         )?;
 
         let _ = generate_commit_info(
@@ -538,12 +543,9 @@ mod tests {
             &ArrowEngineData::new(commit_info_batch),
         )
         .map_err(|e| match e {
-            Error::Arrow(arrow_schema::ArrowError::SchemaError(_)) => (),
+            Error::Arrow(ArrowError::SchemaError(_)) => (),
             Error::Backtraced { source, .. }
-                if matches!(
-                    &*source,
-                    Error::Arrow(arrow_schema::ArrowError::SchemaError(_))
-                ) => {}
+                if matches!(&*source, Error::Arrow(ArrowError::SchemaError(_))) => {}
             _ => panic!("expected arrow schema error error, got {:?}", e),
         });
 
@@ -560,7 +562,7 @@ mod tests {
         )]));
         let commit_info_batch = RecordBatch::try_new(
             engine_commit_info_schema,
-            vec![Arc::new(arrow_array::StringArray::new_null(1))],
+            vec![Arc::new(StringArray::new_null(1))],
         )?;
 
         let _ = generate_commit_info(
@@ -569,12 +571,9 @@ mod tests {
             &ArrowEngineData::new(commit_info_batch),
         )
         .map_err(|e| match e {
-            Error::Arrow(arrow_schema::ArrowError::InvalidArgumentError(_)) => (),
+            Error::Arrow(ArrowError::InvalidArgumentError(_)) => (),
             Error::Backtraced { source, .. }
-                if matches!(
-                    &*source,
-                    Error::Arrow(arrow_schema::ArrowError::InvalidArgumentError(_))
-                ) => {}
+                if matches!(&*source, Error::Arrow(ArrowError::InvalidArgumentError(_))) => {}
             _ => panic!("expected arrow invalid arg error, got {:?}", e),
         });
 
@@ -640,16 +639,16 @@ mod tests {
                 ),
                 true,
             )]));
-            use arrow_array::builder::StringBuilder;
+
             let key_builder = StringBuilder::new();
             let val_builder = StringBuilder::new();
-            let names = arrow_array::builder::MapFieldNames {
+            let names = crate::arrow::array::MapFieldNames {
                 entry: "entries".to_string(),
                 key: "key".to_string(),
                 value: "value".to_string(),
             };
             let mut builder =
-                arrow_array::builder::MapBuilder::new(Some(names), key_builder, val_builder);
+                crate::arrow::array::MapBuilder::new(Some(names), key_builder, val_builder);
             builder.append(is_null).unwrap();
             let array = builder.finish();
 
@@ -671,15 +670,14 @@ mod tests {
     fn test_write_metadata_schema() {
         let schema = get_write_metadata_schema();
         let expected = StructType::new(vec![
-            StructField::new("path", DataType::STRING, false),
-            StructField::new(
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null(
                 "partitionValues",
                 MapType::new(DataType::STRING, DataType::STRING, true),
-                false,
             ),
-            StructField::new("size", DataType::LONG, false),
-            StructField::new("modificationTime", DataType::LONG, false),
-            StructField::new("dataChange", DataType::BOOLEAN, false),
+            StructField::not_null("size", DataType::LONG),
+            StructField::not_null("modificationTime", DataType::LONG),
+            StructField::not_null("dataChange", DataType::BOOLEAN),
         ]);
         assert_eq!(*schema, expected.into());
     }

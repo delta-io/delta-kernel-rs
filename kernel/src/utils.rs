@@ -13,6 +13,7 @@ pub(crate) use require;
 
 #[cfg(test)]
 pub(crate) mod test_utils {
+    use crate::arrow::array::RecordBatch;
     use itertools::Itertools;
     use object_store::local::LocalFileSystem;
     use object_store::ObjectStore;
@@ -21,7 +22,11 @@ pub(crate) mod test_utils {
     use tempfile::TempDir;
     use test_utils::delta_path_for_version;
 
-    use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
+    use crate::{
+        actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove},
+        engine::arrow_data::ArrowEngineData,
+        EngineData,
+    };
 
     #[derive(Serialize)]
     pub(crate) enum Action {
@@ -73,9 +78,23 @@ pub(crate) mod test_utils {
                 .await
                 .expect("put log file in store");
         }
+
         /// Get the path to the root of the table.
         pub(crate) fn table_root(&self) -> &Path {
             self.dir.path()
         }
+    }
+
+    /// Try to convert an `EngineData` into a `RecordBatch`. Panics if not using `ArrowEngineData` from
+    /// the default module
+    fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
+        ArrowEngineData::try_from_engine_data(engine_data)
+            .unwrap()
+            .into()
+    }
+
+    /// Checks that two `EngineData` objects are equal by converting them to `RecordBatch` and comparing
+    pub(crate) fn assert_batch_matches(actual: Box<dyn EngineData>, expected: Box<dyn EngineData>) {
+        assert_eq!(into_record_batch(actual), into_record_batch(expected));
     }
 }

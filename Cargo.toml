@@ -6,6 +6,7 @@ members = [
     "kernel",
     "kernel/examples/*",
     "test-utils",
+    "feature-tests",
 ]
 # Only check / build main crates by default (check all with `--workspace`)
 default-members = ["acceptance", "kernel"]
@@ -18,22 +19,11 @@ keywords = ["deltalake", "delta", "datalake"]
 license = "Apache-2.0"
 repository = "https://github.com/delta-io/delta-kernel-rs"
 readme = "README.md"
-rust-version = "1.80"
-version = "0.5.0"
+rust-version = "1.81"
+version = "0.8.0"
 
 [workspace.dependencies]
-arrow = { version = ">=53, <54" }
-arrow-arith = { version = ">=53, <54" }
-arrow-array = { version = ">=53, <54" }
-arrow-buffer = { version = ">=53, <54" }
-arrow-cast = { version = ">=53, <54" }
-arrow-data = { version = ">=53, <54" }
-arrow-ord = { version = ">=53, <54" }
-arrow-json = { version = ">=53, <54" }
-arrow-select = { version = ">=53, <54" }
-arrow-schema = { version = ">=53, <54" }
-parquet = { version = ">=53, <54", features = ["object_store"] }
 object_store = { version = ">=0.11, <0.12" }
-hdfs-native-object-store = "0.12.0"
-hdfs-native = "0.10.0"
+hdfs-native-object-store = "0.13.0"
+hdfs-native = "0.11.0"
 walkdir = "2.5.0"

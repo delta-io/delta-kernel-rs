@@ -24,7 +24,7 @@ mod tests;
 /// Returns `None` if the predicate is not eligible for data skipping.
 ///
 /// We normalize each binary operation to a comparison between a column and a literal value and
-/// rewite that in terms of the min/max values of the column.
+/// rewrite that in terms of the min/max values of the column.
 /// For example, `1 < a` is rewritten as `minValues.a > 1`.
 ///
 /// For Unary `Not`, we push the Not down using De Morgan's Laws to invert everything below the Not.
@@ -36,8 +36,15 @@ mod tests;
 ///         are not eligible for data skipping.
 /// - `OR` is rewritten only if all operands are eligible for data skipping. Otherwise, the whole OR
 ///        expression is dropped.
-fn as_data_skipping_predicate(expr: &Expr, inverted: bool) -> Option<Expr> {
-    DataSkippingPredicateCreator.eval_expr(expr, inverted)
+#[cfg(test)]
+fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
+    DataSkippingPredicateCreator.eval(expr)
+}
+
+/// Like `as_data_skipping_predicate`, but invokes [`PredicateEvaluator::eval_sql_where`] instead
+/// of [`PredicateEvaluator::eval_expr`].
+fn as_sql_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
+    DataSkippingPredicateCreator.eval_sql_where(expr)
 }
 
 pub(crate) struct DataSkippingFilter {
@@ -59,7 +66,7 @@ impl DataSkippingFilter {
         physical_predicate: Option<(ExpressionRef, SchemaRef)>,
     ) -> Option<Self> {
         static PREDICATE_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
-            DataType::struct_type([StructField::new("predicate", DataType::BOOLEAN, true)])
+            DataType::struct_type([StructField::nullable("predicate", DataType::BOOLEAN)])
         });
         static STATS_EXPR: LazyLock<Expr> = LazyLock::new(|| column_expr!("add.stats"));
         static FILTER_EXPR: LazyLock<Expr> =
@@ -67,6 +74,28 @@ impl DataSkippingFilter {
 
         let (predicate, referenced_schema) = physical_predicate?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
+
+        // Convert all fields into nullable, as stats may not be available for all columns
+        // (and usually aren't for partition columns).
+        struct NullableStatsTransform;
+        impl<'a> SchemaTransform<'a> for NullableStatsTransform {
+            fn transform_struct_field(
+                &mut self,
+                field: &'a StructField,
+            ) -> Option<Cow<'a, StructField>> {
+                use Cow::*;
+                let field = match self.transform(&field.data_type)? {
+                    Borrowed(_) if field.is_nullable() => Borrowed(field),
+                    data_type => Owned(StructField {
+                        name: field.name.clone(),
+                        data_type: data_type.into_owned(),
+                        nullable: true,
+                        metadata: field.metadata.clone(),
+                    }),
+                };
+                Some(field)
+            }
+        }
 
         // Convert a min/max stats schema into a nullcount schema (all leaf fields are LONG)
         struct NullCountStatsTransform;
@@ -78,14 +107,19 @@ impl DataSkippingFilter {
                 Some(Cow::Owned(PrimitiveType::Long))
             }
         }
-        let nullcount_schema = NullCountStatsTransform
+
+        let stats_schema = NullableStatsTransform
             .transform_struct(&referenced_schema)?
             .into_owned();
+
+        let nullcount_schema = NullCountStatsTransform
+            .transform_struct(&stats_schema)?
+            .into_owned();
         let stats_schema = Arc::new(StructType::new([
-            StructField::new("numRecords", DataType::LONG, true),
-            StructField::new("nullCount", nullcount_schema, true),
-            StructField::new("minValues", referenced_schema.clone(), true),
-            StructField::new("maxValues", referenced_schema, true),
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", nullcount_schema),
+            StructField::nullable("minValues", stats_schema.clone()),
+            StructField::nullable("maxValues", stats_schema),
         ]));
 
         // Skipping happens in several steps:
@@ -108,7 +142,7 @@ impl DataSkippingFilter {
 
         let skipping_evaluator = engine.get_expression_handler().get_evaluator(
             stats_schema.clone(),
-            Expr::struct_from([as_data_skipping_predicate(&predicate, false)?]),
+            Expr::struct_from([as_sql_data_skipping_predicate(&predicate)?]),
             PREDICATE_SCHEMA.clone(),
         );
 
@@ -203,6 +237,10 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
             (Ordering::Greater, true) => BinaryOperator::LessThanOrEqual,
         };
         Some(Expr::binary(op, col, val.clone()))
+    }
+
+    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
+        PredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted).map(Expr::literal)
     }
 
     fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<Expr> {

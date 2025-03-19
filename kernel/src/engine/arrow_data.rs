@@ -2,15 +2,23 @@ use crate::engine_data::{EngineData, EngineList, EngineMap, GetData, RowVisitor}
 use crate::schema::{ColumnName, DataType};
 use crate::{DeltaResult, Error};
 
-use arrow_array::cast::AsArray;
-use arrow_array::types::{Int32Type, Int64Type};
-use arrow_array::{Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray};
-use arrow_schema::{FieldRef, DataType as ArrowDataType};
+use crate::arrow::array::cast::AsArray;
+use crate::arrow::array::types::{Int32Type, Int64Type};
+use crate::arrow::array::{
+    Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray,
+};
+use crate::arrow::datatypes::{DataType as ArrowDataType, FieldRef};
 use tracing::debug;
 
 use std::collections::{HashMap, HashSet};
 
-/// ArrowEngineData holds an Arrow RecordBatch, implements `EngineData` so the kernel can extract from it.
+pub use crate::engine::arrow_utils::fix_nested_null_masks;
+
+/// ArrowEngineData holds an Arrow `RecordBatch`, implements `EngineData` so the kernel can extract from it.
+///
+/// WARNING: Row visitors require that all leaf columns of the record batch have correctly computed
+/// NULL masks. The arrow parquet reader is known to produce incomplete NULL masks, for
+/// example. When in doubt, call [`fix_nested_null_masks`] first.
 pub struct ArrowEngineData {
     data: RecordBatch,
 }
@@ -38,6 +46,12 @@ impl ArrowEngineData {
 impl From<RecordBatch> for ArrowEngineData {
     fn from(value: RecordBatch) -> Self {
         ArrowEngineData::new(value)
+    }
+}
+
+impl From<StructArray> for ArrowEngineData {
+    fn from(value: StructArray) -> Self {
+        ArrowEngineData::new(value.into())
     }
 }
 
@@ -138,14 +152,20 @@ impl EngineData for ArrowEngineData {
         self.data.num_rows()
     }
 
-    fn visit_rows(&self, leaf_columns: &[ColumnName], visitor: &mut dyn RowVisitor) -> DeltaResult<()> {
+    fn visit_rows(
+        &self,
+        leaf_columns: &[ColumnName],
+        visitor: &mut dyn RowVisitor,
+    ) -> DeltaResult<()> {
         // Make sure the caller passed the correct number of column names
         let leaf_types = visitor.selected_column_names_and_types().1;
         if leaf_types.len() != leaf_columns.len() {
             return Err(Error::MissingColumn(format!(
                 "Visitor expected {} column names, but caller passed {}",
-                leaf_types.len(), leaf_columns.len()
-            )).with_backtrace());
+                leaf_types.len(),
+                leaf_columns.len()
+            ))
+            .with_backtrace());
         }
 
         // Collect the names of all leaf columns we want to extract, along with their parents, to
@@ -154,7 +174,7 @@ impl EngineData for ArrowEngineData {
         let mut mask = HashSet::new();
         for column in leaf_columns {
             for i in 0..column.len() {
-                mask.insert(&column[..i+1]);
+                mask.insert(&column[..i + 1]);
             }
         }
         debug!("Column mask for selected columns {leaf_columns:?} is {mask:#?}");
@@ -162,12 +182,11 @@ impl EngineData for ArrowEngineData {
         let mut getters = vec![];
         Self::extract_columns(&mut vec![], &mut getters, leaf_types, &mask, &self.data)?;
         if getters.len() != leaf_columns.len() {
-            return Err(Error::MissingColumn(
-                format!(
-                    "Visitor expected {} leaf columns, but only {} were found in the data",
-                    leaf_columns.len(), getters.len()
-                )
-            ));
+            return Err(Error::MissingColumn(format!(
+                "Visitor expected {} leaf columns, but only {} were found in the data",
+                leaf_columns.len(),
+                getters.len()
+            )));
         }
         visitor.visit(self.len(), &getters)
     }
@@ -185,14 +204,11 @@ impl ArrowEngineData {
             path.push(field.name().to_string());
             if column_mask.contains(&path[..]) {
                 if let Some(struct_array) = column.as_struct_opt() {
-                    debug!("Recurse into a struct array for {}", ColumnName::new(path.iter()));
-                    Self::extract_columns(
-                        path,
-                        getters,
-                        leaf_types,
-                        column_mask,
-                        struct_array,
-                    )?;
+                    debug!(
+                        "Recurse into a struct array for {}",
+                        ColumnName::new(path.iter())
+                    );
+                    Self::extract_columns(path, getters, leaf_types, column_mask, struct_array)?;
                 } else if column.data_type() == &ArrowDataType::Null {
                     debug!("Pushing a null array for {}", ColumnName::new(path.iter()));
                     getters.push(&());
@@ -215,16 +231,20 @@ impl ArrowEngineData {
         col: &'a dyn Array,
     ) -> DeltaResult<&'a dyn GetData<'a>> {
         use ArrowDataType::Utf8;
-        let col_as_list = || if let Some(array) = col.as_list_opt::<i32>() {
-            (array.value_type() == Utf8).then_some(array as _)
-        } else if let Some(array) = col.as_list_opt::<i64>() {
-            (array.value_type() == Utf8).then_some(array as _)
-        } else {
-            None
+        let col_as_list = || {
+            if let Some(array) = col.as_list_opt::<i32>() {
+                (array.value_type() == Utf8).then_some(array as _)
+            } else if let Some(array) = col.as_list_opt::<i64>() {
+                (array.value_type() == Utf8).then_some(array as _)
+            } else {
+                None
+            }
         };
-        let col_as_map = || col.as_map_opt().and_then(|array| {
-            (array.key_type() == &Utf8 && array.value_type() == &Utf8).then_some(array as _)
-        });
+        let col_as_map = || {
+            col.as_map_opt().and_then(|array| {
+                (array.key_type() == &Utf8 && array.value_type() == &Utf8).then_some(array as _)
+            })
+        };
         let result: Result<&'a dyn GetData<'a>, _> = match data_type {
             &DataType::BOOLEAN => {
                 debug!("Pushing boolean array for {}", ColumnName::new(path));
@@ -236,11 +256,15 @@ impl ArrowEngineData {
             }
             &DataType::INTEGER => {
                 debug!("Pushing int32 array for {}", ColumnName::new(path));
-                col.as_primitive_opt::<Int32Type>().map(|a| a as _).ok_or("int")
+                col.as_primitive_opt::<Int32Type>()
+                    .map(|a| a as _)
+                    .ok_or("int")
             }
             &DataType::LONG => {
                 debug!("Pushing int64 array for {}", ColumnName::new(path));
-                col.as_primitive_opt::<Int64Type>().map(|a| a as _).ok_or("long")
+                col.as_primitive_opt::<Int64Type>()
+                    .map(|a| a as _)
+                    .ok_or("long")
             }
             DataType::Array(_) => {
                 debug!("Pushing list for {}", ColumnName::new(path));
@@ -252,14 +276,17 @@ impl ArrowEngineData {
             }
             data_type => {
                 return Err(Error::UnexpectedColumnType(format!(
-                    "On {}: Unsupported type {data_type}", ColumnName::new(path)
+                    "On {}: Unsupported type {data_type}",
+                    ColumnName::new(path)
                 )));
             }
         };
         result.map_err(|type_name| {
             Error::UnexpectedColumnType(format!(
                 "Type mismatch on {}: expected {}, got {}",
-                ColumnName::new(path), type_name, col.data_type()
+                ColumnName::new(path),
+                type_name,
+                col.data_type()
             ))
         })
     }
@@ -269,8 +296,8 @@ impl ArrowEngineData {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use crate::arrow::array::{RecordBatch, StringArray};
+    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 
     use crate::{
         actions::{get_log_schema, Metadata, Protocol},

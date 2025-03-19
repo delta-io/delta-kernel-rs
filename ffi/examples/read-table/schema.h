@@ -34,6 +34,7 @@ typedef struct
 {
   char* name;
   char* type;
+  bool is_nullable;
   uintptr_t children;
 } SchemaItem;
 
@@ -51,11 +52,12 @@ typedef struct
 
 // lists are preallocated to have exactly enough space, so we just fill in the next open slot and
 // increment our length
-SchemaItem* add_to_list(SchemaItemList* list, char* name, char* type)
+SchemaItem* add_to_list(SchemaItemList* list, char* name, char* type, bool is_nullable)
 {
   int idx = list->len;
   list->list[idx].name = name;
   list->list[idx].type = type;
+  list->list[idx].is_nullable = is_nullable;
   list->len++;
   return &list->list[idx];
 }
@@ -83,6 +85,24 @@ void print_list(SchemaBuilder* builder, uintptr_t list_id, int indent, int paren
   }
 }
 
+void print_physical_name(const char *name, const CStringMap* metadata)
+{
+#ifdef VERBOSE
+  char* key_str = "delta.columnMapping.physicalName";
+  KernelStringSlice key = { key_str, strlen(key_str) };
+  char* value = get_from_map(metadata, key, allocate_string);
+  if (value) {
+    printf("Physical name of %s is %s\n", name, value);
+    free(value);
+  } else {
+    printf("No physical name\n");
+  }
+#else
+  (void)name;
+  (void)metadata;
+#endif
+}
+
 // declare all our visitor methods
 uintptr_t make_field_list(void* data, uintptr_t reserve)
 {
@@ -106,42 +126,51 @@ void visit_struct(
   void* data,
   uintptr_t sibling_list_id,
   struct KernelStringSlice name,
+  bool is_nullable,
+  const CStringMap * metadata,
   uintptr_t child_list_id)
 {
   SchemaBuilder* builder = data;
   char* name_ptr = allocate_string(name);
   PRINT_CHILD_VISIT("struct", name_ptr, sibling_list_id, "Children", child_list_id);
-  SchemaItem* struct_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "struct");
+  print_physical_name(name_ptr, metadata);
+  SchemaItem* struct_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "struct", is_nullable);
   struct_item->children = child_list_id;
 }
+
 void visit_array(
   void* data,
   uintptr_t sibling_list_id,
   struct KernelStringSlice name,
-  bool contains_null,
+  bool is_nullable,
+  const CStringMap * metadata,
   uintptr_t child_list_id)
 {
   SchemaBuilder* builder = data;
-  char* name_ptr = malloc(sizeof(char) * (name.len + 24));
+  char* name_ptr = malloc(sizeof(char) * (name.len + 22));
   snprintf(name_ptr, name.len + 1, "%s", name.ptr);
-  snprintf(name_ptr + name.len, 24, " (contains null: %s)", contains_null ? "true" : "false");
+  snprintf(name_ptr + name.len, 22, " (is nullable: %s)", is_nullable ? "true" : "false");
+  print_physical_name(name_ptr, metadata);
   PRINT_CHILD_VISIT("array", name_ptr, sibling_list_id, "Types", child_list_id);
-  SchemaItem* array_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "array");
+  SchemaItem* array_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "array", is_nullable);
   array_item->children = child_list_id;
 }
+
 void visit_map(
   void* data,
   uintptr_t sibling_list_id,
   struct KernelStringSlice name,
-  bool value_contains_null,
+  bool is_nullable,
+  const CStringMap * metadata,
   uintptr_t child_list_id)
 {
   SchemaBuilder* builder = data;
-  char* name_ptr = malloc(sizeof(char) * (name.len + 24));
+  char* name_ptr = malloc(sizeof(char) * (name.len + 22));
   snprintf(name_ptr, name.len + 1, "%s", name.ptr);
-  snprintf(name_ptr + name.len, 24, " (contains null: %s)", value_contains_null ? "true" : "false");
+  snprintf(name_ptr + name.len, 22, " (is nullable: %s)", is_nullable ? "true" : "false");
+  print_physical_name(name_ptr, metadata);
   PRINT_CHILD_VISIT("map", name_ptr, sibling_list_id, "Types", child_list_id);
-  SchemaItem* map_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "map");
+  SchemaItem* map_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "map", is_nullable);
   map_item->children = child_list_id;
 }
 
@@ -149,6 +178,8 @@ void visit_decimal(
   void* data,
   uintptr_t sibling_list_id,
   struct KernelStringSlice name,
+  bool is_nullable,
+  const CStringMap * metadata,
   uint8_t precision,
   uint8_t scale)
 {
@@ -156,26 +187,30 @@ void visit_decimal(
   char* name_ptr = allocate_string(name);
   char* type = malloc(19 * sizeof(char));
   snprintf(type, 19, "decimal(%u)(%d)", precision, scale);
+  print_physical_name(name_ptr, metadata);
   PRINT_NO_CHILD_VISIT(type, name_ptr, sibling_list_id);
-  add_to_list(&builder->lists[sibling_list_id], name_ptr, type);
+  add_to_list(&builder->lists[sibling_list_id], name_ptr, type, is_nullable);
 }
 
 void visit_simple_type(
   void* data,
   uintptr_t sibling_list_id,
   struct KernelStringSlice name,
+  bool is_nullable,
+  const CStringMap * metadata,
   char* type)
 {
   SchemaBuilder* builder = data;
   char* name_ptr = allocate_string(name);
+  print_physical_name(name_ptr, metadata);
   PRINT_NO_CHILD_VISIT(type, name_ptr, sibling_list_id);
-  add_to_list(&builder->lists[sibling_list_id], name_ptr, type);
+  add_to_list(&builder->lists[sibling_list_id], name_ptr, type, is_nullable);
 }
 
-#define DEFINE_VISIT_SIMPLE_TYPE(typename)                                                         \
-  void visit_##typename(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name)      \
-  {                                                                                                \
-    visit_simple_type(data, sibling_list_id, name, #typename);                                     \
+#define DEFINE_VISIT_SIMPLE_TYPE(typename)                                                                                                  \
+  void visit_##typename(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name, bool is_nullable, const CStringMap * metadata)\
+  {                                                                                                                                         \
+    visit_simple_type(data, sibling_list_id, name, is_nullable, metadata, #typename);                                                       \
   }
 
 DEFINE_VISIT_SIMPLE_TYPE(string)
@@ -238,7 +273,8 @@ void print_schema(SharedSnapshot* snapshot)
     .visit_timestamp = visit_timestamp,
     .visit_timestamp_ntz = visit_timestamp_ntz,
   };
-  uintptr_t schema_list_id = visit_schema(snapshot, &visitor);
+  SharedSchema* schema = logical_schema(snapshot);
+  uintptr_t schema_list_id = visit_schema(schema, &visitor);
 #ifdef VERBOSE
   printf("Schema returned in list %" PRIxPTR "\n", schema_list_id);
 #endif
@@ -246,5 +282,6 @@ void print_schema(SharedSnapshot* snapshot)
   printf("Schema:\n");
   print_list(&builder, schema_list_id, 0, 0);
   printf("\n");
+  free_schema(schema);
   free_builder(builder);
 }

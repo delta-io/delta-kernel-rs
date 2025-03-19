@@ -176,37 +176,37 @@ impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
 pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
     static CDF_SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| {
         let deletion_vector = StructType::new([
-            StructField::new("storageType", DataType::STRING, true),
-            StructField::new("pathOrInlineDv", DataType::STRING, true),
-            StructField::new("offset", DataType::INTEGER, true),
-            StructField::new("sizeInBytes", DataType::INTEGER, true),
-            StructField::new("cardinality", DataType::LONG, true),
+            StructField::nullable("storageType", DataType::STRING),
+            StructField::nullable("pathOrInlineDv", DataType::STRING),
+            StructField::nullable("offset", DataType::INTEGER),
+            StructField::nullable("sizeInBytes", DataType::INTEGER),
+            StructField::nullable("cardinality", DataType::LONG),
         ]);
         let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
         let file_constant_values =
-            StructType::new([StructField::new("partitionValues", partition_values, true)]);
+            StructType::new([StructField::nullable("partitionValues", partition_values)]);
 
         let add = StructType::new([
-            StructField::new("path", DataType::STRING, true),
-            StructField::new("deletionVector", deletion_vector.clone(), true),
-            StructField::new("fileConstantValues", file_constant_values.clone(), true),
+            StructField::nullable("path", DataType::STRING),
+            StructField::nullable("deletionVector", deletion_vector.clone()),
+            StructField::nullable("fileConstantValues", file_constant_values.clone()),
         ]);
         let remove = StructType::new([
-            StructField::new("path", DataType::STRING, true),
-            StructField::new("deletionVector", deletion_vector, true),
-            StructField::new("fileConstantValues", file_constant_values.clone(), true),
+            StructField::nullable("path", DataType::STRING),
+            StructField::nullable("deletionVector", deletion_vector),
+            StructField::nullable("fileConstantValues", file_constant_values.clone()),
         ]);
         let cdc = StructType::new([
-            StructField::new("path", DataType::STRING, true),
-            StructField::new("fileConstantValues", file_constant_values, true),
+            StructField::nullable("path", DataType::STRING),
+            StructField::nullable("fileConstantValues", file_constant_values),
         ]);
 
         Arc::new(StructType::new([
-            StructField::new("add", add, true),
-            StructField::new("remove", remove, true),
-            StructField::new("cdc", cdc, true),
-            StructField::new("timestamp", DataType::LONG, false),
-            StructField::new("commit_version", DataType::LONG, false),
+            StructField::nullable("add", add),
+            StructField::nullable("remove", remove),
+            StructField::nullable("cdc", cdc),
+            StructField::not_null("timestamp", DataType::LONG),
+            StructField::not_null("commit_version", DataType::LONG),
         ]))
     });
     CDF_SCAN_ROW_SCHEMA.clone()
@@ -334,8 +334,8 @@ mod tests {
         )
         .unwrap();
         let table_schema = StructType::new([
-            StructField::new("id", DataType::INTEGER, true),
-            StructField::new("value", DataType::STRING, true),
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("value", DataType::STRING),
         ]);
         let scan_data = table_changes_action_iter(
             Arc::new(engine),

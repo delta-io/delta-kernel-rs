@@ -17,7 +17,7 @@ error[E0277]: `*mut u32` cannot be shared between threads safely
 14 |     let h: Handle<SharedNotSync> = Arc::new(s).into();
    |                                                ^^^^ `*mut u32` cannot be shared between threads safely
    |
-   = help: within `NotSync`, the trait `Sync` is not implemented for `*mut u32`, which is required by `Arc<NotSync>: Into<_>`
+   = help: within `NotSync`, the trait `Sync` is not implemented for `*mut u32`
 note: required because it appears within the type `NotSync`
   --> tests/invalid-handle-code/shared-not-sync.rs:5:12
    |
