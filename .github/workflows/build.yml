@@ -10,27 +10,20 @@ jobs:
   format:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - name: Install minimal stable with clippy and rustfmt
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - name: Install minimal stable with rustfmt
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          profile: default
-          toolchain: stable
-          override: true
-      - uses: Swatinem/rust-cache@v2
+          components: rustfmt
       - name: format
         run: cargo fmt -- --check
+
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install minimal stable and cargo msrv
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: default
-          toolchain: stable
-          override: true
-      - uses: Swatinem/rust-cache@v2
+        uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Install cargo-msrv
         shell: bash
         run: |
@@ -46,11 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install minimal stable and cargo msrv
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: default
-          toolchain: stable
-          override: true
+        uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-msrv
         shell: bash
@@ -74,16 +63,12 @@ jobs:
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install minimal stable
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: default
-          toolchain: stable
-          override: true
-      - uses: Swatinem/rust-cache@v2
+        uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: build docs
         run: cargo doc
+
   build:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -93,16 +78,11 @@ jobs:
           - ubuntu-latest
           - windows-latest
     steps:
-      - uses: actions/checkout@v3
-      - name: Install minimal stable with clippy and rustfmt
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - name: Install minimal stable with clippy
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          profile: default
-          toolchain: stable
-          override: true
-      - uses: Swatinem/rust-cache@v2
-      - name: check kernel builds with no-default-features
-        run: cargo build -p delta_kernel --no-default-features
+          components: clippy
       - name: build and lint with clippy
         run: cargo clippy --benches --tests --all-features -- -D warnings
       - name: lint without default features
@@ -120,14 +100,9 @@ jobs:
           - ubuntu-latest
           - windows-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install minimal stable with clippy and rustfmt
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: default
-          toolchain: stable
-          override: true
-      - uses: Swatinem/rust-cache@v2
+        uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: test
         run: cargo test --workspace --verbose --all-features -- --skip read_table_version_hdfs
 
@@ -220,14 +195,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: default
-          toolchain: stable
-          override: true
+        uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
-      - uses: Swatinem/rust-cache@v2
       - name: Generate code coverage
         run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json -- --skip read_table_version_hdfs
       - name: Upload coverage to Codecov
