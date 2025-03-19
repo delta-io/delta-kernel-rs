@@ -50,13 +50,13 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
             offset.clone()
         } else {
             let parts = offset.parts().collect_vec();
-            if parts.is_empty() {
+            if parts.pop().is_empty() {
                 return Err(Error::generic(format!(
                     "Offset path must not be a root directory. Got: '{}'",
                     url.as_str()
                 )));
             }
-            Path::from_iter(parts[..parts.len() - 1].iter().cloned())
+            Path::from_iter(parts)
         };
 
         let store = self.inner.clone();
