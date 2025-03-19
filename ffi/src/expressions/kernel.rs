@@ -96,7 +96,7 @@ pub struct EngineExpressionVisitor {
     pub visit_literal_decimal: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
-        value_ms: u64,
+        value_ms: i64,
         value_ls: u64,
         precision: u8,
         scale: u8,
@@ -318,14 +318,12 @@ pub fn visit_expression_internal(
                 buf.len()
             ),
             Scalar::Decimal(value, precision, scale) => {
-                let ms: u64 = (value >> 64) as u64;
-                let ls: u64 = *value as u64;
                 call!(
                     visitor,
                     visit_literal_decimal,
                     sibling_list_id,
-                    ms,
-                    ls,
+                    (value >> 64) as i64,
+                    *value as u64,
                     *precision,
                     *scale
                 )

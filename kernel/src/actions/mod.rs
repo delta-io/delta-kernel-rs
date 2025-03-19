@@ -14,7 +14,8 @@ use crate::table_features::{
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{DeltaResult, EngineData, Error, RowVisitor as _};
+use crate::{DeltaResult, EngineData, Error, FileMeta, RowVisitor as _};
+use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use delta_kernel_derive::Schema;
@@ -296,11 +297,11 @@ impl Protocol {
                 ))
             }
             None => {
-                // no features, we currently only support version 1 in this case
+                // no features, we currently only support version 1 or 2 in this case
                 require!(
-                    self.min_writer_version == 1,
+                    self.min_writer_version == 1 || self.min_writer_version == 2,
                     Error::unsupported(
-                        "Currently delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1 or 7"
+                        "Currently delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1, 2, or 7"
                     )
                 );
                 Ok(())
@@ -573,12 +574,11 @@ pub struct SetTransaction {
 /// file actions. This action is only allowed in checkpoints following the V2 spec.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-file-information
-#[allow(unused)] //TODO: Remove once we implement V2 checkpoint file processing
 #[derive(Schema, Debug, PartialEq)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct Sidecar {
     /// A path to a sidecar file that can be either:
-    /// - A relative path (just the file name) within the `_delta_log/_sidecars` directory.  
+    /// - A relative path (just the file name) within the `_delta_log/_sidecars` directory.
     /// - An absolute path
     /// The path is a URI as specified by [RFC 2396 URI Generic Syntax], which needs to be decoded
     /// to get the file path.
@@ -594,6 +594,25 @@ pub(crate) struct Sidecar {
 
     /// A map containing any additional metadata about the logicial file.
     pub tags: Option<HashMap<String, String>>,
+}
+
+impl Sidecar {
+    /// Convert a Sidecar record to a FileMeta.
+    ///
+    /// This helper first builds the URL by joining the provided log_root with
+    /// the "_sidecars/" folder and the given sidecar path.
+    pub(crate) fn to_filemeta(&self, log_root: &Url) -> DeltaResult<FileMeta> {
+        Ok(FileMeta {
+            location: log_root.join("_sidecars/")?.join(&self.path)?,
+            last_modified: self.modification_time,
+            size: self.size_in_bytes.try_into().map_err(|_| {
+                Error::generic(format!(
+                    "Failed to convert sidecar size {} to usize",
+                    self.size_in_bytes
+                ))
+            })?,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -841,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v2_checkpoint_unsupported() {
+    fn test_v2_checkpoint_supported() {
         let protocol = Protocol::try_new(
             3,
             7,
@@ -849,7 +868,7 @@ mod tests {
             Some([ReaderFeatures::V2Checkpoint]),
         )
         .unwrap();
-        assert!(protocol.ensure_read_supported().is_err());
+        assert!(protocol.ensure_read_supported().is_ok());
 
         let protocol = Protocol::try_new(
             4,
@@ -879,7 +898,7 @@ mod tests {
             Some(&empty_features),
         )
         .unwrap();
-        assert!(protocol.ensure_read_supported().is_err());
+        assert!(protocol.ensure_read_supported().is_ok());
 
         let protocol = Protocol::try_new(
             3,
@@ -897,7 +916,7 @@ mod tests {
             Some([WriterFeatures::V2Checkpoint]),
         )
         .unwrap();
-        assert!(protocol.ensure_read_supported().is_err());
+        assert!(protocol.ensure_read_supported().is_ok());
 
         let protocol = Protocol {
             min_reader_version: 1,
@@ -918,19 +937,24 @@ mod tests {
 
     #[test]
     fn test_ensure_write_supported() {
-        let protocol = Protocol {
-            min_reader_version: 3,
-            min_writer_version: 7,
-            reader_features: Some(vec![]),
-            writer_features: Some(vec![]),
-        };
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some(vec![
+                WriterFeatures::AppendOnly,
+                WriterFeatures::DeletionVectors,
+                WriterFeatures::Invariants,
+            ]),
+        )
+        .unwrap();
         assert!(protocol.ensure_write_supported().is_ok());
 
         let protocol = Protocol::try_new(
             3,
             7,
             Some([ReaderFeatures::DeletionVectors]),
-            Some([WriterFeatures::DeletionVectors]),
+            Some([WriterFeatures::RowTracking]),
         )
         .unwrap();
         assert!(protocol.ensure_write_supported().is_err());

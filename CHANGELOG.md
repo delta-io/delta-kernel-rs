@@ -1,5 +1,36 @@
 # Changelog
 
+## [v0.8.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.8.0/) (2025-03-04)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.7.0...v0.8.0)
+
+### 🏗️ Breaking changes
+
+1. ffi: `get_partition_column_count` and `get_partition_columns` now take a `Snapshot` instead of a
+   `Scan` ([#697])
+2. ffi: expression visitor callback `visit_literal_decimal` now takes `i64` for the upper half of a 128-bit int value  ([#724])
+3. - `DefaultJsonHandler::with_readahead()` renamed to `DefaultJsonHandler::with_buffer_size()` ([#711])
+4. DefaultJsonHandler's defaults changed:
+  - default buffer size: 10 => 1000 requests/files
+  - default batch size: 1024 => 1000 rows
+5. Bump MSRV to rustc 1.81 ([#725])
+
+### 🐛 Bug Fixes
+
+1. Pin `chrono` version to fix arrow compilation failure ([#719])
+
+### ⚡ Performance
+
+1. Replace default engine JSON reader's `FileStream` with concurrent futures ([#711])
+
+
+[#719]: https://github.com/delta-io/delta-kernel-rs/pull/719
+[#724]: https://github.com/delta-io/delta-kernel-rs/pull/724
+[#697]: https://github.com/delta-io/delta-kernel-rs/pull/697
+[#725]: https://github.com/delta-io/delta-kernel-rs/pull/725
+[#711]: https://github.com/delta-io/delta-kernel-rs/pull/711
+
+
 ## [v0.7.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.7.0/) (2025-02-24)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.6.1...v0.7.0)
