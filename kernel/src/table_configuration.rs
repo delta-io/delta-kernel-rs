@@ -14,6 +14,7 @@ use std::sync::{Arc, LazyLock};
 use url::Url;
 
 use crate::actions::{ensure_reader_supported_features, Metadata, Protocol};
+use crate::schema::InvariantChecker;
 use crate::schema::{Schema, SchemaRef};
 use crate::table_features::{
     column_mapping_mode, validate_schema_column_mapping, ColumnMappingMode, ReaderFeatures,
@@ -220,7 +221,7 @@ impl TableConfiguration {
     pub(crate) fn is_append_only_supported(&self) -> bool {
         let protocol = &self.protocol;
         match protocol.min_writer_version() {
-            7 if protocol.has_writer_feature(&WriterFeatures::AppendOnly) => true,
+            7 if protocol.has_writer_feature(WriterFeatures::AppendOnly) => true,
             version => (2..=6).contains(&version),
         }
     }
@@ -234,7 +235,7 @@ impl TableConfiguration {
     pub(crate) fn is_invariants_supported(&self) -> bool {
         let protocol = &self.protocol;
         match protocol.min_writer_version() {
-            7 if protocol.has_writer_feature(&WriterFeatures::Invariants) => true,
+            7 if protocol.has_writer_feature(WriterFeatures::Invariants) => true,
             version => (2..=6).contains(&version),
         }
     }
