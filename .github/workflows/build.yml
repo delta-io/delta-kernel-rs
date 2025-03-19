@@ -118,7 +118,7 @@ jobs:
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
         with:
-          cmake-version: "3.30.x"
+          cmake-version: '3.30.x'
       - name: Install arrow-glib
         run: |
           if [ "$RUNNER_OS" == "Linux" ]; then
