@@ -44,16 +44,18 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
         &self,
         path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
-        let url = path.clone();
+        // The offset is used for list-after; the prefix is used to restrict the listing to a specific directory.
+        // Unfortunately, `Path`` provides no easy way to check whether a name is directory-like,
+        // because it strips trailing /, so we're reduced to manually checking the original URL.
         let offset = Path::from_url_path(path.path())?;
-        let prefix = if url.path().ends_with('/') {
+        let prefix = if path.path().ends_with('/') {
             offset.clone()
         } else {
-            let parts = offset.parts().collect_vec();
-            if parts.pop().is_empty() {
+            let mut parts = offset.parts().collect_vec();
+            if parts.pop().is_none() {
                 return Err(Error::generic(format!(
                     "Offset path must not be a root directory. Got: '{}'",
-                    url.as_str()
+                    path.as_str()
                 )));
             }
             Path::from_iter(parts)
@@ -63,7 +65,7 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
 
         // This channel will become the iterator
         let (sender, receiver) = std::sync::mpsc::sync_channel(4_000);
-
+        let url = path.clone();
         self.task_executor.spawn(async move {
             let mut stream = store.list_with_offset(Some(&prefix), &offset);
 
