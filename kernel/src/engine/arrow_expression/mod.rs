@@ -79,40 +79,35 @@ impl Scalar {
                     None,
                 ))
             }
-            Null(data_type) => match data_type {
-                DataType::Primitive(primitive) => match primitive {
-                    PrimitiveType::Byte => Arc::new(Int8Array::new_null(num_rows)),
-                    PrimitiveType::Short => Arc::new(Int16Array::new_null(num_rows)),
-                    PrimitiveType::Integer => Arc::new(Int32Array::new_null(num_rows)),
-                    PrimitiveType::Long => Arc::new(Int64Array::new_null(num_rows)),
-                    PrimitiveType::Float => Arc::new(Float32Array::new_null(num_rows)),
-                    PrimitiveType::Double => Arc::new(Float64Array::new_null(num_rows)),
-                    PrimitiveType::String => Arc::new(StringArray::new_null(num_rows)),
-                    PrimitiveType::Boolean => Arc::new(BooleanArray::new_null(num_rows)),
-                    PrimitiveType::Timestamp => {
-                        Arc::new(TimestampMicrosecondArray::new_null(num_rows).with_timezone("UTC"))
-                    }
-                    PrimitiveType::TimestampNtz => {
-                        Arc::new(TimestampMicrosecondArray::new_null(num_rows))
-                    }
-                    PrimitiveType::Date => Arc::new(Date32Array::new_null(num_rows)),
-                    PrimitiveType::Binary => Arc::new(BinaryArray::new_null(num_rows)),
-                    PrimitiveType::Decimal(precision, scale) => Arc::new(
-                        Decimal128Array::new_null(num_rows)
-                            .with_precision_and_scale(*precision, *scale as i8)?,
-                    ),
-                },
-                DataType::Struct(t) => {
-                    let fields: Fields = t.fields().map(ArrowField::try_from).try_collect()?;
-                    Arc::new(StructArray::new_null(fields, num_rows))
-                }
-                DataType::Array(t) => {
-                    let field =
-                        ArrowField::new(LIST_ARRAY_ROOT, t.element_type().try_into()?, true);
-                    Arc::new(ListArray::new_null(Arc::new(field), num_rows))
-                }
-                DataType::Map { .. } => unimplemented!(),
-            },
+            Null(DataType::BYTE) => Arc::new(Int8Array::new_null(num_rows)),
+            Null(DataType::SHORT) => Arc::new(Int16Array::new_null(num_rows)),
+            Null(DataType::INTEGER) => Arc::new(Int32Array::new_null(num_rows)),
+            Null(DataType::LONG) => Arc::new(Int64Array::new_null(num_rows)),
+            Null(DataType::FLOAT) => Arc::new(Float32Array::new_null(num_rows)),
+            Null(DataType::DOUBLE) => Arc::new(Float64Array::new_null(num_rows)),
+            Null(DataType::STRING) => Arc::new(StringArray::new_null(num_rows)),
+            Null(DataType::BOOLEAN) => Arc::new(BooleanArray::new_null(num_rows)),
+            Null(DataType::TIMESTAMP) => {
+                Arc::new(TimestampMicrosecondArray::new_null(num_rows).with_timezone("UTC"))
+            }
+            Null(DataType::TIMESTAMP_NTZ) => {
+                Arc::new(TimestampMicrosecondArray::new_null(num_rows))
+            }
+            Null(DataType::DATE) => Arc::new(Date32Array::new_null(num_rows)),
+            Null(DataType::BINARY) => Arc::new(BinaryArray::new_null(num_rows)),
+            Null(DataType::Primitive(PrimitiveType::Decimal(precision, scale))) => Arc::new(
+                Decimal128Array::new_null(num_rows)
+                    .with_precision_and_scale(*precision, *scale as i8)?,
+            ),
+            Null(DataType::Struct(t)) => {
+                let fields: Fields = t.fields().map(ArrowField::try_from).try_collect()?;
+                Arc::new(StructArray::new_null(fields, num_rows))
+            }
+            Null(DataType::Array(t)) => {
+                let field = ArrowField::new(LIST_ARRAY_ROOT, t.element_type().try_into()?, true);
+                Arc::new(ListArray::new_null(Arc::new(field), num_rows))
+            }
+            Null(DataType::Map { .. }) => unimplemented!(),
         };
         Ok(arr)
     }
