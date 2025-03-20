@@ -54,6 +54,8 @@ impl Drop for FileReadResultIterator {
 ///
 /// The iterator must be valid (returned by [`read_parquet_file`]) and not yet freed by
 /// [`free_read_result_iter`]. The visitor function pointer must be non-null.
+///
+/// [`free_engine_data`]: crate::free_engine_data
 #[no_mangle]
 pub unsafe extern "C" fn read_result_next(
     mut data: Handle<ExclusiveFileReadResultIterator>,

@@ -81,7 +81,7 @@ impl Iterator for EngineIterator {
 ///
 /// Whoever instantiates the struct must ensure it does not outlive the data it points to. The
 /// compiler cannot help us here, because raw pointers don't have lifetimes. A good rule of thumb is
-/// to always use the [`kernel_string_slice`] macro to create string slices, and to avoid returning
+/// to always use the `kernel_string_slice` macro to create string slices, and to avoid returning
 /// a string slice from a code block or function (since the move risks over-extending its lifetime):
 ///
 /// ```ignore
@@ -331,6 +331,8 @@ pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
 /// an opaque struct that encapsulates data read by an engine. this handle can be passed back into
 /// some kernel calls to operate on the data, or can be converted into the raw data as read by the
 /// [`delta_kernel::Engine`] by calling [`get_raw_engine_data`]
+///
+/// [`get_raw_engine_data`]: crate::engine_data::get_raw_engine_data
 #[handle_descriptor(target=dyn EngineData, mutable=true)]
 pub struct ExclusiveEngineData;
 
@@ -677,8 +679,11 @@ pub struct StringSliceIterator;
 
 /// # Safety
 ///
-/// The iterator must be valid (returned by [kernel_scan_data_init]) and not yet freed by
-/// [kernel_scan_data_free]. The visitor function pointer must be non-null.
+/// The iterator must be valid (returned by [`kernel_scan_data_init`]) and not yet freed by
+/// [`free_kernel_scan_data`]. The visitor function pointer must be non-null.
+///
+/// [`kernel_scan_data_init`]: crate::scan::kernel_scan_data_init
+/// [`free_kernel_scan_data`]: crate::scan::free_kernel_scan_data
 #[no_mangle]
 pub unsafe extern "C" fn string_slice_next(
     data: Handle<StringSliceIterator>,
