@@ -40,10 +40,8 @@ trybuild = "1.0"
 [features]
 default = ["default-engine"]
 cloud = ["delta_kernel/cloud"]
-default-engine = [
-  "delta_kernel/default-engine",
-]
+default-engine = ["delta_kernel/default-engine", "delta_kernel/arrow"]
 tracing = [ "tracing-core", "tracing-subscriber" ]
-sync-engine = ["delta_kernel/sync-engine"]
+sync-engine = ["delta_kernel/sync-engine", "delta_kernel/arrow"]
 developer-visibility = []
 test-ffi = []
