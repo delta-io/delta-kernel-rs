@@ -355,12 +355,14 @@ pub trait ExternEngine: Send + Sync {
 #[handle_descriptor(target=dyn ExternEngine, mutable=false)]
 pub struct SharedExternEngine;
 
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 struct ExternEngineVtable {
     // Actual engine instance to use
     engine: Arc<dyn Engine>,
     allocate_error: AllocateErrorFn,
 }
 
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 impl Drop for ExternEngineVtable {
     fn drop(&mut self) {
         debug!("dropping engine interface");
@@ -371,6 +373,7 @@ impl Drop for ExternEngineVtable {
 ///
 /// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
 /// responsible for handling  any races that could result.
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 unsafe impl Send for ExternEngineVtable {}
 
 /// # Safety
@@ -382,8 +385,10 @@ unsafe impl Send for ExternEngineVtable {}
 /// Basically, by failing to implement these traits, we forbid the engine from being able to declare
 /// its thread-safety (because rust assumes it is not threadsafe). By implementing them, we leave it
 /// up to the engine to enforce thread safety if engine chooses to use threads at all.
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 unsafe impl Sync for ExternEngineVtable {}
 
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 impl ExternEngine for ExternEngineVtable {
     fn engine(&self) -> Arc<dyn Engine> {
         self.engine.clone()
