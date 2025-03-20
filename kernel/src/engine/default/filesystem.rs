@@ -53,7 +53,7 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
         } else {
             let mut parts = offset.parts().collect_vec();
             if parts.pop().is_none() {
-                return Err(Error::generic(format!(
+                return Err(Error::Generic(format!(
                     "Offset path must not be a root directory. Got: '{}'",
                     path.as_str()
                 )));
