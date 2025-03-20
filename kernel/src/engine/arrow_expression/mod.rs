@@ -107,7 +107,11 @@ impl Scalar {
                 let field = ArrowField::new(LIST_ARRAY_ROOT, t.element_type().try_into()?, true);
                 Arc::new(ListArray::new_null(Arc::new(field), num_rows))
             }
-            Null(DataType::Map { .. }) => unimplemented!(),
+            Null(DataType::Map { .. }) => {
+                return Err(Error::unsupported(
+                    "Scalar::to_array does not yet support Map types",
+                ));
+            }
         };
         Ok(arr)
     }
