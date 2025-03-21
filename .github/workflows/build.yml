@@ -107,9 +107,9 @@ jobs:
           components: clippy
       - name: build and lint with clippy
         run: cargo clippy --benches --tests --all-features -- -D warnings
-      - name: lint without default features - packages which depend on kernel with features
+      - name: lint without default features - packages which depend on kernel with features enabled
         run: cargo clippy --workspace --no-default-features --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
-      - name: lint without default features - packages which don't on kernel with features
+      - name: lint without default features - packages which don't depend on kernel with features enabled
         run: cargo clippy --no-default-features --package delta_kernel --package delta_kernel_ffi --package delta_kernel_derive --package delta_kernel_ffi_macros -- -D warnings
       - name: check kernel builds with default-engine
         run: cargo build -p feature_tests --features default-engine
