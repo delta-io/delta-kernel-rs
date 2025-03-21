@@ -4,23 +4,24 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
-use crate::parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
-};
-use crate::parquet::arrow::arrow_writer::ArrowWriter;
-use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::DynObjectStore;
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
+use super::UrlExt;
+use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
+use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{fixup_parquet_read, generate_mask, get_requested_indices};
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use crate::parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
+use crate::parquet::arrow::arrow_writer::ArrowWriter;
+use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, EngineData, Error, ExpressionRef, FileDataReadResultIterator, FileMeta,
@@ -191,18 +192,19 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         //   -> reqwest to get data
         //   -> parse to parquet
         // SAFETY: we did is_empty check above, this is ok.
-        let file_opener: Box<dyn FileOpener> = match files[0].location.scheme() {
-            "http" | "https" => Box::new(PresignedUrlOpener::new(
+        let file_opener: Box<dyn FileOpener> = if files[0].location.is_presigned() {
+            Box::new(PresignedUrlOpener::new(
                 1024,
                 physical_schema.clone(),
                 predicate,
-            )),
-            _ => Box::new(ParquetOpener::new(
+            ))
+        } else {
+            Box::new(ParquetOpener::new(
                 1024,
                 physical_schema.clone(),
                 predicate,
                 self.store.clone(),
-            )),
+            ))
         };
         FileStream::new_async_read_iterator(
             self.task_executor.clone(),

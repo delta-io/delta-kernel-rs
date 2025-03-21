@@ -158,6 +158,16 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
     }
 }
 
+pub(self) trait UrlExt {
+    fn is_presigned(&self) -> bool;
+}
+
+impl UrlExt for Url {
+    fn is_presigned(&self) -> bool {
+        matches!(self.scheme(), "http" | "https") && self.query().is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::executor::tokio::TokioBackgroundExecutor;
