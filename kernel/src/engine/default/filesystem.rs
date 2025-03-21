@@ -45,7 +45,7 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
         path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
         // The offset is used for list-after; the prefix is used to restrict the listing to a specific directory.
-        // Unfortunately, `Path`` provides no easy way to check whether a name is directory-like,
+        // Unfortunately, `Path` provides no easy way to check whether a name is directory-like,
         // because it strips trailing /, so we're reduced to manually checking the original URL.
         let offset = Path::from_url_path(path.path())?;
         let prefix = if path.path().ends_with('/') {
