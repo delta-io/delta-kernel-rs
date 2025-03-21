@@ -22,11 +22,15 @@ pub(crate) mod test_utils {
     use tempfile::TempDir;
     use test_utils::delta_path_for_version;
 
+    use crate::actions::get_log_schema;
+    use crate::arrow::array::StringArray;
+    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use crate::engine::sync::SyncEngine;
     use crate::{
         actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove},
         engine::arrow_data::ArrowEngineData,
-        EngineData,
     };
+    use crate::{Engine, EngineData};
 
     #[derive(Serialize)]
     pub(crate) enum Action {
@@ -96,5 +100,24 @@ pub(crate) mod test_utils {
     /// Checks that two `EngineData` objects are equal by converting them to `RecordBatch` and comparing
     pub(crate) fn assert_batch_matches(actual: Box<dyn EngineData>, expected: Box<dyn EngineData>) {
         assert_eq!(into_record_batch(actual), into_record_batch(expected));
+    }
+
+    /// Converts a `StringArray` to an `EngineData` object
+    pub(crate) fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
+        let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
+        let schema = Arc::new(ArrowSchema::new(vec![string_field]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
+            .expect("Can't convert to record batch");
+        Box::new(ArrowEngineData::new(batch))
+    }
+
+    /// Parses a batch of JSON strings into an `EngineData` object
+    pub(crate) fn parse_json_batch(json_strings: StringArray) -> Box<dyn EngineData> {
+        let engine = SyncEngine::new();
+        let json_handler = engine.get_json_handler();
+        let output_schema = get_log_schema().clone();
+        json_handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap()
     }
 }
