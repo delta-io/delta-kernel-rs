@@ -765,7 +765,7 @@ impl<T> Default for ReferenceSet<T> {
 #[cfg(test)]
 mod tests {
     use delta_kernel::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
-    use object_store::{memory::InMemory, path::Path};
+    use object_store::memory::InMemory;
     use test_utils::{actions_to_string, actions_to_string_partitioned, add_commit, TestAction};
 
     use super::*;
@@ -839,11 +839,7 @@ mod tests {
             actions_to_string(vec![TestAction::Metadata]),
         )
         .await?;
-        let engine = DefaultEngine::new(
-            storage.clone(),
-            Path::from("/"),
-            Arc::new(TokioBackgroundExecutor::new()),
-        );
+        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let path = "memory:///";
 
@@ -872,11 +868,7 @@ mod tests {
             actions_to_string_partitioned(vec![TestAction::Metadata]),
         )
         .await?;
-        let engine = DefaultEngine::new(
-            storage.clone(),
-            Path::from("/"),
-            Arc::new(TokioBackgroundExecutor::new()),
-        );
+        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let path = "memory:///";
 

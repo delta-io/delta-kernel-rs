@@ -14,7 +14,6 @@ use crate::{DeltaResult, Error, FileMeta, FileSlice, FileSystemClient};
 pub struct ObjectStoreFileSystemClient<E: TaskExecutor> {
     inner: Arc<DynObjectStore>,
     has_ordered_listing: bool,
-    table_root: Path,
     task_executor: Arc<E>,
     readahead: usize,
 }
@@ -23,13 +22,11 @@ impl<E: TaskExecutor> ObjectStoreFileSystemClient<E> {
     pub(crate) fn new(
         store: Arc<DynObjectStore>,
         has_ordered_listing: bool,
-        table_root: Path,
         task_executor: Arc<E>,
     ) -> Self {
         Self {
             inner: store,
             has_ordered_listing,
-            table_root,
             task_executor,
             readahead: 10,
         }
@@ -47,16 +44,28 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
         &self,
         path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
-        let url = path.clone();
-        let offset = Path::from(path.path());
-        // TODO properly handle table prefix
-        let prefix = self.table_root.child("_delta_log");
+        // The offset is used for list-after; the prefix is used to restrict the listing to a specific directory.
+        // Unfortunately, `Path` provides no easy way to check whether a name is directory-like,
+        // because it strips trailing /, so we're reduced to manually checking the original URL.
+        let offset = Path::from_url_path(path.path())?;
+        let prefix = if path.path().ends_with('/') {
+            offset.clone()
+        } else {
+            let mut parts = offset.parts().collect_vec();
+            if parts.pop().is_none() {
+                return Err(Error::Generic(format!(
+                    "Offset path must not be a root directory. Got: '{}'",
+                    path.as_str()
+                )));
+            }
+            Path::from_iter(parts)
+        };
 
         let store = self.inner.clone();
 
         // This channel will become the iterator
         let (sender, receiver) = std::sync::mpsc::sync_channel(4_000);
-
+        let url = path.clone();
         self.task_executor.spawn(async move {
             let mut stream = store.list_with_offset(Some(&prefix), &offset);
 
@@ -192,11 +201,9 @@ mod tests {
         let mut url = Url::from_directory_path(tmp.path()).unwrap();
 
         let store = Arc::new(LocalFileSystem::new());
-        let prefix = Path::from(url.path());
         let client = ObjectStoreFileSystemClient::new(
             store,
             false, // don't have ordered listing
-            prefix,
             Arc::new(TokioBackgroundExecutor::new()),
         );
 
@@ -229,11 +236,10 @@ mod tests {
         store.put(&name, data.clone().into()).await.unwrap();
 
         let table_root = Url::parse("memory:///").expect("valid url");
-        let prefix = Path::from_url_path(table_root.path()).expect("Couldn't get path");
-        let engine = DefaultEngine::new(store, prefix, Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
         let files: Vec<_> = engine
             .get_file_system_client()
-            .list_from(&table_root)
+            .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap())
             .unwrap()
             .try_collect()
             .unwrap();
@@ -260,11 +266,12 @@ mod tests {
 
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let store = Arc::new(LocalFileSystem::new());
-        let prefix = Path::from_url_path(url.path()).expect("Couldn't get path");
-        let engine = DefaultEngine::new(store, prefix, Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
         let client = engine.get_file_system_client();
 
-        let files = client.list_from(&Url::parse("file://").unwrap()).unwrap();
+        let files = client
+            .list_from(&url.join("_delta_log").unwrap().join("0").unwrap())
+            .unwrap();
         let mut len = 0;
         for (file, expected) in files.zip(expected_names.iter()) {
             assert!(
