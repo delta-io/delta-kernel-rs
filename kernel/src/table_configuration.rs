@@ -13,8 +13,9 @@ use std::sync::{Arc, LazyLock};
 
 use url::Url;
 
-use crate::actions::{ensure_supported_features, Metadata, Protocol};
-use crate::schema::{InvariantChecker, Schema, SchemaRef};
+use crate::actions::{ensure_reader_supported_features, Metadata, Protocol};
+use crate::schema::InvariantChecker;
+use crate::schema::{Schema, SchemaRef};
 use crate::table_features::{
     column_mapping_mode, validate_schema_column_mapping, ColumnMappingMode, ReaderFeatures,
     WriterFeatures,
@@ -159,7 +160,11 @@ impl TableConfiguration {
         let protocol_supported = match self.protocol.reader_features() {
             // if min_reader_version = 3 and all reader features are subset of supported => OK
             Some(reader_features) if self.protocol.min_reader_version() == 3 => {
-                ensure_supported_features(reader_features, &CDF_SUPPORTED_READER_FEATURES).is_ok()
+                ensure_reader_supported_features(
+                    reader_features,
+                    CDF_SUPPORTED_READER_FEATURES.clone(),
+                )
+                .is_ok()
             }
             // if min_reader_version = 1 and there are no reader features => OK
             None => self.protocol.min_reader_version() == 1,
@@ -187,11 +192,11 @@ impl TableConfiguration {
     pub(crate) fn is_deletion_vector_supported(&self) -> bool {
         let read_supported = self
             .protocol()
-            .has_reader_feature(&ReaderFeatures::DeletionVectors)
+            .has_reader_feature(ReaderFeatures::DeletionVectors)
             && self.protocol.min_reader_version() == 3;
         let write_supported = self
             .protocol()
-            .has_writer_feature(&WriterFeatures::DeletionVectors)
+            .has_writer_feature(WriterFeatures::DeletionVectors)
             && self.protocol.min_writer_version() == 7;
         read_supported && write_supported
     }
@@ -218,7 +223,7 @@ impl TableConfiguration {
     pub(crate) fn is_append_only_supported(&self) -> bool {
         let protocol = &self.protocol;
         match protocol.min_writer_version() {
-            7 if protocol.has_writer_feature(&WriterFeatures::AppendOnly) => true,
+            7 if protocol.has_writer_feature(WriterFeatures::AppendOnly) => true,
             version => (2..=6).contains(&version),
         }
     }
@@ -232,7 +237,7 @@ impl TableConfiguration {
     pub(crate) fn is_invariants_supported(&self) -> bool {
         let protocol = &self.protocol;
         match protocol.min_writer_version() {
-            7 if protocol.has_writer_feature(&WriterFeatures::Invariants) => true,
+            7 if protocol.has_writer_feature(WriterFeatures::Invariants) => true,
             version => (2..=6).contains(&version),
         }
     }

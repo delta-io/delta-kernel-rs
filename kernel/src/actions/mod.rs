@@ -1,10 +1,8 @@
 //! Provides parsing and manipulation of the various actions defined in the [Delta
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
-use std::any::type_name;
 use std::collections::{HashMap, HashSet};
-use std::fmt::{Debug, Display};
-use std::hash::Hash;
+use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::LazyLock;
 
@@ -160,11 +158,11 @@ pub struct Protocol {
     /// A collection of features that a client must implement in order to correctly
     /// read this table (exist only when minReaderVersion is set to 3)
     #[serde(skip_serializing_if = "Option::is_none")]
-    reader_features: Option<Vec<String>>,
+    reader_features: Option<Vec<ReaderFeatures>>,
     /// A collection of features that a client must implement in order to correctly
     /// write this table (exist only when minWriterVersion is set to 7)
     #[serde(skip_serializing_if = "Option::is_none")]
-    writer_features: Option<Vec<String>>,
+    writer_features: Option<Vec<WriterFeatures>>,
 }
 
 impl Protocol {
@@ -192,8 +190,16 @@ impl Protocol {
                 )
             );
         }
-        let reader_features = reader_features.map(|f| f.into_iter().map(Into::into).collect());
-        let writer_features = writer_features.map(|f| f.into_iter().map(Into::into).collect());
+        let reader_features: Option<Vec<ReaderFeatures>> = reader_features.and_then(|f| {
+            f.into_iter()
+                .map(|f| ReaderFeatures::from_str(&f.into()).ok())
+                .collect::<Option<Vec<ReaderFeatures>>>()
+        });
+        let writer_features = writer_features.and_then(|f| {
+            f.into_iter()
+                .map(|f| WriterFeatures::from_str(&f.into()).ok())
+                .collect::<Option<Vec<WriterFeatures>>>()
+        });
         Ok(Protocol {
             min_reader_version,
             min_writer_version,
@@ -221,25 +227,25 @@ impl Protocol {
     }
 
     /// Get the reader features for the protocol
-    pub fn reader_features(&self) -> Option<&[String]> {
+    pub fn reader_features(&self) -> Option<&[ReaderFeatures]> {
         self.reader_features.as_deref()
     }
 
     /// Get the writer features for the protocol
-    pub fn writer_features(&self) -> Option<&[String]> {
+    pub fn writer_features(&self) -> Option<&[WriterFeatures]> {
         self.writer_features.as_deref()
     }
 
     /// True if this protocol has the requested reader feature
-    pub fn has_reader_feature(&self, feature: &ReaderFeatures) -> bool {
+    pub fn has_reader_feature(&self, feature: ReaderFeatures) -> bool {
         self.reader_features()
-            .is_some_and(|features| features.iter().any(|f| f == feature.as_ref()))
+            .is_some_and(|features| features.iter().any(|f| *f == feature))
     }
 
     /// True if this protocol has the requested writer feature
-    pub fn has_writer_feature(&self, feature: &WriterFeatures) -> bool {
+    pub fn has_writer_feature(&self, feature: WriterFeatures) -> bool {
         self.writer_features()
-            .is_some_and(|features| features.iter().any(|f| f == feature.as_ref()))
+            .is_some_and(|features| features.iter().any(|f| *f == feature))
     }
 
     /// Check if reading a table with this protocol is supported. That is: does the kernel support
@@ -249,7 +255,7 @@ impl Protocol {
         match &self.reader_features {
             // if min_reader_version = 3 and all reader features are subset of supported => OK
             Some(reader_features) if self.min_reader_version == 3 => {
-                ensure_supported_features(reader_features, &SUPPORTED_READER_FEATURES)
+                ensure_reader_supported_features(reader_features, SUPPORTED_READER_FEATURES.clone())
             }
             // if min_reader_version = 3 and no reader features => ERROR
             // NOTE this is caught by the protocol parsing.
@@ -277,9 +283,12 @@ impl Protocol {
     /// support the specified protocol writer version and all enabled writer features?
     pub fn ensure_write_supported(&self) -> DeltaResult<()> {
         match &self.writer_features {
-            Some(writer_features) if self.min_writer_version == 7 => {
-                // if we're on version 7, make sure we support all the specified features
-                ensure_supported_features(writer_features, &SUPPORTED_WRITER_FEATURES)
+            // if min_reader_version = 3 and min_writer_version = 7 and all writer features are
+            // supported => OK
+            Some(writer_features)
+                if self.min_reader_version == 3 && self.min_writer_version == 7 =>
+            {
+                ensure_writer_supported_features(writer_features, SUPPORTED_WRITER_FEATURES.clone())
             }
             Some(_) => {
                 // there are features, but we're not on 7, so the protocol is actually broken
@@ -301,41 +310,79 @@ impl Protocol {
     }
 }
 
-// given unparsed `table_features`, parse and check if they are subset of `supported_features`
-pub(crate) fn ensure_supported_features<T>(
-    table_features: &[String],
-    supported_features: &HashSet<T>,
-) -> DeltaResult<()>
+#[inline]
+fn create_feature_error<T>(
+    unsupported: Vec<T>,
+    unsupported_or_unknown: &str,
+    features: HashSet<T>,
+) -> Error
 where
-    <T as FromStr>::Err: Display,
-    T: Debug + FromStr + Hash + Eq,
+    T: ToString + Debug,
 {
-    let error = |unsupported, unsupported_or_unknown| {
-        let supported = supported_features.iter().collect::<Vec<_>>();
-        let features_type = type_name::<T>()
-            .rsplit("::")
-            .next()
-            .unwrap_or("table features");
-        Error::Unsupported(format!(
-            "{} {} {:?}. Supported {} are {:?}",
-            unsupported_or_unknown, features_type, unsupported, features_type, supported
-        ))
-    };
-    let parsed_features: HashSet<T> = table_features
+    let unsupported = unsupported
         .iter()
-        .map(|s| T::from_str(s).map_err(|_| error(vec![s.to_string()], "Unknown")))
-        .collect::<Result<_, Error>>()?;
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
 
-    // check that parsed features are a subset of supported features
+    Error::Unsupported(format!(
+        "{} reader features {:?}. Supported reader features are {:?}",
+        unsupported_or_unknown, unsupported, features
+    ))
+}
+
+pub(crate) fn ensure_reader_supported_features(
+    table_features: &[ReaderFeatures],
+    supported_features: HashSet<ReaderFeatures>,
+) -> DeltaResult<()> {
+    let (unknown_features, other_features): (Vec<_>, Vec<_>) = table_features
+        .iter()
+        .cloned()
+        .partition(|f| matches!(f, ReaderFeatures::Unknown(_)));
+    if !unknown_features.is_empty() {
+        return Err(create_feature_error(
+            unknown_features,
+            "Unknown",
+            supported_features,
+        ));
+    }
+    let parsed_features = HashSet::from_iter(other_features);
     parsed_features
-        .is_subset(supported_features)
+        .is_subset(&supported_features)
         .then_some(())
         .ok_or_else(|| {
             let unsupported = parsed_features
-                .difference(supported_features)
-                .map(|f| format!("{:?}", f))
+                .difference(&supported_features)
+                .cloned()
                 .collect::<Vec<_>>();
-            error(unsupported, "Unsupported")
+            create_feature_error(unsupported, "Unsupported", supported_features)
+        })
+}
+
+pub(crate) fn ensure_writer_supported_features(
+    table_features: &[WriterFeatures],
+    supported_features: HashSet<WriterFeatures>,
+) -> DeltaResult<()> {
+    let (unknown_features, other_features): (Vec<_>, Vec<_>) = table_features
+        .iter()
+        .cloned()
+        .partition(|f| matches!(f, WriterFeatures::Unknown(_)));
+    if !unknown_features.is_empty() {
+        return Err(create_feature_error(
+            unknown_features,
+            "Unknown",
+            supported_features,
+        ));
+    }
+    let parsed_features = HashSet::from_iter(other_features);
+    parsed_features
+        .is_subset(&supported_features)
+        .then_some(())
+        .ok_or_else(|| {
+            let unsupported = parsed_features
+                .difference(&supported_features)
+                .cloned()
+                .collect::<Vec<_>>();
+            create_feature_error(unsupported, "Unsupported", supported_features)
         })
 }
 
@@ -915,24 +962,26 @@ mod tests {
 
     #[test]
     fn test_ensure_supported_features() {
-        let supported_features = [
+        let supported_features: HashSet<_> = [
             ReaderFeatures::ColumnMapping,
             ReaderFeatures::DeletionVectors,
         ]
         .into_iter()
         .collect();
-        let table_features = vec![ReaderFeatures::ColumnMapping.to_string()];
-        ensure_supported_features(&table_features, &supported_features).unwrap();
+        let table_features = vec![ReaderFeatures::ColumnMapping];
+        ensure_reader_supported_features(&table_features, supported_features.clone()).unwrap();
 
         // test unknown features
-        let table_features = vec![ReaderFeatures::ColumnMapping.to_string(), "idk".to_string()];
-        let error = ensure_supported_features(&table_features, &supported_features).unwrap_err();
+        let table_features = vec![ReaderFeatures::Unknown("idk".into())];
+        let error =
+            ensure_reader_supported_features(&table_features, supported_features).unwrap_err();
+        dbg!(&error);
         match error {
             Error::Unsupported(e) if e ==
-                "Unknown ReaderFeatures [\"idk\"]. Supported ReaderFeatures are [ColumnMapping, DeletionVectors]"
+                "Unknown reader features [\"idk\"]. Supported reader features are {ColumnMapping, DeletionVectors}"
             => {},
             Error::Unsupported(e) if e ==
-                "Unknown ReaderFeatures [\"idk\"]. Supported ReaderFeatures are [DeletionVectors, ColumnMapping]"
+                "Unknown reader features [\"idk\"]. Supported reader features are {DeletionVectors, ColumnMapping}"
             => {},
             _ => panic!("Expected unsupported error"),
         }
