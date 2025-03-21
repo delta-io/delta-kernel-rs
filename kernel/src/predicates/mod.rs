@@ -219,7 +219,9 @@ pub(crate) trait PredicateEvaluator {
             (Equal, _) => self.eval_eq(col, val, inverted),
             (NotEqual, _) => self.eval_eq(col, val, !inverted),
             (Distinct, _) => self.eval_distinct(col, val, inverted),
+            #[allow(deprecated)]
             (In, _) => self.eval_in(col, val, inverted),
+            #[allow(deprecated)]
             (NotIn, _) => self.eval_in(col, val, !inverted),
         }
     }

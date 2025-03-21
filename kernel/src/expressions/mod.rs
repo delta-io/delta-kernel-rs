@@ -41,8 +41,18 @@ pub enum BinaryOperator {
     /// Distinct
     Distinct,
     /// IN
+    #[deprecated(
+        note = "IN expressions are deprecated and will be removed soon. Opaque expressions will \
+                allow for engines to interpret expressions which are not included in the kernel's \
+                expression language."
+    )]
     In,
     /// NOT IN
+    #[deprecated(
+        note = "NOT IN expressions are deprecated and will be removed soon. Opaque expressions \
+                will allow for engines to interpret expressions which are not included in the \
+                kernel's expression language."
+    )]
     NotIn,
 }
 
@@ -54,6 +64,7 @@ impl BinaryOperator {
             Plus | Minus | Multiply | Divide => false, // not a comparison
             LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual => true,
             Equal | NotEqual => true,
+            #[allow(deprecated)]
             Distinct | In | NotIn => false, // tolerates NULL input
         }
     }
@@ -67,6 +78,7 @@ impl BinaryOperator {
             LessThan => Some(GreaterThan),
             LessThanOrEqual => Some(GreaterThanOrEqual),
             Equal | NotEqual | Distinct | Plus | Multiply => Some(*self),
+            #[allow(deprecated)]
             In | NotIn | Minus | Divide => None, // not commutative
         }
     }
@@ -105,7 +117,9 @@ impl Display for BinaryOperator {
             // so ideally this would not be used as we use Display for rendering expressions
             // in our code we take care of this, but theirs might not ...
             Self::Distinct => write!(f, "DISTINCT"),
+            #[allow(deprecated)]
             Self::In => write!(f, "IN"),
+            #[allow(deprecated)]
             Self::NotIn => write!(f, "NOT IN"),
         }
     }

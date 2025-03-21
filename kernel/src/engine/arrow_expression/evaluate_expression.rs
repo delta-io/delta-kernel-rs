@@ -122,6 +122,7 @@ pub(crate) fn evaluate_expression(
                 UnaryOperator::IsNull => Arc::new(is_null(&arr)?),
             })
         }
+        #[allow(deprecated)]
         (
             Binary(BinaryExpression {
                 op: In,
@@ -183,6 +184,7 @@ pub(crate) fn evaluate_expression(
                 "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
             ))),
         },
+        #[allow(deprecated)]
         (
             Binary(BinaryExpression {
                 op: NotIn,
@@ -215,6 +217,7 @@ pub(crate) fn evaluate_expression(
                 NotEqual => |l, r| neq(l, r).map(wrap_comparison_result),
                 Distinct => |l, r| distinct(l, r).map(wrap_comparison_result),
                 // NOTE: [Not]In was already covered above
+                #[allow(deprecated)]
                 In | NotIn => return Err(Error::generic("Invalid expression given")),
             };
 
