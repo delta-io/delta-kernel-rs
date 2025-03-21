@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::schema::{DataType, StructType};
-use crate::table_properties::ParseIntervalError;
+use crate::table_properties::{ParseBoolError, ParseIntervalError};
 use crate::Version;
 
 #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
@@ -188,6 +188,10 @@ pub enum Error {
     /// Parsing error when attempting to deserialize an interval
     #[error(transparent)]
     ParseIntervalError(#[from] ParseIntervalError),
+
+    /// Parsing error when attempting to deserialize a bool
+    #[error(transparent)]
+    ParseBoolError(#[from] ParseBoolError),
 
     #[error("Change data feed is unsupported for the table at version {0}")]
     ChangeDataFeedUnsupported(Version),
