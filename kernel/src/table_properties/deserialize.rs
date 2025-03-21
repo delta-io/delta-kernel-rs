@@ -2,15 +2,13 @@
 //! us to relatively simply implement the functionality described in the protocol and expose
 //! 'simple' types to the user in the [`TableProperties`] struct. E.g. we can expose a `bool`
 //! directly instead of a `BoolConfig` type that we implement `Deserialize` for.
-use std::num::NonZero;
-use std::time::Duration;
-
 use super::*;
 use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
 use crate::utils::require;
-
-use tracing::warn;
+use crate::{DeltaResult, Error};
+use std::num::NonZero;
+use std::time::Duration;
 
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
@@ -27,7 +25,7 @@ where
         let mut props = TableProperties::default();
         let unparsed = unparsed.into_iter().filter(|(k, v)| {
             // Only keep elements that fail to parse
-            try_parse(&mut props, k.as_ref(), v.as_ref()).is_none()
+            try_parse(&mut props, k.as_ref(), v.as_ref()).is_err()
         });
         props.unknown_properties = unparsed.map(|(k, v)| (k.into(), v.into())).collect();
         props
@@ -36,20 +34,20 @@ where
 
 // attempt to parse a key-value pair into a `TableProperties` struct. Returns Some(()) if the key
 // was successfully parsed, and None otherwise.
-fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
+fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> DeltaResult<()> {
     // NOTE!! we do Some(parse(v)?) instead of just parse(v) because we want to return None if the
     // parsing fails. If we simply call 'parse(v)', then we would (incorrectly) return Some(()) and
     // just set the property to None.
     match k {
-        "delta.appendOnly" => props.append_only = Some(parse_bool(v)?),
-        "delta.autoOptimize.autoCompact" => props.auto_compact = Some(parse_bool(v)?),
-        "delta.autoOptimize.optimizeWrite" => props.optimize_write = Some(parse_bool(v)?),
-        "delta.checkpointInterval" => props.checkpoint_interval = Some(parse_positive_int(v)?),
+        "delta.appendOnly" => props.append_only = parse_bool(v)?,
+        "delta.autoOptimize.autoCompact" => props.auto_compact = parse_bool(v)?,
+        "delta.autoOptimize.optimizeWrite" => props.optimize_write = parse_bool(v)?,
+        "delta.checkpointInterval" => props.checkpoint_interval = parse_positive_int(v)?,
         "delta.checkpoint.writeStatsAsJson" => {
-            props.checkpoint_write_stats_as_json = Some(parse_bool(v)?)
+            props.checkpoint_write_stats_as_json = parse_bool(v)?
         }
         "delta.checkpoint.writeStatsAsStruct" => {
-            props.checkpoint_write_stats_as_struct = Some(parse_bool(v)?)
+            props.checkpoint_write_stats_as_struct = parse_bool(v)?
         }
         "delta.columnMapping.mode" => {
             props.column_mapping_mode = ColumnMappingMode::try_from(v).ok()
@@ -58,81 +56,88 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
             props.data_skipping_num_indexed_cols = DataSkippingNumIndexedCols::try_from(v).ok()
         }
         "delta.dataSkippingStatsColumns" => {
-            props.data_skipping_stats_columns = Some(parse_column_names(v)?)
+            props.data_skipping_stats_columns = parse_column_names(v)?
         }
         "delta.deletedFileRetentionDuration" => {
-            props.deleted_file_retention_duration = Some(parse_interval(v)?)
+            props.deleted_file_retention_duration = parse_interval(v)?
         }
-        "delta.enableChangeDataFeed" => props.enable_change_data_feed = Some(parse_bool(v)?),
-        "delta.enableDeletionVectors" => props.enable_deletion_vectors = Some(parse_bool(v)?),
+        "delta.enableChangeDataFeed" => props.enable_change_data_feed = parse_bool(v)?,
+        "delta.enableDeletionVectors" => props.enable_deletion_vectors = parse_bool(v)?,
         "delta.isolationLevel" => props.isolation_level = IsolationLevel::try_from(v).ok(),
-        "delta.logRetentionDuration" => props.log_retention_duration = Some(parse_interval(v)?),
-        "delta.enableExpiredLogCleanup" => props.enable_expired_log_cleanup = Some(parse_bool(v)?),
-        "delta.randomizeFilePrefixes" => props.randomize_file_prefixes = Some(parse_bool(v)?),
-        "delta.randomPrefixLength" => props.random_prefix_length = Some(parse_positive_int(v)?),
+        "delta.logRetentionDuration" => props.log_retention_duration = parse_interval(v)?,
+        "delta.enableExpiredLogCleanup" => props.enable_expired_log_cleanup = parse_bool(v)?,
+        "delta.randomizeFilePrefixes" => props.randomize_file_prefixes = parse_bool(v)?,
+        "delta.randomPrefixLength" => props.random_prefix_length = parse_positive_int(v)?,
         "delta.setTransactionRetentionDuration" => {
-            props.set_transaction_retention_duration = Some(parse_interval(v)?)
+            props.set_transaction_retention_duration = parse_interval(v)?
         }
-        "delta.targetFileSize" => props.target_file_size = Some(parse_positive_int(v)?),
-        "delta.tuneFileSizesForRewrites" => {
-            props.tune_file_sizes_for_rewrites = Some(parse_bool(v)?)
-        }
+        "delta.targetFileSize" => props.target_file_size = parse_positive_int(v)?,
+        "delta.tuneFileSizesForRewrites" => props.tune_file_sizes_for_rewrites = parse_bool(v)?,
         "delta.checkpointPolicy" => props.checkpoint_policy = CheckpointPolicy::try_from(v).ok(),
-        "delta.enableRowTracking" => props.enable_row_tracking = Some(parse_bool(v)?),
-        "delta.enableInCommitTimestamps" => {
-            props.enable_in_commit_timestamps = Some(parse_bool(v)?)
-        }
+        "delta.enableRowTracking" => props.enable_row_tracking = parse_bool(v)?,
+        "delta.enableInCommitTimestamps" => props.enable_in_commit_timestamps = parse_bool(v)?,
         "delta.inCommitTimestampEnablementVersion" => {
-            props.in_commit_timestamp_enablement_version = Some(parse_non_negative(v)?)
+            props.in_commit_timestamp_enablement_version = parse_non_negative(v)?
         }
         "delta.inCommitTimestampEnablementTimestamp" => {
-            props.in_commit_timestamp_enablement_timestamp = Some(parse_non_negative(v)?)
+            props.in_commit_timestamp_enablement_timestamp = parse_non_negative(v)?
         }
-        _ => return None,
+        _ => return Err(Error::Generic("foo".to_string())),
     }
-    Some(())
+    Ok(())
 }
 
 /// Deserialize a string representing a positive (> 0) integer into an `Option<u64>`. Returns `Some`
 /// if successfully parses, and `None` otherwise.
-pub(crate) fn parse_positive_int(s: &str) -> Option<NonZero<u64>> {
+pub(crate) fn parse_positive_int(s: &str) -> DeltaResult<Option<NonZero<u64>>> {
     // parse as non-negative and verify the result is non-zero
-    NonZero::new(parse_non_negative(s)?)
+    parse_non_negative(s).map(|maybe_num| maybe_num.and_then(NonZero::<u64>::new))
 }
 
 /// Deserialize a string representing a non-negative integer into an `Option<u64>`. Returns `Some` if
 /// successfully parses, and `None` otherwise.
-pub(crate) fn parse_non_negative<T>(s: &str) -> Option<T>
+pub(crate) fn parse_non_negative<T>(s: &str) -> DeltaResult<Option<T>>
 where
     i64: TryInto<T>,
 {
     // parse to i64 since java doesn't even allow u64
-    let n: i64 = s.parse().ok().filter(|&i| i >= 0)?;
-    n.try_into().ok()
+    Ok(s.parse::<i64>()
+        .ok()
+        .filter(|&i| i >= 0)
+        .and_then(|value| value.try_into().ok()))
 }
 
 /// Deserialize a string representing a boolean into an `Option<bool>`. Returns `Some` if
 /// successfully parses, and `None` otherwise.
-pub(crate) fn parse_bool(s: &str) -> Option<bool> {
+pub(crate) fn parse_bool(s: &str) -> DeltaResult<Option<bool>> {
+    parse_bool_impl(s).map(Some).map_err(Error::ParseBoolError)
+}
+
+/// The input string is not a valid interval
+#[derive(thiserror::Error, Debug)]
+#[error("'{0}' is not an bool")]
+pub struct ParseBoolError(String);
+
+fn parse_bool_impl(s: &str) -> Result<bool, ParseBoolError> {
     match s {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(ParseBoolError(s.to_string())),
     }
 }
 
 /// Deserialize a comma-separated list of column names into an `Option<Vec<ColumnName>>`. Returns
 /// `Some` if successfully parses, and `None` otherwise.
-pub(crate) fn parse_column_names(s: &str) -> Option<Vec<ColumnName>> {
-    ColumnName::parse_column_name_list(s)
-        .inspect_err(|e| warn!("column name list failed to parse: {e}"))
-        .ok()
+pub(crate) fn parse_column_names(s: &str) -> DeltaResult<Option<Vec<ColumnName>>> {
+    ColumnName::parse_column_name_list(s).map(Some)
 }
 
 /// Deserialize an interval string of the form "interval 5 days" into an `Option<Duration>`.
 /// Returns `Some` if successfully parses, and `None` otherwise.
-pub(crate) fn parse_interval(s: &str) -> Option<Duration> {
-    parse_interval_impl(s).ok()
+pub(crate) fn parse_interval(s: &str) -> DeltaResult<Option<Duration>> {
+    parse_interval_impl(s)
+        .map(Some)
+        .map_err(Error::ParseIntervalError)
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -215,104 +220,107 @@ mod tests {
 
     #[test]
     fn test_parse_bool() {
-        assert!(parse_bool("true").unwrap());
-        assert!(!parse_bool("false").unwrap());
-        assert_eq!(parse_bool("whatever"), None);
+        assert_eq!(parse_bool("true").unwrap(), Some(true));
+        assert_eq!(parse_bool("false").unwrap(), Some(false));
+        assert_eq!(
+            parse_bool("whatever").unwrap_err().to_string(),
+            "'whatever' is not an bool".to_string()
+        );
     }
 
     #[test]
     fn test_parse_int() {
-        assert_eq!(parse_positive_int("12").unwrap().get(), 12);
-        assert_eq!(parse_positive_int("0"), None);
-        assert_eq!(parse_positive_int("-12"), None);
-        assert_eq!(parse_non_negative::<u64>("12").unwrap(), 12);
-        assert_eq!(parse_non_negative::<u64>("0").unwrap(), 0);
-        assert_eq!(parse_non_negative::<u64>("-12"), None);
-        assert_eq!(parse_non_negative::<i64>("12").unwrap(), 12);
-        assert_eq!(parse_non_negative::<i64>("0").unwrap(), 0);
-        assert_eq!(parse_non_negative::<i64>("-12"), None);
+        assert_eq!(parse_positive_int("12").unwrap(), NonZero::<u64>::new(12));
+        assert_eq!(parse_positive_int("0").unwrap(), None);
+        assert_eq!(parse_positive_int("-12").unwrap(), None);
+        assert_eq!(parse_non_negative::<u64>("12").unwrap(), Some(12));
+        assert_eq!(parse_non_negative::<u64>("0").unwrap(), Some(0));
+        assert_eq!(parse_non_negative::<u64>("-12").unwrap(), None);
+        assert_eq!(parse_non_negative::<i64>("12").unwrap(), Some(12));
+        assert_eq!(parse_non_negative::<i64>("0").unwrap(), Some(0));
+        assert_eq!(parse_non_negative::<i64>("-12").unwrap(), None);
     }
 
     #[test]
     fn test_parse_interval() {
         assert_eq!(
             parse_interval("interval 123 nanosecond").unwrap(),
-            Duration::from_nanos(123)
+            Some(Duration::from_nanos(123))
         );
 
         assert_eq!(
             parse_interval("interval 123 nanoseconds").unwrap(),
-            Duration::from_nanos(123)
+            Some(Duration::from_nanos(123))
         );
 
         assert_eq!(
             parse_interval("interval 123 microsecond").unwrap(),
-            Duration::from_micros(123)
+            Some(Duration::from_micros(123))
         );
 
         assert_eq!(
             parse_interval("interval 123 microseconds").unwrap(),
-            Duration::from_micros(123)
+            Some(Duration::from_micros(123))
         );
 
         assert_eq!(
             parse_interval("interval 123 millisecond").unwrap(),
-            Duration::from_millis(123)
+            Some(Duration::from_millis(123))
         );
 
         assert_eq!(
             parse_interval("interval 123 milliseconds").unwrap(),
-            Duration::from_millis(123)
+            Some(Duration::from_millis(123))
         );
 
         assert_eq!(
             parse_interval("interval 123 second").unwrap(),
-            Duration::from_secs(123)
+            Some(Duration::from_secs(123))
         );
 
         assert_eq!(
             parse_interval("interval 123 seconds").unwrap(),
-            Duration::from_secs(123)
+            Some(Duration::from_secs(123))
         );
 
         assert_eq!(
             parse_interval("interval 123 minute").unwrap(),
-            Duration::from_secs(123 * 60)
+            Some(Duration::from_secs(123 * 60))
         );
 
         assert_eq!(
             parse_interval("interval 123 minutes").unwrap(),
-            Duration::from_secs(123 * 60)
+            Some(Duration::from_secs(123 * 60))
         );
 
         assert_eq!(
             parse_interval("interval 123 hour").unwrap(),
-            Duration::from_secs(123 * 3600)
+            Some(Duration::from_secs(123 * 3600))
         );
 
         assert_eq!(
             parse_interval("interval 123 hours").unwrap(),
-            Duration::from_secs(123 * 3600)
+            Some(Duration::from_secs(123 * 3600))
         );
 
         assert_eq!(
             parse_interval("interval 123 day").unwrap(),
-            Duration::from_secs(123 * 86400)
+            Some(Duration::from_secs(123 * 86400))
         );
 
         assert_eq!(
             parse_interval("interval 123 days").unwrap(),
-            Duration::from_secs(123 * 86400)
+            Some(Duration::from_secs(123 * 86400))
         );
 
         assert_eq!(
             parse_interval("interval 123 week").unwrap(),
-            Duration::from_secs(123 * 604800)
+            Some(Duration::from_secs(123 * 604800))
         );
 
         assert_eq!(
             parse_interval("interval 123 week").unwrap(),
-            Duration::from_secs(123 * 604800)
+            Some(Duration::from_secs(123 * 604800))
         );
     }
 

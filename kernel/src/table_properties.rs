@@ -21,7 +21,7 @@ use crate::{Error, Version};
 use strum::EnumString;
 
 mod deserialize;
-pub use deserialize::ParseIntervalError;
+pub use deserialize::{ParseBoolError, ParseIntervalError};
 
 /// Delta table properties. These are parsed from the 'configuration' map in the most recent
 /// 'Metadata' action of a table.
