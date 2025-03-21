@@ -1,13 +1,18 @@
 //! EngineData related ffi code
 
+#[cfg(feature = "default-engine")]
 use delta_kernel::arrow::array::{
     ffi::{FFI_ArrowArray, FFI_ArrowSchema},
     ArrayData, StructArray,
 };
-use delta_kernel::{DeltaResult, EngineData};
+#[cfg(feature = "default-engine")]
+use delta_kernel::DeltaResult;
+use delta_kernel::EngineData;
 use std::ffi::c_void;
 
-use crate::{ExclusiveEngineData, ExternResult, IntoExternResult, SharedExternEngine};
+use crate::ExclusiveEngineData;
+#[cfg(feature = "default-engine")]
+use crate::{ExternResult, IntoExternResult, SharedExternEngine};
 
 use super::handle::Handle;
 

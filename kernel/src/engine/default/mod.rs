@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use self::storage::parse_url_opts;
-use object_store::{path::Path, DynObjectStore};
+use object_store::DynObjectStore;
 use url::Url;
 
 use self::executor::TaskExecutor;
@@ -60,8 +60,8 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         V: Into<String>,
     {
         // table root is the path of the table in the ObjectStore
-        let (store, table_root) = parse_url_opts(table_root, options)?;
-        Ok(Self::new(Arc::new(store), table_root, task_executor))
+        let (store, _table_root) = parse_url_opts(table_root, options)?;
+        Ok(Self::new(Arc::new(store), task_executor))
     }
 
     /// Create a new [`DefaultEngine`] instance
@@ -71,7 +71,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// - `store`: The object store to use.
     /// - `table_root_path`: The root path of the table within storage.
     /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    pub fn new(store: Arc<DynObjectStore>, table_root: Path, task_executor: Arc<E>) -> Self {
+    pub fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
         // HACK to check if we're using a LocalFileSystem from ObjectStore. We need this because
         // local filesystem doesn't return a sorted list by default. Although the `object_store`
         // crate explicitly says it _does not_ return a sorted listing, in practice all the cloud
@@ -97,7 +97,6 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             file_system: Arc::new(ObjectStoreFileSystemClient::new(
                 store.clone(),
                 !is_local,
-                table_root,
                 task_executor.clone(),
             )),
             json: Arc::new(DefaultJsonHandler::new(
@@ -156,5 +155,22 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
 
     fn get_parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         self.parquet.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::executor::tokio::TokioBackgroundExecutor;
+    use super::*;
+    use crate::engine::tests::test_arrow_engine;
+    use object_store::local::LocalFileSystem;
+
+    #[test]
+    fn test_default_engine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let store = Arc::new(LocalFileSystem::new());
+        let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        test_arrow_engine(&engine, &url);
     }
 }

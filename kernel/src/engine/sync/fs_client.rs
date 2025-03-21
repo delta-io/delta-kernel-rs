@@ -39,7 +39,7 @@ impl FileSystemClient for SyncFilesystemClient {
             let all_ents: Vec<_> = std::fs::read_dir(path_to_read)?
                 .filter(|ent_res| {
                     match (ent_res, min_file_name) {
-                        (Ok(ent), Some(min_file_name)) => ent.file_name() >= *min_file_name,
+                        (Ok(ent), Some(min_file_name)) => ent.file_name() > *min_file_name,
                         _ => true, // Keep unfiltered and/or error entries
                     }
                 })
@@ -106,7 +106,7 @@ mod tests {
         writeln!(f, "null")?;
         f.flush()?;
 
-        let url_path = tmp_dir.path().join(get_json_filename(1));
+        let url_path = tmp_dir.path().join(get_json_filename(0));
         let url = Url::from_file_path(url_path).unwrap();
         let files: Vec<_> = client.list_from(&url)?.try_collect()?;
 
@@ -137,11 +137,11 @@ mod tests {
             // i+1 in index because we started at 0001 in the listing
             assert_eq!(
                 file?.location.to_file_path().unwrap().to_str().unwrap(),
-                expected[i + 1].to_str().unwrap()
+                expected[i + 2].to_str().unwrap()
             );
             file_count += 1;
         }
-        assert_eq!(file_count, 2);
+        assert_eq!(file_count, 1);
 
         let url_path = tmp_dir.path().join("");
         let url = Url::from_file_path(url_path).unwrap();
