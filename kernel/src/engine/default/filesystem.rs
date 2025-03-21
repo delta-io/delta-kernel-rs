@@ -135,13 +135,11 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
                         if url.is_presigned() {
                             // have to annotate type here or rustc can't figure it out
                             Ok::<bytes::Bytes, Error>(reqwest::get(url).await?.bytes().await?)
+                        } else if let Some(rng) = range {
+                            Ok(store.get_range(&path, rng).await?)
                         } else {
-                            if let Some(rng) = range {
-                                Ok(store.get_range(&path, rng).await?)
-                            } else {
-                                let result = store.get(&path).await?;
-                                Ok(result.bytes().await?)
-                            }
+                            let result = store.get(&path).await?;
+                            Ok(result.bytes().await?)
                         }
                     }
                 })

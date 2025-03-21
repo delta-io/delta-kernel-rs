@@ -158,7 +158,7 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
     }
 }
 
-pub(self) trait UrlExt {
+trait UrlExt {
     fn is_presigned(&self) -> bool;
 }
 
