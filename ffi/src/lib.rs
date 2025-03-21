@@ -81,7 +81,7 @@ impl Iterator for EngineIterator {
 ///
 /// Whoever instantiates the struct must ensure it does not outlive the data it points to. The
 /// compiler cannot help us here, because raw pointers don't have lifetimes. A good rule of thumb is
-/// to always use the [`kernel_string_slice`] macro to create string slices, and to avoid returning
+/// to always use the `kernel_string_slice` macro to create string slices, and to avoid returning
 /// a string slice from a code block or function (since the move risks over-extending its lifetime):
 ///
 /// ```ignore
@@ -331,6 +331,8 @@ pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
 /// an opaque struct that encapsulates data read by an engine. this handle can be passed back into
 /// some kernel calls to operate on the data, or can be converted into the raw data as read by the
 /// [`delta_kernel::Engine`] by calling [`get_raw_engine_data`]
+///
+/// [`get_raw_engine_data`]: crate::engine_data::get_raw_engine_data
 #[handle_descriptor(target=dyn EngineData, mutable=true)]
 pub struct ExclusiveEngineData;
 
@@ -353,12 +355,14 @@ pub trait ExternEngine: Send + Sync {
 #[handle_descriptor(target=dyn ExternEngine, mutable=false)]
 pub struct SharedExternEngine;
 
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 struct ExternEngineVtable {
     // Actual engine instance to use
     engine: Arc<dyn Engine>,
     allocate_error: AllocateErrorFn,
 }
 
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 impl Drop for ExternEngineVtable {
     fn drop(&mut self) {
         debug!("dropping engine interface");
@@ -369,6 +373,7 @@ impl Drop for ExternEngineVtable {
 ///
 /// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
 /// responsible for handling  any races that could result.
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 unsafe impl Send for ExternEngineVtable {}
 
 /// # Safety
@@ -380,8 +385,10 @@ unsafe impl Send for ExternEngineVtable {}
 /// Basically, by failing to implement these traits, we forbid the engine from being able to declare
 /// its thread-safety (because rust assumes it is not threadsafe). By implementing them, we leave it
 /// up to the engine to enforce thread safety if engine chooses to use threads at all.
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 unsafe impl Sync for ExternEngineVtable {}
 
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 impl ExternEngine for ExternEngineVtable {
     fn engine(&self) -> Arc<dyn Engine> {
         self.engine.clone()
@@ -677,8 +684,11 @@ pub struct StringSliceIterator;
 
 /// # Safety
 ///
-/// The iterator must be valid (returned by [kernel_scan_data_init]) and not yet freed by
-/// [kernel_scan_data_free]. The visitor function pointer must be non-null.
+/// The iterator must be valid (returned by [`kernel_scan_data_init`]) and not yet freed by
+/// [`free_kernel_scan_data`]. The visitor function pointer must be non-null.
+///
+/// [`kernel_scan_data_init`]: crate::scan::kernel_scan_data_init
+/// [`free_kernel_scan_data`]: crate::scan::free_kernel_scan_data
 #[no_mangle]
 pub unsafe extern "C" fn string_slice_next(
     data: Handle<StringSliceIterator>,

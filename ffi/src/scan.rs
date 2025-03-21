@@ -30,8 +30,9 @@ use super::handle::Handle;
 pub struct SharedScan;
 
 /// Drops a scan.
+///
 /// # Safety
-/// Caller is responsible for passing a [valid][Handle#Validity] scan handle.
+/// Caller is responsible for passing a valid scan handle.
 #[no_mangle]
 pub unsafe extern "C" fn free_scan(scan: Handle<SharedScan>) {
     scan.drop_handle();
@@ -182,6 +183,9 @@ fn kernel_scan_data_init_impl(
 ///
 /// The iterator must be valid (returned by [kernel_scan_data_init]) and not yet freed by
 /// [`free_kernel_scan_data`]. The visitor function pointer must be non-null.
+///
+/// [`free_bool_slice`]: crate::free_bool_slice
+/// [`free_engine_data`]: crate::free_engine_data
 #[no_mangle]
 pub unsafe extern "C" fn kernel_scan_data_next(
     data: Handle<SharedScanDataIterator>,

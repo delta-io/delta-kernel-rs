@@ -8,8 +8,11 @@ members = [
     "test-utils",
     "feature-tests",
 ]
-# Only check / build main crates by default (check all with `--workspace`)
-default-members = ["acceptance", "kernel"]
+# note that in addition to the members above, the workspace includes examples:
+# - inspect-table
+# - read-table-changes
+# - read-table-multi-threaded
+# - read-table-single-threaded
 resolver = "2"
 
 [workspace.package]

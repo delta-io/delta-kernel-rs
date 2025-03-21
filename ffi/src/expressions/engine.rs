@@ -28,12 +28,14 @@ impl KernelExpressionVisitorState {
 ///
 /// When invoking [`scan::scan`], The engine provides a pointer to the (engine's native) predicate,
 /// along with a visitor function that can be invoked to recursively visit the predicate. This
-/// engine state must be valid until the call to `scan::scan` returns. Inside that method, the
+/// engine state must be valid until the call to [`scan::scan`] returns. Inside that method, the
 /// kernel allocates visitor state, which becomes the second argument to the predicate visitor
 /// invocation along with the engine-provided predicate pointer. The visitor state is valid for the
 /// lifetime of the predicate visitor invocation. Thanks to this double indirection, engine and
 /// kernel each retain ownership of their respective objects, with no need to coordinate memory
 /// lifetimes with the other.
+///
+/// [`scan::scan`]: crate::scan::scan
 #[repr(C)]
 pub struct EnginePredicate {
     pub predicate: *mut c_void,
