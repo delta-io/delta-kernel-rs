@@ -52,6 +52,7 @@ pub enum KernelError {
     ChangeDataFeedUnsupported,
     ChangeDataFeedIncompatibleSchema,
     InvalidCheckpoint,
+    EmptyLogSegment,
 }
 
 impl From<Error> for KernelError {
@@ -110,6 +111,7 @@ impl From<Error> for KernelError {
                 KernelError::ChangeDataFeedIncompatibleSchema
             }
             Error::InvalidCheckpoint(_) => KernelError::InvalidCheckpoint,
+            Error::EmptyLogSegment => KernelError::EmptyLogSegment,
         }
     }
 }

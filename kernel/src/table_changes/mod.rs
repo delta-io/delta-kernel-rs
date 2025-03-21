@@ -111,7 +111,7 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 pub struct TableChanges {
     pub(crate) log_segment: LogSegment,
     table_root: Url,
-    end_snapshot: Snapshot,
+    end_snapshot: Arc<Snapshot>,
     start_version: Version,
     schema: Schema,
 }
@@ -149,9 +149,12 @@ impl TableChanges {
         // Both snapshots ensure that reading is supported at the start and end version using
         // `ensure_read_supported`. Note that we must still verify that reading is
         // supported for every protocol action in the CDF range.
-        let start_snapshot =
-            Snapshot::try_new(table_root.as_url().clone(), engine, Some(start_version))?;
-        let end_snapshot = Snapshot::try_new(table_root.as_url().clone(), engine, end_version)?;
+        let start_snapshot = Arc::new(Snapshot::try_new(
+            table_root.as_url().clone(),
+            engine,
+            Some(start_version),
+        )?);
+        let end_snapshot = Snapshot::try_new_from(start_snapshot.clone(), engine, end_version)?;
 
         // Verify CDF is enabled at the beginning and end of the interval using
         // [`check_cdf_table_properties`] to fail early. This also ensures that column mapping is

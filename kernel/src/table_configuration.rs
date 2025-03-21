@@ -33,7 +33,7 @@ use crate::{DeltaResult, Error, Version};
 /// `try_new` successfully returns `TableConfiguration`, it is also guaranteed that reading the
 /// table is supported.
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableConfiguration {
     metadata: Metadata,
     protocol: Protocol,
@@ -86,6 +86,58 @@ impl TableConfiguration {
             column_mapping_mode,
             table_root,
             version,
+        })
+    }
+
+    pub(crate) fn new_from(
+        table_configuration: &Self,
+        new_metadata: Option<Metadata>,
+        new_protocol: Option<Protocol>,
+        new_version: Version,
+    ) -> DeltaResult<Self> {
+        // simplest case: no new P/M, just return the existing table configuration with new version
+        if new_metadata.is_none() && new_protocol.is_none() {
+            return Ok(Self {
+                version: new_version,
+                ..(*table_configuration).clone()
+            });
+        }
+
+        // if there's new metadata: have to parse schema, table properties
+        let (metadata, schema, table_properties) = match new_metadata {
+            Some(metadata) => {
+                let schema = Arc::new(metadata.parse_schema()?);
+                let table_properties = metadata.parse_table_properties();
+                (metadata, schema, table_properties)
+            }
+            None => (
+                table_configuration.metadata.clone(),
+                table_configuration.schema.clone(),
+                table_configuration.table_properties.clone(),
+            ),
+        };
+
+        // if there's new protocol: have to ensure read supported
+        let protocol = match new_protocol {
+            Some(protocol) => {
+                protocol.ensure_read_supported()?;
+                protocol
+            }
+            None => table_configuration.protocol.clone(),
+        };
+
+        // if either change, have to validate column mapping mode
+        let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
+        validate_schema_column_mapping(&schema, column_mapping_mode)?;
+
+        Ok(Self {
+            schema,
+            metadata,
+            protocol,
+            table_properties,
+            column_mapping_mode,
+            table_root: table_configuration.table_root.clone(),
+            version: new_version,
         })
     }
 

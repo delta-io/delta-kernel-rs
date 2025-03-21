@@ -21,6 +21,7 @@ const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 /// throughout time, `Snapshot`s represent a view of a table at a specific point in time; they
 /// have a defined schema (which may change over time for any given table), specific version, and
 /// frozen log segment.
+#[derive(PartialEq, Eq)]
 pub struct Snapshot {
     log_segment: LogSegment,
     table_configuration: TableConfiguration,
@@ -43,13 +44,21 @@ impl std::fmt::Debug for Snapshot {
 }
 
 impl Snapshot {
+    fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
+        Self {
+            log_segment,
+            table_configuration,
+        }
+    }
+
     /// Create a new [`Snapshot`] instance for the given version.
     ///
     /// # Parameters
     ///
     /// - `table_root`: url pointing at the table root (where `_delta_log` folder is located)
     /// - `engine`: Implementation of [`Engine`] apis.
-    /// - `version`: target version of the [`Snapshot`]
+    /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
+    ///   version of the table.
     pub fn try_new(
         table_root: Url,
         engine: &dyn Engine,
@@ -65,6 +74,98 @@ impl Snapshot {
 
         // try_new_from_log_segment will ensure the protocol is supported
         Self::try_new_from_log_segment(table_root, log_segment, engine)
+    }
+
+    /// Create a new [`Snapshot`] instance from an existing [`Snapshot`]. This is useful when you
+    /// already have a [`Snapshot`] lying around and want to do the minimal work to 'update' the
+    /// snapshot to a later version.
+    ///
+    /// # Parameters
+    ///
+    /// - `existing_snapshot`: reference to an existing [`Snapshot`]
+    /// - `engine`: Implementation of [`Engine`] apis.
+    /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
+    ///   version of the table.
+    pub fn try_new_from(
+        existing_snapshot: Arc<Snapshot>,
+        engine: &dyn Engine,
+        version: impl Into<Option<Version>>,
+    ) -> DeltaResult<Arc<Self>> {
+        // simple heuristic for now:
+        // 1. if the new version == existing version, just return the existing snapshot
+        // 2. if the new version < existing version, just return an entirely new snapshot
+        // 3. list from (existing snapshot version + 1) onward
+        // 4a. if new checkpoint is found: just create a new snapshot from that checkpoint (and
+        // commits after it)
+        // 4b. if no new checkpoint is found: do lightweight P+M replay on the latest commits
+        let old_version = existing_snapshot.version();
+        let new_version = version.into();
+        if let Some(new_version) = new_version {
+            if new_version == old_version {
+                // Re-requesting the same version
+                return Ok(existing_snapshot.clone());
+            }
+            if new_version < old_version {
+                warn!(
+                    "[Snapshot::try_new_from] new version: {new_version} is older than existing version: {}",
+                    old_version
+                );
+                // Hint is too new, just create a new snapshot the normal way
+                return Snapshot::try_new(
+                    existing_snapshot.table_root().clone(),
+                    engine,
+                    Some(new_version),
+                )
+                .map(Arc::new);
+            }
+        }
+
+        // create a log segment just from existing_snapshot.version -> new_version
+        let log_root = existing_snapshot.log_segment.log_root.clone();
+        let fs_client = engine.get_file_system_client();
+        let new_log_segment = LogSegment::for_versions(
+            fs_client.as_ref(),
+            log_root,
+            existing_snapshot.version() + 1,
+            new_version,
+        );
+
+        match new_log_segment {
+            Err(Error::EmptyLogSegment) => {
+                // no new log files at all, just return the existing snapshot
+                Ok(existing_snapshot.clone())
+            }
+            Ok(new_log_segment) if new_log_segment.ascending_commit_files.is_empty() => {
+                // no new commits, just return the existing snapshot
+                Ok(existing_snapshot.clone())
+            }
+            Ok(new_log_segment) if new_log_segment.has_checkpoint() => {
+                // we have a checkpoint in the new LogSegment, just construct a new snapshot from that
+                Self::try_new_from_log_segment(
+                    existing_snapshot.table_root().clone(),
+                    new_log_segment,
+                    engine,
+                )
+                .map(Arc::new)
+            }
+            Ok(new_log_segment) => {
+                // we have new commits and no new snapshot: we replay new commits for P+M and then
+                // create a new snapshot by combining LogSegments and building a new TableConfiguration
+                let (new_metadata, new_protocol) = new_log_segment.protocol_and_metadata(engine)?;
+                let table_configuration = TableConfiguration::new_from(
+                    existing_snapshot.table_configuration(),
+                    new_metadata,
+                    new_protocol,
+                    new_log_segment.end_version,
+                )?;
+                // NB: we must add the new log segment to the existing snapshot's log segment
+                Ok(Arc::new(Snapshot::new(
+                    LogSegment::try_concat(existing_snapshot.log_segment.clone(), new_log_segment)?,
+                    table_configuration,
+                )))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Create a new [`Snapshot`] instance.
@@ -197,11 +298,14 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::ObjectStore;
+    use serde_json::json;
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::filesystem::ObjectStoreFileSystemClient;
+    use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
     use crate::path::ParsedLogPath;
+    use test_utils::{add_commit, delta_path_for_version};
 
     #[test]
     fn test_snapshot_read_metadata() {
@@ -237,6 +341,180 @@ mod tests {
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
         let expected: SchemaRef = serde_json::from_str(schema_string).unwrap();
         assert_eq!(snapshot.schema(), expected);
+    }
+
+    // interesting cases for testing Snapshot::new_from:
+    // 1. new version < existing version
+    // 2. new version == existing version
+    // 3. new version > existing version AND
+    //   a. log segment hasn't changed
+    //   b. log segment for old..=new version has a checkpoint (with new protocol/metadata)
+    //   b. log segment for old..=new version has no checkpoint
+    //     i. commits have (new protocol, new metadata)
+    //     ii. commits have (new protocol, no metadata)
+    //     iii. commits have (no protocol, new metadata)
+    //     iv. commits have (no protocol, no metadata)
+    #[tokio::test]
+    async fn test_snapshot_new_from() -> DeltaResult<()> {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+
+        let engine = SyncEngine::new();
+        let old_snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, Some(1)).unwrap());
+        // 1. new version < existing version
+        let snapshot = Snapshot::try_new_from(old_snapshot.clone(), &engine, Some(0)).unwrap();
+        let expected = Snapshot::try_new(url.clone(), &engine, Some(0)).unwrap();
+        assert_eq!(snapshot, expected.into());
+
+        // 2. new version == existing version
+        let snapshot = Snapshot::try_new_from(old_snapshot.clone(), &engine, Some(1)).unwrap();
+        let expected = old_snapshot.clone();
+        assert_eq!(snapshot, expected);
+
+        // tests Snapshot::new_from by:
+        // 1. creating a snapshot with new API for commits 0..=2 (based on old snapshot at 0)
+        // 2. comparing with a snapshot created directly at version 2
+        //
+        // the commits tested are:
+        // - commit 0 -> base snapshot at this version
+        // - commit 1 -> final snapshots at this version
+        //
+        // in each test we will modify versions 1 and 2 to test different scenarios
+        fn test_new_from(store: Arc<InMemory>) -> DeltaResult<()> {
+            let url = Url::parse("memory:///")?;
+            let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
+            let base_snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, Some(0))?);
+            let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(1))?;
+            let expected = Snapshot::try_new(url.clone(), &engine, Some(1))?;
+            assert_eq!(snapshot, expected.into());
+            Ok(())
+        }
+
+        // TODO: unify this and lots of stuff in LogSegment tests and test_utils
+        async fn commit(store: &InMemory, version: Version, commit: Vec<serde_json::Value>) {
+            let commit_data = commit
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<String>>()
+                .join("\n");
+            add_commit(store, version, commit_data).await.unwrap();
+        }
+
+        // for (3) we will just engineer custom log files
+        let store = Arc::new(InMemory::new());
+        // everything will have a starting 0 commit with commitInfo, protocol, metadata
+        let commit0 = vec![
+            json!({
+                "commitInfo": {
+                    "timestamp": 1587968586154i64,
+                    "operation": "WRITE",
+                    "operationParameters": {"mode":"ErrorIfExists","partitionBy":"[]"},
+                    "isBlindAppend":true
+                }
+            }),
+            json!({
+                "protocol": {
+                    "minReaderVersion": 1,
+                    "minWriterVersion": 2
+                }
+            }),
+            json!({
+                "metaData": {
+                    "id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+                    "format": {
+                        "provider": "parquet",
+                        "options": {}
+                    },
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
+                    "partitionColumns": [],
+                    "configuration": {},
+                    "createdTime": 1587968585495i64
+                }
+            }),
+        ];
+        commit(store.as_ref(), 0, commit0.clone()).await;
+        // 3. new version > existing version
+        // a. no new log segment
+        let url = Url::parse("memory:///")?;
+        let engine = DefaultEngine::new(
+            Arc::new(store.fork()),
+            Arc::new(TokioBackgroundExecutor::new()),
+        );
+        let base_snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, Some(0))?);
+        let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(1))?;
+        let expected = Snapshot::try_new(url.clone(), &engine, Some(0))?;
+        assert_eq!(snapshot, expected.into());
+
+        //// TODO checkpoint test
+        //// b. log segment for old..=new version has a checkpoint (with new protocol/metadata)
+        //let store_3a = store.fork();
+        //let mut checkpoint1 = commit0.clone();
+        //checkpoint1[1] = json!({
+        //    "protocol": {
+        //        "minReaderVersion": 2,
+        //        "minWriterVersion": 5
+        //    }
+        //});
+        //checkpoint1[2]["partitionColumns"] = serde_json::to_value(["some_partition_column"])?;
+        //
+        // // Write the record batch to a Parquet file
+        // let mut buffer = vec![];
+        // let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
+        // writer.write(&record_batch)?;
+        // writer.close()?;
+
+        // store
+        //     .put(
+        //         &delta_path_for_version(1, "checkpoint.parquet"),
+        //         buffer.into(),
+        //     )
+        //     .await
+        //     .unwrap();
+        // test_new_from(store_3a.into())?;
+
+        // c. log segment for old..=new version has no checkpoint
+        // i. commits have (new protocol, new metadata)
+        let store_3c_i = store.fork();
+        let mut commit1 = commit0.clone();
+        commit1[1] = json!({
+            "protocol": {
+                "minReaderVersion": 2,
+                "minWriterVersion": 5
+            }
+        });
+        commit1[2]["partitionColumns"] = serde_json::to_value(["some_partition_column"])?;
+        commit(&store_3c_i, 1, commit1).await;
+        test_new_from(store_3c_i.into())?;
+
+        // ii. commits have (new protocol, no metadata)
+        let store_3c_ii = store.fork();
+        let mut commit1 = commit0.clone();
+        commit1[1] = json!({
+            "protocol": {
+                "minReaderVersion": 2,
+                "minWriterVersion": 5
+            }
+        });
+        commit1.remove(2); // remove metadata
+        commit(&store_3c_ii, 1, commit1).await;
+        test_new_from(store_3c_ii.into())?;
+
+        // iii. commits have (no protocol, new metadata)
+        let store_3c_iii = store.fork();
+        let mut commit1 = commit0.clone();
+        commit1[2]["partitionColumns"] = serde_json::to_value(["some_partition_column"])?;
+        commit1.remove(1); // remove protocol
+        commit(&store_3c_iii, 1, commit1).await;
+        test_new_from(store_3c_iii.into())?;
+
+        // iv. commits have (no protocol, no metadata)
+        let store_3c_iv = store.fork();
+        let commit1 = vec![commit0[0].clone()];
+        commit(&store_3c_iv, 1, commit1).await;
+        test_new_from(store_3c_iv.into())?;
+
+        Ok(())
     }
 
     #[test]
