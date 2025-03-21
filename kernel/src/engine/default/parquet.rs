@@ -4,6 +4,13 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
+use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
+use crate::parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
+use crate::parquet::arrow::arrow_writer::ArrowWriter;
+use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::DynObjectStore;
@@ -11,17 +18,10 @@ use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use super::UrlExt;
-use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{fixup_parquet_read, generate_mask, get_requested_indices};
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use crate::parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
-};
-use crate::parquet::arrow::arrow_writer::ArrowWriter;
-use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, EngineData, Error, ExpressionRef, FileDataReadResultIterator, FileMeta,
