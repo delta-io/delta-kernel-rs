@@ -626,7 +626,7 @@ pub unsafe extern "C" fn version(snapshot: Handle<SharedSnapshot>) -> u64 {
 #[no_mangle]
 pub unsafe extern "C" fn logical_schema(snapshot: Handle<SharedSnapshot>) -> Handle<SharedSchema> {
     let snapshot = unsafe { snapshot.as_ref() };
-    Arc::new(snapshot.schema().clone()).into()
+    snapshot.schema().into()
 }
 
 /// Free a schema
