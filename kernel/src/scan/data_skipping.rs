@@ -239,12 +239,12 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         Some(Expr::binary(op, col, val.clone()))
     }
 
-    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
-        KernelPredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted).map(Expr::literal)
-    }
-
     fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
         KernelPredicateEvaluatorDefaults::eval_scalar(val, inverted).map(Expr::literal)
+    }
+
+    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
+        KernelPredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted).map(Expr::literal)
     }
 
     fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Expr> {
