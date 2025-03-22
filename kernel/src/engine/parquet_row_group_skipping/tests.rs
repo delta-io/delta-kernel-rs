@@ -1,5 +1,5 @@
 use super::*;
-use crate::expressions::{column_expr, column_name};
+use crate::expressions::{column_name, column_pred};
 use crate::kernel_predicates::DataSkippingPredicateEvaluator as _;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use crate::Predicate;
@@ -41,21 +41,21 @@ fn test_get_stat_values() {
 
     // The expression doesn't matter -- it just needs to mention all the columns we care about.
     let columns = Predicate::and_from(vec![
-        column_expr!("varlen.utf8"),
-        column_expr!("numeric.ints.int64"),
-        column_expr!("numeric.ints.int32"),
-        column_expr!("numeric.ints.int16"),
-        column_expr!("numeric.ints.int8"),
-        column_expr!("numeric.floats.float32"),
-        column_expr!("numeric.floats.float64"),
-        column_expr!("bool"),
-        column_expr!("varlen.binary"),
-        column_expr!("numeric.decimals.decimal32"),
-        column_expr!("numeric.decimals.decimal64"),
-        column_expr!("numeric.decimals.decimal128"),
-        column_expr!("chrono.date32"),
-        column_expr!("chrono.timestamp"),
-        column_expr!("chrono.timestamp_ntz"),
+        column_pred!("varlen.utf8"),
+        column_pred!("numeric.ints.int64"),
+        column_pred!("numeric.ints.int32"),
+        column_pred!("numeric.ints.int16"),
+        column_pred!("numeric.ints.int8"),
+        column_pred!("numeric.floats.float32"),
+        column_pred!("numeric.floats.float64"),
+        column_pred!("bool"),
+        column_pred!("varlen.binary"),
+        column_pred!("numeric.decimals.decimal32"),
+        column_pred!("numeric.decimals.decimal64"),
+        column_pred!("numeric.decimals.decimal128"),
+        column_pred!("chrono.date32"),
+        column_pred!("chrono.timestamp"),
+        column_pred!("chrono.timestamp_ntz"),
     ]);
     let filter = RowGroupFilter::new(metadata.metadata().row_group(0), &columns);
 

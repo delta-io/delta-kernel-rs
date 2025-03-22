@@ -30,7 +30,8 @@ pub(crate) trait ParquetStatsProvider {
 /// Blanket implementation that converts a [`ParquetStatsProvider`] into a
 /// [`DataSkippingPredicateEvaluator`].
 impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
-    type Output = bool;
+    type Predicate = bool;
+    type Expression = Scalar;
     type TypedStat = Scalar;
     type IntStat = i64;
 

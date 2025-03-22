@@ -1,5 +1,7 @@
 use super::*;
-use crate::expressions::{column_expr, column_name, ArrayData, Expression, StructData};
+use crate::expressions::{
+    column_expr, column_name, column_pred, ArrayData, Expression, StructData,
+};
 use crate::schema::ArrayType;
 use crate::DataType;
 
@@ -340,12 +342,12 @@ fn test_eval_column() {
         (Scalar::Null(DataType::BOOLEAN), None),
         (Scalar::from(1), None),
     ];
-    let col = &column_name!("x");
+    let col = &column_expr!("x");
     for (input, expect) in &test_cases {
         let filter = DefaultKernelPredicateEvaluator::from(input.clone());
         for inverted in [true, false] {
             expect_eq!(
-                filter.eval_column(col, inverted),
+                filter.eval_pred_expr(col, inverted),
                 expect.map(|v| v != inverted),
                 "{input:?} (inverted: {inverted})"
             );
@@ -363,7 +365,7 @@ fn test_eval_not() {
     ];
     let filter = DefaultKernelPredicateEvaluator::from(UnimplementedColumnResolver);
     for (input, expect) in test_cases {
-        let input = input.into();
+        let input = Pred::from(Expr::from(input));
         for inverted in [true, false] {
             expect_eq!(
                 filter.eval_pred_not(&input, inverted),
@@ -474,29 +476,6 @@ fn eval_binary() {
     let val = Expression::literal(10);
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
 
-    // unsupported
-    expect_eq!(
-        filter.eval_pred_binary(BinaryPredicateOp::Plus, &col, &val, false),
-        None,
-        "x + 10"
-    );
-    expect_eq!(
-        filter.eval_pred_binary(BinaryPredicateOp::Minus, &col, &val, false),
-        None,
-        "x - 10"
-    );
-    expect_eq!(
-        filter.eval_pred_binary(BinaryPredicateOp::Multiply, &col, &val, false),
-        None,
-        "x * 10"
-    );
-    expect_eq!(
-        filter.eval_pred_binary(BinaryPredicateOp::Divide, &col, &val, false),
-        None,
-        "x / 10"
-    );
-
-    // supported
     for inverted in [true, false] {
         expect_eq!(
             filter.eval_pred_binary(BinaryPredicateOp::LessThan, &col, &val, inverted),
@@ -583,6 +562,7 @@ impl ResolveColumnAsScalar for NullColumnResolver {
 #[test]
 fn test_sql_where() {
     let col = &column_expr!("x");
+    let col_pred = &column_pred!("x");
     const VAL: Expr = Expr::Literal(Scalar::Integer(1));
     const NULL: Expr = Expr::Literal(Scalar::Null(DataType::BOOLEAN));
     const FALSE: Expr = Expr::Literal(Scalar::Boolean(false));
@@ -591,18 +571,30 @@ fn test_sql_where() {
     let empty_filter = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
 
     // Basic sanity check
-    expect_eq!(null_filter.eval_sql_where(&VAL), None, "WHERE {VAL}");
-    expect_eq!(empty_filter.eval_sql_where(&VAL), None, "WHERE {VAL}");
+    expect_eq!(null_filter.eval_sql_where(&VAL.into()), None, "WHERE {VAL}");
+    expect_eq!(
+        empty_filter.eval_sql_where(&VAL.into()),
+        None,
+        "WHERE {VAL}"
+    );
 
-    expect_eq!(null_filter.eval_sql_where(col), Some(false), "WHERE {col}");
-    expect_eq!(empty_filter.eval_sql_where(col), None, "WHERE {col}");
+    expect_eq!(
+        null_filter.eval_sql_where(col_pred),
+        Some(false),
+        "WHERE {col_pred}"
+    );
+    expect_eq!(
+        empty_filter.eval_sql_where(col_pred),
+        None,
+        "WHERE {col_pred}"
+    );
 
     // SQL eval does not modify behavior of IS NULL
     let pred = &Pred::is_null(col.clone());
     expect_eq!(null_filter.eval_sql_where(pred), Some(true), "{pred}");
 
     // NOT a gets skipped when NULL but not when missing
-    let pred = &!col.clone();
+    let pred = &!col_pred.clone();
     expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 

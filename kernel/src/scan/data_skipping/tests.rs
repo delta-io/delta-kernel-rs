@@ -157,6 +157,7 @@ fn test_eval_variadic() {
                 Some(v) => Expr::literal(v),
                 None => Expr::null_literal(DataType::BOOLEAN),
             })
+            .map(Pred::from)
             .collect();
 
         let pred = Pred::and_from(inputs.clone());

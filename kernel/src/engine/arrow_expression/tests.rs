@@ -29,11 +29,11 @@ fn test_array_column() {
 
     let result = evaluate_predicate(&not_op, &batch).unwrap();
     let expected = BooleanArray::from(vec![true, false, true]);
-    assert_eq!(result.as_ref(), &expected);
+    assert_eq!(result, expected);
 
     let result = evaluate_predicate(&in_op, &batch).unwrap();
     let expected = BooleanArray::from(vec![false, true, false]);
-    assert_eq!(result.as_ref(), &expected);
+    assert_eq!(result, expected);
 }
 
 #[test]
@@ -71,7 +71,7 @@ fn test_literal_type_array() {
 
     let in_result = evaluate_predicate(&in_op, &batch).unwrap();
     let in_expected = BooleanArray::from(vec![true]);
-    assert_eq!(in_result.as_ref(), &in_expected);
+    assert_eq!(in_result, in_expected);
 }
 
 #[test]
@@ -119,11 +119,11 @@ fn test_str_arrays() {
 
     let result = evaluate_predicate(&str_in_op, &batch).unwrap();
     let expected = BooleanArray::from(vec![true, true, true]);
-    assert_eq!(result.as_ref(), &expected);
+    assert_eq!(result, expected);
 
     let result = evaluate_predicate(&str_not_op, &batch).unwrap();
     let expected = BooleanArray::from(vec![false, false, false]);
-    assert_eq!(result.as_ref(), &expected);
+    assert_eq!(result, expected);
 }
 
 #[test]
@@ -228,32 +228,32 @@ fn test_binary_cmp() {
     let predicate = column.clone().lt(2);
     let results = evaluate_predicate(&predicate, &batch).unwrap();
     let expected = BooleanArray::from(vec![true, false, false]);
-    assert_eq!(results.as_ref(), &expected);
+    assert_eq!(results, expected);
 
     let predicate = column.clone().le(2);
     let results = evaluate_predicate(&predicate, &batch).unwrap();
     let expected = BooleanArray::from(vec![true, true, false]);
-    assert_eq!(results.as_ref(), &expected);
+    assert_eq!(results, expected);
 
     let predicate = column.clone().gt(2);
     let results = evaluate_predicate(&predicate, &batch).unwrap();
     let expected = BooleanArray::from(vec![false, false, true]);
-    assert_eq!(results.as_ref(), &expected);
+    assert_eq!(results, expected);
 
     let predicate = column.clone().ge(2);
     let results = evaluate_predicate(&predicate, &batch).unwrap();
     let expected = BooleanArray::from(vec![false, true, true]);
-    assert_eq!(results.as_ref(), &expected);
+    assert_eq!(results, expected);
 
     let predicate = column.clone().eq(2);
     let results = evaluate_predicate(&predicate, &batch).unwrap();
     let expected = BooleanArray::from(vec![false, true, false]);
-    assert_eq!(results.as_ref(), &expected);
+    assert_eq!(results, expected);
 
     let predicate = column.clone().ne(2);
     let results = evaluate_predicate(&predicate, &batch).unwrap();
     let expected = BooleanArray::from(vec![true, false, true]);
-    assert_eq!(results.as_ref(), &expected);
+    assert_eq!(results, expected);
 }
 
 #[test]
@@ -278,20 +278,20 @@ fn test_logical() {
     let predicate = Predicate::and(column_a.clone(), column_b.clone());
     let results = evaluate_predicate(&predicate, &batch).unwrap();
     let expected = BooleanArray::from(vec![false, false]);
-    assert_eq!(results.as_ref(), &expected);
+    assert_eq!(results, expected);
 
     let predicate = Predicate::and(column_a.clone(), true);
     let results = evaluate_predicate(&predicate, &batch).unwrap();
     let expected = BooleanArray::from(vec![true, false]);
-    assert_eq!(results.as_ref(), &expected);
+    assert_eq!(results, expected);
 
     let predicate = Predicate::or(column_a.clone(), column_b);
     let results = evaluate_predicate(&predicate, &batch).unwrap();
     let expected = BooleanArray::from(vec![true, true]);
-    assert_eq!(results.as_ref(), &expected);
+    assert_eq!(results, expected);
 
     let predicate = Predicate::or(column_a.clone(), false);
     let results = evaluate_predicate(&predicate, &batch).unwrap();
     let expected = BooleanArray::from(vec![true, false]);
-    assert_eq!(results.as_ref(), &expected);
+    assert_eq!(results, expected);
 }

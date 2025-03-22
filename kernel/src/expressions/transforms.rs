@@ -1,8 +1,10 @@
-use crate::expressions::{
-    BinaryPredicate, ColumnName, Expression, JunctionPredicate, Predicate, Scalar, UnaryPredicate,
-};
 use std::borrow::Cow;
 use std::collections::HashSet;
+
+use crate::expressions::{
+    BinaryExpression, BinaryPredicate, ColumnName, Expression, JunctionPredicate, Predicate,
+    Scalar, UnaryPredicate,
+};
 
 /// Generic framework for recursive bottom-up transforms of expressions and
 /// predicates. Transformations return `Option<Cow>` with the following semantics:
@@ -43,6 +45,13 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_expr_struct(fields)
     }
 
+    /// Called for the child predicate of each [`Predicate::Not`] encountered during the
+    /// traversal. Implementations can call [`Self::recurse_into_pred_not`] if they wish to
+    /// recursively transform the child expression.
+    fn transform_pred_not(&mut self, pred: &'a Predicate) -> Option<Cow<'a, Predicate>> {
+        self.recurse_into_pred_not(pred)
+    }
+
     /// Called for each [`UnaryPredicate`] encountered during the traversal. Implementations can
     /// call [`Self::recurse_into_pred_unary`] if they wish to recursively transform the child.
     fn transform_pred_unary(
@@ -50,6 +59,15 @@ pub trait ExpressionTransform<'a> {
         pred: &'a UnaryPredicate,
     ) -> Option<Cow<'a, UnaryPredicate>> {
         self.recurse_into_pred_unary(pred)
+    }
+
+    /// Called for each [`BinaryExpression`] encountered during the traversal. Implementations can
+    /// call [`Self::recurse_into_expr_binary`] if they wish to recursively transform the children.
+    fn transform_expr_binary(
+        &mut self,
+        expr: &'a BinaryExpression,
+    ) -> Option<Cow<'a, BinaryExpression>> {
+        self.recurse_into_expr_binary(expr)
     }
 
     /// Called for each [`BinaryPredicate`] encountered during the traversal. Implementations can
@@ -75,7 +93,6 @@ pub trait ExpressionTransform<'a> {
     /// on the child(ren) of non-leaf variants.
     fn transform_expr(&mut self, expr: &'a Expression) -> Option<Cow<'a, Expression>> {
         use Cow::*;
-        let pred = expr; // TODO: Get rid of this
         let expr = match expr {
             Expression::Literal(s) => match self.transform_expr_literal(s)? {
                 Owned(s) => Owned(Expression::Literal(s)),
@@ -85,9 +102,35 @@ pub trait ExpressionTransform<'a> {
                 Owned(c) => Owned(Expression::Column(c)),
                 Borrowed(_) => Borrowed(expr),
             },
+            Expression::Predicate(p) => match self.transform_pred(p)? {
+                Owned(p) => Owned(p.into()),
+                Borrowed(_) => Borrowed(expr),
+            },
             Expression::Struct(s) => match self.transform_expr_struct(s)? {
                 Owned(s) => Owned(Expression::Struct(s)),
                 Borrowed(_) => Borrowed(expr),
+            },
+            Expression::Binary(b) => match self.transform_expr_binary(b)? {
+                Owned(b) => Owned(Expression::Binary(b)),
+                Borrowed(_) => Borrowed(expr),
+            },
+        };
+        Some(expr)
+    }
+
+    /// General entry point for transforming a predicate. This method will dispatch to the specific
+    /// transform for each predicate variant. Also invoked internally in order to recurse on the
+    /// child(ren) of non-leaf variants.
+    fn transform_pred(&mut self, pred: &'a Predicate) -> Option<Cow<'a, Predicate>> {
+        use Cow::*;
+        let pred = match pred {
+            Predicate::BooleanExpression(e) => match self.transform_expr(e)? {
+                Owned(e) => Owned(Predicate::BooleanExpression(e.into())),
+                Borrowed(_) => Borrowed(pred),
+            },
+            Predicate::Not(p) => match self.transform_pred_not(p)? {
+                Owned(p) => Owned(Predicate::not(p)),
+                Borrowed(_) => Borrowed(pred),
             },
             Predicate::Unary(u) => match self.transform_pred_unary(u)? {
                 Owned(u) => Owned(Predicate::Unary(u)),
@@ -102,12 +145,6 @@ pub trait ExpressionTransform<'a> {
                 Borrowed(_) => Borrowed(pred),
             },
         };
-        Some(expr)
-    }
-
-    fn transform_pred(&mut self, pred: &'a Predicate) -> Option<Cow<'a, Predicate>> {
-        // TODO: Actually split this out
-        let pred = self.transform_expr(pred)?;
         Some(pred)
     }
 
@@ -138,6 +175,18 @@ pub trait ExpressionTransform<'a> {
         } else {
             Some(Cow::Borrowed(fields))
         }
+    }
+
+    /// Recursively transforms the child of a [`Predicate::Not`] expression. Returns `None` if the
+    /// child was removed, `Some(Cow::Owned)` if the child was changed, and `Some(Cow::Borrowed)`
+    /// otherwise.
+    fn recurse_into_pred_not(&mut self, p: &'a Predicate) -> Option<Cow<'a, Predicate>> {
+        use Cow::*;
+        let p = match self.transform_pred(p)? {
+            Owned(pred) => Owned(Predicate::not(pred)),
+            Borrowed(_) => Borrowed(p),
+        };
+        Some(p)
     }
 
     /// Recursively transforms a unary predicate's child. Returns `None` if the child was removed,
@@ -175,6 +224,27 @@ pub trait ExpressionTransform<'a> {
         Some(b)
     }
 
+    /// Recursively transforms a binary expression's children. Returns `None` if at least one child
+    /// was removed, `Some(Cow::Owned)` if at least one child changed, and `Some(Cow::Borrowed)`
+    /// otherwise.
+    fn recurse_into_expr_binary(
+        &mut self,
+        b: &'a BinaryExpression,
+    ) -> Option<Cow<'a, BinaryExpression>> {
+        use Cow::*;
+        let left = self.transform_expr(&b.left)?;
+        let right = self.transform_expr(&b.right)?;
+        let b = match (&left, &right) {
+            (Borrowed(_), Borrowed(_)) => Borrowed(b),
+            _ => Owned(BinaryExpression::new(
+                b.op,
+                left.into_owned(),
+                right.into_owned(),
+            )),
+        };
+        Some(b)
+    }
+
     /// Recursively transforms a junction predicate's children. Returns `None` if all children were
     /// removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
     /// `Some(Cow::Borrowed)` otherwise.
@@ -182,23 +252,37 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         j: &'a JunctionPredicate,
     ) -> Option<Cow<'a, JunctionPredicate>> {
-        use Cow::*;
-        let j = match self.recurse_into_expr_struct(&j.preds)? {
-            Owned(preds) => Owned(JunctionPredicate::new(j.op, preds)),
-            Borrowed(_) => Borrowed(j),
-        };
-        Some(j)
+        let mut num_borrowed = 0;
+        let new_preds: Vec<_> = j
+            .preds
+            .iter()
+            .filter_map(|f| self.transform_pred(f))
+            .inspect(|f| {
+                if matches!(f, Cow::Borrowed(_)) {
+                    num_borrowed += 1;
+                }
+            })
+            .collect();
+
+        if new_preds.is_empty() {
+            None // all fields filtered out
+        } else if num_borrowed < j.preds.len() {
+            // At least one child was changed or filtered out, so make a new child list
+            let preds = new_preds.into_iter().map(|f| f.into_owned()).collect();
+            Some(Cow::Owned(JunctionPredicate::new(j.op, preds)))
+        } else {
+            Some(Cow::Borrowed(j))
+        }
     }
 }
 
-/// Retrieves the set of column names referenced by an expression.
 #[derive(Default)]
-pub(crate) struct GetColumnReferences<'a> {
+pub struct GetColumnReferences<'a> {
     references: HashSet<&'a ColumnName>,
 }
 
 impl<'a> GetColumnReferences<'a> {
-    pub(crate) fn into_inner(self) -> HashSet<&'a ColumnName> {
+    pub fn into_inner(self) -> HashSet<&'a ColumnName> {
         self.references
     }
 }
@@ -273,11 +357,22 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
         self.depth_limited(Self::recurse_into_expr_struct, fields)
     }
 
+    fn transform_pred_not(&mut self, pred: &'a Predicate) -> Option<Cow<'a, Predicate>> {
+        self.depth_limited(Self::recurse_into_pred_not, pred)
+    }
+
     fn transform_pred_unary(
         &mut self,
         pred: &'a UnaryPredicate,
     ) -> Option<Cow<'a, UnaryPredicate>> {
         self.depth_limited(Self::recurse_into_pred_unary, pred)
+    }
+
+    fn transform_expr_binary(
+        &mut self,
+        expr: &'a BinaryExpression,
+    ) -> Option<Cow<'a, BinaryExpression>> {
+        self.depth_limited(Self::recurse_into_expr_binary, expr)
     }
 
     fn transform_pred_binary(
@@ -297,34 +392,36 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
 
 #[cfg(test)]
 mod tests {
-    use crate::expressions::{
-        column_expr, Expression as Expr, ExpressionDepthChecker, Predicate as Pred,
-    };
+    use super::ExpressionDepthChecker;
+    use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
 
     #[test]
     fn test_depth_checker() {
-        let expr = Pred::and_from([
-            Expr::struct_from([
+        let expr = Expr::struct_from([
+            Expr::from(Pred::and_from([
                 Pred::and_from([
                     Pred::lt(Expr::literal(10), column_expr!("x")),
-                    Pred::or_from([Expr::literal(true), column_expr!("b")]),
+                    Pred::or_from([Pred::from(true), Pred::from(column_expr!("b"))]),
                 ]),
-                Expr::literal(true),
-                Pred::not(Expr::literal(true)),
-            ]),
-            Pred::and_from([
+                Pred::from(true),
+                Pred::not(true),
+            ])),
+            Expr::from(Pred::and_from([
                 Pred::not(column_expr!("b")),
                 Pred::gt(Expr::literal(10), column_expr!("x")),
                 Pred::or_from([
-                    Pred::and_from([Pred::not(Expr::literal(true)), Expr::literal(10)]),
-                    Expr::literal(10),
+                    Pred::and_from([Pred::not(true), Pred::from(Expr::literal(10))]),
+                    Pred::from(Expr::literal(10)),
                 ]),
+                Pred::from(true),
+            ])),
+            Expr::from(Pred::ne(
                 Expr::literal(true),
-            ]),
-            Pred::ne(
-                Expr::literal(true),
-                Pred::and_from([Expr::literal(true), column_expr!("b")]),
-            ),
+                Expr::from(Pred::and_from([
+                    Pred::from(true),
+                    Pred::from(column_expr!("b")),
+                ])),
+            )),
         ]);
 
         // Similar to ExpressionDepthChecker::check, but also returns call count

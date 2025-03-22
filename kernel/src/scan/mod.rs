@@ -12,9 +12,8 @@ use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
-use crate::expressions::{
-    ColumnName, Expression, ExpressionRef, ExpressionTransform, Predicate, PredicateRef, Scalar,
-};
+use crate::expressions::transforms::ExpressionTransform;
+use crate::expressions::{ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
 use crate::scan::state::{DvInfo, Stats};
 use crate::schema::{
@@ -823,16 +822,16 @@ mod tests {
     fn test_static_skipping() {
         const NULL: Expression = Expression::null_literal(DataType::BOOLEAN);
         let test_cases = [
-            (false, column_expr!("a")),
-            (true, Expression::literal(false)),
-            (false, Expression::literal(true)),
-            (true, NULL),
+            (false, Predicate::from(column_expr!("a"))),
+            (true, Predicate::from(false)),
+            (false, Predicate::from(true)),
+            (true, Predicate::from(NULL)),
             (true, Predicate::and(column_expr!("a"), false)),
             (false, Predicate::or(column_expr!("a"), true)),
             (false, Predicate::or(column_expr!("a"), false)),
             (false, Predicate::lt(column_expr!("a"), 10)),
-            (false, Predicate::lt(Expression::literal(10), 100)),
-            (true, Predicate::gt(Expression::literal(10), 100)),
+            (false, Predicate::lt(10, 100)),
+            (true, Predicate::gt(10, 100)),
             (true, Predicate::and(NULL, column_expr!("a"))),
         ];
         for (should_skip, predicate) in test_cases {
@@ -884,23 +883,23 @@ mod tests {
         // NOTE: We break several column mapping rules here because they don't matter for this
         // test. For example, we do not provide field ids, and not all columns have physical names.
         let test_cases = [
-            (Expression::literal(true), Some(PhysicalPredicate::None)),
+            (Predicate::from(true), Some(PhysicalPredicate::None)),
             (
-                Expression::literal(false),
+                Predicate::from(false),
                 Some(PhysicalPredicate::StaticSkipAll),
             ),
-            (column_expr!("x"), None), // no such column
+            (Predicate::from(column_expr!("x")), None), // no such column
             (
-                column_expr!("a"),
+                Predicate::from(column_expr!("a")),
                 Some(PhysicalPredicate::Some(
-                    column_expr!("a").into(),
+                    Predicate::from(column_expr!("a")).into(),
                     StructType::new(vec![StructField::nullable("a", DataType::LONG)]).into(),
                 )),
             ),
             (
-                column_expr!("b"),
+                Predicate::from(column_expr!("b")),
                 Some(PhysicalPredicate::Some(
-                    column_expr!("phys_b").into(),
+                    Predicate::from(column_expr!("phys_b")).into(),
                     StructType::new(vec![StructField::nullable("phys_b", DataType::LONG)
                         .with_metadata([(
                             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -910,9 +909,9 @@ mod tests {
                 )),
             ),
             (
-                column_expr!("nested.x"),
+                Predicate::from(column_expr!("nested.x")),
                 Some(PhysicalPredicate::Some(
-                    column_expr!("nested.x").into(),
+                    Predicate::from(column_expr!("nested.x")).into(),
                     StructType::new(vec![StructField::nullable(
                         "nested",
                         StructType::new(vec![StructField::nullable("x", DataType::LONG)]),
@@ -921,9 +920,9 @@ mod tests {
                 )),
             ),
             (
-                column_expr!("nested.y"),
+                Predicate::from(column_expr!("nested.y")),
                 Some(PhysicalPredicate::Some(
-                    column_expr!("nested.phys_y").into(),
+                    Predicate::from(column_expr!("nested.phys_y")).into(),
                     StructType::new(vec![StructField::nullable(
                         "nested",
                         StructType::new(vec![StructField::nullable("phys_y", DataType::LONG)
@@ -936,9 +935,9 @@ mod tests {
                 )),
             ),
             (
-                column_expr!("mapped.n"),
+                Predicate::from(column_expr!("mapped.n")),
                 Some(PhysicalPredicate::Some(
-                    column_expr!("phys_mapped.phys_n").into(),
+                    Predicate::from(column_expr!("phys_mapped.phys_n")).into(),
                     StructType::new(vec![StructField::nullable(
                         "phys_mapped",
                         StructType::new(vec![StructField::nullable("phys_n", DataType::LONG)

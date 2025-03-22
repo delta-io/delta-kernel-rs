@@ -5,16 +5,18 @@ use std::fmt::{Display, Formatter};
 
 use itertools::Itertools;
 
+#[cfg(test)]
+pub use self::column_names::column_pred;
 pub use self::column_names::{
     column_expr, column_name, joined_column_expr, joined_column_name, ColumnName,
 };
 pub use self::scalars::{ArrayData, Scalar, StructData};
-pub use self::transforms::{ExpressionDepthChecker, ExpressionTransform};
+use self::transforms::{ExpressionTransform as _, GetColumnReferences};
 use crate::DataType;
 
 mod column_names;
 mod scalars;
-mod transforms;
+pub mod transforms;
 
 pub type ExpressionRef = std::sync::Arc<Expression>;
 pub type PredicateRef = std::sync::Arc<Predicate>;
@@ -26,10 +28,15 @@ pub type PredicateRef = std::sync::Arc<Predicate>;
 /// A unary predicate operator.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UnaryPredicateOp {
-    /// Unary Not
-    Not,
     /// Unary Is Null
     IsNull,
+}
+
+/// A unary expression operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(unused)] // No unary expressions yet
+pub enum UnaryExpressionOp {
+    // TODO: Integer negation? Casting?
 }
 
 /// A binary predicate operator.
@@ -53,6 +60,11 @@ pub enum BinaryPredicateOp {
     In,
     /// NOT IN
     NotIn,
+}
+
+/// A binary expression operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BinaryExpressionOp {
     /// Arithmetic Plus
     Plus,
     /// Arithmetic Minus
@@ -63,10 +75,6 @@ pub enum BinaryPredicateOp {
     Divide,
 }
 
-/// A binary expression operator.
-// TODO: Actually split this out
-pub type BinaryExpressionOp = BinaryPredicateOp;
-
 /// A junction (AND/OR) predicate operator.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JunctionPredicateOp {
@@ -76,9 +84,25 @@ pub enum JunctionPredicateOp {
     Or,
 }
 
+/// A variadic expression operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(unused)] // No variadic expressions yet
+pub enum VariadicExpressionOp {
+    // TODO: COALESCE?
+}
+
 ////////////////////////////////////////////////////////////////////////
 // Expressions
 ////////////////////////////////////////////////////////////////////////
+
+#[derive(Clone, Debug, PartialEq)]
+#[allow(unused)] // No unary expressions yet
+pub struct UnaryExpression {
+    /// The operator.
+    pub op: UnaryExpressionOp,
+    /// The expression.
+    pub expr: Box<Expression>,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct UnaryPredicate {
@@ -98,8 +122,24 @@ pub struct BinaryPredicate {
     pub right: Box<Expression>,
 }
 
-// TODO: Actually split this out
-pub type BinaryExpression = BinaryPredicate;
+#[derive(Clone, Debug, PartialEq)]
+pub struct BinaryExpression {
+    /// The operator.
+    pub op: BinaryExpressionOp,
+    /// The left-hand side of the operation.
+    pub left: Box<Expression>,
+    /// The right-hand side of the operation.
+    pub right: Box<Expression>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[allow(unused)] // No variadic expressions yet
+pub struct VariadicExpression {
+    /// The operator.
+    pub op: VariadicExpressionOp,
+    /// The input expressions.
+    pub exprs: Vec<Expression>,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct JunctionPredicate {
@@ -120,19 +160,41 @@ pub enum Expression {
     Literal(Scalar),
     /// A column reference by name.
     Column(ColumnName),
+    /// A predicate treated as a boolean expression
+    Predicate(Box<Predicate>),
     /// A struct computed from a Vec of expressions
     Struct(Vec<Expression>),
+    // TODO: An expression that takes one expression as input.
+    // Unary(UnaryExpression),
+    /// An expression that takes two expressions as input.
+    Binary(BinaryExpression),
+    // TODO: An expression that takes a variable number of expressions as input.
+    // Variadic(VariadicExpression),
+}
+
+/// A SQL predicate.
+///
+/// These predicates do not track or validate data types, other than the type
+/// of literals. It is up to the predicate evaluator to validate the
+/// predicate against a schema and add appropriate casts as required.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Predicate {
+    /// A boolean-valued expression, useful for e.g. `AND(<boolean_col1>, <boolean_col2>)`.
+    BooleanExpression(Box<Expression>),
+    /// Boolean inversion (true <-> false)
+    ///
+    /// NOTE: NOT is not a normal unary predicate, because it requires a predicate as input (not an
+    /// expression), and is never directly evaluated. Instead, observing that all predicates are
+    /// invertible, NOT is always pushed down into its child predicate, inverting it. For example,
+    /// `NOT (a < b)` pushes down and inverts `<` to `>=`, producing `a >= b`.
+    Not(Box<Predicate>),
     /// A predicate that takes one expression as input.
     Unary(UnaryPredicate),
     /// A predicate that takes two expressions as input.
     Binary(BinaryPredicate),
     /// A variadic junction predicate -- conjunction or disjunction.
     Junction(JunctionPredicate),
-    // TODO: support more expressions, such as IS IN, LIKE, etc.
 }
-
-/// TODO: Split this out as a proper enum
-pub type Predicate = Expression;
 
 ////////////////////////////////////////////////////////////////////////
 // Struct/Enum impls
@@ -140,10 +202,9 @@ pub type Predicate = Expression;
 
 impl BinaryPredicateOp {
     /// True if this is a comparison for which NULL input always produces NULL output
-    pub(crate) fn is_null_intolerant_comparison(&self) -> bool {
+    pub(crate) fn is_null_intolerant(&self) -> bool {
         use BinaryPredicateOp::*;
         match self {
-            Plus | Minus | Multiply | Divide => false, // not a comparison
             LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual => true,
             Equal | NotEqual => true,
             Distinct | In | NotIn => false, // tolerates NULL input
@@ -158,8 +219,8 @@ impl BinaryPredicateOp {
             GreaterThanOrEqual => Some(LessThanOrEqual),
             LessThan => Some(GreaterThan),
             LessThanOrEqual => Some(GreaterThanOrEqual),
-            Equal | NotEqual | Distinct | Plus | Multiply => Some(*self),
-            In | NotIn | Minus | Divide => None, // not commutative
+            Equal | NotEqual | Distinct => Some(*self),
+            In | NotIn => None, // not commutative
         }
     }
 }
@@ -174,10 +235,30 @@ impl JunctionPredicateOp {
     }
 }
 
+#[allow(unused)] // No unary expressions yet
+impl UnaryExpression {
+    fn new(op: UnaryExpressionOp, expr: impl Into<Expression>) -> Self {
+        let expr = Box::new(expr.into());
+        Self { op, expr }
+    }
+}
+
 impl UnaryPredicate {
     fn new(op: UnaryPredicateOp, expr: impl Into<Expression>) -> Self {
         let expr = Box::new(expr.into());
         Self { op, expr }
+    }
+}
+
+impl BinaryExpression {
+    fn new(
+        op: BinaryExpressionOp,
+        left: impl Into<Expression>,
+        right: impl Into<Expression>,
+    ) -> Self {
+        let left = Box::new(left.into());
+        let right = Box::new(right.into());
+        Self { op, left, right }
     }
 }
 
@@ -193,6 +274,13 @@ impl BinaryPredicate {
     }
 }
 
+#[allow(unused)] // No variadic expressions yet
+impl VariadicExpression {
+    fn new(op: VariadicExpressionOp, exprs: Vec<Expression>) -> Self {
+        Self { op, exprs }
+    }
+}
+
 impl JunctionPredicate {
     fn new(op: JunctionPredicateOp, preds: Vec<Predicate>) -> Self {
         Self { op, preds }
@@ -202,7 +290,7 @@ impl JunctionPredicate {
 impl Expression {
     /// Returns a set of columns referenced by this expression.
     pub fn references(&self) -> HashSet<&ColumnName> {
-        let mut references = transforms::GetColumnReferences::default();
+        let mut references = GetColumnReferences::default();
         let _ = references.transform_expr(self);
         references.into_inner()
     }
@@ -225,59 +313,142 @@ impl Expression {
         Self::Literal(Scalar::Null(data_type))
     }
 
+    /// Wraps a predicate as a boolean-valued expression
+    pub fn predicate(value: Predicate) -> Self {
+        match value {
+            Predicate::BooleanExpression(expr) => *expr,
+            _ => Self::Predicate(value.into()),
+        }
+    }
+
     /// Create a new struct expression
     pub fn struct_from(exprs: impl IntoIterator<Item = Self>) -> Self {
         Self::Struct(exprs.into_iter().collect())
     }
 
-    /// Logical NOT (boolean inversion)
-    pub fn not(pred: impl Into<Self>) -> Self {
-        Self::unary(UnaryPredicateOp::Not, pred.into())
-    }
-
     /// Create a new predicate `self IS NULL`
-    pub fn is_null(self) -> Self {
-        Self::unary(UnaryPredicateOp::IsNull, self)
+    pub fn is_null(self) -> Predicate {
+        Predicate::is_null(self)
     }
 
     /// Create a new predicate `self IS NOT NULL`
     pub fn is_not_null(self) -> Predicate {
-        Self::not(Self::is_null(self))
+        Predicate::is_not_null(self)
     }
 
     /// Create a new predicate `self == other`
-    pub fn eq(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryPredicateOp::Equal, self, other)
+    pub fn eq(self, other: impl Into<Self>) -> Predicate {
+        Predicate::eq(self, other)
     }
 
     /// Create a new predicate `self != other`
-    pub fn ne(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryPredicateOp::NotEqual, self, other)
+    pub fn ne(self, other: impl Into<Self>) -> Predicate {
+        Predicate::ne(self, other)
     }
 
     /// Create a new predicate `self <= other`
-    pub fn le(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryPredicateOp::LessThanOrEqual, self, other)
+    pub fn le(self, other: impl Into<Self>) -> Predicate {
+        Predicate::le(self, other)
     }
 
     /// Create a new predicate `self < other`
-    pub fn lt(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryPredicateOp::LessThan, self, other)
+    pub fn lt(self, other: impl Into<Self>) -> Predicate {
+        Predicate::lt(self, other)
     }
 
     /// Create a new predicate `self >= other`
-    pub fn ge(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryPredicateOp::GreaterThanOrEqual, self, other)
+    pub fn ge(self, other: impl Into<Self>) -> Predicate {
+        Predicate::ge(self, other)
     }
 
     /// Create a new predicate `self > other`
-    pub fn gt(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryPredicateOp::GreaterThan, self, other)
+    pub fn gt(self, other: impl Into<Self>) -> Predicate {
+        Predicate::gt(self, other)
     }
 
     /// Create a new predicate `DISTINCT(self, other)`
-    pub fn distinct(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryPredicateOp::Distinct, self, other)
+    pub fn distinct(self, other: impl Into<Self>) -> Predicate {
+        Predicate::distinct(self, other)
+    }
+
+    /// Creates a new binary expression lhs OP rhs
+    pub fn binary(
+        op: BinaryExpressionOp,
+        lhs: impl Into<Expression>,
+        rhs: impl Into<Expression>,
+    ) -> Self {
+        Self::Binary(BinaryExpression {
+            op,
+            left: Box::new(lhs.into()),
+            right: Box::new(rhs.into()),
+        })
+    }
+}
+
+impl Predicate {
+    /// Returns a set of columns referenced by this predicate.
+    pub fn references(&self) -> HashSet<&ColumnName> {
+        let mut references = GetColumnReferences::default();
+        let _ = references.transform_pred(self);
+        references.into_inner()
+    }
+
+    /// Wraps a boolean-valued expression as a predicate
+    pub fn expression(expr: impl Into<Expression>) -> Self {
+        match expr.into() {
+            Expression::Predicate(p) => *p,
+            expr => Predicate::BooleanExpression(expr.into()),
+        }
+    }
+
+    /// Logical NOT (boolean inversion)
+    pub fn not(pred: impl Into<Self>) -> Self {
+        Self::Not(pred.into().into())
+    }
+
+    /// Create a new predicate `self IS NULL`
+    pub fn is_null(expr: impl Into<Expression>) -> Predicate {
+        Self::unary(UnaryPredicateOp::IsNull, expr)
+    }
+
+    /// Create a new predicate `self IS NOT NULL`
+    pub fn is_not_null(expr: impl Into<Expression>) -> Predicate {
+        Self::not(Self::is_null(expr))
+    }
+
+    /// Create a new predicate `self == other`
+    pub fn eq(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::Equal, a, b)
+    }
+
+    /// Create a new predicate `self != other`
+    pub fn ne(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::NotEqual, a, b)
+    }
+
+    /// Create a new predicate `self <= other`
+    pub fn le(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::LessThanOrEqual, a, b)
+    }
+
+    /// Create a new predicate `self < other`
+    pub fn lt(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::LessThan, a, b)
+    }
+
+    /// Create a new predicate `self >= other`
+    pub fn ge(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::GreaterThanOrEqual, a, b)
+    }
+
+    /// Create a new predicate `self > other`
+    pub fn gt(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::GreaterThan, a, b)
+    }
+
+    /// Create a new predicate `DISTINCT(self, other)`
+    pub fn distinct(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::Distinct, a, b)
     }
 
     /// Create a new predicate `self AND other`
@@ -332,12 +503,20 @@ impl Expression {
 
 impl Display for BinaryExpressionOp {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        use BinaryPredicateOp::*;
+        use BinaryExpressionOp::*;
         match self {
             Plus => write!(f, "+"),
             Minus => write!(f, "-"),
             Multiply => write!(f, "*"),
             Divide => write!(f, "/"),
+        }
+    }
+}
+
+impl Display for BinaryPredicateOp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use BinaryPredicateOp::*;
+        match self {
             LessThan => write!(f, "<"),
             LessThanOrEqual => write!(f, "<="),
             GreaterThan => write!(f, ">"),
@@ -360,11 +539,23 @@ impl Display for Expression {
         match self {
             Literal(l) => write!(f, "{l}"),
             Column(name) => write!(f, "Column({name})"),
+            Predicate(p) => write!(f, "{p}"),
             Struct(exprs) => write!(
                 f,
                 "Struct({})",
                 &exprs.iter().map(|e| format!("{e}")).join(", ")
             ),
+            Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
+        }
+    }
+}
+
+impl Display for Predicate {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use Predicate::*;
+        match self {
+            BooleanExpression(expr) => write!(f, "{expr}"),
+            Not(pred) => write!(f, "NOT({pred})"),
             Binary(BinaryPredicate {
                 op: BinaryPredicateOp::Distinct,
                 left,
@@ -372,7 +563,6 @@ impl Display for Expression {
             }) => write!(f, "DISTINCT({left}, {right})"),
             Binary(BinaryPredicate { op, left, right }) => write!(f, "{left} {op} {right}"),
             Unary(UnaryPredicate { op, expr }) => match op {
-                UnaryPredicateOp::Not => write!(f, "NOT {expr}"),
                 UnaryPredicateOp::IsNull => write!(f, "{expr} IS NULL"),
             },
             Junction(JunctionPredicate { op, preds }) => {
@@ -396,6 +586,34 @@ impl<T: Into<Scalar>> From<T> for Expression {
 impl From<ColumnName> for Expression {
     fn from(value: ColumnName) -> Self {
         Self::Column(value)
+    }
+}
+
+impl From<Predicate> for Expression {
+    fn from(value: Predicate) -> Self {
+        Self::predicate(value)
+    }
+}
+
+impl From<Expression> for Predicate {
+    fn from(value: Expression) -> Self {
+        Self::expression(value)
+    }
+}
+
+/// Shortcut for wrapping a boolean [`Expression::Literal`] inside [`Predicate::BooleanExpression`].
+//#[cfg(test)]
+impl From<bool> for Predicate {
+    fn from(value: bool) -> Self {
+        Self::expression(value)
+    }
+}
+
+/// Shortcut for wrapping a boolean [`Expression::Column`] inside [`Predicate::BooleanExpression`].
+//#[cfg(test)]
+impl From<ColumnName> for Predicate {
+    fn from(value: ColumnName) -> Self {
+        Self::expression(value)
     }
 }
 
@@ -448,10 +666,13 @@ mod tests {
     fn test_expression_format() {
         let col_ref = column_expr!("x");
         let cases = [
-            (col_ref.clone(), "Column(x)"),
+            (Predicate::from(col_ref.clone()), "Column(x)"),
             (col_ref.clone().eq(2), "Column(x) = 2"),
             ((col_ref.clone() - 4).lt(10), "Column(x) - 4 < 10"),
-            ((col_ref.clone() + 4) / 10 * 42, "Column(x) + 4 / 10 * 42"),
+            (
+                Predicate::from((col_ref.clone() + 4) / 10 * 42),
+                "Column(x) + 4 / 10 * 42",
+            ),
             (
                 Predicate::and(col_ref.clone().ge(2), col_ref.clone().le(10)),
                 "AND(Column(x) >= 2, Column(x) <= 10)",

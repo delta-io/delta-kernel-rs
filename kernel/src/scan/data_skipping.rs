@@ -193,7 +193,8 @@ impl DataSkippingFilter {
 struct DataSkippingPredicateCreator;
 
 impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
-    type Output = Expr;
+    type Predicate = Pred;
+    type Expression = Expr;
     type TypedStat = Expr;
     type IntStat = Expr;
 
@@ -235,12 +236,16 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         Some(Pred::binary(op, col, val.clone()))
     }
 
-    fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
-        KernelPredicateEvaluatorDefaults::eval_pred_scalar(val, inverted).map(Expr::literal)
+    fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
+        KernelPredicateEvaluatorDefaults::eval_pred_scalar(val, inverted)
+            .map(Expr::literal)
+            .map(|e| e.eq(true))
     }
 
-    fn eval_pred_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
-        KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted).map(Expr::literal)
+    fn eval_pred_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
+        KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted)
+            .map(Expr::literal)
+            .map(|e| e.eq(true))
     }
 
     fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
@@ -285,7 +290,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
                 Some(pred) => Some(pred),
                 None => keep_null.then(|| {
                     keep_null = false;
-                    Expr::null_literal(DataType::BOOLEAN)
+                    Expr::null_literal(DataType::BOOLEAN).eq(true)
                 }),
             })
             .collect();

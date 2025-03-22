@@ -96,6 +96,7 @@ fn test_junctions() {
                 Some(v) => Expr::literal(v),
                 None => Expr::null_literal(DataType::BOOLEAN),
             })
+            .map(Pred::from)
             .collect();
 
         expect_eq!(

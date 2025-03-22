@@ -42,7 +42,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
     )
     .unwrap();
 
-    let mut sub_exprs = vec![
+    let mut sub_exprs: Vec<Pred> = [
         Expr::literal(i8::MAX),
         Expr::literal(i8::MIN),
         Expr::literal(f32::MAX),
@@ -66,17 +66,28 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         Scalar::Struct(top_level_struct).into(),
         Scalar::Array(array_data).into(),
         Expr::struct_from(vec![Pred::or_from(vec![
-            Scalar::Integer(5).into(),
-            Scalar::Long(20).into(),
-        ])]),
-        Pred::is_not_null(column_expr!("col")),
-    ];
+            Pred::expression(Scalar::Integer(5)),
+            Pred::expression(Scalar::Long(20)),
+        ])
+        .into()]),
+        Pred::is_not_null(column_expr!("col")).into(),
+    ]
+    .into_iter()
+    .map(Pred::from)
+    .collect();
     sub_exprs.extend(
         [
             BinaryExpressionOp::Divide,
             BinaryExpressionOp::Multiply,
             BinaryExpressionOp::Plus,
             BinaryExpressionOp::Minus,
+        ]
+        .into_iter()
+        .map(|op| Expr::binary(op, Scalar::Integer(0), Scalar::Long(0)))
+        .map(Pred::from),
+    );
+    sub_exprs.extend(
+        [
             BinaryPredicateOp::In,
             BinaryPredicateOp::Equal,
             BinaryPredicateOp::NotEqual,
@@ -91,5 +102,5 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         .map(|op| Pred::binary(op, Scalar::Integer(0), Scalar::Long(0))),
     );
 
-    Arc::new(Pred::and_from(sub_exprs)).into()
+    Arc::new(Expr::from(Pred::and_from(sub_exprs))).into()
 }

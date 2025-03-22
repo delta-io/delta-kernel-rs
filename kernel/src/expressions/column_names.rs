@@ -422,6 +422,18 @@ pub use __column_expr as column_expr;
 
 #[macro_export]
 #[doc(hidden)]
+#[cfg(test)]
+macro_rules! __column_pred {
+    ( $($name:tt)* ) => {
+        $crate::expressions::Predicate::from($crate::__column_name!($($name)*))
+    };
+}
+#[doc(inline)]
+#[cfg(test)]
+pub use __column_pred as column_pred;
+
+#[macro_export]
+#[doc(hidden)]
 macro_rules! __joined_column_expr {
     ( $($name:tt)* ) => {
         $crate::expressions::Expression::from($crate::__joined_column_name!($($name)*))
