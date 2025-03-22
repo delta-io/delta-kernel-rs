@@ -97,3 +97,17 @@ where
         .map(|data| Ok(Box::new(ArrowEngineData::new(data??.into())) as _));
     Ok(Box::new(result))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::tests::test_arrow_engine;
+
+    #[test]
+    fn test_sync_engine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = url::Url::from_directory_path(tmp.path()).unwrap();
+        let engine = SyncEngine::new();
+        test_arrow_engine(&engine, &url);
+    }
+}

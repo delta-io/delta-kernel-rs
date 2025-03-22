@@ -66,6 +66,10 @@ impl JsonHandler for SyncJsonHandler {
             )));
         };
 
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+
         // write data to tmp file
         let mut tmp_file = NamedTempFile::new_in(parent)?;
         let buf = to_json_bytes(data)?;
