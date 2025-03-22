@@ -309,7 +309,7 @@ fn test_eval_junction() {
             .cloned()
             .map(|v| match v {
                 Some(v) => Pred::literal(v),
-                None => Pred::null_literal(DataType::BOOLEAN),
+                None => Pred::null_literal(),
             })
             .collect();
         for inverted in [true, false] {
@@ -359,7 +359,7 @@ fn test_eval_not() {
     ];
     let filter = DefaultKernelPredicateEvaluator::from(UnimplementedColumnResolver);
     for (input, expect) in test_cases {
-        let input = input.into();
+        let input = Pred::from_expr(input);
         for inverted in [true, false] {
             expect_eq!(
                 filter.eval_pred_not(&input, inverted),
@@ -470,29 +470,6 @@ fn eval_binary() {
     let val = Expr::literal(10);
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
 
-    // unsupported
-    expect_eq!(
-        filter.eval_pred_binary(BinaryPredicateOp::Plus, &col, &val, false),
-        None,
-        "x + 10"
-    );
-    expect_eq!(
-        filter.eval_pred_binary(BinaryPredicateOp::Minus, &col, &val, false),
-        None,
-        "x - 10"
-    );
-    expect_eq!(
-        filter.eval_pred_binary(BinaryPredicateOp::Multiply, &col, &val, false),
-        None,
-        "x * 10"
-    );
-    expect_eq!(
-        filter.eval_pred_binary(BinaryPredicateOp::Divide, &col, &val, false),
-        None,
-        "x / 10"
-    );
-
-    // supported
     for inverted in [true, false] {
         expect_eq!(
             filter.eval_pred_binary(BinaryPredicateOp::LessThan, &col, &val, inverted),
@@ -581,15 +558,23 @@ fn test_sql_where() {
     let col = &column_expr!("x");
     let col_pred = &column_pred!("x");
     const VAL: Expr = Expr::Literal(Scalar::Integer(1));
-    const NULL: Pred = Pred::null_literal(DataType::BOOLEAN);
-    const FALSE: Pred = Pred::Literal(Scalar::Boolean(false));
-    const TRUE: Pred = Pred::Literal(Scalar::Boolean(true));
+    const NULL: Pred = Pred::null_literal();
+    const FALSE: Pred = Pred::literal(false);
+    const TRUE: Pred = Pred::literal(true);
     let null_filter = DefaultKernelPredicateEvaluator::from(NullColumnResolver);
     let empty_filter = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
 
     // Basic sanity check
-    expect_eq!(null_filter.eval_sql_where(&VAL), None, "WHERE {VAL}");
-    expect_eq!(empty_filter.eval_sql_where(&VAL), None, "WHERE {VAL}");
+    expect_eq!(
+        null_filter.eval_sql_where(&Pred::from_expr(VAL)),
+        None,
+        "WHERE {VAL}"
+    );
+    expect_eq!(
+        empty_filter.eval_sql_where(&Pred::from_expr(VAL)),
+        None,
+        "WHERE {VAL}"
+    );
 
     expect_eq!(
         null_filter.eval_sql_where(col_pred),

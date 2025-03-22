@@ -5,9 +5,9 @@ use std::ffi::c_void;
 
 use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
 use delta_kernel::expressions::{
-    ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicateOp, Expression,
-    JunctionPredicate, JunctionPredicateOp, MapData, Predicate, Scalar, StructData, UnaryPredicate,
-    UnaryPredicateOp,
+    ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
+    Expression, JunctionPredicate, JunctionPredicateOp, MapData, Predicate, Scalar, StructData,
+    UnaryPredicate, UnaryPredicateOp,
 };
 
 /// Free the memory the passed SharedExpression
@@ -423,6 +423,7 @@ fn visit_expression_impl(
             call!(visitor, visit_column, sibling_list_id, name);
         }
         Expression::Struct(exprs) => visit_expression_struct(visitor, exprs, sibling_list_id),
+        Expression::Predicate(pred) => visit_predicate_impl(visitor, pred, sibling_list_id),
         Expression::Binary(BinaryExpression { op, left, right }) => {
             let child_list_id = call!(visitor, make_field_list, 2);
             visit_expression_impl(visitor, left, child_list_id);
@@ -432,6 +433,37 @@ fn visit_expression_impl(
                 BinaryExpressionOp::Minus => visitor.visit_minus,
                 BinaryExpressionOp::Multiply => visitor.visit_multiply,
                 BinaryExpressionOp::Divide => visitor.visit_divide,
+            };
+            op(visitor.data, sibling_list_id, child_list_id);
+        }
+    }
+}
+
+fn visit_predicate_impl(
+    visitor: &mut EngineExpressionVisitor,
+    predicate: &Predicate,
+    sibling_list_id: usize,
+) {
+    match predicate {
+        Predicate::BooleanExpression(expr) => visit_expression_impl(visitor, expr, sibling_list_id),
+        Predicate::Not(pred) => {
+            let child_list_id = call!(visitor, make_field_list, 1);
+            visit_predicate_impl(visitor, pred, child_list_id);
+            call!(visitor, visit_not, sibling_list_id, child_list_id);
+        }
+        Predicate::Unary(UnaryPredicate { op, expr }) => {
+            let child_list_id = call!(visitor, make_field_list, 1);
+            visit_expression_impl(visitor, expr, child_list_id);
+            let op = match op {
+                UnaryPredicateOp::IsNull => visitor.visit_is_null,
+            };
+            op(visitor.data, sibling_list_id, child_list_id);
+        }
+        Predicate::Binary(BinaryPredicate { op, left, right }) => {
+            let child_list_id = call!(visitor, make_field_list, 2);
+            visit_expression_impl(visitor, left, child_list_id);
+            visit_expression_impl(visitor, right, child_list_id);
+            let op = match op {
                 BinaryPredicateOp::LessThan => visitor.visit_lt,
                 BinaryPredicateOp::LessThanOrEqual => visitor.visit_le,
                 BinaryPredicateOp::GreaterThan => visitor.visit_gt,
@@ -444,28 +476,10 @@ fn visit_expression_impl(
             };
             op(visitor.data, sibling_list_id, child_list_id);
         }
-        Predicate::Unary(UnaryPredicate { op, expr }) => {
-            let child_id_list = call!(visitor, make_field_list, 1);
-            visit_expression_impl(visitor, expr, child_id_list);
-            let op = match op {
-                UnaryPredicateOp::Not => visitor.visit_not,
-                UnaryPredicateOp::IsNull => visitor.visit_is_null,
-            };
-            op(visitor.data, sibling_list_id, child_id_list);
-        }
         Predicate::Junction(JunctionPredicate { op, preds }) => {
             visit_predicate_junction(visitor, op, preds, sibling_list_id)
         }
     }
-}
-
-fn visit_predicate_impl(
-    visitor: &mut EngineExpressionVisitor,
-    predicate: &Predicate,
-    sibling_list_id: usize,
-) {
-    // TODO: Actually split this out
-    visit_expression_impl(visitor, predicate, sibling_list_id)
 }
 
 fn visit_expression_internal(

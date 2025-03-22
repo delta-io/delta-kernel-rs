@@ -284,7 +284,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
                 Some(pred) => Some(pred),
                 None => keep_null.then(|| {
                     keep_null = false;
-                    Pred::null_literal(DataType::BOOLEAN)
+                    Pred::null_literal()
                 }),
             })
             .collect();

@@ -154,8 +154,8 @@ fn test_eval_junction() {
         let inputs: Vec<_> = inputs
             .iter()
             .map(|val| match val {
-                Some(v) => Pred::literal(v),
-                None => Pred::null_literal(DataType::BOOLEAN),
+                Some(v) => Pred::literal(*v),
+                None => Pred::null_literal(),
             })
             .collect();
 
@@ -253,9 +253,9 @@ fn test_eval_distinct() {
 fn test_sql_where() {
     let col = &column_expr!("x");
     const VAL: Expr = Expr::Literal(Scalar::Integer(10));
-    const NULL: Pred = Pred::null_literal(DataType::BOOLEAN);
-    const FALSE: Pred = Pred::Literal(Scalar::Boolean(false));
-    const TRUE: Pred = Pred::Literal(Scalar::Boolean(true));
+    const NULL: Pred = Pred::null_literal();
+    const FALSE: Pred = Pred::literal(false);
+    const TRUE: Pred = Pred::literal(true);
 
     const ROWCOUNT: i64 = 2;
     const ALL_NULL: i64 = ROWCOUNT;

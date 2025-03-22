@@ -847,7 +847,7 @@ mod tests {
 
     #[test]
     fn test_static_skipping() {
-        const NULL: Pred = Pred::null_literal(DataType::BOOLEAN);
+        const NULL: Pred = Pred::null_literal();
         let test_cases = [
             (false, column_pred!("a")),
             (true, Pred::literal(false)),

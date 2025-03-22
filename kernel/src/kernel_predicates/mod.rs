@@ -122,6 +122,18 @@ pub(crate) trait KernelPredicateEvaluator {
         self.eval_pred(pred, !inverted)
     }
 
+    /// Dispatches a (possibly inverted) boolean expression used as a predicate
+    fn eval_pred_expr(&self, expr: &Expr, inverted: bool) -> Option<Self::Output> {
+        // Directly evaluate literals and and predicates used as expressions. Evaluate columns as
+        // `<col> == TRUE`. All other expressions unsupported.
+        match expr {
+            Expr::Literal(val) => self.eval_pred_scalar(val, inverted),
+            Expr::Column(col) => self.eval_pred_column(col, inverted),
+            Expr::Predicate(pred) => self.eval_pred(pred, inverted),
+            Expr::Struct(_) | Expr::Binary(_) => None,
+        }
+    }
+
     /// Dispatches a (possibly inverted) unary expression to each operator's specific implementation.
     fn eval_pred_unary(
         &self,
@@ -130,7 +142,6 @@ pub(crate) trait KernelPredicateEvaluator {
         inverted: bool,
     ) -> Option<Self::Output> {
         match op {
-            UnaryPredicateOp::Not => self.eval_pred_not(expr, inverted),
             UnaryPredicateOp::IsNull => match expr {
                 // WARNING: Only literals and columns can be safely null-checked. Attempting to
                 // null-check an expressions such as `a < 10` could wrongly produce FALSE in case
@@ -139,7 +150,7 @@ pub(crate) trait KernelPredicateEvaluator {
                 // partition pruning encounters a non-partition column.
                 Expr::Literal(val) => self.eval_pred_scalar_is_null(val, inverted),
                 Expr::Column(col) => self.eval_pred_is_null(col, inverted),
-                _ => {
+                Expr::Predicate(_) | Expr::Struct(_) | Expr::Binary(_) => {
                     debug!("Unsupported operand: IS [NOT] NULL: {expr:?}");
                     None
                 }
@@ -207,7 +218,6 @@ pub(crate) trait KernelPredicateEvaluator {
             }
         };
         match op {
-            Plus | Minus | Multiply | Divide => None, // Unsupported - not boolean output
             LessThan => self.eval_pred_lt(col, val, inverted),
             GreaterThanOrEqual => self.eval_pred_lt(col, val, !inverted),
             LessThanOrEqual => self.eval_pred_le(col, val, inverted),
@@ -233,14 +243,11 @@ pub(crate) trait KernelPredicateEvaluator {
     }
 
     /// Dispatches a predicate to the specific implementation for each predicate variant.
-    ///
-    /// NOTE: [`Expression::Struct`] is not supported and always evaluates to `None`.
     fn eval_pred(&self, pred: &Pred, inverted: bool) -> Option<Self::Output> {
-        use Expr::*; // TODO: Change to Pred::* once we split up the types
+        use Pred::*;
         match pred {
-            Literal(val) => self.eval_pred_scalar(val, inverted),
-            Column(col) => self.eval_pred_column(col, inverted),
-            Struct(_) => None, // not supported
+            BooleanExpression(expr) => self.eval_pred_expr(expr, inverted),
+            Not(pred) => self.eval_pred_not(pred, inverted),
             Unary(UnaryPredicate { op, expr }) => self.eval_pred_unary(*op, expr, inverted),
             Binary(BinaryPredicate { op, left, right }) => {
                 self.eval_pred_binary(*op, left, right, inverted)
@@ -354,7 +361,7 @@ pub(crate) trait KernelPredicateEvaluator {
     /// WARNING: Not an idempotent transform. If data skipping eval produces a sql predicate,
     /// evaluating the result with sql semantics has undefined behavior.
     fn eval_pred_sql_where(&self, pred: &Pred, inverted: bool) -> Option<Self::Output> {
-        use Expr::*;
+        use Pred::*;
         match pred {
             Junction(JunctionPredicate { op, preds }) => {
                 // Recursively invoke `eval_pred_sql_where` instead of the usual `eval_pred` for AND/OR.
@@ -363,7 +370,7 @@ pub(crate) trait KernelPredicateEvaluator {
                     .map(|pred| self.eval_pred_sql_where(pred, inverted));
                 self.finish_eval_pred_junction(*op, preds, inverted)
             }
-            Binary(BinaryPredicate { op, left, right }) if op.is_null_intolerant_comparison() => {
+            Binary(BinaryPredicate { op, left, right }) if op.is_null_intolerant() => {
                 // Perform a nullsafe comparison instead of the usual `eval_pred_binary`
                 let preds = [
                     self.eval_pred_unary(UnaryPredicateOp::IsNull, left, true),
@@ -372,11 +379,8 @@ pub(crate) trait KernelPredicateEvaluator {
                 ];
                 self.finish_eval_pred_junction(JunctionPredicateOp::And, preds, false)
             }
-            Unary(UnaryPredicate {
-                op: UnaryPredicateOp::Not,
-                expr,
-            }) => self.eval_pred_sql_where(expr, !inverted),
-            Column(col) => {
+            Not(pred) => self.eval_pred_sql_where(pred, !inverted),
+            BooleanExpression(Expr::Column(col)) => {
                 // Perform a nullsafe comparison instead of the usual `eval_pred_column`
                 let preds = [
                     self.eval_pred_is_null(col, true),
@@ -384,10 +388,11 @@ pub(crate) trait KernelPredicateEvaluator {
                 ];
                 self.finish_eval_pred_junction(JunctionPredicateOp::And, preds, false)
             }
-            Literal(val) if val.is_null() => {
+            BooleanExpression(Expr::Literal(val)) if val.is_null() => {
                 // AND(NULL IS NOT NULL, NULL) = AND(FALSE, NULL) = FALSE
                 self.eval_pred_scalar(&Scalar::from(false), false)
             }
+            BooleanExpression(Expr::Predicate(pred)) => self.eval_pred_sql_where(pred, inverted),
             // Process all remaining predicates normally, because they are not proven safe. Indeed,
             // predicates like DISTINCT and IS [NOT] NULL are known-unsafe under SQL semantics:
             //
@@ -469,7 +474,7 @@ impl KernelPredicateEvaluatorDefaults {
             LessThanOrEqual => Self::partial_cmp_scalars(Ordering::Greater, left, right, !inverted),
             GreaterThan => Self::partial_cmp_scalars(Ordering::Greater, left, right, inverted),
             GreaterThanOrEqual => Self::partial_cmp_scalars(Ordering::Less, left, right, !inverted),
-            _ => {
+            Distinct | In | NotIn => {
                 debug!("Unsupported binary operator: {left:?} {op:?} {right:?}");
                 None
             }

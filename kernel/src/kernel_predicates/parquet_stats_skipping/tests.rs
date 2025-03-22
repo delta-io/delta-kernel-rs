@@ -93,8 +93,8 @@ fn test_junctions() {
         let inputs: Vec<_> = inputs
             .iter()
             .map(|val| match val {
-                Some(v) => Expr::literal(v),
-                None => Expr::null_literal(DataType::BOOLEAN),
+                Some(v) => Pred::literal(*v),
+                None => Pred::null_literal(),
             })
             .collect();
 

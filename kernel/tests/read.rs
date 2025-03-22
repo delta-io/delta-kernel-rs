@@ -968,7 +968,7 @@ fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
             table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
         ),
         (
-            Expr::literal(3i64),
+            Pred::from_expr(Expr::literal(3i64)),
             table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
         ),
         (
