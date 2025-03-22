@@ -7,6 +7,7 @@ use object_store::path::Path;
 use object_store::{DynObjectStore, ObjectStore};
 use url::Url;
 
+use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
 use crate::{DeltaResult, Error, FileMeta, FileSlice, FileSystemClient};
 
@@ -131,19 +132,14 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
                     };
                     let store = store.clone();
                     async move {
-                        match url.scheme() {
-                            "http" | "https" => {
-                                // have to annotate type here or rustc can't figure it out
-                                Ok::<bytes::Bytes, Error>(reqwest::get(url).await?.bytes().await?)
-                            }
-                            _ => {
-                                if let Some(rng) = range {
-                                    Ok(store.get_range(&path, rng).await?)
-                                } else {
-                                    let result = store.get(&path).await?;
-                                    Ok(result.bytes().await?)
-                                }
-                            }
+                        if url.is_presigned() {
+                            // have to annotate type here or rustc can't figure it out
+                            Ok::<bytes::Bytes, Error>(reqwest::get(url).await?.bytes().await?)
+                        } else if let Some(rng) = range {
+                            Ok(store.get_range(&path, rng).await?)
+                        } else {
+                            let result = store.get(&path).await?;
+                            Ok(result.bytes().await?)
                         }
                     }
                 })
