@@ -14,8 +14,8 @@ use crate::arrow::error::ArrowError;
 use crate::engine::arrow_utils::prim_array_cmp;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
-    BinaryExpression, BinaryPredicate, BinaryPredicateOp, Expression, JunctionPredicate,
-    JunctionPredicateOp, Predicate, Scalar, UnaryPredicate, UnaryPredicateOp,
+    BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
+    JunctionPredicate, JunctionPredicateOp, Predicate, Scalar, UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
 use itertools::Itertools;
@@ -25,10 +25,6 @@ fn downcast_to_bool(arr: &dyn Array) -> DeltaResult<&BooleanArray> {
     arr.as_any()
         .downcast_ref::<BooleanArray>()
         .ok_or_else(|| Error::generic("expected boolean array"))
-}
-
-fn wrap_comparison_result(arr: BooleanArray) -> ArrayRef {
-    Arc::new(arr) as _
 }
 
 trait ProvidesColumnByName {
@@ -87,7 +83,7 @@ pub(crate) fn evaluate_expression(
     batch: &RecordBatch,
     result_type: Option<&DataType>,
 ) -> DeltaResult<ArrayRef> {
-    use BinaryPredicateOp::*;
+    use BinaryExpressionOp::*;
     use Expression::*;
     match (expression, result_type) {
         (Literal(scalar), _) => Ok(scalar.to_array(batch.num_rows())?),
@@ -115,29 +111,63 @@ pub(crate) fn evaluate_expression(
         (Struct(_), _) => Err(Error::generic(
             "Data type is required to evaluate struct expressions",
         )),
-        (Unary(UnaryPredicate { op, expr }), _) => {
-            let arr = evaluate_expression(expr.as_ref(), batch, None)?;
-            let result = match op {
-                UnaryPredicateOp::Not => not(downcast_to_bool(&arr)?)?,
-                UnaryPredicateOp::IsNull => is_null(&arr)?,
-            };
+        (Predicate(pred), None | Some(&DataType::BOOLEAN)) => {
+            let result = evaluate_predicate(pred, batch)?;
             Ok(Arc::new(result))
         }
-        (
-            Binary(BinaryPredicate {
-                op: In,
-                left,
-                right,
-            }),
-            _,
-        ) => match (left.as_ref(), right.as_ref()) {
-            (Literal(_), Column(_)) => {
+        (Predicate(_), Some(data_type)) => Err(Error::generic(format!(
+            "Unexpected data type: {data_type:?}"
+        ))),
+        (Binary(BinaryExpression { op, left, right }), _) => {
+            let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
+            let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
+
+            type Operation = fn(&dyn Datum, &dyn Datum) -> Result<ArrayRef, ArrowError>;
+            let eval: Operation = match op {
+                Plus => add,
+                Minus => sub,
+                Multiply => mul,
+                Divide => div,
+            };
+
+            Ok(eval(&left_arr, &right_arr)?)
+        }
+    }
+}
+
+pub(crate) fn evaluate_predicate(
+    predicate: &Predicate,
+    batch: &RecordBatch,
+) -> DeltaResult<BooleanArray> {
+    use BinaryPredicateOp::*;
+    use Predicate::*;
+    match predicate {
+        BooleanExpression(expr) => {
+            // Grr -- there's no way to cast an `Arc<dyn Array>` back to its native type, so we
+            // can't use `Arc::into_inner` here and must unconditionally clone instead.
+            let arr = evaluate_expression(expr, batch, Some(&DataType::BOOLEAN))?;
+            Ok(downcast_to_bool(&arr)?.clone())
+        }
+        Not(pred) => Ok(not(&evaluate_predicate(pred, batch)?)?),
+        Unary(UnaryPredicate { op, expr }) => {
+            let arr = evaluate_expression(expr.as_ref(), batch, None)?;
+            let result = match op {
+                UnaryPredicateOp::IsNull => is_null(&arr)?,
+            };
+            Ok(result)
+        }
+        Binary(BinaryPredicate {
+            op: In,
+            left,
+            right,
+        }) => match (left.as_ref(), right.as_ref()) {
+            (Expression::Literal(_), Expression::Column(_)) => {
                 let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
                 let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
                 if let Some(string_arr) = left_arr.as_string_opt::<i32>() {
                     if let Some(right_arr) = right_arr.as_list_opt::<i32>() {
                         let result = in_list_utf8(string_arr, right_arr)?;
-                        return Ok(wrap_comparison_result(result));
+                        return Ok(result);
                     }
                 }
                 prim_array_cmp! {
@@ -174,52 +204,44 @@ pub(crate) fn evaluate_expression(
                     (ArrowDataType::Decimal256(_, _), Decimal256Type)
                 }
             }
-            (Literal(lit), Literal(Scalar::Array(ad))) => {
+            (Expression::Literal(lit), Expression::Literal(Scalar::Array(ad))) => {
                 #[allow(deprecated)]
                 let exists = ad.array_elements().contains(lit);
-                Ok(Arc::new(BooleanArray::from(vec![exists])))
+                Ok(BooleanArray::from(vec![exists]))
             }
             (l, r) => Err(Error::invalid_expression(format!(
                 "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
             ))),
         },
-        (
-            Binary(BinaryPredicate {
-                op: NotIn,
-                left,
-                right,
-            }),
-            _,
-        ) => {
+        Binary(BinaryPredicate {
+            op: NotIn,
+            left,
+            right,
+        }) => {
             let reverse_op = Predicate::binary(In, *left.clone(), *right.clone());
             let reverse_pred = evaluate_predicate(&reverse_op, batch)?;
-            let result = not(reverse_pred.as_boolean())?;
-            Ok(wrap_comparison_result(result))
+            Ok(not(&reverse_pred)?)
         }
-        (Binary(BinaryExpression { op, left, right }), _) => {
+        Binary(BinaryPredicate { op, left, right }) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
 
-            type Operation = fn(&dyn Datum, &dyn Datum) -> Result<ArrayRef, ArrowError>;
+            type Operation = fn(&dyn Datum, &dyn Datum) -> Result<BooleanArray, ArrowError>;
             let eval: Operation = match op {
-                Plus => add,
-                Minus => sub,
-                Multiply => mul,
-                Divide => div,
-                LessThan => |l, r| lt(l, r).map(wrap_comparison_result),
-                LessThanOrEqual => |l, r| lt_eq(l, r).map(wrap_comparison_result),
-                GreaterThan => |l, r| gt(l, r).map(wrap_comparison_result),
-                GreaterThanOrEqual => |l, r| gt_eq(l, r).map(wrap_comparison_result),
-                Equal => |l, r| eq(l, r).map(wrap_comparison_result),
-                NotEqual => |l, r| neq(l, r).map(wrap_comparison_result),
-                Distinct => |l, r| distinct(l, r).map(wrap_comparison_result),
+                LessThan => |l, r| lt(l, r),
+                LessThanOrEqual => |l, r| lt_eq(l, r),
+                GreaterThan => |l, r| gt(l, r),
+                GreaterThanOrEqual => |l, r| gt_eq(l, r),
+                Equal => |l, r| eq(l, r),
+                NotEqual => |l, r| neq(l, r),
+                Distinct => |l, r| distinct(l, r),
                 // NOTE: [Not]In was already covered above
                 In | NotIn => return Err(Error::generic("Invalid expression given")),
             };
 
             Ok(eval(&left_arr, &right_arr)?)
         }
-        (Junction(JunctionPredicate { op, preds }), None | Some(&DataType::BOOLEAN)) => {
+        Junction(JunctionPredicate { op, preds }) => {
             type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
             let (reducer, default): (Operation, _) = match op {
                 JunctionPredicateOp::And => (and_kleene, true),
@@ -228,24 +250,8 @@ pub(crate) fn evaluate_expression(
             preds
                 .iter()
                 .map(|pred| evaluate_predicate(pred, batch))
-                .reduce(|l, r| {
-                    let result = reducer(downcast_to_bool(&l?)?, downcast_to_bool(&r?)?)?;
-                    Ok(wrap_comparison_result(result))
-                })
-                .unwrap_or_else(|| {
-                    evaluate_expression(&Expression::literal(default), batch, result_type)
-                })
+                .reduce(|l, r| Ok(reducer(&l?, &r?)?))
+                .unwrap_or_else(|| Ok(BooleanArray::from(vec![default; batch.num_rows()])))
         }
-        (Junction(_), _) => Err(Error::Generic(format!(
-            "Junction {expression:?} is expected to return boolean results, got {result_type:?}"
-        ))),
     }
-}
-
-pub(crate) fn evaluate_predicate(
-    predicate: &Predicate,
-    batch: &RecordBatch,
-) -> DeltaResult<ArrayRef> {
-    // TODO: Actually split this out
-    evaluate_expression(predicate, batch, Some(&DataType::BOOLEAN))
 }

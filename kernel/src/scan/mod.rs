@@ -13,9 +13,8 @@ use crate::actions::deletion_vector::{
 };
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{
-    ColumnName, Expression, ExpressionRef, ExpressionTransform, Predicate, PredicateRef, Scalar,
-};
+use crate::expressions::transforms::ExpressionTransform;
+use crate::expressions::{ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
 use crate::log_replay::HasSelectionVector;
 use crate::scan::state::{DvInfo, Stats};
@@ -845,7 +844,7 @@ mod tests {
 
     #[test]
     fn test_static_skipping() {
-        const NULL: Pred = Pred::null_literal(DataType::BOOLEAN);
+        const NULL: Pred = Pred::null_literal();
         let test_cases = [
             (false, column_pred!("a")),
             (true, Pred::literal(false)),

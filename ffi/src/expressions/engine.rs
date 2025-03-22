@@ -11,9 +11,14 @@ use delta_kernel::expressions::{
 };
 use delta_kernel::DeltaResult;
 
+pub enum ExpressionOrPredicate {
+    Expression(Expression),
+    Predicate(Predicate),
+}
+
 #[derive(Default)]
 pub struct KernelExpressionVisitorState {
-    inflight_ids: ReferenceSet<Expression>,
+    inflight_ids: ReferenceSet<ExpressionOrPredicate>,
 }
 
 /// A predicate that can be used to skip data when scanning.
@@ -36,27 +41,35 @@ pub struct EnginePredicate {
 }
 
 fn wrap_expression(state: &mut KernelExpressionVisitorState, expr: impl Into<Expression>) -> usize {
-    state.inflight_ids.insert(expr.into())
+    state
+        .inflight_ids
+        .insert(ExpressionOrPredicate::Expression(expr.into()))
 }
 
 fn wrap_predicate(state: &mut KernelExpressionVisitorState, pred: impl Into<Predicate>) -> usize {
-    // TODO: Actually split this out
-    wrap_expression(state, pred)
+    state
+        .inflight_ids
+        .insert(ExpressionOrPredicate::Predicate(pred.into()))
 }
 
 pub(crate) fn unwrap_kernel_expression(
     state: &mut KernelExpressionVisitorState,
     exprid: usize,
 ) -> Option<Expression> {
-    state.inflight_ids.take(exprid)
+    match state.inflight_ids.take(exprid)? {
+        ExpressionOrPredicate::Expression(expr) => Some(expr),
+        ExpressionOrPredicate::Predicate(pred) => Some(Expression::predicate(pred)),
+    }
 }
 
 pub(crate) fn unwrap_kernel_predicate(
     state: &mut KernelExpressionVisitorState,
     predid: usize,
 ) -> Option<Predicate> {
-    // TODO: Actually split this out
-    unwrap_kernel_expression(state, predid)
+    match state.inflight_ids.take(predid)? {
+        ExpressionOrPredicate::Expression(expr) => Some(Predicate::from_expr(expr)),
+        ExpressionOrPredicate::Predicate(pred) => Some(pred),
+    }
 }
 
 fn visit_expression_binary(
@@ -79,8 +92,12 @@ fn visit_predicate_binary(
     a: usize,
     b: usize,
 ) -> usize {
-    // TODO: Actually split this out
-    visit_expression_binary(state, op, a, b)
+    let left = unwrap_kernel_expression(state, a);
+    let right = unwrap_kernel_expression(state, b);
+    match left.zip(right) {
+        Some((left, right)) => wrap_predicate(state, Predicate::binary(op, left, right)),
+        None => 0, // invalid child => invalid node
+    }
 }
 
 fn visit_predicate_unary(
@@ -102,6 +119,42 @@ pub extern "C" fn visit_predicate_and(
         children.flat_map(|child| unwrap_kernel_predicate(state, child as usize)),
     );
     wrap_predicate(state, result)
+}
+
+#[no_mangle]
+pub extern "C" fn visit_expression_plus(
+    state: &mut KernelExpressionVisitorState,
+    a: usize,
+    b: usize,
+) -> usize {
+    visit_expression_binary(state, BinaryExpressionOp::Plus, a, b)
+}
+
+#[no_mangle]
+pub extern "C" fn visit_expression_minus(
+    state: &mut KernelExpressionVisitorState,
+    a: usize,
+    b: usize,
+) -> usize {
+    visit_expression_binary(state, BinaryExpressionOp::Minus, a, b)
+}
+
+#[no_mangle]
+pub extern "C" fn visit_expression_multiply(
+    state: &mut KernelExpressionVisitorState,
+    a: usize,
+    b: usize,
+) -> usize {
+    visit_expression_binary(state, BinaryExpressionOp::Multiply, a, b)
+}
+
+#[no_mangle]
+pub extern "C" fn visit_expression_divide(
+    state: &mut KernelExpressionVisitorState,
+    a: usize,
+    b: usize,
+) -> usize {
+    visit_expression_binary(state, BinaryExpressionOp::Divide, a, b)
 }
 
 #[no_mangle]
