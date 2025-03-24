@@ -177,7 +177,7 @@ impl UrlExt for Url {
                 // note signed permission (sp) must always be present
                 self
                 .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("sp")) ||
-                // <https://cloud.google.com/storage/docs/authentication/signatures
+                // https://cloud.google.com/storage/docs/authentication/signatures
                 self
                 .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("X-Goog-Credential")) ||
                 // https://www.alibabacloud.com/help/en/oss/user-guide/upload-files-using-presigned-urls
@@ -215,6 +215,13 @@ mod tests {
         assert!(url.is_presigned());
 
         let url = Url::parse("https://example.com?X-OSS-Credential=foo").unwrap();
+        assert!(url.is_presigned());
+
+        // assert that query keys are case insensitive
+        let url = Url::parse("https://example.com?x-gooG-credenTIAL=foo").unwrap();
+        assert!(url.is_presigned());
+
+        let url = Url::parse("https://example.com?x-oss-CREDENTIAL=foo").unwrap();
         assert!(url.is_presigned());
 
         let url = Url::parse("https://example.com").unwrap();
