@@ -59,9 +59,12 @@ impl SetTransactionScanner {
                 Expr::column([SET_TRANSACTION_NAME, "appId"]).is_not_null(),
             ))
         });
-        self.snapshot
-            .log_segment()
-            .replay(engine, schema.clone(), schema, META_PREDICATE.clone())
+        self.snapshot.log_segment().read_actions(
+            engine,
+            schema.clone(),
+            schema,
+            META_PREDICATE.clone(),
+        )
     }
 
     /// Scan the Delta Log for the latest transaction entry of an application
