@@ -158,6 +158,35 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
     }
 }
 
+trait UrlExt {
+    // Check if a given url is a presigned url and can be used
+    // to access the object store via simple http requests
+    fn is_presigned(&self) -> bool;
+}
+
+impl UrlExt for Url {
+    fn is_presigned(&self) -> bool {
+        matches!(self.scheme(), "http" | "https")
+            && (
+                // https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
+                // https://developers.cloudflare.com/r2/api/s3/presigned-urls/
+                self
+                .query_pairs()
+                .any(|(k, _)| k.eq_ignore_ascii_case("X-Amz-Signature")) ||
+                // https://learn.microsoft.com/en-us/rest/api/storageservices/create-user-delegation-sas#version-2020-12-06-and-later
+                // note signed permission (sp) must always be present
+                self
+                .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("sp")) ||
+                // https://cloud.google.com/storage/docs/authentication/signatures
+                self
+                .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("X-Goog-Credential")) ||
+                // https://www.alibabacloud.com/help/en/oss/user-guide/upload-files-using-presigned-urls
+                self
+                .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("X-OSS-Credential"))
+            )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::executor::tokio::TokioBackgroundExecutor;
@@ -172,5 +201,30 @@ mod tests {
         let store = Arc::new(LocalFileSystem::new());
         let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
         test_arrow_engine(&engine, &url);
+    }
+
+    #[test]
+    fn test_pre_signed_url() {
+        let url = Url::parse("https://example.com?X-Amz-Signature=foo").unwrap();
+        assert!(url.is_presigned());
+
+        let url = Url::parse("https://example.com?sp=foo").unwrap();
+        assert!(url.is_presigned());
+
+        let url = Url::parse("https://example.com?X-Goog-Credential=foo").unwrap();
+        assert!(url.is_presigned());
+
+        let url = Url::parse("https://example.com?X-OSS-Credential=foo").unwrap();
+        assert!(url.is_presigned());
+
+        // assert that query keys are case insensitive
+        let url = Url::parse("https://example.com?x-gooG-credenTIAL=foo").unwrap();
+        assert!(url.is_presigned());
+
+        let url = Url::parse("https://example.com?x-oss-CREDENTIAL=foo").unwrap();
+        assert!(url.is_presigned());
+
+        let url = Url::parse("https://example.com").unwrap();
+        assert!(!url.is_presigned());
     }
 }
