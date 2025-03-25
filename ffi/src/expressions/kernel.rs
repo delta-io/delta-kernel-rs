@@ -209,7 +209,7 @@ pub unsafe extern "C" fn visit_expression_ref(
     visit_expression_internal(expression, visitor)
 }
 
-pub fn visit_expression_internal(
+fn visit_expression_internal(
     expression: &Expression,
     visitor: &mut EngineExpressionVisitor,
 ) -> usize {
