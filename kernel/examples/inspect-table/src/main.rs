@@ -223,7 +223,7 @@ fn try_main() -> DeltaResult<()> {
         }
         Commands::Actions { oldest_first } => {
             let log_schema = get_log_schema();
-            let actions = snapshot.log_segment().replay(
+            let actions = snapshot.log_segment().read_actions(
                 &engine,
                 log_schema.clone(),
                 log_schema.clone(),
