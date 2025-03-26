@@ -3,11 +3,11 @@
 use super::arrow_expression::ArrowExpressionHandler;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::{
-    DeltaResult, Engine, Error, Expression, ExpressionHandler, FileDataReadResultIterator,
+    DeltaResult, Engine, Error, ExpressionHandler, ExpressionRef, FileDataReadResultIterator,
     FileMeta, FileSystemClient, JsonHandler, ParquetHandler, SchemaRef,
 };
 
-use arrow_schema::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use itertools::Itertools;
 use std::fs::File;
 use std::sync::Arc;
@@ -60,12 +60,12 @@ impl Engine for SyncEngine {
 fn read_files<F, I>(
     files: &[FileMeta],
     schema: SchemaRef,
-    predicate: Option<Expression>,
+    predicate: Option<ExpressionRef>,
     mut try_create_from_file: F,
 ) -> DeltaResult<FileDataReadResultIterator>
 where
     I: Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static,
-    F: FnMut(File, SchemaRef, ArrowSchemaRef, Option<&Expression>) -> DeltaResult<I>
+    F: FnMut(File, SchemaRef, ArrowSchemaRef, Option<ExpressionRef>) -> DeltaResult<I>
         + Send
         + 'static,
 {
@@ -88,7 +88,7 @@ where
                 File::open(path)?,
                 schema.clone(),
                 arrow_schema.clone(),
-                predicate.as_ref(),
+                predicate.clone(),
             )
         })
         // Flatten to Iterator<DeltaResult<DeltaResult<ArrowEngineData>>>
@@ -96,4 +96,18 @@ where
         // Double unpack and map Iterator<DeltaResult<Box<EngineData>>>
         .map(|data| Ok(Box::new(ArrowEngineData::new(data??.into())) as _));
     Ok(Box::new(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::tests::test_arrow_engine;
+
+    #[test]
+    fn test_sync_engine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = url::Url::from_directory_path(tmp.path()).unwrap();
+        let engine = SyncEngine::new();
+        test_arrow_engine(&engine, &url);
+    }
 }

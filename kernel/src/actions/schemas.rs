@@ -2,10 +2,20 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::schema::{ArrayType, DataType, MapType, StructField};
+use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
+
+pub(crate) trait ToSchema {
+    fn to_schema() -> StructType;
+}
 
 pub(crate) trait ToDataType {
     fn to_data_type() -> DataType;
+}
+
+impl<T: ToSchema> ToDataType for T {
+    fn to_data_type() -> DataType {
+        T::to_schema().into()
+    }
 }
 
 pub(crate) trait ToNullableContainerType {
@@ -74,20 +84,20 @@ pub(crate) trait GetNullableContainerStructField {
 // nullable values
 impl<T: ToNullableContainerType> GetNullableContainerStructField for T {
     fn get_nullable_container_struct_field(name: impl Into<String>) -> StructField {
-        StructField::new(name, T::to_nullable_container_type(), false)
+        StructField::not_null(name, T::to_nullable_container_type())
     }
 }
 
 // Normal types produce non-nullable fields
 impl<T: ToDataType> GetStructField for T {
     fn get_struct_field(name: impl Into<String>) -> StructField {
-        StructField::new(name, T::to_data_type(), false)
+        StructField::not_null(name, T::to_data_type())
     }
 }
 
 // Option types produce nullable fields
 impl<T: ToDataType> GetStructField for Option<T> {
     fn get_struct_field(name: impl Into<String>) -> StructField {
-        StructField::new(name, T::to_data_type(), true)
+        StructField::nullable(name, T::to_data_type())
     }
 }

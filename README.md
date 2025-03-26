@@ -1,12 +1,12 @@
 # delta-kernel-rs
 
-Delta-kernel-rs is an experimental [Delta][delta] implementation focused on
-interoperability with a wide range of query engines. It currently only supports
-reads.
+Delta-kernel-rs is an experimental [Delta][delta] implementation focused on interoperability with a
+wide range of query engines. It currently supports reads and (experimental) writes. Only blind
+appends are currently supported in the write path.
 
-The Delta Kernel project is a Rust and C library for building Delta connectors that can read (and
-soon, write) Delta tables without needing to understand the Delta [protocol
-details][delta-protocol]. This is the Rust/C equivalent of [Java Delta Kernel][java-kernel].
+The Delta Kernel project is a Rust and C library for building Delta connectors that can read and
+write Delta tables without needing to understand the Delta [protocol details][delta-protocol]. This
+is the Rust/C equivalent of [Java Delta Kernel][java-kernel].
 
 ## Crates
 
@@ -15,7 +15,7 @@ Delta-kernel-rs is split into a few different crates:
 - kernel: The actual core kernel crate
 - acceptance: Acceptance tests that validate correctness  via the [Delta Acceptance Tests][dat]
 - derive-macros: A crate for our [derive-macros] to live in
-- ffi: Functionallity that enables delta-kernel-rs to be used from `C` or `C++` See the [ffi](ffi)
+- ffi: Functionality that enables delta-kernel-rs to be used from `C` or `C++` See the [ffi](ffi)
   directory for more information.
 
 ## Building
@@ -33,18 +33,20 @@ the acceptance tests against it.
 
 In general, you will want to depend on `delta-kernel-rs` by adding it as a dependency to your
 `Cargo.toml`, (that is, for rust projects using cargo) for other projects please see the [FFI]
-module. The core kernel includes facilities for reading delta tables, but requires the consumer
-to implement the `Engine` trait in order to use the table-reading APIs. If there is no need to
-implement the consumer's own `Engine` trait, the kernel has a feature flag to enable a default,
-asynchronous `Engine` implementation built with [Arrow] and [Tokio].
+module. The core kernel includes facilities for reading and writing delta tables, and allows the
+consumer to implement their own `Engine` trait in order to build engine-specific implementations of
+the various `Engine` APIs that the kernel relies on (e.g. implement an engine-specific
+`read_json_files()` using the native engine JSON reader). If there is no need to implement the
+consumer's own `Engine` trait, the kernel has a feature flag to enable a default, asynchronous
+`Engine` implementation built with [Arrow] and [Tokio].
 
 ```toml
 # fewer dependencies, requires consumer to implement Engine trait.
 # allows consumers to implement their own in-memory format
-delta_kernel = "0.3"
+delta_kernel = "0.8.0"
 
 # or turn on the default engine, based on arrow
-delta_kernel = { version = "0.3", features = ["default-engine"] }
+delta_kernel = { version = "0.8.0", features = ["default-engine"] }
 ```
 
 ### Feature flags
@@ -63,10 +65,40 @@ We intend to follow [Semantic Versioning](https://semver.org/). However, in the 
 are still unstable. We therefore may break APIs within minor releases (that is, `0.1` -> `0.2`), but
 we will not break APIs in patch releases (`0.1.0` -> `0.1.1`).
 
+## Arrow versioning
+If you enable the `default-engine` or `sync-engine` features, you get an implementation of the
+`Engine` trait that uses [Arrow] as its data format.
+
+The [`arrow crate`](https://docs.rs/arrow/latest/arrow/) tends to release new major versions rather
+quickly. To enable engines that already integrate arrow to also integrate kernel and not force them
+to track a specific version of arrow that kernel depends on, we take as broad dependency on arrow
+versions as we can.
+
+We allow selecting the version of arrow to use via feature flags. Currently we support the following
+flags:
+
+- `arrow_53`: Use arrow version 53
+- `arrow_54`: Use arrow version 54
+
+Note that if more than one `arrow_x` feature is enabled, kernel will default to the _lowest_
+specified flag. This also means that if you use `--all-features` you will get the lowest version of
+arrow that kernel supports.
+
+If no arrow feature is enabled, but are least one of `default-engine`, `sync-engine`,
+`arrow-conversion` or, `arrow-expression` is enabled, the lowest supported arrow version will be
+enabled.
+
+### Object Store
+You may also need to patch the `object_store` version used if the version of `parquet` you depend on
+depends on a different version of `object_store`. This can be done by including `object_store` in
+the patch list with the required version. You can find this out by checking the `parquet` [docs.rs
+page](https://docs.rs/parquet/52.2.0/parquet/index.html), switching to the version you want to use,
+and then checking what version of `object_store` it depends on.
+
 ## Documentation
 
 - [API Docs](https://docs.rs/delta_kernel/latest/delta_kernel/)
-- [arcitecture.md](doc/architecture.md) document describing the kernel architecture (currently wip)
+- [architecture.md](doc/architecture.md) document describing the kernel architecture (currently wip)
 
 ## Examples
 
@@ -83,12 +115,13 @@ projects.
 There are a few key concepts that will help in understanding kernel:
 
 1. The `Engine` trait encapsulates all the functionality and engine or connector needs to provide to
-   the Delta Kernel in order to read the Delta table.
+   the Delta Kernel in order to read/write the Delta table.
 2. The `DefaultEngine` is our default implementation of the the above trait. It lives in
    `engine/default`, and provides a reference implementation for all `Engine`
    functionality. `DefaultEngine` uses [arrow](https://docs.rs/arrow/latest/arrow/) as its in-memory
    data format.
 3. A `Scan` is the entrypoint for reading data from a table.
+4. A `Transaction` is the entrypoint for writing data to a table.
 
 ### Design Principles
 
@@ -133,7 +166,7 @@ Some design principles which should be considered:
 [delta-github]: https://github.com/delta-io/delta
 [java-kernel]: https://github.com/delta-io/delta/tree/master/kernel
 [rustup]: https://rustup.rs
-[architecture.md]: https://github.com/delta-incubator/delta-kernel-rs/tree/master/architecture.md
+[architecture.md]: https://github.com/delta-io/delta-kernel-rs/tree/master/architecture.md
 [dat]: https://github.com/delta-incubator/dat
 [derive-macros]: https://doc.rust-lang.org/reference/procedural-macros.html
 [API Docs]: https://docs.rs/delta_kernel/latest/delta_kernel/

@@ -1,6 +1,7 @@
-/// FFI interface for the delta kernel
-///
-/// Exposes that an engine needs to call from C/C++ to interface with kernel
+//! FFI interface for the delta kernel
+//!
+//! Exposes that an engine needs to call from C/C++ to interface with kernel
+
 #[cfg(feature = "default-engine")]
 use std::collections::HashMap;
 use std::default::Default;
@@ -10,8 +11,9 @@ use std::sync::Arc;
 use tracing::debug;
 use url::Url;
 
+use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{DeltaResult, Engine, EngineData, Error, Table};
+use delta_kernel::{DeltaResult, Engine, EngineData, Table};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 // cbindgen doesn't understand our use of feature flags here, and by default it parses `mod handle`
@@ -29,10 +31,17 @@ use handle::Handle;
 // relies on `crate::`
 extern crate self as delta_kernel_ffi;
 
+pub mod engine_data;
 pub mod engine_funcs;
+pub mod error;
+use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
 pub mod expressions;
+#[cfg(feature = "tracing")]
+pub mod ffi_tracing;
 pub mod scan;
 pub mod schema;
+#[cfg(feature = "test-ffi")]
+pub mod test_ffi;
 
 pub(crate) type NullableCvoid = Option<NonNull<c_void>>;
 
@@ -71,53 +80,100 @@ impl Iterator for EngineIterator {
 /// Intentionally not Copy, Clone, Send, nor Sync.
 ///
 /// Whoever instantiates the struct must ensure it does not outlive the data it points to. The
-/// compiler cannot help us here, because raw pointers don't have lifetimes. To reduce the risk of
-/// accidental misuse, it is recommended to only instantiate this struct as a function arg, by
-/// converting a string slice `Into` a `KernelStringSlice`. That way, the borrowed reference at call
-/// site protects the `KernelStringSlice` until the function returns. Meanwhile, the callee should
-/// assume that the slice is only valid until the function returns, and must not retain any
-/// references to the slice or its data that could outlive the function call.
+/// compiler cannot help us here, because raw pointers don't have lifetimes. A good rule of thumb is
+/// to always use the `kernel_string_slice` macro to create string slices, and to avoid returning
+/// a string slice from a code block or function (since the move risks over-extending its lifetime):
 ///
+/// ```ignore
+/// # // Ignored because this code is pub(crate) and doc tests cannot compile it
+/// let dangling_slice = {
+///     let tmp = String::from("tmp");
+///     kernel_string_slice!(tmp)
+/// }
 /// ```
-/// # use delta_kernel_ffi::KernelStringSlice;
-/// fn wants_slice(slice: KernelStringSlice) { }
-/// let msg = String::from("hello");
-/// wants_slice(msg.into());
-/// ```
+///
+/// Meanwhile, the callee must assume that the slice is only valid until the function returns, and
+/// must not retain any references to the slice or its data that might outlive the function call.
 #[repr(C)]
 pub struct KernelStringSlice {
     ptr: *const c_char,
     len: usize,
 }
-
-// We can construct a `KernelStringSlice` from anything that acts like a Rust string slice. The user
-// of this trait is still responsible to ensure the result doesn't outlive the input data tho --
-// especially if it crosses an FFI boundary to or from external code.
-impl<T: AsRef<[u8]>> From<T> for KernelStringSlice {
-    fn from(s: T) -> Self {
-        let s = s.as_ref();
-        KernelStringSlice {
-            ptr: s.as_ptr().cast(),
-            len: s.len(),
+impl KernelStringSlice {
+    /// Creates a new string slice from a source string. This method is dangerous and can easily
+    /// lead to use-after-free scenarios. The [`kernel_string_slice`] macro should be preferred as a
+    /// much safer alternative.
+    ///
+    /// # Safety
+    ///
+    /// Caller affirms that the source will outlive the statement that creates this slice. The
+    /// compiler cannot help as raw pointers do not have lifetimes that the compiler can
+    /// verify. Thus, e.g., the following incorrect code would compile and leave `s` dangling,
+    /// because the unnamed string arg is dropped as soon as the statement finishes executing.
+    ///
+    /// ```ignore
+    /// # // Ignored because this code is pub(crate) and doc tests cannot compile it
+    /// let s = KernelStringSlice::new_unsafe(String::from("bad").as_str());
+    /// ```
+    pub(crate) unsafe fn new_unsafe(source: &str) -> Self {
+        let source = source.as_bytes();
+        Self {
+            ptr: source.as_ptr().cast(),
+            len: source.len(),
         }
     }
 }
 
-trait TryFromStringSlice: Sized {
-    unsafe fn try_from_slice(slice: &KernelStringSlice) -> DeltaResult<Self>;
+/// Creates a new [`KernelStringSlice`] from a string reference (which must be an identifier, to
+/// ensure it is not immediately dropped). This is the safest way to create a kernel string slice.
+///
+/// NOTE: It is still possible to misuse the resulting kernel string slice in unsafe ways, such as
+/// returning it from the function or code block that owns the string reference.
+macro_rules! kernel_string_slice {
+    ( $source:ident ) => {{
+        // Safety: A named source cannot immediately go out of scope, so the resulting slice must
+        // remain valid at least that long. Any dangerous situations will arise from the subsequent
+        // misuse of this string slice, not from its creation.
+        //
+        // NOTE: The `do_it` wrapper avoids an "unnecessary `unsafe` block" clippy warning in case
+        // the invocation site of this macro is already in an `unsafe` block. We can't just disable
+        // the warning with #[allow(unused_unsafe)] because expression annotation is unstable rust.
+        fn do_it(s: &str) -> $crate::KernelStringSlice {
+            unsafe { $crate::KernelStringSlice::new_unsafe(s) }
+        }
+        do_it(&$source)
+    }};
+}
+pub(crate) use kernel_string_slice;
+
+trait TryFromStringSlice<'a>: Sized {
+    unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> DeltaResult<Self>;
 }
 
-impl TryFromStringSlice for String {
-    /// Converts a slice into a `String`. The slice remains valid after this call.
+impl<'a> TryFromStringSlice<'a> for String {
+    /// Converts a kernel string slice into a `String`.
     ///
     /// # Safety
     ///
     /// The slice must be a valid (non-null) pointer, and must point to the indicated number of
     /// valid utf8 bytes.
-    unsafe fn try_from_slice(slice: &KernelStringSlice) -> DeltaResult<String> {
-        let slice = unsafe { std::slice::from_raw_parts(slice.ptr.cast(), slice.len) };
-        let slice = std::str::from_utf8(slice)?;
+    unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> DeltaResult<Self> {
+        let slice: &str = unsafe { TryFromStringSlice::try_from_slice(slice) }?;
         Ok(slice.into())
+    }
+}
+
+impl<'a> TryFromStringSlice<'a> for &'a str {
+    /// Converts a kernel string slice into a borrowed `str`. The result does not outlive the kernel
+    /// string slice it came from.
+    ///
+    /// # Safety
+    ///
+    /// The slice must be a valid (non-null) pointer, and must point to the indicated number of
+    /// valid utf8 bytes.
+    unsafe fn try_from_slice(slice: &'a KernelStringSlice) -> DeltaResult<Self> {
+        let slice = unsafe { std::slice::from_raw_parts(slice.ptr.cast(), slice.len) };
+        Ok(std::str::from_utf8(slice)?)
     }
 }
 
@@ -275,7 +331,9 @@ pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
 /// an opaque struct that encapsulates data read by an engine. this handle can be passed back into
 /// some kernel calls to operate on the data, or can be converted into the raw data as read by the
 /// [`delta_kernel::Engine`] by calling [`get_raw_engine_data`]
-#[handle_descriptor(target=dyn EngineData, mutable=true, sized=false)]
+///
+/// [`get_raw_engine_data`]: crate::engine_data::get_raw_engine_data
+#[handle_descriptor(target=dyn EngineData, mutable=true)]
 pub struct ExclusiveEngineData;
 
 /// Drop an `ExclusiveEngineData`.
@@ -288,194 +346,6 @@ pub unsafe extern "C" fn free_engine_data(engine_data: Handle<ExclusiveEngineDat
     engine_data.drop_handle();
 }
 
-#[repr(C)]
-#[derive(Debug)]
-pub enum KernelError {
-    UnknownError, // catch-all for unrecognized kernel Error types
-    FFIError,     // errors encountered in the code layer that supports FFI
-    #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
-    ArrowError,
-    EngineDataTypeError,
-    ExtractError,
-    GenericError,
-    IOErrorError,
-    #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
-    ParquetError,
-    #[cfg(feature = "default-engine")]
-    ObjectStoreError,
-    #[cfg(feature = "default-engine")]
-    ObjectStorePathError,
-    #[cfg(feature = "default-engine")]
-    ReqwestError,
-    FileNotFoundError,
-    MissingColumnError,
-    UnexpectedColumnTypeError,
-    MissingDataError,
-    MissingVersionError,
-    DeletionVectorError,
-    InvalidUrlError,
-    MalformedJsonError,
-    MissingMetadataError,
-    MissingProtocolError,
-    MissingMetadataAndProtocolError,
-    ParseError,
-    JoinFailureError,
-    Utf8Error,
-    ParseIntError,
-    InvalidColumnMappingModeError,
-    InvalidTableLocationError,
-    InvalidDecimalError,
-    InvalidStructDataError,
-    InternalError,
-    InvalidExpression,
-    InvalidLogPath,
-}
-
-impl From<Error> for KernelError {
-    fn from(e: Error) -> Self {
-        match e {
-            // NOTE: By definition, no kernel Error maps to FFIError
-            #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
-            Error::Arrow(_) => KernelError::ArrowError,
-            Error::EngineDataType(_) => KernelError::EngineDataTypeError,
-            Error::Extract(..) => KernelError::ExtractError,
-            Error::Generic(_) => KernelError::GenericError,
-            Error::GenericError { .. } => KernelError::GenericError,
-            Error::IOError(_) => KernelError::IOErrorError,
-            #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
-            Error::Parquet(_) => KernelError::ParquetError,
-            #[cfg(feature = "default-engine")]
-            Error::ObjectStore(_) => KernelError::ObjectStoreError,
-            #[cfg(feature = "default-engine")]
-            Error::ObjectStorePath(_) => KernelError::ObjectStorePathError,
-            #[cfg(feature = "default-engine")]
-            Error::Reqwest(_) => KernelError::ReqwestError,
-            Error::FileNotFound(_) => KernelError::FileNotFoundError,
-            Error::MissingColumn(_) => KernelError::MissingColumnError,
-            Error::UnexpectedColumnType(_) => KernelError::UnexpectedColumnTypeError,
-            Error::MissingData(_) => KernelError::MissingDataError,
-            Error::MissingVersion => KernelError::MissingVersionError,
-            Error::DeletionVector(_) => KernelError::DeletionVectorError,
-            Error::InvalidUrl(_) => KernelError::InvalidUrlError,
-            Error::MalformedJson(_) => KernelError::MalformedJsonError,
-            Error::MissingMetadata => KernelError::MissingMetadataError,
-            Error::MissingProtocol => KernelError::MissingProtocolError,
-            Error::MissingMetadataAndProtocol => KernelError::MissingMetadataAndProtocolError,
-            Error::ParseError(..) => KernelError::ParseError,
-            Error::JoinFailure(_) => KernelError::JoinFailureError,
-            Error::Utf8Error(_) => KernelError::Utf8Error,
-            Error::ParseIntError(_) => KernelError::ParseIntError,
-            Error::InvalidColumnMappingMode(_) => KernelError::InvalidColumnMappingModeError,
-            Error::InvalidTableLocation(_) => KernelError::InvalidTableLocationError,
-            Error::InvalidDecimal(_) => KernelError::InvalidDecimalError,
-            Error::InvalidStructData(_) => KernelError::InvalidStructDataError,
-            Error::InternalError(_) => KernelError::InternalError,
-            Error::Backtraced {
-                source,
-                backtrace: _,
-            } => Self::from(*source),
-            Error::InvalidExpressionEvaluation(_) => KernelError::InvalidExpression,
-            Error::InvalidLogPath(_) => KernelError::InvalidLogPath,
-        }
-    }
-}
-
-/// An error that can be returned to the engine. Engines that wish to associate additional
-/// information can define and use any type that is [pointer
-/// interconvertible](https://en.cppreference.com/w/cpp/language/static_cast#pointer-interconvertible)
-/// with this one -- e.g. by subclassing this struct or by embedding this struct as the first member
-/// of a [standard layout](https://en.cppreference.com/w/cpp/language/data_members#Standard-layout)
-/// class.
-#[repr(C)]
-pub struct EngineError {
-    etype: KernelError,
-}
-
-/// Semantics: Kernel will always immediately return the leaked engine error to the engine (if it
-/// allocated one at all), and engine is responsible for freeing it.
-#[repr(C)]
-pub enum ExternResult<T> {
-    Ok(T),
-    Err(*mut EngineError),
-}
-
-pub type AllocateErrorFn =
-    extern "C" fn(etype: KernelError, msg: KernelStringSlice) -> *mut EngineError;
-
-// NOTE: We can't "just" impl From<DeltaResult<T>> because we require an error allocator.
-impl<T> ExternResult<T> {
-    pub fn is_ok(&self) -> bool {
-        match self {
-            Self::Ok(_) => true,
-            Self::Err(_) => false,
-        }
-    }
-    pub fn is_err(&self) -> bool {
-        !self.is_ok()
-    }
-}
-
-/// Represents an engine error allocator. Ultimately all implementations will fall back to an
-/// [`AllocateErrorFn`] provided by the engine, but the trait allows us to conveniently access the
-/// allocator in various types that may wrap it.
-pub trait AllocateError {
-    /// Allocates a new error in engine memory and returns the resulting pointer. The engine is
-    /// expected to copy the passed-in message, which is only guaranteed to remain valid until the
-    /// call returns. Kernel will always immediately return the result of this method to the engine.
-    ///
-    /// # Safety
-    ///
-    /// The string slice must be valid until the call returns, and the error allocator must also be
-    /// valid.
-    unsafe fn allocate_error(&self, etype: KernelError, msg: KernelStringSlice)
-        -> *mut EngineError;
-}
-
-impl AllocateError for AllocateErrorFn {
-    unsafe fn allocate_error(
-        &self,
-        etype: KernelError,
-        msg: KernelStringSlice,
-    ) -> *mut EngineError {
-        self(etype, msg)
-    }
-}
-
-impl AllocateError for &dyn ExternEngine {
-    /// # Safety
-    ///
-    /// In addition to the usual requirements, the engine handle must be valid.
-    unsafe fn allocate_error(
-        &self,
-        etype: KernelError,
-        msg: KernelStringSlice,
-    ) -> *mut EngineError {
-        self.error_allocator().allocate_error(etype, msg)
-    }
-}
-
-/// Converts a [DeltaResult] into an [ExternResult], using the engine's error allocator.
-///
-/// # Safety
-///
-/// The allocator must be valid.
-trait IntoExternResult<T> {
-    unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T>;
-}
-
-impl<T> IntoExternResult<T> for DeltaResult<T> {
-    unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T> {
-        match self {
-            Ok(ok) => ExternResult::Ok(ok),
-            Err(err) => {
-                let msg = format!("{}", err);
-                let err = unsafe { alloc.allocate_error(err.into(), msg.as_str().into()) };
-                ExternResult::Err(err)
-            }
-        }
-    }
-}
-
 // A wrapper for Engine which defines additional FFI-specific methods.
 pub trait ExternEngine: Send + Sync {
     fn engine(&self) -> Arc<dyn Engine>;
@@ -485,12 +355,14 @@ pub trait ExternEngine: Send + Sync {
 #[handle_descriptor(target=dyn ExternEngine, mutable=false)]
 pub struct SharedExternEngine;
 
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 struct ExternEngineVtable {
     // Actual engine instance to use
     engine: Arc<dyn Engine>,
     allocate_error: AllocateErrorFn,
 }
 
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 impl Drop for ExternEngineVtable {
     fn drop(&mut self) {
         debug!("dropping engine interface");
@@ -501,6 +373,7 @@ impl Drop for ExternEngineVtable {
 ///
 /// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
 /// responsible for handling  any races that could result.
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 unsafe impl Send for ExternEngineVtable {}
 
 /// # Safety
@@ -512,8 +385,10 @@ unsafe impl Send for ExternEngineVtable {}
 /// Basically, by failing to implement these traits, we forbid the engine from being able to declare
 /// its thread-safety (because rust assumes it is not threadsafe). By implementing them, we leave it
 /// up to the engine to enforce thread safety if engine chooses to use threads at all.
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 unsafe impl Sync for ExternEngineVtable {}
 
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
 impl ExternEngine for ExternEngineVtable {
     fn engine(&self) -> Arc<dyn Engine> {
         self.engine.clone()
@@ -527,7 +402,7 @@ impl ExternEngine for ExternEngineVtable {
 ///
 /// Caller is responsible for passing a valid path pointer.
 unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<Url> {
-    let path = unsafe { String::try_from_slice(&path) }?;
+    let path: &str = unsafe { TryFromStringSlice::try_from_slice(&path) }?;
     let table = Table::try_from_uri(path)?;
     Ok(table.location().clone())
 }
@@ -595,7 +470,8 @@ pub unsafe extern "C" fn set_builder_option(
 }
 
 /// Consume the builder and return a `default` engine. After calling, the passed pointer is _no
-/// longer valid_.
+/// longer valid_. Note that this _consumes_ and frees the builder, so there is no need to
+/// drop/free it afterwards.
 ///
 ///
 /// # Safety
@@ -648,6 +524,18 @@ pub unsafe extern "C" fn get_sync_engine(
     get_sync_engine_impl(allocate_error).into_extern_result(&allocate_error)
 }
 
+#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+fn engine_to_handle(
+    engine: Arc<dyn Engine>,
+    allocate_error: AllocateErrorFn,
+) -> Handle<SharedExternEngine> {
+    let engine: Arc<dyn ExternEngine> = Arc::new(ExternEngineVtable {
+        engine,
+        allocate_error,
+    });
+    engine.into()
+}
+
 #[cfg(feature = "default-engine")]
 fn get_default_engine_impl(
     url: Url,
@@ -661,11 +549,7 @@ fn get_default_engine_impl(
         options,
         Arc::new(TokioBackgroundExecutor::new()),
     );
-    let engine: Arc<dyn ExternEngine> = Arc::new(ExternEngineVtable {
-        engine: Arc::new(engine?),
-        allocate_error,
-    });
-    Ok(engine.into())
+    Ok(engine_to_handle(Arc::new(engine?), allocate_error))
 }
 
 #[cfg(feature = "sync-engine")]
@@ -673,11 +557,7 @@ fn get_sync_engine_impl(
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     let engine = delta_kernel::engine::sync::SyncEngine::new();
-    let engine: Arc<dyn ExternEngine> = Arc::new(ExternEngineVtable {
-        engine: Arc::new(engine),
-        allocate_error,
-    });
-    Ok(engine.into())
+    Ok(engine_to_handle(Arc::new(engine), allocate_error))
 }
 
 /// # Safety
@@ -688,6 +568,9 @@ pub unsafe extern "C" fn free_engine(engine: Handle<SharedExternEngine>) {
     debug!("engine released engine");
     engine.drop_handle();
 }
+
+#[handle_descriptor(target=Schema, mutable=false, sized=true)]
+pub struct SharedSchema;
 
 #[handle_descriptor(target=Snapshot, mutable=false, sized=true)]
 pub struct SharedSnapshot;
@@ -735,19 +618,63 @@ pub unsafe extern "C" fn version(snapshot: Handle<SharedSnapshot>) -> u64 {
     snapshot.version()
 }
 
+/// Get the logical schema of the specified snapshot
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn logical_schema(snapshot: Handle<SharedSnapshot>) -> Handle<SharedSchema> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot.schema().into()
+}
+
+/// Free a schema
+///
+/// # Safety
+/// Engine is responsible for providing a valid schema handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_schema(schema: Handle<SharedSchema>) {
+    schema.drop_handle();
+}
+
 /// Get the resolved root of the table. This should be used in any future calls that require
 /// constructing a path
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid handle.
+/// Caller is responsible for passing a valid snapshot handle.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_table_root(
     snapshot: Handle<SharedSnapshot>,
     allocate_fn: AllocateStringFn,
 ) -> NullableCvoid {
     let snapshot = unsafe { snapshot.as_ref() };
-    allocate_fn(snapshot.table_root().to_string().as_str().into())
+    let table_root = snapshot.table_root().to_string();
+    allocate_fn(kernel_string_slice!(table_root))
+}
+
+/// Get a count of the number of partition columns for this snapshot
+///
+/// # Safety
+/// Caller is responsible for passing a valid snapshot handle
+#[no_mangle]
+pub unsafe extern "C" fn get_partition_column_count(snapshot: Handle<SharedSnapshot>) -> usize {
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot.metadata().partition_columns.len()
+}
+
+/// Get an iterator of the list of partition columns for this snapshot.
+///
+/// # Safety
+/// Caller is responsible for passing a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn get_partition_columns(
+    snapshot: Handle<SharedSnapshot>,
+) -> Handle<StringSliceIterator> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    let iter: Box<StringIter> = Box::new(snapshot.metadata().partition_columns.clone().into_iter());
+    iter.into()
 }
 
 type StringIter = dyn Iterator<Item = String> + Send;
@@ -757,8 +684,11 @@ pub struct StringSliceIterator;
 
 /// # Safety
 ///
-/// The iterator must be valid (returned by [kernel_scan_data_init]) and not yet freed by
-/// [kernel_scan_data_free]. The visitor function pointer must be non-null.
+/// The iterator must be valid (returned by [`kernel_scan_data_init`]) and not yet freed by
+/// [`free_kernel_scan_data`]. The visitor function pointer must be non-null.
+///
+/// [`kernel_scan_data_init`]: crate::scan::kernel_scan_data_init
+/// [`free_kernel_scan_data`]: crate::scan::free_kernel_scan_data
 #[no_mangle]
 pub unsafe extern "C" fn string_slice_next(
     data: Handle<StringSliceIterator>,
@@ -775,7 +705,7 @@ fn string_slice_next_impl(
 ) -> bool {
     let data = unsafe { data.as_mut() };
     if let Some(data) = data.next() {
-        (engine_visitor)(engine_context, data.as_str().into());
+        (engine_visitor)(engine_context, kernel_string_slice!(data));
         true
     } else {
         false
@@ -838,6 +768,150 @@ impl<T> Default for ReferenceSet<T> {
             map: Default::default(),
             // NOTE: 0 is interpreted as None
             next_id: 1,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use delta_kernel::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
+    use object_store::memory::InMemory;
+    use test_utils::{actions_to_string, actions_to_string_partitioned, add_commit, TestAction};
+
+    use super::*;
+    use crate::error::{EngineError, KernelError};
+
+    #[no_mangle]
+    extern "C" fn allocate_err(etype: KernelError, _: KernelStringSlice) -> *mut EngineError {
+        let boxed = Box::new(EngineError { etype });
+        Box::leak(boxed)
+    }
+
+    #[no_mangle]
+    extern "C" fn allocate_str(kernel_str: KernelStringSlice) -> NullableCvoid {
+        let s = unsafe { String::try_from_slice(&kernel_str) };
+        let ptr = Box::into_raw(Box::new(s.unwrap())).cast(); // never null
+        let ptr = unsafe { NonNull::new_unchecked(ptr) };
+        Some(ptr)
+    }
+
+    // helper to recover a string from the above
+    fn recover_string(ptr: NonNull<c_void>) -> String {
+        let ptr = ptr.as_ptr().cast();
+        *unsafe { Box::from_raw(ptr) }
+    }
+
+    fn ok_or_panic<T>(result: ExternResult<T>) -> T {
+        match result {
+            ExternResult::Ok(t) => t,
+            ExternResult::Err(e) => unsafe {
+                panic!("Got engine error with type {:?}", (*e).etype);
+            },
+        }
+    }
+
+    #[test]
+    fn string_slice() {
+        let s = "foo";
+        let _ = kernel_string_slice!(s);
+    }
+
+    #[test]
+    fn bool_slice() {
+        let bools = vec![true, false, true];
+        let bool_slice = KernelBoolSlice::from(bools);
+        unsafe {
+            free_bool_slice(bool_slice);
+        }
+    }
+
+    pub(crate) fn get_default_engine() -> Handle<SharedExternEngine> {
+        let path = "memory:///doesntmatter/foo";
+        let path = kernel_string_slice!(path);
+        let builder = unsafe { ok_or_panic(get_engine_builder(path, allocate_err)) };
+        unsafe { ok_or_panic(builder_build(builder)) }
+    }
+
+    #[test]
+    fn engine_builder() {
+        let engine = get_default_engine();
+        unsafe {
+            free_engine(engine);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            storage.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
+        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let path = "memory:///";
+
+        let snapshot =
+            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+
+        let version = unsafe { version(snapshot.shallow_copy()) };
+        assert_eq!(version, 0);
+
+        let table_root = unsafe { snapshot_table_root(snapshot.shallow_copy(), allocate_str) };
+        assert!(table_root.is_some());
+        let s = recover_string(table_root.unwrap());
+        assert_eq!(&s, path);
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_partition_cols() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            storage.as_ref(),
+            0,
+            actions_to_string_partitioned(vec![TestAction::Metadata]),
+        )
+        .await?;
+        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let path = "memory:///";
+
+        let snapshot =
+            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+
+        let partition_count = unsafe { get_partition_column_count(snapshot.shallow_copy()) };
+        assert_eq!(partition_count, 1, "Should have one partition");
+
+        let partition_iter = unsafe { get_partition_columns(snapshot.shallow_copy()) };
+
+        #[no_mangle]
+        extern "C" fn visit_partition(_context: NullableCvoid, slice: KernelStringSlice) {
+            let s = unsafe { String::try_from_slice(&slice) }.unwrap();
+            assert_eq!(s.as_str(), "val", "Partition col should be 'val'");
+        }
+        while unsafe { string_slice_next(partition_iter.shallow_copy(), None, visit_partition) } {
+            // validate happens inside visit_partition
+        }
+
+        unsafe { free_string_slice_data(partition_iter) }
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "sync-engine")]
+    fn sync_engine() {
+        let engine = unsafe { get_sync_engine(allocate_err) };
+        let engine = ok_or_panic(engine);
+        unsafe {
+            free_engine(engine);
         }
     }
 }

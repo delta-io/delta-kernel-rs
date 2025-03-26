@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.12)
 project(read_table)
 option(PRINT_DATA "Print out the table data. Requires arrow-glib" ON)
-add_executable(read_table read_table.c arrow.c)
+option(VERBOSE "Enable for more diagnostics messages." OFF)
+add_executable(read_table read_table.c arrow.c kernel_utils.c)
 target_compile_definitions(read_table PUBLIC DEFINE_DEFAULT_ENGINE)
 target_include_directories(read_table PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/ffi-headers")
 target_link_directories(read_table PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/debug")
@@ -18,15 +19,20 @@ add_test(NAME read_and_print_basic_partitioned COMMAND ${TestRunner} ${DatPath}/
 
 if(WIN32)
   set(CMAKE_C_FLAGS_DEBUG "/MT")
-  target_link_libraries(read_table PUBLIC ws2_32 userenv bcrypt ntdll)
+  target_link_libraries(read_table PUBLIC ws2_32 userenv bcrypt ncrypt crypt32 secur32 ntdll RuntimeObject)
 endif(WIN32)
 
 if(MSVC)
-  target_compile_options(read_table PRIVATE /W4 /WX)
+  target_compile_options(read_table PRIVATE /W3 /WX)
 else()
   # no-strict-prototypes because arrow headers have fn defs without prototypes
-  target_compile_options(read_table PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-strict-prototypes)
+  target_compile_options(read_table PRIVATE -Wall -Wextra -Wpedantic -Werror -Wno-strict-prototypes -g -fsanitize=address)
+  target_link_options(read_table PRIVATE -g -fsanitize=address)
 endif()
+
+if(VERBOSE)
+  target_compile_definitions(read_table PUBLIC VERBOSE)
+endif(VERBOSE)
 
 if(PRINT_DATA)
   include(FindPkgConfig)

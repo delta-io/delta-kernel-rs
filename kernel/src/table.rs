@@ -1,11 +1,15 @@
 //! In-memory representation of a Delta table, which acts as an immutable root entity for reading
 //! the different versions
 
+use std::borrow::Cow;
+use std::ops::Deref;
 use std::path::PathBuf;
 
 use url::Url;
 
 use crate::snapshot::Snapshot;
+use crate::table_changes::TableChanges;
+use crate::transaction::Transaction;
 use crate::{DeltaResult, Engine, Error, Version};
 
 /// In-memory representation of a Delta table, which acts as an immutable root entity for reading
@@ -33,7 +37,7 @@ impl Table {
     /// `/local/paths`, and even `../relative/paths`.
     pub fn try_from_uri(uri: impl AsRef<str>) -> DeltaResult<Self> {
         let uri = uri.as_ref();
-        let uri_type: UriType = resolve_uri_type(uri)?;
+        let uri_type = resolve_uri_type(uri)?;
         let url = match uri_type {
             UriType::LocalPath(path) => {
                 if !path.exists() {
@@ -76,6 +80,28 @@ impl Table {
     pub fn snapshot(&self, engine: &dyn Engine, version: Option<Version>) -> DeltaResult<Snapshot> {
         Snapshot::try_new(self.location.clone(), engine, version)
     }
+
+    /// Create a [`TableChanges`] to get a change data feed for the table between `start_version`,
+    /// and `end_version`. If no `end_version` is supplied, the latest version will be used as the
+    /// `end_version`.
+    pub fn table_changes(
+        &self,
+        engine: &dyn Engine,
+        start_version: Version,
+        end_version: impl Into<Option<Version>>,
+    ) -> DeltaResult<TableChanges> {
+        TableChanges::try_new(
+            self.location.clone(),
+            engine,
+            start_version,
+            end_version.into(),
+        )
+    }
+
+    /// Create a new write transaction for this table.
+    pub fn new_transaction(&self, engine: &dyn Engine) -> DeltaResult<Transaction> {
+        Transaction::try_new(self.snapshot(engine, None)?)
+    }
 }
 
 #[derive(Debug)]
@@ -90,7 +116,12 @@ enum UriType {
 /// Will return an error if the path is not valid.
 fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
     let table_uri = table_uri.as_ref();
-    if let Ok(url) = Url::parse(table_uri) {
+    let table_uri = if table_uri.ends_with('/') {
+        Cow::Borrowed(table_uri)
+    } else {
+        Cow::Owned(format!("{table_uri}/"))
+    };
+    if let Ok(url) = Url::parse(&table_uri) {
         let scheme = url.scheme().to_string();
         if url.scheme() == "file" {
             Ok(UriType::LocalPath(
@@ -100,12 +131,12 @@ fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
         } else if scheme.len() == 1 {
             // NOTE this check is required to support absolute windows paths which may properly
             // parse as url we assume here that a single character scheme is a windows drive letter
-            Ok(UriType::LocalPath(PathBuf::from(table_uri)))
+            Ok(UriType::LocalPath(PathBuf::from(table_uri.as_ref())))
         } else {
             Ok(UriType::Url(url))
         }
     } else {
-        Ok(UriType::LocalPath(table_uri.into()))
+        Ok(UriType::LocalPath(table_uri.deref().into()))
     }
 }
 
@@ -166,5 +197,16 @@ mod tests {
 
         #[cfg(not(windows))]
         resolve_uri_type("file://foo/bar").expect_err("file://foo/bar should not have parsed");
+    }
+
+    #[test]
+    fn try_from_uri_without_trailing_slash() {
+        let location = "s3://foo/__unitystorage/catalogs/cid/tables/tid";
+        let table = Table::try_from_uri(location).unwrap();
+
+        assert_eq!(
+            table.location.join("_delta_log/").unwrap().as_str(),
+            "s3://foo/__unitystorage/catalogs/cid/tables/tid/_delta_log/"
+        );
     }
 }

@@ -41,6 +41,10 @@ struct Cli {
     /// to the aws metadata server, which will fail unless you're on an ec2 instance.
     #[arg(long)]
     public: bool,
+
+    /// Only print the schema of the table
+    #[arg(long)]
+    schema_only: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -65,11 +69,11 @@ fn main() -> ExitCode {
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
 
-    // build a table and get the lastest snapshot from it
+    // build a table and get the latest snapshot from it
     let table = Table::try_from_uri(&cli.path)?;
     println!("Reading {}", table.location());
 
-    let engine: Box<dyn Engine> = match cli.engine {
+    let engine: Arc<dyn Engine> = match cli.engine {
         EngineType::Default => {
             let mut options = if let Some(region) = cli.region {
                 HashMap::from([("region", region)])
@@ -79,16 +83,21 @@ fn try_main() -> DeltaResult<()> {
             if cli.public {
                 options.insert("skip_signature", "true".to_string());
             }
-            Box::new(DefaultEngine::try_new(
+            Arc::new(DefaultEngine::try_new(
                 table.location(),
                 options,
                 Arc::new(TokioBackgroundExecutor::new()),
             )?)
         }
-        EngineType::Sync => Box::new(SyncEngine::new()),
+        EngineType::Sync => Arc::new(SyncEngine::new()),
     };
 
     let snapshot = table.snapshot(engine.as_ref(), None)?;
+
+    if cli.schema_only {
+        println!("{:#?}", snapshot.schema());
+        return Ok(());
+    }
 
     let read_schema_opt = cli
         .columns
@@ -111,7 +120,7 @@ fn try_main() -> DeltaResult<()> {
         .build()?;
 
     let batches: Vec<RecordBatch> = scan
-        .execute(engine.as_ref())?
+        .execute(engine)?
         .map(|scan_result| -> DeltaResult<_> {
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();

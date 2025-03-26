@@ -12,10 +12,9 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::sync::SyncEngine;
-use delta_kernel::scan::state::{DvInfo, GlobalScanState, Stats};
-use delta_kernel::scan::transform_to_logical;
+use delta_kernel::scan::state::{transform_to_logical, DvInfo, GlobalScanState, Stats};
 use delta_kernel::schema::Schema;
-use delta_kernel::{DeltaResult, Engine, EngineData, FileMeta, Table};
+use delta_kernel::{DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Table};
 
 use clap::{Parser, ValueEnum};
 use url::Url;
@@ -81,7 +80,7 @@ fn main() -> ExitCode {
 struct ScanFile {
     path: String,
     size: i64,
-    partition_values: HashMap<String, String>,
+    transform: Option<ExpressionRef>,
     dv_info: DvInfo,
 }
 
@@ -104,19 +103,20 @@ fn truncate_batch(batch: RecordBatch, rows: usize) -> RecordBatch {
     RecordBatch::try_new(batch.schema(), cols).unwrap()
 }
 
-// This is the callback that will be called fo each valid scan row
+// This is the callback that will be called for each valid scan row
 fn send_scan_file(
     scan_tx: &mut spmc::Sender<ScanFile>,
     path: &str,
     size: i64,
     _stats: Option<Stats>,
     dv_info: DvInfo,
-    partition_values: HashMap<String, String>,
+    transform: Option<ExpressionRef>,
+    _: HashMap<String, String>,
 ) {
     let scan_file = ScanFile {
         path: path.to_string(),
         size,
-        partition_values,
+        transform,
         dv_info,
     };
     scan_tx.send(scan_file).unwrap();
@@ -125,7 +125,7 @@ fn send_scan_file(
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
 
-    // build a table and get the lastest snapshot from it
+    // build a table and get the latest snapshot from it
     let table = Table::try_from_uri(&cli.path)?;
     println!("Reading {}", table.location());
 
@@ -210,10 +210,11 @@ fn try_main() -> DeltaResult<()> {
     drop(record_batch_tx);
 
     for res in scan_data {
-        let (data, vector) = res?;
+        let (data, vector, transforms) = res?;
         scan_file_tx = delta_kernel::scan::state::visit_scan_files(
             data.as_ref(),
             &vector,
+            &transforms,
             scan_file_tx,
             send_scan_file,
         )?;
@@ -256,7 +257,6 @@ fn do_work(
 ) {
     // get the type for the function calls
     let engine: &dyn Engine = engine.as_ref();
-    let read_schema = scan_state.read_schema.clone();
     // in a loop, try and get a ScanFile. Note that `recv` will return an `Err` when the other side
     // hangs up, which indicates there's no more data to process.
     while let Ok(scan_file) = scan_file_rx.recv() {
@@ -279,7 +279,7 @@ fn do_work(
 
         // this example uses the parquet_handler from the engine, but an engine could
         // choose to use whatever method it might want to read a parquet file. The reader
-        // could, for example, fill in the parition columns, or apply deletion vectors. Here
+        // could, for example, fill in the partition columns, or apply deletion vectors. Here
         // we assume a more naive parquet reader and fix the data up after the fact.
         // further parallelism would also be possible here as we could read the parquet file
         // in chunks where each thread reads one chunk. The engine would need to ensure
@@ -287,19 +287,19 @@ fn do_work(
         // vector
         let read_results = engine
             .get_parquet_handler()
-            .read_parquet_files(&[meta], read_schema.clone(), None)
+            .read_parquet_files(&[meta], scan_state.physical_schema.clone(), None)
             .unwrap();
 
         for read_result in read_results {
             let read_result = read_result.unwrap();
-            let len = read_result.length();
-
-            // ask the kernel to transform the physical data into the correct logical form
+            let len = read_result.len();
+            // transform the physical data into the correct logical form
             let logical = transform_to_logical(
                 engine,
                 read_result,
-                &scan_state,
-                &scan_file.partition_values,
+                &scan_state.physical_schema,
+                &scan_state.logical_schema,
+                &scan_file.transform,
             )
             .unwrap();
 

@@ -14,7 +14,7 @@ const MULTIPART_PART_LEN: usize = 10;
 /// The number of characters in the uuid part of a uuid checkpoint
 const UUID_PART_LEN: usize = 36;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
 enum LogPathFileType {
@@ -37,7 +37,7 @@ enum LogPathFileType {
     Unknown,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
 struct ParsedLogPath<Location: AsUrl = FileMeta> {
@@ -70,6 +70,12 @@ trait AsUrl {
 impl AsUrl for FileMeta {
     fn as_url(&self) -> &Url {
         &self.location
+    }
+}
+
+impl AsUrl for Url {
+    fn as_url(&self) -> &Url {
+        self
     }
 }
 
@@ -157,10 +163,11 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
     fn is_checkpoint(&self) -> bool {
-        // TODO: Include UuidCheckpoint once we actually support v2 checkpoints
         matches!(
             self.file_type,
-            LogPathFileType::SinglePartCheckpoint | LogPathFileType::MultiPartCheckpoint { .. }
+            LogPathFileType::SinglePartCheckpoint
+                | LogPathFileType::MultiPartCheckpoint { .. }
+                | LogPathFileType::UuidCheckpoint(_)
         )
     }
 
@@ -168,11 +175,26 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
     #[allow(dead_code)] // currently only used in tests, which don't "count"
     fn is_unknown(&self) -> bool {
-        // TODO: Stop treating UuidCheckpoint as unknown once we support v2 checkpoints
-        matches!(
-            self.file_type,
-            LogPathFileType::Unknown | LogPathFileType::UuidCheckpoint(_)
-        )
+        matches!(self.file_type, LogPathFileType::Unknown)
+    }
+}
+
+impl ParsedLogPath<Url> {
+    /// Create a new ParsedCommitPath<Url> for a new json commit file at the specified version
+    pub(crate) fn new_commit(
+        table_root: &Url,
+        version: Version,
+    ) -> DeltaResult<ParsedLogPath<Url>> {
+        let filename = format!("{:020}.json", version);
+        let location = table_root.join("_delta_log/")?.join(&filename)?;
+        let path = Self::try_from(location)?
+            .ok_or_else(|| Error::internal_error("attempted to create invalid commit path"))?;
+        if !path.is_commit() {
+            return Err(Error::internal_error(
+                "ParsedLogPath::new_commit created a non-commit path",
+            ));
+        }
+        Ok(path)
     }
 }
 
@@ -181,13 +203,6 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-
-    // Easier to test directly with Url instead of FileMeta!
-    impl AsUrl for Url {
-        fn as_url(&self) -> &Url {
-            self
-        }
-    }
 
     fn table_log_dir_url() -> Url {
         let path = PathBuf::from("./tests/data/table-with-dv-small/_delta_log/");
@@ -216,8 +231,26 @@ mod tests {
 
         // ignored - no extension
         let log_path = table_log_dir.join("00000000000000000010").unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
-        assert!(log_path.is_none());
+        let result = ParsedLogPath::try_from(log_path);
+        assert!(
+            matches!(result, Ok(None)),
+            "Expected Ok(None) for missing file extension"
+        );
+
+        // empty extension - should be treated as unknown file type
+        let log_path = table_log_dir.join("00000000000000000011.").unwrap();
+        let result = ParsedLogPath::try_from(log_path);
+        assert!(
+            matches!(
+                result,
+                Ok(Some(ParsedLogPath {
+                    file_type: LogPathFileType::Unknown,
+                    ..
+                }))
+            ),
+            "Expected Unknown file type, got {:?}",
+            result
+        );
 
         // ignored - version fails to parse
         let log_path = table_log_dir.join("abc.json").unwrap();
@@ -321,10 +354,7 @@ mod tests {
             LogPathFileType::UuidCheckpoint(ref u) if u == "3a0d65cd-4056-49b8-937b-95f9e3ee90e5",
         ));
         assert!(!log_path.is_commit());
-
-        // TODO: Support v2 checkpoints! Until then we can't treat these as checkpoint files.
-        assert!(!log_path.is_checkpoint());
-        assert!(log_path.is_unknown());
+        assert!(log_path.is_checkpoint());
 
         let log_path = table_log_dir
             .join("00000000000000000002.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json")
@@ -341,10 +371,7 @@ mod tests {
             LogPathFileType::UuidCheckpoint(ref u) if u == "3a0d65cd-4056-49b8-937b-95f9e3ee90e5",
         ));
         assert!(!log_path.is_commit());
-
-        // TODO: Support v2 checkpoints! Until then we can't treat these as checkpoint files.
-        assert!(!log_path.is_checkpoint());
-        assert!(log_path.is_unknown());
+        assert!(log_path.is_checkpoint());
 
         let log_path = table_log_dir
             .join("00000000000000000002.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.foo")
@@ -376,6 +403,16 @@ mod tests {
         assert!(!log_path.is_commit());
         assert!(!log_path.is_checkpoint());
         assert!(log_path.is_unknown());
+
+        // Boundary test - UUID with exactly 35 characters (one too short)
+        let log_path = table_log_dir
+            .join("00000000000000000010.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e.parquet")
+            .unwrap();
+        let result = ParsedLogPath::try_from(log_path);
+        assert!(
+            matches!(result, Err(Error::InvalidLogPath(_))),
+            "Expected an error for UUID with exactly 35 characters"
+        );
     }
 
     #[test]
@@ -517,5 +554,16 @@ mod tests {
             .join("00000000000000000008.00000000000000000a15.compacted.json")
             .unwrap();
         ParsedLogPath::try_from(log_path).expect_err("non-numeric hi");
+    }
+
+    #[test]
+    fn test_new_commit() {
+        let table_log_dir = table_log_dir_url();
+        let log_path = ParsedLogPath::new_commit(&table_log_dir, 10).unwrap();
+        assert_eq!(log_path.version, 10);
+        assert!(log_path.is_commit());
+        assert_eq!(log_path.extension, "json");
+        assert!(matches!(log_path.file_type, LogPathFileType::Commit));
+        assert_eq!(log_path.filename, "00000000000000000010.json");
     }
 }

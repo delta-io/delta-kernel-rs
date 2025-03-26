@@ -8,7 +8,7 @@ This crate provides a c foreign function internface (ffi) for delta-kernel-rs.
 You can build static and shared-libraries, as well as the include headers by simply running:
 
 ```sh
-cargo build [--release] [--features default-engine]
+cargo build [--release]
 ```
 
 This will place libraries in the root `target` dir (`../target/[debug,release]` from the directory containing this README), and headers in `../target/ffi-headers`. In that directory there will be a `delta_kernel_ffi.h` file, which is the C header, and a `delta_kernel_ffi.hpp` which is the C++ header.
@@ -23,6 +23,14 @@ cd build
 cmake ..
 make
 ./read_table ../../../../kernel/tests/data/table-with-dv-small
+```
+
+Note there are two configurations that can currently be configured in cmake:
+```bash
+# turn on VERBOSE mode (default is off) - print more diagnostics
+$ cmake -DVERBOSE=yes ..
+# turn off PRINT_DATA (default is on) - see below
+$ cmake -DPRINT_DATA=no ..
 ```
 
 By default this has a dependency on

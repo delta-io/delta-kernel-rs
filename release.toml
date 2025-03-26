@@ -1,0 +1,3 @@
+tag = false
+publish = false
+pre-release-commit-message = "release {{version}}"

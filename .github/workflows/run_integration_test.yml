@@ -1,0 +1,29 @@
+name: Run tests to ensure we can compile across arrow versions
+
+on: [workflow_dispatch, push, pull_request]
+
+jobs:
+  arrow_integration_test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macOS-latest
+          - os: ubuntu-latest
+          - os: windows-latest
+            skip: ${{ github.event_name == 'pull_request' }} # skip running windows tests on every PR since they are slow
+    steps:
+      - name: Skip job for pull requests on Windows
+        if: ${{ matrix.skip }}
+        run: echo "Skipping job for pull requests on Windows."
+      - uses: actions/checkout@v4
+        if: ${{ !matrix.skip }}
+      - name: Setup rust toolchain
+        if: ${{ !matrix.skip }}
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Run integration tests
+        if: ${{ !matrix.skip }}
+        shell: bash
+        run: pushd integration-tests && ./test-all-arrow-versions.sh

@@ -4,25 +4,27 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
+use crate::engine::ensure_data_types::DataTypeCompat;
 use crate::{
     engine::arrow_data::ArrowEngineData,
-    schema::{DataType, PrimitiveType, Schema, SchemaRef, StructField, StructType},
+    schema::{DataType, Schema, SchemaRef, StructField, StructType},
     utils::require,
     DeltaResult, EngineData, Error,
 };
 
-use arrow_array::{
-    cast::AsArray, new_null_array, Array as ArrowArray, GenericListArray, OffsetSizeTrait,
-    RecordBatch, StringArray, StructArray,
+use crate::arrow::array::{
+    cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray,
+    OffsetSizeTrait, RecordBatch, StringArray, StructArray,
 };
-use arrow_json::ReaderBuilder;
-use arrow_schema::{
+use crate::arrow::buffer::NullBuffer;
+use crate::arrow::compute::concat_batches;
+use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef, Fields,
     SchemaRef as ArrowSchemaRef,
 };
-use arrow_select::concat::concat_batches;
+use crate::arrow::json::{LineDelimitedWriter, ReaderBuilder};
+use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 use itertools::Itertools;
-use parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 use tracing::debug;
 
 macro_rules! prim_array_cmp {
@@ -39,7 +41,7 @@ macro_rules! prim_array_cmp {
                         .ok_or(Error::invalid_expression(
                             format!("Cannot cast to list array: {}", $right_arr.data_type()))
                         )?;
-                arrow_ord::comparison::in_list(prim_array, list_array).map(wrap_comparison_result)
+                crate::arrow::compute::kernels::comparison::in_list(prim_array, list_array).map(wrap_comparison_result)
             }
         )+
             _ => Err(ArrowError::CastError(
@@ -54,173 +56,29 @@ macro_rules! prim_array_cmp {
 
 pub(crate) use prim_array_cmp;
 
-/// Get the indicies in `parquet_schema` of the specified columns in `requested_schema`. This
-/// returns a tuples of (mask_indicies: Vec<parquet_schema_index>, reorder_indicies:
-/// Vec<requested_index>). `mask_indicies` is used for generating the mask for reading from the
-
-fn make_arrow_error(s: String) -> Error {
-    Error::Arrow(arrow_schema::ArrowError::InvalidArgumentError(s))
+/// Get the indices in `parquet_schema` of the specified columns in `requested_schema`. This
+/// returns a tuples of (mask_indices: Vec<parquet_schema_index>, reorder_indices:
+/// Vec<requested_index>). `mask_indices` is used for generating the mask for reading from the
+pub(crate) fn make_arrow_error(s: impl Into<String>) -> Error {
+    Error::Arrow(crate::arrow::error::ArrowError::InvalidArgumentError(
+        s.into(),
+    ))
+    .with_backtrace()
 }
 
-/// Capture the compatibility between two data-types, as passed to [`ensure_data_types`]
-pub(crate) enum DataTypeCompat {
-    /// The two types are the same
-    Identical,
-    /// What is read from parquet needs to be cast to the associated type
-    NeedsCast(ArrowDataType),
-    /// Types are compatible, but are nested types. This is used when comparing types where casting
-    /// is not desired (i.e. in the expression evaluator)
-    Nested,
-}
-
-// Check if two types can be cast
-fn check_cast_compat(
-    target_type: ArrowDataType,
-    source_type: &ArrowDataType,
-) -> DeltaResult<DataTypeCompat> {
-    use ArrowDataType::*;
-
-    match (source_type, &target_type) {
-        (source_type, target_type) if source_type == target_type => Ok(DataTypeCompat::Identical),
-        (&ArrowDataType::Timestamp(_, _), &ArrowDataType::Timestamp(_, _)) => {
-            // timestamps are able to be cast between each other
-            Ok(DataTypeCompat::NeedsCast(target_type))
-        }
-        // Allow up-casting to a larger type if it's safe and can't cause overflow or loss of precision.
-        (Int8, Int16 | Int32 | Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (Int16, Int32 | Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (Int32, Int64 | Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (Float32, Float64) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        (_, Decimal128(p, s)) if can_upcast_to_decimal(source_type, *p, *s) => {
-            Ok(DataTypeCompat::NeedsCast(target_type))
-        }
-        (Date32, Timestamp(_, None)) => Ok(DataTypeCompat::NeedsCast(target_type)),
-        _ => Err(make_arrow_error(format!(
-            "Incorrect datatype. Expected {}, got {}",
-            target_type, source_type
-        ))),
-    }
-}
-
-// Returns whether the given source type can be safely cast to a decimal with the given precision and scale without
-// loss of information.
-fn can_upcast_to_decimal(
-    source_type: &ArrowDataType,
-    target_precision: u8,
-    target_scale: i8,
-) -> bool {
-    use ArrowDataType::*;
-
-    let (source_precision, source_scale) = match source_type {
-        Decimal128(p, s) => (*p, *s),
-        // Allow converting integers to a decimal that can hold all possible values.
-        Int8 => (3u8, 0i8),
-        Int16 => (5u8, 0i8),
-        Int32 => (10u8, 0i8),
-        Int64 => (20u8, 0i8),
-        _ => return false,
-    };
-
-    target_precision >= source_precision
-        && target_scale >= source_scale
-        && target_precision - source_precision >= (target_scale - source_scale) as u8
-}
-
-/// Ensure a kernel data type matches an arrow data type. This only ensures that the actual "type"
-/// is the same, but does so recursively into structs, and ensures lists and maps have the correct
-/// associated types as well. This returns an `Ok(DataTypeCompat)` if the types are compatible, and
-/// will indicate what kind of compatibility they have, or an error if the types do not match. If
-/// there is a `struct` type included, we only ensure that the named fields that the kernel is
-/// asking for exist, and that for those fields the types match. Un-selected fields are ignored.
-pub(crate) fn ensure_data_types(
-    kernel_type: &DataType,
-    arrow_type: &ArrowDataType,
-) -> DeltaResult<DataTypeCompat> {
-    match (kernel_type, arrow_type) {
-        (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
-            check_cast_compat(kernel_type.try_into()?, arrow_type)
-        }
-        (&DataType::BOOLEAN, ArrowDataType::Boolean)
-        | (&DataType::STRING, ArrowDataType::Utf8)
-        | (&DataType::BINARY, ArrowDataType::Binary) => {
-            // strings, bools, and binary  aren't primitive in arrow
-            Ok(DataTypeCompat::Identical)
-        }
-        (
-            DataType::Primitive(PrimitiveType::Decimal(kernel_prec, kernel_scale)),
-            ArrowDataType::Decimal128(arrow_prec, arrow_scale),
-        ) if arrow_prec == kernel_prec && *arrow_scale == *kernel_scale as i8 => {
-            // decimal isn't primitive in arrow. cast above is okay as we limit range
-            Ok(DataTypeCompat::Identical)
-        }
-        (DataType::Array(inner_type), ArrowDataType::List(arrow_list_type)) => {
-            let kernel_array_type = &inner_type.element_type;
-            let arrow_list_type = arrow_list_type.data_type();
-            ensure_data_types(kernel_array_type, arrow_list_type)
-        }
-        (DataType::Map(kernel_map_type), ArrowDataType::Map(arrow_map_type, _)) => {
-            if let ArrowDataType::Struct(fields) = arrow_map_type.data_type() {
-                let mut fields = fields.iter();
-                if let Some(key_type) = fields.next() {
-                    ensure_data_types(&kernel_map_type.key_type, key_type.data_type())?;
-                } else {
-                    return Err(make_arrow_error(
-                        "Arrow map struct didn't have a key type".to_string(),
-                    ));
-                }
-                if let Some(value_type) = fields.next() {
-                    ensure_data_types(&kernel_map_type.value_type, value_type.data_type())?;
-                } else {
-                    return Err(make_arrow_error(
-                        "Arrow map struct didn't have a value type".to_string(),
-                    ));
-                }
-                if fields.next().is_some() {
-                    return Err(Error::generic("map fields had more than 2 members"));
-                }
-                Ok(DataTypeCompat::Nested)
-            } else {
-                Err(make_arrow_error(
-                    "Arrow map type wasn't a struct.".to_string(),
-                ))
-            }
-        }
-        (DataType::Struct(kernel_fields), ArrowDataType::Struct(arrow_fields)) => {
-            // build a list of kernel fields that matches the order of the arrow fields
-            let mapped_fields = arrow_fields
-                .iter()
-                .filter_map(|f| kernel_fields.fields.get(f.name()));
-
-            // keep track of how many fields we matched up
-            let mut found_fields = 0;
-            // ensure that for the fields that we found, the types match
-            for (kernel_field, arrow_field) in mapped_fields.zip(arrow_fields) {
-                ensure_data_types(&kernel_field.data_type, arrow_field.data_type())?;
-                found_fields += 1;
-            }
-
-            // require that we found the number of fields that we requested.
-            require!(kernel_fields.fields.len() == found_fields, {
-                let arrow_field_map: HashSet<&String> =
-                    HashSet::from_iter(arrow_fields.iter().map(|f| f.name()));
-                let missing_field_names = kernel_fields
-                    .fields
-                    .keys()
-                    .filter(|kernel_field| !arrow_field_map.contains(kernel_field))
-                    .take(5)
-                    .join(", ");
-                make_arrow_error(format!(
-                    "Missing Struct fields {} (Up to five missing fields shown)",
-                    missing_field_names
-                ))
-            });
-            Ok(DataTypeCompat::Nested)
-        }
-        _ => Err(make_arrow_error(format!(
-            "Incorrect datatype. Expected {}, got {}",
-            kernel_type, arrow_type
-        ))),
-    }
+/// Applies post-processing to data read from parquet files. This includes `reorder_struct_array` to
+/// ensure schema compatibility, as well as `fix_nested_null_masks` to ensure that leaf columns have
+/// accurate null masks that row visitors rely on for correctness.
+pub(crate) fn fixup_parquet_read<T>(
+    batch: RecordBatch,
+    requested_ordering: &[ReorderIndex],
+) -> DeltaResult<T>
+where
+    StructArray: Into<T>,
+{
+    let data = reorder_struct_array(batch.into(), requested_ordering)?;
+    let data = fix_nested_null_masks(data);
+    Ok(data.into())
 }
 
 /*
@@ -516,7 +374,15 @@ fn get_indices(
                     }
                 }
                 _ => {
-                    match ensure_data_types(&requested_field.data_type, field.data_type())? {
+                    // we don't care about matching on nullability or metadata here so pass `false`
+                    // as the final argument. These can differ between the delta schema and the
+                    // parquet schema without causing issues in reading the data. We fix them up in
+                    // expression evaluation later.
+                    match super::ensure_data_types::ensure_data_types(
+                        &requested_field.data_type,
+                        field.data_type(),
+                        false,
+                    )? {
                         DataTypeCompat::Identical => {
                             reorder_indices.push(ReorderIndex::identity(index))
                         }
@@ -571,7 +437,6 @@ fn get_indices(
 /// Get the indices in `parquet_schema` of the specified columns in `requested_schema`. This returns
 /// a tuple of (mask_indices: Vec<parquet_schema_index>, reorder_indices:
 /// Vec<requested_index>). `mask_indices` is used for generating the mask for reading from the
-
 /// parquet file, and simply contains an entry for each index we wish to select from the parquet
 /// file set to the index of the requested column in the parquet. `reorder_indices` is used for
 /// re-ordering. See the documentation for [`ReorderIndex`] to understand what each element in the
@@ -636,6 +501,7 @@ pub(crate) fn reorder_struct_array(
     input_data: StructArray,
     requested_ordering: &[ReorderIndex],
 ) -> DeltaResult<StructArray> {
+    debug!("Reordering {input_data:?} with ordering: {requested_ordering:?}");
     if !ordering_needs_transform(requested_ordering) {
         // indices is already sorted, meaning we requested in the order that the columns were
         // stored in the parquet
@@ -653,7 +519,7 @@ pub(crate) fn reorder_struct_array(
             match &reorder_index.transform {
                 ReorderIndexTransform::Cast(target) => {
                     let col = input_cols[parquet_position].as_ref();
-                    let col = Arc::new(arrow_cast::cast::cast(col, target)?);
+                    let col = Arc::new(crate::arrow::compute::cast(col, target)?);
                     let new_field = Arc::new(
                         input_fields[parquet_position]
                             .as_ref()
@@ -762,6 +628,53 @@ fn reorder_list<O: OffsetSizeTrait>(
     }
 }
 
+/// Use this function to recursively compute properly unioned null masks for all nested
+/// columns of a record batch, making it safe to project out and consume nested columns.
+///
+/// Arrow does not guarantee that the null masks associated with nested columns are accurate --
+/// instead, the reader must consult the union of logical null masks the column and all
+/// ancestors. The parquet reader stopped doing this automatically as of arrow-53.3, for example.
+pub fn fix_nested_null_masks(batch: StructArray) -> StructArray {
+    compute_nested_null_masks(batch, None)
+}
+
+/// Splits a StructArray into its parts, unions in the parent null mask, and uses the result to
+/// recursively update the children as well before putting everything back together.
+fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>) -> StructArray {
+    let (fields, columns, nulls) = sa.into_parts();
+    let nulls = NullBuffer::union(parent_nulls, nulls.as_ref());
+    let columns = columns
+        .into_iter()
+        .map(|column| match column.as_struct_opt() {
+            Some(sa) => Arc::new(compute_nested_null_masks(sa.clone(), nulls.as_ref())) as _,
+            None => {
+                let data = column.to_data();
+                let nulls = NullBuffer::union(nulls.as_ref(), data.nulls());
+                let builder = data.into_builder().nulls(nulls);
+                // Use an unchecked build to avoid paying a redundant O(k) validation cost for a
+                // `RecordBatch` with k leaf columns.
+                //
+                // SAFETY: The builder was constructed from an `ArrayData` we extracted from the
+                // column. The change we make is the null buffer, via `NullBuffer::union` with input
+                // null buffers that were _also_ extracted from the column and its parent. A union
+                // can only _grow_ the set of NULL rows, so data validity is preserved. Even if the
+                // `parent_nulls` somehow had a length mismatch --- which it never should, having
+                // also been extracted from our grandparent --- the mismatch would have already
+                // caused `NullBuffer::union` to panic.
+                let data = unsafe { builder.build_unchecked() };
+                make_array(data)
+            }
+        })
+        .collect();
+
+    // Use an unchecked constructor to avoid paying O(n*k) a redundant null buffer validation cost
+    // for a `RecordBatch` with n rows and k leaf columns.
+    //
+    // SAFETY: We are simply reassembling the input `StructArray` we previously broke apart, with
+    // updated null buffers. See above for details about null buffer safety.
+    unsafe { StructArray::new_unchecked(fields, columns, nulls) }
+}
+
 /// Arrow lacks the functionality to json-parse a string column into a struct column -- even tho the
 /// JSON file reader does exactly the same thing. This function is a hack to work around that gap.
 pub(crate) fn parse_json(
@@ -813,20 +726,35 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
     Ok(concat_batches(&schema, output.iter())?)
 }
 
+/// serialize an arrow RecordBatch to a JSON string by appending to a buffer.
+// TODO (zach): this should stream data to the JSON writer and output an iterator.
+pub(crate) fn to_json_bytes(
+    data: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send,
+) -> DeltaResult<Vec<u8>> {
+    let mut writer = LineDelimitedWriter::new(Vec::new());
+    for chunk in data.into_iter() {
+        let arrow_data = ArrowEngineData::try_from_engine_data(chunk?)?;
+        let record_batch = arrow_data.record_batch();
+        writer.write(record_batch)?;
+    }
+    writer.finish()?;
+    Ok(writer.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow::{
-        array::AsArray,
-        buffer::{OffsetBuffer, ScalarBuffer},
-    };
-    use arrow_array::{
+    use crate::arrow::array::{
         Array, ArrayRef as ArrowArrayRef, BooleanArray, GenericListArray, Int32Array, StructArray,
     };
-    use arrow_schema::{
+    use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
         SchemaRef as ArrowSchemaRef,
+    };
+    use crate::arrow::{
+        array::AsArray,
+        buffer::{OffsetBuffer, ScalarBuffer},
     };
 
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
@@ -901,9 +829,9 @@ mod tests {
     #[test]
     fn simple_mask_indices() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
-            StructField::new("s", DataType::STRING, true),
-            StructField::new("i2", DataType::INTEGER, true),
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::nullable("s", DataType::STRING),
+            StructField::nullable("i2", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
@@ -925,8 +853,8 @@ mod tests {
     #[test]
     fn ensure_data_types_fails_correctly() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
-            StructField::new("s", DataType::INTEGER, true),
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::nullable("s", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
@@ -936,28 +864,22 @@ mod tests {
         assert!(res.is_err());
 
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
-            StructField::new("s", DataType::STRING, true),
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::nullable("s", DataType::STRING),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
             ArrowField::new("s", ArrowDataType::Int32, true),
         ]));
         let res = get_requested_indices(&requested_schema, &parquet_schema);
-        println!("{res:#?}");
         assert!(res.is_err());
     }
 
     #[test]
     fn mask_with_map() {
-        let requested_schema = Arc::new(StructType::new([StructField::new(
+        let requested_schema = Arc::new(StructType::new([StructField::not_null(
             "map",
-            DataType::Map(Box::new(MapType::new(
-                DataType::INTEGER,
-                DataType::STRING,
-                false,
-            ))),
-            false,
+            MapType::new(DataType::INTEGER, DataType::STRING, false),
         )]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new_map(
             "map",
@@ -978,9 +900,9 @@ mod tests {
     #[test]
     fn simple_reorder_indices() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
-            StructField::new("s", DataType::STRING, true),
-            StructField::new("i2", DataType::INTEGER, true),
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::nullable("s", DataType::STRING),
+            StructField::nullable("i2", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i2", ArrowDataType::Int32, true),
@@ -1002,9 +924,9 @@ mod tests {
     #[test]
     fn simple_nullable_field_missing() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
-            StructField::new("s", DataType::STRING, true),
-            StructField::new("i2", DataType::INTEGER, true),
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::nullable("s", DataType::STRING),
+            StructField::nullable("i2", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
@@ -1025,16 +947,15 @@ mod tests {
     #[test]
     fn nested_indices() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
-            StructField::new(
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::not_null(
                 "nested",
                 StructType::new([
-                    StructField::new("int32", DataType::INTEGER, false),
-                    StructField::new("string", DataType::STRING, false),
+                    StructField::not_null("int32", DataType::INTEGER),
+                    StructField::not_null("string", DataType::STRING),
                 ]),
-                false,
             ),
-            StructField::new("j", DataType::INTEGER, false),
+            StructField::not_null("j", DataType::INTEGER),
         ]));
         let parquet_schema = nested_parquet_schema();
         let (mask_indices, reorder_indices) =
@@ -1055,16 +976,15 @@ mod tests {
     #[test]
     fn nested_indices_reorder() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new(
+            StructField::not_null(
                 "nested",
                 StructType::new([
-                    StructField::new("string", DataType::STRING, false),
-                    StructField::new("int32", DataType::INTEGER, false),
+                    StructField::not_null("string", DataType::STRING),
+                    StructField::not_null("int32", DataType::INTEGER),
                 ]),
-                false,
             ),
-            StructField::new("j", DataType::INTEGER, false),
-            StructField::new("i", DataType::INTEGER, false),
+            StructField::not_null("j", DataType::INTEGER),
+            StructField::not_null("i", DataType::INTEGER),
         ]));
         let parquet_schema = nested_parquet_schema();
         let (mask_indices, reorder_indices) =
@@ -1085,13 +1005,12 @@ mod tests {
     #[test]
     fn nested_indices_mask_inner() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
-            StructField::new(
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::not_null(
                 "nested",
-                StructType::new([StructField::new("int32", DataType::INTEGER, false)]),
-                false,
+                StructType::new([StructField::not_null("int32", DataType::INTEGER)]),
             ),
-            StructField::new("j", DataType::INTEGER, false),
+            StructField::not_null("j", DataType::INTEGER),
         ]));
         let parquet_schema = nested_parquet_schema();
         let (mask_indices, reorder_indices) =
@@ -1109,9 +1028,9 @@ mod tests {
     #[test]
     fn simple_list_mask() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
-            StructField::new("list", ArrayType::new(DataType::INTEGER, false), false),
-            StructField::new("j", DataType::INTEGER, false),
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::not_null("list", ArrayType::new(DataType::INTEGER, false)),
+            StructField::not_null("j", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
@@ -1140,10 +1059,9 @@ mod tests {
 
     #[test]
     fn list_skip_earlier_element() {
-        let requested_schema = Arc::new(StructType::new([StructField::new(
+        let requested_schema = Arc::new(StructType::new([StructField::not_null(
             "list",
             ArrayType::new(DataType::INTEGER, false),
-            false,
         )]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
@@ -1168,20 +1086,19 @@ mod tests {
     #[test]
     fn nested_indices_list() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
-            StructField::new(
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::not_null(
                 "list",
                 ArrayType::new(
                     StructType::new([
-                        StructField::new("int32", DataType::INTEGER, false),
-                        StructField::new("string", DataType::STRING, false),
+                        StructField::not_null("int32", DataType::INTEGER),
+                        StructField::not_null("string", DataType::STRING),
                     ])
                     .into(),
                     false,
                 ),
-                false,
             ),
-            StructField::new("j", DataType::INTEGER, false),
+            StructField::not_null("j", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
@@ -1220,8 +1137,8 @@ mod tests {
     #[test]
     fn nested_indices_unselected_list() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
-            StructField::new("j", DataType::INTEGER, false),
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::not_null("j", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
@@ -1253,16 +1170,15 @@ mod tests {
     #[test]
     fn nested_indices_list_mask_inner() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
-            StructField::new(
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::not_null(
                 "list",
                 ArrayType::new(
-                    StructType::new([StructField::new("int32", DataType::INTEGER, false)]).into(),
+                    StructType::new([StructField::not_null("int32", DataType::INTEGER)]).into(),
                     false,
                 ),
-                false,
             ),
-            StructField::new("j", DataType::INTEGER, false),
+            StructField::not_null("j", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
@@ -1298,20 +1214,19 @@ mod tests {
     #[test]
     fn nested_indices_list_mask_inner_reorder() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
-            StructField::new(
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::not_null(
                 "list",
                 ArrayType::new(
                     StructType::new([
-                        StructField::new("string", DataType::STRING, false),
-                        StructField::new("int2", DataType::INTEGER, false),
+                        StructField::not_null("string", DataType::STRING),
+                        StructField::not_null("int2", DataType::INTEGER),
                     ])
                     .into(),
                     false,
                 ),
-                false,
             ),
-            StructField::new("j", DataType::INTEGER, false),
+            StructField::not_null("j", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false), // field 0
@@ -1351,16 +1266,15 @@ mod tests {
     #[test]
     fn skipped_struct() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("i", DataType::INTEGER, false),
-            StructField::new(
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::not_null(
                 "nested",
                 StructType::new([
-                    StructField::new("int32", DataType::INTEGER, false),
-                    StructField::new("string", DataType::STRING, false),
+                    StructField::not_null("int32", DataType::INTEGER),
+                    StructField::not_null("string", DataType::STRING),
                 ]),
-                false,
             ),
-            StructField::new("j", DataType::INTEGER, false),
+            StructField::not_null("j", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new(
@@ -1529,8 +1443,8 @@ mod tests {
     #[test]
     fn no_matches() {
         let requested_schema = Arc::new(StructType::new([
-            StructField::new("s", DataType::STRING, true),
-            StructField::new("i2", DataType::INTEGER, true),
+            StructField::nullable("s", DataType::STRING),
+            StructField::nullable("i2", DataType::INTEGER),
         ]));
         let nots_field = ArrowField::new("NOTs", ArrowDataType::Utf8, true);
         let noti2_field = ArrowField::new("NOTi2", ArrowDataType::Int32, true);
@@ -1566,59 +1480,125 @@ mod tests {
     }
 
     #[test]
-    fn accepts_safe_decimal_casts() {
-        use super::can_upcast_to_decimal;
-        use ArrowDataType::*;
-
-        assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 0i8));
-        assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 1i8));
-        assert!(can_upcast_to_decimal(&Decimal128(5, -2), 6u8, -2i8));
-        assert!(can_upcast_to_decimal(&Decimal128(5, -2), 6u8, -1i8));
-        assert!(can_upcast_to_decimal(&Decimal128(5, 1), 6u8, 1i8));
-        assert!(can_upcast_to_decimal(&Decimal128(5, 1), 6u8, 2i8));
-        assert!(can_upcast_to_decimal(
-            &Decimal128(10, 5),
-            arrow_schema::DECIMAL128_MAX_PRECISION,
-            arrow_schema::DECIMAL128_MAX_SCALE - 5
-        ));
-
-        assert!(can_upcast_to_decimal(&Int8, 3u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int8, 4u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int8, 4u8, 1i8));
-        assert!(can_upcast_to_decimal(&Int8, 7u8, 2i8));
-
-        assert!(can_upcast_to_decimal(&Int16, 5u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int16, 6u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int16, 6u8, 1i8));
-        assert!(can_upcast_to_decimal(&Int16, 9u8, 2i8));
-
-        assert!(can_upcast_to_decimal(&Int32, 10u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int32, 11u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int32, 11u8, 1i8));
-        assert!(can_upcast_to_decimal(&Int32, 14u8, 2i8));
-
-        assert!(can_upcast_to_decimal(&Int64, 20u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int64, 21u8, 0i8));
-        assert!(can_upcast_to_decimal(&Int64, 21u8, 1i8));
-        assert!(can_upcast_to_decimal(&Int64, 24u8, 2i8));
+    fn test_write_json() -> DeltaResult<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "string",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["string1", "string2"]))],
+        )?;
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(data));
+        let json = to_json_bytes(Box::new(std::iter::once(Ok(data))))?;
+        assert_eq!(
+            json,
+            "{\"string\":\"string1\"}\n{\"string\":\"string2\"}\n".as_bytes()
+        );
+        Ok(())
     }
 
     #[test]
-    fn rejects_unsafe_decimal_casts() {
-        use super::can_upcast_to_decimal;
-        use ArrowDataType::*;
+    fn test_arrow_broken_nested_null_masks() {
+        use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
+        use crate::engine::arrow_utils::fix_nested_null_masks;
+        use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-        assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, 1i8));
-        assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, -1i8));
-        assert!(!can_upcast_to_decimal(&Decimal128(5, 2), 6u8, 4i8));
+        // Parse some JSON into a nested schema
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "outer",
+            DataType::Struct(Fields::from(vec![
+                Field::new(
+                    "inner_nullable",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("leaf_non_null", DataType::Int32, false),
+                        Field::new("leaf_nullable", DataType::Int32, true),
+                    ])),
+                    true,
+                ),
+                Field::new(
+                    "inner_non_null",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("leaf_non_null", DataType::Int32, false),
+                        Field::new("leaf_nullable", DataType::Int32, true),
+                    ])),
+                    false,
+                ),
+            ])),
+            true,
+        )]));
+        let json_string = r#"
+{ }
+{ "outer" : { "inner_non_null" : { "leaf_non_null" : 1 } } }
+{ "outer" : { "inner_non_null" : { "leaf_non_null" : 2, "leaf_nullable" : 3 } } }
+{ "outer" : { "inner_non_null" : { "leaf_non_null" : 4 }, "inner_nullable" : { "leaf_non_null" : 5 } } }
+{ "outer" : { "inner_non_null" : { "leaf_non_null" : 6 }, "inner_nullable" : { "leaf_non_null" : 7, "leaf_nullable": 8 } } }
+"#;
+        let batch1 = crate::arrow::json::ReaderBuilder::new(schema.clone())
+            .build(json_string.as_bytes())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        println!("Batch 1: {batch1:?}");
 
-        assert!(!can_upcast_to_decimal(&Int8, 2u8, 0i8));
-        assert!(!can_upcast_to_decimal(&Int8, 3u8, 1i8));
-        assert!(!can_upcast_to_decimal(&Int16, 4u8, 0i8));
-        assert!(!can_upcast_to_decimal(&Int16, 5u8, 1i8));
-        assert!(!can_upcast_to_decimal(&Int32, 9u8, 0i8));
-        assert!(!can_upcast_to_decimal(&Int32, 10u8, 1i8));
-        assert!(!can_upcast_to_decimal(&Int64, 19u8, 0i8));
-        assert!(!can_upcast_to_decimal(&Int64, 20u8, 1i8));
+        macro_rules! assert_nulls {
+            ( $column: expr, $nulls: expr ) => {
+                assert_eq!($column.nulls().unwrap(), &NullBuffer::from(&$nulls[..]));
+            };
+        }
+
+        // If any of these tests ever fail, it means the arrow JSON reader started producing
+        // incomplete nested NULL masks. If that happens, we need to update all JSON reads to call
+        // `fix_nested_null_masks`.
+        let outer_1 = batch1.column(0).as_struct();
+        assert_nulls!(outer_1, [false, true, true, true, true]);
+        let inner_nullable_1 = outer_1.column(0).as_struct();
+        assert_nulls!(inner_nullable_1, [false, false, false, true, true]);
+        let nullable_leaf_non_null_1 = inner_nullable_1.column(0);
+        assert_nulls!(nullable_leaf_non_null_1, [false, false, false, true, true]);
+        let nullable_leaf_nullable_1 = inner_nullable_1.column(1);
+        assert_nulls!(nullable_leaf_nullable_1, [false, false, false, false, true]);
+        let inner_non_null_1 = outer_1.column(1).as_struct();
+        assert_nulls!(inner_non_null_1, [false, true, true, true, true]);
+        let non_null_leaf_non_null_1 = inner_non_null_1.column(0);
+        assert_nulls!(non_null_leaf_non_null_1, [false, true, true, true, true]);
+        let non_null_leaf_nullable_1 = inner_non_null_1.column(1);
+        assert_nulls!(non_null_leaf_nullable_1, [false, false, true, false, false]);
+
+        // Write the batch to a parquet file and read it back
+        let mut buffer = vec![];
+        let mut writer =
+            crate::parquet::arrow::ArrowWriter::try_new(&mut buffer, schema.clone(), None).unwrap();
+        writer.write(&batch1).unwrap();
+        writer.close().unwrap(); // writer must be closed to write footer
+        let batch2 = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(buffer))
+            .unwrap()
+            .build()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        println!("Batch 2 before: {batch2:?}");
+
+        // Starting from arrow-53.3, the parquet reader started returning broken nested NULL masks.
+        let batch2 = RecordBatch::from(fix_nested_null_masks(batch2.into()));
+
+        // Verify the data survived the round trip
+        let outer_2 = batch2.column(0).as_struct();
+        assert_eq!(outer_2, outer_1);
+        let inner_nullable_2 = outer_2.column(0).as_struct();
+        assert_eq!(inner_nullable_2, inner_nullable_1);
+        let nullable_leaf_non_null_2 = inner_nullable_2.column(0);
+        assert_eq!(nullable_leaf_non_null_2, nullable_leaf_non_null_1);
+        let nullable_leaf_nullable_2 = inner_nullable_2.column(1);
+        assert_eq!(nullable_leaf_nullable_2, nullable_leaf_nullable_1);
+        let inner_non_null_2 = outer_2.column(1).as_struct();
+        assert_eq!(inner_non_null_2, inner_non_null_1);
+        let non_null_leaf_non_null_2 = inner_non_null_2.column(0);
+        assert_eq!(non_null_leaf_non_null_2, non_null_leaf_non_null_1);
+        let non_null_leaf_nullable_2 = inner_non_null_2.column(1);
+        assert_eq!(non_null_leaf_nullable_2, non_null_leaf_nullable_1);
     }
 }

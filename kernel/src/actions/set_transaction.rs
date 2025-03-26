@@ -1,9 +1,11 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{get_log_schema, SetTransaction, SET_TRANSACTION_NAME};
 use crate::snapshot::Snapshot;
-use crate::{DeltaResult, Engine, EngineData, Expression as Expr, SchemaRef};
+use crate::{
+    DeltaResult, Engine, EngineData, Expression as Expr, ExpressionRef, RowVisitor as _, SchemaRef,
+};
 
 pub use crate::actions::visitors::SetTransactionMap;
 pub struct SetTransactionScanner {
@@ -27,7 +29,7 @@ impl SetTransactionScanner {
         // found. If all ids are requested then we are forced to replay the entire log.
         for maybe_data in self.replay_for_app_ids(engine, schema.clone())? {
             let (txns, _) = maybe_data?;
-            txns.extract(schema.clone(), &mut visitor)?;
+            visitor.visit_rows_of(txns.as_ref())?;
             // if a specific id is requested and a transaction was found, then return
             if application_id.is_some() && !visitor.set_transactions.is_empty() {
                 break;
@@ -52,10 +54,17 @@ impl SetTransactionScanner {
         // checkpoint part when patitioned by `add.path` like the Delta spec requires. There's no
         // point filtering by a particular app id, even if we have one, because app ids are all in
         // the a single checkpoint part having large min/max range (because they're usually uuids).
-        let meta_predicate = Expr::column("txn.appId").is_not_null();
-        self.snapshot
-            .log_segment
-            .replay(engine, schema.clone(), schema, Some(meta_predicate))
+        static META_PREDICATE: LazyLock<Option<ExpressionRef>> = LazyLock::new(|| {
+            Some(Arc::new(
+                Expr::column([SET_TRANSACTION_NAME, "appId"]).is_not_null(),
+            ))
+        });
+        self.snapshot.log_segment().read_actions(
+            engine,
+            schema.clone(),
+            schema,
+            META_PREDICATE.clone(),
+        )
     }
 
     /// Scan the Delta Log for the latest transaction entry of an application
@@ -74,7 +83,7 @@ impl SetTransactionScanner {
     }
 }
 
-#[cfg(all(test, feature = "default-engine"))]
+#[cfg(all(test, feature = "sync-engine"))]
 mod tests {
     use std::path::PathBuf;
 

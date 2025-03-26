@@ -2,26 +2,32 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::stream::StreamExt;
+use itertools::Itertools;
 use object_store::path::Path;
-use object_store::DynObjectStore;
+use object_store::{DynObjectStore, ObjectStore};
 use url::Url;
 
+use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
 use crate::{DeltaResult, Error, FileMeta, FileSlice, FileSystemClient};
 
 #[derive(Debug)]
 pub struct ObjectStoreFileSystemClient<E: TaskExecutor> {
     inner: Arc<DynObjectStore>,
-    table_root: Path,
+    has_ordered_listing: bool,
     task_executor: Arc<E>,
     readahead: usize,
 }
 
 impl<E: TaskExecutor> ObjectStoreFileSystemClient<E> {
-    pub fn new(store: Arc<DynObjectStore>, table_root: Path, task_executor: Arc<E>) -> Self {
+    pub(crate) fn new(
+        store: Arc<DynObjectStore>,
+        has_ordered_listing: bool,
+        task_executor: Arc<E>,
+    ) -> Self {
         Self {
             inner: store,
-            table_root,
+            has_ordered_listing,
             task_executor,
             readahead: 10,
         }
@@ -39,16 +45,28 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
         &self,
         path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
-        let url = path.clone();
-        let offset = Path::from(path.path());
-        // TODO properly handle table prefix
-        let prefix = self.table_root.child("_delta_log");
+        // The offset is used for list-after; the prefix is used to restrict the listing to a specific directory.
+        // Unfortunately, `Path` provides no easy way to check whether a name is directory-like,
+        // because it strips trailing /, so we're reduced to manually checking the original URL.
+        let offset = Path::from_url_path(path.path())?;
+        let prefix = if path.path().ends_with('/') {
+            offset.clone()
+        } else {
+            let mut parts = offset.parts().collect_vec();
+            if parts.pop().is_none() {
+                return Err(Error::Generic(format!(
+                    "Offset path must not be a root directory. Got: '{}'",
+                    path.as_str()
+                )));
+            }
+            Path::from_iter(parts)
+        };
 
         let store = self.inner.clone();
 
         // This channel will become the iterator
         let (sender, receiver) = std::sync::mpsc::sync_channel(4_000);
-
+        let url = path.clone();
         self.task_executor.spawn(async move {
             let mut stream = store.list_with_offset(Some(&prefix), &offset);
 
@@ -60,7 +78,7 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
                         sender
                             .send(Ok(FileMeta {
                                 location,
-                                last_modified: meta.last_modified.timestamp(),
+                                last_modified: meta.last_modified.timestamp_millis(),
                                 size: meta.size,
                             }))
                             .ok();
@@ -72,7 +90,14 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
             }
         });
 
-        Ok(Box::new(receiver.into_iter()))
+        if !self.has_ordered_listing {
+            // This FS doesn't return things in the order we require
+            let mut fms: Vec<FileMeta> = receiver.into_iter().try_collect()?;
+            fms.sort_unstable();
+            Ok(Box::new(fms.into_iter().map(Ok)))
+        } else {
+            Ok(Box::new(receiver.into_iter()))
+        }
     }
 
     /// Read data specified by the start and end offset from the file.
@@ -107,19 +132,14 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
                     };
                     let store = store.clone();
                     async move {
-                        match url.scheme() {
-                            "http" | "https" => {
-                                // have to annotate type here or rustc can't figure it out
-                                Ok::<bytes::Bytes, Error>(reqwest::get(url).await?.bytes().await?)
-                            }
-                            _ => {
-                                if let Some(rng) = range {
-                                    Ok(store.get_range(&path, rng).await?)
-                                } else {
-                                    let result = store.get(&path).await?;
-                                    Ok(result.bytes().await?)
-                                }
-                            }
+                        if url.is_presigned() {
+                            // have to annotate type here or rustc can't figure it out
+                            Ok::<bytes::Bytes, Error>(reqwest::get(url).await?.bytes().await?)
+                        } else if let Some(rng) = range {
+                            Ok(store.get_range(&path, rng).await?)
+                        } else {
+                            let result = store.get(&path).await?;
+                            Ok(result.bytes().await?)
                         }
                     }
                 })
@@ -140,10 +160,16 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use object_store::memory::InMemory;
     use object_store::{local::LocalFileSystem, ObjectStore};
 
+    use test_utils::{abs_diff, delta_path_for_version};
+
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::engine::default::DefaultEngine;
+    use crate::Engine;
 
     use itertools::Itertools;
 
@@ -171,10 +197,9 @@ mod tests {
         let mut url = Url::from_directory_path(tmp.path()).unwrap();
 
         let store = Arc::new(LocalFileSystem::new());
-        let prefix = Path::from(url.path());
         let client = ObjectStoreFileSystemClient::new(
             store,
-            prefix,
+            false, // don't have ordered listing
             Arc::new(TokioBackgroundExecutor::new()),
         );
 
@@ -194,5 +219,69 @@ mod tests {
         assert_eq!(data[0], Bytes::from("kernel"));
         assert_eq!(data[1], Bytes::from("data"));
         assert_eq!(data[2], Bytes::from("el-da"));
+    }
+
+    #[tokio::test]
+    async fn test_file_meta_is_correct() {
+        let store = Arc::new(InMemory::new());
+
+        let begin_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+
+        let data = Bytes::from("kernel-data");
+        let name = delta_path_for_version(1, "json");
+        store.put(&name, data.clone().into()).await.unwrap();
+
+        let table_root = Url::parse("memory:///").expect("valid url");
+        let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let files: Vec<_> = engine
+            .get_file_system_client()
+            .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap())
+            .unwrap()
+            .try_collect()
+            .unwrap();
+
+        assert!(!files.is_empty());
+        for meta in files.into_iter() {
+            let meta_time = Duration::from_millis(meta.last_modified.try_into().unwrap());
+            assert!(abs_diff(meta_time, begin_time) < Duration::from_secs(10));
+        }
+    }
+    #[tokio::test]
+    async fn test_default_engine_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_store = LocalFileSystem::new_with_prefix(tmp.path()).unwrap();
+        let data = Bytes::from("kernel-data");
+
+        let expected_names: Vec<Path> =
+            (0..10).map(|i| delta_path_for_version(i, "json")).collect();
+
+        // put them in in reverse order
+        for name in expected_names.iter().rev() {
+            tmp_store.put(name, data.clone().into()).await.unwrap();
+        }
+
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let store = Arc::new(LocalFileSystem::new());
+        let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let client = engine.get_file_system_client();
+
+        let files = client
+            .list_from(&url.join("_delta_log").unwrap().join("0").unwrap())
+            .unwrap();
+        let mut len = 0;
+        for (file, expected) in files.zip(expected_names.iter()) {
+            assert!(
+                file.as_ref()
+                    .unwrap()
+                    .location
+                    .path()
+                    .ends_with(expected.as_ref()),
+                "{} does not end with {}",
+                file.unwrap().location.path(),
+                expected
+            );
+            len += 1;
+        }
+        assert_eq!(len, 10, "list_from should have returned 10 files");
     }
 }

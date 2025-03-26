@@ -1,15 +1,18 @@
 use std::{path::Path, sync::Arc};
 
-use arrow_array::{Array, RecordBatch};
-use arrow_ord::sort::{lexsort_to_indices, SortColumn};
-use arrow_schema::{DataType, Schema};
-use arrow_select::{concat::concat_batches, filter::filter_record_batch, take::take};
+use delta_kernel::arrow::array::{Array, RecordBatch};
+use delta_kernel::arrow::compute::{
+    concat_batches, filter_record_batch, lexsort_to_indices, take, SortColumn,
+};
+use delta_kernel::arrow::datatypes::{DataType, Schema};
 
+use delta_kernel::parquet::arrow::async_reader::{
+    ParquetObjectReader, ParquetRecordBatchStreamBuilder,
+};
 use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Engine, Error, Table};
 use futures::{stream::TryStreamExt, StreamExt};
 use itertools::Itertools;
 use object_store::{local::LocalFileSystem, ObjectStore};
-use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 
 use crate::{TestCaseInfo, TestResult};
 
@@ -61,9 +64,7 @@ pub fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
-static SKIPPED_TESTS: &[&str; 0] = &[];
-
-// Ensure that two schema have the same field names, and dict_id/ordering.
+// Ensure that two schema have the same field names, and dict_is_ordered
 // We ignore:
 //  - data type: This is checked already in `assert_columns_match`
 //  - nullability: parquet marks many things as nullable that we don't in our schema
@@ -73,10 +74,6 @@ fn assert_schema_fields_match(schema: &Schema, golden: &Schema) {
         assert!(
             schema_field.name() == golden_field.name(),
             "Field names don't match"
-        );
-        assert!(
-            schema_field.dict_id() == golden_field.dict_id(),
-            "Field dict_id doesn't match"
         );
         assert!(
             schema_field.dict_is_ordered() == golden_field.dict_is_ordered(),
@@ -89,8 +86,8 @@ fn assert_schema_fields_match(schema: &Schema, golden: &Schema) {
 fn normalize_col(col: Arc<dyn Array>) -> Arc<dyn Array> {
     if let DataType::Timestamp(unit, Some(zone)) = col.data_type() {
         if **zone == *"+00:00" {
-            arrow_cast::cast::cast(&col, &DataType::Timestamp(*unit, Some("UTC".into())))
-                .expect("Could not cast to UTC")
+            let data_type = DataType::Timestamp(*unit, Some("UTC".into()));
+            delta_kernel::arrow::compute::cast(&col, &data_type).expect("Could not cast to UTC")
         } else {
             col
         }
@@ -113,17 +110,9 @@ fn assert_columns_match(actual: &[Arc<dyn Array>], expected: &[Arc<dyn Array>]) 
 }
 
 pub async fn assert_scan_data(engine: Arc<dyn Engine>, test_case: &TestCaseInfo) -> TestResult<()> {
-    let root_dir = test_case.root_dir();
-    for skipped in SKIPPED_TESTS {
-        if root_dir.ends_with(skipped) {
-            return Ok(());
-        }
-    }
-
-    let engine = engine.as_ref();
     let table_root = test_case.table_root()?;
     let table = Table::new(table_root);
-    let snapshot = table.snapshot(engine, None)?;
+    let snapshot = table.snapshot(engine.as_ref(), None)?;
     let scan = snapshot.into_scan_builder().build()?;
     let mut schema = None;
     let batches: Vec<RecordBatch> = scan

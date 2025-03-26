@@ -2,10 +2,11 @@
 
 use std::sync::Arc;
 
-use arrow_schema::{
-    ArrowError, DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+use crate::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
+use crate::arrow::error::ArrowError;
 use itertools::Itertools;
 
 use crate::error::Error;
@@ -179,6 +180,7 @@ impl TryFrom<&ArrowDataType> for DataType {
         match arrow_datatype {
             ArrowDataType::Utf8 => Ok(DataType::STRING),
             ArrowDataType::LargeUtf8 => Ok(DataType::STRING),
+            ArrowDataType::Utf8View => Ok(DataType::STRING),
             ArrowDataType::Int64 => Ok(DataType::LONG), // undocumented type
             ArrowDataType::Int32 => Ok(DataType::INTEGER),
             ArrowDataType::Int16 => Ok(DataType::SHORT),
@@ -193,6 +195,7 @@ impl TryFrom<&ArrowDataType> for DataType {
             ArrowDataType::Binary => Ok(DataType::BINARY),
             ArrowDataType::FixedSizeBinary(_) => Ok(DataType::BINARY),
             ArrowDataType::LargeBinary => Ok(DataType::BINARY),
+            ArrowDataType::BinaryView => Ok(DataType::BINARY),
             ArrowDataType::Decimal128(p, s) => {
                 if *s < 0 {
                     return Err(ArrowError::from_external_error(
@@ -213,27 +216,27 @@ impl TryFrom<&ArrowDataType> for DataType {
             ArrowDataType::Struct(fields) => {
                 DataType::try_struct_type(fields.iter().map(|field| field.as_ref().try_into()))
             }
-            ArrowDataType::List(field) => Ok(DataType::Array(Box::new(ArrayType::new(
-                (*field).data_type().try_into()?,
-                (*field).is_nullable(),
-            )))),
-            ArrowDataType::LargeList(field) => Ok(DataType::Array(Box::new(ArrayType::new(
-                (*field).data_type().try_into()?,
-                (*field).is_nullable(),
-            )))),
-            ArrowDataType::FixedSizeList(field, _) => Ok(DataType::Array(Box::new(
-                ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()),
-            ))),
+            ArrowDataType::List(field) => {
+                Ok(ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()).into())
+            }
+            ArrowDataType::ListView(field) => {
+                Ok(ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()).into())
+            }
+            ArrowDataType::LargeList(field) => {
+                Ok(ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()).into())
+            }
+            ArrowDataType::LargeListView(field) => {
+                Ok(ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()).into())
+            }
+            ArrowDataType::FixedSizeList(field, _) => {
+                Ok(ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()).into())
+            }
             ArrowDataType::Map(field, _) => {
                 if let ArrowDataType::Struct(struct_fields) = field.data_type() {
                     let key_type = DataType::try_from(struct_fields[0].data_type())?;
                     let value_type = DataType::try_from(struct_fields[1].data_type())?;
                     let value_type_nullable = struct_fields[1].is_nullable();
-                    Ok(DataType::Map(Box::new(MapType::new(
-                        key_type,
-                        value_type,
-                        value_type_nullable,
-                    ))))
+                    Ok(MapType::new(key_type, value_type, value_type_nullable).into())
                 } else {
                     panic!("DataType::Map should contain a struct field child");
                 }
@@ -261,8 +264,7 @@ mod tests {
     fn test_metadata_string_conversion() -> DeltaResult<()> {
         let mut metadata = HashMap::new();
         metadata.insert("description", "hello world".to_owned());
-        let struct_field =
-            StructField::new("name", DataType::STRING, false).with_metadata(metadata);
+        let struct_field = StructField::not_null("name", DataType::STRING).with_metadata(metadata);
 
         let arrow_field = ArrowField::try_from(&struct_field)?;
         let new_metadata = arrow_field.metadata();

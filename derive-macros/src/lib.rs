@@ -1,9 +1,31 @@
-use proc_macro2::{Ident, TokenStream};
+use proc_macro2::{Ident, Span, TokenStream};
 use quote::{quote, quote_spanned};
 use syn::spanned::Spanned;
-use syn::{parse_macro_input, Data, DataStruct, DeriveInput, Fields, Meta, PathArguments, Type};
+use syn::{
+    parse_macro_input, Data, DataStruct, DeriveInput, Error, Fields, Meta, PathArguments, Type,
+};
 
-/// Derive a `delta_kernel::schemas::ToDataType` implementation for the annotated struct. The actual
+/// Parses a dot-delimited column name into an array of field names. See
+/// `delta_kernel::expressions::column_name::column_name` macro for details.
+#[proc_macro]
+pub fn parse_column_name(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let is_valid = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.';
+    let err = match syn::parse(input) {
+        Ok(syn::Lit::Str(name)) => match name.value().chars().find(|c| !is_valid(*c)) {
+            Some(bad_char) => Error::new(name.span(), format!("Invalid character: {bad_char:?}")),
+            _ => {
+                let path = name.value();
+                let path = path.split('.').map(proc_macro2::Literal::string);
+                return quote_spanned! { name.span() => [#(#path),*] }.into();
+            }
+        },
+        Ok(lit) => Error::new(lit.span(), "Expected a string literal"),
+        Err(err) => err,
+    };
+    err.into_compile_error().into()
+}
+
+/// Derive a `delta_kernel::schemas::ToSchema` implementation for the annotated struct. The actual
 /// field names in the schema (and therefore of the struct members) are all mandated by the Delta
 /// spec, and so the user of this macro is responsible for ensuring that
 /// e.g. `Metadata::schema_string` is the snake_case-ified version of `schemaString` from [Delta's
@@ -23,10 +45,10 @@ pub fn derive_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream 
     let schema_fields = gen_schema_fields(&input.data);
     let output = quote! {
         #[automatically_derived]
-        impl crate::actions::schemas::ToDataType for #struct_ident {
-            fn to_data_type() -> crate::schema::DataType {
+        impl crate::actions::schemas::ToSchema for #struct_ident {
+            fn to_schema() -> crate::schema::StructType {
                 use crate::actions::schemas::{ToDataType, GetStructField, GetNullableContainerStructField};
-                crate::schema::DataType::struct_type([
+                crate::schema::StructType::new([
                     #schema_fields
                 ])
             }
@@ -63,7 +85,13 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
             fields: Fields::Named(fields),
             ..
         }) => &fields.named,
-        _ => panic!("this derive macro only works on structs with named fields"),
+        _ => {
+            return Error::new(
+                Span::call_site(),
+                "this derive macro only works on structs with named fields",
+            )
+            .to_compile_error()
+        }
     };
 
     let schema_fields = fields.iter().map(|field| {
@@ -84,13 +112,16 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
                     match &segment.arguments {
                         PathArguments::None => quote! { #segment_ident :: },
                         PathArguments::AngleBracketed(angle_args) => quote! { #segment_ident::#angle_args :: },
-                        _ => panic!("Can only handle <> type path args"),
+                        _ => Error::new(segment.arguments.span(), "Can only handle <> type path args").to_compile_error()
                     }
                 });
                 if have_schema_null {
                     if let Some(first_ident) = type_path.path.segments.first().map(|seg| &seg.ident) {
                         if first_ident != "HashMap" {
-                            panic!("Can only use drop_null_container_values on HashMap fields, not {first_ident:?}");
+                           return Error::new(
+                                first_ident.span(),
+                                format!("Can only use drop_null_container_values on HashMap fields, not {first_ident}")
+                            ).to_compile_error()
                         }
                     }
                     quote_spanned! { field.span() => #(#type_path_quoted),* get_nullable_container_struct_field(stringify!(#name))}
@@ -98,9 +129,7 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
                     quote_spanned! { field.span() => #(#type_path_quoted),* get_struct_field(stringify!(#name))}
                 }
             }
-            _ => {
-                panic!("Can't handle type: {:?}", field.ty);
-            }
+            _ => Error::new(field.span(), format!("Can't handle type: {:?}", field.ty)).to_compile_error()
         }
     });
     quote! { #(#schema_fields),* }
