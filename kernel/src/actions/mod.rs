@@ -126,7 +126,7 @@ pub(crate) struct Metadata {
     pub(crate) partition_columns: Vec<String>,
     /// The time when this metadata action is created, in milliseconds since the Unix epoch
     pub(crate) created_time: Option<i64>,
-    /// Configuration options for the metadata action
+    /// Configuration options for the metadata action. These are parsed into [`TableProperties`].
     pub(crate) configuration: HashMap<String, String>,
 }
 
