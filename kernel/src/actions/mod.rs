@@ -107,10 +107,10 @@ impl Default for Format {
     }
 }
 
-// TODO should this be pub?
 #[derive(Debug, Default, Clone, PartialEq, Eq, Schema)]
 #[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
-pub struct Metadata {
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+pub(crate) struct Metadata {
     /// Unique identifier for this table
     pub(crate) id: String,
     /// User-provided identifier for this table
@@ -123,7 +123,7 @@ pub struct Metadata {
     pub(crate) schema_string: String,
     /// Column names by which the data should be partitioned
     // TODO: after FFI no longer depends directly on this, make pub(crate)
-    pub partition_columns: Vec<String>,
+    pub(crate) partition_columns: Vec<String>,
     /// The time when this metadata action is created, in milliseconds since the Unix epoch
     pub(crate) created_time: Option<i64>,
     /// Configuration options for the metadata action
@@ -145,6 +145,12 @@ impl Metadata {
 
     pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
         Ok(serde_json::from_str(&self.schema_string)?)
+    }
+
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[allow(dead_code)]
+    pub(crate) fn partition_columns(&self) -> &Vec<String> {
+        &self.partition_columns
     }
 
     /// Parse the metadata configuration HashMap<String, String> into a TableProperties struct.

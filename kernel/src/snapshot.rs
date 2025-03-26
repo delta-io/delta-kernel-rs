@@ -103,7 +103,8 @@ impl Snapshot {
     }
 
     /// Table [`Metadata`] at this `Snapshot`s version.
-    pub fn metadata(&self) -> &Metadata {
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn metadata(&self) -> &Metadata {
         self.table_configuration.metadata()
     }
 
