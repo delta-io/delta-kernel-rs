@@ -7,13 +7,13 @@ use delta_kernel::arrow::array::{
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::engine::default::ObjectStoreRegistry;
 use itertools::Itertools;
-use object_store::local::LocalFileSystem;
-use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::ObjectStore;
 use serde_json::Deserializer;
 use serde_json::{json, to_vec};
+use test_utils::get_registry;
 use url::Url;
 
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -35,11 +35,22 @@ fn setup(
     DefaultEngine<TokioBackgroundExecutor>,
     Url,
 ) {
+    let (registry, exec, _engine) = get_registry();
     let (storage, base_path, base_url): (Arc<dyn ObjectStore>, &str, &str) = if in_memory {
-        (Arc::new(InMemory::new()), "/", "memory:///")
+        (
+            registry
+                .get_store(&Url::parse("memory:///").unwrap())
+                .map(|(s, _)| s)
+                .unwrap(),
+            "/",
+            "memory:///",
+        )
     } else {
         (
-            Arc::new(LocalFileSystem::new()),
+            registry
+                .get_store(&Url::parse("file:///").unwrap())
+                .map(|(s, _)| s)
+                .unwrap(),
             "./kernel_write_tests/",
             "file://",
         )
@@ -47,8 +58,7 @@ fn setup(
 
     let table_root_path = Path::from(format!("{base_path}{table_name}"));
     let url = Url::parse(&format!("{base_url}{table_root_path}/")).unwrap();
-    let executor = Arc::new(TokioBackgroundExecutor::new());
-    let engine = DefaultEngine::new(Arc::clone(&storage), executor);
+    let engine = DefaultEngine::new(registry, exec);
 
     (storage, engine, url)
 }

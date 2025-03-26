@@ -5,10 +5,13 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::{DefaultEngine, DefaultObjectStoreRegistry};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
-use delta_kernel::EngineData;
+use delta_kernel::{Engine, EngineData};
 use itertools::Itertools;
+use object_store::memory::InMemory;
 use object_store::{path::Path, ObjectStore};
 
 /// A common useful initial metadata and protocol. Also includes a single commitInfo
@@ -139,4 +142,20 @@ pub fn abs_diff(self_dur: std::time::Duration, other: std::time::Duration) -> st
     } else {
         other.checked_sub(self_dur).unwrap()
     }
+}
+
+pub fn get_registry() -> (
+    Arc<DefaultObjectStoreRegistry>,
+    Arc<TokioBackgroundExecutor>,
+    Arc<dyn Engine>,
+) {
+    let exec = Arc::new(TokioBackgroundExecutor::new());
+    let mut registry = DefaultObjectStoreRegistry::new();
+    registry.register_store(
+        &url::Url::parse("memory:///").unwrap(),
+        Arc::new(InMemory::new()),
+    );
+    let registry = Arc::new(registry);
+    let engine = DefaultEngine::new(registry.clone(), exec.clone());
+    (registry, exec, Arc::new(engine))
 }

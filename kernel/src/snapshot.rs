@@ -188,18 +188,16 @@ fn read_last_checkpoint(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use object_store::local::LocalFileSystem;
-    use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::ObjectStore;
 
+    use super::*;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::filesystem::ObjectStoreFileSystemClient;
+    use crate::engine::default::registry::DefaultObjectStoreRegistry;
     use crate::engine::sync::SyncEngine;
     use crate::path::ParsedLogPath;
 
@@ -247,12 +245,9 @@ mod tests {
         .unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
-        let store = Arc::new(LocalFileSystem::new());
-        let client = ObjectStoreFileSystemClient::new(
-            store,
-            false, // don't have ordered listing
-            Arc::new(TokioBackgroundExecutor::new()),
-        );
+        let exec = Arc::new(TokioBackgroundExecutor::new());
+        let registry = Arc::new(DefaultObjectStoreRegistry::new_test());
+        let client = ObjectStoreFileSystemClient::new(registry, exec);
         let cp = read_last_checkpoint(&client, &url).unwrap();
         assert!(cp.is_none())
     }
@@ -264,7 +259,9 @@ mod tests {
     #[test]
     fn test_read_table_with_invalid_last_checkpoint() {
         // in memory file system
-        let store = Arc::new(InMemory::new());
+        let exec = Arc::new(TokioBackgroundExecutor::new());
+        let registry = Arc::new(DefaultObjectStoreRegistry::new_test());
+        let store = registry.get_memory();
 
         // put _last_checkpoint file
         let data = valid_last_checkpoint();
@@ -285,11 +282,7 @@ mod tests {
                     .expect("put _last_checkpoint");
             });
 
-        let client = ObjectStoreFileSystemClient::new(
-            store,
-            false, // don't have ordered listing
-            Arc::new(TokioBackgroundExecutor::new()),
-        );
+        let client = ObjectStoreFileSystemClient::new(registry, exec);
         let url = Url::parse("memory:///valid/").expect("valid url");
         let valid = read_last_checkpoint(&client, &url).expect("read last checkpoint");
         let url = Url::parse("memory:///invalid/").expect("valid url");

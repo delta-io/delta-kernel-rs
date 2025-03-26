@@ -5,18 +5,19 @@ use std::ops::Range;
 use std::sync::{mpsc, Arc};
 use std::task::Poll;
 
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use crate::arrow::json::ReaderBuilder;
-use crate::arrow::record_batch::RecordBatch;
 use bytes::{Buf, Bytes};
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
 use object_store::path::Path;
-use object_store::{DynObjectStore, GetResultPayload};
+use object_store::GetResultPayload;
 use tracing::warn;
 use url::Url;
 
 use super::executor::TaskExecutor;
+use super::ObjectStoreRegistry;
+use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use crate::arrow::json::ReaderBuilder;
+use crate::arrow::record_batch::RecordBatch;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::parse_json as arrow_parse_json;
 use crate::engine::arrow_utils::to_json_bytes;
@@ -32,7 +33,7 @@ const DEFAULT_BATCH_SIZE: usize = 1000;
 #[derive(Debug)]
 pub struct DefaultJsonHandler<E: TaskExecutor> {
     /// The object store to read files from
-    store: Arc<DynObjectStore>,
+    registry: Arc<dyn ObjectStoreRegistry>,
     /// The executor to run async tasks on
     task_executor: Arc<E>,
     /// The maximum number of read requests to buffer in memory at once. Note that this actually
@@ -45,9 +46,9 @@ pub struct DefaultJsonHandler<E: TaskExecutor> {
 }
 
 impl<E: TaskExecutor> DefaultJsonHandler<E> {
-    pub fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    pub fn new(registry: Arc<dyn ObjectStoreRegistry>, task_executor: Arc<E>) -> Self {
         Self {
-            store,
+            registry,
             task_executor,
             buffer_size: DEFAULT_BUFFER_SIZE,
             batch_size: DEFAULT_BATCH_SIZE,
@@ -103,7 +104,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         }
 
         let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
-        let file_opener = JsonOpener::new(self.batch_size, schema.clone(), self.store.clone());
+        let file_opener = JsonOpener::new(self.batch_size, schema.clone(), self.registry.clone());
 
         let (tx, rx) = mpsc::sync_channel(self.buffer_size);
         let files = files.to_vec();
@@ -141,7 +142,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     ) -> DeltaResult<()> {
         let buffer = to_json_bytes(data)?;
         // Put if absent
-        let store = self.store.clone(); // cheap Arc
+        let (store, _) = self.registry.get_store(path)?;
         let path = Path::from_url_path(path.path())?;
         let path_str = path.to_string();
         self.task_executor
@@ -163,7 +164,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
 pub struct JsonOpener {
     batch_size: usize,
     projected_schema: ArrowSchemaRef,
-    object_store: Arc<DynObjectStore>,
+    registry: Arc<dyn ObjectStoreRegistry>,
 }
 
 impl JsonOpener {
@@ -171,12 +172,12 @@ impl JsonOpener {
     pub fn new(
         batch_size: usize,
         projected_schema: ArrowSchemaRef,
-        object_store: Arc<DynObjectStore>,
+        registry: Arc<dyn ObjectStoreRegistry>,
     ) -> Self {
         Self {
             batch_size,
             projected_schema,
-            object_store,
+            registry,
         }
     }
 }
@@ -187,7 +188,7 @@ impl JsonOpener {
         file_meta: FileMeta,
         _: Option<Range<i64>>,
     ) -> DeltaResult<BoxStream<'static, DeltaResult<RecordBatch>>> {
-        let store = self.object_store.clone();
+        let store = self.registry.get_store(&file_meta.location)?.0;
         let schema = self.projected_schema.clone();
         let batch_size = self.batch_size;
 
@@ -257,9 +258,9 @@ mod tests {
     use crate::engine::default::executor::tokio::{
         TokioBackgroundExecutor, TokioMultiThreadExecutor,
     };
+    use crate::engine::default::DefaultObjectStoreRegistry;
     use futures::future;
     use itertools::Itertools;
-    use object_store::local::LocalFileSystem;
     use object_store::memory::InMemory;
     use object_store::{
         GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -481,8 +482,9 @@ mod tests {
 
     #[test]
     fn test_parse_json() {
-        let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let exec = Arc::new(TokioBackgroundExecutor::new());
+        let registry = Arc::new(DefaultObjectStoreRegistry::new_test());
+        let handler = DefaultJsonHandler::new(registry, exec);
 
         let json_strings = StringArray::from(vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
@@ -500,8 +502,9 @@ mod tests {
 
     #[test]
     fn test_parse_json_drop_field() {
-        let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let exec = Arc::new(TokioBackgroundExecutor::new());
+        let registry = Arc::new(DefaultObjectStoreRegistry::new_test());
+        let handler = DefaultJsonHandler::new(registry, exec);
         let json_strings = StringArray::from(vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2, "maxRowId": 3}}}"#,
         ]);
@@ -526,7 +529,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_json_files() {
-        let store = Arc::new(LocalFileSystem::new());
+        let exec = Arc::new(TokioBackgroundExecutor::new());
+        let registry = Arc::new(DefaultObjectStoreRegistry::new_test());
+        let (store, _) = registry
+            .get_store(&Url::parse("file:///").unwrap())
+            .unwrap();
 
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/table-with-dv-small/_delta_log/00000000000000000000.json",
@@ -542,7 +549,7 @@ mod tests {
             size: meta.size,
         }];
 
-        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultJsonHandler::new(registry, exec);
         let physical_schema = Arc::new(ArrowSchema::try_from(get_log_schema().as_ref()).unwrap());
         let data: Vec<RecordBatch> = handler
             .read_json_files(files, get_log_schema().clone(), None)
@@ -698,12 +705,12 @@ mod tests {
             let files = future::join_all(ordered_file_meta).await;
 
             // fire off the read_json_files call (for all the files in order)
-            let handler = DefaultJsonHandler::new(
-                store,
-                Arc::new(TokioMultiThreadExecutor::new(
-                    tokio::runtime::Handle::current(),
-                )),
-            );
+            let exec = Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            ));
+            let mut registry = DefaultObjectStoreRegistry::new();
+            registry.register_store(&Url::parse("memory:///").unwrap(), store);
+            let handler = DefaultJsonHandler::new(Arc::new(registry), exec);
             let handler = handler.with_buffer_size(*buffer_size);
             let schema = Arc::new(ArrowSchema::new(vec![Arc::new(Field::new(
                 "val",

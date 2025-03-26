@@ -774,9 +774,10 @@ impl<T> Default for ReferenceSet<T> {
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
-    use object_store::memory::InMemory;
-    use test_utils::{actions_to_string, actions_to_string_partitioned, add_commit, TestAction};
+    use delta_kernel::engine::default::ObjectStoreRegistry;
+    use test_utils::{
+        actions_to_string, actions_to_string_partitioned, add_commit, get_registry, TestAction,
+    };
 
     use super::*;
     use crate::error::{EngineError, KernelError};
@@ -842,15 +843,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-        let storage = Arc::new(InMemory::new());
+        let (registry, _, engine) = get_registry();
+        let (storage, _) = registry.get_store(&Url::parse("memory:///")?)?;
         add_commit(
             storage.as_ref(),
             0,
             actions_to_string(vec![TestAction::Metadata]),
         )
         .await?;
-        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+
+        let engine = engine_to_handle(engine, allocate_err);
         let path = "memory:///";
 
         let snapshot =
@@ -871,15 +873,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_partition_cols() -> Result<(), Box<dyn std::error::Error>> {
-        let storage = Arc::new(InMemory::new());
+        let (registry, _, engine) = get_registry();
+        let (storage, _) = registry.get_store(&Url::parse("memory:///")?)?;
+
         add_commit(
             storage.as_ref(),
             0,
             actions_to_string_partitioned(vec![TestAction::Metadata]),
         )
         .await?;
-        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
-        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let engine = engine_to_handle(engine, allocate_err);
         let path = "memory:///";
 
         let snapshot =

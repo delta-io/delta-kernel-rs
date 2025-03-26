@@ -4,30 +4,24 @@ use bytes::Bytes;
 use futures::stream::StreamExt;
 use itertools::Itertools;
 use object_store::path::Path;
-use object_store::{DynObjectStore, ObjectStore};
+use object_store::ObjectStore;
 use url::Url;
 
-use super::UrlExt;
+use super::{ObjectStoreRegistry, UrlExt};
 use crate::engine::default::executor::TaskExecutor;
 use crate::{DeltaResult, Error, FileMeta, FileSlice, FileSystemClient};
 
 #[derive(Debug)]
 pub struct ObjectStoreFileSystemClient<E: TaskExecutor> {
-    inner: Arc<DynObjectStore>,
-    has_ordered_listing: bool,
+    registry: Arc<dyn ObjectStoreRegistry>,
     task_executor: Arc<E>,
     readahead: usize,
 }
 
 impl<E: TaskExecutor> ObjectStoreFileSystemClient<E> {
-    pub(crate) fn new(
-        store: Arc<DynObjectStore>,
-        has_ordered_listing: bool,
-        task_executor: Arc<E>,
-    ) -> Self {
+    pub(crate) fn new(registry: Arc<dyn ObjectStoreRegistry>, task_executor: Arc<E>) -> Self {
         Self {
-            inner: store,
-            has_ordered_listing,
+            registry,
             task_executor,
             readahead: 10,
         }
@@ -62,7 +56,7 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
             Path::from_iter(parts)
         };
 
-        let store = self.inner.clone();
+        let (store, has_ordered_listing) = self.registry.get_store(path)?;
 
         // This channel will become the iterator
         let (sender, receiver) = std::sync::mpsc::sync_channel(4_000);
@@ -90,7 +84,7 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
             }
         });
 
-        if !self.has_ordered_listing {
+        if !has_ordered_listing {
             // This FS doesn't return things in the order we require
             let mut fms: Vec<FileMeta> = receiver.into_iter().try_collect()?;
             fms.sort_unstable();
@@ -110,7 +104,7 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
         &self,
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
-        let store = self.inner.clone();
+        let registry = self.registry.clone();
 
         // This channel will become the output iterator.
         // Because there will already be buffering in the stream, we set the
@@ -130,16 +124,19 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
                     } else {
                         Path::from(url.path())
                     };
-                    let store = store.clone();
+                    let registry = registry.clone();
                     async move {
                         if url.is_presigned() {
                             // have to annotate type here or rustc can't figure it out
                             Ok::<bytes::Bytes, Error>(reqwest::get(url).await?.bytes().await?)
-                        } else if let Some(rng) = range {
-                            Ok(store.get_range(&path, rng).await?)
                         } else {
-                            let result = store.get(&path).await?;
-                            Ok(result.bytes().await?)
+                            let (store, _) = registry.get_store(&url)?;
+                            if let Some(rng) = range {
+                                Ok(store.get_range(&path, rng).await?)
+                            } else {
+                                let result = store.get(&path).await?;
+                                Ok(result.bytes().await?)
+                            }
                         }
                     }
                 })
@@ -162,18 +159,14 @@ mod tests {
     use std::ops::Range;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use object_store::memory::InMemory;
+    use itertools::Itertools;
     use object_store::{local::LocalFileSystem, ObjectStore};
-
     use test_utils::{abs_diff, delta_path_for_version};
 
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::DefaultEngine;
-    use crate::Engine;
-
-    use itertools::Itertools;
-
     use super::*;
+    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::engine::default::{DefaultEngine, DefaultObjectStoreRegistry};
+    use crate::Engine;
 
     #[tokio::test]
     async fn test_read_files() {
@@ -196,12 +189,9 @@ mod tests {
 
         let mut url = Url::from_directory_path(tmp.path()).unwrap();
 
-        let store = Arc::new(LocalFileSystem::new());
-        let client = ObjectStoreFileSystemClient::new(
-            store,
-            false, // don't have ordered listing
-            Arc::new(TokioBackgroundExecutor::new()),
-        );
+        let exec = Arc::new(TokioBackgroundExecutor::new());
+        let registry = Arc::new(DefaultObjectStoreRegistry::new_test());
+        let client = ObjectStoreFileSystemClient::new(registry, exec);
 
         let mut slices: Vec<FileSlice> = Vec::new();
 
@@ -223,7 +213,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_meta_is_correct() {
-        let store = Arc::new(InMemory::new());
+        let exec = Arc::new(TokioBackgroundExecutor::new());
+        let registry = Arc::new(DefaultObjectStoreRegistry::new_test());
+        let (store, _) = registry
+            .get_store(&Url::parse("memory:///").unwrap())
+            .unwrap();
 
         let begin_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 
@@ -232,7 +226,7 @@ mod tests {
         store.put(&name, data.clone().into()).await.unwrap();
 
         let table_root = Url::parse("memory:///").expect("valid url");
-        let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(registry, exec);
         let files: Vec<_> = engine
             .get_file_system_client()
             .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap())
@@ -261,8 +255,9 @@ mod tests {
         }
 
         let url = Url::from_directory_path(tmp.path()).unwrap();
-        let store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let exec = Arc::new(TokioBackgroundExecutor::new());
+        let registry = Arc::new(DefaultObjectStoreRegistry::new_test());
+        let engine = DefaultEngine::new(registry, exec);
         let client = engine.get_file_system_client();
 
         let files = client

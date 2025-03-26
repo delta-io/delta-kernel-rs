@@ -9,14 +9,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use self::storage::parse_url_opts;
-use object_store::DynObjectStore;
 use url::Url;
 
 use self::executor::TaskExecutor;
 use self::filesystem::ObjectStoreFileSystemClient;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
+use self::storage::parse_url_opts;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowExpressionHandler;
 use crate::schema::Schema;
@@ -26,16 +25,18 @@ use crate::{
     ParquetHandler,
 };
 
+pub use registry::{DefaultObjectStoreRegistry, ObjectStoreRegistry};
+
 pub mod executor;
 pub mod file_stream;
 pub mod filesystem;
 pub mod json;
 pub mod parquet;
+pub mod registry;
 pub mod storage;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DefaultEngine<E: TaskExecutor> {
-    store: Arc<DynObjectStore>,
     file_system: Arc<ObjectStoreFileSystemClient<E>>,
     json: Arc<DefaultJsonHandler<E>>,
     parquet: Arc<DefaultParquetHandler<E>>,
@@ -61,56 +62,30 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     {
         // table root is the path of the table in the ObjectStore
         let (store, _table_root) = parse_url_opts(table_root, options)?;
-        Ok(Self::new(Arc::new(store), task_executor))
+        let mut registry = DefaultObjectStoreRegistry::new();
+        registry.register_store(table_root, Arc::new(store));
+        Ok(Self::new(Arc::new(registry), task_executor))
     }
 
     /// Create a new [`DefaultEngine`] instance
     ///
     /// # Parameters
     ///
-    /// - `store`: The object store to use.
-    /// - `table_root_path`: The root path of the table within storage.
+    /// - `registry`: An object store registry. See [`ObjectStoreRegistry`].
     /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    pub fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
-        // HACK to check if we're using a LocalFileSystem from ObjectStore. We need this because
-        // local filesystem doesn't return a sorted list by default. Although the `object_store`
-        // crate explicitly says it _does not_ return a sorted listing, in practice all the cloud
-        // implementations actually do:
-        // - AWS:
-        //   [`ListObjectsV2`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html)
-        //   states: "For general purpose buckets, ListObjectsV2 returns objects in lexicographical
-        //   order based on their key names." (Directory buckets are out of scope for now)
-        // - Azure: Docs state
-        //   [here](https://learn.microsoft.com/en-us/rest/api/storageservices/enumerating-blob-resources):
-        //   "A listing operation returns an XML response that contains all or part of the requested
-        //   list. The operation returns entities in alphabetical order."
-        // - GCP: The [main](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) doc
-        //   doesn't indicate order, but [this
-        //   page](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) does say: "This page
-        //   shows you how to list the [objects](https://cloud.google.com/storage/docs/objects) stored
-        //   in your Cloud Storage buckets, which are ordered in the list lexicographically by name."
-        // So we just need to know if we're local and then if so, we sort the returned file list in
-        // `filesystem.rs`
-        let store_str = format!("{}", store);
-        let is_local = store_str.starts_with("LocalFileSystem");
+    pub fn new(registry: Arc<dyn ObjectStoreRegistry>, task_executor: Arc<E>) -> Self {
         Self {
             file_system: Arc::new(ObjectStoreFileSystemClient::new(
-                store.clone(),
-                !is_local,
+                registry.clone(),
                 task_executor.clone(),
             )),
             json: Arc::new(DefaultJsonHandler::new(
-                store.clone(),
+                registry.clone(),
                 task_executor.clone(),
             )),
-            parquet: Arc::new(DefaultParquetHandler::new(store.clone(), task_executor)),
-            store,
+            parquet: Arc::new(DefaultParquetHandler::new(registry.clone(), task_executor)),
             expression: Arc::new(ArrowExpressionHandler {}),
         }
-    }
-
-    pub fn get_object_store_for_url(&self, _url: &Url) -> Option<Arc<DynObjectStore>> {
-        Some(self.store.clone())
     }
 
     pub async fn write_parquet(
@@ -192,14 +167,14 @@ mod tests {
     use super::executor::tokio::TokioBackgroundExecutor;
     use super::*;
     use crate::engine::tests::test_arrow_engine;
-    use object_store::local::LocalFileSystem;
 
     #[test]
     fn test_default_engine() {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
-        let store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let exec = Arc::new(TokioBackgroundExecutor::new());
+        let registry = Arc::new(DefaultObjectStoreRegistry::new_test());
+        let engine = DefaultEngine::new(registry.clone(), exec.clone());
         test_arrow_engine(&engine, &url);
     }
 

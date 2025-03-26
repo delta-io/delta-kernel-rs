@@ -64,15 +64,32 @@ tempfile = { version = "3", optional = true }
 # Arrow supported versions
 ## 53
 # Used in default engine
-arrow_53 = { package = "arrow", version = "53", features = ["chrono-tz", "ffi", "json", "prettyprint"], optional = true }
+arrow_53 = { package = "arrow", version = "53", features = [
+  "chrono-tz",
+  "ffi",
+  "json",
+  "prettyprint",
+], optional = true }
 # Used in default and sync engine
-parquet_53 = { package = "parquet", version = "53", features = ["async", "object_store"] , optional = true }
+parquet_53 = { package = "parquet", version = "53", features = [
+  "async",
+  "object_store",
+], optional = true }
 ######
 ## 54
-arrow_54 = { package = "arrow", version = "54", features = ["chrono-tz", "ffi", "json", "prettyprint"], optional = true }
-parquet_54 = { package = "parquet", version = "54", features = ["async", "object_store"] , optional = true }
+arrow_54 = { package = "arrow", version = "54", features = [
+  "chrono-tz",
+  "ffi",
+  "json",
+  "prettyprint",
+], optional = true }
+parquet_54 = { package = "parquet", version = "54", features = [
+  "async",
+  "object_store",
+], optional = true }
 ######
 
+async-trait = { version = "0.1", optional = true }
 futures = { version = "0.3", optional = true }
 object_store = { workspace = true, optional = true }
 hdfs-native-object-store = { workspace = true, optional = true }
@@ -120,6 +137,7 @@ default-engine-base = [
   "tokio",
   "uuid/v4",
   "uuid/fast-rng",
+  "async-trait",
 ]
 
 # the default-engine use the reqwest crate with default features which uses native-tls. if you want
@@ -133,10 +151,7 @@ default-engine-rustls = [
 ]
 
 developer-visibility = []
-sync-engine = [
-  "need_arrow",
-  "tempfile",
-]
+sync-engine = ["need_arrow", "tempfile"]
 integration-test = [
   "hdfs-native-object-store/integration-test",
   "hdfs-native",
@@ -150,7 +165,11 @@ version = "=0.5.9"
 rustc_version = "0.4.1"
 
 [dev-dependencies]
-delta_kernel = { path = ".", features = ["arrow", "default-engine", "sync-engine"] }
+delta_kernel = { path = ".", features = [
+  "arrow",
+  "default-engine",
+  "sync-engine",
+] }
 test_utils = { path = "../test-utils" }
 async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implementation
 paste = "1.0"

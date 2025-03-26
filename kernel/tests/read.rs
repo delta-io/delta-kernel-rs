@@ -8,7 +8,7 @@ use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::{DefaultEngine, ObjectStoreRegistry};
 use delta_kernel::expressions::{column_expr, BinaryOperator, Expression, ExpressionRef};
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::scan::state::{transform_to_logical, visit_scan_files, DvInfo, Stats};
@@ -16,7 +16,8 @@ use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, Schema};
 use delta_kernel::{Engine, FileMeta, Table};
 use itertools::Itertools;
-use object_store::{memory::InMemory, path::Path, ObjectStore};
+use object_store::{path::Path, ObjectStore};
+use test_utils::get_registry;
 use test_utils::{
     actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
     record_batch_to_bytes, record_batch_to_bytes_with_props, IntoArray, TestAction, METADATA,
@@ -31,8 +32,10 @@ const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c00
 
 #[tokio::test]
 async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>> {
+    let (registry, exec, _engine) = get_registry();
+
     let batch = generate_simple_batch()?;
-    let storage = Arc::new(InMemory::new());
+    let (storage, _) = registry.get_store(&Url::parse("memory:///").unwrap())?;
     add_commit(
         storage.as_ref(),
         0,
@@ -57,10 +60,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine = Arc::new(DefaultEngine::new(
-        storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    ));
+    let engine = Arc::new(DefaultEngine::new(registry.clone(), exec));
 
     let table = Table::new(location);
     let expected_data = vec![batch.clone(), batch];
@@ -82,8 +82,10 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
 
 #[tokio::test]
 async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
+    let (registry, _exec, engine) = get_registry();
+    let (storage, _) = registry.get_store(&Url::parse("memory:///").unwrap())?;
     let batch = generate_simple_batch()?;
-    let storage = Arc::new(InMemory::new());
+
     add_commit(
         storage.as_ref(),
         0,
@@ -113,16 +115,15 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
     let table = Table::new(location);
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.snapshot(&engine, None).unwrap();
+    let snapshot = table.snapshot(engine.as_ref(), None).unwrap();
     let scan = snapshot.into_scan_builder().build()?;
 
     let mut files = 0;
-    let stream = scan.execute(Arc::new(engine))?.zip(expected_data);
+    let stream = scan.execute(engine)?.zip(expected_data);
 
     for (data, expected) in stream {
         let raw_data = data?.raw_data?;
@@ -136,8 +137,10 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
+    let (registry, _exec, engine) = get_registry();
+    let (storage, _) = registry.get_store(&Url::parse("memory:///").unwrap())?;
     let batch = generate_simple_batch()?;
-    let storage = Arc::new(InMemory::new());
+
     add_commit(
         storage.as_ref(),
         0,
@@ -167,15 +170,14 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
     let table = Table::new(location);
     let expected_data = vec![batch];
 
-    let snapshot = table.snapshot(&engine, None)?;
+    let snapshot = table.snapshot(engine.as_ref(), None)?;
     let scan = snapshot.into_scan_builder().build()?;
 
-    let stream = scan.execute(Arc::new(engine))?.zip(expected_data);
+    let stream = scan.execute(engine)?.zip(expected_data);
 
     let mut files = 0;
     for (data, expected) in stream {
@@ -205,7 +207,9 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         ("id", vec![5, 7].into_array()),
         ("val", vec!["e", "g"].into_array()),
     ])?;
-    let storage = Arc::new(InMemory::new());
+    let (registry, _exec, engine) = get_registry();
+    let (storage, _) = registry.get_store(&Url::parse("memory:///").unwrap())?;
+
     // valid commit with min/max (0, 2)
     add_commit(
         storage.as_ref(),
@@ -239,10 +243,6 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine = Arc::new(DefaultEngine::new(
-        storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    ));
 
     let table = Table::new(location);
     let snapshot = Arc::new(table.snapshot(engine.as_ref(), None)?);
@@ -679,7 +679,7 @@ fn predicate_on_letter() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn predicate_on_letter_and_number() -> Result<(), Box<dyn std::error::Error>> {
     // Partition skipping and file skipping are currently implemented separately. Mixing them in an
-    // AND clause will evaulate each separately, but mixing them in an OR clause disables both.
+    // AND clause will evaluate each separately, but mixing them in an OR clause disables both.
     let full_table: Vec<String> = vec![
         "+--------+--------+",
         "| letter | number |",
@@ -1034,7 +1034,9 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
     // Test for https://github.com/delta-io/delta-kernel-rs/issues/698
     let batch = generate_batch(vec![("val", vec!["a", "b", "c"].into_array())])?;
 
-    let storage = Arc::new(InMemory::new());
+    let (registry, _exec, engine) = get_registry();
+    let (storage, _) = registry.get_store(&Url::parse("memory:///")?)?;
+
     let actions = [
         r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
         r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[\"id\"]"},"isBlindAppend":true}}"#.to_string(),
@@ -1060,10 +1062,6 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
     let location = Url::parse("memory:///")?;
     let table = Table::new(location);
 
-    let engine = Arc::new(DefaultEngine::new(
-        storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    ));
     let snapshot = Arc::new(table.snapshot(engine.as_ref(), None)?);
 
     let predicate = Expression::eq(column_expr!("id"), 2);
@@ -1091,7 +1089,9 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
     let batch_1 = generate_batch(vec![("val", vec!["a", "b", "c"].into_array())])?;
     let batch_2 = generate_batch(vec![("val", vec!["d", "e", "f"].into_array())])?;
 
-    let storage = Arc::new(InMemory::new());
+    let (registry, _exec, engine) = get_registry();
+    let (storage, _) = registry.get_store(&Url::parse("memory:///")?)?;
+
     let actions = [
         r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
         r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}"#.to_string(),
@@ -1123,10 +1123,6 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
     let location = Url::parse("memory:///")?;
     let table = Table::new(location);
 
-    let engine = Arc::new(DefaultEngine::new(
-        storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    ));
     let snapshot = Arc::new(table.snapshot(engine.as_ref(), None)?);
 
     let predicate = Expression::eq(column_expr!("val"), "g");

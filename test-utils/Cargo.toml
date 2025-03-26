@@ -12,6 +12,7 @@ version.workspace = true
 release = false
 
 [dependencies]
-delta_kernel = { path = "../kernel", features = [ "default-engine", "arrow" ] }
+delta_kernel = { path = "../kernel", features = ["default-engine", "arrow"] }
 itertools = "0.13.0"
 object_store = { workspace = true }
+url = "2"

@@ -3,7 +3,8 @@ use std::{path::PathBuf, sync::Arc};
 
 use futures::executor::block_on;
 use itertools::Itertools;
-use object_store::{memory::InMemory, path::Path, ObjectStore};
+use object_store::DynObjectStore;
+use object_store::{path::Path, ObjectStore};
 use url::Url;
 
 use crate::actions::visitors::AddVisitor;
@@ -14,7 +15,7 @@ use crate::actions::{
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreFileSystemClient;
-use crate::engine::default::DefaultEngine;
+use crate::engine::default::{DefaultEngine, DefaultObjectStoreRegistry};
 use crate::engine::sync::SyncEngine;
 use crate::log_segment::LogSegment;
 use crate::parquet::arrow::ArrowWriter;
@@ -86,7 +87,9 @@ fn build_log_with_paths_and_checkpoint(
     paths: &[Path],
     checkpoint_metadata: Option<&CheckpointMetadata>,
 ) -> (Box<dyn FileSystemClient>, Url) {
-    let store = Arc::new(InMemory::new());
+    let exec = Arc::new(TokioBackgroundExecutor::new());
+    let registry = Arc::new(DefaultObjectStoreRegistry::new_test());
+    let store = registry.get_memory();
 
     let data = bytes::Bytes::from("kernel-data");
 
@@ -111,11 +114,7 @@ fn build_log_with_paths_and_checkpoint(
         }
     });
 
-    let client = ObjectStoreFileSystemClient::new(
-        store,
-        false, // don't have ordered listing
-        Arc::new(TokioBackgroundExecutor::new()),
-    );
+    let client = ObjectStoreFileSystemClient::new(registry, exec);
 
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
@@ -123,9 +122,10 @@ fn build_log_with_paths_and_checkpoint(
 }
 
 // Create an in-memory store and return the store and the URL for the store's _delta_log directory.
-fn new_in_memory_store() -> (Arc<InMemory>, Url) {
+fn new_in_memory_store() -> (Arc<DefaultObjectStoreRegistry>, Url) {
+    let registry = DefaultObjectStoreRegistry::new_test();
     (
-        Arc::new(InMemory::new()),
+        Arc::new(registry),
         Url::parse("memory:///")
             .unwrap()
             .join("_delta_log/")
@@ -135,7 +135,7 @@ fn new_in_memory_store() -> (Arc<InMemory>, Url) {
 
 // Writes a record batch obtained from engine data to the in-memory store at a given path.
 fn write_parquet_to_store(
-    store: &Arc<InMemory>,
+    store: &Arc<DynObjectStore>,
     path: String,
     data: Box<dyn EngineData>,
 ) -> DeltaResult<()> {
@@ -155,7 +155,7 @@ fn write_parquet_to_store(
 /// Writes all actions to a _delta_log parquet checkpoint file in the store.
 /// This function formats the provided filename into the _delta_log directory.
 fn add_checkpoint_to_store(
-    store: &Arc<InMemory>,
+    store: &Arc<DynObjectStore>,
     data: Box<dyn EngineData>,
     filename: &str,
 ) -> DeltaResult<()> {
@@ -166,7 +166,7 @@ fn add_checkpoint_to_store(
 /// Writes all actions to a _delta_log/_sidecars file in the store.
 /// This function formats the provided filename into the _sidecars subdirectory.
 fn add_sidecar_to_store(
-    store: &Arc<InMemory>,
+    store: &Arc<DynObjectStore>,
     data: Box<dyn EngineData>,
     filename: &str,
 ) -> DeltaResult<()> {
@@ -177,7 +177,7 @@ fn add_sidecar_to_store(
 /// Writes all actions to a _delta_log json checkpoint file in the store.
 /// This function formats the provided filename into the _delta_log directory.
 fn write_json_to_store(
-    store: &Arc<InMemory>,
+    store: &Arc<DynObjectStore>,
     actions: Vec<Action>,
     filename: &str,
 ) -> DeltaResult<()> {
@@ -857,12 +857,12 @@ fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<
     let read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     add_sidecar_to_store(
-        &store,
+        &store.get_memory(),
         add_batch_simple(read_schema.clone()),
         "sidecarfile1.parquet",
     )?;
     add_sidecar_to_store(
-        &store,
+        &store.get_memory(),
         add_batch_with_remove(read_schema.clone()),
         "sidecarfile2.parquet",
     )?;
@@ -928,7 +928,7 @@ fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
 
     // Add a sidecar file with only add actions
     add_sidecar_to_store(
-        &store,
+        &store.get_memory(),
         add_batch_simple(read_schema.clone()),
         "sidecarfile1.parquet",
     )?;
@@ -1008,7 +1008,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
     add_checkpoint_to_store(
-        &store,
+        &store.get_memory(),
         // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are not read.
         sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_log_schema().clone()),
         "00000000000000000001.checkpoint.parquet",
@@ -1057,12 +1057,12 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
     let checkpoint_part_2 = "00000000000000000001.checkpoint.0000000002.0000000002.parquet";
 
     add_checkpoint_to_store(
-        &store,
+        &store.get_memory(),
         sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_log_schema().clone()),
         checkpoint_part_1,
     )?;
     add_checkpoint_to_store(
-        &store,
+        &store.get_memory(),
         sidecar_batch_with_given_paths(vec!["sidecar2.parquet"], get_log_schema().clone()),
         checkpoint_part_2,
     )?;
@@ -1108,7 +1108,7 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
     add_checkpoint_to_store(
-        &store,
+        &store.get_memory(),
         add_batch_simple(get_log_schema().clone()),
         "00000000000000000001.checkpoint.parquet",
     )?;
@@ -1143,7 +1143,7 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
     write_json_to_store(
-        &store,
+        &store.get_memory(),
         vec![Action::Add(Add {
             path: "fake_path_1".into(),
             data_change: true,
@@ -1193,7 +1193,7 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
     add_checkpoint_to_store(
-        &store,
+        &store.get_memory(),
         sidecar_batch_with_given_paths(
             vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
             get_log_schema().clone(),
@@ -1202,12 +1202,12 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
     )?;
 
     add_sidecar_to_store(
-        &store,
+        &store.get_memory(),
         add_batch_simple(get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?),
         "sidecarfile1.parquet",
     )?;
     add_sidecar_to_store(
-        &store,
+        &store.get_memory(),
         add_batch_with_remove(get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?),
         "sidecarfile2.parquet",
     )?;
