@@ -7,7 +7,7 @@ use crate::{
     ReferenceSet, TryFromStringSlice,
 };
 use delta_kernel::{
-    expressions::{BinaryOperator, ColumnName, Expression, UnaryOperator},
+    expressions::{BinaryOperator, ColumnName, Expression, Predicate, UnaryOperator},
     DeltaResult,
 };
 
@@ -65,9 +65,8 @@ fn visit_expression_unary(
     op: UnaryOperator,
     inner_expr: usize,
 ) -> usize {
-    unwrap_kernel_expression(state, inner_expr).map_or(0, |expr| {
-        wrap_expression(state, Expression::unary(op, expr))
-    })
+    unwrap_kernel_expression(state, inner_expr)
+        .map_or(0, |expr| wrap_expression(state, Predicate::unary(op, expr)))
 }
 
 // The EngineIterator is not thread safe, not reentrant, not owned by callee, not freed by callee.
@@ -76,7 +75,7 @@ pub extern "C" fn visit_expression_and(
     state: &mut KernelExpressionVisitorState,
     children: &mut EngineIterator,
 ) -> usize {
-    let result = Expression::and_from(
+    let result = Predicate::and_from(
         children.flat_map(|child| unwrap_kernel_expression(state, child as usize)),
     );
     wrap_expression(state, result)
@@ -150,9 +149,9 @@ fn visit_expression_column_impl(
 #[no_mangle]
 pub extern "C" fn visit_expression_not(
     state: &mut KernelExpressionVisitorState,
-    inner_expr: usize,
+    inner_pred: usize,
 ) -> usize {
-    visit_expression_unary(state, UnaryOperator::Not, inner_expr)
+    visit_expression_unary(state, UnaryOperator::Not, inner_pred)
 }
 
 #[no_mangle]

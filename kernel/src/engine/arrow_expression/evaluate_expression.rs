@@ -14,8 +14,8 @@ use crate::arrow::error::ArrowError;
 use crate::engine::arrow_utils::prim_array_cmp;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
-    BinaryExpression, BinaryOperator, Expression, JunctionExpression, JunctionOperator, Scalar,
-    UnaryExpression, UnaryOperator,
+    BinaryExpression, BinaryOperator, Expression, JunctionExpression, JunctionOperator, Predicate,
+    Scalar, UnaryExpression, UnaryOperator,
 };
 use crate::schema::DataType;
 use itertools::Itertools;
@@ -191,7 +191,7 @@ pub(crate) fn evaluate_expression(
             }),
             _,
         ) => {
-            let reverse_op = Expression::binary(In, *left.clone(), *right.clone());
+            let reverse_op = Predicate::binary(In, *left.clone(), *right.clone());
             let reverse_expr = evaluate_expression(&reverse_op, batch, None)?;
             let result = not(reverse_expr.as_boolean())?;
             Ok(wrap_comparison_result(result))
@@ -219,15 +219,15 @@ pub(crate) fn evaluate_expression(
 
             Ok(eval(&left_arr, &right_arr)?)
         }
-        (Junction(JunctionExpression { op, exprs }), None | Some(&DataType::BOOLEAN)) => {
+        (Junction(JunctionExpression { op, preds }), None | Some(&DataType::BOOLEAN)) => {
             type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
             let (reducer, default): (Operation, _) = match op {
                 JunctionOperator::And => (and_kleene, true),
                 JunctionOperator::Or => (or_kleene, false),
             };
-            exprs
+            preds
                 .iter()
-                .map(|expr| evaluate_expression(expr, batch, result_type))
+                .map(|pred| evaluate_expression(pred, batch, result_type))
                 .reduce(|l, r| {
                     let result = reducer(downcast_to_bool(&l?)?, downcast_to_bool(&r?)?)?;
                     Ok(wrap_comparison_result(result))

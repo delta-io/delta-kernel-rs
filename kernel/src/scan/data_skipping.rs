@@ -8,8 +8,8 @@ use crate::actions::get_log_add_schema;
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
 use crate::expressions::{
-    column_expr, joined_column_expr, BinaryOperator, ColumnName, Expression as Expr, ExpressionRef,
-    JunctionOperator, Scalar,
+    column_expr, joined_column_expr, BinaryOperator, ColumnName, Expression as Expr,
+    JunctionOperator, Predicate as Pred, PredicateRef, Scalar,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -35,16 +35,16 @@ mod tests;
 /// - `AND` is rewritten as a conjunction of the rewritten operands where we just skip operands that
 ///   are not eligible for data skipping.
 /// - `OR` is rewritten only if all operands are eligible for data skipping. Otherwise, the whole OR
-///   expression is dropped.
+///   predicate is dropped.
 #[cfg(test)]
-fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
-    DataSkippingPredicateCreator.eval(expr)
+fn as_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
+    DataSkippingPredicateCreator.eval(pred)
 }
 
 /// Like `as_data_skipping_predicate`, but invokes [`KernelPredicateEvaluator::eval_sql_where`]
 /// instead of [`KernelPredicateEvaluator::eval`].
-fn as_sql_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
-    DataSkippingPredicateCreator.eval_sql_where(expr)
+fn as_sql_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
+    DataSkippingPredicateCreator.eval_sql_where(pred)
 }
 
 pub(crate) struct DataSkippingFilter {
@@ -63,13 +63,13 @@ impl DataSkippingFilter {
     /// but using an Option lets the engine easily avoid the overhead of applying trivial filters.
     pub(crate) fn new(
         engine: &dyn Engine,
-        physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+        physical_predicate: Option<(PredicateRef, SchemaRef)>,
     ) -> Option<Self> {
         static PREDICATE_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
             DataType::struct_type([StructField::nullable("predicate", DataType::BOOLEAN)])
         });
         static STATS_EXPR: LazyLock<Expr> = LazyLock::new(|| column_expr!("add.stats"));
-        static FILTER_EXPR: LazyLock<Expr> =
+        static FILTER_PRED: LazyLock<Pred> =
             LazyLock::new(|| column_expr!("predicate").distinct(Expr::literal(false)));
 
         let (predicate, referenced_schema) = physical_predicate?;
@@ -148,7 +148,7 @@ impl DataSkippingFilter {
 
         let filter_evaluator = engine.evaluation_handler().new_expression_evaluator(
             stats_schema.clone(),
-            FILTER_EXPR.clone(),
+            FILTER_PRED.clone(),
             DataType::BOOLEAN,
         );
 
@@ -227,7 +227,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         col: Expr,
         val: &Scalar,
         inverted: bool,
-    ) -> Option<Expr> {
+    ) -> Option<Pred> {
         let op = match (ord, inverted) {
             (Ordering::Less, false) => BinaryOperator::LessThan,
             (Ordering::Less, true) => BinaryOperator::GreaterThanOrEqual,
@@ -236,23 +236,23 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
             (Ordering::Greater, false) => BinaryOperator::GreaterThan,
             (Ordering::Greater, true) => BinaryOperator::LessThanOrEqual,
         };
-        Some(Expr::binary(op, col, val.clone()))
+        Some(Pred::binary(op, col, val.clone()))
     }
 
-    fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
-        KernelPredicateEvaluatorDefaults::eval_scalar(val, inverted).map(Expr::literal)
+    fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
+        KernelPredicateEvaluatorDefaults::eval_scalar(val, inverted).map(Pred::literal)
     }
 
-    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
-        KernelPredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted).map(Expr::literal)
+    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
+        KernelPredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted).map(Pred::literal)
     }
 
-    fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Expr> {
+    fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
         let safe_to_skip = match inverted {
             true => self.get_rowcount_stat()?, // all-null
             false => Expr::literal(0i64),      // no-null
         };
-        Some(Expr::ne(self.get_nullcount_stat(col)?, safe_to_skip))
+        Some(Pred::ne(self.get_nullcount_stat(col)?, safe_to_skip))
     }
 
     fn eval_binary_scalars(
@@ -261,17 +261,17 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         left: &Scalar,
         right: &Scalar,
         inverted: bool,
-    ) -> Option<Expr> {
+    ) -> Option<Pred> {
         KernelPredicateEvaluatorDefaults::eval_binary_scalars(op, left, right, inverted)
-            .map(Expr::literal)
+            .map(Pred::literal)
     }
 
     fn finish_eval_junction(
         &self,
         mut op: JunctionOperator,
-        exprs: impl IntoIterator<Item = Option<Expr>>,
+        preds: impl IntoIterator<Item = Option<Pred>>,
         inverted: bool,
-    ) -> Option<Expr> {
+    ) -> Option<Pred> {
         if inverted {
             op = op.invert();
         }
@@ -282,16 +282,16 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         // where FALSE would otherwise be expected. So, we filter out all nulls except the first,
         // observing that one NULL is enough to produce the correct behavior during predicate eval.
         let mut keep_null = true;
-        let exprs: Vec<_> = exprs
+        let preds: Vec<_> = preds
             .into_iter()
-            .flat_map(|e| match e {
-                Some(expr) => Some(expr),
+            .flat_map(|p| match p {
+                Some(pred) => Some(pred),
                 None => keep_null.then(|| {
                     keep_null = false;
-                    Expr::null_literal(DataType::BOOLEAN)
+                    Pred::null_literal(DataType::BOOLEAN)
                 }),
             })
             .collect();
-        Some(Expr::junction(op, exprs))
+        Some(Pred::junction(op, preds))
     }
 }
