@@ -2,6 +2,8 @@
 //! ordered list of leaf values (scalars) into an [`Expression`] with a literal value for each leaf.
 
 use std::borrow::Cow;
+use std::mem;
+
 use tracing::debug;
 
 use crate::expressions::{Expression, Scalar};
@@ -19,7 +21,7 @@ pub(crate) struct LiteralExpressionTransform<'a, T: Iterator<Item = &'a Scalar>>
     /// build the parent container, then push the parent back on.
     stack: Vec<Expression>,
     /// Since schema transforms are infallible we keep track of errors here
-    error: Option<Error>,
+    error: Result<(), Error>,
 }
 
 /// Any error for [`LiteralExpressionTransform`]
@@ -51,16 +53,14 @@ impl<'a, I: Iterator<Item = &'a Scalar>> LiteralExpressionTransform<'a, I> {
         Self {
             scalars: scalars.into_iter(),
             stack: Vec::new(),
-            error: None,
+            error: Ok(()),
         }
     }
 
     /// return the Expression we just built (or propagate Error). the top of `stack` should be our
     /// final Expression
-    pub(crate) fn into_expr(mut self) -> Result<Expression, Error> {
-        if let Some(e) = self.error {
-            return Err(e);
-        }
+    pub(crate) fn try_into_expr(mut self) -> Result<Expression, Error> {
+        self.error?;
 
         if self.scalars.next().is_some() {
             return Err(Error::ExcessScalars);
@@ -72,9 +72,9 @@ impl<'a, I: Iterator<Item = &'a Scalar>> LiteralExpressionTransform<'a, I> {
         }
     }
 
-    fn set_error(&mut self, e: Error) {
-        if let Some(err) = &self.error.replace(e) {
-            debug!("Overwriting error that was already set: {err}");
+    fn set_error(&mut self, error: Error) {
+        if let Err(e) = mem::replace(&mut self.error, Err(error)) {
+            debug!("Overwriting error that was already set: {e}");
         }
     }
 
@@ -95,9 +95,7 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
         prim_type: &'a PrimitiveType,
     ) -> Option<Cow<'a, PrimitiveType>> {
         // first always check error to terminate early if possible
-        if self.error.is_some() {
-            return None;
-        }
+        self.error.as_ref().ok()?;
 
         let next = self.scalars.next();
         let scalar = self.check_error(next.ok_or(Error::InsufficientScalars))?;
@@ -122,9 +120,7 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
 
     fn transform_struct(&mut self, struct_type: &'a StructType) -> Option<Cow<'a, StructType>> {
         // first always check error to terminate early if possible
-        if self.error.is_some() {
-            return None;
-        }
+        self.error.as_ref().ok()?;
 
         // Only consume newly-added entries (if any). There could be fewer than expected if
         // the recursion encountered an error.
@@ -149,15 +145,16 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
         }
 
         // If all children are NULL and at least one is ostensibly non-nullable, we interpret
-        // the struct itself as being NULL
-        let struct_expr = if all_null && found_non_nullable_null {
+        // the struct itself as being NULL (if all aren't null then it's an error)
+        let struct_expr = if found_non_nullable_null {
+            if !all_null {
+                // we found a non_nullable NULL, but other siblings are non-null: error
+                self.set_error(Error::Schema(
+                    "NULL value for non-nullable struct field with non-NULL siblings".to_string(),
+                ));
+                return None;
+            }
             Expression::null_literal(struct_type.clone().into())
-        } else if found_non_nullable_null {
-            // we found a non_nullable NULL, but other siblings are non-null: error
-            self.set_error(Error::Schema(
-                "NULL value for non-nullable struct field with non-NULL siblings".to_string(),
-            ));
-            return None;
         } else {
             Expression::struct_from(field_exprs)
         };
@@ -168,9 +165,7 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         // first always check error to terminate early if possible
-        if self.error.is_some() {
-            return None;
-        }
+        self.error.as_ref().ok()?;
 
         self.recurse_into_struct_field(field);
         Some(Cow::Borrowed(field))
@@ -178,24 +173,16 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
 
     // arrays unsupported for now
     fn transform_array(&mut self, _array_type: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
-        // first always check error to terminate early if possible
-        if self.error.is_some() {
-            return None;
-        }
         self.set_error(Error::Unsupported(
-            "ArrayType not yet supported in TODO".to_string(),
+            "ArrayType not yet supported in literal expression transform".to_string(),
         ));
         None
     }
 
     // maps unsupported for now
     fn transform_map(&mut self, _map_type: &'a MapType) -> Option<Cow<'a, MapType>> {
-        // first always check error to terminate early if possible
-        if self.error.is_some() {
-            return None;
-        }
         self.set_error(Error::Unsupported(
-            "MapType not yet supported in TODO".to_string(),
+            "MapType not yet supported in literal expression transform".to_string(),
         ));
         None
     }
@@ -224,13 +211,13 @@ mod tests {
         let _transformed = schema_transform.transform(&datatype);
         match expected {
             Ok(expected_expr) => {
-                let actual_expr = schema_transform.into_expr().unwrap();
+                let actual_expr = schema_transform.try_into_expr().unwrap();
                 // TODO: we can't compare NULLs so we convert with .to_string to workaround
                 // see: https://github.com/delta-io/delta-kernel-rs/pull/677
                 assert_eq!(expected_expr.to_string(), actual_expr.to_string());
             }
             Err(()) => {
-                assert!(schema_transform.into_expr().is_err());
+                assert!(schema_transform.try_into_expr().is_err());
             }
         }
     }

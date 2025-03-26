@@ -372,7 +372,7 @@ trait ExpressionHandlerExtension: ExpressionHandler {
         // Convert schema and leaf values to an expression
         let mut schema_transform = LiteralExpressionTransform::new(values);
         schema_transform.transform_struct(schema.as_ref());
-        let row_expr = schema_transform.into_expr()?;
+        let row_expr = schema_transform.try_into_expr()?;
 
         let eval = self.get_evaluator(null_row_schema, row_expr, schema.into());
         eval.evaluate(null_row.as_ref())
