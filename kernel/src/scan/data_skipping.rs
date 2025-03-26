@@ -8,8 +8,8 @@ use crate::actions::get_log_add_schema;
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
 use crate::expressions::{
-    column_expr, joined_column_expr, BinaryOperator, ColumnName, Expression as Expr, ExpressionRef,
-    Scalar, VariadicOperator,
+    column_expr, joined_column_expr, BinaryOperator, ColumnName, Expression as Expr,
+    Predicate as Pred, PredicateRef, Scalar, VariadicOperator,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -35,16 +35,16 @@ mod tests;
 /// - `AND` is rewritten as a conjunction of the rewritten operands where we just skip operands that
 ///         are not eligible for data skipping.
 /// - `OR` is rewritten only if all operands are eligible for data skipping. Otherwise, the whole OR
-///        expression is dropped.
+///        predicate is dropped.
 #[cfg(test)]
-fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
-    DataSkippingPredicateCreator.eval(expr)
+fn as_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
+    DataSkippingPredicateCreator.eval(pred)
 }
 
-/// Like `as_data_skipping_predicate`, but invokes [`PredicateEvaluator::eval_sql_where`] instead
-/// of [`PredicateEvaluator::eval_expr`].
-fn as_sql_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
-    DataSkippingPredicateCreator.eval_sql_where(expr)
+/// Like `as_data_skipping_predicate`, but invokes [`KernelPredicateEvaluator::eval_sql_where`] instead
+/// of [`KernelPredicateEvaluator::eval_pred`].
+fn as_sql_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
+    DataSkippingPredicateCreator.eval_sql_where(pred)
 }
 
 pub(crate) struct DataSkippingFilter {
@@ -63,13 +63,13 @@ impl DataSkippingFilter {
     /// but using an Option lets the engine easily avoid the overhead of applying trivial filters.
     pub(crate) fn new(
         engine: &dyn Engine,
-        physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+        physical_predicate: Option<(PredicateRef, SchemaRef)>,
     ) -> Option<Self> {
         static PREDICATE_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
             DataType::struct_type([StructField::nullable("predicate", DataType::BOOLEAN)])
         });
         static STATS_EXPR: LazyLock<Expr> = LazyLock::new(|| column_expr!("add.stats"));
-        static FILTER_EXPR: LazyLock<Expr> =
+        static FILTER_PRED: LazyLock<Pred> =
             LazyLock::new(|| column_expr!("predicate").distinct(false));
 
         let (predicate, referenced_schema) = physical_predicate?;
@@ -148,7 +148,7 @@ impl DataSkippingFilter {
 
         let filter_evaluator = engine.expression_handler().new_expression_evaluator(
             stats_schema.clone(),
-            FILTER_EXPR.clone(),
+            FILTER_PRED.clone(),
             DataType::BOOLEAN,
         );
 
@@ -252,7 +252,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
             true => self.get_rowcount_stat()?, // all-null
             false => Expr::literal(0i64),      // no-null
         };
-        Some(Expr::ne(self.get_nullcount_stat(col)?, safe_to_skip))
+        Some(Pred::ne(self.get_nullcount_stat(col)?, safe_to_skip))
     }
 
     fn eval_binary_scalars(

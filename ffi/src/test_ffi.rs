@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use crate::{expressions::SharedExpression, handle::Handle};
 use delta_kernel::{
-    expressions::{column_expr, ArrayData, BinaryOperator, Expression, Scalar, StructData},
+    expressions::{
+        column_expr, ArrayData, BinaryOperator, Expression as Expr, Predicate as Pred, Scalar,
+        StructData,
+    },
     schema::{ArrayType, DataType, StructField, StructType},
 };
 
@@ -16,8 +19,6 @@ use delta_kernel::{
 /// [`free_kernel_predicate`], or [`Handle::drop_handle`]
 #[no_mangle]
 pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpression> {
-    use Expression as Expr;
-
     let array_type = ArrayType::new(
         DataType::Primitive(delta_kernel::schema::PrimitiveType::Short),
         false,
@@ -64,11 +65,11 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         Expr::null_literal(DataType::SHORT),
         Scalar::Struct(top_level_struct).into(),
         Scalar::Array(array_data).into(),
-        Expr::struct_from(vec![Expr::or_from(vec![
+        Expr::struct_from(vec![Pred::or_from(vec![
             Scalar::Integer(5).into(),
             Scalar::Long(20).into(),
         ])]),
-        Expr::is_not_null(column_expr!("col")),
+        Pred::is_not_null(column_expr!("col")),
     ];
     sub_exprs.extend(
         [
@@ -90,5 +91,5 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         .map(|op| Expr::binary(op, Scalar::Integer(0), Scalar::Long(0))),
     );
 
-    Arc::new(Expr::and_from(sub_exprs)).into()
+    Arc::new(Pred::and_from(sub_exprs)).into()
 }

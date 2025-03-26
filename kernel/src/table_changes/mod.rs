@@ -18,7 +18,7 @@
 //! let schema = table_changes
 //!     .schema()
 //!     .project(&["id", "_commit_version"])?;
-//! let predicate = Arc::new(Expression::gt(column_expr!("id"), Scalar::from(10)));
+//! let predicate = Arc::new(Predicate::gt(column_expr!("id"), Scalar::from(10)));
 //!
 //! // Construct the table changes scan
 //! let table_changes_scan = table_changes

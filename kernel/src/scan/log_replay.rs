@@ -9,7 +9,9 @@ use super::data_skipping::DataSkippingFilter;
 use super::{ScanData, Transform};
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{column_expr, column_name, ColumnName, Expression, ExpressionRef};
+use crate::expressions::{
+    column_expr, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
+};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::scan::{DeletionVectorDescriptor, Scalar, TransformExpr};
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
@@ -31,7 +33,7 @@ impl FileActionKey {
 }
 
 struct LogReplayScanner {
-    partition_filter: Option<ExpressionRef>,
+    partition_filter: Option<PredicateRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
 
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
@@ -49,7 +51,7 @@ struct AddRemoveDedupVisitor<'seen> {
     selection_vector: Vec<bool>,
     logical_schema: SchemaRef,
     transform: Option<Arc<Transform>>,
-    partition_filter: Option<ExpressionRef>,
+    partition_filter: Option<PredicateRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
     is_log_batch: bool,
 }
@@ -312,7 +314,7 @@ fn get_add_transform_expr() -> Expression {
 
 impl LogReplayScanner {
     /// Create a new [`LogReplayScanner`] instance
-    fn new(engine: &dyn Engine, physical_predicate: Option<(ExpressionRef, SchemaRef)>) -> Self {
+    fn new(engine: &dyn Engine, physical_predicate: Option<(PredicateRef, SchemaRef)>) -> Self {
         Self {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
             data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
@@ -363,7 +365,7 @@ pub(crate) fn scan_action_iter(
     action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
     logical_schema: SchemaRef,
     transform: Option<Arc<Transform>>,
-    physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+    physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> impl Iterator<Item = DeltaResult<ScanData>> {
     let mut log_scanner = LogReplayScanner::new(engine, physical_predicate);
     let add_transform = engine.expression_handler().new_expression_evaluator(

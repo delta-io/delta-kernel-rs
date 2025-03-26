@@ -25,7 +25,7 @@ use crate::scan::test_utils::{
 use crate::snapshot::CheckpointMetadata;
 use crate::utils::test_utils::{assert_batch_matches, Action};
 use crate::{
-    DeltaResult, Engine as _, EngineData, Expression, ExpressionRef, FileMeta, FileSystemClient,
+    DeltaResult, Engine as _, EngineData, Expression, FileMeta, FileSystemClient, PredicateRef,
     RowVisitor, Table,
 };
 use test_utils::delta_path_for_version;
@@ -934,7 +934,7 @@ fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     )?;
 
     // Filter out sidecar files that do not contain remove actions
-    let remove_predicate: LazyLock<Option<ExpressionRef>> = LazyLock::new(|| {
+    let remove_predicate: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
         Some(Arc::new(
             Expression::column([REMOVE_NAME, "path"]).is_not_null(),
         ))

@@ -12,7 +12,9 @@ use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
-use crate::expressions::{ColumnName, Expression, ExpressionRef, ExpressionTransform, Scalar};
+use crate::expressions::{
+    ColumnName, Expression, ExpressionRef, ExpressionTransform, Predicate, PredicateRef, Scalar,
+};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
 use crate::scan::state::{DvInfo, Stats};
 use crate::schema::{
@@ -34,7 +36,7 @@ pub mod state;
 pub struct ScanBuilder {
     snapshot: Arc<Snapshot>,
     schema: Option<SchemaRef>,
-    predicate: Option<ExpressionRef>,
+    predicate: Option<PredicateRef>,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -83,7 +85,7 @@ impl ScanBuilder {
     ///
     /// NOTE: The filtering is best-effort and can produce false positives (rows that should should
     /// have been filtered out but were kept).
-    pub fn with_predicate(mut self, predicate: impl Into<Option<ExpressionRef>>) -> Self {
+    pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();
         self
     }
@@ -120,7 +122,7 @@ impl ScanBuilder {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PhysicalPredicate {
-    Some(ExpressionRef, SchemaRef),
+    Some(PredicateRef, SchemaRef),
     StaticSkipAll,
     None,
 }
@@ -134,7 +136,7 @@ impl PhysicalPredicate {
     /// NOTE: It is possible the predicate resolves to FALSE even ignoring column references,
     /// e.g. `col > 10 AND FALSE`. Such predicates can statically skip the whole query.
     pub(crate) fn try_new(
-        predicate: &Expression,
+        predicate: &Predicate,
         logical_schema: &Schema,
     ) -> DeltaResult<PhysicalPredicate> {
         if can_statically_skip_all_files(predicate) {
@@ -180,11 +182,11 @@ impl PhysicalPredicate {
 
 // Evaluates a static data skipping predicate, ignoring any column references, and returns true if
 // the predicate allows to statically skip all files. Since this is direct evaluation (not an
-// expression rewrite), we use a `DefaultPredicateEvaluator` with an empty column resolver.
-fn can_statically_skip_all_files(predicate: &Expression) -> bool {
+// expression rewrite), we use a `DefaultKernelPredicateEvaluator` with an empty column resolver.
+fn can_statically_skip_all_files(predicate: &Predicate) -> bool {
     use crate::kernel_predicates::KernelPredicateEvaluator as _;
-    DefaultKernelPredicateEvaluator::from(EmptyColumnResolver).eval_sql_where(predicate)
-        == Some(false)
+    let evaluator = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
+    evaluator.eval_sql_where(predicate) == Some(false)
 }
 
 // Build the stats read schema filtering the table schema to keep only skipping-eligible
@@ -354,7 +356,7 @@ impl Scan {
     }
 
     /// Get the predicate [`Expression`] of the scan.
-    pub fn physical_predicate(&self) -> Option<ExpressionRef> {
+    pub fn physical_predicate(&self) -> Option<PredicateRef> {
         if let PhysicalPredicate::Some(ref predicate, _) = self.physical_predicate {
             Some(predicate.clone())
         } else {
@@ -825,13 +827,13 @@ mod tests {
             (true, Expression::literal(false)),
             (false, Expression::literal(true)),
             (true, NULL),
-            (true, Expression::and(column_expr!("a"), false)),
-            (false, Expression::or(column_expr!("a"), true)),
-            (false, Expression::or(column_expr!("a"), false)),
-            (false, Expression::lt(column_expr!("a"), 10)),
-            (false, Expression::lt(Expression::literal(10), 100)),
-            (true, Expression::gt(Expression::literal(10), 100)),
-            (true, Expression::and(NULL, column_expr!("a"))),
+            (true, Predicate::and(column_expr!("a"), false)),
+            (false, Predicate::or(column_expr!("a"), true)),
+            (false, Predicate::or(column_expr!("a"), false)),
+            (false, Predicate::lt(column_expr!("a"), 10)),
+            (false, Predicate::lt(Expression::literal(10), 100)),
+            (true, Predicate::gt(Expression::literal(10), 100)),
+            (true, Predicate::and(NULL, column_expr!("a"))),
         ];
         for (should_skip, predicate) in test_cases {
             assert_eq!(
@@ -953,9 +955,9 @@ mod tests {
                 )),
             ),
             (
-                Expression::and(column_expr!("mapped.n"), true),
+                Predicate::and(column_expr!("mapped.n"), true),
                 Some(PhysicalPredicate::Some(
-                    Expression::and(column_expr!("phys_mapped.phys_n"), true).into(),
+                    Predicate::and(column_expr!("phys_mapped.phys_n"), true).into(),
                     StructType::new(vec![StructField::nullable(
                         "phys_mapped",
                         StructType::new(vec![StructField::nullable("phys_n", DataType::LONG)
@@ -972,7 +974,7 @@ mod tests {
                 )),
             ),
             (
-                Expression::and(column_expr!("mapped.n"), false),
+                Predicate::and(column_expr!("mapped.n"), false),
                 Some(PhysicalPredicate::StaticSkipAll),
             ),
         ];

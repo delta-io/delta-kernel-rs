@@ -11,8 +11,8 @@ use crate::schema::SchemaRef;
 use crate::snapshot::CheckpointMetadata;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, FileSystemClient,
-    ParquetHandler, RowVisitor, Version,
+    DeltaResult, Engine, EngineData, Error, Expression, FileSystemClient, ParquetHandler,
+    Predicate, PredicateRef, RowVisitor, Version,
 };
 use itertools::Itertools;
 use std::collections::HashMap;
@@ -203,7 +203,7 @@ impl LogSegment {
         engine: &dyn Engine,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
-        meta_predicate: Option<ExpressionRef>,
+        meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
         // `replay` expects commit files to be sorted in descending order, so we reverse the sorted
         // commit files
@@ -239,7 +239,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         checkpoint_read_schema: SchemaRef,
-        meta_predicate: Option<ExpressionRef>,
+        meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
         let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
             || checkpoint_read_schema.contains(REMOVE_NAME);
@@ -335,7 +335,7 @@ impl LogSegment {
         log_root: Url,
         batch: &dyn EngineData,
         checkpoint_read_schema: SchemaRef,
-        meta_predicate: Option<ExpressionRef>,
+        meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<Option<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>> {
         // Visit the rows of the checkpoint batch to extract sidecar file references
         let mut visitor = SidecarVisitor::default();
@@ -392,8 +392,8 @@ impl LogSegment {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
         let schema = get_log_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
         // filter out log files that do not contain metadata or protocol information
-        static META_PREDICATE: LazyLock<Option<ExpressionRef>> = LazyLock::new(|| {
-            Some(Arc::new(Expression::or(
+        static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
+            Some(Arc::new(Predicate::or(
                 Expression::column([METADATA_NAME, "id"]).is_not_null(),
                 Expression::column([PROTOCOL_NAME, "minReaderVersion"]).is_not_null(),
             )))

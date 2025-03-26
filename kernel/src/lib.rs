@@ -105,7 +105,7 @@ pub(crate) mod log_segment;
 pub use delta_kernel_derive;
 pub use engine_data::{EngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
-pub use expressions::{Expression, ExpressionRef};
+pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use table::Table;
 
 #[cfg(any(
@@ -401,7 +401,7 @@ pub trait JsonHandler: AsAny {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        predicate: Option<ExpressionRef>,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
     /// Atomically (!) write a single JSON file. Each row of the input data should be written as a
@@ -452,7 +452,7 @@ pub trait ParquetHandler: AsAny {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        predicate: Option<ExpressionRef>,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 }
 

@@ -280,32 +280,33 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
 
 #[cfg(test)]
 mod tests {
-    use crate::expressions::{column_expr, Expression as Expr, ExpressionDepthChecker};
-    use std::ops::Not;
+    use crate::expressions::{
+        column_expr, Expression as Expr, ExpressionDepthChecker, Predicate as Pred,
+    };
 
     #[test]
     fn test_depth_checker() {
-        let expr = Expr::and_from([
+        let expr = Pred::and_from([
             Expr::struct_from([
-                Expr::and_from([
-                    Expr::lt(Expr::literal(10), column_expr!("x")),
-                    Expr::or_from([Expr::literal(true), column_expr!("b")]),
+                Pred::and_from([
+                    Pred::lt(Expr::literal(10), column_expr!("x")),
+                    Pred::or_from([Expr::literal(true), column_expr!("b")]),
                 ]),
                 Expr::literal(true),
-                Expr::not(Expr::literal(true)),
+                Pred::not(Expr::literal(true)),
             ]),
-            Expr::and_from([
-                Expr::not(column_expr!("b")),
-                Expr::gt(Expr::literal(10), column_expr!("x")),
-                Expr::or_from([
-                    Expr::and_from([Expr::not(Expr::literal(true)), Expr::literal(10)]),
+            Pred::and_from([
+                Pred::not(column_expr!("b")),
+                Pred::gt(Expr::literal(10), column_expr!("x")),
+                Pred::or_from([
+                    Pred::and_from([Pred::not(Expr::literal(true)), Expr::literal(10)]),
                     Expr::literal(10),
                 ]),
                 Expr::literal(true),
             ]),
-            Expr::ne(
+            Pred::ne(
                 Expr::literal(true),
-                Expr::and_from([Expr::literal(true), column_expr!("b")]),
+                Pred::and_from([Expr::literal(true), column_expr!("b")]),
             ),
         ]);
 

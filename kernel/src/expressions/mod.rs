@@ -17,6 +17,7 @@ mod scalars;
 mod transforms;
 
 pub type ExpressionRef = std::sync::Arc<Expression>;
+pub type PredicateRef = std::sync::Arc<Predicate>;
 
 ////////////////////////////////////////////////////////////////////////
 // Operators
@@ -94,7 +95,7 @@ pub struct BinaryExpression {
 pub struct VariadicExpression {
     /// The operator.
     pub op: VariadicOperator,
-    /// The expressions.
+    /// The input expressions.
     pub exprs: Vec<Expression>,
 }
 
@@ -119,6 +120,9 @@ pub enum Expression {
     Variadic(VariadicExpression),
     // TODO: support more expressions, such as IS IN, LIKE, etc.
 }
+
+/// TODO: Split this out as a proper enum
+pub type Predicate = Expression;
 
 ////////////////////////////////////////////////////////////////////////
 // Struct/Enum impls
@@ -202,6 +206,7 @@ impl Expression {
         Self::Literal(value.into())
     }
 
+    /// Creates a NULL literal expression
     pub const fn null_literal(data_type: DataType) -> Self {
         Self::Literal(Scalar::Null(data_type))
     }
@@ -211,47 +216,52 @@ impl Expression {
         Self::Struct(exprs.into_iter().collect())
     }
 
-    /// Create a new expression `self IS NULL`
+    /// Logical NOT (boolean inversion)
+    pub fn not(pred: impl Into<Self>) -> Self {
+        Self::unary(UnaryOperator::Not, pred.into())
+    }
+
+    /// Create a new predicate `self IS NULL`
     pub fn is_null(self) -> Self {
         Self::unary(UnaryOperator::IsNull, self)
     }
 
-    /// Create a new expression `self IS NOT NULL`
-    pub fn is_not_null(self) -> Self {
-        !Self::is_null(self)
+    /// Create a new predicate `self IS NOT NULL`
+    pub fn is_not_null(self) -> Predicate {
+        Self::not(Self::is_null(self))
     }
 
-    /// Create a new expression `self == other`
+    /// Create a new predicate `self == other`
     pub fn eq(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::Equal, self, other)
     }
 
-    /// Create a new expression `self != other`
+    /// Create a new predicate `self != other`
     pub fn ne(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::NotEqual, self, other)
     }
 
-    /// Create a new expression `self <= other`
+    /// Create a new predicate `self <= other`
     pub fn le(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::LessThanOrEqual, self, other)
     }
 
-    /// Create a new expression `self < other`
+    /// Create a new predicate `self < other`
     pub fn lt(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::LessThan, self, other)
     }
 
-    /// Create a new expression `self >= other`
+    /// Create a new predicate `self >= other`
     pub fn ge(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::GreaterThanOrEqual, self, other)
     }
 
-    /// Create a new expression `self > other`
+    /// Create a new predicate `self > other`
     pub fn gt(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::GreaterThan, self, other)
     }
 
-    /// Create a new expression `DISTINCT(self, other)`
+    /// Create a new predicate `DISTINCT(self, other)`
     pub fn distinct(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::Distinct, self, other)
     }
@@ -294,7 +304,6 @@ impl Expression {
             right: Box::new(rhs.into()),
         })
     }
-
 
     /// Creates a new variadic expression OP(exprs...)
     pub fn variadic(op: VariadicOperator, exprs: impl IntoIterator<Item = Self>) -> Self {
@@ -373,11 +382,13 @@ impl From<ColumnName> for Expression {
         Self::Column(value)
     }
 }
-impl std::ops::Not for Expression {
+
+#[cfg(test)]
+impl std::ops::Not for Predicate {
     type Output = Self;
 
     fn not(self) -> Self {
-        Self::unary(UnaryOperator::Not, self)
+        Self::not(self)
     }
 }
 
@@ -415,7 +426,7 @@ impl<R: Into<Expression>> std::ops::Div<R> for Expression {
 
 #[cfg(test)]
 mod tests {
-    use super::{column_expr, Expression};
+    use super::{column_expr, Predicate};
 
     #[test]
     fn test_expression_format() {
@@ -426,11 +437,11 @@ mod tests {
             ((col_ref.clone() - 4).lt(10), "Column(x) - 4 < 10"),
             ((col_ref.clone() + 4) / 10 * 42, "Column(x) + 4 / 10 * 42"),
             (
-                Expression::and(col_ref.clone().ge(2), col_ref.clone().le(10)),
+                Predicate::and(col_ref.clone().ge(2), col_ref.clone().le(10)),
                 "AND(Column(x) >= 2, Column(x) <= 10)",
             ),
             (
-                Expression::and_from([
+                Predicate::and_from([
                     col_ref.clone().ge(2),
                     col_ref.clone().le(10),
                     col_ref.clone().le(100),
@@ -438,7 +449,7 @@ mod tests {
                 "AND(Column(x) >= 2, Column(x) <= 10, Column(x) <= 100)",
             ),
             (
-                Expression::or(col_ref.clone().gt(2), col_ref.clone().lt(10)),
+                Predicate::or(col_ref.clone().gt(2), col_ref.clone().lt(10)),
                 "OR(Column(x) > 2, Column(x) < 10)",
             ),
             (col_ref.eq("foo"), "Column(x) = 'foo'"),

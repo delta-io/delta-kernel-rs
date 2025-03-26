@@ -1,12 +1,12 @@
 //! Defines [`EngineExpressionVisitor`]. This is a visitor that can be used to convert the kernel's
 //! [`Expression`] to an engine's expression format.
-use crate::expressions::SharedExpression;
+use crate::expressions::{SharedExpression, SharedPredicate};
 use std::ffi::c_void;
 
 use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
 use delta_kernel::expressions::{
-    ArrayData, BinaryExpression, BinaryOperator, Expression, Scalar, StructData, UnaryExpression,
-    UnaryOperator, VariadicExpression, VariadicOperator,
+    ArrayData, BinaryExpression, BinaryOperator, Expression, Predicate, Scalar, StructData,
+    UnaryExpression, UnaryOperator, VariadicExpression, VariadicOperator,
 };
 
 /// Free the memory the passed SharedExpression
@@ -208,6 +208,39 @@ pub unsafe extern "C" fn visit_expression_ref(
     visit_expression_internal(expression, visitor)
 }
 
+/// Visit the predicate of the passed [`SharedPredicate`] Handle using the provided `visitor`.
+/// See the documentation of [`EngineExpressionVisitor`] for a description of how this visitor
+/// works.
+///
+/// This method returns the id that the engine generated for the top level predicate
+///
+/// # Safety
+///
+/// The caller must pass a valid SharedPredicate Handle and expression visitor
+#[no_mangle]
+pub unsafe extern "C" fn visit_predicate(
+    predicate: &Handle<SharedPredicate>,
+    visitor: &mut EngineExpressionVisitor,
+) -> usize {
+    visit_predicate_internal(predicate.as_ref(), visitor)
+}
+
+/// Visit the predicate of the passed [`Predicate`] pointer using the provided `visitor`.  See the
+/// documentation of [`EngineExpressionVisitor`] for a description of how this visitor works.
+///
+/// This method returns the id that the engine generated for the top level predicate
+///
+/// # Safety
+///
+/// The caller must pass a valid Predicate pointer and expression visitor
+#[no_mangle]
+pub unsafe extern "C" fn visit_predicate_ref(
+    predicate: &Predicate,
+    visitor: &mut EngineExpressionVisitor,
+) -> usize {
+    visit_predicate_internal(predicate, visitor)
+}
+
 macro_rules! call {
     ( $visitor:ident, $visitor_fn:ident $(, $extra_args:expr) *) => {
         ($visitor.$visitor_fn)($visitor.data $(, $extra_args) *)
@@ -269,12 +302,12 @@ fn visit_expression_struct(
 fn visit_expression_variadic(
     visitor: &mut EngineExpressionVisitor,
     op: &VariadicOperator,
-    exprs: &[Expression],
+    preds: &[Predicate],
     sibling_list_id: usize,
 ) {
-    let child_list_id = call!(visitor, make_field_list, exprs.len());
-    for expr in exprs {
-        visit_expression_impl(visitor, expr, child_list_id);
+    let child_list_id = call!(visitor, make_field_list, preds.len());
+    for pred in preds {
+        visit_predicate_impl(visitor, pred, child_list_id);
     }
 
     let visit_fn = match op {
@@ -385,11 +418,26 @@ fn visit_expression_impl(
     }
 }
 
+fn visit_predicate_impl(
+    visitor: &mut EngineExpressionVisitor,
+    predicate: &Predicate,
+    sibling_list_id: usize,
+) {
+    // TODO: Actually split this out
+    visit_expression_impl(visitor, predicate, sibling_list_id)
+}
+
 pub fn visit_expression_internal(
     expression: &Expression,
     visitor: &mut EngineExpressionVisitor,
 ) -> usize {
     let top_level = call!(visitor, make_field_list, 1);
     visit_expression_impl(visitor, expression, top_level);
+    top_level
+}
+
+fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressionVisitor) -> usize {
+    let top_level = call!(visitor, make_field_list, 1);
+    visit_predicate_impl(visitor, predicate, top_level);
     top_level
 }

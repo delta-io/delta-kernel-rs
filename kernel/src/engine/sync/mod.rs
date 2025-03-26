@@ -3,8 +3,8 @@
 use super::arrow_expression::ArrowExpressionHandler;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::{
-    DeltaResult, Engine, Error, ExpressionHandler, ExpressionRef, FileDataReadResultIterator,
-    FileMeta, FileSystemClient, JsonHandler, ParquetHandler, SchemaRef,
+    DeltaResult, Engine, Error, ExpressionHandler, FileDataReadResultIterator, FileMeta,
+    FileSystemClient, JsonHandler, ParquetHandler, PredicateRef, SchemaRef,
 };
 
 use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
@@ -60,12 +60,12 @@ impl Engine for SyncEngine {
 fn read_files<F, I>(
     files: &[FileMeta],
     schema: SchemaRef,
-    predicate: Option<ExpressionRef>,
+    predicate: Option<PredicateRef>,
     mut try_create_from_file: F,
 ) -> DeltaResult<FileDataReadResultIterator>
 where
     I: Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static,
-    F: FnMut(File, SchemaRef, ArrowSchemaRef, Option<ExpressionRef>) -> DeltaResult<I>
+    F: FnMut(File, SchemaRef, ArrowSchemaRef, Option<PredicateRef>) -> DeltaResult<I>
         + Send
         + 'static,
 {

@@ -2,7 +2,7 @@ use super::*;
 use crate::expressions::{column_expr, column_name};
 use crate::kernel_predicates::DataSkippingPredicateEvaluator as _;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
-use crate::Expression;
+use crate::Predicate;
 use std::fs::File;
 
 /// Performs an exhaustive set of reads against a specially crafted parquet file.
@@ -40,7 +40,7 @@ fn test_get_stat_values() {
     let metadata = ArrowReaderMetadata::load(&file, Default::default()).unwrap();
 
     // The expression doesn't matter -- it just needs to mention all the columns we care about.
-    let columns = Expression::and_from(vec![
+    let columns = Predicate::and_from(vec![
         column_expr!("varlen.utf8"),
         column_expr!("numeric.ints.int64"),
         column_expr!("numeric.ints.int32"),

@@ -1,6 +1,6 @@
 use crate::expressions::{
-    BinaryExpression, BinaryOperator, ColumnName, Expression as Expr, Scalar, UnaryExpression,
-    UnaryOperator, VariadicExpression, VariadicOperator,
+    BinaryExpression, BinaryOperator, ColumnName, Expression as Expr, Predicate as Pred, Scalar,
+    UnaryExpression, UnaryOperator, VariadicExpression, VariadicOperator,
 };
 use crate::schema::DataType;
 
@@ -30,11 +30,10 @@ mod tests;
 /// example, [`crate::engine::parquet_stats_skipping::ParquetStatsProvider`] directly evaluates the
 /// predicate over parquet footer stats and returns boolean results, while
 /// [`crate::scan::data_skipping::DataSkippingPredicateCreator`] instead transforms the input
-/// predicate expression to a data skipping predicate expresion that the engine can evaluated
-/// directly against Delta data skipping stats during log replay. Although this approach is harder
-/// to read and reason about at first, the majority of expressions can be implemented generically,
-/// which greatly reduces redundancy and ensures that all flavors of predicate evaluation have the
-/// same semantics.
+/// predicate to a data skipping predicate that the engine can evaluated directly against Delta data
+/// skipping stats during log replay. Although this approach is harder to read and reason about at
+/// first, the majority of predicates can be implemented generically, which greatly reduces
+/// redundancy and ensures that all flavors of predicate evaluation have the same semantics.
 ///
 /// # NULL and error semantics
 ///
@@ -48,12 +47,12 @@ mod tests;
 /// rely on nullcount stats for their work (NULL/missing nullcount stats makes them output NULL).
 ///
 /// For safety reasons, NULL-checking operations only accept literal and column inputs where
-/// stats-based skipping is well-defined. If an arbitrary data skipping expression evaluates to
-/// NULL, there is no way to tell whether the original expression really evaluated to NULL (safe to
+/// stats-based skipping is well-defined. If an arbitrary data skipping predicate evaluates to
+/// NULL, there is no way to tell whether the original predicate really evaluated to NULL (safe to
 /// use), or the data skipping version evaluated to NULL due to missing stats (very unsafe to use).
 ///
 /// NOTE: The error-handling semantics of this trait's scalar-based predicate evaluation may differ
-/// from those of the engine's expression evaluation, because kernel expressions don't include the
+/// from those of the engine's predicate evaluation, because kernel predicates don't include the
 /// necessary type information to reliably detect all type errors.
 pub(crate) trait KernelPredicateEvaluator {
     type Output;
@@ -239,6 +238,13 @@ pub(crate) trait KernelPredicateEvaluator {
         }
     }
 
+    /// Dispatches a predicate to the specific implementation for each predicate variant.
+    #[cfg(test)]
+    fn eval_pred(&self, pred: &Pred, inverted: bool) -> Option<Self::Output> {
+        // TODO: actually split this out
+        self.eval_expr(pred, inverted)
+    }
+
     /// Evaluates a (possibly inverted) predicate with SQL WHERE semantics.
     ///
     /// By default, [`eval_expr`] behaves badly for comparisons involving NULL columns (e.g. `a <
@@ -401,15 +407,15 @@ pub(crate) trait KernelPredicateEvaluator {
         }
     }
 
-    /// A convenient non-inverted wrapper for [`eval_expr`]
+    /// A convenient non-inverted wrapper for [`eval_pred`]
     #[cfg(test)]
-    fn eval(&self, expr: &Expr) -> Option<Self::Output> {
-        self.eval_expr(expr, false)
+    fn eval(&self, pred: &Pred) -> Option<Self::Output> {
+        self.eval_pred(pred, false)
     }
 
     /// A convenient non-inverted wrapper for [`eval_expr_sql_where`].
-    fn eval_sql_where(&self, expr: &Expr) -> Option<Self::Output> {
-        self.eval_expr_sql_where(expr, false)
+    fn eval_sql_where(&self, pred: &Pred) -> Option<Self::Output> {
+        self.eval_expr_sql_where(pred, false)
     }
 }
 
