@@ -7,13 +7,16 @@ use crate::{
     DeltaResult, Engine, EngineData, Expression as Expr, ExpressionRef, RowVisitor as _, SchemaRef,
 };
 
-pub use crate::actions::visitors::SetTransactionMap;
-pub struct SetTransactionScanner {
+pub(crate) use crate::actions::visitors::SetTransactionMap;
+
+#[allow(dead_code)]
+pub(crate) struct SetTransactionScanner {
     snapshot: Arc<Snapshot>,
 }
 
+#[allow(dead_code)]
 impl SetTransactionScanner {
-    pub fn new(snapshot: Arc<Snapshot>) -> Self {
+    pub(crate) fn new(snapshot: Arc<Snapshot>) -> Self {
         SetTransactionScanner { snapshot }
     }
 
@@ -68,7 +71,7 @@ impl SetTransactionScanner {
     }
 
     /// Scan the Delta Log for the latest transaction entry of an application
-    pub fn application_transaction(
+    pub(crate) fn application_transaction(
         &self,
         engine: &dyn Engine,
         application_id: &str,
@@ -78,7 +81,10 @@ impl SetTransactionScanner {
     }
 
     /// Scan the Delta Log to obtain the latest transaction for all applications
-    pub fn application_transactions(&self, engine: &dyn Engine) -> DeltaResult<SetTransactionMap> {
+    pub(crate) fn application_transactions(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<SetTransactionMap> {
         self.scan_application_transactions(engine, None)
     }
 }

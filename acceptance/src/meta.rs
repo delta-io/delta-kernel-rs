@@ -89,7 +89,7 @@ impl TestCaseInfo {
         let tvm = TableVersionMetaData {
             version: snapshot.version(),
             properties: metadata
-                .configuration
+                .configuration()
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),

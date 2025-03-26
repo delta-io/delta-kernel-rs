@@ -361,7 +361,7 @@ impl RowVisitor for CdcVisitor {
     }
 }
 
-pub type SetTransactionMap = HashMap<String, SetTransaction>;
+pub(crate) type SetTransactionMap = HashMap<String, SetTransaction>;
 
 /// Extract application transaction actions from the log into a map
 ///
