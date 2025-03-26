@@ -1,5 +1,5 @@
 use super::*;
-use crate::expressions::{column_expr, Expression as Expr};
+use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
 use crate::kernel_predicates::KernelPredicateEvaluator as _;
 use crate::DataType;
 
@@ -160,19 +160,19 @@ fn test_eval_binary_comparisons() {
     const FIFTEEN: Scalar = Scalar::Integer(15);
     const NULL_VAL: Scalar = Scalar::Null(DataType::INTEGER);
 
-    let expressions = [
-        Expr::lt(column_expr!("x"), Expr::literal(10)),
-        Expr::le(column_expr!("x"), Expr::literal(10)),
-        Expr::eq(column_expr!("x"), Expr::literal(10)),
-        Expr::ne(column_expr!("x"), Expr::literal(10)),
-        Expr::gt(column_expr!("x"), Expr::literal(10)),
-        Expr::ge(column_expr!("x"), Expr::literal(10)),
+    let predicates = [
+        Pred::lt(column_expr!("x"), Expr::literal(10)),
+        Pred::le(column_expr!("x"), Expr::literal(10)),
+        Pred::eq(column_expr!("x"), Expr::literal(10)),
+        Pred::ne(column_expr!("x"), Expr::literal(10)),
+        Pred::gt(column_expr!("x"), Expr::literal(10)),
+        Pred::ge(column_expr!("x"), Expr::literal(10)),
     ];
 
     let do_test = |min: Scalar, max: Scalar, expected: &[Option<bool>]| {
         let filter = MinMaxTestFilter::new(Some(min.clone()), Some(max.clone()));
-        for (expr, expect) in expressions.iter().zip(expected.iter()) {
-            expect_eq!(filter.eval(expr), *expect, "{expr:#?} with [{min}..{max}]");
+        for (pred, expect) in predicates.iter().zip(expected.iter()) {
+            expect_eq!(filter.eval(pred), *expect, "{pred:#?} with [{min}..{max}]");
         }
     };
 
@@ -229,8 +229,8 @@ impl ParquetStatsProvider for NullCountTestFilter {
 #[test]
 fn test_eval_is_null() {
     let expressions = [
-        Expr::is_null(column_expr!("x")),
-        Expr::is_not_null(column_expr!("x")),
+        Pred::is_null(column_expr!("x")),
+        Pred::is_not_null(column_expr!("x")),
     ];
 
     let do_test = |nullcount: i64, expected: &[Option<bool>]| {

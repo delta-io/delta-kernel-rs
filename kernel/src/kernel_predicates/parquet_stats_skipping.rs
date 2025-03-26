@@ -89,9 +89,9 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
     fn finish_eval_junction(
         &self,
         op: JunctionOperator,
-        exprs: impl IntoIterator<Item = Option<bool>>,
+        preds: impl IntoIterator<Item = Option<bool>>,
         inverted: bool,
     ) -> Option<bool> {
-        KernelPredicateEvaluatorDefaults::finish_eval_junction(op, exprs, inverted)
+        KernelPredicateEvaluatorDefaults::finish_eval_junction(op, preds, inverted)
     }
 }

@@ -13,7 +13,7 @@ use crate::schema::{DataType, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_features::ReaderFeature;
 use crate::utils::test_utils::{Action, LocalMockTable};
-use crate::Expression;
+use crate::Predicate;
 use crate::{DeltaResult, Engine, Error, Version};
 
 use itertools::Itertools;
@@ -517,7 +517,7 @@ async fn data_skipping_filter() {
         .await;
 
     // Look for actions with id > 4
-    let predicate = Expression::binary(
+    let predicate = Predicate::binary(
         BinaryOperator::GreaterThan,
         column_expr!("id"),
         Scalar::from(4),

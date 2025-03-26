@@ -6,7 +6,7 @@ use std::fmt::{Display, Formatter};
 use itertools::Itertools;
 
 pub use self::column_names::{
-    column_expr, column_name, joined_column_expr, joined_column_name, ColumnName,
+    column_expr, column_name, column_pred, joined_column_expr, joined_column_name, ColumnName,
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use self::transforms::GetColumnReferences;
@@ -19,6 +19,7 @@ mod scalars;
 pub mod transforms;
 
 pub type ExpressionRef = std::sync::Arc<Expression>;
+pub type PredicateRef = std::sync::Arc<Predicate>;
 
 ////////////////////////////////////////////////////////////////////////
 // Operators
@@ -98,8 +99,8 @@ pub struct BinaryExpression {
 pub struct JunctionExpression {
     /// The operator.
     pub op: JunctionOperator,
-    /// The expressions.
-    pub exprs: Vec<Expression>,
+    /// The input predicates.
+    pub preds: Vec<Predicate>,
 }
 
 /// A SQL expression.
@@ -123,6 +124,9 @@ pub enum Expression {
     Junction(JunctionExpression),
     // TODO: support more expressions, such as IS IN, LIKE, etc.
 }
+
+/// TODO: Split this out as a proper enum
+pub type Predicate = Expression;
 
 ////////////////////////////////////////////////////////////////////////
 // Struct/Enum impls
@@ -180,8 +184,8 @@ impl BinaryExpression {
 }
 
 impl JunctionExpression {
-    fn new(op: JunctionOperator, exprs: Vec<Expression>) -> Self {
-        Self { op, exprs }
+    fn new(op: JunctionOperator, preds: Vec<Predicate>) -> Self {
+        Self { op, preds }
     }
 }
 
@@ -217,82 +221,82 @@ impl Expression {
     }
 
     /// Logical NOT (boolean inversion)
-    pub fn not(expr: impl Into<Self>) -> Self {
-        Self::unary(UnaryOperator::Not, expr.into())
+    pub fn not(pred: impl Into<Self>) -> Self {
+        Self::unary(UnaryOperator::Not, pred.into())
     }
 
-    /// Create a new expression `self IS NULL`
+    /// Create a new predicate `self IS NULL`
     pub fn is_null(self) -> Self {
         Self::unary(UnaryOperator::IsNull, self)
     }
 
-    /// Create a new expression `self IS NOT NULL`
-    pub fn is_not_null(self) -> Self {
+    /// Create a new predicate `self IS NOT NULL`
+    pub fn is_not_null(self) -> Predicate {
         Self::not(Self::is_null(self))
     }
 
-    /// Create a new expression `self == other`
+    /// Create a new predicate `self == other`
     pub fn eq(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::Equal, self, other)
     }
 
-    /// Create a new expression `self != other`
+    /// Create a new predicate `self != other`
     pub fn ne(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::NotEqual, self, other)
     }
 
-    /// Create a new expression `self <= other`
+    /// Create a new predicate `self <= other`
     pub fn le(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::LessThanOrEqual, self, other)
     }
 
-    /// Create a new expression `self < other`
+    /// Create a new predicate `self < other`
     pub fn lt(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::LessThan, self, other)
     }
 
-    /// Create a new expression `self >= other`
+    /// Create a new predicate `self >= other`
     pub fn ge(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::GreaterThanOrEqual, self, other)
     }
 
-    /// Create a new expression `self > other`
+    /// Create a new predicate `self > other`
     pub fn gt(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::GreaterThan, self, other)
     }
 
-    /// Create a new expression `DISTINCT(self, other)`
+    /// Create a new predicate `DISTINCT(self, other)`
     pub fn distinct(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::Distinct, self, other)
     }
 
-    /// Create a new expression `self AND other`
+    /// Create a new predicate `self AND other`
     pub fn and(a: impl Into<Self>, b: impl Into<Self>) -> Self {
         Self::and_from([a.into(), b.into()])
     }
 
-    /// Create a new expression `self OR other`
+    /// Create a new predicate `self OR other`
     pub fn or(a: impl Into<Self>, b: impl Into<Self>) -> Self {
         Self::or_from([a.into(), b.into()])
     }
 
-    /// Creates a new expression AND(exprs...)
-    pub fn and_from(exprs: impl IntoIterator<Item = Self>) -> Self {
-        Self::junction(JunctionOperator::And, exprs)
+    /// Creates a new predicate AND(preds...)
+    pub fn and_from(preds: impl IntoIterator<Item = Self>) -> Self {
+        Self::junction(JunctionOperator::And, preds)
     }
 
-    /// Creates a new expression OR(exprs...)
-    pub fn or_from(exprs: impl IntoIterator<Item = Self>) -> Self {
-        Self::junction(JunctionOperator::Or, exprs)
+    /// Creates a new predicate OR(preds...)
+    pub fn or_from(preds: impl IntoIterator<Item = Self>) -> Self {
+        Self::junction(JunctionOperator::Or, preds)
     }
 
-    /// Creates a new unary expression OP expr
+    /// Creates a new unary predicate OP expr
     pub fn unary(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
         let expr = Box::new(expr.into());
         Self::Unary(UnaryExpression { op, expr })
     }
 
-    /// Creates a new binary expression lhs OP rhs
+    /// Creates a new binary predicate lhs OP rhs
     pub fn binary(
         op: BinaryOperator,
         lhs: impl Into<Expression>,
@@ -305,10 +309,10 @@ impl Expression {
         })
     }
 
-    /// Creates a new junction expression OP(exprs...)
-    pub fn junction(op: JunctionOperator, exprs: impl IntoIterator<Item = Self>) -> Self {
-        let exprs = exprs.into_iter().collect();
-        Self::Junction(JunctionExpression { op, exprs })
+    /// Creates a new junction expression OP(preds...)
+    pub fn junction(op: JunctionOperator, preds: impl IntoIterator<Item = Self>) -> Self {
+        let preds = preds.into_iter().collect();
+        Self::Junction(JunctionExpression { op, preds })
     }
 }
 
@@ -361,13 +365,13 @@ impl Display for Expression {
                 UnaryOperator::Not => write!(f, "NOT {expr}"),
                 UnaryOperator::IsNull => write!(f, "{expr} IS NULL"),
             },
-            Junction(JunctionExpression { op, exprs }) => {
-                let exprs = &exprs.iter().map(|e| format!("{e}")).join(", ");
+            Junction(JunctionExpression { op, preds }) => {
+                let preds = &preds.iter().map(|p| format!("{p}")).join(", ");
                 let op = match op {
                     JunctionOperator::And => "AND",
                     JunctionOperator::Or => "OR",
                 };
-                write!(f, "{op}({exprs})")
+                write!(f, "{op}({preds})")
             }
         }
     }
@@ -419,7 +423,7 @@ impl<R: Into<Expression>> std::ops::Div<R> for Expression {
 
 #[cfg(test)]
 mod tests {
-    use super::{column_expr, Expression as Expr};
+    use super::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
 
     #[test]
     fn test_expression_format() {
@@ -433,20 +437,32 @@ mod tests {
                 Expr::struct_from([column_expr!("x"), Expr::literal(2), Expr::literal(10)]),
                 "Struct(Column(x), 2, 10)",
             ),
+        ];
+
+        for (expr, expected) in cases {
+            let result = format!("{}", expr);
+            assert_eq!(result, expected);
+        }
+    }
+
+    #[test]
+    fn test_predicate_format() {
+        let cases = [
+            (column_pred!("x"), "Column(x)"),
             (column_expr!("x").eq(Expr::literal(2)), "Column(x) = 2"),
             (
                 (column_expr!("x") - Expr::literal(4)).lt(Expr::literal(10)),
                 "Column(x) - 4 < 10",
             ),
             (
-                Expr::and(
+                Pred::and(
                     column_expr!("x").ge(Expr::literal(2)),
                     column_expr!("x").le(Expr::literal(10)),
                 ),
                 "AND(Column(x) >= 2, Column(x) <= 10)",
             ),
             (
-                Expr::and_from([
+                Pred::and_from([
                     column_expr!("x").ge(Expr::literal(2)),
                     column_expr!("x").le(Expr::literal(10)),
                     column_expr!("x").le(Expr::literal(100)),
@@ -454,7 +470,7 @@ mod tests {
                 "AND(Column(x) >= 2, Column(x) <= 10, Column(x) <= 100)",
             ),
             (
-                Expr::or(
+                Pred::or(
                     column_expr!("x").gt(Expr::literal(2)),
                     column_expr!("x").lt(Expr::literal(10)),
                 ),
@@ -466,8 +482,8 @@ mod tests {
             ),
         ];
 
-        for (expr, expected) in cases {
-            let result = format!("{}", expr);
+        for (pred, expected) in cases {
+            let result = format!("{}", pred);
             assert_eq!(result, expected);
         }
     }

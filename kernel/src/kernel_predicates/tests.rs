@@ -1,5 +1,8 @@
 use super::*;
-use crate::expressions::{column_expr, column_name, ArrayData, StructData};
+use crate::expressions::{
+    column_expr, column_name, column_pred, ArrayData, Expression as Expr, Predicate as Pred,
+    StructData,
+};
 use crate::schema::ArrayType;
 use crate::DataType;
 
@@ -305,8 +308,8 @@ fn test_eval_junction() {
             .iter()
             .cloned()
             .map(|v| match v {
-                Some(v) => Expr::literal(v),
-                None => Expr::null_literal(DataType::BOOLEAN),
+                Some(v) => Pred::literal(v),
+                None => Pred::null_literal(DataType::BOOLEAN),
             })
             .collect();
         for inverted in [true, false] {
@@ -574,10 +577,11 @@ impl ResolveColumnAsScalar for NullColumnResolver {
 #[test]
 fn test_sql_where() {
     let col = &column_expr!("x");
+    let col_pred = &column_pred!("x");
     const VAL: Expr = Expr::Literal(Scalar::Integer(1));
-    const NULL: Expr = Expr::null_literal(DataType::BOOLEAN);
-    const FALSE: Expr = Expr::Literal(Scalar::Boolean(false));
-    const TRUE: Expr = Expr::Literal(Scalar::Boolean(true));
+    const NULL: Pred = Pred::null_literal(DataType::BOOLEAN);
+    const FALSE: Pred = Pred::Literal(Scalar::Boolean(false));
+    const TRUE: Pred = Pred::Literal(Scalar::Boolean(true));
     let null_filter = DefaultKernelPredicateEvaluator::from(NullColumnResolver);
     let empty_filter = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
 
@@ -585,66 +589,74 @@ fn test_sql_where() {
     expect_eq!(null_filter.eval_sql_where(&VAL), None, "WHERE {VAL}");
     expect_eq!(empty_filter.eval_sql_where(&VAL), None, "WHERE {VAL}");
 
-    expect_eq!(null_filter.eval_sql_where(col), Some(false), "WHERE {col}");
-    expect_eq!(empty_filter.eval_sql_where(col), None, "WHERE {col}");
+    expect_eq!(
+        null_filter.eval_sql_where(col_pred),
+        Some(false),
+        "WHERE {col_pred}"
+    );
+    expect_eq!(
+        empty_filter.eval_sql_where(col_pred),
+        None,
+        "WHERE {col_pred}"
+    );
 
     // SQL eval does not modify behavior of IS NULL
-    let expr = &Expr::is_null(col.clone());
-    expect_eq!(null_filter.eval_sql_where(expr), Some(true), "{expr}");
+    let pred = &Pred::is_null(col.clone());
+    expect_eq!(null_filter.eval_sql_where(pred), Some(true), "{pred}");
 
     // NOT a gets skipped when NULL but not when missing
-    let expr = &Expr::not(col.clone());
-    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
-    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
+    let pred = &Pred::not(col_pred.clone());
+    expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     // Injected NULL checks only short circuit if inputs are NULL
-    let expr = &Expr::lt(FALSE, TRUE);
-    expect_eq!(null_filter.eval_sql_where(expr), Some(true), "{expr}");
-    expect_eq!(empty_filter.eval_sql_where(expr), Some(true), "{expr}");
+    let pred = &Pred::lt(FALSE, TRUE);
+    expect_eq!(null_filter.eval_sql_where(pred), Some(true), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), Some(true), "{pred}");
 
     // Contrast normal vs SQL WHERE semantics - comparison
-    let expr = &Expr::lt(col.clone(), VAL);
-    expect_eq!(null_filter.eval(expr), None, "{expr}");
-    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
+    let pred = &Pred::lt(col.clone(), VAL);
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     // NULL check produces NULL due to missing column
-    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
-    let expr = &Expr::lt(VAL, col.clone());
-    expect_eq!(null_filter.eval(expr), None, "{expr}");
-    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
-    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
+    let pred = &Pred::lt(VAL, col.clone());
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
-    let expr = &Expr::distinct(VAL, col.clone());
-    expect_eq!(null_filter.eval(expr), Some(true), "{expr}");
-    expect_eq!(null_filter.eval_sql_where(expr), Some(true), "{expr}");
-    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
+    let pred = &Pred::distinct(VAL, col.clone());
+    expect_eq!(null_filter.eval(pred), Some(true), "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), Some(true), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
-    let expr = &Expr::distinct(NULL, col.clone());
-    expect_eq!(null_filter.eval(expr), Some(false), "{expr}");
-    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
-    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
+    let pred = &Pred::distinct(NULL, col.clone());
+    expect_eq!(null_filter.eval(pred), Some(false), "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     // Contrast normal vs SQL WHERE semantics - comparison inside AND
-    let expr = &Expr::and(TRUE, Expr::lt(col.clone(), VAL));
-    expect_eq!(null_filter.eval(expr), None, "{expr}");
-    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
-    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
+    let pred = &Pred::and(TRUE, Pred::lt(col.clone(), VAL));
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     // NULL allows static skipping under SQL semantics
-    let expr = &Expr::and(NULL, Expr::lt(col.clone(), VAL));
-    expect_eq!(null_filter.eval(expr), None, "{expr}");
-    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
-    expect_eq!(empty_filter.eval_sql_where(expr), Some(false), "{expr}");
+    let pred = &Pred::and(NULL, Pred::lt(col.clone(), VAL));
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), Some(false), "{pred}");
 
     // Contrast normal vs. SQL WHERE semantics - comparison inside AND inside AND
-    let expr = &Expr::and(TRUE, Expr::and(TRUE, Expr::lt(col.clone(), VAL)));
-    expect_eq!(null_filter.eval(expr), None, "{expr}");
-    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
-    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
+    let pred = &Pred::and(TRUE, Pred::and(TRUE, Pred::lt(col.clone(), VAL)));
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     // Ditto for comparison inside OR inside AND
-    let expr = &Expr::or(FALSE, Expr::and(TRUE, Expr::lt(col.clone(), VAL)));
-    expect_eq!(null_filter.eval(expr), None, "{expr}");
-    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
-    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
+    let pred = &Pred::or(FALSE, Pred::and(TRUE, Pred::lt(col.clone(), VAL)));
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 }

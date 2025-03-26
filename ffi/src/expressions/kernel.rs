@@ -6,7 +6,7 @@ use std::ffi::c_void;
 use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryOperator, Expression, JunctionExpression, JunctionOperator,
-    MapData, Scalar, StructData, UnaryExpression, UnaryOperator,
+    MapData, Predicate, Scalar, StructData, UnaryExpression, UnaryOperator,
 };
 
 /// Free the memory the passed SharedExpression
@@ -299,12 +299,12 @@ fn visit_expression_struct(
 fn visit_expression_junction(
     visitor: &mut EngineExpressionVisitor,
     op: &JunctionOperator,
-    exprs: &[Expression],
+    preds: &[Predicate],
     sibling_list_id: usize,
 ) {
-    let child_list_id = call!(visitor, make_field_list, exprs.len());
-    for expr in exprs {
-        visit_expression_impl(visitor, expr, child_list_id);
+    let child_list_id = call!(visitor, make_field_list, preds.len());
+    for pred in preds {
+        visit_expression_impl(visitor, pred, child_list_id);
     }
 
     let visit_fn = match op {
@@ -401,7 +401,7 @@ fn visit_expression_impl(
             };
             op(visitor.data, sibling_list_id, child_list_id);
         }
-        Expression::Unary(UnaryExpression { op, expr }) => {
+        Predicate::Unary(UnaryExpression { op, expr }) => {
             let child_id_list = call!(visitor, make_field_list, 1);
             visit_expression_impl(visitor, expr, child_id_list);
             let op = match op {
@@ -410,8 +410,8 @@ fn visit_expression_impl(
             };
             op(visitor.data, sibling_list_id, child_id_list);
         }
-        Expression::Junction(JunctionExpression { op, exprs }) => {
-            visit_expression_junction(visitor, op, exprs, sibling_list_id)
+        Predicate::Junction(JunctionExpression { op, preds }) => {
+            visit_expression_junction(visitor, op, preds, sibling_list_id)
         }
     }
 }

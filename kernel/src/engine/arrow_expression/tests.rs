@@ -14,6 +14,7 @@ use crate::DataType as DeltaDataTypes;
 use crate::EvaluationHandlerExtension as _;
 
 use Expression as Expr;
+use Predicate as Pred;
 
 #[test]
 fn test_array_column() {
@@ -27,21 +28,21 @@ fn test_array_column() {
     let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
-    let not_op = Expr::binary(
+    let not_op = Pred::binary(
         BinaryOperator::NotIn,
         Expr::literal(5),
         column_expr!("item"),
     );
 
-    let in_op = Expr::binary(BinaryOperator::In, Expr::literal(5), column_expr!("item"));
+    let in_op = Pred::binary(BinaryOperator::In, Expr::literal(5), column_expr!("item"));
 
     let result = evaluate_expression(&not_op, &batch, None).unwrap();
     let expected = BooleanArray::from(vec![true, false, true]);
     assert_eq!(result.as_ref(), &expected);
 
-    let in_result = evaluate_expression(&in_op, &batch, None).unwrap();
-    let in_expected = BooleanArray::from(vec![false, true, false]);
-    assert_eq!(in_result.as_ref(), &in_expected);
+    let result = evaluate_expression(&in_op, &batch, None).unwrap();
+    let expected = BooleanArray::from(vec![false, true, false]);
+    assert_eq!(result.as_ref(), &expected);
 }
 
 #[test]
@@ -51,7 +52,7 @@ fn test_bad_right_type_array() {
     let schema = Schema::new([field.clone()]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
 
-    let in_op = Expr::binary(
+    let in_op = Pred::binary(
         BinaryOperator::NotIn,
         Expr::literal(5),
         column_expr!("item"),
@@ -72,7 +73,7 @@ fn test_literal_type_array() {
     let schema = Schema::new([field.clone()]);
     let batch = RecordBatch::new_empty(Arc::new(schema));
 
-    let in_op = Expr::binary(
+    let in_op = Pred::binary(
         BinaryOperator::NotIn,
         Expr::literal(5),
         Scalar::Array(
@@ -227,7 +228,7 @@ fn test_invalid_array_sides() {
     let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
-    let in_op = Expr::binary(
+    let in_op = Pred::binary(
         BinaryOperator::NotIn,
         column_expr!("item"),
         column_expr!("item"),
@@ -254,13 +255,13 @@ fn test_str_arrays() {
     let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
-    let str_not_op = Expr::binary(
+    let str_not_op = Pred::binary(
         BinaryOperator::NotIn,
         Expr::literal("bye"),
         column_expr!("item"),
     );
 
-    let str_in_op = Expr::binary(
+    let str_in_op = Pred::binary(
         BinaryOperator::In,
         Expr::literal("hi"),
         column_expr!("item"),
@@ -270,9 +271,9 @@ fn test_str_arrays() {
     let expected = BooleanArray::from(vec![true, true, true]);
     assert_eq!(result.as_ref(), &expected);
 
-    let in_result = evaluate_expression(&str_not_op, &batch, None).unwrap();
-    let in_expected = BooleanArray::from(vec![false, false, false]);
-    assert_eq!(in_result.as_ref(), &in_expected);
+    let result = evaluate_expression(&str_not_op, &batch, None).unwrap();
+    let expected = BooleanArray::from(vec![false, false, false]);
+    assert_eq!(result.as_ref(), &expected);
 }
 
 #[test]
@@ -419,30 +420,30 @@ fn test_logical() {
         ],
     )
     .unwrap();
-    let column_a = column_expr!("a");
-    let column_b = column_expr!("b");
+    let column_a = column_pred!("a");
+    let column_b = column_pred!("b");
 
-    let expression = Expr::and(column_a.clone(), column_b.clone());
+    let pred = Pred::and(column_a.clone(), column_b.clone());
     let results =
-        evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
+        evaluate_expression(&pred, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
     let expected = Arc::new(BooleanArray::from(vec![false, false]));
     assert_eq!(results.as_ref(), expected.as_ref());
 
-    let expression = Expr::and(column_a.clone(), Expr::literal(true));
+    let pred = Pred::and(column_a.clone(), Pred::literal(true));
     let results =
-        evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
+        evaluate_expression(&pred, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
     let expected = Arc::new(BooleanArray::from(vec![true, false]));
     assert_eq!(results.as_ref(), expected.as_ref());
 
-    let expression = Expr::or(column_a.clone(), column_b);
+    let pred = Pred::or(column_a.clone(), column_b);
     let results =
-        evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
+        evaluate_expression(&pred, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
     let expected = Arc::new(BooleanArray::from(vec![true, true]));
     assert_eq!(results.as_ref(), expected.as_ref());
 
-    let expression = Expr::or(column_a.clone(), Expr::literal(false));
+    let pred = Pred::or(column_a.clone(), Pred::literal(false));
     let results =
-        evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
+        evaluate_expression(&pred, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
     let expected = Arc::new(BooleanArray::from(vec![true, false]));
     assert_eq!(results.as_ref(), expected.as_ref());
 }

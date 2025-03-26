@@ -1,6 +1,6 @@
 use crate::expressions::{
     BinaryExpression, BinaryOperator, ColumnName, Expression as Expr, JunctionExpression,
-    JunctionOperator, Scalar, UnaryExpression, UnaryOperator,
+    JunctionOperator, Predicate as Pred, Scalar, UnaryExpression, UnaryOperator,
 };
 use crate::schema::DataType;
 
@@ -30,11 +30,10 @@ mod tests;
 /// example, [`crate::engine::parquet_stats_skipping::ParquetStatsProvider`] directly evaluates the
 /// predicate over parquet footer stats and returns boolean results, while
 /// [`crate::scan::data_skipping::DataSkippingPredicateCreator`] instead transforms the input
-/// predicate expression to a data skipping predicate expresion that the engine can evaluated
-/// directly against Delta data skipping stats during log replay. Although this approach is harder
-/// to read and reason about at first, the majority of expressions can be implemented generically,
-/// which greatly reduces redundancy and ensures that all flavors of predicate evaluation have the
-/// same semantics.
+/// predicate to a data skipping predicate that the engine can evaluated directly against Delta data
+/// skipping stats during log replay. Although this approach is harder to read and reason about at
+/// first, the majority of predicates can be implemented generically, which greatly reduces
+/// redundancy and ensures that all flavors of predicate evaluation have the same semantics.
 ///
 /// # NULL and error semantics
 ///
@@ -48,12 +47,12 @@ mod tests;
 /// rely on nullcount stats for their work (NULL/missing nullcount stats makes them output NULL).
 ///
 /// For safety reasons, NULL-checking operations only accept literal and column inputs where
-/// stats-based skipping is well-defined. If an arbitrary data skipping expression evaluates to
-/// NULL, there is no way to tell whether the original expression really evaluated to NULL (safe to
+/// stats-based skipping is well-defined. If an arbitrary data skipping predicate evaluates to
+/// NULL, there is no way to tell whether the original predicate really evaluated to NULL (safe to
 /// use), or the data skipping version evaluated to NULL due to missing stats (very unsafe to use).
 ///
 /// NOTE: The error-handling semantics of this trait's scalar-based predicate evaluation may differ
-/// from those of the engine's expression evaluation, because kernel expressions don't include the
+/// from those of the engine's predicate evaluation, because kernel predicates don't include the
 /// necessary type information to reliably detect all type errors.
 pub(crate) trait KernelPredicateEvaluator {
     type Output;
@@ -97,15 +96,15 @@ pub(crate) trait KernelPredicateEvaluator {
         inverted: bool,
     ) -> Option<Self::Output>;
 
-    /// Completes evaluation of a (possibly inverted) junction expression.
+    /// Completes evaluation of a (possibly inverted) junction predicate.
     ///
     /// AND and OR are implemented by first evaluating its (possibly inverted) inputs. This part is
     /// always the same, provided by [`eval_junction`]). The results are then combined to become the
-    /// expression's output in some implementation-defined way (this method).
+    /// predicate's output in some implementation-defined way (this method).
     fn finish_eval_junction(
         &self,
         op: JunctionOperator,
-        exprs: impl IntoIterator<Item = Option<Self::Output>>,
+        preds: impl IntoIterator<Item = Option<Self::Output>>,
         inverted: bool,
     ) -> Option<Self::Output>;
 
@@ -118,9 +117,9 @@ pub(crate) trait KernelPredicateEvaluator {
         self.eval_eq(col, &Scalar::from(inverted), true)
     }
 
-    /// Dispatches a (possibly inverted) NOT expression
-    fn eval_not(&self, expr: &Expr, inverted: bool) -> Option<Self::Output> {
-        self.eval_expr(expr, !inverted)
+    /// Dispatches a (possibly inverted) NOT predicate
+    fn eval_not(&self, pred: &Pred, inverted: bool) -> Option<Self::Output> {
+        self.eval_expr(pred, !inverted)
     }
 
     /// Dispatches a (possibly inverted) unary expression to each operator's specific implementation.
@@ -211,15 +210,16 @@ pub(crate) trait KernelPredicateEvaluator {
         }
     }
 
-    /// Dispatches a junction operation, leveraging each implementation's [`finish_eval_junction`].
+    /// Dispatches a predicate junction operation (AND or OR), leveraging each implementation's
+    /// [`finish_eval_junction`].
     fn eval_junction(
         &self,
         op: JunctionOperator,
-        exprs: &[Expr],
+        preds: &[Pred],
         inverted: bool,
     ) -> Option<Self::Output> {
-        let exprs = exprs.iter().map(|expr| self.eval_expr(expr, inverted));
-        self.finish_eval_junction(op, exprs, inverted)
+        let preds = preds.iter().map(|pred| self.eval_expr(pred, inverted));
+        self.finish_eval_junction(op, preds, inverted)
     }
 
     /// Dispatches an expression to the specific implementation for each expression variant.
@@ -235,7 +235,7 @@ pub(crate) trait KernelPredicateEvaluator {
             Binary(BinaryExpression { op, left, right }) => {
                 self.eval_binary(*op, left, right, inverted)
             }
-            Junction(JunctionExpression { op, exprs }) => self.eval_junction(*op, exprs, inverted),
+            Junction(JunctionExpression { op, preds }) => self.eval_junction(*op, preds, inverted),
         }
     }
 
@@ -243,8 +243,8 @@ pub(crate) trait KernelPredicateEvaluator {
     ///
     /// By default, [`eval_expr`] behaves badly for comparisons involving NULL columns (e.g. `a <
     /// 10` when `a` is NULL), because the comparison correctly evaluates to NULL, but NULL
-    /// expressions are interpreted as "stats missing" (= cannot skip). This ambiguity can "poison"
-    /// the entire expression, causing it to return NULL instead of FALSE that would allow skipping:
+    /// values are interpreted as "stats missing" (= cannot skip). This ambiguity can "poison"
+    /// the entire predicate, causing it to return NULL instead of FALSE that would allow skipping:
     ///
     /// ```text
     /// WHERE a < 10 -- NULL (can't skip file)
@@ -271,7 +271,7 @@ pub(crate) trait KernelPredicateEvaluator {
     /// ```
     ///
     /// HOWEVER, we cannot safely NULL-check the result of an arbitrary data skipping predicate
-    /// because an expression will also produce NULL if the value is just plain missing (e.g. data
+    /// because a predicate will also produce NULL if the value is just plain missing (e.g. data
     /// skipping over a column that lacks stats), and if that NULL should propagate all the way to
     /// top-level, it would be wrongly interpreted as FALSE (= skippable).
     ///
@@ -310,11 +310,11 @@ pub(crate) trait KernelPredicateEvaluator {
     ///
     /// Any time the push-down reaches an operator that does not support push-down (such as OR), we
     /// simply drop the NULL check. This way, the top-level NULL check only applies to
-    /// sub-expressions that can safely implement it, while ignoring other sub-expressions. The
-    /// unsupported sub-expressions could produce nulls at runtime that prevent skipping, but false
+    /// sub-predicates that can safely implement it, while ignoring other sub-predicates. The
+    /// unsupported sub-predicates could produce nulls at runtime that prevent skipping, but false
     /// positives are OK -- the query will still correctly filter out the unwanted rows that result.
     ///
-    /// At expression evaluation time, a NULL value of `a` (from our example) would evaluate as:
+    /// At predicate evaluation time, a NULL value of `a` (from our example) would evaluate as:
     ///
     /// ```text
     /// AND(..., AND(a IS NOT NULL, 10 IS NOT NULL, a < 10), ...)
@@ -341,24 +341,24 @@ pub(crate) trait KernelPredicateEvaluator {
     ///
     /// WARNING: Not an idempotent transform. If data skipping eval produces a sql predicate,
     /// evaluating the result with sql semantics has undefined behavior.
-    fn eval_expr_sql_where(&self, filter: &Expr, inverted: bool) -> Option<Self::Output> {
+    fn eval_expr_sql_where(&self, pred: &Pred, inverted: bool) -> Option<Self::Output> {
         use Expr::*;
-        match filter {
-            Junction(JunctionExpression { op, exprs }) => {
+        match pred {
+            Junction(JunctionExpression { op, preds }) => {
                 // Recursively invoke `eval_expr_sql_where` instead of the usual `eval_expr` for AND/OR.
-                let exprs = exprs
+                let preds = preds
                     .iter()
-                    .map(|expr| self.eval_expr_sql_where(expr, inverted));
-                self.finish_eval_junction(*op, exprs, inverted)
+                    .map(|pred| self.eval_expr_sql_where(pred, inverted));
+                self.finish_eval_junction(*op, preds, inverted)
             }
             Binary(BinaryExpression { op, left, right }) if op.is_null_intolerant_comparison() => {
                 // Perform a nullsafe comparison instead of the usual `eval_binary`
-                let exprs = [
+                let preds = [
                     self.eval_unary(UnaryOperator::IsNull, left, true),
                     self.eval_unary(UnaryOperator::IsNull, right, true),
                     self.eval_binary(*op, left, right, inverted),
                 ];
-                self.finish_eval_junction(JunctionOperator::And, exprs, false)
+                self.finish_eval_junction(JunctionOperator::And, preds, false)
             }
             Unary(UnaryExpression {
                 op: UnaryOperator::Not,
@@ -366,18 +366,18 @@ pub(crate) trait KernelPredicateEvaluator {
             }) => self.eval_expr_sql_where(expr, !inverted),
             Column(col) => {
                 // Perform a nullsafe comparison instead of the usual `eval_column`
-                let exprs = [
+                let preds = [
                     self.eval_is_null(col, true),
                     self.eval_column(col, inverted),
                 ];
-                self.finish_eval_junction(JunctionOperator::And, exprs, false)
+                self.finish_eval_junction(JunctionOperator::And, preds, false)
             }
             Literal(val) if val.is_null() => {
                 // AND(NULL IS NOT NULL, NULL) = AND(FALSE, NULL) = FALSE
                 self.eval_scalar(&Scalar::from(false), false)
             }
-            // Process all remaining expressions normally, because they are not proven safe. Indeed,
-            // expressions like DISTINCT and IS [NOT] NULL are known-unsafe under SQL semantics:
+            // Process all remaining predicates normally, because they are not proven safe. Indeed,
+            // predicates like DISTINCT and IS [NOT] NULL are known-unsafe under SQL semantics:
             //
             // ```
             // x IS NULL    # when x really is NULL
@@ -396,19 +396,19 @@ pub(crate) trait KernelPredicateEvaluator {
             // = FALSE
             // ```
             //
-            _ => self.eval_expr(filter, inverted),
+            _ => self.eval_expr(pred, inverted),
         }
     }
 
     /// A convenient non-inverted wrapper for [`eval_expr`]
     #[cfg(test)]
-    fn eval(&self, expr: &Expr) -> Option<Self::Output> {
-        self.eval_expr(expr, false)
+    fn eval(&self, pred: &Pred) -> Option<Self::Output> {
+        self.eval_expr(pred, false)
     }
 
     /// A convenient non-inverted wrapper for [`eval_expr_sql_where`].
-    fn eval_sql_where(&self, expr: &Expr) -> Option<Self::Output> {
-        self.eval_expr_sql_where(expr, false)
+    fn eval_sql_where(&self, pred: &Pred) -> Option<Self::Output> {
+        self.eval_expr_sql_where(pred, false)
     }
 }
 
@@ -474,14 +474,14 @@ impl KernelPredicateEvaluatorDefaults {
     /// non-dominant value. Inverting the operation also inverts the dominant value.
     pub(crate) fn finish_eval_junction(
         op: JunctionOperator,
-        exprs: impl IntoIterator<Item = Option<bool>>,
+        preds: impl IntoIterator<Item = Option<bool>>,
         inverted: bool,
     ) -> Option<bool> {
         let dominator = match op {
             JunctionOperator::And => inverted,
             JunctionOperator::Or => !inverted,
         };
-        let result = exprs.into_iter().try_fold(false, |found_null, val| {
+        let result = preds.into_iter().try_fold(false, |found_null, val| {
             match val {
                 Some(val) if val == dominator => None, // (1) short circuit, dominant found
                 Some(_) => Some(found_null),
@@ -603,10 +603,10 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
     fn finish_eval_junction(
         &self,
         op: JunctionOperator,
-        exprs: impl IntoIterator<Item = Option<bool>>,
+        preds: impl IntoIterator<Item = Option<bool>>,
         inverted: bool,
     ) -> Option<bool> {
-        KernelPredicateEvaluatorDefaults::finish_eval_junction(op, exprs, inverted)
+        KernelPredicateEvaluatorDefaults::finish_eval_junction(op, preds, inverted)
     }
 }
 
@@ -662,7 +662,7 @@ pub(crate) trait DataSkippingPredicateEvaluator {
     fn finish_eval_junction(
         &self,
         op: JunctionOperator,
-        exprs: impl IntoIterator<Item = Option<Self::Output>>,
+        preds: impl IntoIterator<Item = Option<Self::Output>>,
         inverted: bool,
     ) -> Option<Self::Output>;
 
@@ -748,22 +748,22 @@ pub(crate) trait DataSkippingPredicateEvaluator {
 
     /// See [`KernelPredicateEvaluator::eval_ge`]
     fn eval_eq(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
-        let (op, exprs) = if inverted {
+        let (op, preds) = if inverted {
             // Column could compare not-equal if min or max value differs from the literal.
-            let exprs = [
+            let preds = [
                 self.partial_cmp_min_stat(col, val, Ordering::Equal, true),
                 self.partial_cmp_max_stat(col, val, Ordering::Equal, true),
             ];
-            (JunctionOperator::Or, exprs)
+            (JunctionOperator::Or, preds)
         } else {
             // Column could compare equal if its min/max values bracket the literal.
-            let exprs = [
+            let preds = [
                 self.partial_cmp_min_stat(col, val, Ordering::Greater, true),
                 self.partial_cmp_max_stat(col, val, Ordering::Less, true),
             ];
-            (JunctionOperator::And, exprs)
+            (JunctionOperator::And, preds)
         };
-        self.finish_eval_junction(op, exprs, false)
+        self.finish_eval_junction(op, preds, false)
     }
 }
 
@@ -817,9 +817,9 @@ impl<T: DataSkippingPredicateEvaluator> KernelPredicateEvaluator for T {
     fn finish_eval_junction(
         &self,
         op: JunctionOperator,
-        exprs: impl IntoIterator<Item = Option<Self::Output>>,
+        preds: impl IntoIterator<Item = Option<Self::Output>>,
         inverted: bool,
     ) -> Option<Self::Output> {
-        self.finish_eval_junction(op, exprs, inverted)
+        self.finish_eval_junction(op, preds, inverted)
     }
 }
