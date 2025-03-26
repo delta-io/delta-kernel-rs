@@ -121,7 +121,7 @@ impl Scalar {
 pub struct ArrowExpressionHandler;
 
 impl ExpressionHandler for ArrowExpressionHandler {
-    fn get_evaluator(
+    fn new_expression_evaluator(
         &self,
         schema: SchemaRef,
         expression: Expression,

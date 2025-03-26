@@ -140,7 +140,7 @@ impl TableChanges {
     ) -> DeltaResult<Self> {
         let log_root = table_root.join("_delta_log/")?;
         let log_segment = LogSegment::for_table_changes(
-            engine.get_file_system_client().as_ref(),
+            engine.file_system_client().as_ref(),
             log_root,
             start_version,
             end_version,

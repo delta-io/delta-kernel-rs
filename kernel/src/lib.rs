@@ -334,7 +334,7 @@ pub trait ExpressionHandler: AsAny {
     ///
     /// [`Schema`]: crate::schema::StructType
     /// [`DataType`]: crate::schema::DataType
-    fn get_evaluator(
+    fn new_expression_evaluator(
         &self,
         schema: SchemaRef,
         expression: Expression,
@@ -463,16 +463,16 @@ pub trait ParquetHandler: AsAny {
 /// table.
 pub trait Engine: AsAny {
     /// Get the connector provided [`ExpressionHandler`].
-    fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler>;
+    fn expression_handler(&self) -> Arc<dyn ExpressionHandler>;
 
     /// Get the connector provided [`FileSystemClient`]
-    fn get_file_system_client(&self) -> Arc<dyn FileSystemClient>;
+    fn file_system_client(&self) -> Arc<dyn FileSystemClient>;
 
     /// Get the connector provided [`JsonHandler`].
-    fn get_json_handler(&self) -> Arc<dyn JsonHandler>;
+    fn json_handler(&self) -> Arc<dyn JsonHandler>;
 
     /// Get the connector provided [`ParquetHandler`].
-    fn get_parquet_handler(&self) -> Arc<dyn ParquetHandler>;
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
 }
 
 // we have an 'internal' feature flag: default-engine-base, which is actually just the shared

@@ -640,7 +640,7 @@ mod tests {
     #[test]
     fn test_parse_add_partitioned() {
         let engine = SyncEngine::new();
-        let json_handler = engine.get_json_handler();
+        let json_handler = engine.json_handler();
         let json_strings: StringArray = vec![
             r#"{"commitInfo":{"timestamp":1670892998177,"operation":"WRITE","operationParameters":{"mode":"Append","partitionBy":"[\"c1\",\"c2\"]"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"3","numOutputRows":"3","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
@@ -698,7 +698,7 @@ mod tests {
     #[test]
     fn test_parse_remove_partitioned() {
         let engine = SyncEngine::new();
-        let json_handler = engine.get_json_handler();
+        let json_handler = engine.json_handler();
         let json_strings: StringArray = vec![
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
             r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
@@ -737,7 +737,7 @@ mod tests {
     #[test]
     fn test_parse_txn() {
         let engine = SyncEngine::new();
-        let json_handler = engine.get_json_handler();
+        let json_handler = engine.json_handler();
         let json_strings: StringArray = vec![
             r#"{"commitInfo":{"timestamp":1670892998177,"operation":"WRITE","operationParameters":{"mode":"Append","partitionBy":"[\"c1\",\"c2\"]"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"3","numOutputRows":"3","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,

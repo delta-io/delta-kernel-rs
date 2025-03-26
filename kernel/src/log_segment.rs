@@ -214,7 +214,7 @@ impl LogSegment {
             .map(|f| f.location.clone())
             .collect();
         let commit_stream = engine
-            .get_json_handler()
+            .json_handler()
             .read_json_files(&commit_files, commit_read_schema, meta_predicate.clone())?
             .map_ok(|batch| (batch, true));
 
@@ -256,7 +256,7 @@ impl LogSegment {
             .map(|f| f.location.clone())
             .collect();
 
-        let parquet_handler = engine.get_parquet_handler();
+        let parquet_handler = engine.parquet_handler();
 
         // Historically, we had a shared file reader trait for JSON and Parquet handlers,
         // but it was removed to avoid unnecessary coupling. This is a concrete case
@@ -264,7 +264,7 @@ impl LogSegment {
         // If similar patterns start appearing elsewhere, we should reconsider that decision.
         let actions = match self.checkpoint_parts.first() {
             Some(parsed_log_path) if parsed_log_path.extension == "json" => {
-                engine.get_json_handler().read_json_files(
+                engine.json_handler().read_json_files(
                     &checkpoint_file_meta,
                     checkpoint_read_schema.clone(),
                     meta_predicate.clone(),

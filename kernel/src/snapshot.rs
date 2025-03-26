@@ -55,7 +55,7 @@ impl Snapshot {
         engine: &dyn Engine,
         version: Option<Version>,
     ) -> DeltaResult<Self> {
-        let fs_client = engine.get_file_system_client();
+        let fs_client = engine.file_system_client();
         let log_root = table_root.join("_delta_log/")?;
 
         let checkpoint_hint = read_last_checkpoint(fs_client.as_ref(), &log_root)?;

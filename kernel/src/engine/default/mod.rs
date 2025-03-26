@@ -123,7 +123,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         let transform = write_context.logical_to_physical();
         let input_schema: Schema = data.record_batch().schema().try_into()?;
         let output_schema = write_context.schema();
-        let logical_to_physical_expr = self.get_expression_handler().get_evaluator(
+        let logical_to_physical_expr = self.expression_handler().new_expression_evaluator(
             input_schema.into(),
             transform.clone(),
             output_schema.clone().into(),
@@ -141,19 +141,19 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 }
 
 impl<E: TaskExecutor> Engine for DefaultEngine<E> {
-    fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler> {
+    fn expression_handler(&self) -> Arc<dyn ExpressionHandler> {
         self.expression.clone()
     }
 
-    fn get_file_system_client(&self) -> Arc<dyn FileSystemClient> {
+    fn file_system_client(&self) -> Arc<dyn FileSystemClient> {
         self.file_system.clone()
     }
 
-    fn get_json_handler(&self) -> Arc<dyn JsonHandler> {
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
         self.json.clone()
     }
 
-    fn get_parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         self.parquet.clone()
     }
 }

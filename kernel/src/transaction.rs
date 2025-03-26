@@ -112,7 +112,7 @@ impl Transaction {
             ParsedLogPath::new_commit(self.read_snapshot.table_root(), commit_version)?;
 
         // step three: commit the actions as a json file in the log
-        let json_handler = engine.get_json_handler();
+        let json_handler = engine.json_handler();
         match json_handler.write_json_file(&commit_path.location, Box::new(actions), false) {
             Ok(()) => Ok(CommitResult::Committed(commit_version)),
             Err(Error::FileAlreadyExists(_)) => Ok(CommitResult::Conflict(self, commit_version)),
@@ -186,7 +186,7 @@ fn generate_adds<'a>(
     engine: &dyn Engine,
     write_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
 ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a {
-    let expression_handler = engine.get_expression_handler();
+    let expression_handler = engine.expression_handler();
     let write_metadata_schema = get_write_metadata_schema();
     let log_schema = get_log_add_schema();
 
@@ -196,7 +196,7 @@ fn generate_adds<'a>(
                 .fields()
                 .map(|f| Expression::column([f.name()])),
         )]);
-        let adds_evaluator = expression_handler.get_evaluator(
+        let adds_evaluator = expression_handler.new_expression_evaluator(
             write_metadata_schema.clone(),
             adds_expr,
             log_schema.clone().into(),
@@ -320,7 +320,7 @@ fn generate_commit_info(
         .shift_remove("inCommitTimestamp");
     commit_info_field.data_type = DataType::Struct(commit_info_data_type);
 
-    let commit_info_evaluator = engine.get_expression_handler().get_evaluator(
+    let commit_info_evaluator = engine.expression_handler().new_expression_evaluator(
         engine_commit_info_schema.into(),
         commit_info_expr,
         commit_info_empty_struct_schema.into(),
@@ -353,19 +353,19 @@ mod tests {
     }
 
     impl Engine for ExprEngine {
-        fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler> {
+        fn expression_handler(&self) -> Arc<dyn ExpressionHandler> {
             self.0.clone()
         }
 
-        fn get_json_handler(&self) -> Arc<dyn JsonHandler> {
+        fn json_handler(&self) -> Arc<dyn JsonHandler> {
             unimplemented!()
         }
 
-        fn get_parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
             unimplemented!()
         }
 
-        fn get_file_system_client(&self) -> Arc<dyn FileSystemClient> {
+        fn file_system_client(&self) -> Arc<dyn FileSystemClient> {
             unimplemented!()
         }
     }
