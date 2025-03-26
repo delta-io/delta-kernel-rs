@@ -9,7 +9,7 @@ use url::Url;
 use crate::actions::{Metadata, Protocol};
 use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
-use crate::schema::Schema;
+use crate::schema::{Schema, SchemaRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
@@ -98,8 +98,7 @@ impl Snapshot {
     }
 
     /// Table [`Schema`] at this `Snapshot`s version.
-    // TODO should this return SchemaRef?
-    pub fn schema(&self) -> &Schema {
+    pub fn schema(&self) -> SchemaRef {
         self.table_configuration.schema()
     }
 
@@ -203,7 +202,6 @@ mod tests {
     use crate::engine::default::filesystem::ObjectStoreFileSystemClient;
     use crate::engine::sync::SyncEngine;
     use crate::path::ParsedLogPath;
-    use crate::schema::StructType;
 
     #[test]
     fn test_snapshot_read_metadata() {
@@ -219,8 +217,8 @@ mod tests {
         assert_eq!(snapshot.protocol(), &expected);
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
-        let expected: StructType = serde_json::from_str(schema_string).unwrap();
-        assert_eq!(snapshot.schema(), &expected);
+        let expected: SchemaRef = serde_json::from_str(schema_string).unwrap();
+        assert_eq!(snapshot.schema(), expected);
     }
 
     #[test]
@@ -237,8 +235,8 @@ mod tests {
         assert_eq!(snapshot.protocol(), &expected);
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
-        let expected: StructType = serde_json::from_str(schema_string).unwrap();
-        assert_eq!(snapshot.schema(), &expected);
+        let expected: SchemaRef = serde_json::from_str(schema_string).unwrap();
+        assert_eq!(snapshot.schema(), expected);
     }
 
     #[test]
@@ -250,11 +248,9 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let store = Arc::new(LocalFileSystem::new());
-        let prefix = Path::from(url.path());
         let client = ObjectStoreFileSystemClient::new(
             store,
             false, // don't have ordered listing
-            prefix,
             Arc::new(TokioBackgroundExecutor::new()),
         );
         let cp = read_last_checkpoint(&client, &url).unwrap();
@@ -292,7 +288,6 @@ mod tests {
         let client = ObjectStoreFileSystemClient::new(
             store,
             false, // don't have ordered listing
-            Path::from("/"),
             Arc::new(TokioBackgroundExecutor::new()),
         );
         let url = Url::parse("memory:///valid/").expect("valid url");

@@ -17,6 +17,7 @@ use object_store::DynObjectStore;
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
+use super::UrlExt;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{fixup_parquet_read, generate_mask, get_requested_indices};
 use crate::engine::default::executor::TaskExecutor;
@@ -191,18 +192,19 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         //   -> reqwest to get data
         //   -> parse to parquet
         // SAFETY: we did is_empty check above, this is ok.
-        let file_opener: Box<dyn FileOpener> = match files[0].location.scheme() {
-            "http" | "https" => Box::new(PresignedUrlOpener::new(
+        let file_opener: Box<dyn FileOpener> = if files[0].location.is_presigned() {
+            Box::new(PresignedUrlOpener::new(
                 1024,
                 physical_schema.clone(),
                 predicate,
-            )),
-            _ => Box::new(ParquetOpener::new(
+            ))
+        } else {
+            Box::new(ParquetOpener::new(
                 1024,
                 physical_schema.clone(),
                 predicate,
                 self.store.clone(),
-            )),
+            ))
         };
         FileStream::new_async_read_iterator(
             self.task_executor.clone(),

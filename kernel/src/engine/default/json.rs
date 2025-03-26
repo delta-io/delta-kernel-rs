@@ -142,7 +142,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         let buffer = to_json_bytes(data)?;
         // Put if absent
         let store = self.store.clone(); // cheap Arc
-        let path = Path::from(path.path());
+        let path = Path::from_url_path(path.path())?;
         let path_str = path.to_string();
         self.task_executor
             .block_on(async move {

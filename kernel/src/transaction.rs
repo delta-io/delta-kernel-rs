@@ -78,7 +78,9 @@ impl Transaction {
         let read_snapshot = snapshot.into();
 
         // important! before a read/write to the table we must check it is supported
-        read_snapshot.protocol().ensure_write_supported()?;
+        read_snapshot
+            .table_configuration()
+            .ensure_write_supported()?;
 
         Ok(Transaction {
             read_snapshot,
@@ -149,8 +151,9 @@ impl Transaction {
         // for now, we just pass through all the columns except partition columns.
         // note this is _incorrect_ if table config deems we need partition columns.
         let partition_columns = &self.read_snapshot.metadata().partition_columns;
-        let fields = self.read_snapshot.schema().fields();
-        let fields = fields
+        let schema = self.read_snapshot.schema();
+        let fields = schema
+            .fields()
             .filter(|f| !partition_columns.contains(f.name()))
             .map(|f| Expression::column([f.name()]));
         Expression::struct_from(fields)
@@ -165,11 +168,7 @@ impl Transaction {
         let target_dir = self.read_snapshot.table_root();
         let snapshot_schema = self.read_snapshot.schema();
         let logical_to_physical = self.generate_logical_to_physical();
-        WriteContext::new(
-            target_dir.clone(),
-            Arc::new(snapshot_schema.clone()),
-            logical_to_physical,
-        )
+        WriteContext::new(target_dir.clone(), snapshot_schema, logical_to_physical)
     }
 
     /// Add write metadata about files to include in the transaction. This API can be called
