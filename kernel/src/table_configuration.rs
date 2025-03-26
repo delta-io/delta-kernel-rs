@@ -102,10 +102,10 @@ impl TableConfiguration {
         &self.protocol
     }
 
-    /// The [`Schema`] of for this table at this version.
+    /// The logical schema ([`SchemaRef`]) of this table at this version.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    pub(crate) fn schema(&self) -> &Schema {
-        self.schema.as_ref()
+    pub(crate) fn schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
 
     /// The [`TableProperties`] of this table at this version.
@@ -140,7 +140,9 @@ impl TableConfiguration {
 
         // for now we don't allow invariants so although we support writer version 2 and the
         // ColumnInvariant TableFeature we _must_ check here that they are not actually in use
-        if self.is_invariants_supported() && InvariantChecker::has_invariants(self.schema()) {
+        if self.is_invariants_supported()
+            && InvariantChecker::has_invariants(self.schema().as_ref())
+        {
             return Err(Error::unsupported(
                 "Column invariants are not yet supported",
             ));

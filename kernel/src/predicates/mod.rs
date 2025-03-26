@@ -67,29 +67,11 @@ pub(crate) trait PredicateEvaluator {
     /// A (possibly inverted) NULL check, e.g. `<expr> IS [NOT] NULL`.
     fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Self::Output>;
 
-    /// A less-than comparison, e.g. `<col> < <value>`.
-    ///
-    /// NOTE: Caller is responsible to commute and/or invert the operation if needed,
-    /// e.g. `NOT(<value> < <col>)` becomes `<col> <= <value>`.
-    fn eval_lt(&self, col: &ColumnName, val: &Scalar) -> Option<Self::Output>;
+    /// A (possibly inverted) less-than comparison, e.g. `<col> < <value>`.
+    fn eval_lt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output>;
 
-    /// A less-than-or-equal comparison, e.g. `<col> <= <value>`
-    ///
-    /// NOTE: Caller is responsible to commute and/or invert the operation if needed,
-    /// e.g. `NOT(<value> <= <col>)` becomes `<col> < <value>`.
-    fn eval_le(&self, col: &ColumnName, val: &Scalar) -> Option<Self::Output>;
-
-    /// A greater-than comparison, e.g. `<col> > <value>`
-    ///
-    /// NOTE: Caller is responsible to commute and/or invert the operation if needed,
-    /// e.g. `NOT(<value> > <col>)` becomes `<col> >= <value>`.
-    fn eval_gt(&self, col: &ColumnName, val: &Scalar) -> Option<Self::Output>;
-
-    /// A greater-than-or-equal comparison, e.g. `<col> >= <value>`
-    ///
-    /// NOTE: Caller is responsible to commute and/or invert the operation if needed,
-    /// e.g. `NOT(<value> >= <col>)` becomes `<col> > <value>`.
-    fn eval_ge(&self, col: &ColumnName, val: &Scalar) -> Option<Self::Output>;
+    /// A (possibly inverted) less-than-or-equal comparison, e.g. `<col> <= <value>`
+    fn eval_le(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output>;
 
     /// A (possibly inverted) equality comparison, e.g. `<col> = <value>` or `<col> != <value>`.
     ///
@@ -210,17 +192,17 @@ pub(crate) trait PredicateEvaluator {
                 return None;
             }
         };
-        match (op, inverted) {
-            (Plus | Minus | Multiply | Divide, _) => None, // Unsupported - not boolean output
-            (LessThan, false) | (GreaterThanOrEqual, true) => self.eval_lt(col, val),
-            (LessThanOrEqual, false) | (GreaterThan, true) => self.eval_le(col, val),
-            (GreaterThan, false) | (LessThanOrEqual, true) => self.eval_gt(col, val),
-            (GreaterThanOrEqual, false) | (LessThan, true) => self.eval_ge(col, val),
-            (Equal, _) => self.eval_eq(col, val, inverted),
-            (NotEqual, _) => self.eval_eq(col, val, !inverted),
-            (Distinct, _) => self.eval_distinct(col, val, inverted),
-            (In, _) => self.eval_in(col, val, inverted),
-            (NotIn, _) => self.eval_in(col, val, !inverted),
+        match op {
+            Plus | Minus | Multiply | Divide => None, // Unsupported - not boolean output
+            LessThan => self.eval_lt(col, val, inverted),
+            GreaterThanOrEqual => self.eval_lt(col, val, !inverted),
+            LessThanOrEqual => self.eval_le(col, val, inverted),
+            GreaterThan => self.eval_le(col, val, !inverted),
+            Equal => self.eval_eq(col, val, inverted),
+            NotEqual => self.eval_eq(col, val, !inverted),
+            Distinct => self.eval_distinct(col, val, inverted),
+            In => self.eval_in(col, val, inverted),
+            NotIn => self.eval_in(col, val, !inverted),
         }
     }
 
@@ -577,24 +559,14 @@ impl<R: ResolveColumnAsScalar> PredicateEvaluator for DefaultPredicateEvaluator<
         self.eval_scalar_is_null(&col, inverted)
     }
 
-    fn eval_lt(&self, col: &ColumnName, val: &Scalar) -> Option<bool> {
+    fn eval_lt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<bool> {
         let col = self.resolve_column(col)?;
-        self.eval_binary_scalars(BinaryOperator::LessThan, &col, val, false)
+        self.eval_binary_scalars(BinaryOperator::LessThan, &col, val, inverted)
     }
 
-    fn eval_le(&self, col: &ColumnName, val: &Scalar) -> Option<bool> {
+    fn eval_le(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<bool> {
         let col = self.resolve_column(col)?;
-        self.eval_binary_scalars(BinaryOperator::LessThanOrEqual, &col, val, false)
-    }
-
-    fn eval_gt(&self, col: &ColumnName, val: &Scalar) -> Option<bool> {
-        let col = self.resolve_column(col)?;
-        self.eval_binary_scalars(BinaryOperator::GreaterThan, &col, val, false)
-    }
-
-    fn eval_ge(&self, col: &ColumnName, val: &Scalar) -> Option<bool> {
-        let col = self.resolve_column(col)?;
-        self.eval_binary_scalars(BinaryOperator::GreaterThanOrEqual, &col, val, false)
+        self.eval_binary_scalars(BinaryOperator::LessThanOrEqual, &col, val, inverted)
     }
 
     fn eval_eq(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<bool> {
@@ -727,49 +699,47 @@ pub(crate) trait DataSkippingPredicateEvaluator {
     }
 
     /// See [`PredicateEvaluator::eval_lt`]
-    fn eval_lt(&self, col: &ColumnName, val: &Scalar) -> Option<Self::Output> {
-        // Given `col < val`:
-        // Skip if `val` is not greater than _all_ values in [min, max], implies
-        // Skip if `val <= min AND val <= max` implies
-        // Skip if `val <= min` implies
-        // Keep if `NOT(val <= min)` implies
-        // Keep if `val > min` implies
-        // Keep if `min < val`
-        self.partial_cmp_min_stat(col, val, Ordering::Less, false)
+    fn eval_lt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
+        if inverted {
+            // Given `col >= val`:
+            // Skip if `val is greater than _every_ value in [min, max], implies
+            // Skip if `val > min AND val > max` implies
+            // Skip if `val > max` implies
+            // Keep if `NOT(val > max)` implies
+            // Keep if `NOT(max < val)`
+            self.partial_cmp_max_stat(col, val, Ordering::Less, true)
+        } else {
+            // Given `col < val`:
+            // Skip if `val` is not greater than _all_ values in [min, max], implies
+            // Skip if `val <= min AND val <= max` implies
+            // Skip if `val <= min` implies
+            // Keep if `NOT(val <= min)` implies
+            // Keep if `val > min` implies
+            // Keep if `min < val`
+            self.partial_cmp_min_stat(col, val, Ordering::Less, false)
+        }
     }
 
     /// See [`PredicateEvaluator::eval_le`]
-    fn eval_le(&self, col: &ColumnName, val: &Scalar) -> Option<Self::Output> {
-        // Given `col <= val`:
-        // Skip if `val` is less than _all_ values in [min, max], implies
-        // Skip if `val < min AND val < max` implies
-        // Skip if `val < min` implies
-        // Keep if `NOT(val < min)` implies
-        // Keep if `NOT(min > val)`
-        self.partial_cmp_min_stat(col, val, Ordering::Greater, true)
-    }
-
-    /// See [`PredicateEvaluator::eval_gt`]
-    fn eval_gt(&self, col: &ColumnName, val: &Scalar) -> Option<Self::Output> {
-        // Given `col > val`:
-        // Skip if `val` is not less than _all_ values in [min, max], implies
-        // Skip if `val >= min AND val >= max` implies
-        // Skip if `val >= max` implies
-        // Keep if `NOT(val >= max)` implies
-        // Keep if `NOT(max <= val)` implies
-        // Keep if `max > val`
-        self.partial_cmp_max_stat(col, val, Ordering::Greater, false)
-    }
-
-    /// See [`PredicateEvaluator::eval_ge`]
-    fn eval_ge(&self, col: &ColumnName, val: &Scalar) -> Option<Self::Output> {
-        // Given `col >= val`:
-        // Skip if `val is greater than _every_ value in [min, max], implies
-        // Skip if `val > min AND val > max` implies
-        // Skip if `val > max` implies
-        // Keep if `NOT(val > max)` implies
-        // Keep if `NOT(max < val)`
-        self.partial_cmp_max_stat(col, val, Ordering::Less, true)
+    fn eval_le(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
+        if inverted {
+            // Given `col > val`:
+            // Skip if `val` is not less than _all_ values in [min, max], implies
+            // Skip if `val >= min AND val >= max` implies
+            // Skip if `val >= max` implies
+            // Keep if `NOT(val >= max)` implies
+            // Keep if `NOT(max <= val)` implies
+            // Keep if `max > val`
+            self.partial_cmp_max_stat(col, val, Ordering::Greater, false)
+        } else {
+            // Given `col <= val`:
+            // Skip if `val` is less than _all_ values in [min, max], implies
+            // Skip if `val < min AND val < max` implies
+            // Skip if `val < min` implies
+            // Keep if `NOT(val < min)` implies
+            // Keep if `NOT(min > val)`
+            self.partial_cmp_min_stat(col, val, Ordering::Greater, true)
+        }
     }
 
     /// See [`PredicateEvaluator::eval_ge`]
@@ -808,20 +778,12 @@ impl<T: DataSkippingPredicateEvaluator> PredicateEvaluator for T {
         self.eval_is_null(col, inverted)
     }
 
-    fn eval_lt(&self, col: &ColumnName, val: &Scalar) -> Option<Self::Output> {
-        self.eval_lt(col, val)
+    fn eval_lt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
+        self.eval_lt(col, val, inverted)
     }
 
-    fn eval_le(&self, col: &ColumnName, val: &Scalar) -> Option<Self::Output> {
-        self.eval_le(col, val)
-    }
-
-    fn eval_gt(&self, col: &ColumnName, val: &Scalar) -> Option<Self::Output> {
-        self.eval_gt(col, val)
-    }
-
-    fn eval_ge(&self, col: &ColumnName, val: &Scalar) -> Option<Self::Output> {
-        self.eval_ge(col, val)
+    fn eval_le(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
+        self.eval_le(col, val, inverted)
     }
 
     fn eval_eq(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {

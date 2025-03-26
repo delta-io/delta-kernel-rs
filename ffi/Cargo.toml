@@ -22,7 +22,6 @@ tracing-core = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [ "json" ] }
 url = "2"
 delta_kernel = { path = "../kernel", default-features = false, features = [
-  "arrow",
   "developer-visibility",
 ] }
 delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.8.0" }
@@ -32,7 +31,6 @@ cbindgen = "0.28"
 libc = "0.2.158"
 
 [dev-dependencies]
-delta_kernel = { path = "../kernel", features = ["default-engine", "sync-engine"] }
 object_store = { workspace = true }
 rand = "0.8.5"
 test_utils = { path = "../test-utils" }
@@ -42,10 +40,8 @@ trybuild = "1.0"
 [features]
 default = ["default-engine"]
 cloud = ["delta_kernel/cloud"]
-default-engine = [
-  "delta_kernel/default-engine",
-]
+default-engine = ["delta_kernel/default-engine", "delta_kernel/arrow"]
 tracing = [ "tracing-core", "tracing-subscriber" ]
-sync-engine = ["delta_kernel/sync-engine"]
+sync-engine = ["delta_kernel/sync-engine", "delta_kernel/arrow"]
 developer-visibility = []
 test-ffi = []

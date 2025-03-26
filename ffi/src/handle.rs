@@ -88,14 +88,14 @@ mod private {
     /// Additionally, in keeping with the [`Send`] contract, multi-threaded external code must
     /// enforce mutual exclusion -- no mutable handle should ever be passed to more than one kernel
     /// API call at a time. If thread races are possible, the handle should be protected with a
-    /// mutex. Due to Rust [reference
-    /// rules](https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html#the-rules-of-references),
-    /// this requirement applies even for API calls that appear to be read-only (because Rust code
-    /// always receives the handle as mutable).
+    /// mutex. Due to Rust [reference rules], this requirement applies even for API calls that
+    /// appear to be read-only (because Rust code always receives the handle as mutable).
     ///
     /// NOTE: Because the underlying type is always [`Sync`], multi-threaded external code can
     /// freely access shared (non-mutable) handles.
     ///
+    /// [reference rules]:
+    /// https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html#the-rules-of-references
     /// cbindgen:transparent-typedef
     #[repr(transparent)]
     pub struct Handle<H: HandleDescriptor> {

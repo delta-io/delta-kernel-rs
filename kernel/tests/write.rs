@@ -48,7 +48,7 @@ fn setup(
     let table_root_path = Path::from(format!("{base_path}{table_name}"));
     let url = Url::parse(&format!("{base_url}{table_root_path}/")).unwrap();
     let executor = Arc::new(TokioBackgroundExecutor::new());
-    let engine = DefaultEngine::new(Arc::clone(&storage), table_root_path, executor);
+    let engine = DefaultEngine::new(Arc::clone(&storage), executor);
 
     (storage, engine, url)
 }

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use self::storage::parse_url_opts;
-use object_store::{path::Path, DynObjectStore};
+use object_store::DynObjectStore;
 use url::Url;
 
 use self::executor::TaskExecutor;
@@ -60,8 +60,8 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         V: Into<String>,
     {
         // table root is the path of the table in the ObjectStore
-        let (store, table_root) = parse_url_opts(table_root, options)?;
-        Ok(Self::new(Arc::new(store), table_root, task_executor))
+        let (store, _table_root) = parse_url_opts(table_root, options)?;
+        Ok(Self::new(Arc::new(store), task_executor))
     }
 
     /// Create a new [`DefaultEngine`] instance
@@ -71,7 +71,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// - `store`: The object store to use.
     /// - `table_root_path`: The root path of the table within storage.
     /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    pub fn new(store: Arc<DynObjectStore>, table_root: Path, task_executor: Arc<E>) -> Self {
+    pub fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
         // HACK to check if we're using a LocalFileSystem from ObjectStore. We need this because
         // local filesystem doesn't return a sorted list by default. Although the `object_store`
         // crate explicitly says it _does not_ return a sorted listing, in practice all the cloud
@@ -97,7 +97,6 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             file_system: Arc::new(ObjectStoreFileSystemClient::new(
                 store.clone(),
                 !is_local,
-                table_root,
                 task_executor.clone(),
             )),
             json: Arc::new(DefaultJsonHandler::new(
@@ -156,5 +155,76 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
 
     fn get_parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         self.parquet.clone()
+    }
+}
+
+trait UrlExt {
+    // Check if a given url is a presigned url and can be used
+    // to access the object store via simple http requests
+    fn is_presigned(&self) -> bool;
+}
+
+impl UrlExt for Url {
+    fn is_presigned(&self) -> bool {
+        matches!(self.scheme(), "http" | "https")
+            && (
+                // https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
+                // https://developers.cloudflare.com/r2/api/s3/presigned-urls/
+                self
+                .query_pairs()
+                .any(|(k, _)| k.eq_ignore_ascii_case("X-Amz-Signature")) ||
+                // https://learn.microsoft.com/en-us/rest/api/storageservices/create-user-delegation-sas#version-2020-12-06-and-later
+                // note signed permission (sp) must always be present
+                self
+                .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("sp")) ||
+                // https://cloud.google.com/storage/docs/authentication/signatures
+                self
+                .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("X-Goog-Credential")) ||
+                // https://www.alibabacloud.com/help/en/oss/user-guide/upload-files-using-presigned-urls
+                self
+                .query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("X-OSS-Credential"))
+            )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::executor::tokio::TokioBackgroundExecutor;
+    use super::*;
+    use crate::engine::tests::test_arrow_engine;
+    use object_store::local::LocalFileSystem;
+
+    #[test]
+    fn test_default_engine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let store = Arc::new(LocalFileSystem::new());
+        let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        test_arrow_engine(&engine, &url);
+    }
+
+    #[test]
+    fn test_pre_signed_url() {
+        let url = Url::parse("https://example.com?X-Amz-Signature=foo").unwrap();
+        assert!(url.is_presigned());
+
+        let url = Url::parse("https://example.com?sp=foo").unwrap();
+        assert!(url.is_presigned());
+
+        let url = Url::parse("https://example.com?X-Goog-Credential=foo").unwrap();
+        assert!(url.is_presigned());
+
+        let url = Url::parse("https://example.com?X-OSS-Credential=foo").unwrap();
+        assert!(url.is_presigned());
+
+        // assert that query keys are case insensitive
+        let url = Url::parse("https://example.com?x-gooG-credenTIAL=foo").unwrap();
+        assert!(url.is_presigned());
+
+        let url = Url::parse("https://example.com?x-oss-CREDENTIAL=foo").unwrap();
+        assert!(url.is_presigned());
+
+        let url = Url::parse("https://example.com").unwrap();
+        assert!(!url.is_presigned());
     }
 }

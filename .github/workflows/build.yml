@@ -69,6 +69,28 @@ jobs:
       - name: build docs
         run: cargo doc
 
+
+  # When we run cargo { build, clippy } --no-default-features, we want to build/lint the kernel to
+  # ensure that we can build the kernel without any features enabled. Unfortunately, due to how
+  # cargo resolves features, if we have a workspace member that depends on the kernel with features
+  # enabled, the kernel will be compiled with those features (even if we specify
+  # --no-default-features).
+  #
+  # To cope with this, we split build/clippy --no-default-features into two runs:
+  # 1. build/clippy all packages that depend on the kernel with some features enabled:
+  #    - acceptance
+  #    - test_utils
+  #    - feature_tests
+  #    (and examples)
+  #    - inspect-table
+  #    - read-table-changes
+  #    - read-table-multi-threaded
+  #    - read-table-single-threaded
+  # 2. build/clippy all packages that only have no-feature kernel dependency
+  #    - delta_kernel
+  #    - delta_kernel_derive
+  #    - delta_kernel_ffi
+  #    - delta_kernel_ffi_macros
   build:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -85,8 +107,10 @@ jobs:
           components: clippy
       - name: build and lint with clippy
         run: cargo clippy --benches --tests --all-features -- -D warnings
-      - name: lint without default features
-        run: cargo clippy --no-default-features -- -D warnings
+      - name: lint without default features - packages which depend on kernel with features enabled
+        run: cargo clippy --workspace --no-default-features --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
+      - name: lint without default features - packages which don't depend on kernel with features enabled
+        run: cargo clippy --no-default-features --package delta_kernel --package delta_kernel_ffi --package delta_kernel_derive --package delta_kernel_ffi_macros -- -D warnings
       - name: check kernel builds with default-engine
         run: cargo build -p feature_tests --features default-engine
       - name: check kernel builds with default-engine-rustls

@@ -96,9 +96,7 @@ impl ScanBuilder {
     /// perform actual data reads.
     pub fn build(self) -> DeltaResult<Scan> {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
-        let logical_schema = self
-            .schema
-            .unwrap_or_else(|| self.snapshot.schema().clone().into());
+        let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
         let state_info = get_state_info(
             logical_schema.as_ref(),
             &self.snapshot.metadata().partition_columns,
