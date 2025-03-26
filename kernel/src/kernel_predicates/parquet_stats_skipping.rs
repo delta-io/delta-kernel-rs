@@ -1,6 +1,6 @@
 //! An implementation of data skipping that leverages parquet stats from the file footer.
 use crate::expressions::{BinaryOperator, ColumnName, Scalar, VariadicOperator};
-use crate::predicates::{DataSkippingPredicateEvaluator, PredicateEvaluatorDefaults};
+use crate::kernel_predicates::{DataSkippingPredicateEvaluator, KernelPredicateEvaluatorDefaults};
 use crate::schema::DataType;
 use std::cmp::Ordering;
 
@@ -57,15 +57,15 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
         val: &Scalar,
         inverted: bool,
     ) -> Option<bool> {
-        PredicateEvaluatorDefaults::partial_cmp_scalars(ord, &col, val, inverted)
+        KernelPredicateEvaluatorDefaults::partial_cmp_scalars(ord, &col, val, inverted)
     }
 
     fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<bool> {
-        PredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted)
+        KernelPredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted)
     }
 
     fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<bool> {
-        PredicateEvaluatorDefaults::eval_scalar(val, inverted)
+        KernelPredicateEvaluatorDefaults::eval_scalar(val, inverted)
     }
 
     fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<bool> {
@@ -83,7 +83,7 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
         right: &Scalar,
         inverted: bool,
     ) -> Option<bool> {
-        PredicateEvaluatorDefaults::eval_binary_scalars(op, left, right, inverted)
+        KernelPredicateEvaluatorDefaults::eval_binary_scalars(op, left, right, inverted)
     }
 
     fn finish_eval_variadic(
@@ -92,6 +92,6 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
         exprs: impl IntoIterator<Item = Option<bool>>,
         inverted: bool,
     ) -> Option<bool> {
-        PredicateEvaluatorDefaults::finish_eval_variadic(op, exprs, inverted)
+        KernelPredicateEvaluatorDefaults::finish_eval_variadic(op, exprs, inverted)
     }
 }

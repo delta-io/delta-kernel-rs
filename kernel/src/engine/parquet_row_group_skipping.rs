@@ -2,11 +2,11 @@
 use crate::expressions::{
     BinaryExpression, ColumnName, Expression, Scalar, UnaryExpression, VariadicExpression,
 };
+use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::parquet::arrow::arrow_reader::ArrowReaderBuilder;
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::file::statistics::Statistics;
 use crate::parquet::schema::types::ColumnDescPtr;
-use crate::predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::schema::{DataType, PrimitiveType};
 use chrono::{DateTime, Days};
 use std::collections::{HashMap, HashSet};
@@ -57,7 +57,7 @@ impl<'a> RowGroupFilter<'a> {
 
     /// Applies a filtering predicate to a row group. Return value false means to skip it.
     fn apply(row_group: &'a RowGroupMetaData, predicate: &Expression) -> bool {
-        use crate::predicates::PredicateEvaluator as _;
+        use crate::kernel_predicates::KernelPredicateEvaluator as _;
         RowGroupFilter::new(row_group, predicate).eval_sql_where(predicate) != Some(false)
     }
 

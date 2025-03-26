@@ -43,7 +43,7 @@ fn test_default_eval_scalar() {
     ];
     for (value, inverted, expect) in test_cases.into_iter() {
         assert_eq!(
-            PredicateEvaluatorDefaults::eval_scalar(&value, inverted),
+            KernelPredicateEvaluatorDefaults::eval_scalar(&value, inverted),
             expect,
             "value: {value:?} inverted: {inverted}"
         );
@@ -100,7 +100,7 @@ fn test_default_partial_cmp_scalars() {
     ];
 
     // scalars of different types are always incomparable
-    let compare = PredicateEvaluatorDefaults::partial_cmp_scalars;
+    let compare = KernelPredicateEvaluatorDefaults::partial_cmp_scalars;
     for (i, a) in smaller_values.iter().enumerate() {
         for b in smaller_values.iter().skip(i + 1) {
             for op in [Less, Equal, Greater] {
@@ -193,7 +193,7 @@ fn test_eval_binary_scalars() {
     let smaller_value = Scalar::Long(1);
     let larger_value = Scalar::Long(10);
     for inverted in [true, false] {
-        let compare = PredicateEvaluatorDefaults::eval_binary_scalars;
+        let compare = KernelPredicateEvaluatorDefaults::eval_binary_scalars;
         expect_eq!(
             compare(Equal, &smaller_value, &smaller_value, inverted),
             Some(!inverted),
@@ -269,7 +269,7 @@ fn test_eval_binary_columns() {
         (column_name!("x"), Scalar::from(1)),
         (column_name!("y"), Scalar::from(10)),
     ]);
-    let filter = DefaultPredicateEvaluator::from(columns);
+    let filter = DefaultKernelPredicateEvaluator::from(columns);
     let x = column_expr!("x");
     let y = column_expr!("y");
     for inverted in [true, false] {
@@ -307,7 +307,7 @@ fn test_eval_variadic() {
         (&[Some(false), Some(true), None], Some(false), Some(true)),
         (&[Some(true), Some(false), None], Some(false), Some(true)),
     ];
-    let filter = DefaultPredicateEvaluator::from(UnimplementedColumnResolver);
+    let filter = DefaultKernelPredicateEvaluator::from(UnimplementedColumnResolver);
     for (inputs, expect_and, expect_or) in test_cases.iter() {
         let inputs: Vec<_> = inputs
             .iter()
@@ -343,7 +343,7 @@ fn test_eval_column() {
     ];
     let col = &column_name!("x");
     for (input, expect) in &test_cases {
-        let filter = DefaultPredicateEvaluator::from(input.clone());
+        let filter = DefaultKernelPredicateEvaluator::from(input.clone());
         for inverted in [true, false] {
             expect_eq!(
                 filter.eval_column(col, inverted),
@@ -362,7 +362,7 @@ fn test_eval_not() {
         (Scalar::Null(DataType::BOOLEAN), None),
         (Scalar::Long(1), None),
     ];
-    let filter = DefaultPredicateEvaluator::from(UnimplementedColumnResolver);
+    let filter = DefaultKernelPredicateEvaluator::from(UnimplementedColumnResolver);
     for (input, expect) in test_cases {
         let input = input.into();
         for inverted in [true, false] {
@@ -378,7 +378,7 @@ fn test_eval_not() {
 #[test]
 fn test_eval_is_null() {
     let expr = column_expr!("x");
-    let filter = DefaultPredicateEvaluator::from(Scalar::from(1));
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
     expect_eq!(
         filter.eval_unary(UnaryOperator::IsNull, &expr, true),
         Some(true),
@@ -408,7 +408,7 @@ fn test_eval_distinct() {
     let one = &Scalar::from(1);
     let two = &Scalar::from(2);
     let null = &Scalar::Null(DataType::INTEGER);
-    let filter = DefaultPredicateEvaluator::from(one.clone());
+    let filter = DefaultKernelPredicateEvaluator::from(one.clone());
     let col = &column_name!("x");
     expect_eq!(
         filter.eval_distinct(col, one, true),
@@ -441,7 +441,7 @@ fn test_eval_distinct() {
         "DISTINCT(x, NULL) (x = 1)"
     );
 
-    let filter = DefaultPredicateEvaluator::from(null.clone());
+    let filter = DefaultKernelPredicateEvaluator::from(null.clone());
     expect_eq!(
         filter.eval_distinct(col, one, true),
         Some(false),
@@ -470,7 +470,7 @@ fn test_eval_distinct() {
 fn eval_binary() {
     let col = column_expr!("x");
     let val = Expression::literal(10);
-    let filter = DefaultPredicateEvaluator::from(Scalar::from(1));
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
 
     // unsupported
     expect_eq!(
@@ -585,8 +585,8 @@ fn test_sql_where() {
     const NULL: Expr = Expr::Literal(Scalar::Null(DataType::BOOLEAN));
     const FALSE: Expr = Expr::Literal(Scalar::Boolean(false));
     const TRUE: Expr = Expr::Literal(Scalar::Boolean(true));
-    let null_filter = DefaultPredicateEvaluator::from(NullColumnResolver);
-    let empty_filter = DefaultPredicateEvaluator::from(EmptyColumnResolver);
+    let null_filter = DefaultKernelPredicateEvaluator::from(NullColumnResolver);
+    let empty_filter = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
 
     // Basic sanity check
     expect_eq!(null_filter.eval_sql_where(&VAL), None, "WHERE {VAL}");

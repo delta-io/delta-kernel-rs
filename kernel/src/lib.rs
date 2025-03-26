@@ -88,8 +88,8 @@ pub mod table_properties;
 pub mod transaction;
 
 pub mod arrow;
+pub(crate) mod kernel_predicates;
 pub mod parquet;
-pub(crate) mod predicates;
 pub(crate) mod utils;
 
 #[cfg(feature = "developer-visibility")]
