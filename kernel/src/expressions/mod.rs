@@ -184,15 +184,9 @@ impl VariadicExpression {
 impl Expression {
     /// Returns a set of columns referenced by this expression.
     pub fn references(&self) -> HashSet<&ColumnName> {
-        let mut set = HashSet::new();
-
-        for expr in self.walk() {
-            if let Self::Column(name) = expr {
-                set.insert(name);
-            }
-        }
-
-        set
+        let mut references = transforms::GetColumnReferences::default();
+        let _ = references.transform(self);
+        references.into_inner()
     }
 
     /// Create a new column name expression from input satisfying `FromIterator for ColumnName`.
@@ -306,26 +300,6 @@ impl Expression {
     pub fn variadic(op: VariadicOperator, exprs: impl IntoIterator<Item = Self>) -> Self {
         let exprs = exprs.into_iter().collect::<Vec<_>>();
         Self::Variadic(VariadicExpression { op, exprs })
-    }
-
-    fn walk(&self) -> impl Iterator<Item = &Self> + '_ {
-        use Expression::*;
-        let mut stack = vec![self];
-        std::iter::from_fn(move || {
-            let expr = stack.pop()?;
-            match expr {
-                Literal(_) => {}
-                Column { .. } => {}
-                Struct(exprs) => stack.extend(exprs),
-                Unary(UnaryExpression { expr, .. }) => stack.push(expr),
-                Binary(BinaryExpression { left, right, .. }) => {
-                    stack.push(left);
-                    stack.push(right);
-                }
-                Variadic(VariadicExpression { exprs, .. }) => stack.extend(exprs),
-            }
-            Some(expr)
-        })
     }
 }
 

@@ -2,6 +2,7 @@ use crate::expressions::{
     BinaryExpression, ColumnName, Expression, Scalar, UnaryExpression, VariadicExpression,
 };
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 /// Generic framework for recursive bottom-up expression transforms. Transformations return
 /// `Option<Cow>` with the following semantics:
@@ -173,6 +174,25 @@ pub trait ExpressionTransform<'a> {
             Borrowed(_) => Borrowed(v),
         };
         Some(v)
+    }
+}
+
+/// Retrieves the set of column names referenced by an expression.
+#[derive(Default)]
+pub(crate) struct GetColumnReferences<'a> {
+    references: HashSet<&'a ColumnName>,
+}
+
+impl<'a> GetColumnReferences<'a> {
+    pub(crate) fn into_inner(self) -> HashSet<&'a ColumnName> {
+        self.references
+    }
+}
+
+impl<'a> ExpressionTransform<'a> for GetColumnReferences<'a> {
+    fn transform_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+        self.references.insert(name);
+        Some(Cow::Borrowed(name))
     }
 }
 
