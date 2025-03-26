@@ -15,7 +15,9 @@ use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
 use crate::schema::{DataType, PrimitiveType, SchemaRef, SchemaTransform, StructField, StructType};
-use crate::{Engine, EngineData, ExpressionEvaluator, JsonHandler, RowVisitor as _};
+use crate::{
+    Engine, EngineData, ExpressionEvaluator, JsonHandler, PredicateEvaluator, RowVisitor as _,
+};
 
 #[cfg(test)]
 mod tests;
@@ -50,8 +52,8 @@ fn as_sql_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
 pub(crate) struct DataSkippingFilter {
     stats_schema: SchemaRef,
     select_stats_evaluator: Arc<dyn ExpressionEvaluator>,
-    skipping_evaluator: Arc<dyn ExpressionEvaluator>,
-    filter_evaluator: Arc<dyn ExpressionEvaluator>,
+    skipping_evaluator: Arc<dyn PredicateEvaluator>,
+    filter_evaluator: Arc<dyn PredicateEvaluator>,
     json_handler: Arc<dyn JsonHandler>,
 }
 
@@ -65,9 +67,6 @@ impl DataSkippingFilter {
         engine: &dyn Engine,
         physical_predicate: Option<(PredicateRef, SchemaRef)>,
     ) -> Option<Self> {
-        static PREDICATE_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
-            DataType::struct_type([StructField::nullable("predicate", DataType::BOOLEAN)])
-        });
         static STATS_EXPR: LazyLock<Expr> = LazyLock::new(|| column_expr!("add.stats"));
         static FILTER_PRED: LazyLock<Pred> =
             LazyLock::new(|| column_expr!("predicate").distinct(Expr::literal(false)));
@@ -140,17 +139,14 @@ impl DataSkippingFilter {
             DataType::STRING,
         );
 
-        let skipping_evaluator = engine.evaluation_handler().new_expression_evaluator(
+        let skipping_evaluator = engine.evaluation_handler().new_predicate_evaluator(
             stats_schema.clone(),
-            Expr::struct_from([as_sql_data_skipping_predicate(&predicate)?]),
-            PREDICATE_SCHEMA.clone(),
+            as_sql_data_skipping_predicate(&predicate)?,
         );
 
-        let filter_evaluator = engine.evaluation_handler().new_expression_evaluator(
-            stats_schema.clone(),
-            FILTER_PRED.clone(),
-            DataType::BOOLEAN,
-        );
+        let filter_evaluator = engine
+            .evaluation_handler()
+            .new_predicate_evaluator(stats_schema.clone(), FILTER_PRED.clone());
 
         Some(Self {
             stats_schema,

@@ -15,7 +15,16 @@ use delta_kernel::expressions::{
 /// # Safety
 /// Engine is responsible for passing a valid SharedExpression
 #[no_mangle]
-pub unsafe extern "C" fn free_kernel_predicate(data: Handle<SharedExpression>) {
+pub unsafe extern "C" fn free_kernel_expression(data: Handle<SharedExpression>) {
+    data.drop_handle();
+}
+
+/// Free the memory the passed SharedPredicate
+///
+/// # Safety
+/// Engine is responsible for passing a valid SharedPredicate
+#[no_mangle]
+pub unsafe extern "C" fn free_kernel_predicate(data: Handle<SharedPredicate>) {
     data.drop_handle();
 }
 
