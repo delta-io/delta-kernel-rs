@@ -534,8 +534,7 @@ pub(crate) struct Cdc {
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-struct SetTransaction {
+pub(crate) struct SetTransaction {
     /// A unique identifier for the application performing the transaction.
     pub(crate) app_id: String,
 
