@@ -1,9 +1,9 @@
 //! A simple, single threaded, [`Engine`] that can only read from the local filesystem
 
-use super::arrow_expression::ArrowExpressionHandler;
+use super::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::{
-    DeltaResult, Engine, Error, ExpressionHandler, FileDataReadResultIterator, FileMeta,
+    DeltaResult, Engine, Error, EvaluationHandler, FileDataReadResultIterator, FileMeta,
     FileSystemClient, JsonHandler, ParquetHandler, PredicateRef, SchemaRef,
 };
 
@@ -23,7 +23,7 @@ pub struct SyncEngine {
     fs_client: Arc<fs_client::SyncFilesystemClient>,
     json_handler: Arc<json::SyncJsonHandler>,
     parquet_handler: Arc<parquet::SyncParquetHandler>,
-    expression_handler: Arc<ArrowExpressionHandler>,
+    evaluation_handler: Arc<ArrowEvaluationHandler>,
 }
 
 impl SyncEngine {
@@ -33,14 +33,14 @@ impl SyncEngine {
             fs_client: Arc::new(fs_client::SyncFilesystemClient {}),
             json_handler: Arc::new(json::SyncJsonHandler {}),
             parquet_handler: Arc::new(parquet::SyncParquetHandler {}),
-            expression_handler: Arc::new(ArrowExpressionHandler {}),
+            evaluation_handler: Arc::new(ArrowEvaluationHandler {}),
         }
     }
 }
 
 impl Engine for SyncEngine {
-    fn expression_handler(&self) -> Arc<dyn ExpressionHandler> {
-        self.expression_handler.clone()
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+        self.evaluation_handler.clone()
     }
 
     fn file_system_client(&self) -> Arc<dyn FileSystemClient> {

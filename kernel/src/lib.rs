@@ -35,7 +35,7 @@
 //!
 //! ## Expression handling
 //!
-//! Expression handling is done via the [`ExpressionHandler`], which in turn allows the creation of
+//! Expression handling is done via the [`EvaluationHandler`], which in turn allows the creation of
 //! [`ExpressionEvaluator`]s. These evaluators are created for a specific predicate [`Expression`]
 //! and allow evaluation of that predicate for a specific batches of data.
 //!
@@ -313,8 +313,20 @@ impl<T: Any + Send + Sync> AsAny for T {
 pub trait ExpressionEvaluator: AsAny {
     /// Evaluate the expression on a given EngineData.
     ///
-    /// Contains one value for each row of the input.
+    /// Produces one value for each row of the input.
     /// The data type of the output is same as the type output of the expression this evaluator is using.
+    fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>>;
+}
+
+/// Trait for implementing a Predicate evaluator.
+///
+/// It contains one Predicate which can be evaluated on multiple ColumnarBatches.
+/// Connectors can implement this trait to optimize the evaluation using the
+/// connector specific capabilities.
+pub trait PredicateEvaluator: AsAny {
+    /// Evaluate the predicate on a given EngineData.
+    ///
+    /// Produces one boolean value for each row of the input.
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>>;
 }
 
@@ -322,7 +334,7 @@ pub trait ExpressionEvaluator: AsAny {
 ///
 /// Delta Kernel can use this handler to evaluate predicate on partition filters,
 /// fill up partition column values and any computation on data using Expressions.
-pub trait ExpressionHandler: AsAny {
+pub trait EvaluationHandler: AsAny {
     /// Create an [`ExpressionEvaluator`] that can evaluate the given [`Expression`]
     /// on columnar batches with the given [`Schema`] to produce data of [`DataType`].
     ///
@@ -340,6 +352,21 @@ pub trait ExpressionHandler: AsAny {
         expression: Expression,
         output_type: DataType,
     ) -> Arc<dyn ExpressionEvaluator>;
+
+    /// Create a [`PredicateEvaluator`] that can evaluate the given [`Predicate`] on columnar
+    /// batches with the given [`Schema`] to produce a column of boolean results.
+    ///
+    /// # Parameters
+    ///
+    /// - `schema`: Schema of the input data.
+    /// - `predicate`: Predicate to evaluate.
+    ///
+    /// [`Schema`]: crate::schema::StructType
+    fn new_predicate_evaluator(
+        &self,
+        schema: SchemaRef,
+        predicate: Predicate,
+    ) -> Arc<dyn PredicateEvaluator>;
 }
 
 /// Provides file system related functionalities to Delta Kernel.
@@ -462,8 +489,8 @@ pub trait ParquetHandler: AsAny {
 /// Engines/Connectors are expected to pass an implementation of this trait when reading a Delta
 /// table.
 pub trait Engine: AsAny {
-    /// Get the connector provided [`ExpressionHandler`].
-    fn expression_handler(&self) -> Arc<dyn ExpressionHandler>;
+    /// Get the connector provided [`EvaluationHandler`].
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler>;
 
     /// Get the connector provided [`FileSystemClient`]
     fn file_system_client(&self) -> Arc<dyn FileSystemClient>;

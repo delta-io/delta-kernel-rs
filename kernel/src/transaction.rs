@@ -186,7 +186,7 @@ fn generate_adds<'a>(
     engine: &dyn Engine,
     write_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
 ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a {
-    let expression_handler = engine.expression_handler();
+    let evaluation_handler = engine.evaluation_handler();
     let write_metadata_schema = get_write_metadata_schema();
     let log_schema = get_log_add_schema();
 
@@ -196,7 +196,7 @@ fn generate_adds<'a>(
                 .fields()
                 .map(|f| Expression::column([f.name()])),
         )]);
-        let adds_evaluator = expression_handler.new_expression_evaluator(
+        let adds_evaluator = evaluation_handler.new_expression_evaluator(
             write_metadata_schema.clone(),
             adds_expr,
             log_schema.clone().into(),
@@ -320,7 +320,7 @@ fn generate_commit_info(
         .shift_remove("inCommitTimestamp");
     commit_info_field.data_type = DataType::Struct(commit_info_data_type);
 
-    let commit_info_evaluator = engine.expression_handler().new_expression_evaluator(
+    let commit_info_evaluator = engine.evaluation_handler().new_expression_evaluator(
         engine_commit_info_schema.into(),
         commit_info_expr,
         commit_info_empty_struct_schema.into(),
@@ -334,9 +334,9 @@ mod tests {
     use super::*;
 
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::arrow_expression::ArrowExpressionHandler;
+    use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::schema::MapType;
-    use crate::{ExpressionHandler, FileSystemClient, JsonHandler, ParquetHandler};
+    use crate::{EvaluationHandler, FileSystemClient, JsonHandler, ParquetHandler};
 
     use crate::arrow::array::{MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
@@ -344,16 +344,16 @@ mod tests {
     use crate::arrow::json::writer::LineDelimitedWriter;
     use crate::arrow::record_batch::RecordBatch;
 
-    struct ExprEngine(Arc<dyn ExpressionHandler>);
+    struct ExprEngine(Arc<dyn EvaluationHandler>);
 
     impl ExprEngine {
         fn new() -> Self {
-            ExprEngine(Arc::new(ArrowExpressionHandler))
+            ExprEngine(Arc::new(ArrowEvaluationHandler))
         }
     }
 
     impl Engine for ExprEngine {
-        fn expression_handler(&self) -> Arc<dyn ExpressionHandler> {
+        fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
             self.0.clone()
         }
 

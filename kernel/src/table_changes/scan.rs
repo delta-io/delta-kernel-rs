@@ -286,7 +286,7 @@ fn read_scan_file(
         physical_to_logical_expr(&scan_file, global_state.logical_schema.as_ref(), all_fields)?;
     let physical_schema =
         scan_file_physical_schema(&scan_file, global_state.physical_schema.as_ref());
-    let phys_to_logical_eval = engine.expression_handler().new_expression_evaluator(
+    let phys_to_logical_eval = engine.evaluation_handler().new_expression_evaluator(
         physical_schema.clone(),
         physical_to_logical_expr,
         global_state.logical_schema.clone().into(),

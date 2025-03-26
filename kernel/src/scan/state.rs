@@ -110,7 +110,7 @@ pub fn transform_to_logical(
 ) -> DeltaResult<Box<dyn EngineData>> {
     match transform {
         Some(ref transform) => engine
-            .expression_handler()
+            .evaluation_handler()
             .new_expression_evaluator(
                 physical_schema.clone(),
                 transform.as_ref().clone(), // TODO: Maybe eval should take a ref
