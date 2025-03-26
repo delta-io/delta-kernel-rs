@@ -108,7 +108,9 @@ impl Snapshot {
     }
 
     /// Table [`Protocol`] at this `Snapshot`s version.
-    pub fn protocol(&self) -> &Protocol {
+    #[allow(dead_code)]
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn protocol(&self) -> &Protocol {
         self.table_configuration.protocol()
     }
 

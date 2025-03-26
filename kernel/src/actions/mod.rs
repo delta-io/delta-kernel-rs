@@ -107,10 +107,10 @@ impl Default for Format {
     }
 }
 
+// TODO should this be pub?
 #[derive(Debug, Default, Clone, PartialEq, Eq, Schema)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 #[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
-pub(crate) struct Metadata {
+pub struct Metadata {
     /// Unique identifier for this table
     pub(crate) id: String,
     /// User-provided identifier for this table
@@ -138,6 +138,7 @@ impl Metadata {
     }
 
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[allow(dead_code)]
     pub(crate) fn configuration(&self) -> &HashMap<String, String> {
         &self.configuration
     }
@@ -179,7 +180,7 @@ pub(crate) struct Protocol {
 impl Protocol {
     /// Try to create a new Protocol instance from reader/writer versions and table features. This
     /// can fail if the protocol is invalid.
-    pub fn try_new(
+    pub(crate) fn try_new(
         min_reader_version: i32,
         min_writer_version: i32,
         reader_features: Option<impl IntoIterator<Item = impl Into<String>>>,
@@ -213,40 +214,42 @@ impl Protocol {
 
     /// Create a new Protocol by visiting the EngineData and extracting the first protocol row into
     /// a Protocol instance. If no protocol row is found, returns Ok(None).
-    pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
         let mut visitor = ProtocolVisitor::default();
         visitor.visit_rows_of(data)?;
         Ok(visitor.protocol)
     }
 
     /// This protocol's minimum reader version
-    pub fn min_reader_version(&self) -> i32 {
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn min_reader_version(&self) -> i32 {
         self.min_reader_version
     }
 
     /// This protocol's minimum writer version
-    pub fn min_writer_version(&self) -> i32 {
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn min_writer_version(&self) -> i32 {
         self.min_writer_version
     }
 
     /// Get the reader features for the protocol
-    pub fn reader_features(&self) -> Option<&[String]> {
+    pub(crate) fn reader_features(&self) -> Option<&[String]> {
         self.reader_features.as_deref()
     }
 
     /// Get the writer features for the protocol
-    pub fn writer_features(&self) -> Option<&[String]> {
+    pub(crate) fn writer_features(&self) -> Option<&[String]> {
         self.writer_features.as_deref()
     }
 
     /// True if this protocol has the requested reader feature
-    pub fn has_reader_feature(&self, feature: &ReaderFeatures) -> bool {
+    pub(crate) fn has_reader_feature(&self, feature: &ReaderFeatures) -> bool {
         self.reader_features()
             .is_some_and(|features| features.iter().any(|f| f == feature.as_ref()))
     }
 
     /// True if this protocol has the requested writer feature
-    pub fn has_writer_feature(&self, feature: &WriterFeatures) -> bool {
+    pub(crate) fn has_writer_feature(&self, feature: &WriterFeatures) -> bool {
         self.writer_features()
             .is_some_and(|features| features.iter().any(|f| f == feature.as_ref()))
     }
@@ -254,7 +257,7 @@ impl Protocol {
     /// Check if reading a table with this protocol is supported. That is: does the kernel support
     /// the specified protocol reader version and all enabled reader features? If yes, returns unit
     /// type, otherwise will return an error.
-    pub fn ensure_read_supported(&self) -> DeltaResult<()> {
+    pub(crate) fn ensure_read_supported(&self) -> DeltaResult<()> {
         match &self.reader_features {
             // if min_reader_version = 3 and all reader features are subset of supported => OK
             Some(reader_features) if self.min_reader_version == 3 => {
@@ -284,7 +287,7 @@ impl Protocol {
 
     /// Check if writing to a table with this protocol is supported. That is: does the kernel
     /// support the specified protocol writer version and all enabled writer features?
-    pub fn ensure_write_supported(&self) -> DeltaResult<()> {
+    pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
         match &self.writer_features {
             Some(writer_features) if self.min_writer_version == 7 => {
                 // if we're on version 7, make sure we support all the specified features
@@ -435,6 +438,7 @@ pub(crate) struct Add {
 
 impl Add {
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[allow(dead_code)]
     pub(crate) fn dv_unique_id(&self) -> Option<String> {
         self.deletion_vector.as_ref().map(|dv| dv.unique_id())
     }
