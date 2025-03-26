@@ -122,7 +122,6 @@ pub(crate) struct Metadata {
     /// Schema of the table
     pub(crate) schema_string: String,
     /// Column names by which the data should be partitioned
-    // TODO: after FFI no longer depends directly on this, make pub(crate)
     pub(crate) partition_columns: Vec<String>,
     /// The time when this metadata action is created, in milliseconds since the Unix epoch
     pub(crate) created_time: Option<i64>,
