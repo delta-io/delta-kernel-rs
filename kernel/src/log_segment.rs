@@ -186,19 +186,21 @@ impl LogSegment {
         );
         LogSegment::try_new(ascending_commit_files, vec![], log_root, end_version)
     }
-    /// Read a stream of log data from this log segment.
+
+    /// Read a stream of actions from this log segment. This returns an iterator of (EngineData,
+    /// bool) pairs, where the boolean flag indicates whether the data was read from a commit file
+    /// (true) or a checkpoint file (false).
     ///
     /// The log files will be read from most recent to oldest.
-    /// The boolean flags indicates whether the data was read from
-    /// a commit file (true) or a checkpoint file (false).
     ///
-    /// `read_schema` is the schema to read the log files with. This can be used
-    /// to project the log files to a subset of the columns.
+    /// `commit_read_schema` is the (physical) schema to read the commit files with, and
+    /// `checkpoint_read_schema` is the (physical) schema to read checkpoint files with. This can be
+    /// used to project the log files to a subset of the columns.
     ///
     /// `meta_predicate` is an optional expression to filter the log files with. It is _NOT_ the
     /// query's predicate, but rather a predicate for filtering log files themselves.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    pub(crate) fn replay(
+    pub(crate) fn read_actions(
         &self,
         engine: &dyn Engine,
         commit_read_schema: SchemaRef,
@@ -399,7 +401,7 @@ impl LogSegment {
             )))
         });
         // read the same protocol and metadata schema for both commits and checkpoints
-        self.replay(engine, schema.clone(), schema, META_PREDICATE.clone())
+        self.read_actions(engine, schema.clone(), schema, META_PREDICATE.clone())
     }
 }
 
