@@ -154,7 +154,7 @@ impl LogReplayScanner {
         // As a result, we would read the file path for the remove action, which is unnecessary because
         // all of the rows will be filtered by the predicate. Instead, we wait until deletion
         // vectors are resolved so that we can skip both actions in the pair.
-        let action_iter = engine.get_json_handler().read_json_files(
+        let action_iter = engine.json_handler().read_json_files(
             &[commit_file.location.clone()],
             visitor_schema,
             None, // not safe to apply data skipping yet
@@ -226,16 +226,15 @@ impl LogReplayScanner {
         let remove_dvs = Arc::new(remove_dvs);
 
         let schema = FileActionSelectionVisitor::schema();
-        let action_iter = engine.get_json_handler().read_json_files(
-            &[commit_file.location.clone()],
-            schema,
-            None,
-        )?;
+        let action_iter =
+            engine
+                .json_handler()
+                .read_json_files(&[commit_file.location.clone()], schema, None)?;
         let commit_version = commit_file
             .version
             .try_into()
             .map_err(|_| Error::generic("Failed to convert commit version to i64"))?;
-        let evaluator = engine.get_expression_handler().get_evaluator(
+        let evaluator = engine.evaluation_handler().new_expression_evaluator(
             get_log_add_schema().clone(),
             cdf_scan_row_expression(timestamp, commit_version),
             cdf_scan_row_schema().into(),

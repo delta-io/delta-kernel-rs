@@ -47,7 +47,7 @@ mod tests {
         base_url: &Url,
         engine_data: impl Fn() -> Box<dyn EngineData>,
     ) {
-        let json = engine.get_json_handler();
+        let json = engine.json_handler();
         let get_data = || Box::new(std::iter::once(Ok(engine_data())));
 
         let expected_names: Vec<Path> = (1..4)
@@ -61,7 +61,7 @@ mod tests {
         let path = base_url.join("other").unwrap();
         json.write_json_file(&path, get_data(), false).unwrap();
 
-        let fs = engine.get_file_system_client();
+        let fs = engine.file_system_client();
 
         // list files after an offset
         let test_url = base_url.join(expected_names[0].as_ref()).unwrap();

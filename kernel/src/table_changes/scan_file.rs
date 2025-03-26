@@ -326,13 +326,9 @@ mod tests {
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let log_root = table_root.join("_delta_log/").unwrap();
-        let log_segment = LogSegment::for_table_changes(
-            engine.get_file_system_client().as_ref(),
-            log_root,
-            0,
-            None,
-        )
-        .unwrap();
+        let log_segment =
+            LogSegment::for_table_changes(engine.file_system_client().as_ref(), log_root, 0, None)
+                .unwrap();
         let table_schema = StructType::new([
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),

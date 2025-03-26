@@ -286,7 +286,7 @@ fn read_scan_file(
         physical_to_logical_expr(&scan_file, global_state.logical_schema.as_ref(), all_fields)?;
     let physical_schema =
         scan_file_physical_schema(&scan_file, global_state.physical_schema.as_ref());
-    let phys_to_logical_eval = engine.get_expression_handler().get_evaluator(
+    let phys_to_logical_eval = engine.evaluation_handler().new_expression_evaluator(
         physical_schema.clone(),
         physical_to_logical_expr,
         global_state.logical_schema.clone().into(),
@@ -301,7 +301,7 @@ fn read_scan_file(
         size: 0,
         location,
     };
-    let read_result_iter = engine.get_parquet_handler().read_parquet_files(
+    let read_result_iter = engine.parquet_handler().read_parquet_files(
         &[file],
         physical_schema,
         physical_predicate,

@@ -10,7 +10,7 @@ use super::*;
 use crate::expressions::*;
 use crate::schema::{ArrayType, StructField, StructType};
 use crate::DataType as DeltaDataTypes;
-use crate::ExpressionHandlerExtension as _;
+use crate::EvaluationHandlerExtension as _;
 
 #[test]
 fn test_array_column() {
@@ -312,7 +312,7 @@ fn test_null_row() {
         ),
         StructField::nullable("c", crate::schema::DataType::STRING),
     ]));
-    let handler = ArrowExpressionHandler;
+    let handler = ArrowEvaluationHandler;
     let result = handler.null_row(schema.clone()).unwrap();
     let expected = RecordBatch::try_new(
         Arc::new(schema.as_ref().try_into().unwrap()),
@@ -343,13 +343,13 @@ fn test_null_row_err() {
         "a",
         crate::schema::DataType::STRING,
     )]));
-    let handler = ArrowExpressionHandler;
+    let handler = ArrowEvaluationHandler;
     assert!(handler.null_row(not_null_schema).is_err());
 }
 
 // helper to take values/schema to pass to `create_one` and assert the result = expected
 fn assert_create_one(values: &[Scalar], schema: SchemaRef, expected: RecordBatch) {
-    let handler = ArrowExpressionHandler;
+    let handler = ArrowEvaluationHandler;
     let actual = handler.create_one(schema, values).unwrap();
     let actual_rb: RecordBatch = actual
         .into_any()
@@ -482,14 +482,14 @@ fn test_create_one_not_null_struct() {
             StructField::nullable("c", DeltaDataTypes::INTEGER),
         ]),
     )]));
-    let handler = ArrowExpressionHandler;
+    let handler = ArrowEvaluationHandler;
     assert!(handler.create_one(schema, values).is_err());
 }
 
 #[test]
 fn test_create_one_top_level_null() {
     let values = &[Scalar::Null(DeltaDataTypes::INTEGER)];
-    let handler = ArrowExpressionHandler;
+    let handler = ArrowEvaluationHandler;
 
     let schema = Arc::new(StructType::new([StructField::not_null(
         "col_1",

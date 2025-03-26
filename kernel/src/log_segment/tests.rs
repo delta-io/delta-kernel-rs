@@ -835,7 +835,7 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
     let checkpoint_batch = add_batch_simple(get_log_schema().clone());
 
     let mut iter = LogSegment::process_sidecars(
-        engine.get_parquet_handler(),
+        engine.parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
         get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?,
@@ -873,7 +873,7 @@ fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<
     );
 
     let mut iter = LogSegment::process_sidecars(
-        engine.get_parquet_handler(),
+        engine.parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
         read_schema.clone(),
@@ -901,7 +901,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
     );
 
     let mut iter = LogSegment::process_sidecars(
-        engine.get_parquet_handler(),
+        engine.parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
         get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?,
@@ -941,7 +941,7 @@ fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     });
 
     let mut iter = LogSegment::process_sidecars(
-        engine.get_parquet_handler(),
+        engine.parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
         read_schema.clone(),

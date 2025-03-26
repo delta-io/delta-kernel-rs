@@ -349,7 +349,7 @@ pub(crate) fn scan_action_iter(
     physical_predicate: Option<(ExpressionRef, SchemaRef)>,
 ) -> impl Iterator<Item = DeltaResult<ScanData>> {
     let mut log_scanner = LogReplayScanner::new(engine, physical_predicate);
-    let add_transform = engine.get_expression_handler().get_evaluator(
+    let add_transform = engine.evaluation_handler().new_expression_evaluator(
         get_log_add_schema().clone(),
         get_add_transform_expr(),
         SCAN_ROW_DATATYPE.clone(),
