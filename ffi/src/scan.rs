@@ -215,9 +215,12 @@ fn kernel_scan_data_next_impl(
         .data
         .lock()
         .map_err(|_| Error::generic("poisoned mutex"))?;
-    if let Some((data, sel_vec, transforms)) = data.next().transpose()? {
+    if let Some(scan_data) = data.next().transpose()? {
+        let (data, sel_vec) = scan_data.filtered_data;
         let bool_slice = KernelBoolSlice::from(sel_vec);
-        let transform_map = CTransforms { transforms };
+        let transform_map = CTransforms {
+            transforms: scan_data.transforms,
+        };
         (engine_visitor)(engine_context, data.into(), bool_slice, &transform_map);
         Ok(true)
     } else {

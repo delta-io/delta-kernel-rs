@@ -211,11 +211,12 @@ fn try_main() -> DeltaResult<()> {
             let scan = ScanBuilder::new(snapshot).build()?;
             let scan_data = scan.scan_data(&engine)?;
             for res in scan_data {
-                let (data, vector, transforms) = res?;
+                let scan_data = res?;
+                let (data, sel_vec) = scan_data.filtered_data;
                 delta_kernel::scan::state::visit_scan_files(
                     data.as_ref(),
-                    &vector,
-                    &transforms,
+                    &sel_vec,
+                    &scan_data.transforms,
                     (),
                     print_scan_file,
                 )?;

@@ -361,11 +361,12 @@ fn read_with_scan_data(
     let scan_data = scan.scan_data(engine)?;
     let mut scan_files = vec![];
     for data in scan_data {
-        let (data, vec, transforms) = data?;
+        let scan_data = data?;
+        let (data, sel_vec) = scan_data.filtered_data;
         scan_files = visit_scan_files(
             data.as_ref(),
-            &vec,
-            &transforms,
+            &sel_vec,
+            &scan_data.transforms,
             scan_files,
             scan_data_callback,
         )?;

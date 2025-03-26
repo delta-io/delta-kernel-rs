@@ -12,6 +12,7 @@ use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
+use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ColumnName, Expression, ExpressionRef, ExpressionTransform, Scalar};
 use crate::predicates::{DefaultPredicateEvaluator, EmptyColumnResolver};
 use crate::scan::state::{DvInfo, Stats};
@@ -320,10 +321,15 @@ pub(crate) enum TransformExpr {
     Partition(usize),
 }
 
-// TODO(nick): Make this a struct in a follow-on PR
-// (data, deletion_vec, transforms)
-pub type ScanData = (Box<dyn EngineData>, Vec<bool>, Vec<Option<ExpressionRef>>);
+/// Result of a data scan operation containing filtered data and associated transformations.
+pub struct ScanData {
+    /// Engine data with its selection vector indicating relevant rows
+    pub filtered_data: FilteredEngineData,
 
+    /// Row-level transformations where each expression must be applied to its corresponding row in
+    /// the `filtered_data`. If an expression is `None`, no transformation is needed for that row.
+    pub transforms: Vec<Option<ExpressionRef>>,
+}
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
 pub struct Scan {
@@ -493,15 +499,16 @@ impl Scan {
         let table_root = self.snapshot.table_root().clone();
         let physical_predicate = self.physical_predicate();
 
-        let scan_data = self.scan_data(engine.as_ref())?;
-        let scan_files_iter = scan_data
+        let scan_data_iter = self.scan_data(engine.as_ref())?;
+        let scan_files_iter = scan_data_iter
             .map(|res| {
-                let (data, vec, transforms) = res?;
+                let scan_data = res?;
+                let (data, sel_vec) = scan_data.filtered_data;
                 let scan_files = vec![];
                 state::visit_scan_files(
                     data.as_ref(),
-                    &vec,
-                    &transforms,
+                    &sel_vec,
+                    &scan_data.transforms,
                     scan_files,
                     scan_data_callback,
                 )
@@ -792,12 +799,13 @@ pub(crate) mod test_utils {
         );
         let mut batch_count = 0;
         for res in iter {
-            let (batch, sel, transforms) = res.unwrap();
-            assert_eq!(sel, expected_sel_vec);
+            let scan_data = res.unwrap();
+            let (batch, sel_vec) = scan_data.filtered_data;
+            assert_eq!(sel_vec, expected_sel_vec);
             crate::scan::state::visit_scan_files(
                 batch.as_ref(),
-                &sel,
-                &transforms,
+                &sel_vec,
+                &scan_data.transforms,
                 context.clone(),
                 validate_callback,
             )
@@ -1005,11 +1013,12 @@ mod tests {
         }
         let mut files = vec![];
         for data in scan_data {
-            let (data, vec, transforms) = data?;
+            let scan_data = data?;
+            let (data, sel_vec) = scan_data.filtered_data;
             files = state::visit_scan_files(
                 data.as_ref(),
-                &vec,
-                &transforms,
+                &sel_vec,
+                &scan_data.transforms,
                 files,
                 scan_data_callback,
             )?;

@@ -350,7 +350,10 @@ impl LogReplayScanner {
         // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
         let selection_vector = visitor.selection_vector;
         let result = add_transform.evaluate(actions)?;
-        Ok((result, selection_vector, visitor.row_transform_exprs))
+        Ok(ScanData {
+            filtered_data: (result, selection_vector),
+            transforms: visitor.row_transform_exprs,
+        })
     }
 }
 
@@ -382,7 +385,12 @@ pub(crate) fn scan_action_iter(
                 is_log_batch,
             )
         })
-        .filter(|res| res.as_ref().map_or(true, |(_, sv, _)| sv.contains(&true)))
+        .filter(|res| {
+            res.as_ref().map_or(true, |scan_data| {
+                let (_, sel_vec) = &scan_data.filtered_data;
+                sel_vec.contains(&true)
+            })
+        })
 }
 
 #[cfg(test)]
@@ -464,8 +472,8 @@ mod tests {
             None,
         );
         for res in iter {
-            let (_batch, _sel, transforms) = res.unwrap();
-            assert!(transforms.is_empty(), "Should have no transforms");
+            let scan_data = res.unwrap();
+            assert!(scan_data.transforms.is_empty(), "Should have no transforms");
         }
     }
 
@@ -510,7 +518,8 @@ mod tests {
         }
 
         for res in iter {
-            let (_batch, _sel, transforms) = res.unwrap();
+            let scan_data = res.unwrap();
+            let transforms = scan_data.transforms;
             // in this case we have a metadata action first and protocol 3rd, so we expect 4 items,
             // the first and 3rd being a `None`
             assert_eq!(transforms.len(), 4, "Should have 4 transforms");
