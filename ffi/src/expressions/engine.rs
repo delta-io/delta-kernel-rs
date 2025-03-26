@@ -47,7 +47,7 @@ fn wrap_expression(state: &mut KernelExpressionVisitorState, expr: impl Into<Exp
     state.inflight_expressions.insert(expr.into())
 }
 
-pub fn unwrap_kernel_expression(
+pub(crate) fn unwrap_kernel_expression(
     state: &mut KernelExpressionVisitorState,
     exprid: usize,
 ) -> Option<Expression> {
