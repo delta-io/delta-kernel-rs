@@ -237,15 +237,9 @@ impl Display for Expression {
 impl Expression {
     /// Returns a set of columns referenced by this expression.
     pub fn references(&self) -> HashSet<&ColumnName> {
-        let mut set = HashSet::new();
-
-        for expr in self.walk() {
-            if let Self::Column(name) = expr {
-                set.insert(name);
-            }
-        }
-
-        set
+        let mut references = GetColumnReferences::default();
+        let _ = references.transform(self);
+        references.into_inner()
     }
 
     /// Create a new column name expression from input satisfying `FromIterator for ColumnName`.
@@ -370,26 +364,6 @@ impl Expression {
     /// Create a new expression `DISTINCT(self, other)`
     pub fn distinct(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::Distinct, self, other)
-    }
-
-    fn walk(&self) -> impl Iterator<Item = &Self> + '_ {
-        use Expression::*;
-        let mut stack = vec![self];
-        std::iter::from_fn(move || {
-            let expr = stack.pop()?;
-            match expr {
-                Literal(_) => {}
-                Column { .. } => {}
-                Struct(exprs) => stack.extend(exprs),
-                Unary(UnaryExpression { expr, .. }) => stack.push(expr),
-                Binary(BinaryExpression { left, right, .. }) => {
-                    stack.push(left);
-                    stack.push(right);
-                }
-                Variadic(VariadicExpression { exprs, .. }) => stack.extend(exprs),
-            }
-            Some(expr)
-        })
     }
 }
 
@@ -603,6 +577,25 @@ impl<R: Into<Expression>> std::ops::Div<R> for Expression {
 
     fn div(self, rhs: R) -> Self {
         Self::binary(BinaryOperator::Divide, self, rhs)
+    }
+}
+
+/// Retrieves the set of column names referenced by an expression.
+#[derive(Default)]
+pub(crate) struct GetColumnReferences<'a> {
+    references: HashSet<&'a ColumnName>,
+}
+
+impl<'a> GetColumnReferences<'a> {
+    pub(crate) fn into_inner(self) -> HashSet<&'a ColumnName> {
+        self.references
+    }
+}
+
+impl<'a> ExpressionTransform<'a> for GetColumnReferences<'a> {
+    fn transform_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+        self.references.insert(name);
+        Some(Cow::Borrowed(name))
     }
 }
 
