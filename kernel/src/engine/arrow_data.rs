@@ -340,7 +340,7 @@ mod tests {
         let engine = SyncEngine::new();
         let handler = engine.get_json_handler();
         let json_strings: StringArray = vec![
-            r#"{"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": ["deletionVectors"], "writerFeatures": ["invariants", "appendOnly"]}}"#,
+            r#"{"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": ["deletionVectors", "cool_feature"], "writerFeatures": ["invariants", "cool_feature", "appendOnly"]}}"#,
         ]
         .into();
         let output_schema = get_log_schema().project(&["protocol"])?;
@@ -351,11 +351,24 @@ mod tests {
         assert_eq!(protocol.min_writer_version(), 7);
         assert_eq!(
             protocol.reader_features(),
-            Some([ReaderFeatures::DeletionVectors].as_slice())
+            Some(
+                [
+                    ReaderFeatures::DeletionVectors,
+                    ReaderFeatures::Unknown("cool_feature".to_string())
+                ]
+                .as_slice()
+            )
         );
         assert_eq!(
             protocol.writer_features(),
-            Some([WriterFeatures::Invariants, WriterFeatures::AppendOnly].as_slice())
+            Some(
+                [
+                    WriterFeatures::Invariants,
+                    WriterFeatures::Unknown("cool_feature".to_string()),
+                    WriterFeatures::AppendOnly
+                ]
+                .as_slice()
+            )
         );
         Ok(())
     }

@@ -179,6 +179,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_unknown_features() {
+        let mixed_reader = &[
+            ReaderFeatures::DeletionVectors,
+            ReaderFeatures::Unknown("cool_feature".to_string()),
+            ReaderFeatures::ColumnMapping,
+        ];
+        let mixed_writer = &[
+            WriterFeatures::DeletionVectors,
+            WriterFeatures::Unknown("cool_feature".to_string()),
+            WriterFeatures::AppendOnly,
+        ];
+
+        let reader_string = serde_json::to_string(mixed_reader).unwrap();
+        let writer_string = serde_json::to_string(mixed_writer).unwrap();
+
+        assert_eq!(
+            &reader_string,
+            "[\"deletionVectors\",\"cool_feature\",\"columnMapping\"]"
+        );
+        assert_eq!(
+            &writer_string,
+            "[\"deletionVectors\",\"cool_feature\",\"appendOnly\"]"
+        );
+
+        let typed_reader: Vec<ReaderFeatures> = serde_json::from_str(&reader_string).unwrap();
+        let typed_writer: Vec<WriterFeatures> = serde_json::from_str(&writer_string).unwrap();
+
+        assert_eq!(typed_reader.len(), 3);
+        assert_eq!(&typed_reader, mixed_reader);
+        assert_eq!(typed_writer.len(), 3);
+        assert_eq!(&typed_writer, mixed_writer);
+    }
+
+    #[test]
     fn test_roundtrip_reader_features() {
         let cases = [
             (ReaderFeatures::ColumnMapping, "columnMapping"),

@@ -2,7 +2,8 @@
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
 use std::collections::{HashMap, HashSet};
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
+use std::hash::Hash;
 use std::str::FromStr;
 use std::sync::LazyLock;
 
@@ -190,14 +191,14 @@ impl Protocol {
                 )
             );
         }
-        let reader_features: Option<Vec<ReaderFeatures>> = reader_features.and_then(|f| {
+        let reader_features = reader_features.and_then(|f| {
             f.into_iter()
-                .map(|f| ReaderFeatures::from_str(&f.into()).ok())
+                .map(feature_or_unknown)
                 .collect::<Option<Vec<ReaderFeatures>>>()
         });
         let writer_features = writer_features.and_then(|f| {
             f.into_iter()
-                .map(|f| WriterFeatures::from_str(&f.into()).ok())
+                .map(feature_or_unknown)
                 .collect::<Option<Vec<WriterFeatures>>>()
         });
         Ok(Protocol {
@@ -255,7 +256,7 @@ impl Protocol {
         match &self.reader_features {
             // if min_reader_version = 3 and all reader features are subset of supported => OK
             Some(reader_features) if self.min_reader_version == 3 => {
-                ensure_reader_supported_features(reader_features, SUPPORTED_READER_FEATURES.clone())
+                ensure_supported_feature(reader_features, SUPPORTED_READER_FEATURES.clone())
             }
             // if min_reader_version = 3 and no reader features => ERROR
             // NOTE this is caught by the protocol parsing.
@@ -288,7 +289,7 @@ impl Protocol {
             Some(writer_features)
                 if self.min_reader_version == 3 && self.min_writer_version == 7 =>
             {
-                ensure_writer_supported_features(writer_features, SUPPORTED_WRITER_FEATURES.clone())
+                ensure_supported_feature(writer_features, SUPPORTED_WRITER_FEATURES.clone())
             }
             Some(_) => {
                 // there are features, but we're not on 7, so the protocol is actually broken
@@ -330,14 +331,37 @@ where
     ))
 }
 
-pub(crate) fn ensure_reader_supported_features(
-    table_features: &[ReaderFeatures],
-    supported_features: HashSet<ReaderFeatures>,
+pub(crate) trait UnknownFeature: Clone + Hash + Eq + Display + Debug {
+    fn is_unknown(&self) -> bool;
+    fn build_unknown(feature: String) -> Self;
+}
+
+impl UnknownFeature for ReaderFeatures {
+    fn is_unknown(&self) -> bool {
+        matches!(self, ReaderFeatures::Unknown(_))
+    }
+
+    fn build_unknown(feature: String) -> Self {
+        ReaderFeatures::Unknown(feature)
+    }
+}
+
+impl UnknownFeature for WriterFeatures {
+    fn is_unknown(&self) -> bool {
+        matches!(self, WriterFeatures::Unknown(_))
+    }
+
+    fn build_unknown(feature: String) -> Self {
+        WriterFeatures::Unknown(feature)
+    }
+}
+
+pub(crate) fn ensure_supported_feature<T: UnknownFeature>(
+    table_features: &[T],
+    supported_features: HashSet<T>,
 ) -> DeltaResult<()> {
-    let (unknown_features, other_features): (Vec<_>, Vec<_>) = table_features
-        .iter()
-        .cloned()
-        .partition(|f| matches!(f, ReaderFeatures::Unknown(_)));
+    let (unknown_features, other_features): (Vec<_>, Vec<_>) =
+        table_features.iter().cloned().partition(|f| f.is_unknown());
     if !unknown_features.is_empty() {
         return Err(create_feature_error(
             unknown_features,
@@ -358,32 +382,12 @@ pub(crate) fn ensure_reader_supported_features(
         })
 }
 
-pub(crate) fn ensure_writer_supported_features(
-    table_features: &[WriterFeatures],
-    supported_features: HashSet<WriterFeatures>,
-) -> DeltaResult<()> {
-    let (unknown_features, other_features): (Vec<_>, Vec<_>) = table_features
-        .iter()
-        .cloned()
-        .partition(|f| matches!(f, WriterFeatures::Unknown(_)));
-    if !unknown_features.is_empty() {
-        return Err(create_feature_error(
-            unknown_features,
-            "Unknown",
-            supported_features,
-        ));
-    }
-    let parsed_features = HashSet::from_iter(other_features);
-    parsed_features
-        .is_subset(&supported_features)
-        .then_some(())
-        .ok_or_else(|| {
-            let unsupported = parsed_features
-                .difference(&supported_features)
-                .cloned()
-                .collect::<Vec<_>>();
-            create_feature_error(unsupported, "Unsupported", supported_features)
-        })
+#[inline]
+pub(crate) fn feature_or_unknown<T: UnknownFeature + FromStr>(
+    feature: impl Into<String>,
+) -> Option<T> {
+    let f = feature.into();
+    T::from_str(&f).ok().or(Some(T::build_unknown(f)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
@@ -969,12 +973,11 @@ mod tests {
         .into_iter()
         .collect();
         let table_features = vec![ReaderFeatures::ColumnMapping];
-        ensure_reader_supported_features(&table_features, supported_features.clone()).unwrap();
+        ensure_supported_feature(&table_features, supported_features.clone()).unwrap();
 
         // test unknown features
         let table_features = vec![ReaderFeatures::Unknown("idk".into())];
-        let error =
-            ensure_reader_supported_features(&table_features, supported_features).unwrap_err();
+        let error = ensure_supported_feature(&table_features, supported_features).unwrap_err();
         dbg!(&error);
         match error {
             Error::Unsupported(e) if e ==
