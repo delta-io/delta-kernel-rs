@@ -42,6 +42,23 @@ pub unsafe extern "C" fn free_scan_data(scan_data: Handle<CScanData>) {
     scan_data.drop_handle();
 }
 
+/// Get a selection vector out of a [`CScanData`] struct
+///
+/// # Safety
+/// Engine is responsible for providing valid pointers for each argument
+#[no_mangle]
+pub unsafe extern "C" fn selection_vector_from_scan_data(
+    scan_data: Handle<CScanData>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<KernelBoolSlice> {
+    let scan_data = unsafe { scan_data.as_ref() };
+    selection_vector_from_scan_data_impl(scan_data).into_extern_result(&engine.as_ref())
+}
+
+fn selection_vector_from_scan_data_impl(scan_data: &ScanData) -> DeltaResult<KernelBoolSlice> {
+    Ok(scan_data.filtered_data.1.clone().into())
+}
+
 /// Drops a scan.
 ///
 /// # Safety
@@ -422,10 +439,10 @@ struct ContextWrapper {
 }
 
 /// Shim for ffi to call visit_scan_data. This will generally be called when iterating through scan
-/// data which provides the data handle and selection vector as each element in the iterator.
+/// data which provides the [`CScanData`] as each element in the iterator.
 ///
 /// # Safety
-/// engine is responsible for passing a valid [`ExclusiveEngineData`] and selection vector.
+/// engine is responsible for passing a valid [`CScanData`].
 #[no_mangle]
 pub unsafe extern "C" fn visit_scan_data(
     scan_data: Handle<CScanData>,

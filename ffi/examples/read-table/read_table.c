@@ -93,6 +93,17 @@ void do_visit_scan_data(void* engine_context, HandleCScanData scan_data)
 {
   print_diag("\nScan iterator found some data to read\n  Of this data, here is "
              "a selection vector\n");
+  struct EngineContext* context = engine_context;
+
+  ExternResultKernelBoolSlice selection_vector_res =
+    selection_vector_from_scan_data(scan_data, context->engine);
+  if (selection_vector_res.tag != OkKernelBoolSlice) {
+    printf("Could not get selection vector from kernel\n");
+    exit(-1);
+  }
+  KernelBoolSlice selection_vector = selection_vector_res.ok;
+  print_selection_vector("    ", &selection_vector);
+
   // TODO! print selection vector
   // Ask kernel to iterate each individual file and call us back with extracted metadata
   print_diag("Asking kernel to call us back for each scan row (file to read)\n");
