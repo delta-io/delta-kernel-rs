@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use delta_kernel::scan::state::{visit_scan_files, DvInfo, GlobalScanState};
+use delta_kernel::scan::state::{DvInfo, GlobalScanState};
 use delta_kernel::scan::{Scan, ScanData};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Error, Expression, ExpressionRef};
@@ -16,9 +16,9 @@ use crate::expressions::engine::{
 };
 use crate::expressions::SharedExpression;
 use crate::{
-    kernel_string_slice, AllocateStringFn, ExclusiveEngineData, ExternEngine, ExternResult,
-    IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice, NullableCvoid,
-    SharedExternEngine, SharedSchema, SharedSnapshot, TryFromStringSlice,
+    kernel_string_slice, AllocateStringFn, ExternEngine, ExternResult, IntoExternResult,
+    KernelBoolSlice, KernelRowIndexArray, KernelStringSlice, NullableCvoid, SharedExternEngine,
+    SharedSchema, SharedSnapshot, TryFromStringSlice,
 };
 
 use super::handle::Handle;
@@ -28,6 +28,9 @@ use super::handle::Handle;
 // drop it!
 #[handle_descriptor(target=Scan, mutable=false, sized=true)]
 pub struct SharedScan;
+
+#[handle_descriptor(target=ScanData, mutable=false, sized=true)]
+pub struct CScanData;
 
 /// Drops a scan.
 ///
@@ -176,8 +179,8 @@ fn kernel_scan_data_init_impl(
 }
 
 /// Call the provided `engine_visitor` on the next scan data item. The visitor will be provided with
-/// a selection vector and engine data. It is the responsibility of the _engine_ to free these when
-/// it is finished by calling [`free_bool_slice`] and [`free_engine_data`] respectively.
+/// a [`CScanData`]. It is the responsibility of the _engine_ to free these when it is finished
+/// by calling [`free_bool_slice`] and [`free_engine_data`] respectively.
 ///
 /// # Safety
 ///
@@ -190,12 +193,7 @@ fn kernel_scan_data_init_impl(
 pub unsafe extern "C" fn kernel_scan_data_next(
     data: Handle<SharedScanDataIterator>,
     engine_context: NullableCvoid,
-    engine_visitor: extern "C" fn(
-        engine_context: NullableCvoid,
-        engine_data: Handle<ExclusiveEngineData>,
-        selection_vector: KernelBoolSlice,
-        transforms: &CTransforms,
-    ),
+    engine_visitor: extern "C" fn(engine_context: NullableCvoid, scan_data: Handle<CScanData>),
 ) -> ExternResult<bool> {
     let data = unsafe { data.as_ref() };
     kernel_scan_data_next_impl(data, engine_context, engine_visitor)
@@ -204,24 +202,14 @@ pub unsafe extern "C" fn kernel_scan_data_next(
 fn kernel_scan_data_next_impl(
     data: &KernelScanDataIterator,
     engine_context: NullableCvoid,
-    engine_visitor: extern "C" fn(
-        engine_context: NullableCvoid,
-        engine_data: Handle<ExclusiveEngineData>,
-        selection_vector: KernelBoolSlice,
-        transforms: &CTransforms,
-    ),
+    engine_visitor: extern "C" fn(engine_context: NullableCvoid, scan_data: Handle<CScanData>),
 ) -> DeltaResult<bool> {
     let mut data = data
         .data
         .lock()
         .map_err(|_| Error::generic("poisoned mutex"))?;
     if let Some(scan_data) = data.next().transpose()? {
-        let (data, sel_vec) = scan_data.filtered_data;
-        let bool_slice = KernelBoolSlice::from(sel_vec);
-        let transform_map = CTransforms {
-            transforms: scan_data.transforms,
-        };
-        (engine_visitor)(engine_context, data.into(), bool_slice, &transform_map);
+        (engine_visitor)(engine_context, Arc::new(scan_data).into());
         Ok(true)
     } else {
         Ok(false)
@@ -430,25 +418,18 @@ struct ContextWrapper {
 /// engine is responsible for passing a valid [`ExclusiveEngineData`] and selection vector.
 #[no_mangle]
 pub unsafe extern "C" fn visit_scan_data(
-    data: Handle<ExclusiveEngineData>,
-    selection_vec: KernelBoolSlice,
-    transforms: &CTransforms,
+    scan_data: Handle<CScanData>,
     engine_context: NullableCvoid,
     callback: CScanCallback,
 ) {
-    let selection_vec = unsafe { selection_vec.as_ref() };
-    let data = unsafe { data.as_ref() };
+    let scan_data = unsafe { scan_data.as_ref() };
     let context_wrapper = ContextWrapper {
         engine_context,
         callback,
     };
+
     // TODO: return ExternResult to caller instead of panicking?
-    visit_scan_files(
-        data,
-        selection_vec,
-        &transforms.transforms,
-        context_wrapper,
-        rust_callback,
-    )
-    .unwrap();
+    scan_data
+        .visit_scan_files(context_wrapper, rust_callback)
+        .unwrap();
 }

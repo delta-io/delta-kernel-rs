@@ -211,14 +211,7 @@ fn try_main() -> DeltaResult<()> {
 
     for res in scan_data {
         let scan_data = res?;
-        let (data, sel_vec) = scan_data.filtered_data;
-        scan_file_tx = delta_kernel::scan::state::visit_scan_files(
-            data.as_ref(),
-            &sel_vec,
-            &scan_data.transforms,
-            scan_file_tx,
-            send_scan_file,
-        )?;
+        scan_file_tx = scan_data.visit_scan_files(scan_file_tx, send_scan_file)?;
     }
 
     // have sent all scan files, drop this so threads will exit when there's no more work

@@ -503,15 +503,8 @@ impl Scan {
         let scan_files_iter = scan_data_iter
             .map(|res| {
                 let scan_data = res?;
-                let (data, sel_vec) = scan_data.filtered_data;
                 let scan_files = vec![];
-                state::visit_scan_files(
-                    data.as_ref(),
-                    &sel_vec,
-                    &scan_data.transforms,
-                    scan_files,
-                    scan_data_callback,
-                )
+                scan_data.visit_scan_files(scan_files, scan_data_callback)
             })
             // Iterator<DeltaResult<Vec<ScanFile>>> to Iterator<DeltaResult<ScanFile>>
             .flatten_ok();
@@ -800,16 +793,10 @@ pub(crate) mod test_utils {
         let mut batch_count = 0;
         for res in iter {
             let scan_data = res.unwrap();
-            let (batch, sel_vec) = scan_data.filtered_data;
-            assert_eq!(sel_vec, expected_sel_vec);
-            crate::scan::state::visit_scan_files(
-                batch.as_ref(),
-                &sel_vec,
-                &scan_data.transforms,
-                context.clone(),
-                validate_callback,
-            )
-            .unwrap();
+            assert_eq!(&scan_data.filtered_data.1, &expected_sel_vec);
+            scan_data
+                .visit_scan_files(context.clone(), validate_callback)
+                .unwrap();
             batch_count += 1;
         }
         assert_eq!(batch_count, 1);
@@ -1014,14 +1001,7 @@ mod tests {
         let mut files = vec![];
         for data in scan_data {
             let scan_data = data?;
-            let (data, sel_vec) = scan_data.filtered_data;
-            files = state::visit_scan_files(
-                data.as_ref(),
-                &sel_vec,
-                &scan_data.transforms,
-                files,
-                scan_data_callback,
-            )?;
+            files = scan_data.visit_scan_files(files, scan_data_callback)?;
         }
         Ok(files)
     }

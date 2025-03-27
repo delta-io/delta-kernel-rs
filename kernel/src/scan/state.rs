@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::log_replay::SCAN_ROW_SCHEMA;
+use super::ScanData;
 
 /// State that doesn't change between scans
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -151,9 +152,8 @@ pub type ScanCallback<T> = fn(
 /// ## Example
 /// ```ignore
 /// let mut context = [my context];
-/// for res in scan_data { // scan data from scan.scan_data()
+/// for res in scan_data_iter { // scan data iterator from scan.scan_data()
 ///     let scan_data = res?;
-///     let (data, selection_vector) = scan_data.filtered_data;
 ///     context = delta_kernel::scan::state::visit_scan_files(
 ///        data.as_ref(),
 ///        selection_vector,
@@ -163,23 +163,19 @@ pub type ScanCallback<T> = fn(
 ///     )?;
 /// }
 /// ```
-pub fn visit_scan_files<T>(
-    data: &dyn EngineData,
-    selection_vector: &[bool],
-    transforms: &[Option<ExpressionRef>],
-    context: T,
-    callback: ScanCallback<T>,
-) -> DeltaResult<T> {
-    let mut visitor = ScanFileVisitor {
-        callback,
-        selection_vector,
-        transforms,
-        context,
-    };
-    visitor.visit_rows_of(data)?;
-    Ok(visitor.context)
+impl ScanData {
+    pub fn visit_scan_files<T>(&self, context: T, callback: ScanCallback<T>) -> DeltaResult<T> {
+        let (data, selection_vector) = &self.filtered_data;
+        let mut visitor = ScanFileVisitor {
+            callback,
+            selection_vector,
+            transforms: &self.transforms,
+            context,
+        };
+        visitor.visit_rows_of(data.as_ref())?;
+        Ok(visitor.context)
+    }
 }
-
 // add some visitor magic for engines
 struct ScanFileVisitor<'a, T> {
     callback: ScanCallback<T>,
