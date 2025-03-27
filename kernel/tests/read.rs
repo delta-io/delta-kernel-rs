@@ -11,7 +11,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{column_expr, BinaryOperator, Expression, ExpressionRef};
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
-use delta_kernel::scan::state::{transform_to_logical, visit_scan_files, DvInfo, Stats};
+use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, Schema};
 use delta_kernel::{Engine, FileMeta, Table};
@@ -362,14 +362,7 @@ fn read_with_scan_data(
     let mut scan_files = vec![];
     for data in scan_data {
         let scan_data = data?;
-        let (data, sel_vec) = scan_data.filtered_data;
-        scan_files = visit_scan_files(
-            data.as_ref(),
-            &sel_vec,
-            &scan_data.transforms,
-            scan_files,
-            scan_data_callback,
-        )?;
+        scan_files = scan_data.visit_scan_files(scan_files, scan_data_callback)?;
     }
 
     let mut batches = vec![];
