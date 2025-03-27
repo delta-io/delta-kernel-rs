@@ -14,8 +14,8 @@ use crate::arrow::error::ArrowError;
 use crate::engine::arrow_utils::prim_array_cmp;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
-    BinaryExpression, BinaryOperator, BinaryPredicate, Expression, JunctionOperator,
-    JunctionPredicate, Predicate, Scalar, UnaryOperator, UnaryPredicate,
+    BinaryExpression, BinaryPredicate, BinaryPredicateOp, Expression, JunctionPredicate,
+    JunctionPredicateOp, Predicate, Scalar, UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
 use itertools::Itertools;
@@ -87,7 +87,7 @@ pub(crate) fn evaluate_expression(
     batch: &RecordBatch,
     result_type: Option<&DataType>,
 ) -> DeltaResult<ArrayRef> {
-    use BinaryOperator::*;
+    use BinaryPredicateOp::*;
     use Expression::*;
     match (expression, result_type) {
         (Literal(scalar), _) => Ok(scalar.to_array(batch.num_rows())?),
@@ -118,8 +118,8 @@ pub(crate) fn evaluate_expression(
         (Unary(UnaryPredicate { op, expr }), _) => {
             let arr = evaluate_expression(expr.as_ref(), batch, None)?;
             let result = match op {
-                UnaryOperator::Not => not(downcast_to_bool(&arr)?)?,
-                UnaryOperator::IsNull => is_null(&arr)?,
+                UnaryPredicateOp::Not => not(downcast_to_bool(&arr)?)?,
+                UnaryPredicateOp::IsNull => is_null(&arr)?,
             };
             Ok(Arc::new(result))
         }
@@ -222,8 +222,8 @@ pub(crate) fn evaluate_expression(
         (Junction(JunctionPredicate { op, preds }), None | Some(&DataType::BOOLEAN)) => {
             type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
             let (reducer, default): (Operation, _) = match op {
-                JunctionOperator::And => (and_kleene, true),
-                JunctionOperator::Or => (or_kleene, false),
+                JunctionPredicateOp::And => (and_kleene, true),
+                JunctionPredicateOp::Or => (or_kleene, false),
             };
             preds
                 .iter()

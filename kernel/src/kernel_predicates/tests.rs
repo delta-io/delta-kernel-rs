@@ -184,7 +184,7 @@ fn test_default_partial_cmp_scalars() {
 // Verifies that eval_binary_scalars uses partial_cmp_scalars correctly
 #[test]
 fn test_eval_binary_scalars() {
-    use BinaryOperator::*;
+    use BinaryPredicateOp::*;
     let smaller_value = Scalar::Long(1);
     let larger_value = Scalar::Long(10);
     for inverted in [true, false] {
@@ -269,12 +269,12 @@ fn test_eval_binary_columns() {
     let y = column_expr!("y");
     for inverted in [true, false] {
         assert_eq!(
-            filter.eval_pred_binary(BinaryOperator::Equal, &x, &y, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::Equal, &x, &y, inverted),
             Some(inverted),
             "x = y (inverted: {inverted})"
         );
         assert_eq!(
-            filter.eval_pred_binary(BinaryOperator::Equal, &x, &x, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::Equal, &x, &x, inverted),
             Some(!inverted),
             "x = x (inverted: {inverted})"
         );
@@ -315,12 +315,12 @@ fn test_eval_junction() {
         for inverted in [true, false] {
             let invert_if_needed = |v: &Option<_>| v.map(|v| v != inverted);
             expect_eq!(
-                filter.eval_pred_junction(JunctionOperator::And, &inputs, inverted),
+                filter.eval_pred_junction(JunctionPredicateOp::And, &inputs, inverted),
                 invert_if_needed(expect_and),
                 "AND({inputs:?}) (inverted: {inverted})"
             );
             expect_eq!(
-                filter.eval_pred_junction(JunctionOperator::Or, &inputs, inverted),
+                filter.eval_pred_junction(JunctionPredicateOp::Or, &inputs, inverted),
                 invert_if_needed(expect_or),
                 "OR({inputs:?}) (inverted: {inverted})"
             );
@@ -372,7 +372,7 @@ fn test_eval_not() {
 
 #[test]
 fn test_eval_is_null() {
-    use crate::expressions::UnaryOperator::IsNull;
+    use crate::expressions::UnaryPredicateOp::IsNull;
     let expr = column_expr!("x");
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
     expect_eq!(
@@ -464,28 +464,30 @@ fn test_eval_distinct() {
 // test_eval_binary_scalars.
 #[test]
 fn eval_binary() {
+    use crate::expressions::BinaryPredicateOp;
+
     let col = column_expr!("x");
     let val = Expr::literal(10);
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
 
     // unsupported
     expect_eq!(
-        filter.eval_pred_binary(BinaryOperator::Plus, &col, &val, false),
+        filter.eval_pred_binary(BinaryPredicateOp::Plus, &col, &val, false),
         None,
         "x + 10"
     );
     expect_eq!(
-        filter.eval_pred_binary(BinaryOperator::Minus, &col, &val, false),
+        filter.eval_pred_binary(BinaryPredicateOp::Minus, &col, &val, false),
         None,
         "x - 10"
     );
     expect_eq!(
-        filter.eval_pred_binary(BinaryOperator::Multiply, &col, &val, false),
+        filter.eval_pred_binary(BinaryPredicateOp::Multiply, &col, &val, false),
         None,
         "x * 10"
     );
     expect_eq!(
-        filter.eval_pred_binary(BinaryOperator::Divide, &col, &val, false),
+        filter.eval_pred_binary(BinaryPredicateOp::Divide, &col, &val, false),
         None,
         "x / 10"
     );
@@ -493,73 +495,73 @@ fn eval_binary() {
     // supported
     for inverted in [true, false] {
         expect_eq!(
-            filter.eval_pred_binary(BinaryOperator::LessThan, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::LessThan, &col, &val, inverted),
             Some(!inverted),
             "x < 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_pred_binary(BinaryOperator::LessThanOrEqual, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::LessThanOrEqual, &col, &val, inverted),
             Some(!inverted),
             "x <= 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_pred_binary(BinaryOperator::Equal, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::Equal, &col, &val, inverted),
             Some(inverted),
             "x = 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_pred_binary(BinaryOperator::NotEqual, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::NotEqual, &col, &val, inverted),
             Some(!inverted),
             "x != 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_pred_binary(BinaryOperator::GreaterThanOrEqual, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::GreaterThanOrEqual, &col, &val, inverted),
             Some(inverted),
             "x >= 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_pred_binary(BinaryOperator::GreaterThan, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::GreaterThan, &col, &val, inverted),
             Some(inverted),
             "x > 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_pred_binary(BinaryOperator::Distinct, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::Distinct, &col, &val, inverted),
             Some(!inverted),
             "DISTINCT(x, 10) (inverted: {inverted})"
         );
 
         expect_eq!(
-            filter.eval_pred_binary(BinaryOperator::LessThan, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::LessThan, &val, &col, inverted),
             Some(inverted),
             "10 < x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_pred_binary(BinaryOperator::LessThanOrEqual, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::LessThanOrEqual, &val, &col, inverted),
             Some(inverted),
             "10 <= x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_pred_binary(BinaryOperator::Equal, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::Equal, &val, &col, inverted),
             Some(inverted),
             "10 = x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_pred_binary(BinaryOperator::NotEqual, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::NotEqual, &val, &col, inverted),
             Some(!inverted),
             "10 != x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_pred_binary(BinaryOperator::GreaterThanOrEqual, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::GreaterThanOrEqual, &val, &col, inverted),
             Some(!inverted),
             "10 >= x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_pred_binary(BinaryOperator::GreaterThan, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::GreaterThan, &val, &col, inverted),
             Some(!inverted),
             "10 > x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_pred_binary(BinaryOperator::Distinct, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::Distinct, &val, &col, inverted),
             Some(!inverted),
             "DISTINCT(10, x) (inverted: {inverted})"
         );

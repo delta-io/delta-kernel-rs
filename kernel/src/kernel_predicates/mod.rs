@@ -1,6 +1,6 @@
 use crate::expressions::{
-    BinaryOperator, BinaryPredicate, ColumnName, Expression as Expr, JunctionOperator,
-    JunctionPredicate, Predicate as Pred, Scalar, UnaryOperator, UnaryPredicate,
+    BinaryPredicate, BinaryPredicateOp, ColumnName, Expression as Expr, JunctionPredicate,
+    JunctionPredicateOp, Predicate as Pred, Scalar, UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
 
@@ -20,7 +20,7 @@ mod tests;
 ///
 /// Because inversion (`NOT` operator) has special semantics and can often be optimized away by
 /// pushing it down, most methods take an `inverted` flag. That allows operations like
-/// [`UnaryOperator::Not`] to simply evaluate their operand with a flipped `inverted` flag, and
+/// [`UnaryPredicateOp::Not`] to simply evaluate their operand with a flipped `inverted` flag, and
 /// greatly simplifies the implementations of most operators (other than those which have to
 /// directly implement NOT semantics, which are unavoidably complex in that regard).
 ///
@@ -81,7 +81,7 @@ pub(crate) trait KernelPredicateEvaluator {
     /// A (possibly inverted) comparison between two scalars, e.g. `<valueA> != <valueB>`.
     fn eval_pred_binary_scalars(
         &self,
-        op: BinaryOperator,
+        op: BinaryPredicateOp,
         left: &Scalar,
         right: &Scalar,
         inverted: bool,
@@ -90,7 +90,7 @@ pub(crate) trait KernelPredicateEvaluator {
     /// A (possibly inverted) comparison between two columns, e.g. `<colA> != <colB>`.
     fn eval_pred_binary_columns(
         &self,
-        op: BinaryOperator,
+        op: BinaryPredicateOp,
         a: &ColumnName,
         b: &ColumnName,
         inverted: bool,
@@ -103,7 +103,7 @@ pub(crate) trait KernelPredicateEvaluator {
     /// predicate's output in some implementation-defined way (this method).
     fn finish_eval_pred_junction(
         &self,
-        op: JunctionOperator,
+        op: JunctionPredicateOp,
         preds: impl IntoIterator<Item = Option<Self::Output>>,
         inverted: bool,
     ) -> Option<Self::Output>;
@@ -125,13 +125,13 @@ pub(crate) trait KernelPredicateEvaluator {
     /// Dispatches a (possibly inverted) unary expression to each operator's specific implementation.
     fn eval_pred_unary(
         &self,
-        op: UnaryOperator,
+        op: UnaryPredicateOp,
         expr: &Expr,
         inverted: bool,
     ) -> Option<Self::Output> {
         match op {
-            UnaryOperator::Not => self.eval_pred_not(expr, inverted),
-            UnaryOperator::IsNull => match expr {
+            UnaryPredicateOp::Not => self.eval_pred_not(expr, inverted),
+            UnaryPredicateOp::IsNull => match expr {
                 // WARNING: Only literals and columns can be safely null-checked. Attempting to
                 // null-check an expressions such as `a < 10` could wrongly produce FALSE in case
                 // `a` is just plain missing (rather than known to be NULL. A missing-value can
@@ -165,7 +165,7 @@ pub(crate) trait KernelPredicateEvaluator {
                 self.eval_pred_is_null(col, inverted),
                 self.eval_pred_eq(col, val, !inverted),
             ];
-            self.finish_eval_pred_junction(JunctionOperator::Or, args, inverted)
+            self.finish_eval_pred_junction(JunctionPredicateOp::Or, args, inverted)
         }
     }
 
@@ -186,12 +186,12 @@ pub(crate) trait KernelPredicateEvaluator {
     /// NOTE: Only binary operators that produce boolean outputs are supported.
     fn eval_pred_binary(
         &self,
-        op: BinaryOperator,
+        op: BinaryPredicateOp,
         left: &Expr,
         right: &Expr,
         inverted: bool,
     ) -> Option<Self::Output> {
-        use BinaryOperator::*;
+        use BinaryPredicateOp::*;
         use Expr::{Column, Literal};
 
         // NOTE: We rely on the literal values to provide logical type hints. That means we cannot
@@ -224,7 +224,7 @@ pub(crate) trait KernelPredicateEvaluator {
     /// [`finish_eval_junction`].
     fn eval_pred_junction(
         &self,
-        op: JunctionOperator,
+        op: JunctionPredicateOp,
         preds: &[Pred],
         inverted: bool,
     ) -> Option<Self::Output> {
@@ -366,14 +366,14 @@ pub(crate) trait KernelPredicateEvaluator {
             Binary(BinaryPredicate { op, left, right }) if op.is_null_intolerant_comparison() => {
                 // Perform a nullsafe comparison instead of the usual `eval_pred_binary`
                 let preds = [
-                    self.eval_pred_unary(UnaryOperator::IsNull, left, true),
-                    self.eval_pred_unary(UnaryOperator::IsNull, right, true),
+                    self.eval_pred_unary(UnaryPredicateOp::IsNull, left, true),
+                    self.eval_pred_unary(UnaryPredicateOp::IsNull, right, true),
                     self.eval_pred_binary(*op, left, right, inverted),
                 ];
-                self.finish_eval_pred_junction(JunctionOperator::And, preds, false)
+                self.finish_eval_pred_junction(JunctionPredicateOp::And, preds, false)
             }
             Unary(UnaryPredicate {
-                op: UnaryOperator::Not,
+                op: UnaryPredicateOp::Not,
                 expr,
             }) => self.eval_pred_sql_where(expr, !inverted),
             Column(col) => {
@@ -382,7 +382,7 @@ pub(crate) trait KernelPredicateEvaluator {
                     self.eval_pred_is_null(col, true),
                     self.eval_pred_column(col, inverted),
                 ];
-                self.finish_eval_pred_junction(JunctionOperator::And, preds, false)
+                self.finish_eval_pred_junction(JunctionPredicateOp::And, preds, false)
             }
             Literal(val) if val.is_null() => {
                 // AND(NULL IS NOT NULL, NULL) = AND(FALSE, NULL) = FALSE
@@ -456,12 +456,12 @@ impl KernelPredicateEvaluatorDefaults {
 
     /// Directly evaluates a boolean comparison. See [`KernelPredicateEvaluator::eval_pred_binary_scalars`].
     pub(crate) fn eval_pred_binary_scalars(
-        op: BinaryOperator,
+        op: BinaryPredicateOp,
         left: &Scalar,
         right: &Scalar,
         inverted: bool,
     ) -> Option<bool> {
-        use BinaryOperator::*;
+        use BinaryPredicateOp::*;
         match op {
             Equal => Self::partial_cmp_scalars(Ordering::Equal, left, right, inverted),
             NotEqual => Self::partial_cmp_scalars(Ordering::Equal, left, right, !inverted),
@@ -485,13 +485,13 @@ impl KernelPredicateEvaluatorDefaults {
     /// was no dominating input, then any NULL input forces NULL output.  Otherwise, return the
     /// non-dominant value. Inverting the operation also inverts the dominant value.
     pub(crate) fn finish_eval_pred_junction(
-        op: JunctionOperator,
+        op: JunctionPredicateOp,
         preds: impl IntoIterator<Item = Option<bool>>,
         inverted: bool,
     ) -> Option<bool> {
         let dominator = match op {
-            JunctionOperator::And => inverted,
-            JunctionOperator::Or => !inverted,
+            JunctionPredicateOp::And => inverted,
+            JunctionPredicateOp::Or => !inverted,
         };
         let result = preds.into_iter().try_fold(false, |found_null, val| {
             match val {
@@ -577,22 +577,22 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
 
     fn eval_pred_lt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<bool> {
         let col = self.resolve_column(col)?;
-        self.eval_pred_binary_scalars(BinaryOperator::LessThan, &col, val, inverted)
+        self.eval_pred_binary_scalars(BinaryPredicateOp::LessThan, &col, val, inverted)
     }
 
     fn eval_pred_le(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<bool> {
         let col = self.resolve_column(col)?;
-        self.eval_pred_binary_scalars(BinaryOperator::LessThanOrEqual, &col, val, inverted)
+        self.eval_pred_binary_scalars(BinaryPredicateOp::LessThanOrEqual, &col, val, inverted)
     }
 
     fn eval_pred_eq(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<bool> {
         let col = self.resolve_column(col)?;
-        self.eval_pred_binary_scalars(BinaryOperator::Equal, &col, val, inverted)
+        self.eval_pred_binary_scalars(BinaryPredicateOp::Equal, &col, val, inverted)
     }
 
     fn eval_pred_binary_scalars(
         &self,
-        op: BinaryOperator,
+        op: BinaryPredicateOp,
         left: &Scalar,
         right: &Scalar,
         inverted: bool,
@@ -602,7 +602,7 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
 
     fn eval_pred_binary_columns(
         &self,
-        op: BinaryOperator,
+        op: BinaryPredicateOp,
         left: &ColumnName,
         right: &ColumnName,
         inverted: bool,
@@ -614,7 +614,7 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
 
     fn finish_eval_pred_junction(
         &self,
-        op: JunctionOperator,
+        op: JunctionPredicateOp,
         preds: impl IntoIterator<Item = Option<bool>>,
         inverted: bool,
     ) -> Option<bool> {
@@ -664,7 +664,7 @@ pub(crate) trait DataSkippingPredicateEvaluator {
     /// See [`KernelPredicateEvaluator::eval_pred_binary_scalars`]
     fn eval_pred_binary_scalars(
         &self,
-        op: BinaryOperator,
+        op: BinaryPredicateOp,
         left: &Scalar,
         right: &Scalar,
         inverted: bool,
@@ -673,7 +673,7 @@ pub(crate) trait DataSkippingPredicateEvaluator {
     /// See [`KernelPredicateEvaluator::finish_eval_pred_junction`]
     fn finish_eval_pred_junction(
         &self,
-        op: JunctionOperator,
+        op: JunctionPredicateOp,
         preds: impl IntoIterator<Item = Option<Self::Output>>,
         inverted: bool,
     ) -> Option<Self::Output>;
@@ -766,14 +766,14 @@ pub(crate) trait DataSkippingPredicateEvaluator {
                 self.partial_cmp_min_stat(col, val, Ordering::Equal, true),
                 self.partial_cmp_max_stat(col, val, Ordering::Equal, true),
             ];
-            (JunctionOperator::Or, preds)
+            (JunctionPredicateOp::Or, preds)
         } else {
             // Column could compare equal if its min/max values bracket the literal.
             let preds = [
                 self.partial_cmp_min_stat(col, val, Ordering::Greater, true),
                 self.partial_cmp_max_stat(col, val, Ordering::Less, true),
             ];
-            (JunctionOperator::And, preds)
+            (JunctionPredicateOp::And, preds)
         };
         self.finish_eval_pred_junction(op, preds, false)
     }
@@ -808,7 +808,7 @@ impl<T: DataSkippingPredicateEvaluator> KernelPredicateEvaluator for T {
 
     fn eval_pred_binary_scalars(
         &self,
-        op: BinaryOperator,
+        op: BinaryPredicateOp,
         left: &Scalar,
         right: &Scalar,
         inverted: bool,
@@ -818,7 +818,7 @@ impl<T: DataSkippingPredicateEvaluator> KernelPredicateEvaluator for T {
 
     fn eval_pred_binary_columns(
         &self,
-        _op: BinaryOperator,
+        _op: BinaryPredicateOp,
         _a: &ColumnName,
         _b: &ColumnName,
         _inverted: bool,
@@ -828,7 +828,7 @@ impl<T: DataSkippingPredicateEvaluator> KernelPredicateEvaluator for T {
 
     fn finish_eval_pred_junction(
         &self,
-        op: JunctionOperator,
+        op: JunctionPredicateOp,
         preds: impl IntoIterator<Item = Option<Self::Output>>,
         inverted: bool,
     ) -> Option<Self::Output> {

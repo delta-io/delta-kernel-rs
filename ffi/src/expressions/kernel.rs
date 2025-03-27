@@ -5,8 +5,9 @@ use std::ffi::c_void;
 
 use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
 use delta_kernel::expressions::{
-    ArrayData, BinaryExpression, BinaryOperator, Expression, JunctionOperator, JunctionPredicate,
-    MapData, Predicate, Scalar, StructData, UnaryOperator, UnaryPredicate,
+    ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicateOp, Expression,
+    JunctionPredicate, JunctionPredicateOp, MapData, Predicate, Scalar, StructData, UnaryPredicate,
+    UnaryPredicateOp,
 };
 
 /// Free the memory the passed SharedExpression
@@ -331,7 +332,7 @@ fn visit_expression_struct(
 
 fn visit_predicate_junction(
     visitor: &mut EngineExpressionVisitor,
-    op: &JunctionOperator,
+    op: &JunctionPredicateOp,
     preds: &[Predicate],
     sibling_list_id: usize,
 ) {
@@ -341,8 +342,8 @@ fn visit_predicate_junction(
     }
 
     let visit_fn = match op {
-        JunctionOperator::And => &visitor.visit_and,
-        JunctionOperator::Or => &visitor.visit_or,
+        JunctionPredicateOp::And => &visitor.visit_and,
+        JunctionPredicateOp::Or => &visitor.visit_or,
     };
     visit_fn(visitor.data, sibling_list_id, child_list_id);
 }
@@ -418,19 +419,19 @@ fn visit_expression_impl(
             visit_expression_impl(visitor, left, child_list_id);
             visit_expression_impl(visitor, right, child_list_id);
             let op = match op {
-                BinaryOperator::Plus => visitor.visit_add,
-                BinaryOperator::Minus => visitor.visit_minus,
-                BinaryOperator::Multiply => visitor.visit_multiply,
-                BinaryOperator::Divide => visitor.visit_divide,
-                BinaryOperator::LessThan => visitor.visit_lt,
-                BinaryOperator::LessThanOrEqual => visitor.visit_le,
-                BinaryOperator::GreaterThan => visitor.visit_gt,
-                BinaryOperator::GreaterThanOrEqual => visitor.visit_ge,
-                BinaryOperator::Equal => visitor.visit_eq,
-                BinaryOperator::NotEqual => visitor.visit_ne,
-                BinaryOperator::Distinct => visitor.visit_distinct,
-                BinaryOperator::In => visitor.visit_in,
-                BinaryOperator::NotIn => visitor.visit_not_in,
+                BinaryExpressionOp::Plus => visitor.visit_add,
+                BinaryExpressionOp::Minus => visitor.visit_minus,
+                BinaryExpressionOp::Multiply => visitor.visit_multiply,
+                BinaryExpressionOp::Divide => visitor.visit_divide,
+                BinaryPredicateOp::LessThan => visitor.visit_lt,
+                BinaryPredicateOp::LessThanOrEqual => visitor.visit_le,
+                BinaryPredicateOp::GreaterThan => visitor.visit_gt,
+                BinaryPredicateOp::GreaterThanOrEqual => visitor.visit_ge,
+                BinaryPredicateOp::Equal => visitor.visit_eq,
+                BinaryPredicateOp::NotEqual => visitor.visit_ne,
+                BinaryPredicateOp::Distinct => visitor.visit_distinct,
+                BinaryPredicateOp::In => visitor.visit_in,
+                BinaryPredicateOp::NotIn => visitor.visit_not_in,
             };
             op(visitor.data, sibling_list_id, child_list_id);
         }
@@ -438,8 +439,8 @@ fn visit_expression_impl(
             let child_id_list = call!(visitor, make_field_list, 1);
             visit_expression_impl(visitor, expr, child_id_list);
             let op = match op {
-                UnaryOperator::Not => visitor.visit_not,
-                UnaryOperator::IsNull => visitor.visit_is_null,
+                UnaryPredicateOp::Not => visitor.visit_not,
+                UnaryPredicateOp::IsNull => visitor.visit_is_null,
             };
             op(visitor.data, sibling_list_id, child_id_list);
         }

@@ -29,12 +29,16 @@ fn test_array_column() {
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
     let not_op = Pred::binary(
-        BinaryOperator::NotIn,
+        BinaryPredicateOp::NotIn,
         Expr::literal(5),
         column_expr!("item"),
     );
 
-    let in_op = Pred::binary(BinaryOperator::In, Expr::literal(5), column_expr!("item"));
+    let in_op = Pred::binary(
+        BinaryPredicateOp::In,
+        Expr::literal(5),
+        column_expr!("item"),
+    );
 
     let result = evaluate_predicate(&not_op, &batch).unwrap();
     let expected = BooleanArray::from(vec![true, false, true]);
@@ -53,7 +57,7 @@ fn test_bad_right_type_array() {
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
 
     let in_op = Pred::binary(
-        BinaryOperator::NotIn,
+        BinaryPredicateOp::NotIn,
         Expr::literal(5),
         column_expr!("item"),
     );
@@ -74,7 +78,7 @@ fn test_literal_type_array() {
     let batch = RecordBatch::new_empty(Arc::new(schema));
 
     let in_op = Pred::binary(
-        BinaryOperator::NotIn,
+        BinaryPredicateOp::NotIn,
         Expr::literal(5),
         Scalar::Array(
             ArrayData::try_new(
@@ -229,7 +233,7 @@ fn test_invalid_array_sides() {
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
     let in_op = Pred::binary(
-        BinaryOperator::NotIn,
+        BinaryPredicateOp::NotIn,
         column_expr!("item"),
         column_expr!("item"),
     );
@@ -256,13 +260,13 @@ fn test_str_arrays() {
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
     let str_not_op = Pred::binary(
-        BinaryOperator::NotIn,
+        BinaryPredicateOp::NotIn,
         Expr::literal("bye"),
         column_expr!("item"),
     );
 
     let str_in_op = Pred::binary(
-        BinaryOperator::In,
+        BinaryPredicateOp::In,
         Expr::literal("hi"),
         column_expr!("item"),
     );

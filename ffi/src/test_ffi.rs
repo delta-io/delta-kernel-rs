@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::{expressions::SharedExpression, handle::Handle};
 use delta_kernel::expressions::{
-    column_expr, ArrayData, BinaryOperator, Expression as Expr, MapData, Predicate as Pred, Scalar,
-    StructData,
+    column_expr, ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr, MapData,
+    Predicate as Pred, Scalar, StructData,
 };
 use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
@@ -83,19 +83,19 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
     ];
     sub_exprs.extend(
         [
-            BinaryOperator::In,
-            BinaryOperator::Plus,
-            BinaryOperator::Minus,
-            BinaryOperator::Equal,
-            BinaryOperator::NotEqual,
-            BinaryOperator::NotIn,
-            BinaryOperator::Divide,
-            BinaryOperator::Multiply,
-            BinaryOperator::LessThan,
-            BinaryOperator::LessThanOrEqual,
-            BinaryOperator::GreaterThan,
-            BinaryOperator::GreaterThanOrEqual,
-            BinaryOperator::Distinct,
+            BinaryExpressionOp::Divide,
+            BinaryExpressionOp::Multiply,
+            BinaryExpressionOp::Plus,
+            BinaryExpressionOp::Minus,
+            BinaryPredicateOp::In,
+            BinaryPredicateOp::Equal,
+            BinaryPredicateOp::NotEqual,
+            BinaryPredicateOp::NotIn,
+            BinaryPredicateOp::LessThan,
+            BinaryPredicateOp::LessThanOrEqual,
+            BinaryPredicateOp::GreaterThan,
+            BinaryPredicateOp::GreaterThanOrEqual,
+            BinaryPredicateOp::Distinct,
         ]
         .into_iter()
         .map(|op| Pred::binary(op, Scalar::Integer(0), Scalar::Long(0))),
