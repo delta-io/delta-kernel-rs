@@ -80,7 +80,7 @@ pub enum JunctionOperator {
 pub struct UnaryExpression {
     /// The operator.
     pub op: UnaryOperator,
-    /// The expression.
+    /// The input expression.
     pub expr: Box<Expression>,
 }
 
@@ -261,16 +261,6 @@ impl Expression {
         Self::binary(BinaryOperator::GreaterThan, self, other)
     }
 
-    /// Create a new expression `self >= other`
-    pub fn gt_eq(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::GreaterThanOrEqual, self, other)
-    }
-
-    /// Create a new expression `self <= other`
-    pub fn lt_eq(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::LessThanOrEqual, self, other)
-    }
-
     /// Create a new expression `DISTINCT(self, other)`
     pub fn distinct(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::Distinct, self, other)
@@ -383,8 +373,8 @@ impl Display for Expression {
     }
 }
 
-impl<T: Into<Scalar>> From<T> for Expression {
-    fn from(value: T) -> Self {
+impl From<Scalar> for Expression {
+    fn from(value: Scalar) -> Self {
         Self::literal(value)
     }
 }
@@ -433,29 +423,47 @@ mod tests {
 
     #[test]
     fn test_expression_format() {
-        let col_ref = column_expr!("x");
         let cases = [
-            (col_ref.clone(), "Column(x)"),
-            ((col_ref.clone() + 4) / 10 * 42, "Column(x) + 4 / 10 * 42"),
-            (col_ref.clone().eq(2), "Column(x) = 2"),
-            ((col_ref.clone() - 4).lt(10), "Column(x) - 4 < 10"),
+            (column_expr!("x"), "Column(x)"),
             (
-                Expr::and(col_ref.clone().gt_eq(2), col_ref.clone().lt_eq(10)),
+                (column_expr!("x") + Expr::literal(4)) / Expr::literal(10) * Expr::literal(42),
+                "Column(x) + 4 / 10 * 42",
+            ),
+            (
+                Expr::struct_from([column_expr!("x"), Expr::literal(2), Expr::literal(10)]),
+                "Struct(Column(x), 2, 10)",
+            ),
+            (column_expr!("x").eq(Expr::literal(2)), "Column(x) = 2"),
+            (
+                (column_expr!("x") - Expr::literal(4)).lt(Expr::literal(10)),
+                "Column(x) - 4 < 10",
+            ),
+            (
+                Expr::and(
+                    column_expr!("x").ge(Expr::literal(2)),
+                    column_expr!("x").le(Expr::literal(10)),
+                ),
                 "AND(Column(x) >= 2, Column(x) <= 10)",
             ),
             (
                 Expr::and_from([
-                    col_ref.clone().gt_eq(2),
-                    col_ref.clone().lt_eq(10),
-                    col_ref.clone().lt_eq(100),
+                    column_expr!("x").ge(Expr::literal(2)),
+                    column_expr!("x").le(Expr::literal(10)),
+                    column_expr!("x").le(Expr::literal(100)),
                 ]),
                 "AND(Column(x) >= 2, Column(x) <= 10, Column(x) <= 100)",
             ),
             (
-                Expr::or(col_ref.clone().gt(2), col_ref.clone().lt(10)),
+                Expr::or(
+                    column_expr!("x").gt(Expr::literal(2)),
+                    column_expr!("x").lt(Expr::literal(10)),
+                ),
                 "OR(Column(x) > 2, Column(x) < 10)",
             ),
-            (col_ref.eq("foo"), "Column(x) = 'foo'"),
+            (
+                column_expr!("x").eq(Expr::literal("foo")),
+                "Column(x) = 'foo'",
+            ),
         ];
 
         for (expr, expected) in cases {

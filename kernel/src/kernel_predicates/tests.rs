@@ -1,5 +1,5 @@
 use super::*;
-use crate::expressions::{column_expr, column_name, ArrayData, Expression, StructData};
+use crate::expressions::{column_expr, column_name, ArrayData, Expression as Expr, StructData};
 use crate::schema::ArrayType;
 use crate::DataType;
 
@@ -311,8 +311,8 @@ fn test_eval_junction() {
             .iter()
             .cloned()
             .map(|v| match v {
-                Some(v) => Expression::literal(v),
-                None => Expression::null_literal(DataType::BOOLEAN),
+                Some(v) => Expr::literal(v),
+                None => Expr::null_literal(DataType::BOOLEAN),
             })
             .collect();
         for inverted in [true, false] {
@@ -389,7 +389,7 @@ fn test_eval_is_null() {
         "x IS NULL"
     );
 
-    let expr = Expression::literal(1);
+    let expr = Expr::literal(1);
     expect_eq!(
         filter.eval_unary(IsNull, &expr, true),
         Some(true),
@@ -468,7 +468,7 @@ fn test_eval_distinct() {
 #[test]
 fn eval_binary() {
     let col = column_expr!("x");
-    let val = Expression::literal(10);
+    let val = Expr::literal(10);
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
 
     // unsupported
@@ -581,7 +581,7 @@ impl ResolveColumnAsScalar for NullColumnResolver {
 fn test_sql_where() {
     let col = &column_expr!("x");
     const VAL: Expr = Expr::Literal(Scalar::Integer(1));
-    const NULL: Expr = Expr::Literal(Scalar::Null(DataType::BOOLEAN));
+    const NULL: Expr = Expr::null_literal(DataType::BOOLEAN);
     const FALSE: Expr = Expr::Literal(Scalar::Boolean(false));
     const TRUE: Expr = Expr::Literal(Scalar::Boolean(true));
     let null_filter = DefaultKernelPredicateEvaluator::from(NullColumnResolver);

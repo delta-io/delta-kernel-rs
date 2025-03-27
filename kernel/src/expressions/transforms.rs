@@ -107,26 +107,7 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         fields: &'a Vec<Expression>,
     ) -> Option<Cow<'a, Vec<Expression>>> {
-        let mut num_borrowed = 0;
-        let new_fields: Vec<_> = fields
-            .iter()
-            .filter_map(|f| self.transform(f))
-            .inspect(|f| {
-                if matches!(f, Cow::Borrowed(_)) {
-                    num_borrowed += 1;
-                }
-            })
-            .collect();
-
-        if new_fields.is_empty() {
-            None // all fields filtered out
-        } else if num_borrowed < fields.len() {
-            // At least one field was changed or filtered out, so make a new field list
-            let fields = new_fields.into_iter().map(|f| f.into_owned()).collect();
-            Some(Cow::Owned(fields))
-        } else {
-            Some(Cow::Borrowed(fields))
-        }
+        recurse_into_children(fields, |f| self.transform(f))
     }
 
     /// Recursively transforms a unary expression's child. Returns `None` if the child was removed,
@@ -169,13 +150,41 @@ pub trait ExpressionTransform<'a> {
         j: &'a JunctionExpression,
     ) -> Option<Cow<'a, JunctionExpression>> {
         use Cow::*;
-        let j = match self.recurse_into_struct(&j.exprs)? {
+        let j = match recurse_into_children(&j.exprs, |e| self.transform(e))? {
             Owned(exprs) => Owned(JunctionExpression::new(j.op, exprs)),
             Borrowed(_) => Borrowed(j),
         };
         Some(j)
     }
 }
+
+/// Used to recurse into the children of an `Expression::Struct` or `Expression::Junction`.
+fn recurse_into_children<'a, T: Clone>(
+    children: &'a Vec<T>,
+    recurse_fn: impl FnMut(&'a T) -> Option<Cow<'a, T>>,
+) -> Option<Cow<'a, Vec<T>>> {
+    let mut num_borrowed = 0;
+    let new_children: Vec<_> = children
+        .iter()
+        .filter_map(recurse_fn)
+        .inspect(|f| {
+            if matches!(f, Cow::Borrowed(_)) {
+                num_borrowed += 1;
+            }
+        })
+        .collect();
+
+    if new_children.is_empty() {
+        None // all fields filtered out
+    } else if num_borrowed < children.len() {
+        // At least one field was changed or removed, so make a new field list
+        let children = new_children.into_iter().map(Cow::into_owned).collect();
+        Some(Cow::Owned(children))
+    } else {
+        Some(Cow::Borrowed(children))
+    }
+}
+
 /// Retrieves the set of column names referenced by an expression.
 #[derive(Default)]
 pub(crate) struct GetColumnReferences<'a> {
@@ -283,27 +292,27 @@ mod tests {
 
     #[test]
     fn test_depth_checker() {
-        let expr = Expr::and_from([
-            Expr::struct_from([
-                Expr::and_from([
+        let expr = Expr::or_from([
+            Expr::and_from([
+                Expr::or(
                     Expr::lt(Expr::literal(10), column_expr!("x")),
-                    Expr::or_from([Expr::literal(true), column_expr!("b")]),
-                ]),
+                    Expr::gt(Expr::literal(20), column_expr!("b")),
+                ),
                 Expr::literal(true),
                 Expr::not(Expr::literal(true)),
             ]),
             Expr::and_from([
-                Expr::not(column_expr!("b")),
+                Expr::is_null(column_expr!("b")),
                 Expr::gt(Expr::literal(10), column_expr!("x")),
-                Expr::or_from([
-                    Expr::and_from([Expr::not(Expr::literal(true)), Expr::literal(10)]),
-                    Expr::literal(10),
-                ]),
+                Expr::or(
+                    Expr::gt(Expr::literal(5) + Expr::literal(10), Expr::literal(20)),
+                    column_expr!("y"),
+                ),
                 Expr::literal(true),
             ]),
             Expr::ne(
-                Expr::literal(true),
-                Expr::and_from([Expr::literal(true), column_expr!("b")]),
+                Expr::literal(42),
+                Expr::struct_from([Expr::literal(10), column_expr!("b")]),
             ),
         ]);
 
@@ -313,55 +322,55 @@ mod tests {
 
         // NOTE: The checker ignores leaf nodes!
 
-        // AND
-        //  * STRUCT
-        //    * AND     >LIMIT<
+        // OR
+        //  * AND
+        //    * OR     >LIMIT<
         //    * NOT
         //  * AND
         //  * NE
         assert_eq!(check_with_call_count(1), (2, 6));
 
-        // AND
-        //  * STRUCT
-        //    * AND
+        // OR
+        //  * AND
+        //    * OR
         //      * LT     >LIMIT<
-        //      * OR
+        //      * GT
         //    * NOT
         //  * AND
         //  * NE
         assert_eq!(check_with_call_count(2), (3, 8));
 
-        // AND
-        //  * STRUCT
-        //    * AND
+        // OR
+        //  * AND
+        //    * OR
         //      * LT
-        //      * OR
+        //      * GT
         //    * NOT
         //  * AND
-        //    * NOT
+        //    * IS NULL
         //    * GT
         //    * OR
-        //      * AND
-        //        * NOT     >LIMIT<
+        //      * GT
+        //        * PLUS     >LIMIT<
         //  * NE
         assert_eq!(check_with_call_count(3), (4, 13));
 
         // Depth limit not hit (full traversal required)
-
-        // AND
-        //  * STRUCT
-        //    * AND
+        //
+        // OR
+        //  * AND
+        //    * OR
         //      * LT
-        //      * OR
+        //      * GT
         //    * NOT
         //  * AND
-        //    * NOT
+        //    * IS_NULL
         //    * GT
         //    * OR
-        //      * AND
-        //        * NOT
+        //      * GT
+        //        * PLUS
         //  * NE
-        //    * AND
+        //    * STRUCT
         assert_eq!(check_with_call_count(4), (4, 14));
         assert_eq!(check_with_call_count(5), (4, 14));
     }

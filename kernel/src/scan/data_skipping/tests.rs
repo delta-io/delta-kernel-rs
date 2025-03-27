@@ -257,7 +257,7 @@ fn test_eval_distinct() {
 fn test_sql_where() {
     let col = &column_expr!("x");
     const VAL: Expr = Expr::Literal(Scalar::Integer(10));
-    const NULL: Expr = Expr::Literal(Scalar::Null(DataType::BOOLEAN));
+    const NULL: Expr = Expr::null_literal(DataType::BOOLEAN);
     const FALSE: Expr = Expr::Literal(Scalar::Boolean(false));
     const TRUE: Expr = Expr::Literal(Scalar::Boolean(true));
 

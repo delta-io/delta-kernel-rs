@@ -161,12 +161,12 @@ fn test_eval_binary_comparisons() {
     const NULL_VAL: Scalar = Scalar::Null(DataType::INTEGER);
 
     let expressions = [
-        Expr::lt(column_expr!("x"), 10),
-        Expr::le(column_expr!("x"), 10),
-        Expr::eq(column_expr!("x"), 10),
-        Expr::ne(column_expr!("x"), 10),
-        Expr::gt(column_expr!("x"), 10),
-        Expr::ge(column_expr!("x"), 10),
+        Expr::lt(column_expr!("x"), Expr::literal(10)),
+        Expr::le(column_expr!("x"), Expr::literal(10)),
+        Expr::eq(column_expr!("x"), Expr::literal(10)),
+        Expr::ne(column_expr!("x"), Expr::literal(10)),
+        Expr::gt(column_expr!("x"), Expr::literal(10)),
+        Expr::ge(column_expr!("x"), Expr::literal(10)),
     ];
 
     let do_test = |min: Scalar, max: Scalar, expected: &[Option<bool>]| {
