@@ -1,7 +1,5 @@
 use super::*;
-use crate::expressions::{
-    column_expr, column_name, ArrayData, Expression, StructData, UnaryOperator,
-};
+use crate::expressions::{column_expr, column_name, ArrayData, Expression, StructData};
 use crate::schema::ArrayType;
 use crate::DataType;
 
@@ -43,7 +41,7 @@ fn test_default_eval_scalar() {
     ];
     for (value, inverted, expect) in test_cases.into_iter() {
         assert_eq!(
-            KernelPredicateEvaluatorDefaults::eval_scalar(&value, inverted),
+            KernelPredicateEvaluatorDefaults::eval_pred_scalar(&value, inverted),
             expect,
             "value: {value:?} inverted: {inverted}"
         );
@@ -189,11 +187,11 @@ fn test_default_partial_cmp_scalars() {
 // Verifies that eval_binary_scalars uses partial_cmp_scalars correctly
 #[test]
 fn test_eval_binary_scalars() {
-    use BinaryOperator::*;
+    use BinaryPredicateOp::*;
     let smaller_value = Scalar::Long(1);
     let larger_value = Scalar::Long(10);
     for inverted in [true, false] {
-        let compare = KernelPredicateEvaluatorDefaults::eval_binary_scalars;
+        let compare = KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars;
         expect_eq!(
             compare(Equal, &smaller_value, &smaller_value, inverted),
             Some(!inverted),
@@ -274,12 +272,12 @@ fn test_eval_binary_columns() {
     let y = column_expr!("y");
     for inverted in [true, false] {
         assert_eq!(
-            filter.eval_binary(BinaryOperator::Equal, &x, &y, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::Equal, &x, &y, inverted),
             Some(inverted),
             "x = y (inverted: {inverted})"
         );
         assert_eq!(
-            filter.eval_binary(BinaryOperator::Equal, &x, &x, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::Equal, &x, &x, inverted),
             Some(!inverted),
             "x = x (inverted: {inverted})"
         );
@@ -316,16 +314,17 @@ fn test_eval_variadic() {
                 Some(v) => Expression::literal(v),
                 None => Expression::null_literal(DataType::BOOLEAN),
             })
+            .map(Pred::from)
             .collect();
         for inverted in [true, false] {
             let invert_if_needed = |v: &Option<_>| v.map(|v| v != inverted);
             expect_eq!(
-                filter.eval_variadic(VariadicOperator::And, &inputs, inverted),
+                filter.eval_pred_junction(JunctionPredicateOp::And, &inputs, inverted),
                 invert_if_needed(expect_and),
                 "AND({inputs:?}) (inverted: {inverted})"
             );
             expect_eq!(
-                filter.eval_variadic(VariadicOperator::Or, &inputs, inverted),
+                filter.eval_pred_junction(JunctionPredicateOp::Or, &inputs, inverted),
                 invert_if_needed(expect_or),
                 "OR({inputs:?}) (inverted: {inverted})"
             );
@@ -367,7 +366,7 @@ fn test_eval_not() {
         let input = input.into();
         for inverted in [true, false] {
             expect_eq!(
-                filter.eval_not(&input, inverted),
+                filter.eval_pred_not(&input, inverted),
                 expect.map(|v| v != inverted),
                 "NOT({input:?}) (inverted: {inverted})"
             );
@@ -377,27 +376,28 @@ fn test_eval_not() {
 
 #[test]
 fn test_eval_is_null() {
+    use crate::expressions::UnaryPredicateOp::IsNull;
     let expr = column_expr!("x");
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
     expect_eq!(
-        filter.eval_unary(UnaryOperator::IsNull, &expr, true),
+        filter.eval_pred_unary(IsNull, &expr, true),
         Some(true),
         "x IS NOT NULL"
     );
     expect_eq!(
-        filter.eval_unary(UnaryOperator::IsNull, &expr, false),
+        filter.eval_pred_unary(IsNull, &expr, false),
         Some(false),
         "x IS NULL"
     );
 
     let expr = Expression::literal(1);
     expect_eq!(
-        filter.eval_unary(UnaryOperator::IsNull, &expr, true),
+        filter.eval_pred_unary(IsNull, &expr, true),
         Some(true),
         "1 IS NOT NULL"
     );
     expect_eq!(
-        filter.eval_unary(UnaryOperator::IsNull, &expr, false),
+        filter.eval_pred_unary(IsNull, &expr, false),
         Some(false),
         "1 IS NULL"
     );
@@ -411,54 +411,54 @@ fn test_eval_distinct() {
     let filter = DefaultKernelPredicateEvaluator::from(one.clone());
     let col = &column_name!("x");
     expect_eq!(
-        filter.eval_distinct(col, one, true),
+        filter.eval_pred_distinct(col, one, true),
         Some(true),
         "NOT DISTINCT(x, 1) (x = 1)"
     );
     expect_eq!(
-        filter.eval_distinct(col, one, false),
+        filter.eval_pred_distinct(col, one, false),
         Some(false),
         "DISTINCT(x, 1) (x = 1)"
     );
     expect_eq!(
-        filter.eval_distinct(col, two, true),
+        filter.eval_pred_distinct(col, two, true),
         Some(false),
         "NOT DISTINCT(x, 2) (x = 1)"
     );
     expect_eq!(
-        filter.eval_distinct(col, two, false),
+        filter.eval_pred_distinct(col, two, false),
         Some(true),
         "DISTINCT(x, 2) (x = 1)"
     );
     expect_eq!(
-        filter.eval_distinct(col, null, true),
+        filter.eval_pred_distinct(col, null, true),
         Some(false),
         "NOT DISTINCT(x, NULL) (x = 1)"
     );
     expect_eq!(
-        filter.eval_distinct(col, null, false),
+        filter.eval_pred_distinct(col, null, false),
         Some(true),
         "DISTINCT(x, NULL) (x = 1)"
     );
 
     let filter = DefaultKernelPredicateEvaluator::from(null.clone());
     expect_eq!(
-        filter.eval_distinct(col, one, true),
+        filter.eval_pred_distinct(col, one, true),
         Some(false),
         "NOT DISTINCT(x, 1) (x = NULL)"
     );
     expect_eq!(
-        filter.eval_distinct(col, one, false),
+        filter.eval_pred_distinct(col, one, false),
         Some(true),
         "DISTINCT(x, 1) (x = NULL)"
     );
     expect_eq!(
-        filter.eval_distinct(col, null, true),
+        filter.eval_pred_distinct(col, null, true),
         Some(true),
         "NOT DISTINCT(x, NULL) (x = NULL)"
     );
     expect_eq!(
-        filter.eval_distinct(col, null, false),
+        filter.eval_pred_distinct(col, null, false),
         Some(false),
         "DISTINCT(x, NULL) (x = NULL)"
     );
@@ -468,28 +468,30 @@ fn test_eval_distinct() {
 // test_eval_binary_scalars.
 #[test]
 fn eval_binary() {
+    use crate::expressions::BinaryPredicateOp;
+
     let col = column_expr!("x");
     let val = Expression::literal(10);
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
 
     // unsupported
     expect_eq!(
-        filter.eval_binary(BinaryOperator::Plus, &col, &val, false),
+        filter.eval_pred_binary(BinaryPredicateOp::Plus, &col, &val, false),
         None,
         "x + 10"
     );
     expect_eq!(
-        filter.eval_binary(BinaryOperator::Minus, &col, &val, false),
+        filter.eval_pred_binary(BinaryPredicateOp::Minus, &col, &val, false),
         None,
         "x - 10"
     );
     expect_eq!(
-        filter.eval_binary(BinaryOperator::Multiply, &col, &val, false),
+        filter.eval_pred_binary(BinaryPredicateOp::Multiply, &col, &val, false),
         None,
         "x * 10"
     );
     expect_eq!(
-        filter.eval_binary(BinaryOperator::Divide, &col, &val, false),
+        filter.eval_pred_binary(BinaryPredicateOp::Divide, &col, &val, false),
         None,
         "x / 10"
     );
@@ -497,73 +499,73 @@ fn eval_binary() {
     // supported
     for inverted in [true, false] {
         expect_eq!(
-            filter.eval_binary(BinaryOperator::LessThan, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::LessThan, &col, &val, inverted),
             Some(!inverted),
             "x < 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::LessThanOrEqual, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::LessThanOrEqual, &col, &val, inverted),
             Some(!inverted),
             "x <= 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::Equal, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::Equal, &col, &val, inverted),
             Some(inverted),
             "x = 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::NotEqual, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::NotEqual, &col, &val, inverted),
             Some(!inverted),
             "x != 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::GreaterThanOrEqual, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::GreaterThanOrEqual, &col, &val, inverted),
             Some(inverted),
             "x >= 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::GreaterThan, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::GreaterThan, &col, &val, inverted),
             Some(inverted),
             "x > 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::Distinct, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::Distinct, &col, &val, inverted),
             Some(!inverted),
             "DISTINCT(x, 10) (inverted: {inverted})"
         );
 
         expect_eq!(
-            filter.eval_binary(BinaryOperator::LessThan, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::LessThan, &val, &col, inverted),
             Some(inverted),
             "10 < x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::LessThanOrEqual, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::LessThanOrEqual, &val, &col, inverted),
             Some(inverted),
             "10 <= x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::Equal, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::Equal, &val, &col, inverted),
             Some(inverted),
             "10 = x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::NotEqual, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::NotEqual, &val, &col, inverted),
             Some(!inverted),
             "10 != x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::GreaterThanOrEqual, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::GreaterThanOrEqual, &val, &col, inverted),
             Some(!inverted),
             "10 >= x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::GreaterThan, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::GreaterThan, &val, &col, inverted),
             Some(!inverted),
             "10 > x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::Distinct, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::Distinct, &val, &col, inverted),
             Some(!inverted),
             "DISTINCT(10, x) (inverted: {inverted})"
         );

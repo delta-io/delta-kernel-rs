@@ -9,7 +9,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{
-    column_expr, BinaryOperator, Expression, ExpressionRef, Predicate,
+    column_expr, BinaryPredicateOp, Expression, ExpressionRef, Predicate,
 };
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::scan::state::{transform_to_logical, visit_scan_files, DvInfo, Stats};
@@ -253,7 +253,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     //
     // NOTE: For cases that match both batch1 and batch2, we list batch2 first because log replay
     // returns most recently added files first.
-    use BinaryOperator::{
+    use BinaryPredicateOp::{
         Equal, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual, NotEqual,
     };
     let test_cases: Vec<(_, i32, _)> = vec![

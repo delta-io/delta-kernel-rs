@@ -8,8 +8,8 @@ use crate::actions::get_log_add_schema;
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
 use crate::expressions::{
-    column_expr, joined_column_expr, BinaryOperator, ColumnName, Expression as Expr,
-    Predicate as Pred, PredicateRef, Scalar, VariadicOperator,
+    column_expr, joined_column_expr, BinaryPredicateOp, ColumnName, Expression as Expr,
+    JunctionPredicateOp, Predicate as Pred, PredicateRef, Scalar,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -227,27 +227,27 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         col: Expr,
         val: &Scalar,
         inverted: bool,
-    ) -> Option<Expr> {
+    ) -> Option<Pred> {
         let op = match (ord, inverted) {
-            (Ordering::Less, false) => BinaryOperator::LessThan,
-            (Ordering::Less, true) => BinaryOperator::GreaterThanOrEqual,
-            (Ordering::Equal, false) => BinaryOperator::Equal,
-            (Ordering::Equal, true) => BinaryOperator::NotEqual,
-            (Ordering::Greater, false) => BinaryOperator::GreaterThan,
-            (Ordering::Greater, true) => BinaryOperator::LessThanOrEqual,
+            (Ordering::Less, false) => BinaryPredicateOp::LessThan,
+            (Ordering::Less, true) => BinaryPredicateOp::GreaterThanOrEqual,
+            (Ordering::Equal, false) => BinaryPredicateOp::Equal,
+            (Ordering::Equal, true) => BinaryPredicateOp::NotEqual,
+            (Ordering::Greater, false) => BinaryPredicateOp::GreaterThan,
+            (Ordering::Greater, true) => BinaryPredicateOp::LessThanOrEqual,
         };
-        Some(Expr::binary(op, col, val.clone()))
+        Some(Pred::binary(op, col, val.clone()))
     }
 
-    fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
-        KernelPredicateEvaluatorDefaults::eval_scalar(val, inverted).map(Expr::literal)
+    fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
+        KernelPredicateEvaluatorDefaults::eval_pred_scalar(val, inverted).map(Expr::literal)
     }
 
-    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
-        KernelPredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted).map(Expr::literal)
+    fn eval_pred_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
+        KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted).map(Expr::literal)
     }
 
-    fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Expr> {
+    fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
         let safe_to_skip = match inverted {
             true => self.get_rowcount_stat()?, // all-null
             false => Expr::literal(0i64),      // no-null
@@ -255,23 +255,24 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         Some(Pred::ne(self.get_nullcount_stat(col)?, safe_to_skip))
     }
 
-    fn eval_binary_scalars(
+    fn eval_pred_binary_scalars(
         &self,
-        op: BinaryOperator,
+        op: BinaryPredicateOp,
         left: &Scalar,
         right: &Scalar,
         inverted: bool,
-    ) -> Option<Expr> {
-        KernelPredicateEvaluatorDefaults::eval_binary_scalars(op, left, right, inverted)
+    ) -> Option<Pred> {
+        KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, inverted)
             .map(Expr::literal)
+            .map(|e| e.eq(true))
     }
 
-    fn finish_eval_variadic(
+    fn finish_eval_pred_junction(
         &self,
-        mut op: VariadicOperator,
-        exprs: impl IntoIterator<Item = Option<Expr>>,
+        mut op: JunctionPredicateOp,
+        preds: impl IntoIterator<Item = Option<Pred>>,
         inverted: bool,
-    ) -> Option<Expr> {
+    ) -> Option<Pred> {
         if inverted {
             op = op.invert();
         }
@@ -282,16 +283,16 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         // where FALSE would otherwise be expected. So, we filter out all nulls except the first,
         // observing that one NULL is enough to produce the correct behavior during predicate eval.
         let mut keep_null = true;
-        let exprs: Vec<_> = exprs
+        let preds: Vec<_> = preds
             .into_iter()
             .flat_map(|e| match e {
-                Some(expr) => Some(expr),
+                Some(pred) => Some(pred),
                 None => keep_null.then(|| {
                     keep_null = false;
                     Expr::null_literal(DataType::BOOLEAN)
                 }),
             })
             .collect();
-        Some(Expr::variadic(op, exprs))
+        Some(Pred::junction(op, preds))
     }
 }

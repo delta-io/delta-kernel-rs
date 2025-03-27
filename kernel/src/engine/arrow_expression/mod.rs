@@ -21,7 +21,8 @@ use crate::expressions::{Expression, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
 use apply_schema::{apply_schema, apply_schema_to};
-use evaluate_expression::evaluate_expression;
+#[allow(unused)] // TODO actually use `evaluate_predicate` in non-test code
+use evaluate_expression::{evaluate_expression, evaluate_predicate};
 use itertools::Itertools;
 use std::sync::Arc;
 use tracing::debug;

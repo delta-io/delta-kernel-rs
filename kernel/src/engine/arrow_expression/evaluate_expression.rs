@@ -14,8 +14,8 @@ use crate::arrow::error::ArrowError;
 use crate::engine::arrow_utils::prim_array_cmp;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
-    BinaryExpression, BinaryOperator, Expression, Scalar, UnaryExpression, UnaryOperator,
-    VariadicExpression, VariadicOperator,
+    BinaryExpression, BinaryPredicate, BinaryPredicateOp, Expression, JunctionPredicate,
+    JunctionPredicateOp, Predicate, Scalar, UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
 use itertools::Itertools;
@@ -87,7 +87,7 @@ pub(crate) fn evaluate_expression(
     batch: &RecordBatch,
     result_type: Option<&DataType>,
 ) -> DeltaResult<ArrayRef> {
-    use BinaryOperator::*;
+    use BinaryPredicateOp::*;
     use Expression::*;
     match (expression, result_type) {
         (Literal(scalar), _) => Ok(scalar.to_array(batch.num_rows())?),
@@ -115,16 +115,16 @@ pub(crate) fn evaluate_expression(
         (Struct(_), _) => Err(Error::generic(
             "Data type is required to evaluate struct expressions",
         )),
-        (Unary(UnaryExpression { op, expr }), _) => {
+        (Unary(UnaryPredicate { op, expr }), _) => {
             let arr = evaluate_expression(expr.as_ref(), batch, None)?;
             let result = match op {
-                UnaryOperator::Not => not(downcast_to_bool(&arr)?)?,
-                UnaryOperator::IsNull => is_null(&arr)?,
+                UnaryPredicateOp::Not => not(downcast_to_bool(&arr)?)?,
+                UnaryPredicateOp::IsNull => is_null(&arr)?,
             };
             Ok(Arc::new(result))
         }
         (
-            Binary(BinaryExpression {
+            Binary(BinaryPredicate {
                 op: In,
                 left,
                 right,
@@ -184,7 +184,7 @@ pub(crate) fn evaluate_expression(
             ))),
         },
         (
-            Binary(BinaryExpression {
+            Binary(BinaryPredicate {
                 op: NotIn,
                 left,
                 right,
@@ -219,15 +219,15 @@ pub(crate) fn evaluate_expression(
 
             Ok(eval(&left_arr, &right_arr)?)
         }
-        (Variadic(VariadicExpression { op, exprs }), None | Some(&DataType::BOOLEAN)) => {
+        (Junction(JunctionPredicate { op, preds }), None | Some(&DataType::BOOLEAN)) => {
             type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
             let (reducer, default): (Operation, _) = match op {
-                VariadicOperator::And => (and_kleene, true),
-                VariadicOperator::Or => (or_kleene, false),
+                JunctionPredicateOp::And => (and_kleene, true),
+                JunctionPredicateOp::Or => (or_kleene, false),
             };
-            exprs
+            preds
                 .iter()
-                .map(|expr| evaluate_expression(expr, batch, result_type))
+                .map(|pred| evaluate_predicate(pred, batch))
                 .reduce(|l, r| {
                     let result = reducer(downcast_to_bool(&l?)?, downcast_to_bool(&r?)?)?;
                     Ok(wrap_comparison_result(result))
@@ -236,11 +236,19 @@ pub(crate) fn evaluate_expression(
                     evaluate_expression(&Expression::literal(default), batch, result_type)
                 })
         }
-        (Variadic(_), _) => {
+        (Junction(_), _) => {
             // NOTE: Update this error message if we add support for variadic operations on other types
             Err(Error::Generic(format!(
-                "Variadic {expression:?} is expected to return boolean results, got {result_type:?}"
+                "Junction {expression:?} is expected to return boolean results, got {result_type:?}"
             )))
         }
     }
+}
+
+pub(crate) fn evaluate_predicate(
+    predicate: &Predicate,
+    batch: &RecordBatch,
+) -> DeltaResult<ArrayRef> {
+    // TODO: Actually split this out
+    evaluate_expression(predicate, batch, Some(&DataType::BOOLEAN))
 }
