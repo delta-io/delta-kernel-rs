@@ -89,12 +89,13 @@ pub(crate) fn get_log_commit_info_schema() -> &'static SchemaRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 #[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
-pub struct Format {
+pub(crate) struct Format {
     /// Name of the encoding for files in this table
-    pub provider: String,
+    pub(crate) provider: String,
     /// A map containing configuration options for the format
-    pub options: HashMap<String, String>,
+    pub(crate) options: HashMap<String, String>,
 }
 
 impl Default for Format {
@@ -108,49 +109,63 @@ impl Default for Format {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Schema)]
 #[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
-pub struct Metadata {
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+pub(crate) struct Metadata {
     /// Unique identifier for this table
-    pub id: String,
+    pub(crate) id: String,
     /// User-provided identifier for this table
-    pub name: Option<String>,
+    pub(crate) name: Option<String>,
     /// User-provided description for this table
-    pub description: Option<String>,
+    pub(crate) description: Option<String>,
     /// Specification of the encoding for the files stored in the table
-    pub format: Format,
+    pub(crate) format: Format,
     /// Schema of the table
-    pub schema_string: String,
+    pub(crate) schema_string: String,
     /// Column names by which the data should be partitioned
-    pub partition_columns: Vec<String>,
+    pub(crate) partition_columns: Vec<String>,
     /// The time when this metadata action is created, in milliseconds since the Unix epoch
-    pub created_time: Option<i64>,
+    pub(crate) created_time: Option<i64>,
     /// Configuration options for the metadata action. These are parsed into [`TableProperties`].
-    pub configuration: HashMap<String, String>,
+    pub(crate) configuration: HashMap<String, String>,
 }
 
 impl Metadata {
-    pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
         let mut visitor = MetadataVisitor::default();
         visitor.visit_rows_of(data)?;
         Ok(visitor.metadata)
     }
 
-    pub fn parse_schema(&self) -> DeltaResult<StructType> {
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[allow(dead_code)]
+    pub(crate) fn configuration(&self) -> &HashMap<String, String> {
+        &self.configuration
+    }
+
+    pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
         Ok(serde_json::from_str(&self.schema_string)?)
+    }
+
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[allow(dead_code)]
+    pub(crate) fn partition_columns(&self) -> &Vec<String> {
+        &self.partition_columns
     }
 
     /// Parse the metadata configuration HashMap<String, String> into a TableProperties struct.
     /// Note that parsing is infallible -- any items that fail to parse are simply propagated
     /// through to the `TableProperties.unknown_properties` field.
-    pub fn parse_table_properties(&self) -> TableProperties {
+    pub(crate) fn parse_table_properties(&self) -> TableProperties {
         TableProperties::from(self.configuration.iter())
     }
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Schema, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 // TODO move to another module so that we disallow constructing this struct without using the
 // try_new function.
-pub struct Protocol {
+pub(crate) struct Protocol {
     /// The minimum version of the Delta read protocol that a client must implement
     /// in order to correctly read this table
     min_reader_version: i32,
@@ -160,17 +175,17 @@ pub struct Protocol {
     /// A collection of features that a client must implement in order to correctly
     /// read this table (exist only when minReaderVersion is set to 3)
     #[serde(skip_serializing_if = "Option::is_none")]
-    reader_features: Option<Vec<String>>,
+    pub(crate) reader_features: Option<Vec<String>>,
     /// A collection of features that a client must implement in order to correctly
     /// write this table (exist only when minWriterVersion is set to 7)
     #[serde(skip_serializing_if = "Option::is_none")]
-    writer_features: Option<Vec<String>>,
+    pub(crate) writer_features: Option<Vec<String>>,
 }
 
 impl Protocol {
     /// Try to create a new Protocol instance from reader/writer versions and table features. This
     /// can fail if the protocol is invalid.
-    pub fn try_new(
+    pub(crate) fn try_new(
         min_reader_version: i32,
         min_writer_version: i32,
         reader_features: Option<impl IntoIterator<Item = impl Into<String>>>,
@@ -204,40 +219,42 @@ impl Protocol {
 
     /// Create a new Protocol by visiting the EngineData and extracting the first protocol row into
     /// a Protocol instance. If no protocol row is found, returns Ok(None).
-    pub fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
         let mut visitor = ProtocolVisitor::default();
         visitor.visit_rows_of(data)?;
         Ok(visitor.protocol)
     }
 
     /// This protocol's minimum reader version
-    pub fn min_reader_version(&self) -> i32 {
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn min_reader_version(&self) -> i32 {
         self.min_reader_version
     }
 
     /// This protocol's minimum writer version
-    pub fn min_writer_version(&self) -> i32 {
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    pub(crate) fn min_writer_version(&self) -> i32 {
         self.min_writer_version
     }
 
     /// Get the reader features for the protocol
-    pub fn reader_features(&self) -> Option<&[String]> {
+    pub(crate) fn reader_features(&self) -> Option<&[String]> {
         self.reader_features.as_deref()
     }
 
     /// Get the writer features for the protocol
-    pub fn writer_features(&self) -> Option<&[String]> {
+    pub(crate) fn writer_features(&self) -> Option<&[String]> {
         self.writer_features.as_deref()
     }
 
     /// True if this protocol has the requested reader feature
-    pub fn has_reader_feature(&self, feature: &ReaderFeatures) -> bool {
+    pub(crate) fn has_reader_feature(&self, feature: &ReaderFeatures) -> bool {
         self.reader_features()
             .is_some_and(|features| features.iter().any(|f| f == feature.as_ref()))
     }
 
     /// True if this protocol has the requested writer feature
-    pub fn has_writer_feature(&self, feature: &WriterFeatures) -> bool {
+    pub(crate) fn has_writer_feature(&self, feature: &WriterFeatures) -> bool {
         self.writer_features()
             .is_some_and(|features| features.iter().any(|f| f == feature.as_ref()))
     }
@@ -245,7 +262,7 @@ impl Protocol {
     /// Check if reading a table with this protocol is supported. That is: does the kernel support
     /// the specified protocol reader version and all enabled reader features? If yes, returns unit
     /// type, otherwise will return an error.
-    pub fn ensure_read_supported(&self) -> DeltaResult<()> {
+    pub(crate) fn ensure_read_supported(&self) -> DeltaResult<()> {
         match &self.reader_features {
             // if min_reader_version = 3 and all reader features are subset of supported => OK
             Some(reader_features) if self.min_reader_version == 3 => {
@@ -275,7 +292,7 @@ impl Protocol {
 
     /// Check if writing to a table with this protocol is supported. That is: does the kernel
     /// support the specified protocol writer version and all enabled writer features?
-    pub fn ensure_write_supported(&self) -> DeltaResult<()> {
+    pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
         match &self.writer_features {
             Some(writer_features) if self.min_writer_version == 7 => {
                 // if we're on version 7, make sure we support all the specified features
@@ -369,30 +386,31 @@ pub(crate) struct CommitInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
-pub struct Add {
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+pub(crate) struct Add {
     /// A relative path to a data file from the root of the table or an absolute path to a file
     /// that should be added to the table. The path is a URI as specified by
     /// [RFC 2396 URI Generic Syntax], which needs to be decoded to get the data file path.
     ///
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
-    pub path: String,
+    pub(crate) path: String,
 
     /// A map from partition column to value for this logical file. This map can contain null in the
     /// values meaning a partition is null. We drop those values from this map, due to the
     /// `drop_null_container_values` annotation. This means an engine can assume that if a partition
     /// is found in [`Metadata`] `partition_columns`, but not in this map, its value is null.
     #[drop_null_container_values]
-    pub partition_values: HashMap<String, String>,
+    pub(crate) partition_values: HashMap<String, String>,
 
     /// The size of this data file in bytes
-    pub size: i64,
+    pub(crate) size: i64,
 
     /// The time this logical file was created, as milliseconds since the epoch.
-    pub modification_time: i64,
+    pub(crate) modification_time: i64,
 
     /// When `false` the logical file must already be present in the table or the records
     /// in the added file must be contained in one or more remove actions in the same version.
-    pub data_change: bool,
+    pub(crate) data_change: bool,
 
     /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this logical file encoded as a JSON string.
     ///
@@ -424,7 +442,9 @@ pub struct Add {
 }
 
 impl Add {
-    pub fn dv_unique_id(&self) -> Option<String> {
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[allow(dead_code)]
+    pub(crate) fn dv_unique_id(&self) -> Option<String> {
         self.deletion_vector.as_ref().map(|dv| dv.unique_id())
     }
 }
@@ -512,15 +532,16 @@ pub(crate) struct Cdc {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
-pub struct SetTransaction {
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+pub(crate) struct SetTransaction {
     /// A unique identifier for the application performing the transaction.
-    pub app_id: String,
+    pub(crate) app_id: String,
 
     /// An application-specific numeric identifier for this transaction.
-    pub version: i64,
+    pub(crate) version: i64,
 
     /// The time when this transaction action was created in milliseconds since the Unix epoch.
-    pub last_updated: Option<i64>,
+    pub(crate) last_updated: Option<i64>,
 }
 
 /// The sidecar action references a sidecar file which provides some of the checkpoint's
