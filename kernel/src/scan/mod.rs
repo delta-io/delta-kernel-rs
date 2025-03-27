@@ -350,11 +350,6 @@ impl ScanData {
     pub fn selection_vector(&self) -> &Vec<bool> {
         &self.filtered_data.selection_vector
     }
-
-    // Get a reference to the transforms
-    pub fn transforms(&self) -> &Vec<Option<ExpressionRef>> {
-        &self.transforms
-    }
 }
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
