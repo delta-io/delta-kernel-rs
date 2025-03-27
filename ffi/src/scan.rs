@@ -32,6 +32,16 @@ pub struct SharedScan;
 #[handle_descriptor(target=ScanData, mutable=false, sized=true)]
 pub struct CScanData;
 
+/// Drop an `CScanData`.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid scan data handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_scan_data(scan_data: Handle<CScanData>) {
+    scan_data.drop_handle();
+}
+
 /// Drops a scan.
 ///
 /// # Safety
