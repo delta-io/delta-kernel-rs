@@ -6,10 +6,10 @@ use crate::{
     AllocateErrorFn, EngineIterator, ExternResult, IntoExternResult, KernelStringSlice,
     ReferenceSet, TryFromStringSlice,
 };
-use delta_kernel::{
-    expressions::{BinaryOperator, ColumnName, Expression, Predicate, UnaryOperator},
-    DeltaResult,
+use delta_kernel::expressions::{
+    BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, Predicate, UnaryPredicateOp,
 };
+use delta_kernel::DeltaResult;
 
 #[derive(Default)]
 pub struct KernelExpressionVisitorState {
@@ -61,7 +61,7 @@ pub(crate) fn unwrap_kernel_predicate(
 
 fn visit_expression_binary(
     state: &mut KernelExpressionVisitorState,
-    op: BinaryOperator,
+    op: BinaryExpressionOp,
     a: usize,
     b: usize,
 ) -> usize {
@@ -75,7 +75,7 @@ fn visit_expression_binary(
 
 fn visit_predicate_binary(
     state: &mut KernelExpressionVisitorState,
-    op: BinaryOperator,
+    op: BinaryPredicateOp,
     a: usize,
     b: usize,
 ) -> usize {
@@ -85,7 +85,7 @@ fn visit_predicate_binary(
 
 fn visit_predicate_unary(
     state: &mut KernelExpressionVisitorState,
-    op: UnaryOperator,
+    op: UnaryPredicateOp,
     inner_expr: usize,
 ) -> usize {
     unwrap_kernel_expression(state, inner_expr)
@@ -110,7 +110,7 @@ pub extern "C" fn visit_predicate_lt(
     a: usize,
     b: usize,
 ) -> usize {
-    visit_predicate_binary(state, BinaryOperator::LessThan, a, b)
+    visit_predicate_binary(state, BinaryPredicateOp::LessThan, a, b)
 }
 
 #[no_mangle]
@@ -119,7 +119,7 @@ pub extern "C" fn visit_predicate_le(
     a: usize,
     b: usize,
 ) -> usize {
-    visit_predicate_binary(state, BinaryOperator::LessThanOrEqual, a, b)
+    visit_predicate_binary(state, BinaryPredicateOp::LessThanOrEqual, a, b)
 }
 
 #[no_mangle]
@@ -128,7 +128,7 @@ pub extern "C" fn visit_predicate_gt(
     a: usize,
     b: usize,
 ) -> usize {
-    visit_predicate_binary(state, BinaryOperator::GreaterThan, a, b)
+    visit_predicate_binary(state, BinaryPredicateOp::GreaterThan, a, b)
 }
 
 #[no_mangle]
@@ -137,7 +137,7 @@ pub extern "C" fn visit_predicate_ge(
     a: usize,
     b: usize,
 ) -> usize {
-    visit_predicate_binary(state, BinaryOperator::GreaterThanOrEqual, a, b)
+    visit_predicate_binary(state, BinaryPredicateOp::GreaterThanOrEqual, a, b)
 }
 
 #[no_mangle]
@@ -146,7 +146,7 @@ pub extern "C" fn visit_predicate_eq(
     a: usize,
     b: usize,
 ) -> usize {
-    visit_predicate_binary(state, BinaryOperator::Equal, a, b)
+    visit_predicate_binary(state, BinaryPredicateOp::Equal, a, b)
 }
 
 /// # Safety
@@ -183,7 +183,7 @@ pub extern "C" fn visit_predicate_is_null(
     state: &mut KernelExpressionVisitorState,
     inner_expr: usize,
 ) -> usize {
-    visit_predicate_unary(state, UnaryOperator::IsNull, inner_expr)
+    visit_predicate_unary(state, UnaryPredicateOp::IsNull, inner_expr)
 }
 
 /// # Safety

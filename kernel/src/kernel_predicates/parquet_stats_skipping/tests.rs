@@ -43,7 +43,7 @@ impl ParquetStatsProvider for UnimplementedTestFilter {
 /// Tests apply_junction and apply_scalar
 #[test]
 fn test_junctions() {
-    use JunctionOperator::*;
+    use JunctionPredicateOp::*;
 
     let test_cases = &[
         // Every combo of 0, 1 and 2 inputs

@@ -25,18 +25,18 @@ pub type PredicateRef = std::sync::Arc<Predicate>;
 // Operators
 ////////////////////////////////////////////////////////////////////////
 
-/// A unary operator.
+/// A unary predicate operator.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum UnaryOperator {
+pub enum UnaryPredicateOp {
     /// Unary Not
     Not,
     /// Unary Is Null
     IsNull,
 }
 
-/// A binary operator.
+/// A binary predicate operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BinaryOperator {
+pub enum BinaryPredicateOp {
     /// Comparison Less Than
     LessThan,
     /// Comparison Less Than Or Equal
@@ -65,8 +65,13 @@ pub enum BinaryOperator {
     Divide,
 }
 
+/// A binary expression operator.
+// TODO: Actually split this out
+pub type BinaryExpressionOp = BinaryPredicateOp;
+
+/// A junction (AND/OR) predicate operator.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum JunctionOperator {
+pub enum JunctionPredicateOp {
     /// Conjunction
     And,
     /// Disjunction
@@ -80,7 +85,7 @@ pub enum JunctionOperator {
 #[derive(Clone, Debug, PartialEq)]
 pub struct UnaryPredicate {
     /// The operator.
-    pub op: UnaryOperator,
+    pub op: UnaryPredicateOp,
     /// The input expression.
     pub expr: Box<Expression>,
 }
@@ -88,7 +93,7 @@ pub struct UnaryPredicate {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BinaryPredicate {
     /// The operator.
-    pub op: BinaryOperator,
+    pub op: BinaryPredicateOp,
     /// The left-hand side of the operation.
     pub left: Box<Expression>,
     /// The right-hand side of the operation.
@@ -101,7 +106,7 @@ pub type BinaryExpression = BinaryPredicate;
 #[derive(Clone, Debug, PartialEq)]
 pub struct JunctionPredicate {
     /// The operator.
-    pub op: JunctionOperator,
+    pub op: JunctionPredicateOp,
     /// The input predicates.
     pub preds: Vec<Predicate>,
 }
@@ -135,10 +140,10 @@ pub type Predicate = Expression;
 // Struct/Enum impls
 ////////////////////////////////////////////////////////////////////////
 
-impl BinaryOperator {
+impl BinaryPredicateOp {
     /// True if this is a comparison for which NULL input always produces NULL output
     pub(crate) fn is_null_intolerant_comparison(&self) -> bool {
-        use BinaryOperator::*;
+        use BinaryPredicateOp::*;
         match self {
             Plus | Minus | Multiply | Divide => false, // not a comparison
             LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual => true,
@@ -148,8 +153,8 @@ impl BinaryOperator {
     }
 
     /// Returns `<op2>` (if any) such that `B <op2> A` is equivalent to `A <op> B`.
-    pub(crate) fn commute(&self) -> Option<BinaryOperator> {
-        use BinaryOperator::*;
+    pub(crate) fn commute(&self) -> Option<BinaryPredicateOp> {
+        use BinaryPredicateOp::*;
         match self {
             GreaterThan => Some(LessThan),
             GreaterThanOrEqual => Some(LessThanOrEqual),
@@ -161,9 +166,9 @@ impl BinaryOperator {
     }
 }
 
-impl JunctionOperator {
-    pub(crate) fn invert(&self) -> JunctionOperator {
-        use JunctionOperator::*;
+impl JunctionPredicateOp {
+    pub(crate) fn invert(&self) -> JunctionPredicateOp {
+        use JunctionPredicateOp::*;
         match self {
             And => Or,
             Or => And,
@@ -172,14 +177,18 @@ impl JunctionOperator {
 }
 
 impl UnaryPredicate {
-    fn new(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
+    fn new(op: UnaryPredicateOp, expr: impl Into<Expression>) -> Self {
         let expr = Box::new(expr.into());
         Self { op, expr }
     }
 }
 
 impl BinaryPredicate {
-    fn new(op: BinaryOperator, left: impl Into<Expression>, right: impl Into<Expression>) -> Self {
+    fn new(
+        op: BinaryPredicateOp,
+        left: impl Into<Expression>,
+        right: impl Into<Expression>,
+    ) -> Self {
         let left = Box::new(left.into());
         let right = Box::new(right.into());
         Self { op, left, right }
@@ -187,7 +196,7 @@ impl BinaryPredicate {
 }
 
 impl JunctionPredicate {
-    fn new(op: JunctionOperator, preds: Vec<Predicate>) -> Self {
+    fn new(op: JunctionPredicateOp, preds: Vec<Predicate>) -> Self {
         Self { op, preds }
     }
 }
@@ -225,12 +234,12 @@ impl Expression {
 
     /// Logical NOT (boolean inversion)
     pub fn not(pred: impl Into<Self>) -> Self {
-        Self::unary(UnaryOperator::Not, pred.into())
+        Self::unary(UnaryPredicateOp::Not, pred.into())
     }
 
     /// Create a new predicate `self IS NULL`
     pub fn is_null(self) -> Self {
-        Self::unary(UnaryOperator::IsNull, self)
+        Self::unary(UnaryPredicateOp::IsNull, self)
     }
 
     /// Create a new predicate `self IS NOT NULL`
@@ -240,37 +249,37 @@ impl Expression {
 
     /// Create a new predicate `self == other`
     pub fn eq(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::Equal, self, other)
+        Self::binary(BinaryPredicateOp::Equal, self, other)
     }
 
     /// Create a new predicate `self != other`
     pub fn ne(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::NotEqual, self, other)
+        Self::binary(BinaryPredicateOp::NotEqual, self, other)
     }
 
     /// Create a new predicate `self <= other`
     pub fn le(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::LessThanOrEqual, self, other)
+        Self::binary(BinaryPredicateOp::LessThanOrEqual, self, other)
     }
 
     /// Create a new predicate `self < other`
     pub fn lt(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::LessThan, self, other)
+        Self::binary(BinaryPredicateOp::LessThan, self, other)
     }
 
     /// Create a new predicate `self >= other`
     pub fn ge(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::GreaterThanOrEqual, self, other)
+        Self::binary(BinaryPredicateOp::GreaterThanOrEqual, self, other)
     }
 
     /// Create a new predicate `self > other`
     pub fn gt(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::GreaterThan, self, other)
+        Self::binary(BinaryPredicateOp::GreaterThan, self, other)
     }
 
     /// Create a new predicate `DISTINCT(self, other)`
     pub fn distinct(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::Distinct, self, other)
+        Self::binary(BinaryPredicateOp::Distinct, self, other)
     }
 
     /// Create a new predicate `self AND other`
@@ -285,23 +294,23 @@ impl Expression {
 
     /// Creates a new predicate AND(preds...)
     pub fn and_from(preds: impl IntoIterator<Item = Self>) -> Self {
-        Self::junction(JunctionOperator::And, preds)
+        Self::junction(JunctionPredicateOp::And, preds)
     }
 
     /// Creates a new predicate OR(preds...)
     pub fn or_from(preds: impl IntoIterator<Item = Self>) -> Self {
-        Self::junction(JunctionOperator::Or, preds)
+        Self::junction(JunctionPredicateOp::Or, preds)
     }
 
     /// Creates a new unary predicate OP expr
-    pub fn unary(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
+    pub fn unary(op: UnaryPredicateOp, expr: impl Into<Expression>) -> Self {
         let expr = Box::new(expr.into());
         Self::Unary(UnaryPredicate { op, expr })
     }
 
     /// Creates a new binary predicate lhs OP rhs
     pub fn binary(
-        op: BinaryOperator,
+        op: BinaryPredicateOp,
         lhs: impl Into<Expression>,
         rhs: impl Into<Expression>,
     ) -> Self {
@@ -313,7 +322,7 @@ impl Expression {
     }
 
     /// Creates a new junction predicate OP(preds...)
-    pub fn junction(op: JunctionOperator, preds: impl IntoIterator<Item = Self>) -> Self {
+    pub fn junction(op: JunctionPredicateOp, preds: impl IntoIterator<Item = Self>) -> Self {
         let preds = preds.into_iter().collect();
         Self::Junction(JunctionPredicate { op, preds })
     }
@@ -323,9 +332,9 @@ impl Expression {
 // Trait impls
 ////////////////////////////////////////////////////////////////////////
 
-impl Display for BinaryOperator {
+impl Display for BinaryExpressionOp {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        use BinaryOperator::*;
+        use BinaryPredicateOp::*;
         match self {
             Plus => write!(f, "+"),
             Minus => write!(f, "-"),
@@ -359,20 +368,20 @@ impl Display for Expression {
                 &exprs.iter().map(|e| format!("{e}")).join(", ")
             ),
             Binary(BinaryPredicate {
-                op: BinaryOperator::Distinct,
+                op: BinaryPredicateOp::Distinct,
                 left,
                 right,
             }) => write!(f, "DISTINCT({left}, {right})"),
             Binary(BinaryPredicate { op, left, right }) => write!(f, "{left} {op} {right}"),
             Unary(UnaryPredicate { op, expr }) => match op {
-                UnaryOperator::Not => write!(f, "NOT {expr}"),
-                UnaryOperator::IsNull => write!(f, "{expr} IS NULL"),
+                UnaryPredicateOp::Not => write!(f, "NOT {expr}"),
+                UnaryPredicateOp::IsNull => write!(f, "{expr} IS NULL"),
             },
             Junction(JunctionPredicate { op, preds }) => {
                 let preds = &preds.iter().map(|p| format!("{p}")).join(", ");
                 let op = match op {
-                    JunctionOperator::And => "AND",
-                    JunctionOperator::Or => "OR",
+                    JunctionPredicateOp::And => "AND",
+                    JunctionPredicateOp::Or => "OR",
                 };
                 write!(f, "{op}({preds})")
             }
@@ -396,7 +405,7 @@ impl<R: Into<Expression>> std::ops::Add<R> for Expression {
     type Output = Self;
 
     fn add(self, rhs: R) -> Self::Output {
-        Self::binary(BinaryOperator::Plus, self, rhs)
+        Self::binary(BinaryExpressionOp::Plus, self, rhs)
     }
 }
 
@@ -404,7 +413,7 @@ impl<R: Into<Expression>> std::ops::Sub<R> for Expression {
     type Output = Self;
 
     fn sub(self, rhs: R) -> Self {
-        Self::binary(BinaryOperator::Minus, self, rhs)
+        Self::binary(BinaryExpressionOp::Minus, self, rhs)
     }
 }
 
@@ -412,7 +421,7 @@ impl<R: Into<Expression>> std::ops::Mul<R> for Expression {
     type Output = Self;
 
     fn mul(self, rhs: R) -> Self {
-        Self::binary(BinaryOperator::Multiply, self, rhs)
+        Self::binary(BinaryExpressionOp::Multiply, self, rhs)
     }
 }
 
@@ -420,7 +429,7 @@ impl<R: Into<Expression>> std::ops::Div<R> for Expression {
     type Output = Self;
 
     fn div(self, rhs: R) -> Self {
-        Self::binary(BinaryOperator::Divide, self, rhs)
+        Self::binary(BinaryExpressionOp::Divide, self, rhs)
     }
 }
 

@@ -8,8 +8,8 @@ use crate::actions::get_log_add_schema;
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
 use crate::expressions::{
-    column_expr, joined_column_expr, BinaryOperator, ColumnName, Expression as Expr,
-    JunctionOperator, Predicate as Pred, PredicateRef, Scalar,
+    column_expr, joined_column_expr, BinaryPredicateOp, ColumnName, Expression as Expr,
+    JunctionPredicateOp, Predicate as Pred, PredicateRef, Scalar,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -229,12 +229,12 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         inverted: bool,
     ) -> Option<Pred> {
         let op = match (ord, inverted) {
-            (Ordering::Less, false) => BinaryOperator::LessThan,
-            (Ordering::Less, true) => BinaryOperator::GreaterThanOrEqual,
-            (Ordering::Equal, false) => BinaryOperator::Equal,
-            (Ordering::Equal, true) => BinaryOperator::NotEqual,
-            (Ordering::Greater, false) => BinaryOperator::GreaterThan,
-            (Ordering::Greater, true) => BinaryOperator::LessThanOrEqual,
+            (Ordering::Less, false) => BinaryPredicateOp::LessThan,
+            (Ordering::Less, true) => BinaryPredicateOp::GreaterThanOrEqual,
+            (Ordering::Equal, false) => BinaryPredicateOp::Equal,
+            (Ordering::Equal, true) => BinaryPredicateOp::NotEqual,
+            (Ordering::Greater, false) => BinaryPredicateOp::GreaterThan,
+            (Ordering::Greater, true) => BinaryPredicateOp::LessThanOrEqual,
         };
         Some(Pred::binary(op, col, val.clone()))
     }
@@ -257,7 +257,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
 
     fn eval_pred_binary_scalars(
         &self,
-        op: BinaryOperator,
+        op: BinaryPredicateOp,
         left: &Scalar,
         right: &Scalar,
         inverted: bool,
@@ -268,7 +268,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
 
     fn finish_eval_pred_junction(
         &self,
-        mut op: JunctionOperator,
+        mut op: JunctionPredicateOp,
         preds: impl IntoIterator<Item = Option<Pred>>,
         inverted: bool,
     ) -> Option<Pred> {

@@ -4,7 +4,7 @@ use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{Add, Cdc, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
 use crate::expressions::Scalar;
-use crate::expressions::{column_expr, BinaryOperator};
+use crate::expressions::{column_expr, BinaryPredicateOp};
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::scan::state::DvInfo;
@@ -518,7 +518,7 @@ async fn data_skipping_filter() {
 
     // Look for actions with id > 4
     let predicate = Predicate::binary(
-        BinaryOperator::GreaterThan,
+        BinaryPredicateOp::GreaterThan,
         column_expr!("id"),
         Scalar::from(4),
     );
