@@ -80,7 +80,7 @@ pub enum JunctionOperator {
 pub struct UnaryExpression {
     /// The operator.
     pub op: UnaryOperator,
-    /// The expression.
+    /// The input expression.
     pub expr: Box<Expression>,
 }
 

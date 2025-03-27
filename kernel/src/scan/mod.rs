@@ -847,7 +847,7 @@ mod tests {
 
     #[test]
     fn test_static_skipping() {
-        const NULL: Expression = Expr::null_literal(DataType::BOOLEAN);
+        const NULL: Expr = Expr::null_literal(DataType::BOOLEAN);
         let test_cases = [
             (false, column_expr!("a")),
             (true, Expr::literal(false)),

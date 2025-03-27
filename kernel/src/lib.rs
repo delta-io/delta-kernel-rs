@@ -339,7 +339,7 @@ impl<T: Any + Send + Sync> AsAny for T {
 pub trait ExpressionEvaluator: AsAny {
     /// Evaluate the expression on a given EngineData.
     ///
-    /// Contains one value for each row of the input.
+    /// Produces one value for each row of the input.
     /// The data type of the output is same as the type output of the expression this evaluator is using.
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>>;
 }

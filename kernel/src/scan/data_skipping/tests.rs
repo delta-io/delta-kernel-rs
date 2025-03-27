@@ -36,7 +36,7 @@ fn test_eval_is_null() {
         for (expr, expect) in expressions.iter().zip(expected) {
             let pred = as_data_skipping_predicate(expr).unwrap();
             expect_eq!(
-                filter.eval_expr(&pred, false),
+                filter.eval(&pred),
                 *expect,
                 "{expr:#?} became {pred:#?} ({nullcount} nulls)"
             );
@@ -79,7 +79,7 @@ fn test_eval_binary_comparisons() {
         for (expr, expect) in expressions.iter().zip(expected.iter()) {
             let pred = as_data_skipping_predicate(expr).unwrap();
             expect_eq!(
-                filter.eval_expr(&pred, false),
+                filter.eval(&pred),
                 *expect,
                 "{expr:#?} became {pred:#?} with [{min}..{max}]"
             );
@@ -161,20 +161,16 @@ fn test_eval_junction() {
 
         let expr = Expr::and_from(inputs.clone());
         let pred = as_data_skipping_predicate(&expr).unwrap();
-        expect_eq!(
-            filter.eval_expr(&pred, false),
-            *expect_and,
-            "AND({inputs:?})"
-        );
+        expect_eq!(filter.eval(&pred), *expect_and, "AND({inputs:?})");
 
         let expr = Expr::or_from(inputs.clone());
         let pred = as_data_skipping_predicate(&expr).unwrap();
-        expect_eq!(filter.eval_expr(&pred, false), *expect_or, "OR({inputs:?})");
+        expect_eq!(filter.eval(&pred), *expect_or, "OR({inputs:?})");
 
         let expr = Expr::not(Expr::and_from(inputs.clone()));
         let pred = as_data_skipping_predicate(&expr).unwrap();
         expect_eq!(
-            filter.eval_expr(&pred, false),
+            filter.eval(&pred),
             expect_and.map(|val| !val),
             "NOT AND({inputs:?})"
         );
@@ -182,7 +178,7 @@ fn test_eval_junction() {
         let expr = Expr::not(Expr::or_from(inputs.clone()));
         let pred = as_data_skipping_predicate(&expr).unwrap();
         expect_eq!(
-            filter.eval_expr(&pred, false),
+            filter.eval(&pred),
             expect_or.map(|val| !val),
             "NOT OR({inputs:?})"
         );
@@ -218,7 +214,7 @@ fn test_eval_distinct() {
         for (expr, expect) in expressions.iter().zip(expected) {
             let pred = as_data_skipping_predicate(expr).unwrap();
             expect_eq!(
-                filter.eval_expr(&pred, false),
+                filter.eval(&pred),
                 *expect,
                 "{expr:#?} became {pred:#?} ({min}..{max}, {nullcount} nulls)"
             );
@@ -257,7 +253,7 @@ fn test_eval_distinct() {
 fn test_sql_where() {
     let col = &column_expr!("x");
     const VAL: Expr = Expr::Literal(Scalar::Integer(10));
-    const NULL: Expr = Expr::Literal(Scalar::Null(DataType::BOOLEAN));
+    const NULL: Expr = Expr::null_literal(DataType::BOOLEAN);
     const FALSE: Expr = Expr::Literal(Scalar::Boolean(false));
     const TRUE: Expr = Expr::Literal(Scalar::Boolean(true));
 
@@ -289,13 +285,13 @@ fn test_sql_where() {
             let filter = DefaultKernelPredicateEvaluator::from(resolver);
             let pred = as_data_skipping_predicate(expr).unwrap();
             expect_eq!(
-                filter.eval_expr(&pred, false),
+                filter.eval(&pred),
                 expect,
                 "{expr:#?} became {pred:#?} ({min}..{max}, {nulls} nulls)"
             );
             let sql_pred = as_sql_data_skipping_predicate(expr).unwrap();
             expect_eq!(
-                filter.eval_expr(&sql_pred, false),
+                filter.eval(&sql_pred),
                 expect_sql,
                 "{expr:#?} became {sql_pred:#?} ({min}..{max}, {nulls} nulls)"
             );

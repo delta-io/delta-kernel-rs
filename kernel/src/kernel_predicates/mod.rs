@@ -367,7 +367,7 @@ pub(crate) trait KernelPredicateEvaluator {
             Column(col) => {
                 // Perform a nullsafe comparison instead of the usual `eval_column`
                 let exprs = [
-                    self.eval_unary(UnaryOperator::IsNull, filter, true),
+                    self.eval_is_null(col, true),
                     self.eval_column(col, inverted),
                 ];
                 self.finish_eval_junction(JunctionOperator::And, exprs, false)
