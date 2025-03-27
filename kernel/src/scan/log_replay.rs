@@ -350,10 +350,11 @@ impl LogReplayScanner {
         // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
         let selection_vector = visitor.selection_vector;
         let result = add_transform.evaluate(actions)?;
-        Ok(ScanData {
-            filtered_data: (result, selection_vector),
-            transforms: visitor.row_transform_exprs,
-        })
+        Ok(ScanData::new(
+            result,
+            selection_vector,
+            visitor.row_transform_exprs,
+        ))
     }
 }
 
@@ -387,8 +388,7 @@ pub(crate) fn scan_action_iter(
         })
         .filter(|res| {
             res.as_ref().map_or(true, |scan_data| {
-                let (_, sel_vec) = &scan_data.filtered_data;
-                sel_vec.contains(&true)
+                scan_data.selection_vector().contains(&true)
             })
         })
 }

@@ -162,14 +162,13 @@ pub type ScanCallback<T> = fn(
 /// ```
 impl ScanData {
     pub fn visit_scan_files<T>(&self, context: T, callback: ScanCallback<T>) -> DeltaResult<T> {
-        let (data, selection_vector) = &self.filtered_data;
         let mut visitor = ScanFileVisitor {
             callback,
-            selection_vector,
+            selection_vector: &self.filtered_data.selection_vector,
             transforms: &self.transforms,
             context,
         };
-        visitor.visit_rows_of(data.as_ref())?;
+        visitor.visit_rows_of(self.filtered_data.data.as_ref())?;
         Ok(visitor.context)
     }
 }

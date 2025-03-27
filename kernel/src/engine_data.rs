@@ -8,10 +8,12 @@ use tracing::debug;
 use std::collections::HashMap;
 
 /// Engine data paired with a selection vector that indicates which rows to process.
-///
-/// `Box<dyn EngineData>` - The underlying data
-/// `Vec<bool>` - Selection vector where `true` marks rows to include in results
-pub type FilteredEngineData = (Box<dyn EngineData>, Vec<bool>);
+pub struct FilteredEngineData {
+    // The underlying engine data
+    pub data: Box<dyn EngineData>,
+    // The selection vector where `true` marks rows to include in results
+    pub selection_vector: Vec<bool>,
+}
 
 /// a trait that an engine exposes to give access to a list
 pub trait EngineList {

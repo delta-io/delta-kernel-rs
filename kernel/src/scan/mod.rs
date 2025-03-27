@@ -330,6 +330,32 @@ pub struct ScanData {
     /// the `filtered_data`. If an expression is `None`, no transformation is needed for that row.
     pub transforms: Vec<Option<ExpressionRef>>,
 }
+
+impl ScanData {
+    pub fn new(
+        data: Box<dyn EngineData>,
+        selection_vector: Vec<bool>,
+        transforms: Vec<Option<ExpressionRef>>,
+    ) -> Self {
+        Self {
+            filtered_data: FilteredEngineData {
+                data,
+                selection_vector,
+            },
+            transforms,
+        }
+    }
+
+    // Get a reference to the selection vector
+    pub fn selection_vector(&self) -> &Vec<bool> {
+        &self.filtered_data.selection_vector
+    }
+
+    // Get a reference to the transforms
+    pub fn transforms(&self) -> &Vec<Option<ExpressionRef>> {
+        &self.transforms
+    }
+}
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
 pub struct Scan {
@@ -793,7 +819,7 @@ pub(crate) mod test_utils {
         let mut batch_count = 0;
         for res in iter {
             let scan_data = res.unwrap();
-            assert_eq!(&scan_data.filtered_data.1, &expected_sel_vec);
+            assert_eq!(scan_data.selection_vector(), &expected_sel_vec);
             scan_data
                 .visit_scan_files(context.clone(), validate_callback)
                 .unwrap();

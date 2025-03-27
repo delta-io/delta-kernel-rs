@@ -108,6 +108,7 @@ void do_visit_scan_data(void* engine_context, HandleCScanData scan_data)
   // Ask kernel to iterate each individual file and call us back with extracted metadata
   print_diag("Asking kernel to call us back for each scan row (file to read)\n");
   visit_scan_data(scan_data, engine_context, scan_row_callback);
+  free_bool_slice(selection_vector);
   free_scan_data(scan_data);
 }
 
