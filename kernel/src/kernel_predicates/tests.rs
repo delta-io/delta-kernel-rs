@@ -367,7 +367,7 @@ fn test_eval_not() {
         let input = input.into();
         for inverted in [true, false] {
             expect_eq!(
-                filter.eval_unary(UnaryOperator::Not, &input, inverted),
+                filter.eval_not(&input, inverted),
                 expect.map(|v| v != inverted),
                 "NOT({input:?}) (inverted: {inverted})"
             );

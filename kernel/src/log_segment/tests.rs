@@ -25,7 +25,7 @@ use crate::scan::test_utils::{
 use crate::snapshot::CheckpointMetadata;
 use crate::utils::test_utils::{assert_batch_matches, Action};
 use crate::{
-    DeltaResult, Engine, EngineData, Expression, ExpressionRef, FileMeta, FileSystemClient,
+    DeltaResult, Engine as _, EngineData, Expression, ExpressionRef, FileMeta, FileSystemClient,
     RowVisitor, Table,
 };
 use test_utils::delta_path_for_version;

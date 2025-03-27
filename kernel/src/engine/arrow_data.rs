@@ -302,7 +302,7 @@ mod tests {
     use crate::{
         actions::{get_log_schema, Metadata, Protocol},
         engine::sync::SyncEngine,
-        DeltaResult, Engine, EngineData,
+        DeltaResult, Engine as _, EngineData,
     };
 
     use super::ArrowEngineData;

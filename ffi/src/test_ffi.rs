@@ -1,6 +1,6 @@
 //! Utility functions used for testing ffi code
 
-use std::{ops::Not, sync::Arc};
+use std::sync::Arc;
 
 use crate::{expressions::SharedExpression, handle::Handle};
 use delta_kernel::{
@@ -68,7 +68,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
             Scalar::Integer(5).into(),
             Scalar::Long(20).into(),
         ])]),
-        Expr::not(Expr::is_null(column_expr!("col"))),
+        Expr::is_not_null(column_expr!("col")),
     ];
     sub_exprs.extend(
         [
@@ -86,8 +86,8 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
             BinaryOperator::GreaterThanOrEqual,
             BinaryOperator::Distinct,
         ]
-        .iter()
-        .map(|op| Expr::binary(*op, Scalar::Integer(0), Scalar::Long(0))),
+        .into_iter()
+        .map(|op| Expr::binary(op, Scalar::Integer(0), Scalar::Long(0))),
     );
 
     Arc::new(Expr::and_from(sub_exprs)).into()

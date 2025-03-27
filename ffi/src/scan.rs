@@ -60,7 +60,7 @@ fn scan_impl(
 ) -> DeltaResult<Handle<SharedScan>> {
     let mut scan_builder = snapshot.scan_builder();
     if let Some(predicate) = predicate {
-        let mut visitor_state = KernelExpressionVisitorState::new();
+        let mut visitor_state = KernelExpressionVisitorState::default();
         let exprid = (predicate.visitor)(predicate.predicate, &mut visitor_state);
         let predicate = unwrap_kernel_expression(&mut visitor_state, exprid);
         debug!("Got predicate: {:#?}", predicate);

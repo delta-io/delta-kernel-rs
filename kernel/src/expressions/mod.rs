@@ -257,29 +257,19 @@ impl Expression {
         Self::binary(BinaryOperator::GreaterThan, self, other)
     }
 
-    /// Create a new expression `self >= other`
-    pub fn gt_eq(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::GreaterThanOrEqual, self, other)
-    }
-
-    /// Create a new expression `self <= other`
-    pub fn lt_eq(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::LessThanOrEqual, self, other)
-    }
-
     /// Create a new expression `DISTINCT(self, other)`
     pub fn distinct(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::Distinct, self, other)
     }
 
     /// Create a new expression `self AND other`
-    pub fn and(self, other: impl Into<Self>) -> Self {
-        Self::and_from([self, other.into()])
+    pub fn and(a: impl Into<Self>, b: impl Into<Self>) -> Self {
+        Self::and_from([a.into(), b.into()])
     }
 
     /// Create a new expression `self OR other`
-    pub fn or(self, other: impl Into<Self>) -> Self {
-        Self::or_from([self, other.into()])
+    pub fn or(a: impl Into<Self>, b: impl Into<Self>) -> Self {
+        Self::or_from([a.into(), b.into()])
     }
 
     /// Creates a new expression AND(exprs...)
@@ -294,10 +284,8 @@ impl Expression {
 
     /// Creates a new unary expression OP expr
     pub fn unary(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
-        Self::Unary(UnaryExpression {
-            op,
-            expr: Box::new(expr.into()),
-        })
+        let expr = Box::new(expr.into());
+        Self::Unary(UnaryExpression { op, expr })
     }
 
     /// Creates a new binary expression lhs OP rhs
@@ -312,6 +300,7 @@ impl Expression {
             right: Box::new(rhs.into()),
         })
     }
+
 
     /// Creates a new variadic expression OP(exprs...)
     pub fn variadic(op: VariadicOperator, exprs: impl IntoIterator<Item = Self>) -> Self {
@@ -463,19 +452,19 @@ mod tests {
             ((col_ref.clone() - 4).lt(10), "Column(x) - 4 < 10"),
             ((col_ref.clone() + 4) / 10 * 42, "Column(x) + 4 / 10 * 42"),
             (
-                col_ref.clone().gt_eq(2).and(col_ref.clone().lt_eq(10)),
+                Expression::and(col_ref.clone().ge(2), col_ref.clone().le(10)),
                 "AND(Column(x) >= 2, Column(x) <= 10)",
             ),
             (
                 Expression::and_from([
-                    col_ref.clone().gt_eq(2),
-                    col_ref.clone().lt_eq(10),
-                    col_ref.clone().lt_eq(100),
+                    col_ref.clone().ge(2),
+                    col_ref.clone().le(10),
+                    col_ref.clone().le(100),
                 ]),
                 "AND(Column(x) >= 2, Column(x) <= 10, Column(x) <= 100)",
             ),
             (
-                col_ref.clone().gt(2).or(col_ref.clone().lt(10)),
+                Expression::or(col_ref.clone().gt(2), col_ref.clone().lt(10)),
                 "OR(Column(x) > 2, Column(x) < 10)",
             ),
             (col_ref.eq("foo"), "Column(x) = 'foo'"),
