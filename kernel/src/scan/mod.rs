@@ -430,9 +430,12 @@ impl Scan {
 
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
-        self.snapshot
-            .log_segment()
-            .replay(engine, commit_read_schema, checkpoint_read_schema, None)
+        self.snapshot.log_segment().read_actions(
+            engine,
+            commit_read_schema,
+            checkpoint_read_schema,
+            None,
+        )
     }
 
     /// Get global state that is valid for the entire scan. This is somewhat expensive so should

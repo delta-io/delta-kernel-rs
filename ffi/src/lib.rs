@@ -661,7 +661,7 @@ pub unsafe extern "C" fn snapshot_table_root(
 #[no_mangle]
 pub unsafe extern "C" fn get_partition_column_count(snapshot: Handle<SharedSnapshot>) -> usize {
     let snapshot = unsafe { snapshot.as_ref() };
-    snapshot.metadata().partition_columns.len()
+    snapshot.metadata().partition_columns().len()
 }
 
 /// Get an iterator of the list of partition columns for this snapshot.
@@ -673,7 +673,8 @@ pub unsafe extern "C" fn get_partition_columns(
     snapshot: Handle<SharedSnapshot>,
 ) -> Handle<StringSliceIterator> {
     let snapshot = unsafe { snapshot.as_ref() };
-    let iter: Box<StringIter> = Box::new(snapshot.metadata().partition_columns.clone().into_iter());
+    let iter: Box<StringIter> =
+        Box::new(snapshot.metadata().partition_columns().clone().into_iter());
     iter.into()
 }
 
