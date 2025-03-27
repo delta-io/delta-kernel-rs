@@ -82,10 +82,15 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> DeltaResult<()> {
         "delta.inCommitTimestampEnablementTimestamp" => {
             props.in_commit_timestamp_enablement_timestamp = parse_non_negative(v)?
         }
-        _ => return Err(Error::Generic("foo".to_string())),
+        _ => return Err(Error::ParsePropertyError(ParsePropertyError(k.to_string()))),
     }
     Ok(())
 }
+
+/// The input string is not a valid interval
+#[derive(thiserror::Error, Debug)]
+#[error("'{0}' is not a valid property")]
+pub struct ParsePropertyError(String);
 
 /// Deserialize a string representing a positive (> 0) integer into an `Option<u64>`. Returns `Some`
 /// if successfully parses, and `None` otherwise.
