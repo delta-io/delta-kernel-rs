@@ -1,10 +1,6 @@
 //! Expression handling based on arrow-rs compute kernels.
-mod apply_schema;
-mod evaluate_expression;
-#[cfg(test)]
-mod tests;
+use std::sync::Arc;
 
-use super::arrow_conversion::LIST_ARRAY_ROOT;
 use crate::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, RecordBatch,
@@ -15,16 +11,25 @@ use crate::arrow::compute::concat;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
 };
+
+use super::arrow_conversion::LIST_ARRAY_ROOT;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{Expression, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
+
+use itertools::Itertools;
+use tracing::debug;
+
 use apply_schema::{apply_schema, apply_schema_to};
 use evaluate_expression::evaluate_expression;
-use itertools::Itertools;
-use std::sync::Arc;
-use tracing::debug;
+
+mod apply_schema;
+mod evaluate_expression;
+
+#[cfg(test)]
+mod tests;
 
 // TODO leverage scalars / Datum
 
@@ -132,6 +137,19 @@ impl ExpressionHandler for ArrowExpressionHandler {
             expression: Box::new(expression),
             output_type,
         })
+    }
+
+    /// Create a single-row array with all-null leaf values. Note that if a nested struct is
+    /// included in the `output_type`, the entire struct will be NULL (instead of a not-null struct
+    /// with NULL fields).
+    fn null_row(&self, output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>> {
+        let fields = output_schema.fields();
+        let arrays = fields
+            .map(|field| Scalar::Null(field.data_type().clone()).to_array(1))
+            .try_collect()?;
+        let record_batch =
+            RecordBatch::try_new(Arc::new(output_schema.as_ref().try_into()?), arrays)?;
+        Ok(Box::new(ArrowEngineData::new(record_batch)))
     }
 }
 
