@@ -32,8 +32,8 @@ pub enum Error {
     Schema(String),
 
     /// Insufficient number of scalars (too many) to create a single-row expression
-    #[error("Too many scalars given for literal expression transform")]
-    ExcessScalars,
+    #[error("Excess scalar: {0} given for literal expression transform")]
+    ExcessScalars(Scalar),
 
     /// Insufficient number of scalars (too few) to create a single-row expression
     #[error("Too few scalars given for literal expression transform")]
@@ -49,7 +49,7 @@ pub enum Error {
 }
 
 impl<'a, I: Iterator<Item = &'a Scalar>> LiteralExpressionTransform<'a, I> {
-    pub(crate) fn new(scalars: impl IntoIterator<Item = &'a Scalar, IntoIter = I>) -> Self {
+    pub(crate) fn new(scalars: impl IntoIterator<IntoIter = I>) -> Self {
         Self {
             scalars: scalars.into_iter(),
             stack: Vec::new(),
@@ -62,29 +62,16 @@ impl<'a, I: Iterator<Item = &'a Scalar>> LiteralExpressionTransform<'a, I> {
     pub(crate) fn try_into_expr(mut self) -> Result<Expression, Error> {
         self.error?;
 
-        if self.scalars.next().is_some() {
-            return Err(Error::ExcessScalars);
+        if let Some(s) = self.scalars.next() {
+            return Err(Error::ExcessScalars(s.clone()));
         }
 
-        match self.stack.pop() {
-            Some(expr) => Ok(expr),
-            None => Err(Error::EmptyStack),
-        }
+        self.stack.pop().ok_or(Error::EmptyStack)
     }
 
     fn set_error(&mut self, error: Error) {
         if let Err(e) = mem::replace(&mut self.error, Err(error)) {
             debug!("Overwriting error that was already set: {e}");
-        }
-    }
-
-    fn check_error<T, E: Into<Error>>(&mut self, result: Result<T, E>) -> Option<T> {
-        match result {
-            Ok(val) => Some(val),
-            Err(err) => {
-                self.set_error(err.into());
-                None
-            }
         }
     }
 }
@@ -97,8 +84,10 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
         // first always check error to terminate early if possible
         self.error.as_ref().ok()?;
 
-        let next = self.scalars.next();
-        let scalar = self.check_error(next.ok_or(Error::InsufficientScalars))?;
+        let Some(scalar) = self.scalars.next() else {
+            self.set_error(Error::InsufficientScalars);
+            return None;
+        };
 
         let DataType::Primitive(scalar_type) = scalar.data_type() else {
             self.set_error(Error::Schema(
@@ -115,7 +104,7 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
         }
 
         self.stack.push(Expression::Literal(scalar.clone()));
-        Some(Cow::Borrowed(prim_type))
+        None
     }
 
     fn transform_struct(&mut self, struct_type: &'a StructType) -> Option<Cow<'a, StructType>> {
@@ -160,7 +149,7 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
         };
 
         self.stack.push(struct_expr);
-        Some(Cow::Borrowed(struct_type))
+        None
     }
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
@@ -173,6 +162,7 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
 
     // arrays unsupported for now
     fn transform_array(&mut self, _array_type: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
+        self.error.as_ref().ok()?;
         self.set_error(Error::Unsupported(
             "ArrayType not yet supported in literal expression transform".to_string(),
         ));
@@ -181,6 +171,7 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
 
     // maps unsupported for now
     fn transform_map(&mut self, _map_type: &'a MapType) -> Option<Cow<'a, MapType>> {
+        self.error.as_ref().ok()?;
         self.set_error(Error::Unsupported(
             "MapType not yet supported in literal expression transform".to_string(),
         ));
