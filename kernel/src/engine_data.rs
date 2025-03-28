@@ -7,6 +7,14 @@ use tracing::debug;
 
 use std::collections::HashMap;
 
+/// Engine data paired with a selection vector that indicates which rows to process.
+pub struct FilteredEngineData {
+    // The underlying engine data
+    pub data: Box<dyn EngineData>,
+    // The selection vector where `true` marks rows to include in results
+    pub selection_vector: Vec<bool>,
+}
+
 /// a trait that an engine exposes to give access to a list
 pub trait EngineList {
     /// Return the length of the list at the specified row_index in the raw data
