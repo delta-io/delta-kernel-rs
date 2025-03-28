@@ -18,7 +18,7 @@ use itertools::Itertools;
 use std::collections::HashMap;
 use std::convert::identity;
 use std::sync::{Arc, LazyLock};
-use tracing::warn;
+use tracing::{info, warn};
 use url::Url;
 
 #[cfg(test)]
@@ -554,7 +554,7 @@ fn list_log_files_with_checkpoint(
         ));
     };
     if latest_checkpoint.version != checkpoint_metadata.version {
-        warn!(
+        info!(
             "_last_checkpoint hint is out of date. _last_checkpoint version: {}. Using actual most recent: {}",
             checkpoint_metadata.version,
             latest_checkpoint.version
