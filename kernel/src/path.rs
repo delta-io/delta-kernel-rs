@@ -2,6 +2,7 @@
 
 use std::str::FromStr;
 use url::Url;
+use uuid::Uuid;
 
 use crate::{DeltaResult, Error, FileMeta, Version};
 
@@ -192,6 +193,42 @@ impl ParsedLogPath<Url> {
         if !path.is_commit() {
             return Err(Error::internal_error(
                 "ParsedLogPath::new_commit created a non-commit path",
+            ));
+        }
+        Ok(path)
+    }
+
+    /// Create a new ParsedCommitPath<Url> for a classic-named parquet checkpoint file at the specified version
+    pub(crate) fn new_classic_parquet_checkpoint(
+        table_root: &Url,
+        version: Version,
+    ) -> DeltaResult<ParsedLogPath<Url>> {
+        let filename = format!("{:020}.checkpoint.parquet", version);
+        let location = table_root.join("_delta_log/")?.join(&filename)?;
+        let path = Self::try_from(location)?
+            .ok_or_else(|| Error::internal_error("attempted to create invalid checkpoint path"))?;
+        if !path.is_checkpoint() {
+            return Err(Error::internal_error(
+                "ParsedLogPath::new_classic_parquet_checkpoint created a non-checkpoint path",
+            ));
+        }
+        Ok(path)
+    }
+
+    /// Create a new ParsedCommitPath<Url> for a uuid-named parquet checkpoint file at the specified version
+    pub(crate) fn new_uuid_parquet_checkpoint(
+        table_root: &Url,
+        version: Version,
+    ) -> DeltaResult<ParsedLogPath<Url>> {
+        // Generate a random UUID v4
+        let uuid = Uuid::new_v4().to_string();
+        let filename = format!("{:020}.checkpoint.{}.parquet", version, uuid);
+        let location = table_root.join("_delta_log/")?.join(&filename)?;
+        let path = Self::try_from(location)?
+            .ok_or_else(|| Error::internal_error("attempted to create invalid checkpoint path"))?;
+        if !path.is_checkpoint() {
+            return Err(Error::internal_error(
+                "ParsedLogPath::new_uuid_parquet_checkpoint created a non-checkpoint path",
             ));
         }
         Ok(path)
@@ -565,5 +602,46 @@ mod tests {
         assert_eq!(log_path.extension, "json");
         assert!(matches!(log_path.file_type, LogPathFileType::Commit));
         assert_eq!(log_path.filename, "00000000000000000010.json");
+    }
+    #[test]
+    fn test_new_uuid_parquet_checkpoint() {
+        let table_log_dir = table_log_dir_url();
+        let log_path = ParsedLogPath::new_uuid_parquet_checkpoint(&table_log_dir, 10).unwrap();
+
+        // Basic properties
+        assert_eq!(log_path.version, 10);
+        assert!(log_path.is_checkpoint());
+        assert_eq!(log_path.extension, "parquet");
+        assert!(matches!(
+            log_path.file_type,
+            LogPathFileType::UuidCheckpoint(_)
+        ));
+
+        // Filename structure
+        let parts: Vec<&str> = log_path.filename.split('.').collect();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0], "00000000000000000010");
+        assert_eq!(parts[1], "checkpoint");
+        assert_eq!(parts[3], "parquet");
+
+        // Validate UUID
+        assert!(!parts[2].is_empty());
+        assert!(Uuid::parse_str(parts[2]).is_ok());
+    }
+
+    #[test]
+    fn test_new_classic_parquet_checkpoint() {
+        let table_log_dir = table_log_dir_url();
+        let log_path = ParsedLogPath::new_classic_parquet_checkpoint(&table_log_dir, 10).unwrap();
+
+        // Basic properties
+        assert_eq!(log_path.version, 10);
+        assert!(log_path.is_checkpoint());
+        assert_eq!(log_path.extension, "parquet");
+        assert!(matches!(
+            log_path.file_type,
+            LogPathFileType::SinglePartCheckpoint
+        ));
+        assert_eq!(log_path.filename, "00000000000000000010.checkpoint.parquet");
     }
 }

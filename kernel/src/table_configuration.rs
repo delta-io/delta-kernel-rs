@@ -238,6 +238,25 @@ impl TableConfiguration {
             version => (2..=6).contains(&version),
         }
     }
+
+    /// Returns `true` if V2 checkpoint is supported on this table. To support V2 checkpoint,
+    /// a table must support reader version 3, writer version 7, and the v2Checkpoint feature in
+    /// both the protocol's readerFeatures and writerFeatures.
+    ///
+    /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#v2-checkpoint-table-feature>
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[allow(unused)] // needed to compile w/o default features
+    pub(crate) fn is_v2_checkpoint_supported(&self) -> bool {
+        let read_supported = self
+            .protocol()
+            .has_reader_feature(&ReaderFeatures::V2Checkpoint)
+            && self.protocol.min_reader_version() == 3;
+        let write_supported = self
+            .protocol()
+            .has_writer_feature(&WriterFeatures::V2Checkpoint)
+            && self.protocol.min_writer_version() == 7;
+        read_supported && write_supported
+    }
 }
 
 #[cfg(test)]
