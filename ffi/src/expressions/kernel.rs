@@ -65,6 +65,10 @@ pub struct EngineExpressionVisitor {
     pub visit_literal_int: VisitLiteralFn<i32>,
     /// Visit a 64bit `long`  belonging to the list identified by `sibling_list_id`.
     pub visit_literal_long: VisitLiteralFn<i64>,
+    /// Visit a 64bit unsigned `long`  belonging to the list identified by `sibling_list_id`.
+    pub visit_literal_ulong: VisitLiteralFn<u64>,
+    /// Visit a 32bit unsigned `integer` int belonging to the list identified by `sibling_list_id`.
+    pub visit_literal_uint: VisitLiteralFn<u32>,
     /// Visit a 16bit `short` belonging to the list identified by `sibling_list_id`.
     pub visit_literal_short: VisitLiteralFn<i16>,
     /// Visit an 8bit `byte` belonging to the list identified by `sibling_list_id`.
@@ -292,6 +296,17 @@ fn visit_expression_internal(
         match scalar {
             Scalar::Integer(val) => call!(visitor, visit_literal_int, sibling_list_id, *val),
             Scalar::Long(val) => call!(visitor, visit_literal_long, sibling_list_id, *val),
+            Scalar::ULong(val) => call!(visitor, visit_literal_ulong, sibling_list_id, *val), // TODO: Fix typecast
+            Scalar::USize(val) => {
+                #[cfg(target_pointer_width = "32")]
+                {
+                    call!(visitor, visit_literal_uint, sibling_list_id, *val as u64)
+                }
+                #[cfg(target_pointer_width = "64")]
+                {
+                    call!(visitor, visit_literal_ulong, sibling_list_id, *val as u64)
+                }
+            }
             Scalar::Short(val) => call!(visitor, visit_literal_short, sibling_list_id, *val),
             Scalar::Byte(val) => call!(visitor, visit_literal_byte, sibling_list_id, *val),
             Scalar::Float(val) => call!(visitor, visit_literal_float, sibling_list_id, *val),

@@ -105,6 +105,50 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
             (Long, Statistics::Int64(s)) => s.min_opt()?.into(),
             (Long, Statistics::Int32(s)) => (*s.min_opt()? as i64).into(),
             (Long, _) => return None,
+            (ULong, Statistics::Int64(s)) =>
+            // Attempt to convert value to u64, return None if conversion fails
+            {
+                u64::try_from(*s.min_opt()?).ok()?.into()
+            }
+
+            // Handling ULong type with Int32 statistics
+            (ULong, Statistics::Int32(s)) =>
+            // Attempt to convert value to u64, return None if conversion fails
+            {
+                u64::try_from(*s.min_opt()?).ok()?.into()
+            }
+
+            (ULong, _) => return None,
+            // Handling USize type on 64-bit architecture with Int64 statistics
+            #[cfg(target_pointer_width = "64")]
+            (USize, Statistics::Int64(s)) =>
+            // Attempt to convert value to usize, return None if conversion fails
+            {
+                usize::try_from(*s.min_opt()?).ok()?.into()
+            }
+            // Handling USize type on 64-bit architecture with Int32 statistics
+            #[cfg(target_pointer_width = "64")]
+            (USize, Statistics::Int32(s)) =>
+            // Attempt to convert value to usize, converting from u64 if needed
+            {
+                usize::try_from(*s.min_opt()? as u64).ok()?.into()
+            }
+            // Handling USize type on 32-bit architecture with Int64 statistics
+            #[cfg(target_pointer_width = "32")]
+            (USize, Statistics::Int64(s)) =>
+            // Attempt to convert value to usize, ensuring it's cast to u32 first
+            {
+                usize::try_from(*s.min_opt()? as u32).ok()?.into()
+            }
+
+            // Handling USize type on 32-bit architecture with Int32 statistics
+            #[cfg(target_pointer_width = "32")]
+            (USize, Statistics::Int32(s)) =>
+            // Attempt to convert vvalue to usize, return None if conversion fails
+            {
+                usize::try_from(*s.min_opt()?).ok()?.into()
+            }
+            (USize, _) => return None,
             (Integer, Statistics::Int32(s)) => s.min_opt()?.into(),
             (Integer, _) => return None,
             (Short, Statistics::Int32(s)) => (*s.min_opt()? as i16).into(),
@@ -147,6 +191,51 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
             (Long, Statistics::Int64(s)) => s.max_opt()?.into(),
             (Long, Statistics::Int32(s)) => (*s.max_opt()? as i64).into(),
             (Long, _) => return None,
+            (ULong, Statistics::Int64(s)) =>
+            // Attempt to convert value to u64, return None if conversion fails
+            {
+                u64::try_from(*s.min_opt()?).ok()?.into()
+            }
+
+            // Handling ULong type with Int32 statistics
+            (ULong, Statistics::Int32(s)) =>
+            // Attempt to convert value to u64, return None if conversion fails
+            {
+                u64::try_from(*s.min_opt()?).ok()?.into()
+            }
+
+            (ULong, _) => return None,
+            // Handling USize type on 64-bit architecture with Int64 statistics
+            #[cfg(target_pointer_width = "64")]
+            (USize, Statistics::Int64(s)) =>
+            // Attempt to convert value to usize, return None if conversion fails
+            {
+                usize::try_from(*s.min_opt()?).ok()?.into()
+            }
+            // Handling USize type on 64-bit architecture with Int32 statistics
+            #[cfg(target_pointer_width = "64")]
+            (USize, Statistics::Int32(s)) =>
+            // Attempt to convert value to usize, converting from u64 if needed
+            {
+                usize::try_from(*s.min_opt()? as u64).ok()?.into()
+            }
+            // Handling USize type on 32-bit architecture with Int64 statistics
+            #[cfg(target_pointer_width = "32")]
+            (USize, Statistics::Int64(s)) =>
+            // Attempt to convert value to usize, ensuring it's cast to u32 first
+            {
+                usize::try_from(*s.min_opt()? as u32).ok()?.into()
+            }
+
+            // Handling USize type on 32-bit architecture with Int32 statistics
+            #[cfg(target_pointer_width = "32")]
+            (USize, Statistics::Int32(s)) =>
+            // Attempt to convert vvalue to usize, return None if conversion fails
+            {
+                usize::try_from(*s.min_opt()?).ok()?.into()
+            }
+            (USize, _) => return None,
+
             (Integer, Statistics::Int32(s)) => s.max_opt()?.into(),
             (Integer, _) => return None,
             (Short, Statistics::Int32(s)) => (*s.max_opt()? as i16).into(),

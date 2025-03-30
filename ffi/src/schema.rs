@@ -102,6 +102,24 @@ pub struct EngineSchemaVisitor {
         metadata: &CStringMap,
     ),
 
+    /// Visit a `ulong` belonging to the list identified by `sibling_list_id`.
+    pub visit_ulong: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+        metadata: &CStringMap,
+    ),
+
+    /// Visit a `usize` belonging to the list identified by `sibling_list_id`.
+    pub visit_usize: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+        metadata: &CStringMap,
+    ),
+
     /// Visit an `integer` belonging to the list identified by `sibling_list_id`.
     pub visit_integer: extern "C" fn(
         data: *mut c_void,
@@ -308,6 +326,8 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             }
             &DataType::STRING => call!(visit_string),
             &DataType::LONG => call!(visit_long),
+            &DataType::ULONG => call!(visit_ulong),
+            &DataType::USIZE => call!(visit_usize),
             &DataType::INTEGER => call!(visit_integer),
             &DataType::SHORT => call!(visit_short),
             &DataType::BYTE => call!(visit_byte),

@@ -100,6 +100,20 @@ impl TryFrom<&DataType> for ArrowDataType {
                 match p {
                     PrimitiveType::String => Ok(ArrowDataType::Utf8),
                     PrimitiveType::Long => Ok(ArrowDataType::Int64), // undocumented type
+                    PrimitiveType::ULong => Ok(ArrowDataType::UInt64),
+                    // Since usize is platform dependent, we need to check the target_pointer_width
+                    // to determine the correct arrow type to use.
+                    PrimitiveType::USize => {
+                        #[cfg(target_pointer_width = "32")]
+                        {
+                            Ok(ArrowDataType::UInt32)
+                        }
+
+                        #[cfg(target_pointer_width = "64")]
+                        {
+                            Ok(ArrowDataType::UInt64)
+                        }
+                    }
                     PrimitiveType::Integer => Ok(ArrowDataType::Int32),
                     PrimitiveType::Short => Ok(ArrowDataType::Int16),
                     PrimitiveType::Byte => Ok(ArrowDataType::Int8),

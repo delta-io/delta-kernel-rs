@@ -36,6 +36,8 @@ macro_rules! impl_to_data_type {
 
 impl_to_data_type!(
     (String, DataType::STRING),
+    (u64, DataType::ULONG),
+    (usize, DataType::USIZE),
     (i64, DataType::LONG),
     (i32, DataType::INTEGER),
     (i16, DataType::SHORT),

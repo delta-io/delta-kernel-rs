@@ -493,6 +493,12 @@ pub enum PrimitiveType {
     String,
     /// i64: 8-byte signed integer. Range: -9223372036854775808 to 9223372036854775807
     Long,
+    /// u64: 8-byte unsigned integer. Range: 0 to 18446744073709551615
+    ULong,
+    /// usize: Platform-dependent unsigned integer. Typically used for indexing and memory sizes.
+    ///  - 64-bit platforms: Range 0 to 18_446_744_073_709_551_615
+    ///  - 32-bit platforms: Range 0 to 4_294_967_295
+    USize,
     /// i32: 4-byte signed integer. Range: -2147483648 to 2147483647
     Integer,
     /// i16: 2-byte signed integer numbers. Range: -32768 to 32767
@@ -559,6 +565,8 @@ impl Display for PrimitiveType {
         match self {
             PrimitiveType::String => write!(f, "string"),
             PrimitiveType::Long => write!(f, "long"),
+            PrimitiveType::ULong => write!(f, "ulong"),
+            PrimitiveType::USize => write!(f, "usize"),
             PrimitiveType::Integer => write!(f, "integer"),
             PrimitiveType::Short => write!(f, "short"),
             PrimitiveType::Byte => write!(f, "byte"),
@@ -624,6 +632,8 @@ impl From<SchemaRef> for DataType {
 impl DataType {
     pub const STRING: Self = DataType::Primitive(PrimitiveType::String);
     pub const LONG: Self = DataType::Primitive(PrimitiveType::Long);
+    pub const ULONG: Self = DataType::Primitive(PrimitiveType::ULong);
+    pub const USIZE: Self = DataType::Primitive(PrimitiveType::USize);
     pub const INTEGER: Self = DataType::Primitive(PrimitiveType::Integer);
     pub const SHORT: Self = DataType::Primitive(PrimitiveType::Short);
     pub const BYTE: Self = DataType::Primitive(PrimitiveType::Byte);

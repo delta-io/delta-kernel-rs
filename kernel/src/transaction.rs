@@ -344,6 +344,7 @@ mod tests {
     use crate::arrow::json::writer::LineDelimitedWriter;
     use crate::arrow::record_batch::RecordBatch;
 
+    // TODO(seb): Merge with other definitions and move to a common test module
     struct ExprEngine(Arc<dyn ExpressionHandler>);
 
     impl ExprEngine {

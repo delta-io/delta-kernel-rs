@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use url::Url;
 
+use crate::checkpoints::CheckpointBuilder;
 use crate::snapshot::Snapshot;
 use crate::table_changes::TableChanges;
 use crate::transaction::Transaction;
@@ -96,6 +97,20 @@ impl Table {
             start_version,
             end_version.into(),
         )
+    }
+
+    /// Creates a [`CheckpointBuilder`] for generating table checkpoints.
+    ///
+    /// Checkpoints are compact representations of the table state that improve reading performance.
+    /// Supports three checkpoint types: Classic V1 (legacy tables), Classic V2 (backwards
+    /// compatibility), and UUID V2 (recommended for small/medium tables with v2Checkpoints feature).
+    pub fn checkpoint(
+        &self,
+        engine: &dyn Engine,
+        version: Option<Version>,
+    ) -> DeltaResult<CheckpointBuilder> {
+        let snapshot = self.snapshot(engine, version)?;
+        Ok(CheckpointBuilder::new(snapshot))
     }
 
     /// Create a new write transaction for this table.

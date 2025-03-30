@@ -1,6 +1,11 @@
 //! Expression handling based on arrow-rs compute kernels.
 use std::sync::Arc;
 
+#[cfg(target_pointer_width = "32")]
+use crate::arrow::array::UInt32Array;
+#[cfg(target_pointer_width = "64")]
+use crate::arrow::array::UInt64Array;
+
 use crate::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, RecordBatch,
@@ -40,6 +45,20 @@ impl Scalar {
         let arr: ArrayRef = match self {
             Integer(val) => Arc::new(Int32Array::from_value(*val, num_rows)),
             Long(val) => Arc::new(Int64Array::from_value(*val, num_rows)),
+            ULong(val) => Arc::new(UInt64Array::from_value(*val, num_rows)),
+            // Since usize is platform dependent, we need to check the target_pointer_width
+            // to determine the correct array type to use.
+            USize(val) => {
+                #[cfg(target_pointer_width = "32")]
+                {
+                    Arc::new(UInt32Array::from_value(*val as u32, num_rows))
+                }
+
+                #[cfg(target_pointer_width = "64")]
+                {
+                    Arc::new(UInt64Array::from_value(*val as u64, num_rows))
+                }
+            }
             Short(val) => Arc::new(Int16Array::from_value(*val, num_rows)),
             Byte(val) => Arc::new(Int8Array::from_value(*val, num_rows)),
             Float(val) => Arc::new(Float32Array::from_value(*val, num_rows)),
@@ -88,6 +107,20 @@ impl Scalar {
             Null(DataType::SHORT) => Arc::new(Int16Array::new_null(num_rows)),
             Null(DataType::INTEGER) => Arc::new(Int32Array::new_null(num_rows)),
             Null(DataType::LONG) => Arc::new(Int64Array::new_null(num_rows)),
+            Null(DataType::ULONG) => Arc::new(UInt64Array::new_null(num_rows)),
+            // Since usize is platform dependent, we need to check the target_pointer_width
+            // to determine the correct array type to use.
+            Null(DataType::USIZE) => {
+                #[cfg(target_pointer_width = "32")]
+                {
+                    Arc::new(UInt32Array::new_null(num_rows))
+                }
+
+                #[cfg(target_pointer_width = "64")]
+                {
+                    Arc::new(UInt64Array::new_null(num_rows))
+                }
+            }
             Null(DataType::FLOAT) => Arc::new(Float32Array::new_null(num_rows)),
             Null(DataType::DOUBLE) => Arc::new(Float64Array::new_null(num_rows)),
             Null(DataType::STRING) => Arc::new(StringArray::new_null(num_rows)),
