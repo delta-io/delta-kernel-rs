@@ -198,7 +198,7 @@ impl ParsedLogPath<Url> {
         Ok(path)
     }
 
-    /// Create a new ParsedCommitPath<Url> for a classic-named parquet checkpoint file at the specified version
+    /// Create a new ParsedCheckpointPath<Url> for a classic-named parquet checkpoint file at the specified version
     #[allow(unused)] // TODO: Remove once used
     pub(crate) fn new_classic_parquet_checkpoint(
         table_root: &Url,
@@ -216,7 +216,7 @@ impl ParsedLogPath<Url> {
         Ok(path)
     }
 
-    /// Create a new ParsedCommitPath<Url> for a uuid-named parquet checkpoint file at the specified version
+    /// Create a new ParsedCheckpointPath<Url> for a uuid-named parquet checkpoint file at the specified version
     #[allow(unused)] // TODO: Remove once used
     pub(crate) fn new_uuid_parquet_checkpoint(
         table_root: &Url,
