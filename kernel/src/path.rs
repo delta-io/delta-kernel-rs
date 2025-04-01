@@ -179,23 +179,43 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         matches!(self.file_type, LogPathFileType::Unknown)
     }
 }
-
 impl ParsedLogPath<Url> {
+    // Constants for path components and common strings
+    const DELTA_LOG_DIR: &'static str = "_delta_log/";
+    const COMMIT_TYPE: &'static str = "commit";
+    const CHECKPOINT_TYPE: &'static str = "checkpoint";
+
+    /// Helper function to create a path from a filename
+    fn new_from_filename(
+        table_root: &Url,
+        filename: &str,
+        expected_type: &str,
+        type_check_fn: fn(&Self) -> bool,
+    ) -> DeltaResult<Self> {
+        // Use the constant for the directory path
+        let location = table_root.join(Self::DELTA_LOG_DIR)?.join(filename)?;
+        let path = Self::try_from(location)?.ok_or_else(|| {
+            Error::internal_error(format!(
+                "attempted to create invalid {} path",
+                expected_type
+            ))
+        })?;
+        if !type_check_fn(&path) {
+            return Err(Error::internal_error(format!(
+                "ParsedLogPath::new_{} created a non-{} path",
+                expected_type, expected_type
+            )));
+        }
+        Ok(path)
+    }
+
     /// Create a new ParsedCommitPath<Url> for a new json commit file at the specified version
     pub(crate) fn new_commit(
         table_root: &Url,
         version: Version,
     ) -> DeltaResult<ParsedLogPath<Url>> {
         let filename = format!("{:020}.json", version);
-        let location = table_root.join("_delta_log/")?.join(&filename)?;
-        let path = Self::try_from(location)?
-            .ok_or_else(|| Error::internal_error("attempted to create invalid commit path"))?;
-        if !path.is_commit() {
-            return Err(Error::internal_error(
-                "ParsedLogPath::new_commit created a non-commit path",
-            ));
-        }
-        Ok(path)
+        Self::new_from_filename(table_root, &filename, Self::COMMIT_TYPE, Self::is_commit)
     }
 
     /// Create a new ParsedCheckpointPath<Url> for a classic-named parquet checkpoint file at the specified version
@@ -205,15 +225,12 @@ impl ParsedLogPath<Url> {
         version: Version,
     ) -> DeltaResult<ParsedLogPath<Url>> {
         let filename = format!("{:020}.checkpoint.parquet", version);
-        let location = table_root.join("_delta_log/")?.join(&filename)?;
-        let path = Self::try_from(location)?
-            .ok_or_else(|| Error::internal_error("attempted to create invalid checkpoint path"))?;
-        if !path.is_checkpoint() {
-            return Err(Error::internal_error(
-                "ParsedLogPath::new_classic_parquet_checkpoint created a non-checkpoint path",
-            ));
-        }
-        Ok(path)
+        Self::new_from_filename(
+            table_root,
+            &filename,
+            Self::CHECKPOINT_TYPE,
+            Self::is_checkpoint,
+        )
     }
 
     /// Create a new ParsedCheckpointPath<Url> for a uuid-named parquet checkpoint file at the specified version
@@ -225,15 +242,12 @@ impl ParsedLogPath<Url> {
         // Generate a random UUID v4
         let uuid = Uuid::new_v4().to_string();
         let filename = format!("{:020}.checkpoint.{}.parquet", version, uuid);
-        let location = table_root.join("_delta_log/")?.join(&filename)?;
-        let path = Self::try_from(location)?
-            .ok_or_else(|| Error::internal_error("attempted to create invalid checkpoint path"))?;
-        if !path.is_checkpoint() {
-            return Err(Error::internal_error(
-                "ParsedLogPath::new_uuid_parquet_checkpoint created a non-checkpoint path",
-            ));
-        }
-        Ok(path)
+        Self::new_from_filename(
+            table_root,
+            &filename,
+            Self::CHECKPOINT_TYPE,
+            Self::is_checkpoint,
+        )
     }
 }
 
