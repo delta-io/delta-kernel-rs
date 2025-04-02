@@ -257,6 +257,7 @@ mod tests {
     use crate::engine::default::executor::tokio::{
         TokioBackgroundExecutor, TokioMultiThreadExecutor,
     };
+    use crate::utils::test_utils::string_array_to_engine_data;
     use futures::future;
     use itertools::Itertools;
     use object_store::local::LocalFileSystem;
@@ -469,14 +470,6 @@ mod tests {
         async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
             self.inner.rename_if_not_exists(from, to).await
         }
-    }
-
-    fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
-        let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
-        let schema = Arc::new(ArrowSchema::new(vec![string_field]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
-            .expect("Can't convert to record batch");
-        Box::new(ArrowEngineData::new(batch))
     }
 
     #[test]
