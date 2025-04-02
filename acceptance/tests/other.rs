@@ -3,7 +3,7 @@
 /// Since each new `.rs` file in this directory results in increased build and link time, it is
 /// important to only add new files if absolutely necessary for code readability or test
 /// performance.
-use delta_kernel::snapshot::CheckpointMetadata;
+use delta_kernel::snapshot::LastCheckpointHint;
 
 #[test]
 fn test_checkpoint_serde() {
@@ -11,7 +11,7 @@ fn test_checkpoint_serde() {
         "./tests/dat/out/reader_tests/generated/with_checkpoint/delta/_delta_log/_last_checkpoint",
     )
     .unwrap();
-    let cp: CheckpointMetadata = serde_json::from_reader(file).unwrap();
+    let cp: LastCheckpointHint = serde_json::from_reader(file).unwrap();
     assert_eq!(cp.version, 2)
 }
 
