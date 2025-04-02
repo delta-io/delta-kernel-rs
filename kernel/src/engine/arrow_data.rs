@@ -294,26 +294,14 @@ impl ArrowEngineData {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use crate::arrow::array::StringArray;
 
-    use crate::arrow::array::{RecordBatch, StringArray};
-    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-
+    use crate::utils::test_utils::string_array_to_engine_data;
     use crate::{
         actions::{get_log_schema, Metadata, Protocol},
         engine::sync::SyncEngine,
-        DeltaResult, Engine, EngineData,
+        DeltaResult, Engine,
     };
-
-    use super::ArrowEngineData;
-
-    fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
-        let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
-        let schema = Arc::new(ArrowSchema::new(vec![string_field]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
-            .expect("Can't convert to record batch");
-        Box::new(ArrowEngineData::new(batch))
-    }
 
     #[test]
     fn test_md_extract() -> DeltaResult<()> {

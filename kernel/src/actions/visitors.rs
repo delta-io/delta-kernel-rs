@@ -511,45 +511,10 @@ pub(crate) fn visit_deletion_vector_at<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use crate::arrow::array::{RecordBatch, StringArray};
-    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-
     use super::*;
-    use crate::{
-        actions::get_log_schema,
-        engine::arrow_data::ArrowEngineData,
-        engine::sync::{json::SyncJsonHandler, SyncEngine},
-        Engine, EngineData, JsonHandler,
-    };
 
-    // TODO(nick): Merge all copies of this into one "test utils" thing
-    fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
-        let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
-        let schema = Arc::new(ArrowSchema::new(vec![string_field]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
-            .expect("Can't convert to record batch");
-        Box::new(ArrowEngineData::new(batch))
-    }
-
-    fn action_batch() -> Box<ArrowEngineData> {
-        let handler = SyncJsonHandler {};
-        let json_strings: StringArray = vec![
-            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
-            r#"{"commitInfo":{"timestamp":1677811178585,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isolationLevel":"WriteSerializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"10","numOutputBytes":"635"},"engineInfo":"Databricks-Runtime/<unknown>","txnId":"a6a94671-55ef-450e-9546-b8465b9147de"}}"#,
-            r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
-            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none", "delta.enableChangeDataFeed":"true"},"createdTime":1677811175819}}"#,
-            r#"{"cdc":{"path":"_change_data/age=21/cdc-00000-93f7fceb-281a-446a-b221-07b88132d203.c000.snappy.parquet","partitionValues":{"age":"21"},"size":1033,"dataChange":false}}"#,
-            r#"{"sidecar":{"path":"016ae953-37a9-438e-8683-9a9a4a79a395.parquet","sizeInBytes":9268,"modificationTime":1714496113961,"tags":{"tag_foo":"tag_bar"}}}"#,
-        ]
-        .into();
-        let output_schema = get_log_schema().clone();
-        let parsed = handler
-            .parse_json(string_array_to_engine_data(json_strings), output_schema)
-            .unwrap();
-        ArrowEngineData::try_from_engine_data(parsed).unwrap()
-    }
+    use crate::utils::test_utils::action_batch;
+    use crate::{arrow::array::StringArray, utils::test_utils::parse_json_batch};
 
     #[test]
     fn test_parse_protocol() -> DeltaResult<()> {
@@ -639,8 +604,6 @@ mod tests {
 
     #[test]
     fn test_parse_add_partitioned() {
-        let engine = SyncEngine::new();
-        let json_handler = engine.get_json_handler();
         let json_strings: StringArray = vec![
             r#"{"commitInfo":{"timestamp":1670892998177,"operation":"WRITE","operationParameters":{"mode":"Append","partitionBy":"[\"c1\",\"c2\"]"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"3","numOutputRows":"3","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
@@ -650,10 +613,7 @@ mod tests {
             r#"{"add":{"path":"c1=6/c2=a/part-00011-10619b10-b691-4fd0-acc4-2a9608499d7c.c000.snappy.parquet","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":4},\"maxValues\":{\"c3\":4},\"nullCount\":{\"c3\":0}}"}}"#,
         ]
         .into();
-        let output_schema = get_log_schema().clone();
-        let batch = json_handler
-            .parse_json(string_array_to_engine_data(json_strings), output_schema)
-            .unwrap();
+        let batch = parse_json_batch(json_strings);
         let mut add_visitor = AddVisitor::default();
         add_visitor.visit_rows_of(batch.as_ref()).unwrap();
         let add1 = Add {
@@ -697,18 +657,13 @@ mod tests {
 
     #[test]
     fn test_parse_remove_partitioned() {
-        let engine = SyncEngine::new();
-        let json_handler = engine.get_json_handler();
         let json_strings: StringArray = vec![
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
             r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
             r#"{"remove":{"path":"c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet","deletionTimestamp":1670892998135,"dataChange":true,"partitionValues":{"c1":"4","c2":"c"},"size":452}}"#,
         ]
         .into();
-        let output_schema = get_log_schema().clone();
-        let batch = json_handler
-            .parse_json(string_array_to_engine_data(json_strings), output_schema)
-            .unwrap();
+        let batch = parse_json_batch(json_strings);
         let mut remove_visitor = RemoveVisitor::default();
         remove_visitor.visit_rows_of(batch.as_ref()).unwrap();
         let expected_remove = Remove {
@@ -736,8 +691,6 @@ mod tests {
 
     #[test]
     fn test_parse_txn() {
-        let engine = SyncEngine::new();
-        let json_handler = engine.get_json_handler();
         let json_strings: StringArray = vec![
             r#"{"commitInfo":{"timestamp":1670892998177,"operation":"WRITE","operationParameters":{"mode":"Append","partitionBy":"[\"c1\",\"c2\"]"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"3","numOutputRows":"3","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
@@ -747,10 +700,7 @@ mod tests {
             r#"{"txn":{"appId":"myApp2","version": 4, "lastUpdated": 1670892998177}}"#,
         ]
         .into();
-        let output_schema = get_log_schema().clone();
-        let batch = json_handler
-            .parse_json(string_array_to_engine_data(json_strings), output_schema)
-            .unwrap();
+        let batch = parse_json_batch(json_strings);
         let mut txn_visitor = SetTransactionVisitor::default();
         txn_visitor.visit_rows_of(batch.as_ref()).unwrap();
         let mut actual = txn_visitor.set_transactions;
