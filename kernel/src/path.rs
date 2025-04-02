@@ -625,7 +625,6 @@ mod tests {
         let table_log_dir = table_log_dir_url();
         let log_path = ParsedLogPath::new_classic_parquet_checkpoint(&table_log_dir, 10).unwrap();
 
-        // Basic properties
         assert_eq!(log_path.version, 10);
         assert!(log_path.is_checkpoint());
         assert_eq!(log_path.extension, "parquet");
