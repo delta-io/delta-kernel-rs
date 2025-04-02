@@ -180,96 +180,60 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     }
 }
 
-/// Enum representing different path formats for Delta Lake log files.
-enum PathFormat {
-    /// Represents a JSON commit file (e.g., "00000000000000000001.json").
-    Commit,
-    /// Represents a classic Parquet checkpoint file (e.g., "00000000000000000001.checkpoint.parquet").
-    ClassicCheckpoint,
-    /// Represents a UUID-based Parquet checkpoint file (e.g., "00000000000000000001.checkpoint.<uuid>.parquet").
-    UuidCheckpoint,
-}
-
-impl PathFormat {
-    // Generates the filename for the specified path format and version.
-    fn format_filename(&self, version: Version) -> String {
-        match self {
-            PathFormat::Commit => format!("{:020}.json", version),
-            PathFormat::ClassicCheckpoint => format!("{:020}.checkpoint.parquet", version),
-            PathFormat::UuidCheckpoint => {
-                let uuid = Uuid::new_v4().to_string();
-                format!("{:020}.checkpoint.{}.parquet", version, uuid)
-            }
-        }
-    }
-
-    /// Returns the type of the path as a string (e.g., "commit" or "classic_checkpoint").
-    fn path_type(&self) -> &'static str {
-        match self {
-            PathFormat::Commit => "commit",
-            PathFormat::ClassicCheckpoint => "classic_parquet_checkpoint",
-            PathFormat::UuidCheckpoint => "uuid_parquet_checkpoint",
-        }
-    }
-
-    // Provides a validation function specific to the path format.
-    fn check_fn(&self) -> fn(&ParsedLogPath<Url>) -> bool {
-        match self {
-            PathFormat::Commit => ParsedLogPath::is_commit,
-            PathFormat::ClassicCheckpoint | PathFormat::UuidCheckpoint => {
-                ParsedLogPath::is_checkpoint
-            }
-        }
-    }
-}
-
 impl ParsedLogPath<Url> {
     const DELTA_LOG_DIR: &'static str = "_delta_log/";
 
-    /// Creates a new `ParsedLogPath` based on the specified path format and version.
-    fn create_path(table_root: &Url, version: Version, format: PathFormat) -> DeltaResult<Self> {
-        let path_type = format.path_type();
-        let filename = format.format_filename(version);
+    /// Helper method to create a path with the given filename generator
+    fn create_path(table_root: &Url, filename: String) -> DeltaResult<Self> {
         let location = table_root.join(Self::DELTA_LOG_DIR)?.join(&filename)?;
+        Self::try_from(location)?
+            .ok_or_else(|| Error::internal_error("attempted to create invalid path"))
+    }
 
-        let path = Self::try_from(location)?.ok_or_else(|| {
-            Error::internal_error(format!("attempted to create invalid {} path", path_type))
-        })?;
-
-        let check_fn = format.check_fn();
-        if !check_fn(&path) {
-            return Err(Error::internal_error(format!(
-                "ParsedLogPath::new_{} created a non-{} path",
-                path_type, path_type
-            )));
+    /// Create a new ParsedCommitPath<Url> for a new json commit file
+    pub(crate) fn new_commit(table_root: &Url, version: Version) -> DeltaResult<Self> {
+        let filename = format!("{:020}.json", version);
+        let path = Self::create_path(table_root, filename)?;
+        if !path.is_commit() {
+            return Err(Error::internal_error(
+                "ParsedLogPath::new_commit created a non-commit path",
+            ));
         }
-
         Ok(path)
     }
 
-    /// Create a new ParsedCommitPath<Url> for a new json commit file at the specified version
-    pub(crate) fn new_commit(table_root: &Url, version: Version) -> DeltaResult<Self> {
-        Self::create_path(table_root, version, PathFormat::Commit)
-    }
-
-    /// Create a new ParsedCheckpointPath<Url> for a classic-named parquet checkpoint file at the specified version
-    #[allow(dead_code)] // TODO: Remove this once we have a use case for it
+    /// Create a new ParsedCheckpointPath<Url> for a classic parquet checkpoint file
     pub(crate) fn new_classic_parquet_checkpoint(
         table_root: &Url,
         version: Version,
     ) -> DeltaResult<Self> {
-        Self::create_path(table_root, version, PathFormat::ClassicCheckpoint)
+        let filename = format!("{:020}.checkpoint.parquet", version);
+        let path = Self::create_path(table_root, filename)?;
+        if !path.is_checkpoint() {
+            return Err(Error::internal_error(
+                "ParsedLogPath::new_classic_parquet_checkpoint created a non-checkpoint path",
+            ));
+        }
+        Ok(path)
     }
 
-    /// Create a new ParsedCheckpointPath<Url> for a uuid-named parquet checkpoint file at the specified version
-    #[allow(dead_code)] // TODO: Remove this once we have a use case for it
+    /// Create a new ParsedCheckpointPath<Url> for a UUID-based parquet checkpoint file
     pub(crate) fn new_uuid_parquet_checkpoint(
         table_root: &Url,
         version: Version,
     ) -> DeltaResult<Self> {
-        Self::create_path(table_root, version, PathFormat::UuidCheckpoint)
+        let uuid = Uuid::new_v4().to_string();
+        let filename = format!("{:020}.checkpoint.{}.parquet", version, uuid);
+        let path = Self::create_path(table_root, filename)?;
+        if !path.is_checkpoint() {
+            return Err(Error::internal_error(
+                "ParsedLogPath::new_uuid_parquet_checkpoint created a non-checkpoint path",
+            ));
+        }
+        Ok(path)
     }
 }
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
