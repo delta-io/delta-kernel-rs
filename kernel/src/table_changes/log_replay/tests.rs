@@ -90,7 +90,8 @@ async fn metadata_protocol() {
     let scan_batches =
         table_changes_action_iter(engine, commits, get_schema().into(), None).unwrap();
     let sv = result_to_sv(scan_batches);
-    assert_eq!(sv, &[false, false]);
+    // No selection vector should be returned since no actions are present
+    assert!(sv.is_empty());
 }
 #[tokio::test]
 async fn cdf_not_enabled() {
@@ -354,7 +355,8 @@ async fn filter_data_change() {
         })
         .collect_vec();
 
-    assert_eq!(sv, &[false; 5]);
+    // No selection vector should be returned since no actions are present
+    assert!(sv.is_empty());
 }
 
 #[tokio::test]
