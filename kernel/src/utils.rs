@@ -27,11 +27,15 @@ pub(crate) mod test_utils {
     use tempfile::TempDir;
     use test_utils::delta_path_for_version;
 
+    use crate::actions::get_log_schema;
+    use crate::arrow::array::StringArray;
+    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use crate::engine::sync::SyncEngine;
     use crate::{
         actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove},
         engine::arrow_data::ArrowEngineData,
-        EngineData,
     };
+    use crate::{Engine, EngineData};
 
     #[derive(Serialize)]
     pub(crate) enum Action {

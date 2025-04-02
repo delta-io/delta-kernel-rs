@@ -9,21 +9,23 @@ use super::{ScanData, Transform};
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{column_expr, column_name, ColumnName, Expression, ExpressionRef};
-use crate::log_replay::{FileActionDeduplicator, FileActionKey};
+use crate::log_replay::{FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::predicates::{DefaultPredicateEvaluator, PredicateEvaluator as _};
 use crate::scan::{Scalar, TransformExpr};
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator};
 
-struct LogReplayScanner {
+struct ScanLogReplayProcessor {
     partition_filter: Option<ExpressionRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
-
+    add_transform: Arc<dyn ExpressionEvaluator>,
+    logical_schema: SchemaRef,
+    transform: Option<Arc<Transform>>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
-    seen: HashSet<FileActionKey>,
+    seen_file_keys: HashSet<FileActionKey>,
 }
 
 /// A visitor that deduplicates a stream of add and remove actions into a stream of valid adds. Log
@@ -40,7 +42,9 @@ struct AddRemoveDedupVisitor<'seen> {
 }
 
 impl AddRemoveDedupVisitor<'_> {
-    // The index position in the row getters for the following columns
+    // These index positions correspond to the order of columns defined in
+    // `selected_column_names_and_types()`, and are used to extract file key information
+    // for deduplication purposes
     const ADD_PATH_INDEX: usize = 0;
     const ADD_PARTITION_VALUES_INDEX: usize = 1;
     const ADD_DV_START_INDEX: usize = 2;
@@ -291,44 +295,38 @@ fn get_add_transform_expr() -> Expression {
     ])
 }
 
-impl LogReplayScanner {
-    /// Create a new [`LogReplayScanner`] instance
-    fn new(engine: &dyn Engine, physical_predicate: Option<(ExpressionRef, SchemaRef)>) -> Self {
-        Self {
-            partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
-            data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
-            seen: Default::default(),
-        }
-    }
+impl LogReplayProcessor for ScanLogReplayProcessor {
+    type Output = ScanData;
 
-    fn process_scan_batch(
+    fn process_actions_batch(
         &mut self,
-        add_transform: &dyn ExpressionEvaluator,
-        actions: &dyn EngineData,
-        logical_schema: SchemaRef,
-        transform: Option<Arc<Transform>>,
+        batch: Box<dyn EngineData>,
         is_log_batch: bool,
-    ) -> DeltaResult<ScanData> {
+    ) -> DeltaResult<Self::Output> {
         // Apply data skipping to get back a selection vector for actions that passed skipping. We
         // will update the vector below as log replay identifies duplicates that should be ignored.
         let selection_vector = match &self.data_skipping_filter {
-            Some(filter) => filter.apply(actions)?,
-            None => vec![true; actions.len()],
+            Some(filter) => filter.apply(batch.as_ref())?,
+            None => vec![true; batch.len()],
         };
-        assert_eq!(selection_vector.len(), actions.len());
+        assert_eq!(selection_vector.len(), batch.len());
+
+        let logical_schema = self.logical_schema.clone();
+        let transform = self.transform.clone();
+        let partition_filter = self.partition_filter.clone();
+        // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
+        let result = self.add_transform.evaluate(batch.as_ref())?;
 
         let mut visitor = AddRemoveDedupVisitor::new(
-            &mut self.seen,
+            &mut self.seen_file_keys,
             selection_vector,
             logical_schema,
             transform,
-            self.partition_filter.clone(),
+            partition_filter,
             is_log_batch,
         );
-        visitor.visit_rows_of(actions)?;
 
-        // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
-        let result = add_transform.evaluate(actions)?;
+        visitor.visit_rows_of(batch.as_ref())?;
         Ok((
             result,
             visitor.selection_vector,
@@ -337,10 +335,36 @@ impl LogReplayScanner {
     }
 }
 
+impl ScanLogReplayProcessor {
+    /// Create a new [`ScanLogReplayProcessor`] instance
+    fn new(
+        engine: &dyn Engine,
+        physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+        logical_schema: SchemaRef,
+        transform: Option<Arc<Transform>>,
+    ) -> Self {
+        Self {
+            partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
+            data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
+            add_transform: engine.get_expression_handler().get_evaluator(
+                get_log_add_schema().clone(),
+                get_add_transform_expr(),
+                SCAN_ROW_DATATYPE.clone(),
+            ),
+            seen_file_keys: Default::default(),
+            logical_schema,
+            transform,
+        }
+    }
+}
+
 /// Given an iterator of (engine_data, bool) tuples and a predicate, returns an iterator of
 /// `(engine_data, selection_vec)`. Each row that is selected in the returned `engine_data` _must_
 /// be processed to complete the scan. Non-selected rows _must_ be ignored. The boolean flag
 /// indicates whether the record batch is a log or checkpoint batch.
+///
+/// Note: The iterator of (engine_data, bool) tuples 'action_iter' parameter must be sorted by the
+/// order of the actions in the log from most recent to least recent.
 pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
@@ -348,24 +372,10 @@ pub(crate) fn scan_action_iter(
     transform: Option<Arc<Transform>>,
     physical_predicate: Option<(ExpressionRef, SchemaRef)>,
 ) -> impl Iterator<Item = DeltaResult<ScanData>> {
-    let mut log_scanner = LogReplayScanner::new(engine, physical_predicate);
-    let add_transform = engine.get_expression_handler().get_evaluator(
-        get_log_add_schema().clone(),
-        get_add_transform_expr(),
-        SCAN_ROW_DATATYPE.clone(),
-    );
-    action_iter
-        .map(move |action_res| {
-            let (batch, is_log_batch) = action_res?;
-            log_scanner.process_scan_batch(
-                add_transform.as_ref(),
-                batch.as_ref(),
-                logical_schema.clone(),
-                transform.clone(),
-                is_log_batch,
-            )
-        })
-        .filter(|res| res.as_ref().map_or(true, |(_, sv, _)| sv.contains(&true)))
+    let log_scanner =
+        ScanLogReplayProcessor::new(engine, physical_predicate, logical_schema, transform);
+
+    ScanLogReplayProcessor::apply_to_iterator(log_scanner, action_iter)
 }
 
 #[cfg(test)]
