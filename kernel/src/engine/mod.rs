@@ -61,11 +61,11 @@ mod tests {
         let path = base_url.join("other").unwrap();
         json.write_json_file(&path, get_data(), false).unwrap();
 
-        let fs = engine.file_system_client();
+        let storage = engine.storage_handler();
 
         // list files after an offset
         let test_url = base_url.join(expected_names[0].as_ref()).unwrap();
-        let files: Vec<_> = fs.list_from(&test_url).unwrap().try_collect().unwrap();
+        let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().unwrap();
         assert_eq!(files.len(), expected_names.len() - 1);
         for (file, expected) in files.iter().zip(expected_names.iter().skip(1)) {
             assert_eq!(file.location, base_url.join(expected.as_ref()).unwrap());
@@ -74,12 +74,12 @@ mod tests {
         let test_url = base_url
             .join(delta_path_for_version(0, "json").as_ref())
             .unwrap();
-        let files: Vec<_> = fs.list_from(&test_url).unwrap().try_collect().unwrap();
+        let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().unwrap();
         assert_eq!(files.len(), expected_names.len());
 
         // list files inside a directory / key prefix
         let test_url = base_url.join("_delta_log/").unwrap();
-        let files: Vec<_> = fs.list_from(&test_url).unwrap().try_collect().unwrap();
+        let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().unwrap();
         assert_eq!(files.len(), expected_names.len());
         for (file, expected) in files.iter().zip(expected_names.iter()) {
             assert_eq!(file.location, base_url.join(expected.as_ref()).unwrap());

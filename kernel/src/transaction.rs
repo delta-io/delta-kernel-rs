@@ -336,7 +336,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::arrow_expression::ArrowEvaluationHandler;
     use crate::schema::MapType;
-    use crate::{EvaluationHandler, FileSystemClient, JsonHandler, ParquetHandler};
+    use crate::{EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
 
     use crate::arrow::array::{MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
@@ -365,7 +365,7 @@ mod tests {
             unimplemented!()
         }
 
-        fn file_system_client(&self) -> Arc<dyn FileSystemClient> {
+        fn storage_handler(&self) -> Arc<dyn StorageHandler> {
             unimplemented!()
         }
     }

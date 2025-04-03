@@ -11,8 +11,8 @@ use crate::schema::SchemaRef;
 use crate::snapshot::LastCheckpointHint;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, FileSystemClient,
-    ParquetHandler, RowVisitor, Version,
+    DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, ParquetHandler, RowVisitor,
+    StorageHandler, Version,
 };
 use itertools::Itertools;
 use std::collections::HashMap;
@@ -115,7 +115,7 @@ impl LogSegment {
     /// [`Snapshot`]: crate::snapshot::Snapshot
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn for_snapshot(
-        fs_client: &dyn FileSystemClient,
+        storage: &dyn StorageHandler,
         log_root: Url,
         checkpoint_hint: impl Into<Option<LastCheckpointHint>>,
         time_travel_version: impl Into<Option<Version>>,
@@ -124,13 +124,11 @@ impl LogSegment {
 
         let (mut ascending_commit_files, checkpoint_parts) =
             match (checkpoint_hint.into(), time_travel_version) {
-                (Some(cp), None) => {
-                    list_log_files_with_checkpoint(&cp, fs_client, &log_root, None)?
-                }
+                (Some(cp), None) => list_log_files_with_checkpoint(&cp, storage, &log_root, None)?,
                 (Some(cp), Some(end_version)) if cp.version <= end_version => {
-                    list_log_files_with_checkpoint(&cp, fs_client, &log_root, Some(end_version))?
+                    list_log_files_with_checkpoint(&cp, storage, &log_root, Some(end_version))?
                 }
-                _ => list_log_files_with_version(fs_client, &log_root, None, time_travel_version)?,
+                _ => list_log_files_with_version(storage, &log_root, None, time_travel_version)?,
             };
 
         // Commit file versions must be greater than the most recent checkpoint version if it exists
@@ -152,7 +150,7 @@ impl LogSegment {
     /// is specified it will be the most recent version by default.
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn for_table_changes(
-        fs_client: &dyn FileSystemClient,
+        storage: &dyn StorageHandler,
         log_root: Url,
         start_version: Version,
         end_version: impl Into<Option<Version>>,
@@ -167,7 +165,7 @@ impl LogSegment {
         }
 
         let ascending_commit_files: Vec<_> =
-            list_log_files(fs_client, &log_root, start_version, end_version)?
+            list_log_files(storage, &log_root, start_version, end_version)?
                 .filter_ok(|x| x.is_commit())
                 .try_collect()?;
 
@@ -410,9 +408,9 @@ impl LogSegment {
 /// not specified, the files will begin from version number 0. If `end_version` is not specified, files up to
 /// the most recent version will be included.
 ///
-/// Note: this calls [`FileSystemClient::list_from`] to get the list of log files.
+/// Note: this calls [`StorageHandler::list_from`] to get the list of log files.
 fn list_log_files(
-    fs_client: &dyn FileSystemClient,
+    storage: &dyn StorageHandler,
     log_root: &Url,
     start_version: impl Into<Option<Version>>,
     end_version: impl Into<Option<Version>>,
@@ -422,7 +420,7 @@ fn list_log_files(
     let version_prefix = format!("{:020}", start_version);
     let start_from = log_root.join(&version_prefix)?;
 
-    Ok(fs_client
+    Ok(storage
         .list_from(&start_from)?
         .map(|meta| ParsedLogPath::try_from(meta?))
         // TODO this filters out .crc files etc which start with "." - how do we want to use these kind of files?
@@ -438,7 +436,7 @@ fn list_log_files(
 /// ascending order by version. The elements of `checkpoint_parts` are all the parts of the same
 /// checkpoint. Checkpoint parts share the same version.
 fn list_log_files_with_version(
-    fs_client: &dyn FileSystemClient,
+    storage: &dyn StorageHandler,
     log_root: &Url,
     start_version: Option<Version>,
     end_version: Option<Version>,
@@ -446,7 +444,7 @@ fn list_log_files_with_version(
     // We expect 10 commit files per checkpoint, so start with that size. We could adjust this based
     // on config at some point
 
-    let log_files = list_log_files(fs_client, log_root, start_version, end_version)?;
+    let log_files = list_log_files(storage, log_root, start_version, end_version)?;
 
     log_files.process_results(|iter| {
         let mut commit_files = Vec::with_capacity(10);
@@ -536,12 +534,12 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
 /// See [`list_log_files_with_version`] for details on the return type.
 fn list_log_files_with_checkpoint(
     checkpoint_metadata: &LastCheckpointHint,
-    fs_client: &dyn FileSystemClient,
+    storage: &dyn StorageHandler,
     log_root: &Url,
     end_version: Option<Version>,
 ) -> DeltaResult<(Vec<ParsedLogPath>, Vec<ParsedLogPath>)> {
     let (commit_files, checkpoint_parts) = list_log_files_with_version(
-        fs_client,
+        storage,
         log_root,
         Some(checkpoint_metadata.version),
         end_version,

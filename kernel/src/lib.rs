@@ -42,7 +42,7 @@
 //! ## File system interactions
 //!
 //! Delta Kernel needs to perform some basic operations against file systems like listing and
-//! reading files. These interactions are encapsulated in the [`FileSystemClient`] trait.
+//! reading files. These interactions are encapsulated in the [`StorageHandler`] trait.
 //! Implementers must take care that all assumptions on the behavior if the functions - like sorted
 //! results - are respected.
 //!
@@ -51,7 +51,7 @@
 //! Delta Kernel requires the capability to read and write json files and read parquet files, which
 //! is exposed via the [`JsonHandler`] and [`ParquetHandler`] respectively. When reading files,
 //! connectors are asked to provide the context information it requires to execute the actual
-//! operation. This is done by invoking methods on the [`FileSystemClient`] trait.
+//! operation. This is done by invoking methods on the [`StorageHandler`] trait.
 
 #![cfg_attr(all(doc, NIGHTLY_CHANNEL), feature(doc_auto_cfg))]
 #![warn(
@@ -389,10 +389,10 @@ impl<T: EvaluationHandler> EvaluationHandlerExtension for T {}
 
 /// Provides file system related functionalities to Delta Kernel.
 ///
-/// Delta Kernel uses this client whenever it needs to access the underlying
+/// Delta Kernel uses this handler whenever it needs to access the underlying
 /// file system where the Delta table is present. Connector implementation of
 /// this trait can hide filesystem specific details from Delta Kernel.
-pub trait FileSystemClient: AsAny {
+pub trait StorageHandler: AsAny {
     /// List the paths in the same directory that are lexicographically greater than
     /// (UTF-8 sorting) the given `path`. The result should also be sorted by the file name.
     ///
@@ -410,7 +410,7 @@ pub trait FileSystemClient: AsAny {
 
 /// Provides JSON handling functionality to Delta Kernel.
 ///
-/// Delta Kernel can use this client to parse JSON strings into Row or read content from JSON files.
+/// Delta Kernel can use this handler to parse JSON strings into Row or read content from JSON files.
 /// Connectors can leverage this trait to provide their best implementation of the JSON parsing
 /// capability to Delta Kernel.
 pub trait JsonHandler: AsAny {
@@ -510,8 +510,8 @@ pub trait Engine: AsAny {
     /// Get the connector provided [`EvaluationHandler`].
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler>;
 
-    /// Get the connector provided [`FileSystemClient`]
-    fn file_system_client(&self) -> Arc<dyn FileSystemClient>;
+    /// Get the connector provided [`StorageHandler`]
+    fn storage_handler(&self) -> Arc<dyn StorageHandler>;
 
     /// Get the connector provided [`JsonHandler`].
     fn json_handler(&self) -> Arc<dyn JsonHandler>;
