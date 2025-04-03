@@ -181,7 +181,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
 }
 
 impl ParsedLogPath<Url> {
-    const DELTA_LOG_DIR: &'static str = "_delta_log/";
+    const DELTA_LOG_DIR: &'static str = "_delta_log";
 
     /// Helper method to create a path with the given filename generator
     fn create_path(table_root: &Url, filename: String) -> DeltaResult<Self> {
@@ -224,8 +224,7 @@ impl ParsedLogPath<Url> {
         table_root: &Url,
         version: Version,
     ) -> DeltaResult<Self> {
-        let uuid = Uuid::new_v4().to_string();
-        let filename = format!("{:020}.checkpoint.{}.parquet", version, uuid);
+        let filename = format!("{:020}.checkpoint.{}.parquet", version, Uuid::new_v4());
         let path = Self::create_path(table_root, filename)?;
         if !path.is_checkpoint() {
             return Err(Error::internal_error(
