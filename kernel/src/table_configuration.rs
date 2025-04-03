@@ -162,8 +162,7 @@ impl TableConfiguration {
         let protocol_supported = match self.protocol.reader_features() {
             // if min_reader_version = 3 and all reader features are subset of supported => OK
             Some(reader_features) if self.protocol.min_reader_version() == 3 => {
-                ensure_supported_feature(reader_features, CDF_SUPPORTED_READER_FEATURES.clone())
-                    .is_ok()
+                ensure_supported_feature(reader_features, &CDF_SUPPORTED_READER_FEATURES).is_ok()
             }
             // if min_reader_version = 1 and there are no reader features => OK
             None => self.protocol.min_reader_version() == 1,

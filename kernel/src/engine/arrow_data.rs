@@ -313,8 +313,8 @@ mod tests {
         ]
         .into();
         let output_schema = get_log_schema().clone();
-        let parsed = handler
-            .parse_json(string_array_to_engine_data(json_strings), output_schema)?;
+        let parsed =
+            handler.parse_json(string_array_to_engine_data(json_strings), output_schema)?;
         let metadata = Metadata::try_new_from_data(parsed.as_ref())?.unwrap();
         assert_eq!(metadata.id, "aff5cb91-8cd9-4195-aef9-446908507302");
         assert_eq!(metadata.created_time, Some(1670892997849));

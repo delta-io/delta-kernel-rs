@@ -257,7 +257,7 @@ fn ensure_cdf_read_supported(protocol: &Protocol) -> DeltaResult<()> {
     match &protocol.reader_features() {
         // if min_reader_version = 3 and all reader features are subset of supported => OK
         Some(reader_features) if protocol.min_reader_version() == 3 => {
-            ensure_supported_feature(reader_features, CDF_SUPPORTED_READER_FEATURES.clone())
+            ensure_supported_feature(reader_features, &CDF_SUPPORTED_READER_FEATURES)
         }
         // if min_reader_version = 1 and there are no reader features => OK
         None if protocol.min_reader_version() == 1 => Ok(()),
