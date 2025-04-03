@@ -116,6 +116,7 @@ pub enum WriterFeature {
     /// protocol checks during VACUUM operations
     VacuumProtocolCheck,
     #[serde(untagged)]
+    #[strum(to_string = "{0}")]
     Unknown(String),
 }
 

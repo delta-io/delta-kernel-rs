@@ -260,13 +260,13 @@ impl Protocol {
     /// True if this protocol has the requested reader feature
     pub(crate) fn has_reader_feature(&self, feature: &ReaderFeature) -> bool {
         self.reader_features()
-            .is_some_and(|features| features.iter().any(|f| f == feature))
+            .is_some_and(|features| features.contains(feature))
     }
 
     /// True if this protocol has the requested writer feature
     pub(crate) fn has_writer_feature(&self, feature: &WriterFeature) -> bool {
         self.writer_features()
-            .is_some_and(|features| features.iter().any(|f| f == feature))
+            .is_some_and(|features| features.contains(feature))
     }
 
     /// Check if reading a table with this protocol is supported. That is: does the kernel support
@@ -306,9 +306,7 @@ impl Protocol {
         match &self.writer_features {
             // if min_reader_version = 3 and min_writer_version = 7 and all writer features are
             // supported => OK
-            Some(writer_features)
-                if self.min_reader_version == 3 && self.min_writer_version == 7 =>
-            {
+            Some(writer_features) if self.min_writer_version == 7 => {
                 ensure_supported_feature(writer_features, &SUPPORTED_WRITER_FEATURES)
             }
             Some(_) => {
@@ -353,7 +351,7 @@ where
 
 pub(crate) trait UnknownFeature: Clone + Hash + Eq + Display + Debug {
     fn is_unknown(&self) -> bool;
-    fn build_unknown(feature: String) -> Self;
+    fn build_unknown(feature: impl ToString) -> Self;
 }
 
 impl UnknownFeature for ReaderFeature {
@@ -361,8 +359,8 @@ impl UnknownFeature for ReaderFeature {
         matches!(self, ReaderFeature::Unknown(_))
     }
 
-    fn build_unknown(feature: String) -> Self {
-        ReaderFeature::Unknown(feature)
+    fn build_unknown(feature: impl ToString) -> Self {
+        ReaderFeature::Unknown(feature.to_string())
     }
 }
 
@@ -371,8 +369,8 @@ impl UnknownFeature for WriterFeature {
         matches!(self, WriterFeature::Unknown(_))
     }
 
-    fn build_unknown(feature: String) -> Self {
-        WriterFeature::Unknown(feature)
+    fn build_unknown(feature: impl ToString) -> Self {
+        WriterFeature::Unknown(feature.to_string())
     }
 }
 
@@ -1032,7 +1030,6 @@ mod tests {
         // test unknown features
         let table_features = vec![ReaderFeature::Unknown("idk".into())];
         let error = ensure_supported_feature(&table_features, &supported_features).unwrap_err();
-        dbg!(&error);
         match error {
             Error::Unsupported(e) if e ==
                 "Unknown reader features [\"idk\"]. Supported reader features are {ColumnMapping, DeletionVectors}"
