@@ -510,7 +510,7 @@ mod tests {
             .try_into()
             .unwrap();
 
-        let filename = location.path().split('/').last().unwrap();
+        let filename = location.path().split('/').next_back().unwrap();
         assert_eq!(&expected_location.join(filename).unwrap(), location);
         assert_eq!(expected_size, size);
         assert!(now - last_modified < 10_000);
