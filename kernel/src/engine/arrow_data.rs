@@ -300,7 +300,7 @@ mod tests {
     use crate::{
         actions::{get_log_schema, Metadata, Protocol},
         engine::sync::SyncEngine,
-        table_features::{ReaderFeatures, WriterFeatures},
+        table_features::{ReaderFeature, WriterFeature},
         DeltaResult, Engine,
     };
 
@@ -314,8 +314,7 @@ mod tests {
         .into();
         let output_schema = get_log_schema().clone();
         let parsed = handler
-            .parse_json(string_array_to_engine_data(json_strings), output_schema)
-            .unwrap();
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)?;
         let metadata = Metadata::try_new_from_data(parsed.as_ref())?.unwrap();
         assert_eq!(metadata.id, "aff5cb91-8cd9-4195-aef9-446908507302");
         assert_eq!(metadata.created_time, Some(1670892997849));
@@ -341,8 +340,8 @@ mod tests {
             protocol.reader_features(),
             Some(
                 [
-                    ReaderFeatures::DeletionVectors,
-                    ReaderFeatures::Unknown("cool_feature".to_string())
+                    ReaderFeature::DeletionVectors,
+                    ReaderFeature::Unknown("cool_feature".to_string())
                 ]
                 .as_slice()
             )
@@ -351,9 +350,9 @@ mod tests {
             protocol.writer_features(),
             Some(
                 [
-                    WriterFeatures::Invariants,
-                    WriterFeatures::Unknown("cool_feature".to_string()),
-                    WriterFeatures::AppendOnly
+                    WriterFeature::Invariants,
+                    WriterFeature::Unknown("cool_feature".to_string()),
+                    WriterFeature::AppendOnly
                 ]
                 .as_slice()
             )

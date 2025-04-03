@@ -177,11 +177,11 @@ pub(crate) struct Protocol {
     /// A collection of features that a client must implement in order to correctly
     /// read this table (exist only when minReaderVersion is set to 3)
     #[serde(skip_serializing_if = "Option::is_none")]
-    reader_features: Option<Vec<ReaderFeatures>>,
+    reader_features: Option<Vec<ReaderFeature>>,
     /// A collection of features that a client must implement in order to correctly
     /// write this table (exist only when minWriterVersion is set to 7)
     #[serde(skip_serializing_if = "Option::is_none")]
-    writer_features: Option<Vec<WriterFeatures>>,
+    writer_features: Option<Vec<WriterFeature>>,
 }
 
 impl Protocol {
@@ -212,12 +212,12 @@ impl Protocol {
         let reader_features = reader_features.and_then(|f| {
             f.into_iter()
                 .map(feature_or_unknown)
-                .collect::<Option<Vec<ReaderFeatures>>>()
+                .collect::<Option<Vec<ReaderFeature>>>()
         });
         let writer_features = writer_features.and_then(|f| {
             f.into_iter()
                 .map(feature_or_unknown)
-                .collect::<Option<Vec<WriterFeatures>>>()
+                .collect::<Option<Vec<WriterFeature>>>()
         });
         Ok(Protocol {
             min_reader_version,
@@ -248,25 +248,25 @@ impl Protocol {
     }
 
     /// Get the reader features for the protocol
-    pub(crate) fn reader_features(&self) -> Option<&[ReaderFeatures]> {
+    pub(crate) fn reader_features(&self) -> Option<&[ReaderFeature]> {
         self.reader_features.as_deref()
     }
 
     /// Get the writer features for the protocol
-    pub(crate) fn writer_features(&self) -> Option<&[WriterFeatures]> {
+    pub(crate) fn writer_features(&self) -> Option<&[WriterFeature]> {
         self.writer_features.as_deref()
     }
 
     /// True if this protocol has the requested reader feature
     pub(crate) fn has_reader_feature(&self, feature: &ReaderFeature) -> bool {
         self.reader_features()
-            .is_some_and(|features| features.iter().any(|f| *f == feature))
+            .is_some_and(|features| features.iter().any(|f| f == feature))
     }
 
     /// True if this protocol has the requested writer feature
     pub(crate) fn has_writer_feature(&self, feature: &WriterFeature) -> bool {
         self.writer_features()
-            .is_some_and(|features| features.iter().any(|f| *f == feature))
+            .is_some_and(|features| features.iter().any(|f| f == feature))
     }
 
     /// Check if reading a table with this protocol is supported. That is: does the kernel support
@@ -356,23 +356,23 @@ pub(crate) trait UnknownFeature: Clone + Hash + Eq + Display + Debug {
     fn build_unknown(feature: String) -> Self;
 }
 
-impl UnknownFeature for ReaderFeatures {
+impl UnknownFeature for ReaderFeature {
     fn is_unknown(&self) -> bool {
-        matches!(self, ReaderFeatures::Unknown(_))
+        matches!(self, ReaderFeature::Unknown(_))
     }
 
     fn build_unknown(feature: String) -> Self {
-        ReaderFeatures::Unknown(feature)
+        ReaderFeature::Unknown(feature)
     }
 }
 
-impl UnknownFeature for WriterFeatures {
+impl UnknownFeature for WriterFeature {
     fn is_unknown(&self) -> bool {
-        matches!(self, WriterFeatures::Unknown(_))
+        matches!(self, WriterFeature::Unknown(_))
     }
 
     fn build_unknown(feature: String) -> Self {
-        WriterFeatures::Unknown(feature)
+        WriterFeature::Unknown(feature)
     }
 }
 
@@ -1022,17 +1022,15 @@ mod tests {
 
     #[test]
     fn test_ensure_supported_features() {
-        let supported_features: HashSet<_> = [
-            ReaderFeatures::ColumnMapping,
-            ReaderFeatures::DeletionVectors,
-        ]
-        .into_iter()
-        .collect();
-        let table_features = vec![ReaderFeatures::ColumnMapping];
+        let supported_features: HashSet<_> =
+            [ReaderFeature::ColumnMapping, ReaderFeature::DeletionVectors]
+                .into_iter()
+                .collect();
+        let table_features = vec![ReaderFeature::ColumnMapping];
         ensure_supported_feature(&table_features, supported_features.clone()).unwrap();
 
         // test unknown features
-        let table_features = vec![ReaderFeatures::Unknown("idk".into())];
+        let table_features = vec![ReaderFeature::Unknown("idk".into())];
         let error = ensure_supported_feature(&table_features, supported_features).unwrap_err();
         dbg!(&error);
         match error {

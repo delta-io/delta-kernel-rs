@@ -162,13 +162,13 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<HashSet<WriterFeature>> =
             ])
         });
 
-impl ToDataType for ReaderFeatures {
+impl ToDataType for ReaderFeature {
     fn to_data_type() -> DataType {
         DataType::STRING
     }
 }
 
-impl ToDataType for WriterFeatures {
+impl ToDataType for WriterFeature {
     fn to_data_type() -> DataType {
         DataType::STRING
     }
@@ -181,14 +181,14 @@ mod tests {
     #[test]
     fn test_unknown_features() {
         let mixed_reader = &[
-            ReaderFeatures::DeletionVectors,
-            ReaderFeatures::Unknown("cool_feature".to_string()),
-            ReaderFeatures::ColumnMapping,
+            ReaderFeature::DeletionVectors,
+            ReaderFeature::Unknown("cool_feature".to_string()),
+            ReaderFeature::ColumnMapping,
         ];
         let mixed_writer = &[
-            WriterFeatures::DeletionVectors,
-            WriterFeatures::Unknown("cool_feature".to_string()),
-            WriterFeatures::AppendOnly,
+            WriterFeature::DeletionVectors,
+            WriterFeature::Unknown("cool_feature".to_string()),
+            WriterFeature::AppendOnly,
         ];
 
         let reader_string = serde_json::to_string(mixed_reader).unwrap();
@@ -203,8 +203,8 @@ mod tests {
             "[\"deletionVectors\",\"cool_feature\",\"appendOnly\"]"
         );
 
-        let typed_reader: Vec<ReaderFeatures> = serde_json::from_str(&reader_string).unwrap();
-        let typed_writer: Vec<WriterFeatures> = serde_json::from_str(&writer_string).unwrap();
+        let typed_reader: Vec<ReaderFeature> = serde_json::from_str(&reader_string).unwrap();
+        let typed_writer: Vec<WriterFeature> = serde_json::from_str(&writer_string).unwrap();
 
         assert_eq!(typed_reader.len(), 3);
         assert_eq!(&typed_reader, mixed_reader);
@@ -226,9 +226,8 @@ mod tests {
 
         assert_eq!(ReaderFeature::VARIANTS.len() - 1, cases.len());
         let num_cases = cases.len();
-        for ((feature, expected), name) in cases
-            .into_iter()
-            .zip(&ReaderFeature::VARIANTS[..num_cases])
+        for ((feature, expected), name) in
+            cases.into_iter().zip(&ReaderFeature::VARIANTS[..num_cases])
         {
             assert_eq!(*name, expected);
 
@@ -267,9 +266,8 @@ mod tests {
 
         assert_eq!(WriterFeature::VARIANTS.len() - 1, cases.len());
         let num_cases = cases.len();
-        for ((feature, expected), name) in cases
-            .into_iter()
-            .zip(&WriterFeature::VARIANTS[..num_cases])
+        for ((feature, expected), name) in
+            cases.into_iter().zip(&WriterFeature::VARIANTS[..num_cases])
         {
             assert_eq!(*name, expected);
 
