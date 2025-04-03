@@ -9,17 +9,17 @@ use url::Url;
 
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
-use crate::{DeltaResult, Error, FileMeta, FileSlice, FileSystemClient};
+use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 #[derive(Debug)]
-pub struct ObjectStoreFileSystemClient<E: TaskExecutor> {
+pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
     inner: Arc<DynObjectStore>,
     has_ordered_listing: bool,
     task_executor: Arc<E>,
     readahead: usize,
 }
 
-impl<E: TaskExecutor> ObjectStoreFileSystemClient<E> {
+impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
     pub(crate) fn new(
         store: Arc<DynObjectStore>,
         has_ordered_listing: bool,
@@ -40,7 +40,7 @@ impl<E: TaskExecutor> ObjectStoreFileSystemClient<E> {
     }
 }
 
-impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
+impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
     fn list_from(
         &self,
         path: &Url,
@@ -197,7 +197,7 @@ mod tests {
         let mut url = Url::from_directory_path(tmp.path()).unwrap();
 
         let store = Arc::new(LocalFileSystem::new());
-        let client = ObjectStoreFileSystemClient::new(
+        let storage = ObjectStoreStorageHandler::new(
             store,
             false, // don't have ordered listing
             Arc::new(TokioBackgroundExecutor::new()),
@@ -213,7 +213,7 @@ mod tests {
         url.set_path(&format!("{}/c", url.path()));
         slices.push((url, Some(Range { start: 4, end: 9 })));
         dbg!("Slices are: {}", &slices);
-        let data: Vec<Bytes> = client.read_files(slices).unwrap().try_collect().unwrap();
+        let data: Vec<Bytes> = storage.read_files(slices).unwrap().try_collect().unwrap();
 
         assert_eq!(data.len(), 3);
         assert_eq!(data[0], Bytes::from("kernel"));
@@ -234,7 +234,7 @@ mod tests {
         let table_root = Url::parse("memory:///").expect("valid url");
         let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
         let files: Vec<_> = engine
-            .file_system_client()
+            .storage_handler()
             .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap())
             .unwrap()
             .try_collect()
@@ -263,9 +263,8 @@ mod tests {
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let store = Arc::new(LocalFileSystem::new());
         let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
-        let client = engine.file_system_client();
-
-        let files = client
+        let files = engine
+            .storage_handler()
             .list_from(&url.join("_delta_log").unwrap().join("0").unwrap())
             .unwrap();
         let mut len = 0;

@@ -37,7 +37,7 @@ fn get_segment(
     let table_root = url::Url::from_directory_path(path).unwrap();
     let log_root = table_root.join("_delta_log/")?;
     let log_segment = LogSegment::for_table_changes(
-        engine.file_system_client().as_ref(),
+        engine.storage_handler().as_ref(),
         log_root,
         start_version,
         end_version,
