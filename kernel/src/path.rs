@@ -181,7 +181,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
 }
 
 impl ParsedLogPath<Url> {
-    const DELTA_LOG_DIR: &'static str = "_delta_log";
+    const DELTA_LOG_DIR: &'static str = "_delta_log/";
 
     /// Helper method to create a path with the given filename generator
     fn create_path(table_root: &Url, filename: String) -> DeltaResult<Self> {
