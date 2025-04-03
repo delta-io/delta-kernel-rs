@@ -11,7 +11,7 @@ use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
 use crate::schema::{DataType, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
-use crate::table_features::ReaderFeatures;
+use crate::table_features::ReaderFeature;
 use crate::utils::test_utils::{Action, LocalMockTable};
 use crate::Expression;
 use crate::{DeltaResult, Engine, Error, Version};
@@ -75,8 +75,8 @@ async fn metadata_protocol() {
                 Protocol::try_new(
                     3,
                     7,
-                    Some([ReaderFeatures::DeletionVectors]),
-                    Some([ReaderFeatures::ColumnMapping]),
+                    Some([ReaderFeature::DeletionVectors]),
+                    Some([ReaderFeature::ColumnMapping]),
                 )
                 .unwrap(),
             ),
@@ -129,10 +129,7 @@ async fn unsupported_reader_feature() {
             Protocol::try_new(
                 3,
                 7,
-                Some([
-                    ReaderFeatures::DeletionVectors,
-                    ReaderFeatures::ColumnMapping,
-                ]),
+                Some([ReaderFeature::DeletionVectors, ReaderFeature::ColumnMapping]),
                 Some([""; 0]),
             )
             .unwrap(),

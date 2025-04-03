@@ -29,7 +29,7 @@ mod column_mapping;
 )]
 #[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
-pub enum ReaderFeatures {
+pub enum ReaderFeature {
     /// Mapping of one column to another
     ColumnMapping,
     /// Deletion vectors for merge, update, delete
@@ -70,7 +70,7 @@ pub enum ReaderFeatures {
 )]
 #[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
-pub enum WriterFeatures {
+pub enum WriterFeature {
     /// Append Only Tables
     AppendOnly,
     /// Table invariants
@@ -111,40 +111,40 @@ pub enum WriterFeatures {
     VacuumProtocolCheck,
 }
 
-impl From<ReaderFeatures> for String {
-    fn from(feature: ReaderFeatures) -> Self {
+impl From<ReaderFeature> for String {
+    fn from(feature: ReaderFeature) -> Self {
         feature.to_string()
     }
 }
 
-impl From<WriterFeatures> for String {
-    fn from(feature: WriterFeatures) -> Self {
+impl From<WriterFeature> for String {
+    fn from(feature: WriterFeature) -> Self {
         feature.to_string()
     }
 }
 
-pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeatures>> =
+pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeature>> =
     LazyLock::new(|| {
         HashSet::from([
-            ReaderFeatures::ColumnMapping,
-            ReaderFeatures::DeletionVectors,
-            ReaderFeatures::TimestampWithoutTimezone,
-            ReaderFeatures::TypeWidening,
-            ReaderFeatures::TypeWideningPreview,
-            ReaderFeatures::VacuumProtocolCheck,
-            ReaderFeatures::V2Checkpoint,
+            ReaderFeature::ColumnMapping,
+            ReaderFeature::DeletionVectors,
+            ReaderFeature::TimestampWithoutTimezone,
+            ReaderFeature::TypeWidening,
+            ReaderFeature::TypeWideningPreview,
+            ReaderFeature::VacuumProtocolCheck,
+            ReaderFeature::V2Checkpoint,
         ])
     });
 
-pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<HashSet<WriterFeatures>> =
+pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<HashSet<WriterFeature>> =
     // note: we 'support' Invariants, but only insofar as we check that they are not present.
     // we support writing to tables that have Invariants enabled but not used. similarly, we only
     // support DeletionVectors in that we never write them (no DML).
     LazyLock::new(|| {
             HashSet::from([
-                WriterFeatures::AppendOnly,
-                WriterFeatures::DeletionVectors,
-                WriterFeatures::Invariants,
+                WriterFeature::AppendOnly,
+                WriterFeature::DeletionVectors,
+                WriterFeature::Invariants,
             ])
         });
 
@@ -155,27 +155,27 @@ mod tests {
     #[test]
     fn test_roundtrip_reader_features() {
         let cases = [
-            (ReaderFeatures::ColumnMapping, "columnMapping"),
-            (ReaderFeatures::DeletionVectors, "deletionVectors"),
-            (ReaderFeatures::TimestampWithoutTimezone, "timestampNtz"),
-            (ReaderFeatures::TypeWidening, "typeWidening"),
-            (ReaderFeatures::TypeWideningPreview, "typeWidening-preview"),
-            (ReaderFeatures::V2Checkpoint, "v2Checkpoint"),
-            (ReaderFeatures::VacuumProtocolCheck, "vacuumProtocolCheck"),
+            (ReaderFeature::ColumnMapping, "columnMapping"),
+            (ReaderFeature::DeletionVectors, "deletionVectors"),
+            (ReaderFeature::TimestampWithoutTimezone, "timestampNtz"),
+            (ReaderFeature::TypeWidening, "typeWidening"),
+            (ReaderFeature::TypeWideningPreview, "typeWidening-preview"),
+            (ReaderFeature::V2Checkpoint, "v2Checkpoint"),
+            (ReaderFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
         ];
 
-        assert_eq!(ReaderFeatures::VARIANTS.len(), cases.len());
+        assert_eq!(ReaderFeature::VARIANTS.len(), cases.len());
 
-        for ((feature, expected), name) in cases.into_iter().zip(ReaderFeatures::VARIANTS) {
+        for ((feature, expected), name) in cases.into_iter().zip(ReaderFeature::VARIANTS) {
             assert_eq!(*name, expected);
 
             let serialized = serde_json::to_string(&feature).unwrap();
             assert_eq!(serialized, format!("\"{}\"", expected));
 
-            let deserialized: ReaderFeatures = serde_json::from_str(&serialized).unwrap();
+            let deserialized: ReaderFeature = serde_json::from_str(&serialized).unwrap();
             assert_eq!(deserialized, feature);
 
-            let from_str: ReaderFeatures = expected.parse().unwrap();
+            let from_str: ReaderFeature = expected.parse().unwrap();
             assert_eq!(from_str, feature);
         }
     }
@@ -183,37 +183,37 @@ mod tests {
     #[test]
     fn test_roundtrip_writer_features() {
         let cases = [
-            (WriterFeatures::AppendOnly, "appendOnly"),
-            (WriterFeatures::Invariants, "invariants"),
-            (WriterFeatures::CheckConstraints, "checkConstraints"),
-            (WriterFeatures::ChangeDataFeed, "changeDataFeed"),
-            (WriterFeatures::GeneratedColumns, "generatedColumns"),
-            (WriterFeatures::ColumnMapping, "columnMapping"),
-            (WriterFeatures::IdentityColumns, "identityColumns"),
-            (WriterFeatures::DeletionVectors, "deletionVectors"),
-            (WriterFeatures::RowTracking, "rowTracking"),
-            (WriterFeatures::TimestampWithoutTimezone, "timestampNtz"),
-            (WriterFeatures::TypeWidening, "typeWidening"),
-            (WriterFeatures::TypeWideningPreview, "typeWidening-preview"),
-            (WriterFeatures::DomainMetadata, "domainMetadata"),
-            (WriterFeatures::V2Checkpoint, "v2Checkpoint"),
-            (WriterFeatures::IcebergCompatV1, "icebergCompatV1"),
-            (WriterFeatures::IcebergCompatV2, "icebergCompatV2"),
-            (WriterFeatures::VacuumProtocolCheck, "vacuumProtocolCheck"),
+            (WriterFeature::AppendOnly, "appendOnly"),
+            (WriterFeature::Invariants, "invariants"),
+            (WriterFeature::CheckConstraints, "checkConstraints"),
+            (WriterFeature::ChangeDataFeed, "changeDataFeed"),
+            (WriterFeature::GeneratedColumns, "generatedColumns"),
+            (WriterFeature::ColumnMapping, "columnMapping"),
+            (WriterFeature::IdentityColumns, "identityColumns"),
+            (WriterFeature::DeletionVectors, "deletionVectors"),
+            (WriterFeature::RowTracking, "rowTracking"),
+            (WriterFeature::TimestampWithoutTimezone, "timestampNtz"),
+            (WriterFeature::TypeWidening, "typeWidening"),
+            (WriterFeature::TypeWideningPreview, "typeWidening-preview"),
+            (WriterFeature::DomainMetadata, "domainMetadata"),
+            (WriterFeature::V2Checkpoint, "v2Checkpoint"),
+            (WriterFeature::IcebergCompatV1, "icebergCompatV1"),
+            (WriterFeature::IcebergCompatV2, "icebergCompatV2"),
+            (WriterFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
         ];
 
-        assert_eq!(WriterFeatures::VARIANTS.len(), cases.len());
+        assert_eq!(WriterFeature::VARIANTS.len(), cases.len());
 
-        for ((feature, expected), name) in cases.into_iter().zip(WriterFeatures::VARIANTS) {
+        for ((feature, expected), name) in cases.into_iter().zip(WriterFeature::VARIANTS) {
             assert_eq!(*name, expected);
 
             let serialized = serde_json::to_string(&feature).unwrap();
             assert_eq!(serialized, format!("\"{}\"", expected));
 
-            let deserialized: WriterFeatures = serde_json::from_str(&serialized).unwrap();
+            let deserialized: WriterFeature = serde_json::from_str(&serialized).unwrap();
             assert_eq!(deserialized, feature);
 
-            let from_str: WriterFeatures = expected.parse().unwrap();
+            let from_str: WriterFeature = expected.parse().unwrap();
             assert_eq!(from_str, feature);
         }
     }
