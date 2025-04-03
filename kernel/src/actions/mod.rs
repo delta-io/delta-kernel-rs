@@ -12,7 +12,7 @@ use self::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::schemas::GetStructField;
 use crate::schema::{SchemaRef, StructType};
 use crate::table_features::{
-    ReaderFeatures, WriterFeatures, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
+    ReaderFeature, WriterFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -251,13 +251,13 @@ impl Protocol {
     }
 
     /// True if this protocol has the requested reader feature
-    pub(crate) fn has_reader_feature(&self, feature: &ReaderFeatures) -> bool {
+    pub(crate) fn has_reader_feature(&self, feature: &ReaderFeature) -> bool {
         self.reader_features()
             .is_some_and(|features| features.iter().any(|f| f == feature.as_ref()))
     }
 
     /// True if this protocol has the requested writer feature
-    pub(crate) fn has_writer_feature(&self, feature: &WriterFeatures) -> bool {
+    pub(crate) fn has_writer_feature(&self, feature: &WriterFeature) -> bool {
         self.writer_features()
             .is_some_and(|features| features.iter().any(|f| f == feature.as_ref()))
     }
@@ -874,8 +874,8 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::V2Checkpoint]),
-            Some([ReaderFeatures::V2Checkpoint]),
+            Some([ReaderFeature::V2Checkpoint]),
+            Some([ReaderFeature::V2Checkpoint]),
         )
         .unwrap();
         assert!(protocol.ensure_read_supported().is_ok());
@@ -883,8 +883,8 @@ mod tests {
         let protocol = Protocol::try_new(
             4,
             7,
-            Some([ReaderFeatures::V2Checkpoint]),
-            Some([ReaderFeatures::V2Checkpoint]),
+            Some([ReaderFeature::V2Checkpoint]),
+            Some([ReaderFeature::V2Checkpoint]),
         )
         .unwrap();
         assert!(protocol.ensure_read_supported().is_err());
@@ -904,7 +904,7 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::V2Checkpoint]),
+            Some([ReaderFeature::V2Checkpoint]),
             Some(&empty_features),
         )
         .unwrap();
@@ -914,7 +914,7 @@ mod tests {
             3,
             7,
             Some(&empty_features),
-            Some([WriterFeatures::V2Checkpoint]),
+            Some([WriterFeature::V2Checkpoint]),
         )
         .unwrap();
         assert!(protocol.ensure_read_supported().is_ok());
@@ -922,8 +922,8 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::V2Checkpoint]),
-            Some([WriterFeatures::V2Checkpoint]),
+            Some([ReaderFeature::V2Checkpoint]),
+            Some([WriterFeature::V2Checkpoint]),
         )
         .unwrap();
         assert!(protocol.ensure_read_supported().is_ok());
@@ -952,9 +952,9 @@ mod tests {
             7,
             Some::<Vec<String>>(vec![]),
             Some(vec![
-                WriterFeatures::AppendOnly,
-                WriterFeatures::DeletionVectors,
-                WriterFeatures::Invariants,
+                WriterFeature::AppendOnly,
+                WriterFeature::DeletionVectors,
+                WriterFeature::Invariants,
             ]),
         )
         .unwrap();
@@ -963,8 +963,8 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::DeletionVectors]),
-            Some([WriterFeatures::RowTracking]),
+            Some([ReaderFeature::DeletionVectors]),
+            Some([WriterFeature::RowTracking]),
         )
         .unwrap();
         assert!(protocol.ensure_write_supported().is_err());
@@ -972,24 +972,21 @@ mod tests {
 
     #[test]
     fn test_ensure_supported_features() {
-        let supported_features = [
-            ReaderFeatures::ColumnMapping,
-            ReaderFeatures::DeletionVectors,
-        ]
-        .into_iter()
-        .collect();
-        let table_features = vec![ReaderFeatures::ColumnMapping.to_string()];
+        let supported_features = [ReaderFeature::ColumnMapping, ReaderFeature::DeletionVectors]
+            .into_iter()
+            .collect();
+        let table_features = vec![ReaderFeature::ColumnMapping.to_string()];
         ensure_supported_features(&table_features, &supported_features).unwrap();
 
         // test unknown features
-        let table_features = vec![ReaderFeatures::ColumnMapping.to_string(), "idk".to_string()];
+        let table_features = vec![ReaderFeature::ColumnMapping.to_string(), "idk".to_string()];
         let error = ensure_supported_features(&table_features, &supported_features).unwrap_err();
         match error {
             Error::Unsupported(e) if e ==
-                "Unknown ReaderFeatures [\"idk\"]. Supported ReaderFeatures are [ColumnMapping, DeletionVectors]"
+                "Unknown ReaderFeature [\"idk\"]. Supported ReaderFeature are [ColumnMapping, DeletionVectors]"
             => {},
             Error::Unsupported(e) if e ==
-                "Unknown ReaderFeatures [\"idk\"]. Supported ReaderFeatures are [DeletionVectors, ColumnMapping]"
+                "Unknown ReaderFeature [\"idk\"]. Supported ReaderFeature are [DeletionVectors, ColumnMapping]"
             => {},
             _ => panic!("Expected unsupported error"),
         }
