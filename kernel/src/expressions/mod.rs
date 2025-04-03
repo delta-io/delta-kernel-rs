@@ -15,6 +15,8 @@ use crate::DataType;
 mod column_names;
 mod scalars;
 
+pub(crate) mod literal_expression_transform;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// A binary operator.
 pub enum BinaryOperator {

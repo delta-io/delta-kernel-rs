@@ -1,15 +1,19 @@
-use super::super::arrow_utils::make_arrow_error;
-use crate::arrow::array::{
-    Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
-};
-use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
-use crate::engine::ensure_data_types::ensure_data_types;
-use crate::error::{DeltaResult, Error};
-use crate::schema::{ArrayType, DataType, MapType, Schema, StructField};
-use itertools::Itertools;
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use itertools::Itertools;
+
+use crate::arrow::array::{
+    Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
+};
+use crate::arrow::datatypes::Schema as ArrowSchema;
+use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
+
+use super::super::arrow_utils::make_arrow_error;
+use crate::engine::ensure_data_types::ensure_data_types;
+use crate::error::{DeltaResult, Error};
+use crate::schema::{ArrayType, DataType, MapType, Schema, StructField};
 
 // Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch where the
 // names of fields, nullable, and metadata in the struct have been transformed to match those in
@@ -21,7 +25,18 @@ pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<
         ));
     };
     let applied = apply_schema_to_struct(array, struct_schema)?;
-    Ok(applied.into())
+    let (fields, columns, nulls) = applied.into_parts();
+    if let Some(nulls) = nulls {
+        if nulls.null_count() != 0 {
+            return Err(Error::invalid_struct_data(
+                "Top-level nulls in struct are not supported",
+            ));
+        }
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(fields)),
+        columns,
+    )?)
 }
 
 // helper to transform an arrow field+col into the specified target type. If `rename` is specified
