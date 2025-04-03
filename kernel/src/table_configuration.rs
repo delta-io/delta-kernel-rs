@@ -16,8 +16,8 @@ use url::Url;
 use crate::actions::{ensure_supported_features, Metadata, Protocol};
 use crate::schema::{InvariantChecker, SchemaRef};
 use crate::table_features::{
-    column_mapping_mode, validate_schema_column_mapping, ColumnMappingMode, ReaderFeatures,
-    WriterFeatures,
+    column_mapping_mode, validate_schema_column_mapping, ColumnMappingMode, ReaderFeature,
+    WriterFeature,
 };
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error, Version};
@@ -156,8 +156,8 @@ impl TableConfiguration {
     /// [`TableChanges`]: crate::table_changes::TableChanges
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn is_cdf_read_supported(&self) -> bool {
-        static CDF_SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeatures>> =
-            LazyLock::new(|| HashSet::from([ReaderFeatures::DeletionVectors]));
+        static CDF_SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeature>> =
+            LazyLock::new(|| HashSet::from([ReaderFeature::DeletionVectors]));
         let protocol_supported = match self.protocol.reader_features() {
             // if min_reader_version = 3 and all reader features are subset of supported => OK
             Some(reader_features) if self.protocol.min_reader_version() == 3 => {
@@ -189,11 +189,11 @@ impl TableConfiguration {
     pub(crate) fn is_deletion_vector_supported(&self) -> bool {
         let read_supported = self
             .protocol()
-            .has_reader_feature(&ReaderFeatures::DeletionVectors)
+            .has_reader_feature(&ReaderFeature::DeletionVectors)
             && self.protocol.min_reader_version() == 3;
         let write_supported = self
             .protocol()
-            .has_writer_feature(&WriterFeatures::DeletionVectors)
+            .has_writer_feature(&WriterFeature::DeletionVectors)
             && self.protocol.min_writer_version() == 7;
         read_supported && write_supported
     }
@@ -215,12 +215,12 @@ impl TableConfiguration {
 
     /// Returns `true` if the table supports the appendOnly table feature. To support this feature:
     /// - The table must have a writer version between 2 and 7 (inclusive)
-    /// - If the table is on writer version 7, it must have the [`WriterFeatures::AppendOnly`]
+    /// - If the table is on writer version 7, it must have the [`WriterFeature::AppendOnly`]
     ///   writer feature.
     pub(crate) fn is_append_only_supported(&self) -> bool {
         let protocol = &self.protocol;
         match protocol.min_writer_version() {
-            7 if protocol.has_writer_feature(&WriterFeatures::AppendOnly) => true,
+            7 if protocol.has_writer_feature(&WriterFeature::AppendOnly) => true,
             version => (2..=6).contains(&version),
         }
     }
@@ -234,7 +234,7 @@ impl TableConfiguration {
     pub(crate) fn is_invariants_supported(&self) -> bool {
         let protocol = &self.protocol;
         match protocol.min_writer_version() {
-            7 if protocol.has_writer_feature(&WriterFeatures::Invariants) => true,
+            7 if protocol.has_writer_feature(&WriterFeature::Invariants) => true,
             version => (2..=6).contains(&version),
         }
     }
@@ -247,7 +247,7 @@ mod test {
     use url::Url;
 
     use crate::actions::{Metadata, Protocol};
-    use crate::table_features::{ReaderFeatures, WriterFeatures};
+    use crate::table_features::{ReaderFeature, WriterFeature};
 
     use super::TableConfiguration;
 
@@ -264,8 +264,8 @@ mod test {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::DeletionVectors]),
-            Some([WriterFeatures::DeletionVectors]),
+            Some([ReaderFeature::DeletionVectors]),
+            Some([WriterFeature::DeletionVectors]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -290,8 +290,8 @@ mod test {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::DeletionVectors]),
-            Some([WriterFeatures::DeletionVectors]),
+            Some([ReaderFeature::DeletionVectors]),
+            Some([WriterFeature::DeletionVectors]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -323,8 +323,8 @@ mod test {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::TimestampWithoutTimezone]),
-            Some([WriterFeatures::TimestampWithoutTimezone]),
+            Some([ReaderFeature::TimestampWithoutTimezone]),
+            Some([WriterFeature::TimestampWithoutTimezone]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();

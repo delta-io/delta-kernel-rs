@@ -254,7 +254,7 @@ pub struct Stats {
 /// * `size`: an `i64` which is the size of the file
 /// * `dv_info`: a [`DvInfo`] struct, which allows getting the selection vector for this file
 /// * `transform`: An optional expression that, if not `NULL`, _must_ be applied to physical data to
-///                convert it to the correct logical format. If this is `NULL`, no transform is needed.
+///   convert it to the correct logical format. If this is `NULL`, no transform is needed.
 /// * `partition_values`: [DEPRECATED] a `HashMap<String, String>` which are partition values
 type CScanCallback = extern "C" fn(
     engine_context: NullableCvoid,

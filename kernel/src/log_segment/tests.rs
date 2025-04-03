@@ -22,7 +22,7 @@ use crate::path::ParsedLogPath;
 use crate::scan::test_utils::{
     add_batch_simple, add_batch_with_remove, sidecar_batch_with_given_paths,
 };
-use crate::snapshot::CheckpointMetadata;
+use crate::snapshot::LastCheckpointHint;
 use crate::utils::test_utils::{assert_batch_matches, Action};
 use crate::{
     DeltaResult, Engine, EngineData, Expression, ExpressionRef, FileMeta, FileSystemClient,
@@ -81,10 +81,10 @@ fn delta_path_for_multipart_checkpoint(version: u64, part_num: u32, num_parts: u
 }
 
 // Utility method to build a log using a list of log paths and an optional checkpoint hint. The
-// CheckpointMetadata is written to `_delta_log/_last_checkpoint`.
+// LastCheckpointHint is written to `_delta_log/_last_checkpoint`.
 fn build_log_with_paths_and_checkpoint(
     paths: &[Path],
-    checkpoint_metadata: Option<&CheckpointMetadata>,
+    checkpoint_metadata: Option<&LastCheckpointHint>,
 ) -> (Box<dyn FileSystemClient>, Url) {
     let store = Arc::new(InMemory::new());
 
@@ -269,7 +269,7 @@ fn build_snapshot_with_uuid_checkpoint_json() {
 
 #[test]
 fn build_snapshot_with_correct_last_uuid_checkpoint() {
-    let checkpoint_metadata = CheckpointMetadata {
+    let checkpoint_metadata = LastCheckpointHint {
         version: 5,
         size: 10,
         parts: Some(1),
@@ -347,7 +347,7 @@ fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
 
 #[test]
 fn build_snapshot_with_out_of_date_last_checkpoint() {
-    let checkpoint_metadata = CheckpointMetadata {
+    let checkpoint_metadata = LastCheckpointHint {
         version: 3,
         size: 10,
         parts: None,
@@ -384,7 +384,7 @@ fn build_snapshot_with_out_of_date_last_checkpoint() {
 }
 #[test]
 fn build_snapshot_with_correct_last_multipart_checkpoint() {
-    let checkpoint_metadata = CheckpointMetadata {
+    let checkpoint_metadata = LastCheckpointHint {
         version: 5,
         size: 10,
         parts: Some(3),
@@ -427,7 +427,7 @@ fn build_snapshot_with_correct_last_multipart_checkpoint() {
 
 #[test]
 fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
-    let checkpoint_metadata = CheckpointMetadata {
+    let checkpoint_metadata = LastCheckpointHint {
         version: 5,
         size: 10,
         parts: Some(3),
@@ -462,7 +462,7 @@ fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
 }
 #[test]
 fn build_snapshot_with_bad_checkpoint_hint_fails() {
-    let checkpoint_metadata = CheckpointMetadata {
+    let checkpoint_metadata = LastCheckpointHint {
         version: 5,
         size: 10,
         parts: Some(1),
@@ -536,7 +536,7 @@ fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_checkpo
     // When the _last_checkpoint is out of date and the most recent checkpoint is incomplete, the
     // Snapshot should be made of the most recent complete checkpoint and the commit files that
     // follow it.
-    let checkpoint_metadata = CheckpointMetadata {
+    let checkpoint_metadata = LastCheckpointHint {
         version: 3,
         size: 10,
         parts: None,
@@ -625,7 +625,7 @@ fn build_snapshot_without_checkpoints() {
 
 #[test]
 fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
-    let checkpoint_metadata = CheckpointMetadata {
+    let checkpoint_metadata = LastCheckpointHint {
         version: 5,
         size: 10,
         parts: None,
@@ -665,7 +665,7 @@ fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
 
 #[test]
 fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
-    let checkpoint_metadata = CheckpointMetadata {
+    let checkpoint_metadata = LastCheckpointHint {
         version: 3,
         size: 10,
         parts: None,
