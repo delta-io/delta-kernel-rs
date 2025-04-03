@@ -391,11 +391,11 @@ pub(crate) fn ensure_supported_feature<T: UnknownFeature>(
     }
     let parsed_features = HashSet::from_iter(known_features);
     parsed_features
-        .is_subset(&supported_features)
+        .is_subset(supported_features)
         .then_some(())
         .ok_or_else(|| {
             let unsupported = parsed_features
-                .difference(&supported_features)
+                .difference(supported_features)
                 .cloned()
                 .collect::<Vec<_>>();
             create_feature_error(unsupported, "Unsupported", supported_features)
