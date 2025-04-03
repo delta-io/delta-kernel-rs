@@ -322,7 +322,7 @@ impl Protocol {
                 require!(
                     self.min_writer_version == 1 || self.min_writer_version == 2,
                     Error::unsupported(
-                        "Currently delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1, 2, or 7"
+                        "Currently, delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1, 2, or 7"
                     )
                 );
                 Ok(())
@@ -380,7 +380,7 @@ pub(crate) fn ensure_supported_feature<T: UnknownFeature>(
     table_features: &[T],
     supported_features: HashSet<T>,
 ) -> DeltaResult<()> {
-    let (unknown_features, other_features): (Vec<_>, Vec<_>) =
+    let (unknown_features, known_features): (Vec<_>, Vec<_>) =
         table_features.iter().cloned().partition(|f| f.is_unknown());
     if !unknown_features.is_empty() {
         return Err(create_feature_error(
@@ -389,7 +389,7 @@ pub(crate) fn ensure_supported_feature<T: UnknownFeature>(
             supported_features,
         ));
     }
-    let parsed_features = HashSet::from_iter(other_features);
+    let parsed_features = HashSet::from_iter(known_features);
     parsed_features
         .is_subset(&supported_features)
         .then_some(())
@@ -402,7 +402,6 @@ pub(crate) fn ensure_supported_feature<T: UnknownFeature>(
         })
 }
 
-#[inline]
 pub(crate) fn feature_or_unknown<T: UnknownFeature + FromStr>(
     feature: impl Into<String>,
 ) -> Option<T> {

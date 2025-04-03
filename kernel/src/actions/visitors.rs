@@ -512,15 +512,13 @@ pub(crate) fn visit_deletion_vector_at<'a>(
 #[cfg(test)]
 mod tests {
     use crate::table_features::{ReaderFeatures, WriterFeatures};
-    use std::sync::Arc;
 
-    use crate::arrow::array::{RecordBatch, StringArray};
-    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use crate::arrow::array::StringArray;
 
     use super::*;
 
     use crate::utils::test_utils::action_batch;
-    use crate::{arrow::array::StringArray, utils::test_utils::parse_json_batch};
+    use crate::utils::test_utils::parse_json_batch;
 
     #[test]
     fn test_parse_protocol() -> DeltaResult<()> {

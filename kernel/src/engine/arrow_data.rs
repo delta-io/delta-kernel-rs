@@ -301,7 +301,7 @@ mod tests {
         actions::{get_log_schema, Metadata, Protocol},
         engine::sync::SyncEngine,
         table_features::{ReaderFeatures, WriterFeatures},
-        DeltaResult, Engine, EngineData
+        DeltaResult, Engine,
     };
 
     #[test]
