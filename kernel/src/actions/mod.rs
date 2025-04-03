@@ -270,7 +270,7 @@ impl Protocol {
         match &self.reader_features {
             // if min_reader_version = 3 and all reader features are subset of supported => OK
             Some(reader_features) if self.min_reader_version == 3 => {
-                ensure_supported_feature(reader_features, &SUPPORTED_READER_FEATURES)
+                ensure_supported_features(reader_features, &SUPPORTED_READER_FEATURES)
             }
             // if min_reader_version = 3 and no reader features => ERROR
             // NOTE this is caught by the protocol parsing.
@@ -299,7 +299,7 @@ impl Protocol {
     pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
         match &self.writer_features {
             Some(writer_features) if self.min_writer_version == 7 => {
-                ensure_supported_feature(writer_features, &SUPPORTED_WRITER_FEATURES)
+                ensure_supported_features(writer_features, &SUPPORTED_WRITER_FEATURES)
             }
             Some(_) => {
                 // there are features, but we're not on 7, so the protocol is actually broken
@@ -366,7 +366,7 @@ impl UnknownFeature for WriterFeature {
     }
 }
 
-pub(crate) fn ensure_supported_feature<T: UnknownFeature>(
+pub(crate) fn ensure_supported_features<T: UnknownFeature>(
     table_features: &[T],
     supported_features: &HashSet<T>,
 ) -> DeltaResult<()> {
@@ -1017,11 +1017,11 @@ mod tests {
                 .into_iter()
                 .collect();
         let table_features = vec![ReaderFeature::ColumnMapping];
-        ensure_supported_feature(&table_features, &supported_features).unwrap();
+        ensure_supported_features(&table_features, &supported_features).unwrap();
 
         // test unknown features
         let table_features = vec![ReaderFeature::Unknown("idk".into())];
-        let error = ensure_supported_feature(&table_features, &supported_features).unwrap_err();
+        let error = ensure_supported_features(&table_features, &supported_features).unwrap_err();
         match error {
             Error::Unsupported(e) if e ==
                 "Unknown reader features [\"idk\"]. Supported reader features are {ColumnMapping, DeletionVectors}"

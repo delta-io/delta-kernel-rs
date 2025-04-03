@@ -13,7 +13,7 @@ use std::sync::{Arc, LazyLock};
 
 use url::Url;
 
-use crate::actions::{ensure_supported_feature, Metadata, Protocol};
+use crate::actions::{ensure_supported_features, Metadata, Protocol};
 use crate::schema::InvariantChecker;
 use crate::schema::SchemaRef;
 use crate::table_features::{
@@ -162,7 +162,7 @@ impl TableConfiguration {
         let protocol_supported = match self.protocol.reader_features() {
             // if min_reader_version = 3 and all reader features are subset of supported => OK
             Some(reader_features) if self.protocol.min_reader_version() == 3 => {
-                ensure_supported_feature(reader_features, &CDF_SUPPORTED_READER_FEATURES).is_ok()
+                ensure_supported_features(reader_features, &CDF_SUPPORTED_READER_FEATURES).is_ok()
             }
             // if min_reader_version = 1 and there are no reader features => OK
             None => self.protocol.min_reader_version() == 1,
