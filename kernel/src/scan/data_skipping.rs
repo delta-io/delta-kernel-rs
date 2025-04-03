@@ -33,9 +33,9 @@ mod tests;
 ///
 /// The variadic operations are rewritten as follows:
 /// - `AND` is rewritten as a conjunction of the rewritten operands where we just skip operands that
-///         are not eligible for data skipping.
+///   are not eligible for data skipping.
 /// - `OR` is rewritten only if all operands are eligible for data skipping. Otherwise, the whole OR
-///        expression is dropped.
+///   expression is dropped.
 #[cfg(test)]
 fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
     DataSkippingPredicateCreator.eval(expr)
