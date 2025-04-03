@@ -209,16 +209,10 @@ impl Protocol {
                 )
             );
         }
-        let reader_features = reader_features.and_then(|f| {
-            f.into_iter()
-                .map(feature_or_unknown)
-                .collect::<Option<Vec<ReaderFeature>>>()
-        });
-        let writer_features = writer_features.and_then(|f| {
-            f.into_iter()
-                .map(feature_or_unknown)
-                .collect::<Option<Vec<WriterFeature>>>()
-        });
+        let reader_features =
+            reader_features.and_then(|f| f.into_iter().map(feature_or_unknown).collect());
+        let writer_features =
+            writer_features.and_then(|f| f.into_iter().map(feature_or_unknown).collect());
         Ok(Protocol {
             min_reader_version,
             min_writer_version,
@@ -304,8 +298,6 @@ impl Protocol {
     /// support the specified protocol writer version and all enabled writer features?
     pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
         match &self.writer_features {
-            // if min_reader_version = 3 and min_writer_version = 7 and all writer features are
-            // supported => OK
             Some(writer_features) if self.min_writer_version == 7 => {
                 ensure_supported_feature(writer_features, &SUPPORTED_WRITER_FEATURES)
             }
