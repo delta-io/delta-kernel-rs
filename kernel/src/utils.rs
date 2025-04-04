@@ -113,7 +113,7 @@ pub(crate) mod test_utils {
 
     pub(crate) fn parse_json_batch(json_strings: StringArray) -> Box<dyn EngineData> {
         let engine = SyncEngine::new();
-        let json_handler = engine.get_json_handler();
+        let json_handler = engine.json_handler();
         let output_schema = get_log_schema().clone();
         json_handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)

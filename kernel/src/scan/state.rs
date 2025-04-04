@@ -68,8 +68,8 @@ impl DvInfo {
         self.deletion_vector
             .as_ref()
             .map(|dv_descriptor| {
-                let fs_client = engine.get_file_system_client();
-                dv_descriptor.read(fs_client, table_root)
+                let storage = engine.storage_handler();
+                dv_descriptor.read(storage, table_root)
             })
             .transpose()
     }
@@ -92,8 +92,8 @@ impl DvInfo {
         self.deletion_vector
             .as_ref()
             .map(|dv| {
-                let fs_client = engine.get_file_system_client();
-                dv.row_indexes(fs_client, table_root)
+                let storage = engine.storage_handler();
+                dv.row_indexes(storage, table_root)
             })
             .transpose()
     }
@@ -110,8 +110,8 @@ pub fn transform_to_logical(
 ) -> DeltaResult<Box<dyn EngineData>> {
     match transform {
         Some(ref transform) => engine
-            .get_expression_handler()
-            .get_evaluator(
+            .evaluation_handler()
+            .new_expression_evaluator(
                 physical_schema.clone(),
                 transform.as_ref().clone(), // TODO: Maybe eval should take a ref
                 logical_schema.clone().into(),
