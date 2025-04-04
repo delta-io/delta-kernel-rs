@@ -17,7 +17,7 @@ use crate::engine::arrow_data::ArrowEngineData;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{Expression, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
-use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
+use crate::{EngineData, EvaluationHandler, ExpressionEvaluator};
 
 use itertools::Itertools;
 use tracing::debug;
@@ -123,10 +123,10 @@ impl Scalar {
 }
 
 #[derive(Debug)]
-pub struct ArrowExpressionHandler;
+pub struct ArrowEvaluationHandler;
 
-impl ExpressionHandler for ArrowExpressionHandler {
-    fn get_evaluator(
+impl EvaluationHandler for ArrowEvaluationHandler {
+    fn new_expression_evaluator(
         &self,
         schema: SchemaRef,
         expression: Expression,

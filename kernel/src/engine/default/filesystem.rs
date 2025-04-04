@@ -234,7 +234,7 @@ mod tests {
         let table_root = Url::parse("memory:///").expect("valid url");
         let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
         let files: Vec<_> = engine
-            .get_file_system_client()
+            .file_system_client()
             .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap())
             .unwrap()
             .try_collect()
@@ -263,7 +263,7 @@ mod tests {
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let store = Arc::new(LocalFileSystem::new());
         let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
-        let client = engine.get_file_system_client();
+        let client = engine.file_system_client();
 
         let files = client
             .list_from(&url.join("_delta_log").unwrap().join("0").unwrap())

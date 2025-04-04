@@ -120,7 +120,7 @@ fn read_parquet_file_impl(
     physical_schema: Arc<Schema>,
 ) -> DeltaResult<Handle<ExclusiveFileReadResultIterator>> {
     let engine = extern_engine.engine();
-    let parquet_handler = engine.get_parquet_handler();
+    let parquet_handler = engine.parquet_handler();
     let location = Url::parse(path?)?;
     let delta_fm = delta_kernel::FileMeta {
         location,
@@ -141,12 +141,12 @@ fn read_parquet_file_impl(
 #[handle_descriptor(target=dyn ExpressionEvaluator, mutable=false)]
 pub struct SharedExpressionEvaluator;
 
-/// Get the evaluator as provided by the passed engines `ExpressionHandler`.
+/// Creates a new expression evaluator as provided by the passed engines `EvaluationHandler`.
 ///
 /// # Safety
 /// Caller is responsible for calling with a valid `Engine`, `Expression`, and `SharedSchema`s
 #[no_mangle]
-pub unsafe extern "C" fn get_evaluator(
+pub unsafe extern "C" fn new_expression_evaluator(
     engine: Handle<SharedExternEngine>,
     input_schema: Handle<SharedSchema>,
     expression: &Expression,
@@ -156,17 +156,17 @@ pub unsafe extern "C" fn get_evaluator(
     let engine = unsafe { engine.clone_as_arc() };
     let input_schema = unsafe { input_schema.clone_as_arc() };
     let output_type: DataType = output_type.as_ref().clone().into();
-    get_evaluator_impl(engine, input_schema, expression, output_type)
+    new_expression_evaluator_impl(engine, input_schema, expression, output_type)
 }
 
-fn get_evaluator_impl(
+fn new_expression_evaluator_impl(
     extern_engine: Arc<dyn ExternEngine>,
     input_schema: SchemaRef,
     expression: &Expression,
     output_type: DataType,
 ) -> Handle<SharedExpressionEvaluator> {
     let engine = extern_engine.engine();
-    let evaluator = engine.get_expression_handler().get_evaluator(
+    let evaluator = engine.evaluation_handler().new_expression_evaluator(
         input_schema,
         expression.clone(),
         output_type,
@@ -174,12 +174,12 @@ fn get_evaluator_impl(
     evaluator.into()
 }
 
-/// Free an evaluator
+/// Free an expression evaluator
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle.
 #[no_mangle]
-pub unsafe extern "C" fn free_evaluator(evaluator: Handle<SharedExpressionEvaluator>) {
+pub unsafe extern "C" fn free_expression_evaluator(evaluator: Handle<SharedExpressionEvaluator>) {
     debug!("engine released evaluator");
     evaluator.drop_handle();
 }
@@ -210,7 +210,7 @@ fn evaluate_impl(
 
 #[cfg(test)]
 mod tests {
-    use super::{free_evaluator, get_evaluator};
+    use super::{free_expression_evaluator, new_expression_evaluator};
     use crate::{free_engine, handle::Handle, tests::get_default_engine, SharedSchema};
     use delta_kernel::{
         schema::{DataType, StructField, StructType},
@@ -219,7 +219,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn test_get_evaluator() {
+    fn test_new_evaluator() {
         let engine = get_default_engine();
         let in_schema = Arc::new(StructType::new(vec![StructField::new(
             "a",
@@ -230,7 +230,7 @@ mod tests {
         let output_type: Handle<SharedSchema> = in_schema.clone().into();
         let in_schema_handle: Handle<SharedSchema> = in_schema.into();
         unsafe {
-            let evaluator = get_evaluator(
+            let evaluator = new_expression_evaluator(
                 engine.shallow_copy(),
                 in_schema_handle.shallow_copy(),
                 &expr,
@@ -239,7 +239,7 @@ mod tests {
             in_schema_handle.drop_handle();
             output_type.drop_handle();
             free_engine(engine);
-            free_evaluator(evaluator);
+            free_expression_evaluator(evaluator);
         }
     }
 }
