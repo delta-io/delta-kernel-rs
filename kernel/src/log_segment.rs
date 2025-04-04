@@ -24,6 +24,11 @@ use url::Url;
 #[cfg(test)]
 mod tests;
 
+// This is the size of the buffer we use hold commit file names during log listing. We expect
+// somewhere on the order of 10-200 commit files per checkpoint, so we pick 200. We could adjust
+// this based on config in the future
+const COMMIT_FILES_LIST_BUFFER_LENGTH: usize = 200;
+
 /// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files
 /// and commit files and guarantees the following:
 ///     1. Commit file versions will not have any gaps between them.
@@ -443,13 +448,10 @@ fn list_log_files_with_version(
     start_version: Option<Version>,
     end_version: Option<Version>,
 ) -> DeltaResult<(Vec<ParsedLogPath>, Vec<ParsedLogPath>)> {
-    // We expect 10 commit files per checkpoint, so start with that size. We could adjust this based
-    // on config at some point
-
     let log_files = list_log_files(fs_client, log_root, start_version, end_version)?;
 
     log_files.process_results(|iter| {
-        let mut commit_files = Vec::with_capacity(10);
+        let mut commit_files = Vec::with_capacity(COMMIT_FILES_LIST_BUFFER_LENGTH);
         let mut checkpoint_parts = vec![];
 
         // Group log files by version
