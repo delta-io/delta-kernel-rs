@@ -14,7 +14,8 @@ use std::sync::{Arc, LazyLock};
 use url::Url;
 
 use crate::actions::{ensure_supported_features, Metadata, Protocol};
-use crate::schema::{InvariantChecker, SchemaRef};
+use crate::schema::InvariantChecker;
+use crate::schema::SchemaRef;
 use crate::table_features::{
     column_mapping_mode, validate_schema_column_mapping, ColumnMappingMode, ReaderFeature,
     WriterFeature,

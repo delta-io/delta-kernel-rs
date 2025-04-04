@@ -300,6 +300,7 @@ mod tests {
     use crate::{
         actions::{get_log_schema, Metadata, Protocol},
         engine::sync::SyncEngine,
+        table_features::{ReaderFeature, WriterFeature},
         DeltaResult, Engine,
     };
 
@@ -312,9 +313,8 @@ mod tests {
         ]
         .into();
         let output_schema = get_log_schema().clone();
-        let parsed = handler
-            .parse_json(string_array_to_engine_data(json_strings), output_schema)
-            .unwrap();
+        let parsed =
+            handler.parse_json(string_array_to_engine_data(json_strings), output_schema)?;
         let metadata = Metadata::try_new_from_data(parsed.as_ref())?.unwrap();
         assert_eq!(metadata.id, "aff5cb91-8cd9-4195-aef9-446908507302");
         assert_eq!(metadata.created_time, Some(1670892997849));
@@ -327,20 +327,35 @@ mod tests {
         let engine = SyncEngine::new();
         let handler = engine.get_json_handler();
         let json_strings: StringArray = vec![
-            r#"{"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": ["rw1"], "writerFeatures": ["rw1", "w2"]}}"#,
+            r#"{"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": ["deletionVectors", "cool_feature"], "writerFeatures": ["invariants", "cool_feature", "appendOnly"]}}"#,
         ]
         .into();
         let output_schema = get_log_schema().project(&["protocol"])?;
-        let parsed = handler
-            .parse_json(string_array_to_engine_data(json_strings), output_schema)
-            .unwrap();
+        let parsed =
+            handler.parse_json(string_array_to_engine_data(json_strings), output_schema)?;
         let protocol = Protocol::try_new_from_data(parsed.as_ref())?.unwrap();
         assert_eq!(protocol.min_reader_version(), 3);
         assert_eq!(protocol.min_writer_version(), 7);
-        assert_eq!(protocol.reader_features(), Some(["rw1".into()].as_slice()));
+        assert_eq!(
+            protocol.reader_features(),
+            Some(
+                [
+                    ReaderFeature::DeletionVectors,
+                    ReaderFeature::Unknown("cool_feature".to_string())
+                ]
+                .as_slice()
+            )
+        );
         assert_eq!(
             protocol.writer_features(),
-            Some(["rw1".into(), "w2".into()].as_slice())
+            Some(
+                [
+                    WriterFeature::Invariants,
+                    WriterFeature::Unknown("cool_feature".to_string()),
+                    WriterFeature::AppendOnly
+                ]
+                .as_slice()
+            )
         );
         Ok(())
     }

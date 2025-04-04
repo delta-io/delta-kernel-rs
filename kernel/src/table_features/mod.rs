@@ -1,11 +1,14 @@
-use std::collections::HashSet;
-use std::sync::LazyLock;
-
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::string::ToString;
+use std::sync::LazyLock;
 use strum::{AsRefStr, Display as StrumDisplay, EnumString, VariantNames};
 
+use crate::actions::schemas::ToDataType;
+use crate::schema::DataType;
 pub(crate) use column_mapping::column_mapping_mode;
 pub use column_mapping::{validate_schema_column_mapping, ColumnMappingMode};
+
 mod column_mapping;
 
 /// Reader features communicate capabilities that must be implemented in order to correctly read a
@@ -48,6 +51,9 @@ pub enum ReaderFeature {
     /// vacuumProtocolCheck ReaderWriter feature ensures consistent application of reader and writer
     /// protocol checks during VACUUM operations
     VacuumProtocolCheck,
+    #[serde(untagged)]
+    #[strum(to_string = "{0}")]
+    Unknown(String),
 }
 
 /// Similar to reader features, writer features communicate capabilities that must be implemented
@@ -109,17 +115,26 @@ pub enum WriterFeature {
     /// vacuumProtocolCheck ReaderWriter feature ensures consistent application of reader and writer
     /// protocol checks during VACUUM operations
     VacuumProtocolCheck,
+    #[serde(untagged)]
+    #[strum(to_string = "{0}")]
+    Unknown(String),
 }
 
 impl From<ReaderFeature> for String {
     fn from(feature: ReaderFeature) -> Self {
-        feature.to_string()
+        match feature {
+            ReaderFeature::Unknown(prop) => prop,
+            _ => feature.to_string(),
+        }
     }
 }
 
 impl From<WriterFeature> for String {
     fn from(feature: WriterFeature) -> Self {
-        feature.to_string()
+        match feature {
+            WriterFeature::Unknown(prop) => prop,
+            _ => feature.to_string(),
+        }
     }
 }
 
@@ -148,9 +163,55 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<HashSet<WriterFeature>> =
             ])
         });
 
+impl ToDataType for ReaderFeature {
+    fn to_data_type() -> DataType {
+        DataType::STRING
+    }
+}
+
+impl ToDataType for WriterFeature {
+    fn to_data_type() -> DataType {
+        DataType::STRING
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_unknown_features() {
+        let mixed_reader = &[
+            ReaderFeature::DeletionVectors,
+            ReaderFeature::Unknown("cool_feature".to_string()),
+            ReaderFeature::ColumnMapping,
+        ];
+        let mixed_writer = &[
+            WriterFeature::DeletionVectors,
+            WriterFeature::Unknown("cool_feature".to_string()),
+            WriterFeature::AppendOnly,
+        ];
+
+        let reader_string = serde_json::to_string(mixed_reader).unwrap();
+        let writer_string = serde_json::to_string(mixed_writer).unwrap();
+
+        assert_eq!(
+            &reader_string,
+            "[\"deletionVectors\",\"cool_feature\",\"columnMapping\"]"
+        );
+        assert_eq!(
+            &writer_string,
+            "[\"deletionVectors\",\"cool_feature\",\"appendOnly\"]"
+        );
+
+        let typed_reader: Vec<ReaderFeature> = serde_json::from_str(&reader_string).unwrap();
+        let typed_writer: Vec<WriterFeature> = serde_json::from_str(&writer_string).unwrap();
+
+        assert_eq!(typed_reader.len(), 3);
+        assert_eq!(&typed_reader, mixed_reader);
+        assert_eq!(typed_writer.len(), 3);
+        assert_eq!(&typed_writer, mixed_writer);
+    }
 
     #[test]
     fn test_roundtrip_reader_features() {
@@ -164,9 +225,11 @@ mod tests {
             (ReaderFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
         ];
 
-        assert_eq!(ReaderFeature::VARIANTS.len(), cases.len());
-
-        for ((feature, expected), name) in cases.into_iter().zip(ReaderFeature::VARIANTS) {
+        assert_eq!(ReaderFeature::VARIANTS.len() - 1, cases.len());
+        let num_cases = cases.len();
+        for ((feature, expected), name) in
+            cases.into_iter().zip(&ReaderFeature::VARIANTS[..num_cases])
+        {
             assert_eq!(*name, expected);
 
             let serialized = serde_json::to_string(&feature).unwrap();
@@ -202,9 +265,11 @@ mod tests {
             (WriterFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
         ];
 
-        assert_eq!(WriterFeature::VARIANTS.len(), cases.len());
-
-        for ((feature, expected), name) in cases.into_iter().zip(WriterFeature::VARIANTS) {
+        assert_eq!(WriterFeature::VARIANTS.len() - 1, cases.len());
+        let num_cases = cases.len();
+        for ((feature, expected), name) in
+            cases.into_iter().zip(&WriterFeature::VARIANTS[..num_cases])
+        {
             assert_eq!(*name, expected);
 
             let serialized = serde_json::to_string(&feature).unwrap();
