@@ -1,7 +1,5 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer stats.
-use crate::expressions::{
-    BinaryExpression, ColumnName, Expression, Scalar, UnaryExpression, VariadicExpression,
-};
+use crate::expressions::{ColumnName, Expression, Scalar};
 use crate::parquet::arrow::arrow_reader::ArrowReaderBuilder;
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::file::statistics::Statistics;
@@ -9,7 +7,7 @@ use crate::parquet::schema::types::ColumnDescPtr;
 use crate::predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::schema::{DataType, PrimitiveType};
 use chrono::{DateTime, Days};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use tracing::debug;
 
 #[cfg(test)]
@@ -225,35 +223,19 @@ pub(crate) fn compute_field_indices(
     fields: &[ColumnDescPtr],
     expression: &Expression,
 ) -> HashMap<ColumnName, usize> {
-    fn do_recurse(expression: &Expression, cols: &mut HashSet<ColumnName>) {
-        use Expression::*;
-        let mut recurse = |expr| do_recurse(expr, cols); // simplifies the call sites below
-        match expression {
-            Literal(_) => {}
-            Column(name) => cols.extend([name.clone()]), // returns `()`, unlike `insert`
-            Struct(fields) => fields.iter().for_each(recurse),
-            Unary(UnaryExpression { expr, .. }) => recurse(expr),
-            Binary(BinaryExpression { left, right, .. }) => {
-                [left, right].iter().for_each(|e| recurse(e))
-            }
-            Variadic(VariadicExpression { exprs, .. }) => exprs.iter().for_each(recurse),
-        }
-    }
-
     // Build up a set of requested column paths, then take each found path as the corresponding map
     // key (avoids unnecessary cloning).
     //
     // NOTE: If a requested column was not available, it is silently ignored. These missing columns
     // are implied all-null, so we will infer their min/max stats as NULL and nullcount == rowcount.
-    let mut requested_columns = HashSet::new();
-    do_recurse(expression, &mut requested_columns);
+    let mut requested_columns = expression.references();
     fields
         .iter()
         .enumerate()
         .filter_map(|(i, f)| {
             requested_columns
                 .take(f.path().parts())
-                .map(|path| (path, i))
+                .map(|path| (path.clone(), i))
         })
         .collect()
 }
