@@ -13,7 +13,7 @@ pub(crate) use require;
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use crate::actions::get_log_schema;
+    use crate::actions::{get_log_schema, Sidecar};
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::engine::sync::SyncEngine;
@@ -48,6 +48,8 @@ pub(crate) mod test_utils {
         #[allow(unused)]
         #[serde(rename = "commitInfo")]
         CommitInfo(CommitInfo),
+        #[serde(rename = "sidecar")]
+        Sidecar(Sidecar),
     }
 
     /// A mock table that writes commits to a local temporary delta log. This can be used to

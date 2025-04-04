@@ -20,6 +20,7 @@ const UUID_PART_LEN: usize = 36;
 enum LogPathFileType {
     Commit,
     SinglePartCheckpoint,
+    Sidecar,
     #[allow(unused)]
     UuidCheckpoint(String),
     // NOTE: Delta spec doesn't actually say, but checkpoint part numbers are effectively 31-bit

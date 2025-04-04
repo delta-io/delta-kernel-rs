@@ -526,6 +526,7 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
                 }
             }
             Commit | CompactedCommit { .. } | Unknown => {}
+            Sidecar => todo!(),
         }
     }
     checkpoints

@@ -699,7 +699,8 @@ pub(crate) mod test_utils {
         })
         .collect();
         json_strings.push(r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#.to_string());
-
+        json_strings
+            .push(r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string());
         let json_strings_array: StringArray =
             json_strings.iter().map(|s| s.as_str()).collect_vec().into();
 
