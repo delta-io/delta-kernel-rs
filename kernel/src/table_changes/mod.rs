@@ -31,18 +31,19 @@
 //! let table_change_batches = table_changes_scan.execute(engine.clone())?;
 //! # Ok::<(), Error>(())
 //! ```
-use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use scan::TableChangesScanBuilder;
 use url::Url;
 
-use crate::actions::{ensure_supported_features, Protocol};
+use crate::actions::Protocol;
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::{DataType, Schema, StructField, StructType};
 use crate::snapshot::Snapshot;
-use crate::table_features::{ColumnMappingMode, ReaderFeature};
+use crate::table_features::{
+    ensure_supported_features, ColumnMappingMode, CDF_SUPPORTED_READER_FEATURES,
+};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, Version};
@@ -252,8 +253,6 @@ fn check_cdf_table_properties(table_properties: &TableProperties) -> DeltaResult
 /// Ensures that Change Data Feed is supported for a table with this [`Protocol`] .
 /// See the documentation of [`TableChanges`] for more details.
 fn ensure_cdf_read_supported(protocol: &Protocol) -> DeltaResult<()> {
-    static CDF_SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeature>> =
-        LazyLock::new(|| HashSet::from([ReaderFeature::DeletionVectors]));
     match &protocol.reader_features() {
         // if min_reader_version = 3 and all reader features are subset of supported => OK
         Some(reader_features) if protocol.min_reader_version() == 3 => {

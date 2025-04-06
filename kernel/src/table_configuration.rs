@@ -8,16 +8,14 @@
 //! [`TableProperties`].
 //!
 //! [`Schema`]: crate::schema::Schema
-use std::collections::HashSet;
-use std::sync::{Arc, LazyLock};
-
+use std::sync::Arc;
 use url::Url;
 
-use crate::actions::{ensure_supported_features, Metadata, Protocol};
+use crate::actions::{Metadata, Protocol};
 use crate::schema::{InvariantChecker, SchemaRef};
 use crate::table_features::{
-    column_mapping_mode, validate_schema_column_mapping, ColumnMappingMode, ReaderFeature,
-    WriterFeature,
+    column_mapping_mode, ensure_supported_features, validate_schema_column_mapping,
+    ColumnMappingMode, ReaderFeature, WriterFeature, CDF_SUPPORTED_READER_FEATURES,
 };
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error, Version};
@@ -156,8 +154,6 @@ impl TableConfiguration {
     /// [`TableChanges`]: crate::table_changes::TableChanges
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn is_cdf_read_supported(&self) -> bool {
-        static CDF_SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeature>> =
-            LazyLock::new(|| HashSet::from([ReaderFeature::DeletionVectors]));
         let protocol_supported = match self.protocol.reader_features() {
             // if min_reader_version = 3 and all reader features are subset of supported => OK
             Some(reader_features) if self.protocol.min_reader_version() == 3 => {

@@ -51,6 +51,7 @@ tracing = { version = "0.1", features = ["log"] }
 url = "2"
 uuid = "1.10.0"
 z85 = "3.0.5"
+enumset = "1.1.5"
 
 # bring in our derive macros
 delta_kernel_derive = { path = "../derive-macros", version = "0.8.0" }
