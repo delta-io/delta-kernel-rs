@@ -18,7 +18,7 @@ use std::collections::HashSet;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, TypedGetData};
-use crate::DeltaResult;
+use crate::{DeltaResult, EngineData};
 
 use tracing::debug;
 
@@ -189,4 +189,80 @@ impl<'seen> FileActionDeduplicator<'seen> {
     pub(crate) fn is_log_batch(&self) -> bool {
         self.is_log_batch
     }
+}
+
+/// A trait for processing batches of actions from Delta transaction logs during log replay.
+///
+/// Log replay processors scan transaction logs in **reverse chronological order** (newest to oldest),
+/// filtering and transforming action batches into specialized output types. These processors:
+///
+/// - **Track and deduplicate file actions** to ensure only the latest relevant changes are kept.
+/// - **Maintain selection vectors** to indicate which actions in each batch should be included.
+/// - **Apply custom filtering logic** based on the processor’s purpose (e.g., checkpointing, scanning).
+///
+/// Implementations:
+/// - `ScanLogReplayProcessor`: Used for table scans, this processor filters and selects relevant
+///   file actions to reconstruct the table state at a specific point in time.
+/// - `V1CheckpointLogReplayProcessor`(WIP): Will be responsible for processing log batches to construct
+///   V1 spec checkpoint files, ensuring only necessary metadata and file actions are retained.
+///
+/// The `Output` type must implement [`HasSelectionVector`] to enable filtering of batches
+/// with no selected rows.
+///
+/// TODO: Refactor the Change Data Feed (CDF) processor to use this trait.
+pub(crate) trait LogReplayProcessor {
+    /// The type of results produced by this processor must implement the
+    /// `HasSelectionVector` trait to allow filtering out batches with no selected rows.
+    type Output: HasSelectionVector;
+
+    /// Processes a batch of actions and returns the filtered results.
+    ///
+    /// # Arguments
+    /// - `actions_batch` - A boxed [`EngineData`] instance representing a batch of actions.
+    /// - `is_log_batch` - `true` if the batch originates from a commit log, `false` if from a checkpoint.
+    ///
+    /// Returns a [`DeltaResult`] containing the processor’s output, which includes only selected actions.
+    ///
+    /// Note: Since log replay is stateful, processing may update internal processor state (e.g., deduplication sets).
+    fn process_actions_batch(
+        &mut self,
+        actions_batch: Box<dyn EngineData>,
+        is_log_batch: bool,
+    ) -> DeltaResult<Self::Output>;
+
+    /// Applies a processor to an action iterator and filters out empty results.
+    ///
+    /// # Arguments
+    /// * `processor` - The processor implementation to apply
+    /// * `action_iter` - Iterator of action batches and their source flags
+    ///
+    /// Returns an iterator that yields processed results, filtering out batches
+    /// where no rows were selected
+    ///
+    /// Note: This is an associated function rather than an instance method because the
+    /// returned iterator needs to own the processor.
+    fn apply_to_iterator(
+        mut processor: impl LogReplayProcessor<Output = Self::Output>,
+        action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
+    ) -> impl Iterator<Item = DeltaResult<Self::Output>>
+    where
+        Self::Output: HasSelectionVector,
+    {
+        action_iter
+            .map(move |action_res| {
+                let (batch, is_log_batch) = action_res?;
+                processor.process_actions_batch(batch, is_log_batch)
+            })
+            .filter(|res| {
+                res.as_ref()
+                    .map_or(true, |result| result.has_selected_rows())
+            })
+    }
+}
+
+/// This trait is used to determine if a processor's output contains any selected rows.
+/// This is used to filter out batches with no selected rows from the log replay results.
+pub(crate) trait HasSelectionVector {
+    /// Check if the selection vector contains at least one selected row
+    fn has_selected_rows(&self) -> bool;
 }

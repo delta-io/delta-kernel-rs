@@ -12,6 +12,7 @@ use crate::actions::{
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
+use crate::log_replay::{HasSelectionVector, LogReplayProcessor};
 use crate::path::ParsedLogPath;
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
@@ -26,6 +27,61 @@ use itertools::Itertools;
 
 #[cfg(test)]
 mod tests;
+
+impl HasSelectionVector for TableChangesScanData {
+    fn has_selected_rows(&self) -> bool {
+        self.selection_vector.iter().any(|&selected| selected)
+    }
+}
+struct CdfLogReplayProcessor {
+    scanner: LogReplayScanner,
+    engine: Arc<dyn Engine>,
+    filter: Option<Arc<DataSkippingFilter>>,
+}
+
+impl LogReplayProcessor for CdfLogReplayProcessor {
+    type Output = TableChangesScanData;
+
+    fn process_actions_batch(
+        &mut self,
+        actions_batch: Box<dyn EngineData>,
+        _is_log_batch: bool,
+    ) -> DeltaResult<Self::Output> {
+        // Apply data skipping to get selection vector
+        let selection_vector = match &self.filter {
+            Some(filter) => filter.apply(actions_batch.as_ref())?,
+            None => vec![true; actions_batch.len()],
+        };
+
+        let mut visitor = FileActionSelectionVisitor::new(
+            &self.scanner.remove_dvs,
+            selection_vector,
+            self.scanner.has_cdc_action,
+        );
+        visitor.visit_rows_of(actions_batch.as_ref())?;
+
+        let commit_version = self
+            .scanner
+            .commit_file
+            .version
+            .try_into()
+            .map_err(|_| Error::generic("Failed to convert commit version to i64"))?;
+
+        let evaluator = self.engine.get_expression_handler().get_evaluator(
+            get_log_add_schema().clone(),
+            cdf_scan_row_expression(self.scanner.timestamp, commit_version),
+            cdf_scan_row_schema().into(),
+        );
+
+        let scan_data = evaluator.evaluate(actions_batch.as_ref())?;
+
+        Ok(TableChangesScanData {
+            scan_data,
+            selection_vector: visitor.selection_vector,
+            remove_dvs: self.scanner.remove_dvs.clone().into(),
+        })
+    }
+}
 
 /// Scan data for a Change Data Feed query. This holds metadata that is needed to read data rows.
 pub(crate) struct TableChangesScanData {
@@ -57,11 +113,34 @@ pub(crate) fn table_changes_action_iter(
     let result = commit_files
         .into_iter()
         .map(move |commit_file| -> DeltaResult<_> {
-            let scanner = LogReplayScanner::try_new(engine.as_ref(), commit_file, &table_schema)?;
-            scanner.into_scan_batches(engine.clone(), filter.clone())
-        }) //Iterator-Result-Iterator-Result
-        .flatten_ok() // Iterator-Result-Result
-        .map(|x| x?); // Iterator-Result
+            let scanner =
+                LogReplayScanner::try_new(engine.as_ref(), commit_file.clone(), &table_schema)?;
+
+            let processor = CdfLogReplayProcessor {
+                scanner,
+                engine: engine.clone(),
+                filter: filter.clone(),
+            };
+
+            // Create the action iterator
+            let action_iter = engine.get_json_handler().read_json_files(
+                &[commit_file.location],
+                FileActionSelectionVisitor::schema(),
+                None,
+            )?;
+
+            // Map to (Box<dyn EngineData>, true) trivially
+            // The flag is not used, but is required by the processor trait
+            let batch_iter =
+                action_iter.map(|actions_res| actions_res.map(|actions| (actions, true)));
+
+            // Apply processor to batch iterator
+            Ok(CdfLogReplayProcessor::apply_to_iterator(
+                processor, batch_iter,
+            ))
+        })
+        .flatten_ok()
+        .map(|x| x?);
     Ok(result)
 }
 
@@ -207,62 +286,6 @@ impl LogReplayScanner {
             has_cdc_action,
             remove_dvs,
         })
-    }
-    /// Generates an iterator of [`TableChangesScanData`] by iterating over each action of the
-    /// commit, generating a selection vector, and transforming the engine data. This performs
-    /// phase 2 of [`LogReplayScanner`].
-    fn into_scan_batches(
-        self,
-        engine: Arc<dyn Engine>,
-        filter: Option<Arc<DataSkippingFilter>>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanData>>> {
-        let Self {
-            has_cdc_action,
-            remove_dvs,
-            commit_file,
-            // TODO: Add the timestamp as a column with an expression
-            timestamp,
-        } = self;
-        let remove_dvs = Arc::new(remove_dvs);
-
-        let schema = FileActionSelectionVisitor::schema();
-        let action_iter = engine.get_json_handler().read_json_files(
-            &[commit_file.location.clone()],
-            schema,
-            None,
-        )?;
-        let commit_version = commit_file
-            .version
-            .try_into()
-            .map_err(|_| Error::generic("Failed to convert commit version to i64"))?;
-        let evaluator = engine.get_expression_handler().get_evaluator(
-            get_log_add_schema().clone(),
-            cdf_scan_row_expression(timestamp, commit_version),
-            cdf_scan_row_schema().into(),
-        );
-
-        let result = action_iter.map(move |actions| -> DeltaResult<_> {
-            let actions = actions?;
-
-            // Apply data skipping to get back a selection vector for actions that passed skipping.
-            // We start our selection vector based on what was filtered. We will add to this vector
-            // below if a file has been removed. Note: None implies all files passed data skipping.
-            let selection_vector = match &filter {
-                Some(filter) => filter.apply(actions.as_ref())?,
-                None => vec![true; actions.len()],
-            };
-
-            let mut visitor =
-                FileActionSelectionVisitor::new(&remove_dvs, selection_vector, has_cdc_action);
-            visitor.visit_rows_of(actions.as_ref())?;
-            let scan_data = evaluator.evaluate(actions.as_ref())?;
-            Ok(TableChangesScanData {
-                scan_data,
-                selection_vector: visitor.selection_vector,
-                remove_dvs: remove_dvs.clone(),
-            })
-        });
-        Ok(result)
     }
 }
 
