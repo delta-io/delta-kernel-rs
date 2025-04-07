@@ -13,6 +13,7 @@ use crate::actions::deletion_vector::{
 };
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::expressions::{ColumnName, Expression, ExpressionRef, ExpressionTransform, Scalar};
+use crate::log_replay::HasSelectionVector;
 use crate::predicates::{DefaultPredicateEvaluator, EmptyColumnResolver};
 use crate::scan::state::{DvInfo, Stats};
 use crate::schema::{
@@ -323,6 +324,12 @@ pub(crate) enum TransformExpr {
 // TODO(nick): Make this a struct in a follow-on PR
 // (data, deletion_vec, transforms)
 pub type ScanData = (Box<dyn EngineData>, Vec<bool>, Vec<Option<ExpressionRef>>);
+
+impl HasSelectionVector for ScanData {
+    fn has_selected_rows(&self) -> bool {
+        self.1.contains(&true)
+    }
+}
 
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
