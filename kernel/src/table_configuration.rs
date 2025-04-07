@@ -33,7 +33,7 @@ use crate::{DeltaResult, Error, Version};
 /// `try_new` successfully returns `TableConfiguration`, it is also guaranteed that reading the
 /// table is supported.
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableConfiguration {
     metadata: Metadata,
     protocol: Protocol,
@@ -87,6 +87,31 @@ impl TableConfiguration {
             table_root,
             version,
         })
+    }
+
+    pub(crate) fn try_new_from(
+        table_configuration: &Self,
+        new_metadata: Option<Metadata>,
+        new_protocol: Option<Protocol>,
+        new_version: Version,
+    ) -> DeltaResult<Self> {
+        // simplest case: no new P/M, just return the existing table configuration with new version
+        if new_metadata.is_none() && new_protocol.is_none() {
+            return Ok(Self {
+                version: new_version,
+                ..table_configuration.clone()
+            });
+        }
+
+        // note that while we could pick apart the protocol/metadata updates and validate them
+        // individually, instead we just re-parse so that we can recycle the try_new validation
+        // (instead of duplicating it here).
+        Self::try_new(
+            new_metadata.unwrap_or_else(|| table_configuration.metadata.clone()),
+            new_protocol.unwrap_or_else(|| table_configuration.protocol.clone()),
+            table_configuration.table_root.clone(),
+            new_version,
+        )
     }
 
     /// The [`Metadata`] for this table at this version.
@@ -248,6 +273,7 @@ mod test {
 
     use crate::actions::{Metadata, Protocol};
     use crate::table_features::{ReaderFeature, WriterFeature};
+    use crate::table_properties::TableProperties;
 
     use super::TableConfiguration;
 
@@ -331,5 +357,79 @@ mod test {
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(!table_config.is_deletion_vector_supported());
         assert!(!table_config.is_deletion_vector_enabled());
+    }
+
+    #[test]
+    fn test_try_new_from() {
+        let schema_string =r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string();
+        let metadata = Metadata {
+            configuration: HashMap::from_iter([(
+                "delta.enableChangeDataFeed".to_string(),
+                "true".to_string(),
+            )]),
+            schema_string: schema_string.clone(),
+            ..Default::default()
+        };
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::DeletionVectors]),
+            Some([WriterFeature::DeletionVectors]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
+        let new_metadata = Metadata {
+            configuration: HashMap::from_iter([
+                (
+                    "delta.enableChangeDataFeed".to_string(),
+                    "false".to_string(),
+                ),
+                (
+                    "delta.enableDeletionVectors".to_string(),
+                    "true".to_string(),
+                ),
+            ]),
+            schema_string,
+            ..Default::default()
+        };
+        let new_protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::DeletionVectors, ReaderFeature::V2Checkpoint]),
+            Some([
+                WriterFeature::DeletionVectors,
+                WriterFeature::V2Checkpoint,
+                WriterFeature::AppendOnly,
+            ]),
+        )
+        .unwrap();
+        let new_version = 1;
+        let new_table_config = TableConfiguration::try_new_from(
+            &table_config,
+            Some(new_metadata.clone()),
+            Some(new_protocol.clone()),
+            new_version,
+        )
+        .unwrap();
+
+        assert_eq!(new_table_config.version(), new_version);
+        assert_eq!(new_table_config.metadata(), &new_metadata);
+        assert_eq!(new_table_config.protocol(), &new_protocol);
+        assert_eq!(new_table_config.schema(), table_config.schema());
+        assert_eq!(
+            new_table_config.table_properties(),
+            &TableProperties {
+                enable_change_data_feed: Some(false),
+                enable_deletion_vectors: Some(true),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            new_table_config.column_mapping_mode(),
+            table_config.column_mapping_mode()
+        );
+        assert_eq!(new_table_config.table_root(), table_config.table_root());
     }
 }

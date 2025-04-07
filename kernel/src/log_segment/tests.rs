@@ -154,7 +154,7 @@ fn write_parquet_to_store(
 
 /// Writes all actions to a _delta_log parquet checkpoint file in the store.
 /// This function formats the provided filename into the _delta_log directory.
-fn add_checkpoint_to_store(
+pub(crate) fn add_checkpoint_to_store(
     store: &Arc<InMemory>,
     data: Box<dyn EngineData>,
     filename: &str,

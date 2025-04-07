@@ -15,7 +15,7 @@ const MULTIPART_PART_LEN: usize = 10;
 /// The number of characters in the uuid part of a uuid checkpoint
 const UUID_PART_LEN: usize = 36;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
 enum LogPathFileType {
@@ -38,7 +38,7 @@ enum LogPathFileType {
     Unknown,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
 struct ParsedLogPath<Location: AsUrl = FileMeta> {
