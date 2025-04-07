@@ -18,7 +18,8 @@ use std::collections::HashSet;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, TypedGetData};
-use crate::DeltaResult;
+use crate::scan::data_skipping::DataSkippingFilter;
+use crate::{DeltaResult, EngineData};
 
 use tracing::debug;
 
@@ -43,6 +44,9 @@ impl FileActionKey {
 /// unique file (identified by path and deletion vector ID) is processed only once. Performing
 /// deduplication at the visitor level avoids having to load all actions into memory at once,
 /// significantly reducing memory usage for large Delta tables with extensive history.
+///
+/// TODO: Modify deduplication to track only file paths instead of (path, dv_unique_id).
+/// More info here: https://github.com/delta-io/delta-kernel-rs/issues/701     
 pub(crate) struct FileActionDeduplicator<'seen> {
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log for deduplication. This is a mutable reference to the set
@@ -189,4 +193,116 @@ impl<'seen> FileActionDeduplicator<'seen> {
     pub(crate) fn is_log_batch(&self) -> bool {
         self.is_log_batch
     }
+}
+
+/// A trait for processing batches of actions from Delta transaction logs during log replay.
+///
+/// Log replay processors scan transaction logs in **reverse chronological order** (newest to oldest),
+/// filtering and transforming action batches into specialized output types. These processors:
+///
+/// - **Track and deduplicate file actions** to apply appropriate `Remove` actions to corresponding
+///   `Add` actions (and omit the file from the log replay output)
+/// - **Maintain selection vectors** to indicate which actions in each batch should be included.
+/// - **Apply custom filtering logic** based on the processor’s purpose (e.g., checkpointing, scanning).
+/// - **Data skipping** filters are applied to the initial selection vector to reduce the number of rows
+///   processed by the processor, (if a filter is provided).
+///
+/// Implementations:
+/// - `ScanLogReplayProcessor`: Used for table scans, this processor filters and selects deduplicated  
+///   `Add` actions from log batches to reconstruct the view of the table at a specific point in time.
+///   Note that scans do not expose `Remove` actions. Data skipping may be applied when a predicate is  
+///   provided.
+///
+/// - `CheckpointLogReplayProcessor` (WIP): Will be responsible for processing log batches to construct  
+///   V1 spec checkpoint files. Unlike scans, checkpoint processing includes additional actions, such as  
+///   `Remove`, `Metadata`, and `Protocol`, required to fully reconstruct table state.  
+///   Data skipping is not applied during checkpoint processing.
+///
+/// The `Output` type represents the material result of log replay, and it must implement the
+/// `HasSelectionVector` trait to allow filtering of irrelevant rows:
+///
+/// - For **scans**, the output type is `ScanData`, which contains the file actions (`Add` actions) that
+///   need to be applied to build the table's view, accompanied by a **selection vector** that identifies
+///   which rows should be included. A transform vector may also be included to handle schema changes,
+///   such as renaming columns or modifying data types.
+///
+/// - For **checkpoints**, the output includes the actions necessary to write to the checkpoint file (`Add`,
+///   `Remove`, `Metadata`, `Protocol` actions), filtered by the **selection vector** to determine which
+///   rows are included in the final checkpoint.
+///
+/// TODO: Refactor the Change Data Feed (CDF) processor to use this trait.
+pub(crate) trait LogReplayProcessor: Sized {
+    /// The type of results produced by this processor must implement the
+    /// `HasSelectionVector` trait to allow filtering out batches with no selected rows.
+    type Output: HasSelectionVector;
+
+    /// Processes a batch of actions and returns the filtered results.
+    ///
+    /// # Arguments
+    /// - `actions_batch` - A reference to an [`EngineData`] instance representing a batch of actions.
+    /// - `is_log_batch` - `true` if the batch originates from a commit log, `false` if from a checkpoint.
+    ///
+    /// Returns a [`DeltaResult`] containing the processor’s output, which includes only selected actions.
+    ///
+    /// Note: Since log replay is stateful, processing may update internal processor state (e.g., deduplication sets).
+    fn process_actions_batch(
+        &mut self,
+        actions_batch: &dyn EngineData,
+        is_log_batch: bool,
+    ) -> DeltaResult<Self::Output>;
+
+    /// Applies the processor to an actions iterator and filters out empty results.
+    ///
+    /// # Arguments
+    /// * `action_iter` - Iterator of action batches and their source flags
+    ///
+    /// Returns an iterator that yields the Output type of the processor.
+    fn process_actions_iter(
+        mut self,
+        action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
+    ) -> impl Iterator<Item = DeltaResult<Self::Output>> {
+        action_iter
+            .map(move |action_res| {
+                let (batch, is_log_batch) = action_res?;
+                self.process_actions_batch(batch.as_ref(), is_log_batch)
+            })
+            .filter(|res| {
+                // TODO: Leverage .is_none_or() when msrv = 1.82
+                res.as_ref()
+                    .map_or(true, |result| result.has_selected_rows())
+            })
+    }
+
+    /// Builds the initial selection vector for the action batch, used to filter out rows that
+    /// are not relevant to the current processor's purpose (e.g., checkpointing, scanning).
+    /// This method performs a first pass of filtering using an optional [`DataSkippingFilter`].
+    /// If no filter is provided, it assumes that all rows should be selected.
+    ///
+    /// The selection vector is further updated based on the processor's logic in the
+    /// `process_actions_batch` method.
+    ///
+    /// # Arguments
+    /// - `batch` - A reference to the batch of actions to be processed.
+    ///
+    /// # Returns
+    /// A `DeltaResult<Vec<bool>>`, where each boolean indicates if the corresponding row should be included.
+    /// If no filter is provided, all rows are selected.
+    fn build_selection_vector(&self, batch: &dyn EngineData) -> DeltaResult<Vec<bool>> {
+        match self.data_skipping_filter() {
+            Some(filter) => filter.apply(batch),
+            None => Ok(vec![true; batch.len()]), // If no filter is provided, select all rows
+        }
+    }
+
+    /// Returns an optional reference to the [`DataSkippingFilter`] used to filter rows
+    /// when building the initial selection vector in `build_selection_vector`.
+    /// If `None` is returned, no filter is applied, and all rows are selected.
+    fn data_skipping_filter(&self) -> Option<&DataSkippingFilter>;
+}
+
+/// This trait is used to determine if a processor's output contains any selected rows.
+/// This is used to filter out batches with no selected rows from the log replay results.
+pub(crate) trait HasSelectionVector {
+    /// Check if the selection vector contains at least one selected row
+    fn has_selected_rows(&self) -> bool;
 }

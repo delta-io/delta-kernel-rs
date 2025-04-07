@@ -9,21 +9,67 @@ use super::{ScanData, Transform};
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{column_expr, column_name, ColumnName, Expression, ExpressionRef};
-use crate::log_replay::{FileActionDeduplicator, FileActionKey};
+use crate::log_replay::{FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::predicates::{DefaultPredicateEvaluator, PredicateEvaluator as _};
 use crate::scan::{Scalar, TransformExpr};
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator};
 
-struct LogReplayScanner {
+/// [`ScanLogReplayProcessor`] performs log replay (processes actions) specifically for doing a table scan.
+///
+/// During a table scan, the processor reads batches of log actions (in reverse chronological order)
+/// and performs the following steps:
+///
+/// - Data Skipping: Applies a predicate-based filter (via [`DataSkippingFilter`]) to quickly skip
+///   files that are irrelevant for the query.
+/// - Partition Pruning: Uses an optional partition filter (extracted from a physical predicate)
+///   to exclude actions whose partition values do not meet the required criteria.
+/// - Action Deduplication: Leverages the [`FileActionDeduplicator`] to ensure that for each unique file
+///   (identified by its path and deletion vector unique ID), only the latest valid Add action is processed.
+/// - Transformation: Applies a built-in transformation (`add_transform`) to convert selected Add actions
+///   into [`ScanData`], the intermediate format passed to the engine.
+/// - Row Transform Passthrough: Any user-provided row-level transformation expressions (e.g. those derived
+///   from projection or filters) are preserved and passed through to the engine, which applies them as part
+///   of its scan execution logic.
+///
+/// As an implementation of [`LogReplayProcessor`], [`ScanLogReplayProcessor`] provides the `process_actions_batch`
+/// method, which applies these steps to each batch of log actions and produces a [`ScanData`] result. This result
+/// includes the transformed batch, a selection vector indicating which rows are valid, and any
+/// row-level transformation expressions that need to be applied to the selected rows.
+struct ScanLogReplayProcessor {
     partition_filter: Option<ExpressionRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
-
+    add_transform: Arc<dyn ExpressionEvaluator>,
+    logical_schema: SchemaRef,
+    transform: Option<Arc<Transform>>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
-    seen: HashSet<FileActionKey>,
+    seen_file_keys: HashSet<FileActionKey>,
+}
+
+impl ScanLogReplayProcessor {
+    /// Create a new [`ScanLogReplayProcessor`] instance
+    fn new(
+        engine: &dyn Engine,
+        physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+        logical_schema: SchemaRef,
+        transform: Option<Arc<Transform>>,
+    ) -> Self {
+        Self {
+            partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
+            data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
+            add_transform: engine.get_expression_handler().get_evaluator(
+                get_log_add_schema().clone(),
+                get_add_transform_expr(),
+                SCAN_ROW_DATATYPE.clone(),
+            ),
+            seen_file_keys: Default::default(),
+            logical_schema,
+            transform,
+        }
+    }
 }
 
 /// A visitor that deduplicates a stream of add and remove actions into a stream of valid adds. Log
@@ -291,49 +337,41 @@ fn get_add_transform_expr() -> Expression {
     ])
 }
 
-impl LogReplayScanner {
-    /// Create a new [`LogReplayScanner`] instance
-    fn new(engine: &dyn Engine, physical_predicate: Option<(ExpressionRef, SchemaRef)>) -> Self {
-        Self {
-            partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
-            data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
-            seen: Default::default(),
-        }
-    }
+impl LogReplayProcessor for ScanLogReplayProcessor {
+    type Output = ScanData;
 
-    fn process_scan_batch(
+    fn process_actions_batch(
         &mut self,
-        add_transform: &dyn ExpressionEvaluator,
-        actions: &dyn EngineData,
-        logical_schema: SchemaRef,
-        transform: Option<Arc<Transform>>,
+        actions_batch: &dyn EngineData,
         is_log_batch: bool,
-    ) -> DeltaResult<ScanData> {
-        // Apply data skipping to get back a selection vector for actions that passed skipping. We
-        // will update the vector below as log replay identifies duplicates that should be ignored.
-        let selection_vector = match &self.data_skipping_filter {
-            Some(filter) => filter.apply(actions)?,
-            None => vec![true; actions.len()],
-        };
-        assert_eq!(selection_vector.len(), actions.len());
+    ) -> DeltaResult<Self::Output> {
+        // Build an initial selection vector for the batch which has had the data skipping filter
+        // applied. The selection vector is further updated by the deduplication visitor to remove
+        // rows that are not valid adds.
+        let selection_vector = self.build_selection_vector(actions_batch)?;
+        assert_eq!(selection_vector.len(), actions_batch.len());
 
         let mut visitor = AddRemoveDedupVisitor::new(
-            &mut self.seen,
+            &mut self.seen_file_keys,
             selection_vector,
-            logical_schema,
-            transform,
+            self.logical_schema.clone(),
+            self.transform.clone(),
             self.partition_filter.clone(),
             is_log_batch,
         );
-        visitor.visit_rows_of(actions)?;
+        visitor.visit_rows_of(actions_batch)?;
 
         // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
-        let result = add_transform.evaluate(actions)?;
+        let result = self.add_transform.evaluate(actions_batch)?;
         Ok((
             result,
             visitor.selection_vector,
             visitor.row_transform_exprs,
         ))
+    }
+
+    fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
+        self.data_skipping_filter.as_ref()
     }
 }
 
@@ -348,24 +386,8 @@ pub(crate) fn scan_action_iter(
     transform: Option<Arc<Transform>>,
     physical_predicate: Option<(ExpressionRef, SchemaRef)>,
 ) -> impl Iterator<Item = DeltaResult<ScanData>> {
-    let mut log_scanner = LogReplayScanner::new(engine, physical_predicate);
-    let add_transform = engine.get_expression_handler().get_evaluator(
-        get_log_add_schema().clone(),
-        get_add_transform_expr(),
-        SCAN_ROW_DATATYPE.clone(),
-    );
-    action_iter
-        .map(move |action_res| {
-            let (batch, is_log_batch) = action_res?;
-            log_scanner.process_scan_batch(
-                add_transform.as_ref(),
-                batch.as_ref(),
-                logical_schema.clone(),
-                transform.clone(),
-                is_log_batch,
-            )
-        })
-        .filter(|res| res.as_ref().map_or(true, |(_, sv, _)| sv.contains(&true)))
+    ScanLogReplayProcessor::new(engine, physical_predicate, logical_schema, transform)
+        .process_actions_iter(action_iter)
 }
 
 #[cfg(test)]

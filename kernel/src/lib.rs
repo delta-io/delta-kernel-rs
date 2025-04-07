@@ -77,7 +77,6 @@ pub mod actions;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
-pub mod log_replay;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -97,6 +96,11 @@ pub(crate) mod utils;
 pub mod path;
 #[cfg(not(feature = "developer-visibility"))]
 pub(crate) mod path;
+
+#[cfg(feature = "developer-visibility")]
+pub mod log_replay;
+#[cfg(not(feature = "developer-visibility"))]
+pub(crate) mod log_replay;
 
 #[cfg(feature = "developer-visibility")]
 pub mod log_segment;
