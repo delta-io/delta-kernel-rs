@@ -186,8 +186,9 @@ impl ParsedLogPath<Url> {
     /// Helper method to create a path with the given filename generator
     fn create_path(table_root: &Url, filename: String) -> DeltaResult<Self> {
         let location = table_root.join(Self::DELTA_LOG_DIR)?.join(&filename)?;
-        Self::try_from(location)?
-            .ok_or_else(|| Error::internal_error("attempted to create invalid path"))
+        Self::try_from(location)?.ok_or_else(|| {
+            Error::internal_error(format!("Attempted to create an invalid path: {}", filename))
+        })
     }
 
     /// Create a new ParsedCommitPath<Url> for a new json commit file
@@ -617,6 +618,14 @@ mod tests {
         } else {
             panic!("Expected UuidCheckpoint file type");
         }
+
+        let filename = log_path.filename.to_string();
+        let filename_parts: Vec<&str> = filename.split('.').collect();
+        assert_eq!(filename_parts.len(), 4);
+        assert_eq!(filename_parts[0], "00000000000000000010");
+        assert_eq!(filename_parts[1], "checkpoint");
+        assert_eq!(filename_parts[2].len(), UUID_PART_LEN);
+        assert_eq!(filename_parts[3], "parquet");
     }
 
     #[test]
