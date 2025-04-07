@@ -286,7 +286,7 @@ fn do_work(
         // enough meta-data was passed to each thread to correctly apply the selection
         // vector
         let read_results = engine
-            .get_parquet_handler()
+            .parquet_handler()
             .read_parquet_files(&[meta], scan_state.physical_schema.clone(), None)
             .unwrap();
 

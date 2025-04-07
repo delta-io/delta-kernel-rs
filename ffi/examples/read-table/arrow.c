@@ -117,7 +117,7 @@ static ExclusiveEngineData* apply_transform(
     return data;
   }
   print_diag("  Applying transform\n");
-  SharedExpressionEvaluator* evaluator = get_evaluator(
+  SharedExpressionEvaluator* evaluator = new_expression_evaluator(
     context->engine,
     context->read_schema, // input schema
     context->arrow_context->cur_transform,
@@ -127,7 +127,7 @@ static ExclusiveEngineData* apply_transform(
     &data,
     evaluator);
   free_engine_data(data);
-  free_evaluator(evaluator);
+  free_expression_evaluator(evaluator);
   if (transformed_res.tag != OkHandleExclusiveEngineData) {
     print_error("Failed to transform read data.", (Error*)transformed_res.err);
     free_error((Error*)transformed_res.err);

@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn test_md_extract() -> DeltaResult<()> {
         let engine = SyncEngine::new();
-        let handler = engine.get_json_handler();
+        let handler = engine.json_handler();
         let json_strings: StringArray = vec![
             r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
         ]
@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn test_protocol_extract() -> DeltaResult<()> {
         let engine = SyncEngine::new();
-        let handler = engine.get_json_handler();
+        let handler = engine.json_handler();
         let json_strings: StringArray = vec![
             r#"{"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": ["rw1"], "writerFeatures": ["rw1", "w2"]}}"#,
         ]

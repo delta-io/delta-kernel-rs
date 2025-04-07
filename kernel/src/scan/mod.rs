@@ -533,7 +533,7 @@ impl Scan {
                 // partition columns, but the read schema we use here does _NOT_ include partition
                 // columns. So we cannot safely assume that all column references are valid. See
                 // https://github.com/delta-io/delta-kernel-rs/issues/434 for more details.
-                let read_result_iter = engine.get_parquet_handler().read_parquet_files(
+                let read_result_iter = engine.parquet_handler().read_parquet_files(
                     &[meta],
                     global_state.physical_schema.clone(),
                     physical_predicate.clone(),
@@ -663,7 +663,7 @@ pub fn selection_vector(
     descriptor: &DeletionVectorDescriptor,
     table_root: &Url,
 ) -> DeltaResult<Vec<bool>> {
-    let fs_client = engine.get_file_system_client();
+    let fs_client = engine.file_system_client();
     let dv_treemap = descriptor.read(fs_client, table_root)?;
     Ok(deletion_treemap_to_bools(dv_treemap))
 }

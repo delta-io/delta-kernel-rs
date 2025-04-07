@@ -18,11 +18,11 @@ use self::filesystem::ObjectStoreFileSystemClient;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
 use super::arrow_data::ArrowEngineData;
-use super::arrow_expression::ArrowExpressionHandler;
+use super::arrow_expression::ArrowEvaluationHandler;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
 use crate::{
-    DeltaResult, Engine, EngineData, ExpressionHandler, FileSystemClient, JsonHandler,
+    DeltaResult, Engine, EngineData, EvaluationHandler, FileSystemClient, JsonHandler,
     ParquetHandler,
 };
 
@@ -39,7 +39,7 @@ pub struct DefaultEngine<E: TaskExecutor> {
     file_system: Arc<ObjectStoreFileSystemClient<E>>,
     json: Arc<DefaultJsonHandler<E>>,
     parquet: Arc<DefaultParquetHandler<E>>,
-    expression: Arc<ArrowExpressionHandler>,
+    expression: Arc<ArrowEvaluationHandler>,
 }
 
 impl<E: TaskExecutor> DefaultEngine<E> {
@@ -105,7 +105,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             )),
             parquet: Arc::new(DefaultParquetHandler::new(store.clone(), task_executor)),
             store,
-            expression: Arc::new(ArrowExpressionHandler {}),
+            expression: Arc::new(ArrowEvaluationHandler {}),
         }
     }
 
@@ -123,7 +123,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         let transform = write_context.logical_to_physical();
         let input_schema: Schema = data.record_batch().schema().try_into()?;
         let output_schema = write_context.schema();
-        let logical_to_physical_expr = self.get_expression_handler().get_evaluator(
+        let logical_to_physical_expr = self.evaluation_handler().new_expression_evaluator(
             input_schema.into(),
             transform.clone(),
             output_schema.clone().into(),
@@ -141,19 +141,19 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 }
 
 impl<E: TaskExecutor> Engine for DefaultEngine<E> {
-    fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler> {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
         self.expression.clone()
     }
 
-    fn get_file_system_client(&self) -> Arc<dyn FileSystemClient> {
+    fn file_system_client(&self) -> Arc<dyn FileSystemClient> {
         self.file_system.clone()
     }
 
-    fn get_json_handler(&self) -> Arc<dyn JsonHandler> {
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
         self.json.clone()
     }
 
-    fn get_parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         self.parquet.clone()
     }
 }
