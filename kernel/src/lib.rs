@@ -35,7 +35,7 @@
 //!
 //! ## Expression handling
 //!
-//! Expression handling is done via the [`ExpressionHandler`], which in turn allows the creation of
+//! Expression handling is done via the [`EvaluationHandler`], which in turn allows the creation of
 //! [`ExpressionEvaluator`]s. These evaluators are created for a specific predicate [`Expression`]
 //! and allow evaluation of that predicate for a specific batches of data.
 //!
@@ -331,7 +331,7 @@ pub trait ExpressionEvaluator: AsAny {
 ///
 /// Delta Kernel can use this handler to evaluate predicate on partition filters,
 /// fill up partition column values and any computation on data using Expressions.
-pub trait ExpressionHandler: AsAny {
+pub trait EvaluationHandler: AsAny {
     /// Create an [`ExpressionEvaluator`] that can evaluate the given [`Expression`]
     /// on columnar batches with the given [`Schema`] to produce data of [`DataType`].
     ///
@@ -343,7 +343,7 @@ pub trait ExpressionHandler: AsAny {
     ///
     /// [`Schema`]: crate::schema::StructType
     /// [`DataType`]: crate::schema::DataType
-    fn get_evaluator(
+    fn new_expression_evaluator(
         &self,
         schema: SchemaRef,
         expression: Expression,
@@ -358,10 +358,10 @@ pub trait ExpressionHandler: AsAny {
 }
 
 /// Internal trait to allow us to have a private `create_one` API that's implemented for all
-/// ExpressionHandlers.
+/// EvaluationHandlers.
 // For some reason rustc doesn't detect it's usage so we allow(dead_code) here...
 #[allow(dead_code)]
-trait ExpressionHandlerExtension: ExpressionHandler {
+trait EvaluationHandlerExtension: EvaluationHandler {
     /// Create a single-row [`EngineData`] by applying the given schema to the leaf-values given in
     /// `values`.
     // Note: we will stick with a Schema instead of DataType (more constrained can expand in
@@ -379,13 +379,13 @@ trait ExpressionHandlerExtension: ExpressionHandler {
         schema_transform.transform_struct(schema.as_ref());
         let row_expr = schema_transform.try_into_expr()?;
 
-        let eval = self.get_evaluator(null_row_schema, row_expr, schema.into());
+        let eval = self.new_expression_evaluator(null_row_schema, row_expr, schema.into());
         eval.evaluate(null_row.as_ref())
     }
 }
 
-// Auto-implement the extension trait for all ExpressionHandlers
-impl<T: ExpressionHandler> ExpressionHandlerExtension for T {}
+// Auto-implement the extension trait for all EvaluationHandlers
+impl<T: EvaluationHandler> EvaluationHandlerExtension for T {}
 
 /// Provides file system related functionalities to Delta Kernel.
 ///
@@ -507,17 +507,17 @@ pub trait ParquetHandler: AsAny {
 /// Engines/Connectors are expected to pass an implementation of this trait when reading a Delta
 /// table.
 pub trait Engine: AsAny {
-    /// Get the connector provided [`ExpressionHandler`].
-    fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler>;
+    /// Get the connector provided [`EvaluationHandler`].
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler>;
 
     /// Get the connector provided [`FileSystemClient`]
-    fn get_file_system_client(&self) -> Arc<dyn FileSystemClient>;
+    fn file_system_client(&self) -> Arc<dyn FileSystemClient>;
 
     /// Get the connector provided [`JsonHandler`].
-    fn get_json_handler(&self) -> Arc<dyn JsonHandler>;
+    fn json_handler(&self) -> Arc<dyn JsonHandler>;
 
     /// Get the connector provided [`ParquetHandler`].
-    fn get_parquet_handler(&self) -> Arc<dyn ParquetHandler>;
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
 }
 
 // we have an 'internal' feature flag: default-engine-base, which is actually just the shared

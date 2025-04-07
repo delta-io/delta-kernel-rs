@@ -363,7 +363,7 @@ mod tests {
     fn test_inline_read() {
         let inline = dv_inline();
         let sync_engine = SyncEngine::new();
-        let fs_client = sync_engine.get_file_system_client();
+        let fs_client = sync_engine.file_system_client();
         let parent = Url::parse("http://not.used").unwrap();
         let tree_map = inline.read(fs_client, &parent).unwrap();
         assert_eq!(tree_map.len(), 6);
@@ -381,7 +381,7 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let parent = url::Url::from_directory_path(path).unwrap();
         let sync_engine = SyncEngine::new();
-        let fs_client = sync_engine.get_file_system_client();
+        let fs_client = sync_engine.file_system_client();
 
         let example = dv_example();
         let tree_map = example.read(fs_client, &parent).unwrap();
@@ -441,7 +441,7 @@ mod tests {
     fn test_dv_row_indexes() {
         let example = dv_inline();
         let sync_engine = SyncEngine::new();
-        let fs_client = sync_engine.get_file_system_client();
+        let fs_client = sync_engine.file_system_client();
         let parent = Url::parse("http://not.used").unwrap();
         let row_idx = example.row_indexes(fs_client, &parent).unwrap();
 

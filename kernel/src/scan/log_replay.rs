@@ -60,7 +60,7 @@ impl ScanLogReplayProcessor {
         Self {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
             data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
-            add_transform: engine.get_expression_handler().get_evaluator(
+            add_transform: engine.evaluation_handler().new_expression_evaluator(
                 get_log_add_schema().clone(),
                 get_add_transform_expr(),
                 SCAN_ROW_DATATYPE.clone(),
