@@ -13,7 +13,7 @@ use crate::schema::{Schema, SchemaRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Engine, Error, FileSystemClient, Version};
+use crate::{DeltaResult, Engine, Error, StorageHandler, Version};
 
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 // TODO expose methods for accessing the files of a table (with file pruning).
@@ -55,13 +55,13 @@ impl Snapshot {
         engine: &dyn Engine,
         version: Option<Version>,
     ) -> DeltaResult<Self> {
-        let fs_client = engine.file_system_client();
+        let storage = engine.storage_handler();
         let log_root = table_root.join("_delta_log/")?;
 
-        let checkpoint_hint = read_last_checkpoint(fs_client.as_ref(), &log_root)?;
+        let checkpoint_hint = read_last_checkpoint(storage.as_ref(), &log_root)?;
 
         let log_segment =
-            LogSegment::for_snapshot(fs_client.as_ref(), log_root, checkpoint_hint, version)?;
+            LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_hint, version)?;
 
         // try_new_from_log_segment will ensure the protocol is supported
         Self::try_new_from_log_segment(table_root, log_segment, engine)
@@ -174,11 +174,11 @@ struct LastCheckpointHint {
 ///
 /// TODO: java kernel retries three times before failing, should we do the same?
 fn read_last_checkpoint(
-    fs_client: &dyn FileSystemClient,
+    storage: &dyn StorageHandler,
     log_root: &Url,
 ) -> DeltaResult<Option<LastCheckpointHint>> {
     let file_path = log_root.join(LAST_CHECKPOINT_FILE_NAME)?;
-    match fs_client
+    match storage
         .read_files(vec![(file_path, None)])
         .and_then(|mut data| data.next().expect("read_files should return one file"))
     {
@@ -203,7 +203,7 @@ mod tests {
     use object_store::ObjectStore;
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::filesystem::ObjectStoreFileSystemClient;
+    use crate::engine::default::filesystem::ObjectStoreStorageHandler;
     use crate::engine::sync::SyncEngine;
     use crate::path::ParsedLogPath;
 
@@ -252,12 +252,12 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let store = Arc::new(LocalFileSystem::new());
-        let client = ObjectStoreFileSystemClient::new(
+        let storage = ObjectStoreStorageHandler::new(
             store,
             false, // don't have ordered listing
             Arc::new(TokioBackgroundExecutor::new()),
         );
-        let cp = read_last_checkpoint(&client, &url).unwrap();
+        let cp = read_last_checkpoint(&storage, &url).unwrap();
         assert!(cp.is_none())
     }
 
@@ -289,15 +289,15 @@ mod tests {
                     .expect("put _last_checkpoint");
             });
 
-        let client = ObjectStoreFileSystemClient::new(
+        let storage = ObjectStoreStorageHandler::new(
             store,
             false, // don't have ordered listing
             Arc::new(TokioBackgroundExecutor::new()),
         );
         let url = Url::parse("memory:///valid/").expect("valid url");
-        let valid = read_last_checkpoint(&client, &url).expect("read last checkpoint");
+        let valid = read_last_checkpoint(&storage, &url).expect("read last checkpoint");
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = read_last_checkpoint(&client, &url).expect("read last checkpoint");
+        let invalid = read_last_checkpoint(&storage, &url).expect("read last checkpoint");
         assert!(valid.is_some());
         assert!(invalid.is_none())
     }
