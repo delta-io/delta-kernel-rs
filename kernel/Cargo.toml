@@ -49,7 +49,7 @@ thiserror = "1"
 # only for structured logging
 tracing = { version = "0.1", features = ["log"] }
 url = "2"
-uuid = "1.10.0"
+uuid = { version = "1.10.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.5"
 
 # bring in our derive macros
@@ -118,8 +118,6 @@ default-engine-base = [
   "need_arrow",
   "object_store",
   "tokio",
-  "uuid/v4",
-  "uuid/fast-rng",
 ]
 
 # the default-engine use the reqwest crate with default features which uses native-tls. if you want
