@@ -1,7 +1,8 @@
-use std::collections::HashSet;
-use std::sync::LazyLock;
-
-use serde::{Deserialize, Serialize};
+use crate::{DeltaResult, Error};
+use enumset::{enum_set, EnumSet, EnumSetType};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::any::type_name;
+use std::fmt::Display;
 use strum::{AsRefStr, Display as StrumDisplay, EnumString, VariantNames};
 
 pub(crate) use column_mapping::column_mapping_mode;
@@ -18,14 +19,12 @@ mod column_mapping;
     Serialize,
     Deserialize,
     Debug,
-    Clone,
-    Eq,
-    PartialEq,
     EnumString,
     StrumDisplay,
     AsRefStr,
     VariantNames,
     Hash,
+    EnumSetType,
 )]
 #[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
@@ -59,14 +58,12 @@ pub enum ReaderFeature {
     Serialize,
     Deserialize,
     Debug,
-    Clone,
-    Eq,
-    PartialEq,
     EnumString,
     StrumDisplay,
     AsRefStr,
     VariantNames,
     Hash,
+    EnumSetType,
 )]
 #[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
@@ -123,30 +120,55 @@ impl From<WriterFeature> for String {
     }
 }
 
-pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeature>> =
-    LazyLock::new(|| {
-        HashSet::from([
-            ReaderFeature::ColumnMapping,
-            ReaderFeature::DeletionVectors,
-            ReaderFeature::TimestampWithoutTimezone,
-            ReaderFeature::TypeWidening,
-            ReaderFeature::TypeWideningPreview,
-            ReaderFeature::VacuumProtocolCheck,
-            ReaderFeature::V2Checkpoint,
-        ])
-    });
+pub(crate) static SUPPORTED_READER_FEATURES: EnumSet<ReaderFeature> = enum_set!(
+    ReaderFeature::ColumnMapping
+        | ReaderFeature::DeletionVectors
+        | ReaderFeature::TimestampWithoutTimezone
+        | ReaderFeature::TypeWidening
+        | ReaderFeature::TypeWideningPreview
+        | ReaderFeature::VacuumProtocolCheck
+        | ReaderFeature::V2Checkpoint
+);
 
-pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<HashSet<WriterFeature>> =
+pub(crate) static SUPPORTED_WRITER_FEATURES: EnumSet<WriterFeature> =
     // note: we 'support' Invariants, but only insofar as we check that they are not present.
     // we support writing to tables that have Invariants enabled but not used. similarly, we only
     // support DeletionVectors in that we never write them (no DML).
-    LazyLock::new(|| {
-            HashSet::from([
-                WriterFeature::AppendOnly,
-                WriterFeature::DeletionVectors,
-                WriterFeature::Invariants,
-            ])
-        });
+    enum_set!(
+        WriterFeature::AppendOnly | WriterFeature::DeletionVectors | WriterFeature::Invariants
+    );
+
+pub(crate) static CDF_SUPPORTED_READER_FEATURES: EnumSet<ReaderFeature> =
+    enum_set!(ReaderFeature::DeletionVectors);
+
+pub(crate) fn ensure_supported_features<F>(
+    features: &[String],
+    supported: &EnumSet<F>,
+) -> DeltaResult<()>
+where
+    F: DeserializeOwned + EnumSetType + Display,
+{
+    let features_type = type_name::<F>().rsplit("::").next().unwrap();
+    for feature_str in features {
+        match serde_json::from_str::<F>(&format!("\"{}\"", feature_str)) {
+            Ok(feature_enum) => {
+                if !supported.contains(feature_enum) {
+                    return Err(Error::Unsupported(format!(
+                        "Unsupported {} variant `{}`. Supported features: {}",
+                        features_type, feature_enum, supported
+                    )));
+                }
+            }
+            Err(_) => {
+                return Err(Error::Unsupported(format!(
+                    "Unknown {} variant `{}`. Supported features: {}",
+                    features_type, feature_str, supported
+                )));
+            }
+        }
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -216,5 +238,31 @@ mod tests {
             let from_str: WriterFeature = expected.parse().unwrap();
             assert_eq!(from_str, feature);
         }
+    }
+
+    #[test]
+    fn test_ensure_supported_features() {
+        let supported_features =
+            enum_set!(ReaderFeature::ColumnMapping | ReaderFeature::DeletionVectors);
+        let table_features = vec![ReaderFeature::ColumnMapping.to_string()];
+        ensure_supported_features(&table_features, &supported_features).unwrap();
+    }
+
+    #[test]
+    fn test_ensure_supported_features_unsupported() {
+        let supported_features =
+            enum_set!(ReaderFeature::ColumnMapping | ReaderFeature::DeletionVectors);
+        let table_features = vec![ReaderFeature::TimestampWithoutTimezone.to_string()];
+        let error = ensure_supported_features(&table_features, &supported_features).unwrap_err();
+        assert_eq!(error.to_string(), "Unsupported: Unsupported ReaderFeature variant `timestampNtz`. Supported features: columnMapping | deletionVectors".to_string());
+    }
+
+    #[test]
+    fn test_ensure_supported_features_unknown() {
+        let supported_features =
+            enum_set!(ReaderFeature::ColumnMapping | ReaderFeature::DeletionVectors);
+        let table_features = vec![ReaderFeature::ColumnMapping.to_string(), "idk".to_string()];
+        let error = ensure_supported_features(&table_features, &supported_features).unwrap_err();
+        assert_eq!(error.to_string(), "Unsupported: Unknown ReaderFeature variant `idk`. Supported features: columnMapping | deletionVectors".to_string());
     }
 }
