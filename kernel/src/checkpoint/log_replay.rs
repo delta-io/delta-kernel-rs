@@ -75,9 +75,9 @@ pub(crate) struct CheckpointVisitor<'seen> {
     total_add_actions: i64,
     // i64 for comparison with remove.deletionTimestamp
     minimum_file_retention_timestamp: i64,
-    // Flag to keep only the first protocol action
+    // Flag to track if we've seen a protocol action so we can keep only the first protocol action
     seen_protocol: bool,
-    // Flag to keep only the first metadata action
+    // Flag to track if we've seen a metadata action so we can keep only the first metadata action
     seen_metadata: bool,
     // Set of transaction IDs to deduplicate by appId
     seen_txns: &'seen mut HashSet<String>,
@@ -169,7 +169,7 @@ impl CheckpointVisitor<'_> {
 
         // Check if we've already seen this file action
         if self.deduplicator.check_and_record_seen(file_key) {
-            return Ok(None); // Skip duplicates
+            return Ok(None); // Skip file actions that we've processed before
         }
 
         // For remove actions, check if it's an expired tombstone
@@ -197,7 +197,7 @@ impl CheckpointVisitor<'_> {
         i: usize,
         getter: &'a dyn GetData<'a>,
     ) -> DeltaResult<Option<()>> {
-        // Skip duplicates
+        // Skip protocol actions if we've already seen a newer one
         if self.seen_protocol {
             return Ok(None);
         }
@@ -224,7 +224,7 @@ impl CheckpointVisitor<'_> {
         i: usize,
         getter: &'a dyn GetData<'a>,
     ) -> DeltaResult<Option<()>> {
-        // Skip duplicates
+        // Skip metadata actions if we've already seen a newer one
         if self.seen_metadata {
             return Ok(None);
         }
