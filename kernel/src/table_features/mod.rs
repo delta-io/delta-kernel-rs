@@ -53,7 +53,6 @@ pub enum ReaderFeature {
     VacuumProtocolCheck,
     #[serde(untagged)]
     #[strum(default)]
-    #[strum(to_string = "{0}")]
     Unknown(String),
 }
 
@@ -118,7 +117,6 @@ pub enum WriterFeature {
     VacuumProtocolCheck,
     #[serde(untagged)]
     #[strum(default)]
-    #[strum(to_string = "{0}")]
     Unknown(String),
 }
 
