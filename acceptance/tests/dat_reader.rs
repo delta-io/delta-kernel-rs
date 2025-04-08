@@ -44,8 +44,10 @@ fn reader_test(path: &Path) -> datatest_stable::Result<()> {
     Ok(())
 }
 
-datatest_stable::harness!(
-    reader_test,
-    "tests/dat/out/reader_tests/generated/",
-    r"test_case_info\.json"
-);
+datatest_stable::harness! {
+    {
+        test = reader_test,
+        root = "tests/dat/out/reader_tests/generated/",
+        pattern = r"test_case_info\.json"
+    },
+}
