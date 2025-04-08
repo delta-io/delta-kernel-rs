@@ -190,8 +190,8 @@ impl Protocol {
     pub(crate) fn try_new(
         min_reader_version: i32,
         min_writer_version: i32,
-        reader_features: Option<impl IntoIterator<Item = impl Into<String>>>,
-        writer_features: Option<impl IntoIterator<Item = impl Into<String>>>,
+        reader_features: Option<impl IntoIterator<Item = impl ToString>>,
+        writer_features: Option<impl IntoIterator<Item = impl ToString>>,
     ) -> DeltaResult<Self> {
         if min_reader_version == 3 {
             require!(
@@ -211,14 +211,18 @@ impl Protocol {
         }
 
         fn parse_features<T>(
-            features: Option<impl IntoIterator<Item = impl Into<String>>>,
+            features: Option<impl IntoIterator<Item = impl ToString>>,
         ) -> Result<Option<Vec<T>>, Error>
         where
             T: FromStr,
             T::Err: Display,
         {
             features
-                .map(|fs| fs.into_iter().map(|f| T::from_str(&f.into())).collect())
+                .map(|fs| {
+                    fs.into_iter()
+                        .map(|f| T::from_str(&f.to_string()))
+                        .collect()
+                })
                 .transpose()
                 .map_err(|e| {
                     Error::InvalidProtocol(format!("Failed to parse protocol features: {e}"))

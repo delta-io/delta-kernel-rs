@@ -122,18 +122,6 @@ pub enum WriterFeature {
     Unknown(String),
 }
 
-impl From<ReaderFeature> for String {
-    fn from(feature: ReaderFeature) -> Self {
-        feature.to_string()
-    }
-}
-
-impl From<WriterFeature> for String {
-    fn from(feature: WriterFeature) -> Self {
-        feature.to_string()
-    }
-}
-
 impl ToDataType for ReaderFeature {
     fn to_data_type() -> DataType {
         DataType::STRING
