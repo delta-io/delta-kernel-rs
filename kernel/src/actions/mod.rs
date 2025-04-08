@@ -1,7 +1,6 @@
 //! Provides parsing and manipulation of the various actions defined in the [Delta
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
-use std::any::type_name;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
@@ -178,11 +177,11 @@ pub(crate) struct Protocol {
     /// A collection of features that a client must implement in order to correctly
     /// read this table (exist only when minReaderVersion is set to 3)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) reader_features: Option<Vec<String>>,
+    reader_features: Option<Vec<ReaderFeature>>,
     /// A collection of features that a client must implement in order to correctly
     /// write this table (exist only when minWriterVersion is set to 7)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) writer_features: Option<Vec<String>>,
+    writer_features: Option<Vec<WriterFeature>>,
 }
 
 impl Protocol {
@@ -210,8 +209,25 @@ impl Protocol {
                 )
             );
         }
-        let reader_features = reader_features.map(|f| f.into_iter().map(Into::into).collect());
-        let writer_features = writer_features.map(|f| f.into_iter().map(Into::into).collect());
+
+        fn parse_features<T>(
+            features: Option<impl IntoIterator<Item = impl Into<String>>>,
+        ) -> Result<Option<Vec<T>>, Error>
+        where
+            T: FromStr,
+            T::Err: Display,
+        {
+            features
+                .map(|fs| fs.into_iter().map(|f| T::from_str(&f.into())).collect())
+                .transpose()
+                .map_err(|e| {
+                    Error::InvalidProtocol(format!("Failed to parse protocol features: {e}"))
+                })
+        }
+
+        let reader_features = parse_features(reader_features)?;
+        let writer_features = parse_features(writer_features)?;
+
         Ok(Protocol {
             min_reader_version,
             min_writer_version,
@@ -241,25 +257,25 @@ impl Protocol {
     }
 
     /// Get the reader features for the protocol
-    pub(crate) fn reader_features(&self) -> Option<&[String]> {
+    pub(crate) fn reader_features(&self) -> Option<&[ReaderFeature]> {
         self.reader_features.as_deref()
     }
 
     /// Get the writer features for the protocol
-    pub(crate) fn writer_features(&self) -> Option<&[String]> {
+    pub(crate) fn writer_features(&self) -> Option<&[WriterFeature]> {
         self.writer_features.as_deref()
     }
 
     /// True if this protocol has the requested reader feature
     pub(crate) fn has_reader_feature(&self, feature: &ReaderFeature) -> bool {
         self.reader_features()
-            .is_some_and(|features| features.iter().any(|f| f == feature.as_ref()))
+            .is_some_and(|features| features.contains(feature))
     }
 
     /// True if this protocol has the requested writer feature
     pub(crate) fn has_writer_feature(&self, feature: &WriterFeature) -> bool {
         self.writer_features()
-            .is_some_and(|features| features.iter().any(|f| f == feature.as_ref()))
+            .is_some_and(|features| features.contains(feature))
     }
 
     /// Check if reading a table with this protocol is supported. That is: does the kernel support
@@ -321,42 +337,47 @@ impl Protocol {
     }
 }
 
-// given unparsed `table_features`, parse and check if they are subset of `supported_features`
+// given `table_features`, check if they are subset of `supported_features`
 pub(crate) fn ensure_supported_features<T>(
-    table_features: &[String],
+    table_features: &[T],
     supported_features: &HashSet<T>,
 ) -> DeltaResult<()>
 where
+    T: Display + FromStr + Hash + Eq,
     <T as FromStr>::Err: Display,
-    T: Debug + FromStr + Hash + Eq,
 {
-    let error = |unsupported, unsupported_or_unknown| {
-        let supported = supported_features.iter().collect::<Vec<_>>();
-        let features_type = type_name::<T>()
-            .rsplit("::")
-            .next()
-            .unwrap_or("table features");
-        Error::Unsupported(format!(
-            "{} {} {:?}. Supported {} are {:?}",
-            unsupported_or_unknown, features_type, unsupported, features_type, supported
-        ))
-    };
-    let parsed_features: HashSet<T> = table_features
+    // first check if all features are supported, else we proceed to craft an error message
+    if table_features
         .iter()
-        .map(|s| T::from_str(s).map_err(|_| error(vec![s.to_string()], "Unknown")))
-        .collect::<Result<_, Error>>()?;
+        .all(|feature| supported_features.contains(feature))
+    {
+        return Ok(());
+    }
 
-    // check that parsed features are a subset of supported features
-    parsed_features
-        .is_subset(supported_features)
-        .then_some(())
-        .ok_or_else(|| {
-            let unsupported = parsed_features
-                .difference(supported_features)
-                .map(|f| format!("{:?}", f))
-                .collect::<Vec<_>>();
-            error(unsupported, "Unsupported")
-        })
+    // we get the type name (ReaderFeature/WriterFeature) for better error messages
+    let features_type = std::any::type_name::<T>()
+        .rsplit("::")
+        .next()
+        .unwrap_or("table features");
+
+    // NB: we didn't do this above to avoid allocation in the common case
+    let unsupported: Vec<_> = table_features
+        .iter()
+        .filter(|feature| !supported_features.contains(*feature))
+        .map(|feature| feature.to_string())
+        .collect();
+    let supported: Vec<_> = supported_features
+        .iter()
+        .map(|feature| feature.to_string())
+        .collect();
+
+    Err(Error::Unsupported(format!(
+        "Unknown {} \"{}\". Supported {}s are \"{}\"",
+        features_type,
+        unsupported.join("\", \""),
+        features_type,
+        supported.join("\", \""),
+    )))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
@@ -975,20 +996,23 @@ mod tests {
         let supported_features = [ReaderFeature::ColumnMapping, ReaderFeature::DeletionVectors]
             .into_iter()
             .collect();
-        let table_features = vec![ReaderFeature::ColumnMapping.to_string()];
+        let table_features = vec![ReaderFeature::ColumnMapping];
         ensure_supported_features(&table_features, &supported_features).unwrap();
 
         // test unknown features
-        let table_features = vec![ReaderFeature::ColumnMapping.to_string(), "idk".to_string()];
+        let table_features = vec![
+            ReaderFeature::ColumnMapping,
+            ReaderFeature::Unknown("idk".to_string()),
+        ];
         let error = ensure_supported_features(&table_features, &supported_features).unwrap_err();
         match error {
             Error::Unsupported(e) if e ==
-                "Unknown ReaderFeature [\"idk\"]. Supported ReaderFeature are [ColumnMapping, DeletionVectors]"
+                "Unknown ReaderFeature \"idk\". Supported ReaderFeatures are \"columnMapping\", \"deletionVectors\""
             => {},
             Error::Unsupported(e) if e ==
-                "Unknown ReaderFeature [\"idk\"]. Supported ReaderFeature are [DeletionVectors, ColumnMapping]"
+                "Unknown ReaderFeature \"idk\". Supported ReaderFeatures are \"deletionVectors\", \"columnMapping\""
             => {},
-            _ => panic!("Expected unsupported error"),
+            _ => panic!("Expected unsupported error, got: {error}"),
         }
     }
 }

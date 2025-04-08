@@ -513,8 +513,10 @@ pub(crate) fn visit_deletion_vector_at<'a>(
 mod tests {
     use super::*;
 
-    use crate::utils::test_utils::action_batch;
-    use crate::{arrow::array::StringArray, utils::test_utils::parse_json_batch};
+    use crate::arrow::array::StringArray;
+
+    use crate::table_features::{ReaderFeature, WriterFeature};
+    use crate::utils::test_utils::{action_batch, parse_json_batch};
 
     #[test]
     fn test_parse_protocol() -> DeltaResult<()> {
@@ -523,8 +525,8 @@ mod tests {
         let expected = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
-            reader_features: Some(vec!["deletionVectors".into()]),
-            writer_features: Some(vec!["deletionVectors".into()]),
+            reader_features: Some(vec![ReaderFeature::DeletionVectors]),
+            writer_features: Some(vec![WriterFeature::DeletionVectors]),
         };
         assert_eq!(parsed, expected);
         Ok(())
