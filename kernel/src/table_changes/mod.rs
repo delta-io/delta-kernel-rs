@@ -255,7 +255,7 @@ fn check_cdf_table_properties(table_properties: &TableProperties) -> DeltaResult
 /// See the documentation of [`TableChanges`] for more details.
 fn ensure_cdf_read_supported(protocol: &Protocol) -> DeltaResult<()> {
     static CDF_SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> =
-        LazyLock::new(|| Vec::from([ReaderFeature::DeletionVectors]));
+        LazyLock::new(|| vec![ReaderFeature::DeletionVectors]);
     match &protocol.reader_features() {
         // if min_reader_version = 3 and all reader features are subset of supported => OK
         Some(reader_features) if protocol.min_reader_version() == 3 => {

@@ -362,14 +362,9 @@ where
         .unwrap_or("table feature");
 
     // NB: we didn't do this above to avoid allocation in the common case
-    let mut unsupported: Vec<_> = table_features
+    let mut unsupported = table_features
         .iter()
-        .filter(|feature| !supported_features.contains(*feature))
-        .map(|feature| feature.to_string())
-        .collect();
-
-    // sort for consistent error messages
-    unsupported.sort();
+        .filter(|feature| !supported_features.contains(*feature));
 
     Err(Error::Unsupported(format!(
         "Unknown {}s: \"{}\". Supported {}s: \"{}\"",
@@ -1011,22 +1006,16 @@ mod tests {
     #[test]
     fn test_parse_table_feature_never_fails() {
         // parse a non-str
-        let features = [5];
-        let expected = vec![ReaderFeature::unknown("5")];
-        assert_eq!(
-            parse_features::<ReaderFeature>(features.into()),
-            expected.into()
-        );
+        let features = Some([5]);
+        let expected = Some(vec![ReaderFeature::unknown("5")]);
+        assert_eq!(parse_features::<ReaderFeature>(features), expected);
 
         // weird strs
-        let features = ["", "absurD_)(+13%^⚙️"];
-        let expected = vec![
+        let features = Some(["", "absurD_)(+13%^⚙️"]);
+        let expected = Some(vec![
             ReaderFeature::unknown(""),
             ReaderFeature::unknown("absurD_)(+13%^⚙️"),
-        ];
-        assert_eq!(
-            parse_features::<ReaderFeature>(features.into()),
-            expected.into()
-        );
+        ]);
+        assert_eq!(parse_features::<ReaderFeature>(features), expected);
     }
 }

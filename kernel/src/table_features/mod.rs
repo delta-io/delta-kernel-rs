@@ -146,7 +146,7 @@ impl WriterFeature {
 }
 
 pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> = LazyLock::new(|| {
-    Vec::from([
+    vec![
         ReaderFeature::ColumnMapping,
         ReaderFeature::DeletionVectors,
         ReaderFeature::TimestampWithoutTimezone,
@@ -154,18 +154,18 @@ pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> = Lazy
         ReaderFeature::TypeWideningPreview,
         ReaderFeature::VacuumProtocolCheck,
         ReaderFeature::V2Checkpoint,
-    ])
+    ]
 });
 
 // note: we 'support' Invariants, but only insofar as we check that they are not present.
 // we support writing to tables that have Invariants enabled but not used. similarly, we only
 // support DeletionVectors in that we never write them (no DML).
 pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<WriterFeature>> = LazyLock::new(|| {
-    Vec::from([
+    vec![
         WriterFeature::AppendOnly,
         WriterFeature::DeletionVectors,
         WriterFeature::Invariants,
-    ])
+    ]
 });
 
 #[cfg(test)]
