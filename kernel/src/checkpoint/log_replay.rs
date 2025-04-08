@@ -1,17 +1,19 @@
 //! The [`CheckpointLogReplayProcessor`] implements specialized log replay logic for creating
 //! checkpoint files. It processes log files in reverse chronological order (newest to oldest)
-//! and selects only the minimal set of actions needed to represent the table state at a given version.
+//! and selects the set of actions to include in a checkpoint for a specific version.
 //!
-//! ## Filtering Process
+//! ## Actions Included for Checkpointing
 //!
 //! For checkpoint creation, this processor applies several filtering and deduplication
 //! steps to each batch of log actions:
 //!
-//! 1. **Protocol and Metadata**: Retains only the latest protocol and metadata actions.
-//! 2. **Transactions**: Keeps the most recent action for each unique transaction (by app ID).
-//! 3. **File Actions**: Deduplicates file actions (add/remove) by path and deletion vector ID,
-//!    keeping only the latest valid action.
-//! 4. **Tombstones**: Excludes expired remove actions older than `minimum_file_retention_timestamp`.
+//! 1. **Protocol and Metadata**: Retains exactly one of each - keeping only the latest protocol
+//!    and metadata actions.
+//! 2. **Txn Actions**: Keeps exactly one `txn` action for each unique app ID, always selecting
+//!    the latest one encountered.
+//! 3. **File Actions**: Resolves file actions to produce the latest state of the table, keeping
+//!    the most recent valid add actions and unexpired remove actions (tombstones) that are newer
+//!    than `minimum_file_retention_timestamp`.
 //!
 //! ## Architecture
 //!
@@ -39,38 +41,53 @@ use crate::{DeltaResult, Error};
 ///
 /// This visitor processes actions in newest-to-oldest order (as they appear in log
 /// replay) and applies deduplication logic for both file and non-file actions to
-/// produce the minimal state representation for the table.
+/// produce the actions to include in a checkpoint.
 ///
-/// # File Action Filtering
-/// - Keeps only the first occurrence of each unique (path, dvId) pair
-/// - Excludes expired tombstone remove actions (where deletionTimestamp ≤ minimumFileRetentionTimestamp)
-/// - Add actions represent files present in the table
-/// - Unexpired remove actions represent tombstones still needed for consistency
+/// # File Action Filtering Rules
+/// Kept Actions:
+/// - The first (newest) add action for each unique (path, dvId) pair
+/// - The first (newest) remove action for each unique (path, dvId) pair, but only if
+///   its deletionTimestamp > minimumFileRetentionTimestamp
+/// Omitted Actions:
+/// - Any file action (add/remove) with the same (path, dvId) as a previously processed action
+/// - All remove actions with deletionTimestamp ≤ minimumFileRetentionTimestamp
+/// - All remove actions with missing deletionTimestamp (defaults to 0)
+///
+/// The resulting filtered file actions represents files present in the table (add actions) and
+/// unexpired tombstones required for vacuum operations (remove actions).
 ///
 /// # Non-File Action Filtering
 /// - Keeps only the first protocol action (newest version)
 /// - Keeps only the first metadata action (most recent table metadata)
-/// - Keeps only the first transaction action for each unique app ID
+/// - Keeps only the first txn action for each unique app ID
 ///
 /// # Excluded Actions
-/// CommitInfo, CDC, and CheckpointMetadata actions should not appear in the action
-/// batches processed by this visitor, as they are excluded by the schema used to
-/// read the log files upstream. If present, they will be ignored by the visitor.
-/// Sidecar actions should also be excluded—when encountered in the log, the
-/// corresponding sidecar files are read to extract the referenced file actions,
-/// which are then included directly in the action stream instead of the sidecar actions themselves.
+/// - CommitInfo, CDC, and CheckpointMetadata actions should not appear in the action
+///   batches processed by this visitor, as they are excluded by the schema used to
+///   read the log files upstream. If present, they will be ignored by the visitor.
+/// - Sidecar actions should also be excluded—when encountered in the log, the
+///   corresponding sidecar files are read to extract the referenced file actions,
+///   which are then included directly in the action stream instead of the sidecar actions themselves.
+/// - The CheckpointMetadata action is included down the wire when writing a V2 spec checkpoint.
 ///
-/// The resulting filtered set of actions represents the minimal set needed to reconstruct
-/// the latest valid state of the table at the checkpointed version.
+/// # Memory Usage
+/// This struct has O(N + M) memory usage where:
+/// - N = number of txn actions with unique appIds
+/// - M = number of file actions with unique (path, dvId) pairs
+///
+/// The resulting filtered set of actions are the actions which should be written to a
+/// checkpoint for a corresponding version.
 pub(crate) struct CheckpointVisitor<'seen> {
-    // Deduplicates file actions
+    // Deduplicates file actions (applies logic to filter Adds with corresponding Removes,
+    // and keep unexpired Removes). This deduplicator builds a set of seen file actions.
+    // This set has O(M) memory usage where M = number of file actions with unique (path, dvId) pairs
     deduplicator: FileActionDeduplicator<'seen>,
     // Tracks which rows to include in the final output
     selection_vector: Vec<bool>,
     // TODO: _last_checkpoint schema should be updated to use u64 instead of i64
     // for fields that are not expected to be negative. (Issue #786)
     // i64 to match the `_last_checkpoint` file schema
-    total_file_actions: i64,
+    file_actions_count: i64,
     // i64 to match the `_last_checkpoint` file schema
     total_add_actions: i64,
     // i64 for comparison with remove.deletionTimestamp
@@ -80,6 +97,7 @@ pub(crate) struct CheckpointVisitor<'seen> {
     // Flag to track if we've seen a metadata action so we can keep only the first metadata action
     seen_metadata: bool,
     // Set of transaction IDs to deduplicate by appId
+    // This set has O(N) memory usage where N = number of txn actions with unique appIds
     seen_txns: &'seen mut HashSet<String>,
     // i64 to match the `_last_checkpoint` file schema
     total_non_file_actions: i64,
@@ -94,6 +112,11 @@ impl CheckpointVisitor<'_> {
     const REMOVE_PATH_INDEX: usize = 4; // Position of "remove.path" in getters
     const REMOVE_DELETION_TIMESTAMP_INDEX: usize = 5; // Position of "remove.deletionTimestamp" in getters
     const REMOVE_DV_START_INDEX: usize = 6; // Start position of remove deletion vector columns
+
+    // These are the column names used to access the data in the getters
+    const REMOVE_DELETION_TIMESTAMP: &'static str = "remove.deletionTimestamp";
+    const PROTOCOL_MIN_READER_VERSION: &'static str = "protocol.minReaderVersion";
+    const METADATA_ID: &'static str = "metaData.id";
 
     pub(crate) fn new<'seen>(
         seen_file_keys: &'seen mut HashSet<FileActionKey>,
@@ -114,7 +137,7 @@ impl CheckpointVisitor<'_> {
                 Self::REMOVE_DV_START_INDEX,
             ),
             selection_vector,
-            total_file_actions: 0,
+            file_actions_count: 0,
             total_add_actions: 0,
             minimum_file_retention_timestamp,
 
@@ -141,7 +164,7 @@ impl CheckpointVisitor<'_> {
         // Note: When remove.deletion_timestamp is not present (defaulting to 0), the remove action
         // will be excluded from the checkpoint file as it will be treated as expired.
         let mut deletion_timestamp: i64 = 0;
-        if let Some(ts) = getter.get_opt(i, "remove.deletionTimestamp")? {
+        if let Some(ts) = getter.get_opt(i, Self::REMOVE_DELETION_TIMESTAMP)? {
             deletion_timestamp = ts;
         }
 
@@ -183,7 +206,7 @@ impl CheckpointVisitor<'_> {
         if is_add {
             self.total_add_actions += 1;
         }
-        self.total_file_actions += 1;
+        self.file_actions_count += 1;
         Ok(true) // Include this action
     }
 
@@ -203,7 +226,7 @@ impl CheckpointVisitor<'_> {
         }
 
         // minReaderVersion is a required field, so we check for its presence to determine if this is a protocol action.
-        match getter.get_int(i, "protocol.minReaderVersion")? {
+        match getter.get_int(i, Self::PROTOCOL_MIN_READER_VERSION)? {
             Some(_) => (),            // It is a protocol action
             None => return Ok(false), // Not a protocol action
         };
@@ -230,7 +253,7 @@ impl CheckpointVisitor<'_> {
         }
 
         // id is a required field, so we check for its presence to determine if this is a metadata action.
-        match getter.get_str(i, "metaData.id")? {
+        match getter.get_str(i, Self::METADATA_ID)? {
             Some(_) => (),            // It is a metadata action
             None => return Ok(false), // Not a metadata action
         };
@@ -267,7 +290,10 @@ impl CheckpointVisitor<'_> {
     /// Determines if a row in the batch should be included in the checkpoint.
     ///
     /// This method checks each action type in sequence, short-circuiting as soon as a valid action is found.
-    /// Actions are checked in order of expected frequency (file actions first) to optimize performance.
+    /// Actions are checked in order of expected frequency of occurrence to optimize performance:
+    /// 1. File actions (most frequent)
+    /// 2. Txn actions
+    /// 3. Protocol & Metadata actions (least frequent)
     ///
     /// Returns Ok(true) if the row should be included in the checkpoint.
     /// Returns Ok(false) if the row should be skipped.
@@ -297,6 +323,7 @@ impl RowVisitor for CheckpointVisitor<'_> {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             const STRING: DataType = DataType::STRING;
             const INTEGER: DataType = DataType::INTEGER;
+            const LONG: DataType = DataType::LONG;
             let types_and_names = vec![
                 // File action columns
                 (STRING, column_name!("add.path")),
@@ -304,7 +331,7 @@ impl RowVisitor for CheckpointVisitor<'_> {
                 (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
                 (INTEGER, column_name!("add.deletionVector.offset")),
                 (STRING, column_name!("remove.path")),
-                (DataType::LONG, column_name!("remove.deletionTimestamp")),
+                (LONG, column_name!("remove.deletionTimestamp")),
                 (STRING, column_name!("remove.deletionVector.storageType")),
                 (STRING, column_name!("remove.deletionVector.pathOrInlineDv")),
                 (INTEGER, column_name!("remove.deletionVector.offset")),
@@ -372,7 +399,7 @@ mod tests {
             true,  // Row 7 is a txn action (included)
         ];
 
-        assert_eq!(visitor.total_file_actions, 2);
+        assert_eq!(visitor.file_actions_count, 2);
         assert_eq!(visitor.total_add_actions, 1);
         assert!(visitor.seen_protocol);
         assert!(visitor.seen_metadata);
@@ -418,7 +445,7 @@ mod tests {
         // Only "one_above_threshold" should be kept
         let expected = vec![false, false, true, false];
         assert_eq!(visitor.selection_vector, expected);
-        assert_eq!(visitor.total_file_actions, 1);
+        assert_eq!(visitor.file_actions_count, 1);
         assert_eq!(visitor.total_add_actions, 0);
         assert_eq!(visitor.total_non_file_actions, 0);
         Ok(())
@@ -451,7 +478,7 @@ mod tests {
         // First file action should be included. The second one should be excluded due to the conflict.
         let expected = vec![true, false];
         assert_eq!(visitor.selection_vector, expected);
-        assert_eq!(visitor.total_file_actions, 1);
+        assert_eq!(visitor.file_actions_count, 1);
         assert_eq!(visitor.total_add_actions, 1);
         assert_eq!(visitor.total_non_file_actions, 0);
         Ok(())
@@ -481,7 +508,7 @@ mod tests {
 
         let expected = vec![true];
         assert_eq!(visitor.selection_vector, expected);
-        assert_eq!(visitor.total_file_actions, 1);
+        assert_eq!(visitor.file_actions_count, 1);
         assert_eq!(visitor.total_add_actions, 1);
         assert_eq!(visitor.total_non_file_actions, 0);
         // The action should NOT be added to the seen_file_keys set as it's a checkpoint batch
@@ -520,7 +547,7 @@ mod tests {
 
         let expected = vec![true, true, false];
         assert_eq!(visitor.selection_vector, expected);
-        assert_eq!(visitor.total_file_actions, 2);
+        assert_eq!(visitor.file_actions_count, 2);
         assert_eq!(visitor.total_add_actions, 1);
         assert_eq!(visitor.total_non_file_actions, 0);
 
@@ -557,7 +584,7 @@ mod tests {
         let expected = vec![false, false, false];
         assert_eq!(visitor.selection_vector, expected);
         assert_eq!(visitor.total_non_file_actions, 0);
-        assert_eq!(visitor.total_file_actions, 0);
+        assert_eq!(visitor.file_actions_count, 0);
 
         Ok(())
     }
@@ -596,7 +623,7 @@ mod tests {
         assert_eq!(visitor.selection_vector, expected);
         assert_eq!(visitor.seen_txns.len(), 2); // Two different app IDs
         assert_eq!(visitor.total_non_file_actions, 4); // 2 txns + 1 protocol + 1 metadata
-        assert_eq!(visitor.total_file_actions, 0);
+        assert_eq!(visitor.file_actions_count, 0);
 
         Ok(())
     }
