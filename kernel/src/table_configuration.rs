@@ -8,7 +8,6 @@
 //! [`TableProperties`].
 //!
 //! [`Schema`]: crate::schema::Schema
-use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use url::Url;
@@ -181,8 +180,8 @@ impl TableConfiguration {
     /// [`TableChanges`]: crate::table_changes::TableChanges
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn is_cdf_read_supported(&self) -> bool {
-        static CDF_SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeature>> =
-            LazyLock::new(|| HashSet::from([ReaderFeature::DeletionVectors]));
+        static CDF_SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> =
+            LazyLock::new(|| vec![ReaderFeature::DeletionVectors]);
         let protocol_supported = match self.protocol.reader_features() {
             // if min_reader_version = 3 and all reader features are subset of supported => OK
             Some(reader_features) if self.protocol.min_reader_version() == 3 => {

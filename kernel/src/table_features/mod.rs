@@ -1,8 +1,10 @@
-use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
-use strum::{AsRefStr, Display as StrumDisplay, EnumString, VariantNames};
+use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumString};
+
+use crate::actions::schemas::ToDataType;
+use crate::schema::DataType;
 
 pub(crate) use column_mapping::column_mapping_mode;
 pub use column_mapping::{validate_schema_column_mapping, ColumnMappingMode};
@@ -24,7 +26,7 @@ mod column_mapping;
     EnumString,
     StrumDisplay,
     AsRefStr,
-    VariantNames,
+    EnumCount,
     Hash,
 )]
 #[strum(serialize_all = "camelCase")]
@@ -48,6 +50,9 @@ pub enum ReaderFeature {
     /// vacuumProtocolCheck ReaderWriter feature ensures consistent application of reader and writer
     /// protocol checks during VACUUM operations
     VacuumProtocolCheck,
+    #[serde(untagged)]
+    #[strum(default)]
+    Unknown(String),
 }
 
 /// Similar to reader features, writer features communicate capabilities that must be implemented
@@ -65,7 +70,7 @@ pub enum ReaderFeature {
     EnumString,
     StrumDisplay,
     AsRefStr,
-    VariantNames,
+    EnumCount,
     Hash,
 )]
 #[strum(serialize_all = "camelCase")]
@@ -109,48 +114,97 @@ pub enum WriterFeature {
     /// vacuumProtocolCheck ReaderWriter feature ensures consistent application of reader and writer
     /// protocol checks during VACUUM operations
     VacuumProtocolCheck,
+    #[serde(untagged)]
+    #[strum(default)]
+    Unknown(String),
 }
 
-impl From<ReaderFeature> for String {
-    fn from(feature: ReaderFeature) -> Self {
-        feature.to_string()
+impl ToDataType for ReaderFeature {
+    fn to_data_type() -> DataType {
+        DataType::STRING
     }
 }
 
-impl From<WriterFeature> for String {
-    fn from(feature: WriterFeature) -> Self {
-        feature.to_string()
+impl ToDataType for WriterFeature {
+    fn to_data_type() -> DataType {
+        DataType::STRING
     }
 }
 
-pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeature>> =
-    LazyLock::new(|| {
-        HashSet::from([
-            ReaderFeature::ColumnMapping,
-            ReaderFeature::DeletionVectors,
-            ReaderFeature::TimestampWithoutTimezone,
-            ReaderFeature::TypeWidening,
-            ReaderFeature::TypeWideningPreview,
-            ReaderFeature::VacuumProtocolCheck,
-            ReaderFeature::V2Checkpoint,
-        ])
-    });
+#[cfg(test)] // currently only used in tests
+impl ReaderFeature {
+    pub(crate) fn unknown(s: impl ToString) -> Self {
+        ReaderFeature::Unknown(s.to_string())
+    }
+}
 
-pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<HashSet<WriterFeature>> =
-    // note: we 'support' Invariants, but only insofar as we check that they are not present.
-    // we support writing to tables that have Invariants enabled but not used. similarly, we only
-    // support DeletionVectors in that we never write them (no DML).
-    LazyLock::new(|| {
-            HashSet::from([
-                WriterFeature::AppendOnly,
-                WriterFeature::DeletionVectors,
-                WriterFeature::Invariants,
-            ])
-        });
+#[cfg(test)] // currently only used in tests
+impl WriterFeature {
+    pub(crate) fn unknown(s: impl ToString) -> Self {
+        WriterFeature::Unknown(s.to_string())
+    }
+}
+
+pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> = LazyLock::new(|| {
+    vec![
+        ReaderFeature::ColumnMapping,
+        ReaderFeature::DeletionVectors,
+        ReaderFeature::TimestampWithoutTimezone,
+        ReaderFeature::TypeWidening,
+        ReaderFeature::TypeWideningPreview,
+        ReaderFeature::VacuumProtocolCheck,
+        ReaderFeature::V2Checkpoint,
+    ]
+});
+
+// note: we 'support' Invariants, but only insofar as we check that they are not present.
+// we support writing to tables that have Invariants enabled but not used. similarly, we only
+// support DeletionVectors in that we never write them (no DML).
+pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<WriterFeature>> = LazyLock::new(|| {
+    vec![
+        WriterFeature::AppendOnly,
+        WriterFeature::DeletionVectors,
+        WriterFeature::Invariants,
+    ]
+});
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_unknown_features() {
+        let mixed_reader = &[
+            ReaderFeature::DeletionVectors,
+            ReaderFeature::unknown("cool_feature"),
+            ReaderFeature::ColumnMapping,
+        ];
+        let mixed_writer = &[
+            WriterFeature::DeletionVectors,
+            WriterFeature::unknown("cool_feature"),
+            WriterFeature::AppendOnly,
+        ];
+
+        let reader_string = serde_json::to_string(mixed_reader).unwrap();
+        let writer_string = serde_json::to_string(mixed_writer).unwrap();
+
+        assert_eq!(
+            &reader_string,
+            "[\"deletionVectors\",\"cool_feature\",\"columnMapping\"]"
+        );
+        assert_eq!(
+            &writer_string,
+            "[\"deletionVectors\",\"cool_feature\",\"appendOnly\"]"
+        );
+
+        let typed_reader: Vec<ReaderFeature> = serde_json::from_str(&reader_string).unwrap();
+        let typed_writer: Vec<WriterFeature> = serde_json::from_str(&writer_string).unwrap();
+
+        assert_eq!(typed_reader.len(), 3);
+        assert_eq!(&typed_reader, mixed_reader);
+        assert_eq!(typed_writer.len(), 3);
+        assert_eq!(&typed_writer, mixed_writer);
+    }
 
     #[test]
     fn test_roundtrip_reader_features() {
@@ -162,13 +216,13 @@ mod tests {
             (ReaderFeature::TypeWideningPreview, "typeWidening-preview"),
             (ReaderFeature::V2Checkpoint, "v2Checkpoint"),
             (ReaderFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
+            (ReaderFeature::unknown("something"), "something"),
         ];
 
-        assert_eq!(ReaderFeature::VARIANTS.len(), cases.len());
+        assert_eq!(ReaderFeature::COUNT, cases.len());
 
-        for ((feature, expected), name) in cases.into_iter().zip(ReaderFeature::VARIANTS) {
-            assert_eq!(*name, expected);
-
+        for (feature, expected) in cases {
+            assert_eq!(feature.to_string(), expected);
             let serialized = serde_json::to_string(&feature).unwrap();
             assert_eq!(serialized, format!("\"{}\"", expected));
 
@@ -200,13 +254,13 @@ mod tests {
             (WriterFeature::IcebergCompatV1, "icebergCompatV1"),
             (WriterFeature::IcebergCompatV2, "icebergCompatV2"),
             (WriterFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
+            (WriterFeature::unknown("something"), "something"),
         ];
 
-        assert_eq!(WriterFeature::VARIANTS.len(), cases.len());
+        assert_eq!(WriterFeature::COUNT, cases.len());
 
-        for ((feature, expected), name) in cases.into_iter().zip(WriterFeature::VARIANTS) {
-            assert_eq!(*name, expected);
-
+        for (feature, expected) in cases {
+            assert_eq!(feature.to_string(), expected);
             let serialized = serde_json::to_string(&feature).unwrap();
             assert_eq!(serialized, format!("\"{}\"", expected));
 

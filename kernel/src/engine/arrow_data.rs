@@ -296,6 +296,7 @@ impl ArrowEngineData {
 mod tests {
     use crate::arrow::array::StringArray;
 
+    use crate::table_features::{ReaderFeature, WriterFeature};
     use crate::utils::test_utils::string_array_to_engine_data;
     use crate::{
         actions::{get_log_schema, Metadata, Protocol},
@@ -337,10 +338,13 @@ mod tests {
         let protocol = Protocol::try_new_from_data(parsed.as_ref())?.unwrap();
         assert_eq!(protocol.min_reader_version(), 3);
         assert_eq!(protocol.min_writer_version(), 7);
-        assert_eq!(protocol.reader_features(), Some(["rw1".into()].as_slice()));
+        assert_eq!(
+            protocol.reader_features(),
+            Some([ReaderFeature::unknown("rw1")].as_slice())
+        );
         assert_eq!(
             protocol.writer_features(),
-            Some(["rw1".into(), "w2".into()].as_slice())
+            Some([WriterFeature::unknown("rw1"), WriterFeature::unknown("w2")].as_slice())
         );
         Ok(())
     }

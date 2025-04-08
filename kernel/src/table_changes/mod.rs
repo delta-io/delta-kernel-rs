@@ -31,7 +31,6 @@
 //! let table_change_batches = table_changes_scan.execute(engine.clone())?;
 //! # Ok::<(), Error>(())
 //! ```
-use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use scan::TableChangesScanBuilder;
@@ -255,8 +254,8 @@ fn check_cdf_table_properties(table_properties: &TableProperties) -> DeltaResult
 /// Ensures that Change Data Feed is supported for a table with this [`Protocol`] .
 /// See the documentation of [`TableChanges`] for more details.
 fn ensure_cdf_read_supported(protocol: &Protocol) -> DeltaResult<()> {
-    static CDF_SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeature>> =
-        LazyLock::new(|| HashSet::from([ReaderFeature::DeletionVectors]));
+    static CDF_SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> =
+        LazyLock::new(|| vec![ReaderFeature::DeletionVectors]);
     match &protocol.reader_features() {
         // if min_reader_version = 3 and all reader features are subset of supported => OK
         Some(reader_features) if protocol.min_reader_version() == 3 => {
