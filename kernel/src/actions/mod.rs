@@ -340,7 +340,7 @@ impl Protocol {
 // given `table_features`, check if they are subset of `supported_features`
 pub(crate) fn ensure_supported_features<T>(
     table_features: &[T],
-    supported_features: &Vec<T>,
+    supported_features: &[T],
 ) -> DeltaResult<()>
 where
     T: Display + FromStr + Hash + Eq,
@@ -997,9 +997,7 @@ mod tests {
 
     #[test]
     fn test_ensure_supported_features() {
-        let supported_features = [ReaderFeature::ColumnMapping, ReaderFeature::DeletionVectors]
-            .into_iter()
-            .collect();
+        let supported_features = [ReaderFeature::ColumnMapping, ReaderFeature::DeletionVectors];
         let table_features = vec![ReaderFeature::ColumnMapping];
         ensure_supported_features(&table_features, &supported_features).unwrap();
 
@@ -1008,7 +1006,7 @@ mod tests {
         let error = ensure_supported_features(&table_features, &supported_features).unwrap_err();
         match error {
             Error::Unsupported(e) if e ==
-                "Unknown ReaderFeature \"idk\". Supported ReaderFeatures are \"columnMapping\", \"deletionVectors\""
+                "Unknown ReaderFeatures: \"idk\". Supported ReaderFeatures: \"columnMapping\", \"deletionVectors\""
             => {},
             _ => panic!("Expected unsupported error, got: {error}"),
         }
