@@ -53,10 +53,13 @@ use crate::{DeltaResult, Error};
 /// - Keeps only the first transaction action for each unique app ID
 ///
 /// # Excluded Actions
-/// CommitInfo, CDC, and CheckpointMetadata actions should not be present in the actions
-/// batches processed by this visitor as they are excluded from the schema used to
-/// read the log files. If they are present, they will anyways be excluded by the visitor.
-/// Sidecar actions should not be present either as they are processed upstream.
+/// CommitInfo, CDC, and CheckpointMetadata actions should not appear in the action
+/// batches processed by this visitor, as they are excluded by the schema used to
+/// read the log files upstream. If present, they will be ignored by the visitor.
+/// Sidecar actions should also be excluded—when encountered in the log, the
+/// corresponding sidecar files are read to extract the referenced file actions,
+/// which are then included directly in the action stream instead of the sidecar
+/// actions themselves.
 ///
 /// The resulting filtered set of actions represents the minimal set needed to reconstruct
 /// the latest valid state of the table at the checkpointed version.
