@@ -12,7 +12,6 @@
 //! 3. **File Actions**: Deduplicates file actions (add/remove) by path and deletion vector ID,
 //!    keeping only the latest valid action.
 //! 4. **Tombstones**: Excludes expired remove actions older than `minimum_file_retention_timestamp`.
-//! 5. **Action Types**: Filters out irrelevant action types such as commitInfo, CDC, and sidecar actions.
 //!
 //! ## Architecture
 //!
@@ -54,8 +53,10 @@ use crate::{DeltaResult, Error};
 /// - Keeps only the first transaction action for each unique app ID
 ///
 /// # Excluded Actions
-/// CommitInfo, CDC, Sidecar, and CheckpointMetadata actions are NOT part of the V1 checkpoint schema
-/// and are filtered out.
+/// CommitInfo, CDC, and CheckpointMetadata actions should not be present in the actions
+/// batches processed by this visitor as they are excluded from the schema used to
+/// read the log files. If they are present, they will anyways be excluded by the visitor.
+/// Sidecar actions should not be present either as they are processed upstream.
 ///
 /// The resulting filtered set of actions represents the minimal set needed to reconstruct
 /// the latest valid state of the table at the checkpointed version.
