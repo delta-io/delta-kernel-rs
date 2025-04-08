@@ -1,31 +1,32 @@
-//! `CheckpointLogReplayProcessor` performs log replay specifically for checkpoint creation in delta tables.
+//! The [`CheckpointLogReplayProcessor`] implements specialized log replay logic for creating
+//! checkpoint files. It processes log files in reverse chronological order (newest to oldest)
+//! and selects only the minimal set of actions needed to represent the table state at a given version.
 //!
-//! During checkpoint creation, the processor reads batches of log actions (in reverse chronological order)
-//! and performs the following steps:
+//! ## Filtering Process
 //!
-//! - Protocol and Metadata Filtering: Ensures that only the most recent protocol and metadata actions
-//!   are retained.
-//! - Transaction Deduplication: For each transaction (identified by app ID), only the latest action
-//!   is retained.
-//! - File Action Deduplication: Leverages the [`FileActionDeduplicator`] to ensure that for each
-//!   unique file (identified by its path and deletion vector unique ID), only the most
-//!   recent valid action is included.
-//! - Tombstone Retention Management: Excludes file removal tombstones that are older than the
-//!   configured `minimum_file_retention_timestamp`.
-//! - Action Type Filtering: Excludes other action types such as commitInfo, and CDC actions that
-//!   are not part of the checkpoint schema.
+//! For checkpoint creation, this processor applies several filtering and deduplication
+//! steps to each batch of log actions:
 //!
-//! The [`CheckpointVisitor`] implements the visitor pattern to apply these filtering rules to
-//! each action in the batch, determining which should be included in the checkpoint file.
-//! It handles the deduplication of file actions, expiration of remove tombstones, and filtering of
-//! non-file actions (protocol, metadata, transaction) while excluding unnecessary action types.
+//! 1. **Protocol and Metadata**: Retains only the latest protocol and metadata actions.
+//! 2. **Transactions**: Keeps the most recent action for each unique transaction (by app ID).
+//! 3. **File Actions**: Deduplicates file actions (add/remove) by path and deletion vector ID,
+//!    keeping only the latest valid action.
+//! 4. **Tombstones**: Excludes expired remove actions older than `minimum_file_retention_timestamp`.
+//! 5. **Action Types**: Filters out irrelevant action types such as commitInfo, CDC, and sidecar actions.
 //!
-//! As an implementation of `LogReplayProcessor`, `CheckpointLogReplayProcessor` provides the
-//! `process_actions_batch` method, which applies these steps to each batch of log actions and
-//! produces a `CheckpointData` result. This result encapsulates both the original batch data
-//! and a selection vector indicating which rows should be included in the checkpoint file.
-//! The [`CheckpointVisitor`] is applied within the `process_actions_batch` method to determine
-//! which rows to include by filtering protocol, metadata, transaction, and file actions.
+//! ## Architecture
+//!
+//! - [`CheckpointVisitor`]: Implements [`RowVisitor`] to examine each action in a batch and
+//!   determine if it should be included in the checkpoint. It maintains state for deduplication
+//!   across multiple actions in a batch and efficiently handles all filtering rules.
+//!
+//! - [`CheckpointLogReplayProcessor`]: Implements the [`LogReplayProcessor`] trait and orchestrates
+//!   the overall process. For each batch of log actions, it:
+//!   1. Creates a visitor with the current deduplication state
+//!   2. Applies the visitor to filter actions in the batch
+//!   3. Updates counters and state for cross-batch deduplication
+//!   4. Produces a [`CheckpointData`] result which includes a selection vector indicating which
+//!      actions should be included in the checkpoint file
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
