@@ -663,8 +663,8 @@ pub fn selection_vector(
     descriptor: &DeletionVectorDescriptor,
     table_root: &Url,
 ) -> DeltaResult<Vec<bool>> {
-    let fs_client = engine.file_system_client();
-    let dv_treemap = descriptor.read(fs_client, table_root)?;
+    let storage = engine.storage_handler();
+    let dv_treemap = descriptor.read(storage, table_root)?;
     Ok(deletion_treemap_to_bools(dv_treemap))
 }
 

@@ -68,8 +68,8 @@ impl DvInfo {
         self.deletion_vector
             .as_ref()
             .map(|dv_descriptor| {
-                let fs_client = engine.file_system_client();
-                dv_descriptor.read(fs_client, table_root)
+                let storage = engine.storage_handler();
+                dv_descriptor.read(storage, table_root)
             })
             .transpose()
     }
@@ -92,8 +92,8 @@ impl DvInfo {
         self.deletion_vector
             .as_ref()
             .map(|dv| {
-                let fs_client = engine.file_system_client();
-                dv.row_indexes(fs_client, table_root)
+                let storage = engine.storage_handler();
+                dv.row_indexes(storage, table_root)
             })
             .transpose()
     }
