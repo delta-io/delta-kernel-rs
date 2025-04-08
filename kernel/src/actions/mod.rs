@@ -20,6 +20,7 @@ use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use delta_kernel_derive::Schema;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 pub mod deletion_vector;
@@ -366,21 +367,16 @@ where
         .filter(|feature| !supported_features.contains(*feature))
         .map(|feature| feature.to_string())
         .collect();
-    let mut supported: Vec<_> = supported_features
-        .iter()
-        .map(|feature| feature.to_string())
-        .collect();
 
-    // sort both vecs for consistent error messages
+    // sort for consistent error messages
     unsupported.sort();
-    supported.sort();
 
     Err(Error::Unsupported(format!(
         "Unknown {}s: \"{}\". Supported {}s: \"{}\"",
         features_type,
         unsupported.join("\", \""),
         features_type,
-        supported.join("\", \""),
+        supported_features.iter().join("\", \""),
     )))
 }
 
