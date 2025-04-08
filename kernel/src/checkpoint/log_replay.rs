@@ -150,8 +150,8 @@ impl CheckpointVisitor<'_> {
 
     /// Processes a potential file action to determine if it should be included in the checkpoint.
     ///
-    /// Returns Ok(Some(())) if the row contains a valid file action to be included in the checkpoint.
-    /// Returns Ok(None) if the row doesn't contain a file action or should be skipped.
+    /// Returns Ok(true) if the row contains a valid file action to be included in the checkpoint.
+    /// Returns Ok(false) if the row doesn't contain a file action or should be skipped.
     /// Returns Err(...) if there was an error processing the action.
     ///
     /// Note: This function handles both add and remove actions, applying deduplication logic and
@@ -160,23 +160,23 @@ impl CheckpointVisitor<'_> {
         &mut self,
         i: usize,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<Option<()>> {
+    ) -> DeltaResult<bool> {
         // Extract the file action and handle errors immediately
         let (file_key, is_add) = match self.deduplicator.extract_file_action(i, getters, false)? {
             Some(action) => action,
-            None => return Ok(None), // If no file action is found, skip this row
+            None => return Ok(false), // If no file action is found, skip this row
         };
 
         // Check if we've already seen this file action
         if self.deduplicator.check_and_record_seen(file_key) {
-            return Ok(None); // Skip file actions that we've processed before
+            return Ok(false); // Skip file actions that we've processed before
         }
 
         // For remove actions, check if it's an expired tombstone
         if !is_add
             && self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP_INDEX])?
         {
-            return Ok(None); // Skip expired remove tombstones
+            return Ok(false); // Skip expired remove tombstones
         }
 
         // Valid, non-duplicate file action
@@ -184,96 +184,90 @@ impl CheckpointVisitor<'_> {
             self.total_add_actions += 1;
         }
         self.total_file_actions += 1;
-        Ok(Some(())) // Include this action
+        Ok(true) // Include this action
     }
 
     /// Processes a potential protocol action to determine if it should be included in the checkpoint.
     ///
-    /// Returns Ok(Some(())) if the row contains a valid protocol action.
-    /// Returns Ok(None) if the row doesn't contain a protocol action or is a duplicate.
+    /// Returns Ok(true) if the row contains a valid protocol action.
+    /// Returns Ok(false) if the row doesn't contain a protocol action or is a duplicate.
     /// Returns Err(...) if there was an error processing the action.
     fn check_protocol_action<'a>(
         &mut self,
         i: usize,
         getter: &'a dyn GetData<'a>,
-    ) -> DeltaResult<Option<()>> {
+    ) -> DeltaResult<bool> {
         // Skip protocol actions if we've already seen a newer one
         if self.seen_protocol {
-            return Ok(None);
+            return Ok(false);
         }
 
         // minReaderVersion is a required field, so we check for its presence to determine if this is a protocol action.
         match getter.get_int(i, "protocol.minReaderVersion")? {
-            Some(_) => (),           // It is a protocol action
-            None => return Ok(None), // Not a protocol action
+            Some(_) => (),            // It is a protocol action
+            None => return Ok(false), // Not a protocol action
         };
 
         // Valid, non-duplicate protocol action to be included
         self.seen_protocol = true;
         self.total_non_file_actions += 1;
-        Ok(Some(()))
+        Ok(true)
     }
 
     /// Processes a potential metadata action to determine if it should be included in the checkpoint.
     ///
-    /// Returns Ok(Some(())) if the row contains a valid metadata action.
-    /// Returns Ok(None) if the row doesn't contain a metadata action or is a duplicate.
+    /// Returns Ok(true) if the row contains a valid metadata action.
+    /// Returns Ok(false) if the row doesn't contain a metadata action or is a duplicate.
     /// Returns Err(...) if there was an error processing the action.
     fn check_metadata_action<'a>(
         &mut self,
         i: usize,
         getter: &'a dyn GetData<'a>,
-    ) -> DeltaResult<Option<()>> {
+    ) -> DeltaResult<bool> {
         // Skip metadata actions if we've already seen a newer one
         if self.seen_metadata {
-            return Ok(None);
+            return Ok(false);
         }
 
         // id is a required field, so we check for its presence to determine if this is a metadata action.
         match getter.get_str(i, "metaData.id")? {
-            Some(_) => (),           // It is a metadata action
-            None => return Ok(None), // Not a metadata action
+            Some(_) => (),            // It is a metadata action
+            None => return Ok(false), // Not a metadata action
         };
 
         // Valid, non-duplicate metadata action to be included
         self.seen_metadata = true;
         self.total_non_file_actions += 1;
-        Ok(Some(()))
+        Ok(true)
     }
 
     /// Processes a potential txn action to determine if it should be included in the checkpoint.
     ///
-    /// Returns Ok(Some(())) if the row contains a valid txn action.
-    /// Returns Ok(None) if the row doesn't contain a txn action or is a duplicate.
+    /// Returns Ok(true) if the row contains a valid txn action.
+    /// Returns Ok(false) if the row doesn't contain a txn action or is a duplicate.
     /// Returns Err(...) if there was an error processing the action.
-    fn check_txn_action<'a>(
-        &mut self,
-        i: usize,
-        getter: &'a dyn GetData<'a>,
-    ) -> DeltaResult<Option<()>> {
+    fn check_txn_action<'a>(&mut self, i: usize, getter: &'a dyn GetData<'a>) -> DeltaResult<bool> {
         // Check for txn field
         let app_id = match getter.get_str(i, "txn.appId")? {
             Some(id) => id,
-            None => return Ok(None), // Not a txn action
+            None => return Ok(false), // Not a txn action
         };
 
         // If the app ID already exists in the set, the insertion will return false,
         // indicating that this is a duplicate.
         if !self.seen_txns.insert(app_id.to_string()) {
-            return Ok(None);
+            return Ok(false);
         }
 
         // Valid, non-duplicate txn action to be included
         self.total_non_file_actions += 1;
-        Ok(Some(()))
+        Ok(true)
     }
 
     /// Determines if a row in the batch should be included in the checkpoint.
     ///
-    /// This method efficiently checks each action type using short-circuit evaluation
-    /// through the `.or()` chain. As soon as any check returns `Some(())`, the remaining
-    /// checks are skipped. Actions are checked in order of expected frequency (file actions first)
-    /// to optimize performance in typical workloads.
+    /// This method checks each action type in sequence, short-circuiting as soon as a valid action is found.
+    /// Actions are checked in order of expected frequency (file actions first) to optimize performance.
     ///
     /// Returns Ok(true) if the row should be included in the checkpoint.
     /// Returns Ok(false) if the row should be skipped.
@@ -283,12 +277,12 @@ impl CheckpointVisitor<'_> {
         i: usize,
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<bool> {
-        Ok(self
-            .check_file_action(i, getters)?
-            .or(self.check_txn_action(i, getters[11])?)
-            .or(self.check_protocol_action(i, getters[10])?)
-            .or(self.check_metadata_action(i, getters[9])?)
-            .is_some())
+        // The `||` operator short-circuits the evaluation, so if any of the checks return true,
+        // the rest will not be evaluated.
+        Ok(self.check_file_action(i, getters)?
+            || self.check_txn_action(i, getters[11])?
+            || self.check_protocol_action(i, getters[10])?
+            || self.check_metadata_action(i, getters[9])?)
     }
 }
 
