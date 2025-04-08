@@ -4,21 +4,20 @@
 //! and performs the following steps:
 //!
 //! - Protocol and Metadata Filtering: Ensures that only the most recent protocol and metadata actions
-//!   are retained
+//!   are retained.
 //! - Transaction Deduplication: For each transaction (identified by app ID), only the latest action
-//!   is preserved to maintain a consistent transaction history.
-//! - File Action Deduplication: Leverages the [`FileActionDeduplicator`] mechanism to ensure that
-//!   for each unique file (identified by its path and deletion vector unique ID), only the most
+//!   is retained.
+//! - File Action Deduplication: Leverages the [`FileActionDeduplicator`] to ensure that for each
+//!   unique file (identified by its path and deletion vector unique ID), only the most
 //!   recent valid action is included.
 //! - Tombstone Retention Management: Excludes file removal tombstones that are older than the
-//!   configured `minimum_file_retention_timestamp`, reducing checkpoint size without compromising
-//!   table consistency.
+//!   configured `minimum_file_retention_timestamp`.
 //! - Action Type Filtering: Excludes other action types such as commitInfo, and CDC actions that
-//!   aren't required for reconstructing table state.
+//!   are not part of the checkpoint schema.
 //!
-//! The [`CheckpointVisitor`] implements the visitor pattern to efficiently apply these filtering
-//! rules to each action in the batch, determining which should be included in the checkpoint file.
-//! It handles deduplication of file actions, expiration of remove tombstones, and filtering of
+//! The [`CheckpointVisitor`] implements the visitor pattern to apply these filtering rules to
+//! each action in the batch, determining which should be included in the checkpoint file.
+//! It handles the deduplication of file actions, expiration of remove tombstones, and filtering of
 //! non-file actions (protocol, metadata, transaction) while excluding unnecessary action types.
 //!
 //! As an implementation of `LogReplayProcessor`, `CheckpointLogReplayProcessor` provides the
