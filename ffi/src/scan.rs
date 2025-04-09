@@ -32,7 +32,7 @@ pub struct SharedScan;
 #[handle_descriptor(target=ScanData, mutable=false, sized=true)]
 pub struct CScanData;
 
-/// Drop an `CScanData`.
+/// Drop a `CScanData`.
 ///
 /// # Safety
 ///
@@ -206,8 +206,9 @@ fn kernel_scan_data_init_impl(
 }
 
 /// Call the provided `engine_visitor` on the next scan data item. The visitor will be provided with
-/// a [`CScanData`]. It is the responsibility of the _engine_ to free these when it is finished
-/// by calling [`free_bool_slice`] and [`free_engine_data`] respectively.
+/// a [`CScanData`], which contains the actual scan files and the associated selection vector. It is the
+///  responsibility of the _engine_ to free the associated resources after use by calling
+/// [`free_engine_data`] and [`free_bool_slice`] respectively.
 ///
 /// # Safety
 ///
