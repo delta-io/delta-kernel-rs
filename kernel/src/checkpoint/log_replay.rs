@@ -43,12 +43,12 @@ use crate::{DeltaResult, Error};
 /// replay) and applies deduplication logic for both file and non-file actions to
 /// produce the actions to include in a checkpoint.
 ///
-/// # File Action Filtering Rules
-/// Kept Actions:
+/// # File Action Filtering Rules:
+///   Kept Actions:
 /// - The first (newest) add action for each unique (path, dvId) pair
 /// - The first (newest) remove action for each unique (path, dvId) pair, but only if
 ///   its deletionTimestamp > minimumFileRetentionTimestamp
-/// Omitted Actions:
+///   Omitted Actions:
 /// - Any file action (add/remove) with the same (path, dvId) as a previously processed action
 /// - All remove actions with deletionTimestamp ≤ minimumFileRetentionTimestamp
 /// - All remove actions with missing deletionTimestamp (defaults to 0)
@@ -56,7 +56,7 @@ use crate::{DeltaResult, Error};
 /// The resulting filtered file actions represents files present in the table (add actions) and
 /// unexpired tombstones required for vacuum operations (remove actions).
 ///
-/// # Non-File Action Filtering
+/// # Non-File Action Filtering:
 /// - Keeps only the first protocol action (newest version)
 /// - Keeps only the first metadata action (most recent table metadata)
 /// - Keeps only the first txn action for each unique app ID
