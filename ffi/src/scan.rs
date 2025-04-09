@@ -142,12 +142,12 @@ pub struct SharedScanMetadataIterator;
 
 impl Drop for ScanMetadataIterator {
     fn drop(&mut self) {
-        debug!("dropping KernelScanMetadataIterator");
+        debug!("dropping ScanMetadataIterator");
     }
 }
 
 /// Get an iterator over the data needed to perform a scan. This will return a
-/// [`KernelScanMetadataIterator`] which can be passed to [`scan_metadata_next`] to get the
+/// [`ScanMetadataIterator`] which can be passed to [`scan_metadata_next`] to get the
 /// actual data in the iterator.
 ///
 /// # Safety
