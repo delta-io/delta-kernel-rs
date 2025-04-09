@@ -6,7 +6,7 @@
 //! typically from newest to oldest.
 //!
 //! Log replay is currently implemented for table scans, which filter and apply transformations
-//! to produce file actions which builds the view of the table state at a specific point in time.  
+//! to produce file actions which builds the view of the table state at a specific point in time.
 //! Future extensions will support additional log replay processors beyond the current use case.
 //! (e.g. checkpointing: filter actions to include only those needed to rebuild table state)
 //!
@@ -46,7 +46,7 @@ impl FileActionKey {
 /// significantly reducing memory usage for large Delta tables with extensive history.
 ///
 /// TODO: Modify deduplication to track only file paths instead of (path, dv_unique_id).
-/// More info here: https://github.com/delta-io/delta-kernel-rs/issues/701     
+/// More info here: https://github.com/delta-io/delta-kernel-rs/issues/701
 pub(crate) struct FileActionDeduplicator<'seen> {
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log for deduplication. This is a mutable reference to the set
@@ -208,23 +208,23 @@ impl<'seen> FileActionDeduplicator<'seen> {
 ///   processed by the processor, (if a filter is provided).
 ///
 /// Implementations:
-/// - `ScanLogReplayProcessor`: Used for table scans, this processor filters and selects deduplicated  
+/// - `ScanLogReplayProcessor`: Used for table scans, this processor filters and selects deduplicated
 ///   `Add` actions from log batches to reconstruct the view of the table at a specific point in time.
-///   Note that scans do not expose `Remove` actions. Data skipping may be applied when a predicate is  
+///   Note that scans do not expose `Remove` actions. Data skipping may be applied when a predicate is
 ///   provided.
 ///
-/// - `CheckpointLogReplayProcessor` (WIP): Will be responsible for processing log batches to construct  
-///   V1 spec checkpoint files. Unlike scans, checkpoint processing includes additional actions, such as  
-///   `Remove`, `Metadata`, and `Protocol`, required to fully reconstruct table state.  
+/// - `CheckpointLogReplayProcessor` (WIP): Will be responsible for processing log batches to construct
+///   V1 spec checkpoint files. Unlike scans, checkpoint processing includes additional actions, such as
+///   `Remove`, `Metadata`, and `Protocol`, required to fully reconstruct table state.
 ///   Data skipping is not applied during checkpoint processing.
 ///
 /// The `Output` type represents the material result of log replay, and it must implement the
 /// `HasSelectionVector` trait to allow filtering of irrelevant rows:
 ///
-/// - For **scans**, the output type is `ScanData`, which contains the file actions (`Add` actions) that
-///   need to be applied to build the table's view, accompanied by a **selection vector** that identifies
-///   which rows should be included. A transform vector may also be included to handle schema changes,
-///   such as renaming columns or modifying data types.
+/// - For **scans**, the output type is `ScanMetadata`, which contains the file actions (`Add`
+///   actions) that need to be applied to build the table's view, accompanied by a
+///   **selection vector** that identifies which rows should be included. A transform vector may
+///   also be included to handle schema changes, such as renaming columns or modifying data types.
 ///
 /// - For **checkpoints**, the output includes the actions necessary to write to the checkpoint file (`Add`,
 ///   `Remove`, `Metadata`, `Protocol` actions), filtered by the **selection vector** to determine which

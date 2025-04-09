@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock};
 use itertools::Itertools;
 
 use super::data_skipping::DataSkippingFilter;
-use super::{ScanData, Transform};
+use super::{ScanMetadata, Transform};
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{column_expr, column_name, ColumnName, Expression, ExpressionRef};
@@ -28,15 +28,16 @@ use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator};
 /// - Action Deduplication: Leverages the [`FileActionDeduplicator`] to ensure that for each unique file
 ///   (identified by its path and deletion vector unique ID), only the latest valid Add action is processed.
 /// - Transformation: Applies a built-in transformation (`add_transform`) to convert selected Add actions
-///   into [`ScanData`], the intermediate format passed to the engine.
+///   into [`ScanMetadata`], the intermediate format passed to the engine.
 /// - Row Transform Passthrough: Any user-provided row-level transformation expressions (e.g. those derived
 ///   from projection or filters) are preserved and passed through to the engine, which applies them as part
 ///   of its scan execution logic.
 ///
-/// As an implementation of [`LogReplayProcessor`], [`ScanLogReplayProcessor`] provides the `process_actions_batch`
-/// method, which applies these steps to each batch of log actions and produces a [`ScanData`] result. This result
-/// includes the transformed batch, a selection vector indicating which rows are valid, and any
-/// row-level transformation expressions that need to be applied to the selected rows.
+/// As an implementation of [`LogReplayProcessor`], [`ScanLogReplayProcessor`] provides the
+/// `process_actions_batch` method, which applies these steps to each batch of log actions and
+/// produces a [`ScanMetadata`] result. This result includes the transformed batch, a selection
+/// vector indicating which rows are valid, and any row-level transformation expressions that need
+/// to be applied to the selected rows.
 struct ScanLogReplayProcessor {
     partition_filter: Option<ExpressionRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
@@ -338,7 +339,7 @@ fn get_add_transform_expr() -> Expression {
 }
 
 impl LogReplayProcessor for ScanLogReplayProcessor {
-    type Output = ScanData;
+    type Output = ScanMetadata;
 
     fn process_actions_batch(
         &mut self,
@@ -363,7 +364,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 
         // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
         let result = self.add_transform.evaluate(actions_batch)?;
-        Ok(ScanData::new(
+        Ok(ScanMetadata::new(
             result,
             visitor.selection_vector,
             visitor.row_transform_exprs,
@@ -385,7 +386,7 @@ pub(crate) fn scan_action_iter(
     logical_schema: SchemaRef,
     transform: Option<Arc<Transform>>,
     physical_predicate: Option<(ExpressionRef, SchemaRef)>,
-) -> impl Iterator<Item = DeltaResult<ScanData>> {
+) -> impl Iterator<Item = DeltaResult<ScanMetadata>> {
     ScanLogReplayProcessor::new(engine, physical_predicate, logical_schema, transform)
         .process_actions_iter(action_iter)
 }
@@ -469,9 +470,9 @@ mod tests {
             None,
         );
         for res in iter {
-            let scan_data = res.unwrap();
+            let scan_metadata = res.unwrap();
             assert!(
-                scan_data.scan_file_transforms.is_empty(),
+                scan_metadata.scan_file_transforms.is_empty(),
                 "Should have no transforms"
             );
         }
@@ -518,8 +519,8 @@ mod tests {
         }
 
         for res in iter {
-            let scan_data = res.unwrap();
-            let transforms = scan_data.scan_file_transforms;
+            let scan_metadata = res.unwrap();
+            let transforms = scan_metadata.scan_file_transforms;
             // in this case we have a metadata action first and protocol 3rd, so we expect 4 items,
             // the first and 3rd being a `None`
             assert_eq!(transforms.len(), 4, "Should have 4 transforms");

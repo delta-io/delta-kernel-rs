@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::log_replay::SCAN_ROW_SCHEMA;
-use super::ScanData;
+use super::ScanMetadata;
 
 /// State that doesn't change between scans
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -153,15 +153,15 @@ pub type ScanCallback<T> = fn(
 /// ## Example
 /// ```ignore
 /// let mut context = [my context];
-/// for res in scan_data_iter { // scan data iterator from scan.scan_data()
-///     let scan_data = res?;
-///     context = scan_data.visit_scan_files(
+/// for res in scan_metadata_iter { // scan metadata iterator from scan.scan_metadata()
+///     let scan_metadata = res?;
+///     context = scan_metadata.visit_scan_files(
 ///        context,
 ///        my_callback,
 ///     )?;
 /// }
 /// ```
-impl ScanData {
+impl ScanMetadata {
     pub fn visit_scan_files<T>(&self, context: T, callback: ScanCallback<T>) -> DeltaResult<T> {
         let mut visitor = ScanFileVisitor {
             callback,
@@ -275,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn test_simple_visit_scan_data() {
+    fn test_simple_visit_scan_metadata() {
         let context = TestContext { id: 2 };
         run_with_validate_callback(
             vec![add_batch_simple(get_log_schema().clone())],

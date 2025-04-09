@@ -333,7 +333,7 @@ struct ScanFile {
     transform: Option<ExpressionRef>,
 }
 
-fn scan_data_callback(
+fn scan_metadata_callback(
     batches: &mut Vec<ScanFile>,
     path: &str,
     size: i64,
@@ -350,7 +350,7 @@ fn scan_data_callback(
     });
 }
 
-fn read_with_scan_data(
+fn read_with_scan_metadata(
     location: &Url,
     engine: &dyn Engine,
     scan: &Scan,
@@ -358,11 +358,11 @@ fn read_with_scan_data(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let global_state = scan.global_scan_state();
     let result_schema: ArrowSchemaRef = Arc::new(scan.schema().as_ref().try_into()?);
-    let scan_data = scan.scan_data(engine)?;
+    let scan_metadata = scan.scan_metadata(engine)?;
     let mut scan_files = vec![];
-    for data in scan_data {
-        let scan_data = data?;
-        scan_files = scan_data.visit_scan_files(scan_files, scan_data_callback)?;
+    for res in scan_metadata {
+        let scan_metadata = res?;
+        scan_files = scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)?;
     }
 
     let mut batches = vec![];
@@ -456,7 +456,7 @@ fn read_table_data(
             .build()?;
 
         sort_lines!(expected);
-        read_with_scan_data(table.location(), engine.as_ref(), &scan, &expected)?;
+        read_with_scan_metadata(table.location(), engine.as_ref(), &scan, &expected)?;
         read_with_execute(engine, &scan, &expected)?;
     }
     Ok(())
