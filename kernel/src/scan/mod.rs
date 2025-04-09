@@ -415,9 +415,9 @@ impl Scan {
             .collect()
     }
 
-    /// Get an iterator of [`EngineData`]s that should be included in scan for a query. This handles
-    /// log-replay, reconciling Add and Remove actions, and applying data skipping (if
-    /// possible). Each item in the returned iterator is a tuple of:
+    /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
+    /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
+    /// Each item in the returned iterator is a struct of:
     /// - `Box<dyn EngineData>`: Data in engine format, where each row represents a file to be
     ///   scanned. The schema for each row can be obtained by calling [`scan_row_schema`].
     /// - `Vec<bool>`: A selection vector. If a row is at index `i` and this vector is `false` at
