@@ -31,7 +31,6 @@
 //! let table_change_batches = table_changes_scan.execute(engine.clone())?;
 //! # Ok::<(), Error>(())
 //! ```
-use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use scan::TableChangesScanBuilder;
@@ -42,7 +41,7 @@ use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::{DataType, Schema, StructField, StructType};
 use crate::snapshot::Snapshot;
-use crate::table_features::{ColumnMappingMode, ReaderFeatures};
+use crate::table_features::{ColumnMappingMode, ReaderFeature};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, Version};
@@ -111,7 +110,7 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 pub struct TableChanges {
     pub(crate) log_segment: LogSegment,
     table_root: Url,
-    end_snapshot: Snapshot,
+    end_snapshot: Arc<Snapshot>,
     start_version: Version,
     schema: Schema,
 }
@@ -140,7 +139,7 @@ impl TableChanges {
     ) -> DeltaResult<Self> {
         let log_root = table_root.join("_delta_log/")?;
         let log_segment = LogSegment::for_table_changes(
-            engine.get_file_system_client().as_ref(),
+            engine.storage_handler().as_ref(),
             log_root,
             start_version,
             end_version,
@@ -149,9 +148,12 @@ impl TableChanges {
         // Both snapshots ensure that reading is supported at the start and end version using
         // `ensure_read_supported`. Note that we must still verify that reading is
         // supported for every protocol action in the CDF range.
-        let start_snapshot =
-            Snapshot::try_new(table_root.as_url().clone(), engine, Some(start_version))?;
-        let end_snapshot = Snapshot::try_new(table_root.as_url().clone(), engine, end_version)?;
+        let start_snapshot = Arc::new(Snapshot::try_new(
+            table_root.as_url().clone(),
+            engine,
+            Some(start_version),
+        )?);
+        let end_snapshot = Snapshot::try_new_from(start_snapshot.clone(), engine, end_version)?;
 
         // Verify CDF is enabled at the beginning and end of the interval using
         // [`check_cdf_table_properties`] to fail early. This also ensures that column mapping is
@@ -252,8 +254,8 @@ fn check_cdf_table_properties(table_properties: &TableProperties) -> DeltaResult
 /// Ensures that Change Data Feed is supported for a table with this [`Protocol`] .
 /// See the documentation of [`TableChanges`] for more details.
 fn ensure_cdf_read_supported(protocol: &Protocol) -> DeltaResult<()> {
-    static CDF_SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeatures>> =
-        LazyLock::new(|| HashSet::from([ReaderFeatures::DeletionVectors]));
+    static CDF_SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> =
+        LazyLock::new(|| vec![ReaderFeature::DeletionVectors]);
     match &protocol.reader_features() {
         // if min_reader_version = 3 and all reader features are subset of supported => OK
         Some(reader_features) if protocol.min_reader_version() == 3 => {

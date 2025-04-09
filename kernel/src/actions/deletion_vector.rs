@@ -10,7 +10,7 @@ use url::Url;
 use delta_kernel_derive::Schema;
 
 use crate::utils::require;
-use crate::{DeltaResult, Error, FileSystemClient};
+use crate::{DeltaResult, Error, StorageHandler};
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
 #[cfg_attr(test, derive(serde::Serialize), serde(rename_all = "camelCase"))]
@@ -66,7 +66,7 @@ impl DeletionVectorDescriptor {
                 let path_len = self.path_or_inline_dv.len();
                 require!(
                     path_len >= 20,
-                    Error::deletion_vector("Invalid length {path_len}, must be >= 20")
+                    Error::DeletionVector(format!("Invalid length {path_len}, must be >= 20"))
                 );
                 let prefix_len = path_len - 20;
                 let decoded = z85::decode(&self.path_or_inline_dv[prefix_len..])
@@ -104,7 +104,7 @@ impl DeletionVectorDescriptor {
     //  are present, we assert they are the same
     pub fn read(
         &self,
-        fs_client: Arc<dyn FileSystemClient>,
+        storage: Arc<dyn StorageHandler>,
         parent: &Url,
     ) -> DeltaResult<RoaringTreemap> {
         match self.absolute_path(parent)? {
@@ -125,7 +125,7 @@ impl DeletionVectorDescriptor {
                 let offset = self.offset;
                 let size_in_bytes = self.size_in_bytes;
 
-                let dv_data = fs_client
+                let dv_data = storage
                     .read_files(vec![(path, None)])?
                     .next()
                     .ok_or(Error::missing_data("No deletion vector data"))??;
@@ -178,10 +178,10 @@ impl DeletionVectorDescriptor {
     /// represents a row index that is deleted from the table.
     pub fn row_indexes(
         &self,
-        fs_client: Arc<dyn FileSystemClient>,
+        storage: Arc<dyn StorageHandler>,
         parent: &Url,
     ) -> DeltaResult<Vec<u64>> {
-        Ok(self.read(fs_client, parent)?.into_iter().collect())
+        Ok(self.read(storage, parent)?.into_iter().collect())
     }
 }
 
@@ -363,9 +363,9 @@ mod tests {
     fn test_inline_read() {
         let inline = dv_inline();
         let sync_engine = SyncEngine::new();
-        let fs_client = sync_engine.get_file_system_client();
+        let storage = sync_engine.storage_handler();
         let parent = Url::parse("http://not.used").unwrap();
-        let tree_map = inline.read(fs_client, &parent).unwrap();
+        let tree_map = inline.read(storage, &parent).unwrap();
         assert_eq!(tree_map.len(), 6);
         for i in [3, 4, 7, 11, 18, 29] {
             assert!(tree_map.contains(i));
@@ -381,10 +381,10 @@ mod tests {
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let parent = url::Url::from_directory_path(path).unwrap();
         let sync_engine = SyncEngine::new();
-        let fs_client = sync_engine.get_file_system_client();
+        let storage = sync_engine.storage_handler();
 
         let example = dv_example();
-        let tree_map = example.read(fs_client, &parent).unwrap();
+        let tree_map = example.read(storage, &parent).unwrap();
 
         let expected: Vec<u64> = vec![0, 9];
         let found = tree_map.iter().collect::<Vec<_>>();
@@ -441,9 +441,9 @@ mod tests {
     fn test_dv_row_indexes() {
         let example = dv_inline();
         let sync_engine = SyncEngine::new();
-        let fs_client = sync_engine.get_file_system_client();
+        let storage = sync_engine.storage_handler();
         let parent = Url::parse("http://not.used").unwrap();
-        let row_idx = example.row_indexes(fs_client, &parent).unwrap();
+        let row_idx = example.row_indexes(storage, &parent).unwrap();
 
         assert_eq!(row_idx.len(), 6);
         assert_eq!(&row_idx, &[3, 4, 7, 11, 18, 29]);

@@ -69,8 +69,8 @@ impl DvInfo {
         self.deletion_vector
             .as_ref()
             .map(|dv_descriptor| {
-                let fs_client = engine.get_file_system_client();
-                dv_descriptor.read(fs_client, table_root)
+                let storage = engine.storage_handler();
+                dv_descriptor.read(storage, table_root)
             })
             .transpose()
     }
@@ -93,8 +93,8 @@ impl DvInfo {
         self.deletion_vector
             .as_ref()
             .map(|dv| {
-                let fs_client = engine.get_file_system_client();
-                dv.row_indexes(fs_client, table_root)
+                let storage = engine.storage_handler();
+                dv.row_indexes(storage, table_root)
             })
             .transpose()
     }
@@ -111,8 +111,8 @@ pub fn transform_to_logical(
 ) -> DeltaResult<Box<dyn EngineData>> {
     match transform {
         Some(ref transform) => engine
-            .get_expression_handler()
-            .get_evaluator(
+            .evaluation_handler()
+            .new_expression_evaluator(
                 physical_schema.clone(),
                 transform.as_ref().clone(), // TODO: Maybe eval should take a ref
                 logical_schema.clone().into(),
@@ -136,12 +136,13 @@ pub type ScanCallback<T> = fn(
 /// scan.
 ///
 /// The arguments to the callback are:
-/// * `context`: an `&mut context` argument. this can be anything that engine needs to pass through to each call
+/// * `context`: an `&mut context` argument. this can be anything that engine needs to pass through
+///   to each call
 /// * `path`: a `&str` which is the path to the file
 /// * `size`: an `i64` which is the size of the file
 /// * `dv_info`: a [`DvInfo`] struct, which allows getting the selection vector for this file
-/// * `transform`: An optional expression that, if present, _must_ be applied to physical data to convert it to
-///                the correct logical format
+/// * `transform`: An optional expression that, if present, _must_ be applied to physical data to
+///   convert it to the correct logical format
 /// * `partition_values`: a `HashMap<String, String>` which are partition values
 ///
 /// ## Context

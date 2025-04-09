@@ -378,7 +378,7 @@ fn read_with_scan_data(
             location: file_path,
         };
         let read_results = engine
-            .get_parquet_handler()
+            .parquet_handler()
             .read_parquet_files(
                 &[meta],
                 global_state.physical_schema.clone(),

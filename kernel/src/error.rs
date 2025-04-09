@@ -198,6 +198,12 @@ pub enum Error {
     /// Invalid checkpoint files
     #[error("Invalid Checkpoint: {0}")]
     InvalidCheckpoint(String),
+
+    /// Error while transforming a schema + leaves into an Expression of literals
+    #[error(transparent)]
+    LiteralExpressionTransformError(
+        #[from] crate::expressions::literal_expression_transform::Error,
+    ),
 }
 
 // Convenience constructors for Error types that take a String argument

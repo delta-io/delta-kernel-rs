@@ -291,6 +291,11 @@ impl StructType {
         self.fields.values()
     }
 
+    pub(crate) fn fields_len(&self) -> usize {
+        // O(1) for indexmap
+        self.fields.len()
+    }
+
     // Checks if the `StructType` contains a field with the specified name.
     pub(crate) fn contains(&self, name: impl AsRef<str>) -> bool {
         self.fields.contains_key(name.as_ref())
@@ -1246,6 +1251,26 @@ mod tests {
             MetadataValue::Other(array_json).to_string(),
             "[\"an\",\"array\"]"
         );
+    }
+
+    #[test]
+    fn test_fields_len() {
+        let schema = StructType::new([]);
+        assert!(schema.fields_len() == 0);
+        let schema = StructType::new([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", DataType::LONG),
+            StructField::nullable("c", DataType::LONG),
+            StructField::nullable("d", DataType::LONG),
+        ]);
+        assert_eq!(schema.fields_len(), 4);
+        let schema = StructType::new([
+            StructField::nullable("b", DataType::LONG),
+            StructField::not_null("b", DataType::LONG),
+            StructField::nullable("c", DataType::LONG),
+            StructField::nullable("c", DataType::LONG),
+        ]);
+        assert_eq!(schema.fields_len(), 2);
     }
 
     #[test]

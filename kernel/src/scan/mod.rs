@@ -14,6 +14,7 @@ use crate::actions::deletion_vector::{
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ColumnName, Expression, ExpressionRef, ExpressionTransform, Scalar};
+use crate::log_replay::HasSelectionVector;
 use crate::predicates::{DefaultPredicateEvaluator, EmptyColumnResolver};
 use crate::scan::state::{DvInfo, Stats};
 use crate::schema::{
@@ -351,6 +352,13 @@ impl ScanData {
         &self.scan_files.selection_vector
     }
 }
+
+impl HasSelectionVector for ScanData {
+    fn has_selected_rows(&self) -> bool {
+        self.scan_files.selection_vector.contains(&true)
+    }
+}
+
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
 pub struct Scan {
@@ -416,12 +424,12 @@ impl Scan {
     ///   `filter_record_batch`, you _need_ to extend this vector to the full length of the batch or
     ///   arrow will drop the extra rows.
     /// - `Vec<Option<Expression>>`: Transformation expressions that need to be applied. For each
-    ///    row at index `i` in the above data, if an expression exists at index `i` in the `Vec`,
-    ///    the associated expression _must_ be applied to the data read from the file specified by
-    ///    the row. The resultant schema for this expression is guaranteed to be `Scan.schema()`. If
-    ///    the item at index `i` in this `Vec` is `None`, or if the `Vec` contains fewer than `i`
-    ///    elements, no expression need be applied and the data read from disk is already in the
-    ///    correct logical state.
+    ///   row at index `i` in the above data, if an expression exists at index `i` in the `Vec`,
+    ///   the associated expression _must_ be applied to the data read from the file specified by
+    ///   the row. The resultant schema for this expression is guaranteed to be `Scan.schema()`. If
+    ///   the item at index `i` in this `Vec` is `None`, or if the `Vec` contains fewer than `i`
+    ///   elements, no expression need be applied and the data read from disk is already in the
+    ///   correct logical state.
     pub fn scan_data(
         &self,
         engine: &dyn Engine,
@@ -547,7 +555,7 @@ impl Scan {
                 // partition columns, but the read schema we use here does _NOT_ include partition
                 // columns. So we cannot safely assume that all column references are valid. See
                 // https://github.com/delta-io/delta-kernel-rs/issues/434 for more details.
-                let read_result_iter = engine.get_parquet_handler().read_parquet_files(
+                let read_result_iter = engine.parquet_handler().read_parquet_files(
                     &[meta],
                     global_state.physical_schema.clone(),
                     physical_predicate.clone(),
@@ -677,16 +685,16 @@ pub fn selection_vector(
     descriptor: &DeletionVectorDescriptor,
     table_root: &Url,
 ) -> DeltaResult<Vec<bool>> {
-    let fs_client = engine.get_file_system_client();
-    let dv_treemap = descriptor.read(fs_client, table_root)?;
+    let storage = engine.storage_handler();
+    let dv_treemap = descriptor.read(storage, table_root)?;
     Ok(deletion_treemap_to_bools(dv_treemap))
 }
 
 // some utils that are used in file_stream.rs and state.rs tests
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use crate::arrow::array::{RecordBatch, StringArray};
-    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use crate::arrow::array::StringArray;
+    use crate::utils::test_utils::string_array_to_engine_data;
     use itertools::Itertools;
     use std::sync::Arc;
 
@@ -698,19 +706,10 @@ pub(crate) mod test_utils {
         },
         scan::log_replay::scan_action_iter,
         schema::SchemaRef,
-        EngineData, JsonHandler,
+        JsonHandler,
     };
 
     use super::{state::ScanCallback, Transform};
-
-    // TODO(nick): Merge all copies of this into one "test utils" thing
-    fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
-        let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
-        let schema = Arc::new(ArrowSchema::new(vec![string_field]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
-            .expect("Can't convert to record batch");
-        Box::new(ArrowEngineData::new(batch))
-    }
 
     // Generates a batch of sidecar actions with the given paths.
     // The schema is provided as null columns affect equality checks.
