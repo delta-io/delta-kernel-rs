@@ -30,25 +30,25 @@ use super::handle::Handle;
 pub struct SharedScan;
 
 #[handle_descriptor(target=ScanData, mutable=false, sized=true)]
-pub struct CScanData;
+pub struct SharedScanData;
 
-/// Drop a `CScanData`.
+/// Drop a `SharedScanData`.
 ///
 /// # Safety
 ///
 /// Caller is responsible for passing a valid scan data handle.
 #[no_mangle]
-pub unsafe extern "C" fn free_scan_data(scan_data: Handle<CScanData>) {
+pub unsafe extern "C" fn free_scan_data(scan_data: Handle<SharedScanData>) {
     scan_data.drop_handle();
 }
 
-/// Get a selection vector out of a [`CScanData`] struct
+/// Get a selection vector out of a [`SharedScanData`] struct
 ///
 /// # Safety
 /// Engine is responsible for providing valid pointers for each argument
 #[no_mangle]
 pub unsafe extern "C" fn selection_vector_from_scan_data(
-    scan_data: Handle<CScanData>,
+    scan_data: Handle<SharedScanData>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<KernelBoolSlice> {
     let scan_data = unsafe { scan_data.as_ref() };
@@ -206,7 +206,7 @@ fn kernel_scan_data_init_impl(
 }
 
 /// Call the provided `engine_visitor` on the next scan data item. The visitor will be provided with
-/// a [`CScanData`], which contains the actual scan files and the associated selection vector. It is the
+/// a [`SharedScanData`], which contains the actual scan files and the associated selection vector. It is the
 ///  responsibility of the _engine_ to free the associated resources after use by calling
 /// [`free_engine_data`] and [`free_bool_slice`] respectively.
 ///
@@ -221,7 +221,7 @@ fn kernel_scan_data_init_impl(
 pub unsafe extern "C" fn kernel_scan_data_next(
     data: Handle<SharedScanDataIterator>,
     engine_context: NullableCvoid,
-    engine_visitor: extern "C" fn(engine_context: NullableCvoid, scan_data: Handle<CScanData>),
+    engine_visitor: extern "C" fn(engine_context: NullableCvoid, scan_data: Handle<SharedScanData>),
 ) -> ExternResult<bool> {
     let data = unsafe { data.as_ref() };
     kernel_scan_data_next_impl(data, engine_context, engine_visitor)
@@ -230,7 +230,7 @@ pub unsafe extern "C" fn kernel_scan_data_next(
 fn kernel_scan_data_next_impl(
     data: &KernelScanDataIterator,
     engine_context: NullableCvoid,
-    engine_visitor: extern "C" fn(engine_context: NullableCvoid, scan_data: Handle<CScanData>),
+    engine_visitor: extern "C" fn(engine_context: NullableCvoid, scan_data: Handle<SharedScanData>),
 ) -> DeltaResult<bool> {
     let mut data = data
         .data
@@ -440,13 +440,13 @@ struct ContextWrapper {
 }
 
 /// Shim for ffi to call visit_scan_data. This will generally be called when iterating through scan
-/// data which provides the [`CScanData`] as each element in the iterator.
+/// data which provides the [`SharedScanData`] as each element in the iterator.
 ///
 /// # Safety
-/// engine is responsible for passing a valid [`CScanData`].
+/// engine is responsible for passing a valid [`SharedScanData`].
 #[no_mangle]
 pub unsafe extern "C" fn visit_scan_data(
-    scan_data: Handle<CScanData>,
+    scan_data: Handle<SharedScanData>,
     engine_context: NullableCvoid,
     callback: CScanCallback,
 ) {

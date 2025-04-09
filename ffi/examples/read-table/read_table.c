@@ -85,7 +85,7 @@ void scan_row_callback(
 
 // For each chunk of scan data (which may contain multiple files to scan), kernel will call this
 // function (named do_visit_scan_data to avoid conflict with visit_scan_data exported by kernel)
-void do_visit_scan_data(void* engine_context, HandleCScanData scan_data) {
+void do_visit_scan_data(void* engine_context, HandleSharedScanData scan_data) {
   print_diag("\nScan iterator found some data to read\n  Of this data, here is "
              "a selection vector\n");
   struct EngineContext* context = engine_context;
