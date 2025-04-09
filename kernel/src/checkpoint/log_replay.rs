@@ -218,11 +218,12 @@ impl CheckpointVisitor<'_> {
         }
 
         // minReaderVersion is a required field, so we check for its presence to determine if this is a protocol action.
-        match getter.get_int(i, Self::PROTOCOL_MIN_READER_VERSION)? {
-            Some(_) => (),            // It is a protocol action
-            None => return Ok(false), // Not a protocol action
-        };
-
+        if getter
+            .get_int(i, Self::PROTOCOL_MIN_READER_VERSION)?
+            .is_none()
+        {
+            return Ok(false); // Not a protocol action
+        }
         // Valid, non-duplicate protocol action to be included
         self.seen_protocol = true;
         self.total_non_file_actions += 1;
@@ -245,10 +246,9 @@ impl CheckpointVisitor<'_> {
         }
 
         // id is a required field, so we check for its presence to determine if this is a metadata action.
-        match getter.get_str(i, Self::METADATA_ID)? {
-            Some(_) => (),            // It is a metadata action
-            None => return Ok(false), // Not a metadata action
-        };
+        if getter.get_int(i, Self::METADATA_ID)?.is_none() {
+            return Ok(false); // Not a metadata action
+        }
 
         // Valid, non-duplicate metadata action to be included
         self.seen_metadata = true;
@@ -263,9 +263,8 @@ impl CheckpointVisitor<'_> {
     /// Returns Err(...) if there was an error processing the action.
     fn check_txn_action<'a>(&mut self, i: usize, getter: &'a dyn GetData<'a>) -> DeltaResult<bool> {
         // Check for txn field
-        let app_id = match getter.get_str(i, "txn.appId")? {
-            Some(id) => id,
-            None => return Ok(false), // Not a txn action
+        let Some(app_id) = getter.get_str(i, "txn.appId")? else {
+            return Ok(false); // Not a txn action
         };
 
         // If the app ID already exists in the set, the insertion will return false,
