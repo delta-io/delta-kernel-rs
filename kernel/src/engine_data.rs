@@ -7,7 +7,12 @@ use tracing::debug;
 
 use std::collections::HashMap;
 
-/// Engine data paired with a selection vector that indicates which rows to process.
+/// Engine data paired with a selection vector indicating which rows are logically selected.
+///
+/// A value of `true` in the selection vector means the corresponding row is selected (i.e., not deleted),
+/// while `false` means the row is logically deleted and should be ignored.
+///
+/// Interpreting unselected (`false`) rows will result in incorrect/undefined behavior.
 pub struct FilteredEngineData {
     // The underlying engine data
     pub data: Box<dyn EngineData>,

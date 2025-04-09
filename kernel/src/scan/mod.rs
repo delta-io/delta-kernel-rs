@@ -323,32 +323,32 @@ pub(crate) enum TransformExpr {
 
 /// Result of a data scan operation containing filtered data and associated transformations.
 pub struct ScanData {
-    /// Engine data with its selection vector indicating relevant rows
-    pub filtered_data: FilteredEngineData,
+    /// Filtered engine data with one row per file to scan (and only selected rows should be scanned)
+    pub scan_files: FilteredEngineData,
 
     /// Row-level transformations where each expression must be applied to its corresponding row in
-    /// the `filtered_data`. If an expression is `None`, no transformation is needed for that row.
-    pub transforms: Vec<Option<ExpressionRef>>,
+    /// the `scan_files`. If an expression is `None`, no transformation is needed for that row.
+    pub scan_file_transforms: Vec<Option<ExpressionRef>>,
 }
 
 impl ScanData {
-    pub fn new(
+    fn new(
         data: Box<dyn EngineData>,
         selection_vector: Vec<bool>,
-        transforms: Vec<Option<ExpressionRef>>,
+        scan_file_transforms: Vec<Option<ExpressionRef>>,
     ) -> Self {
         Self {
-            filtered_data: FilteredEngineData {
+            scan_files: FilteredEngineData {
                 data,
                 selection_vector,
             },
-            transforms,
+            scan_file_transforms,
         }
     }
 
     // Get a reference to the selection vector
     pub fn selection_vector(&self) -> &Vec<bool> {
-        &self.filtered_data.selection_vector
+        &self.scan_files.selection_vector
     }
 }
 /// The result of building a scan over a table. This can be used to get the actual data from

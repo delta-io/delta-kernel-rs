@@ -164,11 +164,11 @@ impl ScanData {
     pub fn visit_scan_files<T>(&self, context: T, callback: ScanCallback<T>) -> DeltaResult<T> {
         let mut visitor = ScanFileVisitor {
             callback,
-            selection_vector: &self.filtered_data.selection_vector,
-            transforms: &self.transforms,
+            selection_vector: &self.scan_files.selection_vector,
+            transforms: &self.scan_file_transforms,
             context,
         };
-        visitor.visit_rows_of(self.filtered_data.data.as_ref())?;
+        visitor.visit_rows_of(self.scan_files.data.as_ref())?;
         Ok(visitor.context)
     }
 }

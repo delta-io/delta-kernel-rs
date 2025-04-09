@@ -473,7 +473,10 @@ mod tests {
         );
         for res in iter {
             let scan_data = res.unwrap();
-            assert!(scan_data.transforms.is_empty(), "Should have no transforms");
+            assert!(
+                scan_data.scan_file_transforms.is_empty(),
+                "Should have no transforms"
+            );
         }
     }
 
@@ -519,7 +522,7 @@ mod tests {
 
         for res in iter {
             let scan_data = res.unwrap();
-            let transforms = scan_data.transforms;
+            let transforms = scan_data.scan_file_transforms;
             // in this case we have a metadata action first and protocol 3rd, so we expect 4 items,
             // the first and 3rd being a `None`
             assert_eq!(transforms.len(), 4, "Should have 4 transforms");
