@@ -327,8 +327,14 @@ pub struct ScanData {
     /// Filtered engine data with one row per file to scan (and only selected rows should be scanned)
     pub scan_files: FilteredEngineData,
 
-    /// Row-level transformations where each expression must be applied to its corresponding row in
-    /// the `scan_files`. If an expression is `None`, no transformation is needed for that row.
+    /// Row-level transformations to apply to data read from files.
+    ///
+    /// Each entry in this vector corresponds to a row in the `scan_files` data. The entry is an
+    /// optional expression that must be applied to convert the file's data into the logical schema
+    /// expected by the scan:
+    ///
+    /// - `Some(expr)`: Apply this expression to transform the data to match `Scan.schema()`.
+    /// - `None`: No transformation is needed; the data is already in the correct logical form.
     pub scan_file_transforms: Vec<Option<ExpressionRef>>,
 }
 
