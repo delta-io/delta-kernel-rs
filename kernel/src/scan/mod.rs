@@ -323,9 +323,9 @@ pub(crate) enum TransformExpr {
 
 // TODO(nick): Make this a struct in a follow-on PR
 // (data, deletion_vec, transforms)
-pub type ScanData = (Box<dyn EngineData>, Vec<bool>, Vec<Option<ExpressionRef>>);
+pub type ScanFiles = (Box<dyn EngineData>, Vec<bool>, Vec<Option<ExpressionRef>>);
 
-impl HasSelectionVector for ScanData {
+impl HasSelectionVector for ScanFiles {
     fn has_selected_rows(&self) -> bool {
         self.1.contains(&true)
     }
@@ -405,7 +405,7 @@ impl Scan {
     pub fn scan_data(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanData>>> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanFiles>>> {
         // Compute the static part of the transformation. This is `None` if no transformation is
         // needed (currently just means no partition cols AND no column mapping but will be extended
         // for other transforms as we support them)

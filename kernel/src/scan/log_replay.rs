@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock};
 use itertools::Itertools;
 
 use super::data_skipping::DataSkippingFilter;
-use super::{ScanData, Transform};
+use super::{ScanFiles, Transform};
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{column_expr, column_name, ColumnName, Expression, ExpressionRef};
@@ -338,7 +338,7 @@ fn get_add_transform_expr() -> Expression {
 }
 
 impl LogReplayProcessor for ScanLogReplayProcessor {
-    type Output = ScanData;
+    type Output = ScanFiles;
 
     fn process_actions_batch(
         &mut self,
@@ -385,7 +385,7 @@ pub(crate) fn scan_action_iter(
     logical_schema: SchemaRef,
     transform: Option<Arc<Transform>>,
     physical_predicate: Option<(ExpressionRef, SchemaRef)>,
-) -> impl Iterator<Item = DeltaResult<ScanData>> {
+) -> impl Iterator<Item = DeltaResult<ScanFiles>> {
     ScanLogReplayProcessor::new(engine, physical_predicate, logical_schema, transform)
         .process_actions_iter(action_iter)
 }

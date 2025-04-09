@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use delta_kernel::scan::state::{visit_scan_files, DvInfo, GlobalScanState};
-use delta_kernel::scan::{Scan, ScanData};
+use delta_kernel::scan::{Scan, ScanFiles};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Error, Expression, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -129,7 +129,7 @@ pub struct KernelScanDataIterator {
     // Mutex -> Allow the iterator to be accessed safely by multiple threads.
     // Box -> Wrap its unsized content this struct is fixed-size with thin pointers.
     // Item = DeltaResult<ScanData>
-    data: Mutex<Box<dyn Iterator<Item = DeltaResult<ScanData>> + Send>>,
+    data: Mutex<Box<dyn Iterator<Item = DeltaResult<ScanFiles>> + Send>>,
 
     // Also keep a reference to the external engine for its error allocator. The default Parquet and
     // Json handlers don't hold any reference to the tokio reactor they rely on, so the iterator
