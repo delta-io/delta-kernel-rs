@@ -4,9 +4,9 @@
 #include <sys/time.h>
 
 #include "arrow.h"
-#include "kernel_utils.h"
 #include "read_table.h"
 #include "schema.h"
+#include "kernel_utils.h"
 
 // Print the content of a selection vector if `VERBOSE` is defined in read_table.h
 void print_selection_vector(const char* indent, const KernelBoolSlice* selection_vec)
@@ -20,6 +20,7 @@ void print_selection_vector(const char* indent, const KernelBoolSlice* selection
   (void)selection_vec;
 #endif
 }
+
 // Print info about table partitions if `VERBOSE` is defined in read_table.h
 void print_partition_info(struct EngineContext* context, const CStringMap* partition_values)
 {
@@ -40,6 +41,7 @@ void print_partition_info(struct EngineContext* context, const CStringMap* parti
   (void)partition_values;
 #endif
 }
+
 // Kernel will call this function for each file that should be scanned. The arguments include enough
 // context to construct the correct logical data from the physically read parquet
 void scan_row_callback(
@@ -53,11 +55,7 @@ void scan_row_callback(
 {
   (void)size; // not using this at the moment
   struct EngineContext* context = engine_context;
-  print_diag(
-    "Called back to read file: %.*s. (size: %" PRIu64 ", num records: ",
-    (int)path.len,
-    path.ptr,
-    size);
+  print_diag("Called back to read file: %.*s. (size: %" PRIu64 ", num records: ", (int)path.len, path.ptr, size);
   if (stats) {
     print_diag("%" PRId64 ")\n", stats->num_records);
   } else {
@@ -93,9 +91,8 @@ void do_visit_scan_data(
   KernelBoolSlice selection_vec,
   const CTransforms* transforms)
 {
-  print_diag(
-    "\nScan iterator found some data to read\n  Of this data, here is "
-    "a selection vector\n");
+  print_diag("\nScan iterator found some data to read\n  Of this data, here is "
+             "a selection vector\n");
   struct EngineContext* context = engine_context;
 
   ExternResultKernelBoolSlice selection_vector_res =
@@ -159,8 +156,7 @@ PartitionList* get_partition_list(SharedSnapshot* snapshot)
   return list;
 }
 
-void free_partition_list(PartitionList* list)
-{
+void free_partition_list(PartitionList* list) {
   for (uintptr_t i = 0; i < list->len; i++) {
     free(list->cols[i]);
   }
@@ -168,20 +164,21 @@ void free_partition_list(PartitionList* list)
   free(list);
 }
 
-static const char* LEVEL_STRING[] = { "ERROR", "WARN", "INFO", "DEBUG", "TRACE" };
+static const char *LEVEL_STRING[] = {
+  "ERROR", "WARN", "INFO", "DEBUG", "TRACE"
+};
 
 // define some ansi color escapes so we can have nice colored output in our logs
-#define RED "\x1b[31m"
-#define BLUE "\x1b[34m"
-#define DIM "\x1b[2m"
+#define RED   "\x1b[31m"
+#define BLUE  "\x1b[34m"
+#define DIM   "\x1b[2m"
 #define RESET "\x1b[0m"
 
-void tracing_callback(struct Event event)
-{
+void tracing_callback(struct Event event) {
   struct timeval tv;
   char buffer[32];
   gettimeofday(&tv, NULL);
-  struct tm* tm_info = gmtime(&tv.tv_sec);
+  struct tm *tm_info = gmtime(&tv.tv_sec);
   strftime(buffer, 26, "%Y-%m-%dT%H:%M:%S", tm_info);
   char* level_color = event.level < 3 ? RED : BLUE;
   printf(
@@ -200,12 +197,17 @@ void tracing_callback(struct Event event)
     (int)event.message.len,
     event.message.ptr);
   if (event.file.ptr) {
-    printf("  %sat%s %.*s:%i\n", DIM, RESET, (int)event.file.len, event.file.ptr, event.line);
+    printf(
+      "  %sat%s %.*s:%i\n",
+      DIM,
+      RESET,
+      (int)event.file.len,
+      event.file.ptr,
+      event.line);
   }
 }
 
-void log_line_callback(KernelStringSlice line)
-{
+void log_line_callback(KernelStringSlice line) {
   printf("%.*s", (int)line.len, line.ptr);
 }
 
