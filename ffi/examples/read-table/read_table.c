@@ -85,12 +85,7 @@ void scan_row_callback(
 
 // For each chunk of scan data (which may contain multiple files to scan), kernel will call this
 // function (named do_visit_scan_data to avoid conflict with visit_scan_data exported by kernel)
-void do_visit_scan_data(
-  void* engine_context,
-  ExclusiveEngineData* engine_data,
-  KernelBoolSlice selection_vec,
-  const CTransforms* transforms)
-{
+void do_visit_scan_data(void* engine_context, HandleCScanData scan_data) {
   print_diag("\nScan iterator found some data to read\n  Of this data, here is "
              "a selection vector\n");
   struct EngineContext* context = engine_context;
@@ -104,7 +99,6 @@ void do_visit_scan_data(
   KernelBoolSlice selection_vector = selection_vector_res.ok;
   print_selection_vector("    ", &selection_vector);
 
-  // TODO! print selection vector
   // Ask kernel to iterate each individual file and call us back with extracted metadata
   print_diag("Asking kernel to call us back for each scan row (file to read)\n");
   visit_scan_data(scan_data, engine_context, scan_row_callback);
