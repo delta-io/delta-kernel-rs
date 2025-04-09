@@ -24,7 +24,7 @@ use crate::{
 use super::handle::Handle;
 
 // TODO: Why do we even need to expose a scan, when the only thing an engine can do with it is
-// handit back to the kernel by calling `kernel_scan_data_init`? There isn't even an FFI method to
+// handit back to the kernel by calling `kernel_scan_metadata_init`? There isn't even an FFI method to
 // drop it!
 #[handle_descriptor(target=Scan, mutable=false, sized=true)]
 pub struct SharedScan;
@@ -147,29 +147,29 @@ impl Drop for KernelScanDataIterator {
 }
 
 /// Get an iterator over the data needed to perform a scan. This will return a
-/// [`KernelScanDataIterator`] which can be passed to [`kernel_scan_data_next`] to get the actual
+/// [`KernelScanDataIterator`] which can be passed to [`kernel_scan_metadata_next`] to get the actual
 /// data in the iterator.
 ///
 /// # Safety
 ///
 /// Engine is responsible for passing a valid [`SharedExternEngine`] and [`SharedScan`]
 #[no_mangle]
-pub unsafe extern "C" fn kernel_scan_data_init(
+pub unsafe extern "C" fn kernel_scan_metadata_init(
     engine: Handle<SharedExternEngine>,
     scan: Handle<SharedScan>,
 ) -> ExternResult<Handle<SharedScanDataIterator>> {
     let engine = unsafe { engine.clone_as_arc() };
     let scan = unsafe { scan.as_ref() };
-    kernel_scan_data_init_impl(&engine, scan).into_extern_result(&engine.as_ref())
+    kernel_scan_metadata_init_impl(&engine, scan).into_extern_result(&engine.as_ref())
 }
 
-fn kernel_scan_data_init_impl(
+fn kernel_scan_metadata_init_impl(
     engine: &Arc<dyn ExternEngine>,
     scan: &Scan,
 ) -> DeltaResult<Handle<SharedScanDataIterator>> {
-    let scan_data = scan.scan_data(engine.engine().as_ref())?;
+    let scan_metadata = scan.scan_metadata(engine.engine().as_ref())?;
     let data = KernelScanDataIterator {
-        data: Mutex::new(Box::new(scan_data)),
+        data: Mutex::new(Box::new(scan_metadata)),
         engine: engine.clone(),
     };
     Ok(Arc::new(data).into())
@@ -181,13 +181,13 @@ fn kernel_scan_data_init_impl(
 ///
 /// # Safety
 ///
-/// The iterator must be valid (returned by [kernel_scan_data_init]) and not yet freed by
-/// [`free_kernel_scan_data`]. The visitor function pointer must be non-null.
+/// The iterator must be valid (returned by [kernel_scan_metadata_init]) and not yet freed by
+/// [`free_scan_metadata`]. The visitor function pointer must be non-null.
 ///
 /// [`free_bool_slice`]: crate::free_bool_slice
 /// [`free_engine_data`]: crate::free_engine_data
 #[no_mangle]
-pub unsafe extern "C" fn kernel_scan_data_next(
+pub unsafe extern "C" fn kernel_scan_metadata_next(
     data: Handle<SharedScanDataIterator>,
     engine_context: NullableCvoid,
     engine_visitor: extern "C" fn(
@@ -198,10 +198,10 @@ pub unsafe extern "C" fn kernel_scan_data_next(
     ),
 ) -> ExternResult<bool> {
     let data = unsafe { data.as_ref() };
-    kernel_scan_data_next_impl(data, engine_context, engine_visitor)
+    kernel_scan_metadata_next_impl(data, engine_context, engine_visitor)
         .into_extern_result(&data.engine.as_ref())
 }
-fn kernel_scan_data_next_impl(
+fn kernel_scan_metadata_next_impl(
     data: &KernelScanDataIterator,
     engine_context: NullableCvoid,
     engine_visitor: extern "C" fn(
@@ -228,11 +228,11 @@ fn kernel_scan_data_next_impl(
 /// # Safety
 ///
 /// Caller is responsible for (at most once) passing a valid pointer returned by a call to
-/// [`kernel_scan_data_init`].
+/// [`kernel_scan_metadata_init`].
 // we should probably be consistent with drop vs. free on engine side (probably the latter is more
 // intuitive to non-rust code)
 #[no_mangle]
-pub unsafe extern "C" fn free_kernel_scan_data(data: Handle<SharedScanDataIterator>) {
+pub unsafe extern "C" fn free_scan_metadata(data: Handle<SharedScanDataIterator>) {
     data.drop_handle();
 }
 
@@ -304,7 +304,7 @@ pub unsafe extern "C" fn get_from_string_map(
 /// `get_transform_for_row` returns `NULL` no expression need be applied and the data read from disk
 /// is already in the correct logical state.
 ///
-/// NB: If you are using `visit_scan_data` you don't need to worry about dealing with probing
+/// NB: If you are using `visit_scan_metadata` you don't need to worry about dealing with probing
 /// `CTransforms`. The callback will be invoked with the correct transform for you.
 pub struct CTransforms {
     transforms: Vec<Option<ExpressionRef>>,
@@ -420,13 +420,13 @@ struct ContextWrapper {
     callback: CScanCallback,
 }
 
-/// Shim for ffi to call visit_scan_data. This will generally be called when iterating through scan
+/// Shim for ffi to call visit_scan_metadata. This will generally be called when iterating through scan
 /// data which provides the data handle and selection vector as each element in the iterator.
 ///
 /// # Safety
 /// engine is responsible for passing a valid [`ExclusiveEngineData`] and selection vector.
 #[no_mangle]
-pub unsafe extern "C" fn visit_scan_data(
+pub unsafe extern "C" fn visit_scan_metadata(
     data: Handle<ExclusiveEngineData>,
     selection_vec: KernelBoolSlice,
     transforms: &CTransforms,

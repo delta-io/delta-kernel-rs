@@ -28,20 +28,20 @@ use itertools::Itertools;
 mod tests;
 
 /// Scan data for a Change Data Feed query. This holds metadata that is needed to read data rows.
-pub(crate) struct TableChangesScanData {
+pub(crate) struct TableChangesScanMetadata {
     /// Engine data with the schema defined in [`scan_row_schema`]
     ///
     /// Note: The schema of the engine data will be updated in the future to include columns
     /// used by Change Data Feed.
-    pub(crate) scan_data: Box<dyn EngineData>,
-    /// The selection vector used to filter the `scan_data`.
+    pub(crate) scan_metadata: Box<dyn EngineData>,
+    /// The selection vector used to filter the `scan_metadata`.
     pub(crate) selection_vector: Vec<bool>,
     /// A map from a remove action's path to its deletion vector
     pub(crate) remove_dvs: Arc<HashMap<String, DvInfo>>,
 }
 
 /// Given an iterator of [`ParsedLogPath`] returns an iterator of [`TableChangesScanData`].
-/// Each row that is selected in the returned `TableChangesScanData.scan_data` (according
+/// Each row that is selected in the returned `TableChangesScanData.scan_metadata` (according
 /// to the `selection_vector` field) _must_ be processed to complete the scan. Non-selected
 /// rows _must_ be ignored.
 ///
@@ -52,7 +52,7 @@ pub(crate) fn table_changes_action_iter(
     commit_files: impl IntoIterator<Item = ParsedLogPath>,
     table_schema: SchemaRef,
     physical_predicate: Option<(ExpressionRef, SchemaRef)>,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanData>>> {
+) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
     let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
     let result = commit_files
         .into_iter()
@@ -215,7 +215,7 @@ impl LogReplayScanner {
         self,
         engine: Arc<dyn Engine>,
         filter: Option<Arc<DataSkippingFilter>>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanData>>> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
         let Self {
             has_cdc_action,
             remove_dvs,
@@ -254,9 +254,9 @@ impl LogReplayScanner {
             let mut visitor =
                 FileActionSelectionVisitor::new(&remove_dvs, selection_vector, has_cdc_action);
             visitor.visit_rows_of(actions.as_ref())?;
-            let scan_data = evaluator.evaluate(actions.as_ref())?;
-            Ok(TableChangesScanData {
-                scan_data,
+            let scan_metadata = evaluator.evaluate(actions.as_ref())?;
+            Ok(TableChangesScanMetadata {
+                scan_metadata,
                 selection_vector: visitor.selection_vector,
                 remove_dvs: remove_dvs.clone(),
             })
