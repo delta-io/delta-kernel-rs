@@ -55,7 +55,9 @@ pub unsafe extern "C" fn selection_vector_from_scan_metadata(
     selection_vector_from_scan_metadata_impl(scan_metadata).into_extern_result(&engine.as_ref())
 }
 
-fn selection_vector_from_scan_metadata_impl(scan_metadata: &ScanMetadata) -> DeltaResult<KernelBoolSlice> {
+fn selection_vector_from_scan_metadata_impl(
+    scan_metadata: &ScanMetadata,
+) -> DeltaResult<KernelBoolSlice> {
     Ok(scan_metadata.scan_files.selection_vector.clone().into())
 }
 
@@ -221,7 +223,10 @@ fn scan_metadata_iter_init_impl(
 pub unsafe extern "C" fn scan_metadata_next(
     data: Handle<SharedScanMetadataIterator>,
     engine_context: NullableCvoid,
-    engine_visitor: extern "C" fn(engine_context: NullableCvoid, scan_metadata: Handle<SharedScanMetadata>),
+    engine_visitor: extern "C" fn(
+        engine_context: NullableCvoid,
+        scan_metadata: Handle<SharedScanMetadata>,
+    ),
 ) -> ExternResult<bool> {
     let data = unsafe { data.as_ref() };
     scan_metadata_next_impl(data, engine_context, engine_visitor)
@@ -230,7 +235,10 @@ pub unsafe extern "C" fn scan_metadata_next(
 fn scan_metadata_next_impl(
     data: &ScanMetadataIterator,
     engine_context: NullableCvoid,
-    engine_visitor: extern "C" fn(engine_context: NullableCvoid, scan_metadata: Handle<SharedScanMetadata>),
+    engine_visitor: extern "C" fn(
+        engine_context: NullableCvoid,
+        scan_metadata: Handle<SharedScanMetadata>,
+    ),
 ) -> DeltaResult<bool> {
     let mut data = data
         .data
