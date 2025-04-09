@@ -246,7 +246,7 @@ impl CheckpointVisitor<'_> {
         }
 
         // id is a required field, so we check for its presence to determine if this is a metadata action.
-        if getter.get_int(i, Self::METADATA_ID)?.is_none() {
+        if getter.get_str(i, Self::METADATA_ID)?.is_none() {
             return Ok(false); // Not a metadata action
         }
 
