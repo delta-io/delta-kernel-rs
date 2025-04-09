@@ -177,11 +177,12 @@ impl TableChangesScanBuilder {
 }
 
 impl TableChangesScan {
-    /// Returns an iterator of [`TableChangesScanData`] necessary to read CDF. Each row
+    /// Returns an iterator of [`TableChangesScanMetadata`] necessary to read CDF. Each row
     /// represents an action in the delta log. These rows are filtered to yield only the actions
-    /// necessary to read CDF. Additionally, [`TableChangesScanData`] holds metadata on the
-    /// deletion vectors present in the commit. The engine data in each scan data is guaranteed
-    /// to belong to the same commit. Several [`TableChangesScanData`] may belong to the same commit.
+    /// necessary to read CDF. Additionally, [`TableChangesScanMetadata`] holds metadata on the
+    /// deletion vectors present in the commit. The engine data in each scan metadata is guaranteed
+    /// to belong to the same commit. Several [`TableChangesScanMetadata`] may belong to the same
+    /// commit.
     fn scan_metadata(
         &self,
         engine: Arc<dyn Engine>,

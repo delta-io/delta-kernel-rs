@@ -125,10 +125,10 @@ pub unsafe extern "C" fn free_global_scan_state(state: Handle<SharedGlobalScanSt
 // means kernel made the decision of how to achieve thread safety. This may not be desirable if the
 // engine is single-threaded, or has its own mutual exclusion mechanisms. Deadlock is even a
 // conceivable risk, if this interacts poorly with engine's mutual exclusion mechanism.
-pub struct KernelScanDataIterator {
+pub struct KernelScanMetadataIterator {
     // Mutex -> Allow the iterator to be accessed safely by multiple threads.
     // Box -> Wrap its unsized content this struct is fixed-size with thin pointers.
-    // Item = DeltaResult<ScanData>
+    // Item = DeltaResult<ScanMetadata>
     data: Mutex<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>> + Send>>,
 
     // Also keep a reference to the external engine for its error allocator. The default Parquet and
@@ -137,18 +137,18 @@ pub struct KernelScanDataIterator {
     engine: Arc<dyn ExternEngine>,
 }
 
-#[handle_descriptor(target=KernelScanDataIterator, mutable=false, sized=true)]
-pub struct SharedScanDataIterator;
+#[handle_descriptor(target=KernelScanMetadataIterator, mutable=false, sized=true)]
+pub struct SharedScanMetadataIterator;
 
-impl Drop for KernelScanDataIterator {
+impl Drop for KernelScanMetadataIterator {
     fn drop(&mut self) {
-        debug!("dropping KernelScanDataIterator");
+        debug!("dropping KernelScanMetadataIterator");
     }
 }
 
 /// Get an iterator over the data needed to perform a scan. This will return a
-/// [`KernelScanDataIterator`] which can be passed to [`kernel_scan_metadata_next`] to get the actual
-/// data in the iterator.
+/// [`KernelScanMetadataIterator`] which can be passed to [`kernel_scan_metadata_next`] to get the
+/// actual data in the iterator.
 ///
 /// # Safety
 ///
@@ -157,7 +157,7 @@ impl Drop for KernelScanDataIterator {
 pub unsafe extern "C" fn kernel_scan_metadata_init(
     engine: Handle<SharedExternEngine>,
     scan: Handle<SharedScan>,
-) -> ExternResult<Handle<SharedScanDataIterator>> {
+) -> ExternResult<Handle<SharedScanMetadataIterator>> {
     let engine = unsafe { engine.clone_as_arc() };
     let scan = unsafe { scan.as_ref() };
     kernel_scan_metadata_init_impl(&engine, scan).into_extern_result(&engine.as_ref())
@@ -166,18 +166,18 @@ pub unsafe extern "C" fn kernel_scan_metadata_init(
 fn kernel_scan_metadata_init_impl(
     engine: &Arc<dyn ExternEngine>,
     scan: &Scan,
-) -> DeltaResult<Handle<SharedScanDataIterator>> {
+) -> DeltaResult<Handle<SharedScanMetadataIterator>> {
     let scan_metadata = scan.scan_metadata(engine.engine().as_ref())?;
-    let data = KernelScanDataIterator {
+    let data = KernelScanMetadataIterator {
         data: Mutex::new(Box::new(scan_metadata)),
         engine: engine.clone(),
     };
     Ok(Arc::new(data).into())
 }
 
-/// Call the provided `engine_visitor` on the next scan data item. The visitor will be provided with
-/// a selection vector and engine data. It is the responsibility of the _engine_ to free these when
-/// it is finished by calling [`free_bool_slice`] and [`free_engine_data`] respectively.
+/// Call the provided `engine_visitor` on the next scan metadata item. The visitor will be provided
+/// with a selection vector and engine data. It is the responsibility of the _engine_ to free these
+/// when it is finished by calling [`free_bool_slice`] and [`free_engine_data`] respectively.
 ///
 /// # Safety
 ///
@@ -188,7 +188,7 @@ fn kernel_scan_metadata_init_impl(
 /// [`free_engine_data`]: crate::free_engine_data
 #[no_mangle]
 pub unsafe extern "C" fn kernel_scan_metadata_next(
-    data: Handle<SharedScanDataIterator>,
+    data: Handle<SharedScanMetadataIterator>,
     engine_context: NullableCvoid,
     engine_visitor: extern "C" fn(
         engine_context: NullableCvoid,
@@ -202,7 +202,7 @@ pub unsafe extern "C" fn kernel_scan_metadata_next(
         .into_extern_result(&data.engine.as_ref())
 }
 fn kernel_scan_metadata_next_impl(
-    data: &KernelScanDataIterator,
+    data: &KernelScanMetadataIterator,
     engine_context: NullableCvoid,
     engine_visitor: extern "C" fn(
         engine_context: NullableCvoid,
@@ -232,7 +232,7 @@ fn kernel_scan_metadata_next_impl(
 // we should probably be consistent with drop vs. free on engine side (probably the latter is more
 // intuitive to non-rust code)
 #[no_mangle]
-pub unsafe extern "C" fn free_scan_metadata(data: Handle<SharedScanDataIterator>) {
+pub unsafe extern "C" fn free_scan_metadata(data: Handle<SharedScanMetadataIterator>) {
     data.drop_handle();
 }
 
@@ -297,7 +297,7 @@ pub unsafe extern "C" fn get_from_string_map(
         .and_then(|v| allocate_fn(kernel_string_slice!(v)))
 }
 
-/// Transformation expressions that need to be applied to each row `i` in ScanData. You can use
+/// Transformation expressions that need to be applied to each row `i` in ScanMetadata. You can use
 /// [`get_transform_for_row`] to get the transform for a particular row. If that returns an
 /// associated expression, it _must_ be applied to the data read from the file specified by the
 /// row. The resultant schema for this expression is guaranteed to be `Scan.schema()`. If

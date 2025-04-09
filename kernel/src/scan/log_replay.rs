@@ -28,15 +28,16 @@ use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator};
 /// - Action Deduplication: Leverages the [`FileActionDeduplicator`] to ensure that for each unique file
 ///   (identified by its path and deletion vector unique ID), only the latest valid Add action is processed.
 /// - Transformation: Applies a built-in transformation (`add_transform`) to convert selected Add actions
-///   into [`ScanData`], the intermediate format passed to the engine.
+///   into [`ScanMetadata`], the intermediate format passed to the engine.
 /// - Row Transform Passthrough: Any user-provided row-level transformation expressions (e.g. those derived
 ///   from projection or filters) are preserved and passed through to the engine, which applies them as part
 ///   of its scan execution logic.
 ///
-/// As an implementation of [`LogReplayProcessor`], [`ScanLogReplayProcessor`] provides the `process_actions_batch`
-/// method, which applies these steps to each batch of log actions and produces a [`ScanData`] result. This result
-/// includes the transformed batch, a selection vector indicating which rows are valid, and any
-/// row-level transformation expressions that need to be applied to the selected rows.
+/// As an implementation of [`LogReplayProcessor`], [`ScanLogReplayProcessor`] provides the
+/// `process_actions_batch` method, which applies these steps to each batch of log actions and
+/// produces a [`ScanMetadata`] result. This result includes the transformed batch, a selection
+/// vector indicating which rows are valid, and any row-level transformation expressions that need
+/// to be applied to the selected rows.
 struct ScanLogReplayProcessor {
     partition_filter: Option<ExpressionRef>,
     data_skipping_filter: Option<DataSkippingFilter>,

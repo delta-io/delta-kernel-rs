@@ -47,7 +47,7 @@ pub(crate) struct CdfScanFile {
 
 pub(crate) type CdfScanCallback<T> = fn(context: &mut T, scan_file: CdfScanFile);
 
-/// Transforms an iterator of [`TableChangesScanData`] into an iterator of
+/// Transforms an iterator of [`TableChangesScanMetadata`] into an iterator of
 /// [`CdfScanFile`] by visiting the engine data.
 pub(crate) fn scan_metadata_to_scan_file(
     scan_metadata: impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>,
@@ -78,7 +78,7 @@ pub(crate) fn scan_metadata_to_scan_file(
 /// ## Example
 /// ```ignore
 /// let mut context = [my context];
-/// for res in scan_metadata { // scan data table_changes_scan.scan_metadata()
+/// for res in scan_metadata { // scan metadata table_changes_scan.scan_metadata()
 ///     let (data, vector, remove_dv) = res?;
 ///     context = delta_kernel::table_changes::scan_file::visit_cdf_scan_files(
 ///        data.as_ref(),
@@ -213,7 +213,7 @@ pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
 }
 
 /// Expression to convert an action with `log_schema` into one with
-/// [`cdf_scan_row_schema`]. This is the expression used to create [`TableChangesScanData`].
+/// [`cdf_scan_row_schema`]. This is the expression used to create [`TableChangesScanMetadata`].
 pub(crate) fn cdf_scan_row_expression(commit_timestamp: i64, commit_number: i64) -> Expression {
     Expression::struct_from([
         Expression::struct_from([

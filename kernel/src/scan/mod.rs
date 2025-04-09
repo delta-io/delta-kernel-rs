@@ -462,8 +462,8 @@ impl Scan {
     /// the documentation for [`ScanResult`] for more details. Generally connectors/engines will
     /// want to use [`Scan::scan_metadata`] so they can have more control over the execution of the
     /// scan.
-    // This calls [`Scan::scan_metadata`] to get an iterator of `ScanData` actions for the scan, and
-    // then uses the `engine`'s [`crate::ParquetHandler`] to read the actual table data.
+    // This calls [`Scan::scan_metadata`] to get an iterator of `ScanMetadata` actions for the scan,
+    // and then uses the `engine`'s [`crate::ParquetHandler`] to read the actual table data.
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,

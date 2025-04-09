@@ -152,7 +152,7 @@ pub type ScanCallback<T> = fn(
 /// ## Example
 /// ```ignore
 /// let mut context = [my context];
-/// for res in scan_metadata { // scan data from scan.scan_metadata()
+/// for res in scan_metadata { // scan metadata from scan.scan_metadata()
 ///     let (data, vector) = res?;
 ///     context = delta_kernel::scan::state::visit_scan_files(
 ///        data.as_ref(),

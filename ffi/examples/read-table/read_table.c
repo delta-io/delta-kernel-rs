@@ -83,7 +83,7 @@ void scan_row_callback(
   context->partition_values = NULL;
 }
 
-// For each chunk of scan data (which may contain multiple files to scan), kernel will call this
+// For each chunk of scan metadata (which may contain multiple files to scan), kernel will call this
 // function (named do_visit_scan_metadata to avoid conflict with visit_scan_metadata exported by
 // kernel)
 void do_visit_scan_metadata(
@@ -292,27 +292,28 @@ int main(int argc, char* argv[])
 #endif
   };
 
-  ExternResultHandleSharedScanDataIterator data_iter_res = kernel_scan_metadata_init(engine, scan);
-  if (data_iter_res.tag != OkHandleSharedScanDataIterator) {
-    print_error("Failed to construct scan data iterator.", (Error*)data_iter_res.err);
+  ExternResultHandleSharedScanMetadataIterator data_iter_res =
+    kernel_scan_metadata_init(engine, scan);
+  if (data_iter_res.tag != OkHandleSharedScanMetadataIterator) {
+    print_error("Failed to construct scan metadata iterator.", (Error*)data_iter_res.err);
     free_error((Error*)data_iter_res.err);
     return -1;
   }
 
-  SharedScanDataIterator* data_iter = data_iter_res.ok;
+  SharedScanMetadataIterator* data_iter = data_iter_res.ok;
 
-  print_diag("\nIterating scan data\n");
+  print_diag("\nIterating scan metadata\n");
 
   // iterate scan files
   for (;;) {
     ExternResultbool ok_res =
       kernel_scan_metadata_next(data_iter, &context, do_visit_scan_metadata);
     if (ok_res.tag != Okbool) {
-      print_error("Failed to iterate scan data.", (Error*)ok_res.err);
+      print_error("Failed to iterate scan metadata.", (Error*)ok_res.err);
       free_error((Error*)ok_res.err);
       return -1;
     } else if (!ok_res.ok) {
-      print_diag("Scan data iterator done\n");
+      print_diag("Scan metadata iterator done\n");
       break;
     }
   }
