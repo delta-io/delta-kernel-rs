@@ -24,7 +24,7 @@ use crate::{
 use super::handle::Handle;
 
 // TODO: Why do we even need to expose a scan, when the only thing an engine can do with it is
-// handit back to the kernel by calling `kernel_scan_metadata_init`? There isn't even an FFI method to
+// handit back to the kernel by calling `scan_metadata_iter_init`? There isn't even an FFI method to
 // drop it!
 #[handle_descriptor(target=Scan, mutable=false, sized=true)]
 pub struct SharedScan;
@@ -125,7 +125,7 @@ pub unsafe extern "C" fn free_global_scan_state(state: Handle<SharedGlobalScanSt
 // means kernel made the decision of how to achieve thread safety. This may not be desirable if the
 // engine is single-threaded, or has its own mutual exclusion mechanisms. Deadlock is even a
 // conceivable risk, if this interacts poorly with engine's mutual exclusion mechanism.
-pub struct KernelScanMetadataIterator {
+pub struct ScanMetadataIterator {
     // Mutex -> Allow the iterator to be accessed safely by multiple threads.
     // Box -> Wrap its unsized content this struct is fixed-size with thin pointers.
     // Item = DeltaResult<ScanMetadata>
@@ -137,38 +137,38 @@ pub struct KernelScanMetadataIterator {
     engine: Arc<dyn ExternEngine>,
 }
 
-#[handle_descriptor(target=KernelScanMetadataIterator, mutable=false, sized=true)]
+#[handle_descriptor(target=ScanMetadataIterator, mutable=false, sized=true)]
 pub struct SharedScanMetadataIterator;
 
-impl Drop for KernelScanMetadataIterator {
+impl Drop for ScanMetadataIterator {
     fn drop(&mut self) {
         debug!("dropping KernelScanMetadataIterator");
     }
 }
 
 /// Get an iterator over the data needed to perform a scan. This will return a
-/// [`KernelScanMetadataIterator`] which can be passed to [`kernel_scan_metadata_next`] to get the
+/// [`KernelScanMetadataIterator`] which can be passed to [`scan_metadata_next`] to get the
 /// actual data in the iterator.
 ///
 /// # Safety
 ///
 /// Engine is responsible for passing a valid [`SharedExternEngine`] and [`SharedScan`]
 #[no_mangle]
-pub unsafe extern "C" fn kernel_scan_metadata_init(
+pub unsafe extern "C" fn scan_metadata_iter_init(
     engine: Handle<SharedExternEngine>,
     scan: Handle<SharedScan>,
 ) -> ExternResult<Handle<SharedScanMetadataIterator>> {
     let engine = unsafe { engine.clone_as_arc() };
     let scan = unsafe { scan.as_ref() };
-    kernel_scan_metadata_init_impl(&engine, scan).into_extern_result(&engine.as_ref())
+    scan_metadata_iter_init_impl(&engine, scan).into_extern_result(&engine.as_ref())
 }
 
-fn kernel_scan_metadata_init_impl(
+fn scan_metadata_iter_init_impl(
     engine: &Arc<dyn ExternEngine>,
     scan: &Scan,
 ) -> DeltaResult<Handle<SharedScanMetadataIterator>> {
     let scan_metadata = scan.scan_metadata(engine.engine().as_ref())?;
-    let data = KernelScanMetadataIterator {
+    let data = ScanMetadataIterator {
         data: Mutex::new(Box::new(scan_metadata)),
         engine: engine.clone(),
     };
@@ -181,13 +181,13 @@ fn kernel_scan_metadata_init_impl(
 ///
 /// # Safety
 ///
-/// The iterator must be valid (returned by [kernel_scan_metadata_init]) and not yet freed by
-/// [`free_scan_metadata`]. The visitor function pointer must be non-null.
+/// The iterator must be valid (returned by [scan_metadata_iter_init]) and not yet freed by
+/// [`free_scan_metadata_iter`]. The visitor function pointer must be non-null.
 ///
 /// [`free_bool_slice`]: crate::free_bool_slice
 /// [`free_engine_data`]: crate::free_engine_data
 #[no_mangle]
-pub unsafe extern "C" fn kernel_scan_metadata_next(
+pub unsafe extern "C" fn scan_metadata_next(
     data: Handle<SharedScanMetadataIterator>,
     engine_context: NullableCvoid,
     engine_visitor: extern "C" fn(
@@ -198,11 +198,11 @@ pub unsafe extern "C" fn kernel_scan_metadata_next(
     ),
 ) -> ExternResult<bool> {
     let data = unsafe { data.as_ref() };
-    kernel_scan_metadata_next_impl(data, engine_context, engine_visitor)
+    scan_metadata_next_impl(data, engine_context, engine_visitor)
         .into_extern_result(&data.engine.as_ref())
 }
-fn kernel_scan_metadata_next_impl(
-    data: &KernelScanMetadataIterator,
+fn scan_metadata_next_impl(
+    data: &ScanMetadataIterator,
     engine_context: NullableCvoid,
     engine_visitor: extern "C" fn(
         engine_context: NullableCvoid,
@@ -228,11 +228,11 @@ fn kernel_scan_metadata_next_impl(
 /// # Safety
 ///
 /// Caller is responsible for (at most once) passing a valid pointer returned by a call to
-/// [`kernel_scan_metadata_init`].
+/// [`scan_metadata_iter_init`].
 // we should probably be consistent with drop vs. free on engine side (probably the latter is more
 // intuitive to non-rust code)
 #[no_mangle]
-pub unsafe extern "C" fn free_scan_metadata(data: Handle<SharedScanMetadataIterator>) {
+pub unsafe extern "C" fn free_scan_metadata_iter(data: Handle<SharedScanMetadataIterator>) {
     data.drop_handle();
 }
 

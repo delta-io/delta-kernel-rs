@@ -293,7 +293,7 @@ int main(int argc, char* argv[])
   };
 
   ExternResultHandleSharedScanMetadataIterator data_iter_res =
-    kernel_scan_metadata_init(engine, scan);
+    scan_metadata_iter_init(engine, scan);
   if (data_iter_res.tag != OkHandleSharedScanMetadataIterator) {
     print_error("Failed to construct scan metadata iterator.", (Error*)data_iter_res.err);
     free_error((Error*)data_iter_res.err);
@@ -307,7 +307,7 @@ int main(int argc, char* argv[])
   // iterate scan files
   for (;;) {
     ExternResultbool ok_res =
-      kernel_scan_metadata_next(data_iter, &context, do_visit_scan_metadata);
+      scan_metadata_next(data_iter, &context, do_visit_scan_metadata);
     if (ok_res.tag != Okbool) {
       print_error("Failed to iterate scan metadata.", (Error*)ok_res.err);
       free_error((Error*)ok_res.err);
@@ -326,7 +326,7 @@ int main(int argc, char* argv[])
   context.arrow_context = NULL;
 #endif
 
-  free_scan_metadata(data_iter);
+  free_scan_metadata_iter(data_iter);
   free_scan(scan);
   free_schema(logical_schema);
   free_schema(read_schema);

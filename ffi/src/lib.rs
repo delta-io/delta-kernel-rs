@@ -685,11 +685,11 @@ pub struct StringSliceIterator;
 
 /// # Safety
 ///
-/// The iterator must be valid (returned by [`kernel_scan_metadata_init`]) and not yet freed by
-/// [`free_scan_metadata`]. The visitor function pointer must be non-null.
+/// The iterator must be valid (returned by [`scan_metadata_iter_init`]) and not yet freed by
+/// [`free_scan_metadata_iter`]. The visitor function pointer must be non-null.
 ///
-/// [`kernel_scan_metadata_init`]: crate::scan::kernel_scan_metadata_init
-/// [`free_scan_metadata`]: crate::scan::free_scan_metadata
+/// [`scan_metadata_iter_init`]: crate::scan::scan_metadata_iter_init
+/// [`free_scan_metadata_iter`]: crate::scan::free_scan_metadata_iter
 #[no_mangle]
 pub unsafe extern "C" fn string_slice_next(
     data: Handle<StringSliceIterator>,
