@@ -102,9 +102,9 @@ void do_visit_scan_metadata(void* engine_context, HandleSharedScanMetadata scan_
 
   // Ask kernel to iterate each individual file and call us back with extracted metadata
   print_diag("Asking kernel to call us back for each scan row (file to read)\n");
-  visit_scan_metadata(engine_data, selection_vec, transforms, engine_context, scan_row_callback);
-  free_bool_slice(selection_vec);
-  free_engine_data(engine_data);
+  visit_scan_metadata(scan_metadata, engine_context, scan_row_callback);
+  free_bool_slice(selection_vector);
+  free_engine_data(scan_metadata);
 }
 
 // Called for each element of the partition StringSliceIterator. We just turn the slice into a
