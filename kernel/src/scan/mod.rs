@@ -322,7 +322,9 @@ pub(crate) enum TransformExpr {
     Partition(usize),
 }
 
-/// Result of a data scan operation containing filtered data and associated transformations.
+/// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be scanned
+/// and (2) a vector of transforms (one transform per scan file) that must be applied to the data read
+/// from those files.
 pub struct ScanMetadata {
     /// Filtered engine data with one row per file to scan (and only selected rows should be scanned)
     pub scan_files: FilteredEngineData,
