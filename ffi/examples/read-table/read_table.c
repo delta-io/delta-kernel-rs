@@ -20,7 +20,6 @@ void print_selection_vector(const char* indent, const KernelBoolSlice* selection
   (void)selection_vec;
 #endif
 }
-
 // Print info about table partitions if `VERBOSE` is defined in read_table.h
 void print_partition_info(struct EngineContext* context, const CStringMap* partition_values)
 {
@@ -41,7 +40,6 @@ void print_partition_info(struct EngineContext* context, const CStringMap* parti
   (void)partition_values;
 #endif
 }
-
 // Kernel will call this function for each file that should be scanned. The arguments include enough
 // context to construct the correct logical data from the physically read parquet
 void scan_row_callback(
@@ -89,10 +87,15 @@ void scan_row_callback(
 
 // For each chunk of scan data (which may contain multiple files to scan), kernel will call this
 // function (named do_visit_scan_data to avoid conflict with visit_scan_data exported by kernel)
-void do_visit_scan_data(void* engine_context, HandleCScanData scan_data)
+void do_visit_scan_data(
+  void* engine_context,
+  ExclusiveEngineData* engine_data,
+  KernelBoolSlice selection_vec,
+  const CTransforms* transforms)
 {
-  print_diag("\nScan iterator found some data to read\n  Of this data, here is "
-             "a selection vector\n");
+  print_diag(
+    "\nScan iterator found some data to read\n  Of this data, here is "
+    "a selection vector\n");
   struct EngineContext* context = engine_context;
 
   ExternResultKernelBoolSlice selection_vector_res =
