@@ -333,7 +333,7 @@ pub struct ScanData {
     /// optional expression that must be applied to convert the file's data into the logical schema
     /// expected by the scan:
     ///
-    /// - `Some(expr)`: Apply this expression to transform the data to match `Scan.schema()`.
+    /// - `Some(expr)`: Apply this expression to transform the data to match [`Scan::schema()`].
     /// - `None`: No transformation is needed; the data is already in the correct logical form.
     pub scan_file_transforms: Vec<Option<ExpressionRef>>,
 }
