@@ -335,6 +335,9 @@ pub struct ScanData {
     ///
     /// - `Some(expr)`: Apply this expression to transform the data to match [`Scan::schema()`].
     /// - `None`: No transformation is needed; the data is already in the correct logical form.
+    /// 
+    /// Note: This vector can be indexed by row number, as rows masked by the selection vector will
+    /// have corresponding entries that will be `None`.
     pub scan_file_transforms: Vec<Option<ExpressionRef>>,
 }
 
