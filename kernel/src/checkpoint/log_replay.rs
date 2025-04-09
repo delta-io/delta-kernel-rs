@@ -140,7 +140,6 @@ impl CheckpointVisitor<'_> {
             file_actions_count: 0,
             total_add_actions: 0,
             minimum_file_retention_timestamp,
-
             seen_protocol,
             seen_metadata,
             seen_txns,
@@ -163,10 +162,8 @@ impl CheckpointVisitor<'_> {
         // Spark and the Java Kernel.
         // Note: When remove.deletion_timestamp is not present (defaulting to 0), the remove action
         // will be excluded from the checkpoint file as it will be treated as expired.
-        let mut deletion_timestamp: i64 = 0;
-        if let Some(ts) = getter.get_opt(i, Self::REMOVE_DELETION_TIMESTAMP)? {
-            deletion_timestamp = ts;
-        }
+        let deletion_timestamp = getter.get_opt(i, "remove.deletionTimestamp")?;
+        let deletion_timestamp = deletion_timestamp.unwrap_or(0i64);
 
         Ok(deletion_timestamp <= self.minimum_file_retention_timestamp)
     }
@@ -195,16 +192,11 @@ impl CheckpointVisitor<'_> {
             return Ok(false); // Skip file actions that we've processed before
         }
 
-        // For remove actions, check if it's an expired tombstone
-        if !is_add
-            && self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP_INDEX])?
-        {
-            return Ok(false); // Skip expired remove tombstones
-        }
-
-        // Valid, non-duplicate file action
+        // Check for valid, non-duplicate adds and non-expired removes
         if is_add {
             self.total_add_actions += 1;
+        } else if self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP_INDEX])? {
+            return Ok(false); // Skip expired remove tombstones
         }
         self.file_actions_count += 1;
         Ok(true) // Include this action
