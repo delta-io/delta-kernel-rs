@@ -352,11 +352,6 @@ impl ScanData {
             scan_file_transforms,
         }
     }
-
-    // Get a reference to the selection vector
-    pub fn selection_vector(&self) -> &Vec<bool> {
-        &self.scan_files.selection_vector
-    }
 }
 
 impl HasSelectionVector for ScanData {
@@ -819,7 +814,7 @@ pub(crate) mod test_utils {
         let mut batch_count = 0;
         for res in iter {
             let scan_data = res.unwrap();
-            assert_eq!(scan_data.selection_vector(), &expected_sel_vec);
+            assert_eq!(scan_data.scan_files.selection_vector, expected_sel_vec);
             scan_data
                 .visit_scan_files(context.clone(), validate_callback)
                 .unwrap();

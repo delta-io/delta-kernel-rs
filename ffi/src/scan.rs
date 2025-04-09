@@ -56,7 +56,7 @@ pub unsafe extern "C" fn selection_vector_from_scan_data(
 }
 
 fn selection_vector_from_scan_data_impl(scan_data: &ScanData) -> DeltaResult<KernelBoolSlice> {
-    Ok(scan_data.selection_vector().clone().into())
+    Ok(scan_data.scan_files.selection_vector.clone().into())
 }
 
 /// Drops a scan.
