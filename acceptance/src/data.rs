@@ -109,7 +109,10 @@ fn assert_columns_match(actual: &[Arc<dyn Array>], expected: &[Arc<dyn Array>]) 
     }
 }
 
-pub async fn assert_scan_data(engine: Arc<dyn Engine>, test_case: &TestCaseInfo) -> TestResult<()> {
+pub async fn assert_scan_metadata(
+    engine: Arc<dyn Engine>,
+    test_case: &TestCaseInfo,
+) -> TestResult<()> {
     let table_root = test_case.table_root()?;
     let table = Table::new(table_root);
     let snapshot = table.snapshot(engine.as_ref(), None)?;

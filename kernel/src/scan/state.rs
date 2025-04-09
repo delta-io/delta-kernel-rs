@@ -152,7 +152,7 @@ pub type ScanCallback<T> = fn(
 /// ## Example
 /// ```ignore
 /// let mut context = [my context];
-/// for res in scan_data { // scan data from scan.scan_data()
+/// for res in scan_metadata { // scan metadata from scan.scan_metadata()
 ///     let (data, vector) = res?;
 ///     context = delta_kernel::scan::state::visit_scan_files(
 ///        data.as_ref(),
@@ -281,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn test_simple_visit_scan_data() {
+    fn test_simple_visit_scan_metadata() {
         let context = TestContext { id: 2 };
         run_with_validate_callback(
             vec![add_batch_simple(get_log_schema().clone())],

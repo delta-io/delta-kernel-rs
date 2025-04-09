@@ -3,7 +3,7 @@ Read Table Multi-Threaded
 
 # About
 This example shows a program that reads a table using multiple threads. This shows the use of the
-`scan_data`, `global_scan_state`, and `visit_scan_files` methods, that can be used to partition work
+`scan_metadata`, `global_scan_state`, and `visit_scan_files` methods, that can be used to partition work
 to either multiple threads, or workers (in the case of a distributed engine).
 
 You can run this from the same directory as this `README.md` by running `cargo run -- [args]`.
