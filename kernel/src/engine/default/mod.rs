@@ -68,7 +68,6 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// # Parameters
     ///
     /// - `object_store`: The object store to use.
-    /// - `table_root_path`: The root path of the table within storage.
     /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
     pub fn new(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
         // HACK to check if we're using a LocalFileSystem from ObjectStore. We need this because
