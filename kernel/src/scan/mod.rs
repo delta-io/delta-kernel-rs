@@ -12,6 +12,7 @@ use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
+use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ColumnName, Expression, ExpressionRef, ExpressionTransform, Scalar};
 use crate::log_replay::HasSelectionVector;
 use crate::predicates::{DefaultPredicateEvaluator, EmptyColumnResolver};
@@ -321,13 +322,46 @@ pub(crate) enum TransformExpr {
     Partition(usize),
 }
 
-// TODO(nick): Make this a struct in a follow-on PR
-// (data, deletion_vec, transforms)
-pub type ScanMetadata = (Box<dyn EngineData>, Vec<bool>, Vec<Option<ExpressionRef>>);
+/// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be scanned
+/// and (2) a vector of transforms (one transform per scan file) that must be applied to the data read
+/// from those files.
+pub struct ScanMetadata {
+    /// Filtered engine data with one row per file to scan (and only selected rows should be scanned)
+    pub scan_files: FilteredEngineData,
+
+    /// Row-level transformations to apply to data read from files.
+    ///
+    /// Each entry in this vector corresponds to a row in the `scan_files` data. The entry is an
+    /// optional expression that must be applied to convert the file's data into the logical schema
+    /// expected by the scan:
+    ///
+    /// - `Some(expr)`: Apply this expression to transform the data to match [`Scan::schema()`].
+    /// - `None`: No transformation is needed; the data is already in the correct logical form.
+    ///
+    /// Note: This vector can be indexed by row number, as rows masked by the selection vector will
+    /// have corresponding entries that will be `None`.
+    pub scan_file_transforms: Vec<Option<ExpressionRef>>,
+}
+
+impl ScanMetadata {
+    fn new(
+        data: Box<dyn EngineData>,
+        selection_vector: Vec<bool>,
+        scan_file_transforms: Vec<Option<ExpressionRef>>,
+    ) -> Self {
+        Self {
+            scan_files: FilteredEngineData {
+                data,
+                selection_vector,
+            },
+            scan_file_transforms,
+        }
+    }
+}
 
 impl HasSelectionVector for ScanMetadata {
     fn has_selected_rows(&self) -> bool {
-        self.1.contains(&true)
+        self.scan_files.selection_vector.contains(&true)
     }
 }
 
@@ -383,9 +417,9 @@ impl Scan {
             .collect()
     }
 
-    /// Get an iterator of [`EngineData`]s that should be included in scan for a query. This handles
-    /// log-replay, reconciling Add and Remove actions, and applying data skipping (if
-    /// possible). Each item in the returned iterator is a tuple of:
+    /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
+    /// log-replay, reconciling Add and Remove actions, and applying data skipping (if possible).
+    /// Each item in the returned iterator is a struct of:
     /// - `Box<dyn EngineData>`: Data in engine format, where each row represents a file to be
     ///   scanned. The schema for each row can be obtained by calling [`scan_row_schema`].
     /// - `Vec<bool>`: A selection vector. If a row is at index `i` and this vector is `false` at
@@ -500,18 +534,12 @@ impl Scan {
         let table_root = self.snapshot.table_root().clone();
         let physical_predicate = self.physical_predicate();
 
-        let scan_metadata = self.scan_metadata(engine.as_ref())?;
-        let scan_files_iter = scan_metadata
+        let scan_metadata_iter = self.scan_metadata(engine.as_ref())?;
+        let scan_files_iter = scan_metadata_iter
             .map(|res| {
-                let (data, vec, transforms) = res?;
+                let scan_metadata = res?;
                 let scan_files = vec![];
-                state::visit_scan_files(
-                    data.as_ref(),
-                    &vec,
-                    &transforms,
-                    scan_files,
-                    scan_metadata_callback,
-                )
+                scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)
             })
             // Iterator<DeltaResult<Vec<ScanFile>>> to Iterator<DeltaResult<ScanFile>>
             .flatten_ok();
@@ -790,16 +818,11 @@ pub(crate) mod test_utils {
         );
         let mut batch_count = 0;
         for res in iter {
-            let (batch, sel, transforms) = res.unwrap();
-            assert_eq!(sel, expected_sel_vec);
-            crate::scan::state::visit_scan_files(
-                batch.as_ref(),
-                &sel,
-                &transforms,
-                context.clone(),
-                validate_callback,
-            )
-            .unwrap();
+            let scan_metadata = res.unwrap();
+            assert_eq!(scan_metadata.scan_files.selection_vector, expected_sel_vec);
+            scan_metadata
+                .visit_scan_files(context.clone(), validate_callback)
+                .unwrap();
             batch_count += 1;
         }
         assert_eq!(batch_count, 1);
@@ -988,7 +1011,7 @@ mod tests {
     }
 
     fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
-        let scan_metadata = scan.scan_metadata(engine)?;
+        let scan_metadata_iter = scan.scan_metadata(engine)?;
         fn scan_metadata_callback(
             paths: &mut Vec<String>,
             path: &str,
@@ -1002,15 +1025,9 @@ mod tests {
             assert!(dv_info.deletion_vector.is_none());
         }
         let mut files = vec![];
-        for data in scan_metadata {
-            let (data, vec, transforms) = data?;
-            files = state::visit_scan_files(
-                data.as_ref(),
-                &vec,
-                &transforms,
-                files,
-                scan_metadata_callback,
-            )?;
+        for res in scan_metadata_iter {
+            let scan_metadata = res?;
+            files = scan_metadata.visit_scan_files(files, scan_metadata_callback)?;
         }
         Ok(files)
     }

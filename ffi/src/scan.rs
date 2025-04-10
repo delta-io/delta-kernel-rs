@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use delta_kernel::scan::state::{visit_scan_files, DvInfo, GlobalScanState};
+use delta_kernel::scan::state::{DvInfo, GlobalScanState};
 use delta_kernel::scan::{Scan, ScanMetadata};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Error, Expression, ExpressionRef};
@@ -16,9 +16,9 @@ use crate::expressions::engine::{
 };
 use crate::expressions::SharedExpression;
 use crate::{
-    kernel_string_slice, AllocateStringFn, ExclusiveEngineData, ExternEngine, ExternResult,
-    IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice, NullableCvoid,
-    SharedExternEngine, SharedSchema, SharedSnapshot, TryFromStringSlice,
+    kernel_string_slice, AllocateStringFn, ExternEngine, ExternResult, IntoExternResult,
+    KernelBoolSlice, KernelRowIndexArray, KernelStringSlice, NullableCvoid, SharedExternEngine,
+    SharedSchema, SharedSnapshot, TryFromStringSlice,
 };
 
 use super::handle::Handle;
@@ -28,6 +28,38 @@ use super::handle::Handle;
 // drop it!
 #[handle_descriptor(target=Scan, mutable=false, sized=true)]
 pub struct SharedScan;
+
+#[handle_descriptor(target=ScanMetadata, mutable=false, sized=true)]
+pub struct SharedScanMetadata;
+
+/// Drop a `SharedScanMetadata`.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid scan data handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_scan_metadata(scan_metadata: Handle<SharedScanMetadata>) {
+    scan_metadata.drop_handle();
+}
+
+/// Get a selection vector out of a [`SharedScanMetadata`] struct
+///
+/// # Safety
+/// Engine is responsible for providing valid pointers for each argument
+#[no_mangle]
+pub unsafe extern "C" fn selection_vector_from_scan_metadata(
+    scan_metadata: Handle<SharedScanMetadata>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<KernelBoolSlice> {
+    let scan_metadata = unsafe { scan_metadata.as_ref() };
+    selection_vector_from_scan_metadata_impl(scan_metadata).into_extern_result(&engine.as_ref())
+}
+
+fn selection_vector_from_scan_metadata_impl(
+    scan_metadata: &ScanMetadata,
+) -> DeltaResult<KernelBoolSlice> {
+    Ok(scan_metadata.scan_files.selection_vector.clone().into())
+}
 
 /// Drops a scan.
 ///
@@ -175,9 +207,10 @@ fn scan_metadata_iter_init_impl(
     Ok(Arc::new(data).into())
 }
 
-/// Call the provided `engine_visitor` on the next scan metadata item. The visitor will be provided
-/// with a selection vector and engine data. It is the responsibility of the _engine_ to free these
-/// when it is finished by calling [`free_bool_slice`] and [`free_engine_data`] respectively.
+/// Call the provided `engine_visitor` on the next scan metadata item. The visitor will be provided with
+/// a [`SharedScanMetadata`], which contains the actual scan files and the associated selection vector. It is the
+/// responsibility of the _engine_ to free the associated resources after use by calling
+/// [`free_engine_data`] and [`free_bool_slice`] respectively.
 ///
 /// # Safety
 ///
@@ -192,9 +225,7 @@ pub unsafe extern "C" fn scan_metadata_next(
     engine_context: NullableCvoid,
     engine_visitor: extern "C" fn(
         engine_context: NullableCvoid,
-        engine_data: Handle<ExclusiveEngineData>,
-        selection_vector: KernelBoolSlice,
-        transforms: &CTransforms,
+        scan_metadata: Handle<SharedScanMetadata>,
     ),
 ) -> ExternResult<bool> {
     let data = unsafe { data.as_ref() };
@@ -206,19 +237,15 @@ fn scan_metadata_next_impl(
     engine_context: NullableCvoid,
     engine_visitor: extern "C" fn(
         engine_context: NullableCvoid,
-        engine_data: Handle<ExclusiveEngineData>,
-        selection_vector: KernelBoolSlice,
-        transforms: &CTransforms,
+        scan_metadata: Handle<SharedScanMetadata>,
     ),
 ) -> DeltaResult<bool> {
     let mut data = data
         .data
         .lock()
         .map_err(|_| Error::generic("poisoned mutex"))?;
-    if let Some((data, sel_vec, transforms)) = data.next().transpose()? {
-        let bool_slice = KernelBoolSlice::from(sel_vec);
-        let transform_map = CTransforms { transforms };
-        (engine_visitor)(engine_context, data.into(), bool_slice, &transform_map);
+    if let Some(scan_metadata) = data.next().transpose()? {
+        (engine_visitor)(engine_context, Arc::new(scan_metadata).into());
         Ok(true)
     } else {
         Ok(false)
@@ -421,31 +448,24 @@ struct ContextWrapper {
 }
 
 /// Shim for ffi to call visit_scan_metadata. This will generally be called when iterating through scan
-/// data which provides the data handle and selection vector as each element in the iterator.
+/// data which provides the [`SharedScanMetadata`] as each element in the iterator.
 ///
 /// # Safety
-/// engine is responsible for passing a valid [`ExclusiveEngineData`] and selection vector.
+/// engine is responsible for passing a valid [`SharedScanMetadata`].
 #[no_mangle]
 pub unsafe extern "C" fn visit_scan_metadata(
-    data: Handle<ExclusiveEngineData>,
-    selection_vec: KernelBoolSlice,
-    transforms: &CTransforms,
+    scan_metadata: Handle<SharedScanMetadata>,
     engine_context: NullableCvoid,
     callback: CScanCallback,
 ) {
-    let selection_vec = unsafe { selection_vec.as_ref() };
-    let data = unsafe { data.as_ref() };
+    let scan_metadata = unsafe { scan_metadata.as_ref() };
     let context_wrapper = ContextWrapper {
         engine_context,
         callback,
     };
+
     // TODO: return ExternResult to caller instead of panicking?
-    visit_scan_files(
-        data,
-        selection_vec,
-        &transforms.transforms,
-        context_wrapper,
-        rust_callback,
-    )
-    .unwrap();
+    scan_metadata
+        .visit_scan_files(context_wrapper, rust_callback)
+        .unwrap();
 }

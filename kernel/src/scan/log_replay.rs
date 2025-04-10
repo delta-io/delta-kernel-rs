@@ -364,7 +364,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 
         // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
         let result = self.add_transform.evaluate(actions_batch)?;
-        Ok((
+        Ok(ScanMetadata::new(
             result,
             visitor.selection_vector,
             visitor.row_transform_exprs,
@@ -470,8 +470,11 @@ mod tests {
             None,
         );
         for res in iter {
-            let (_batch, _sel, transforms) = res.unwrap();
-            assert!(transforms.is_empty(), "Should have no transforms");
+            let scan_metadata = res.unwrap();
+            assert!(
+                scan_metadata.scan_file_transforms.is_empty(),
+                "Should have no transforms"
+            );
         }
     }
 
@@ -516,7 +519,8 @@ mod tests {
         }
 
         for res in iter {
-            let (_batch, _sel, transforms) = res.unwrap();
+            let scan_metadata = res.unwrap();
+            let transforms = scan_metadata.scan_file_transforms;
             // in this case we have a metadata action first and protocol 3rd, so we expect 4 items,
             // the first and 3rd being a `None`
             assert_eq!(transforms.len(), 4, "Should have 4 transforms");

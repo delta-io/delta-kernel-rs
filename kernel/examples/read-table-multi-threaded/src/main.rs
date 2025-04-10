@@ -210,14 +210,8 @@ fn try_main() -> DeltaResult<()> {
     drop(record_batch_tx);
 
     for res in scan_metadata {
-        let (data, vector, transforms) = res?;
-        scan_file_tx = delta_kernel::scan::state::visit_scan_files(
-            data.as_ref(),
-            &vector,
-            &transforms,
-            scan_file_tx,
-            send_scan_file,
-        )?;
+        let scan_metadata = res?;
+        scan_file_tx = scan_metadata.visit_scan_files(scan_file_tx, send_scan_file)?;
     }
 
     // have sent all scan files, drop this so threads will exit when there's no more work

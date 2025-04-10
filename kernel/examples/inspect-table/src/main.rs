@@ -209,16 +209,10 @@ fn try_main() -> DeltaResult<()> {
         }
         Commands::ScanMetadata => {
             let scan = ScanBuilder::new(snapshot).build()?;
-            let scan_metadata = scan.scan_metadata(&engine)?;
-            for res in scan_metadata {
-                let (data, vector, transforms) = res?;
-                delta_kernel::scan::state::visit_scan_files(
-                    data.as_ref(),
-                    &vector,
-                    &transforms,
-                    (),
-                    print_scan_file,
-                )?;
+            let scan_metadata_iter = scan.scan_metadata(&engine)?;
+            for res in scan_metadata_iter {
+                let scan_metadata = res?;
+                scan_metadata.visit_scan_files((), print_scan_file)?;
             }
         }
         Commands::Actions { oldest_first } => {
