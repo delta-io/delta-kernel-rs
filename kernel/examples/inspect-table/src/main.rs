@@ -41,7 +41,7 @@ enum Commands {
     /// Show the table's schema
     Schema,
     /// Show the meta-data that would be used to scan the table
-    ScanData,
+    ScanMetadata,
     /// Show each action from the log-segments
     Actions {
         /// Show the log in reverse order (default is log replay order -- newest first)
@@ -207,18 +207,12 @@ fn try_main() -> DeltaResult<()> {
         Commands::Schema => {
             println!("{:#?}", snapshot.schema());
         }
-        Commands::ScanData => {
+        Commands::ScanMetadata => {
             let scan = ScanBuilder::new(snapshot).build()?;
-            let scan_data = scan.scan_data(&engine)?;
-            for res in scan_data {
-                let (data, vector, transforms) = res?;
-                delta_kernel::scan::state::visit_scan_files(
-                    data.as_ref(),
-                    &vector,
-                    &transforms,
-                    (),
-                    print_scan_file,
-                )?;
+            let scan_metadata_iter = scan.scan_metadata(&engine)?;
+            for res in scan_metadata_iter {
+                let scan_metadata = res?;
+                scan_metadata.visit_scan_files((), print_scan_file)?;
             }
         }
         Commands::Actions { oldest_first } => {

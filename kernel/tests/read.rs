@@ -11,7 +11,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{column_expr, BinaryOperator, Expression, ExpressionRef};
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
-use delta_kernel::scan::state::{transform_to_logical, visit_scan_files, DvInfo, Stats};
+use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, Schema};
 use delta_kernel::{Engine, FileMeta, Table};
@@ -333,7 +333,7 @@ struct ScanFile {
     transform: Option<ExpressionRef>,
 }
 
-fn scan_data_callback(
+fn scan_metadata_callback(
     batches: &mut Vec<ScanFile>,
     path: &str,
     size: i64,
@@ -350,7 +350,7 @@ fn scan_data_callback(
     });
 }
 
-fn read_with_scan_data(
+fn read_with_scan_metadata(
     location: &Url,
     engine: &dyn Engine,
     scan: &Scan,
@@ -358,17 +358,11 @@ fn read_with_scan_data(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let global_state = scan.global_scan_state();
     let result_schema: ArrowSchemaRef = Arc::new(scan.schema().as_ref().try_into()?);
-    let scan_data = scan.scan_data(engine)?;
+    let scan_metadata = scan.scan_metadata(engine)?;
     let mut scan_files = vec![];
-    for data in scan_data {
-        let (data, vec, transforms) = data?;
-        scan_files = visit_scan_files(
-            data.as_ref(),
-            &vec,
-            &transforms,
-            scan_files,
-            scan_data_callback,
-        )?;
+    for res in scan_metadata {
+        let scan_metadata = res?;
+        scan_files = scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)?;
     }
 
     let mut batches = vec![];
@@ -462,7 +456,7 @@ fn read_table_data(
             .build()?;
 
         sort_lines!(expected);
-        read_with_scan_data(table.location(), engine.as_ref(), &scan, &expected)?;
+        read_with_scan_metadata(table.location(), engine.as_ref(), &scan, &expected)?;
         read_with_execute(engine, &scan, &expected)?;
     }
     Ok(())

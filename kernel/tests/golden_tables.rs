@@ -273,8 +273,8 @@ async fn canonicalized_paths_test(
         .into_scan_builder()
         .build()
         .expect("build the scan");
-    let mut scan_data = scan.scan_data(&engine).expect("scan data");
-    assert!(scan_data.next().is_none());
+    let mut scan_metadata = scan.scan_metadata(&engine).expect("scan metadata");
+    assert!(scan_metadata.next().is_none());
     Ok(())
 }
 
@@ -289,9 +289,12 @@ async fn checkpoint_test(
         .into_scan_builder()
         .build()
         .expect("build the scan");
-    let scan_data: Vec<_> = scan.scan_data(&engine).expect("scan data").collect();
+    let scan_metadata: Vec<_> = scan
+        .scan_metadata(&engine)
+        .expect("scan metadata")
+        .collect();
     assert_eq!(version, 14);
-    assert!(scan_data.len() == 1);
+    assert!(scan_metadata.len() == 1);
     Ok(())
 }
 
