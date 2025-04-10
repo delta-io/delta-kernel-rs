@@ -28,5 +28,5 @@ version = "0.9.0"
 [workspace.dependencies]
 object_store = { version = ">=0.11, <0.12" }
 hdfs-native-object-store = "0.13.0"
-hdfs-native = "0.11.0"
+hdfs-native = "0.11.1"
 walkdir = "2.5.0"

@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-arrow = "53"
+arrow = "54"
 clap = { version = "4.5", features = ["derive"] }
 delta_kernel = { path = "../../../kernel", features = [
   "cloud",
@@ -13,7 +13,7 @@ delta_kernel = { path = "../../../kernel", features = [
   "default-engine",
   "developer-visibility",
 ] }
-env_logger = "0.11.3"
+env_logger = "0.11.8"
 url = "2"
 
 [package.metadata.release]
