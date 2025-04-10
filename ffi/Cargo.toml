@@ -32,7 +32,7 @@ libc = "0.2.171"
 
 [dev-dependencies]
 object_store = { workspace = true }
-rand = "0.8.0"
+rand = "0.8.5"
 test_utils = { path = "../test-utils" }
 tokio = { version = "1.44" }
 trybuild = "1.0"
