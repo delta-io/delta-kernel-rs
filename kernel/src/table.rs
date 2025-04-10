@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use url::Url;
 
+use crate::checkpoint::CheckpointBuilder;
 use crate::snapshot::Snapshot;
 use crate::table_changes::TableChanges;
 use crate::transaction::Transaction;
@@ -96,6 +97,14 @@ impl Table {
             start_version,
             end_version.into(),
         )
+    }
+
+    pub fn checkpoint(
+        &self,
+        engine: &dyn Engine,
+        version: Option<Version>,
+    ) -> DeltaResult<CheckpointBuilder> {
+        Ok(CheckpointBuilder::new(self.snapshot(engine, version)?))
     }
 
     /// Create a new write transaction for this table.
