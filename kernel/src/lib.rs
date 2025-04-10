@@ -74,6 +74,7 @@ use url::Url;
 use self::schema::{DataType, SchemaRef};
 
 pub mod actions;
+mod checkpoint;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
