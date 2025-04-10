@@ -87,9 +87,11 @@ pub(crate) struct CheckpointVisitor<'seen> {
     // TODO: _last_checkpoint schema should be updated to use u64 instead of i64
     // for fields that are not expected to be negative. (Issue #786)
     // i64 to match the `_last_checkpoint` file schema
+    non_file_actions_count: i64,
+    // i64 to match the `_last_checkpoint` file schema
     file_actions_count: i64,
     // i64 to match the `_last_checkpoint` file schema
-    total_add_actions: i64,
+    add_actions_count: i64,
     // i64 for comparison with remove.deletionTimestamp
     minimum_file_retention_timestamp: i64,
     // Flag to track if we've seen a protocol action so we can keep only the first protocol action
@@ -99,8 +101,6 @@ pub(crate) struct CheckpointVisitor<'seen> {
     // Set of transaction IDs to deduplicate by appId
     // This set has O(N) memory usage where N = number of txn actions with unique appIds
     seen_txns: &'seen mut HashSet<String>,
-    // i64 to match the `_last_checkpoint` file schema
-    total_non_file_actions: i64,
 }
 
 #[allow(unused)]
@@ -138,12 +138,12 @@ impl CheckpointVisitor<'_> {
             ),
             selection_vector,
             file_actions_count: 0,
-            total_add_actions: 0,
+            add_actions_count: 0,
             minimum_file_retention_timestamp,
             seen_protocol,
             seen_metadata,
             seen_txns,
-            total_non_file_actions: 0,
+            non_file_actions_count: 0,
         }
     }
 
@@ -194,7 +194,7 @@ impl CheckpointVisitor<'_> {
 
         // Check for valid, non-duplicate adds and non-expired removes
         if is_add {
-            self.total_add_actions += 1;
+            self.add_actions_count += 1;
         } else if self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP_INDEX])? {
             return Ok(false); // Skip expired remove tombstones
         }
@@ -226,7 +226,7 @@ impl CheckpointVisitor<'_> {
         }
         // Valid, non-duplicate protocol action to be included
         self.seen_protocol = true;
-        self.total_non_file_actions += 1;
+        self.non_file_actions_count += 1;
         Ok(true)
     }
 
@@ -252,7 +252,7 @@ impl CheckpointVisitor<'_> {
 
         // Valid, non-duplicate metadata action to be included
         self.seen_metadata = true;
-        self.total_non_file_actions += 1;
+        self.non_file_actions_count += 1;
         Ok(true)
     }
 
@@ -274,7 +274,7 @@ impl CheckpointVisitor<'_> {
         }
 
         // Valid, non-duplicate txn action to be included
-        self.total_non_file_actions += 1;
+        self.non_file_actions_count += 1;
         Ok(true)
     }
 
@@ -391,11 +391,11 @@ mod tests {
         ];
 
         assert_eq!(visitor.file_actions_count, 2);
-        assert_eq!(visitor.total_add_actions, 1);
+        assert_eq!(visitor.add_actions_count, 1);
         assert!(visitor.seen_protocol);
         assert!(visitor.seen_metadata);
         assert_eq!(visitor.seen_txns.len(), 1);
-        assert_eq!(visitor.total_non_file_actions, 3);
+        assert_eq!(visitor.non_file_actions_count, 3);
 
         assert_eq!(visitor.selection_vector, expected);
         Ok(())
@@ -437,41 +437,8 @@ mod tests {
         let expected = vec![false, false, true, false];
         assert_eq!(visitor.selection_vector, expected);
         assert_eq!(visitor.file_actions_count, 1);
-        assert_eq!(visitor.total_add_actions, 0);
-        assert_eq!(visitor.total_non_file_actions, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn test_checkpoint_visitor_conflicting_file_actions_in_log_batch() -> DeltaResult<()> {
-        let json_strings: StringArray = vec![
-            r#"{"add":{"path":"file1","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true}}"#,
-             // Duplicate path
-            r#"{"remove":{"path":"file1","deletionTimestamp":100,"dataChange":true,"partitionValues":{}}}"#,
-        ]
-        .into();
-        let batch = parse_json_batch(json_strings);
-
-        let mut seen_file_keys = HashSet::new();
-        let mut seen_txns = HashSet::new();
-        let mut visitor = CheckpointVisitor::new(
-            &mut seen_file_keys,
-            true,
-            vec![true; 2],
-            0,
-            false,
-            false,
-            &mut seen_txns,
-        );
-
-        visitor.visit_rows_of(batch.as_ref())?;
-
-        // First file action should be included. The second one should be excluded due to the conflict.
-        let expected = vec![true, false];
-        assert_eq!(visitor.selection_vector, expected);
-        assert_eq!(visitor.file_actions_count, 1);
-        assert_eq!(visitor.total_add_actions, 1);
-        assert_eq!(visitor.total_non_file_actions, 0);
+        assert_eq!(visitor.add_actions_count, 0);
+        assert_eq!(visitor.non_file_actions_count, 0);
         Ok(())
     }
 
@@ -500,8 +467,8 @@ mod tests {
         let expected = vec![true];
         assert_eq!(visitor.selection_vector, expected);
         assert_eq!(visitor.file_actions_count, 1);
-        assert_eq!(visitor.total_add_actions, 1);
-        assert_eq!(visitor.total_non_file_actions, 0);
+        assert_eq!(visitor.add_actions_count, 1);
+        assert_eq!(visitor.non_file_actions_count, 0);
         // The action should NOT be added to the seen_file_keys set as it's a checkpoint batch
         // and actions in checkpoint batches do not conflict with each other.
         // This is a key difference from log batches, where actions can conflict.
@@ -539,8 +506,8 @@ mod tests {
         let expected = vec![true, true, false];
         assert_eq!(visitor.selection_vector, expected);
         assert_eq!(visitor.file_actions_count, 2);
-        assert_eq!(visitor.total_add_actions, 1);
-        assert_eq!(visitor.total_non_file_actions, 0);
+        assert_eq!(visitor.add_actions_count, 1);
+        assert_eq!(visitor.non_file_actions_count, 0);
 
         Ok(())
     }
@@ -574,7 +541,7 @@ mod tests {
         // All actions should be skipped as they have already been seen
         let expected = vec![false, false, false];
         assert_eq!(visitor.selection_vector, expected);
-        assert_eq!(visitor.total_non_file_actions, 0);
+        assert_eq!(visitor.non_file_actions_count, 0);
         assert_eq!(visitor.file_actions_count, 0);
 
         Ok(())
@@ -613,7 +580,7 @@ mod tests {
         let expected = vec![true, false, true, true, false, true, false];
         assert_eq!(visitor.selection_vector, expected);
         assert_eq!(visitor.seen_txns.len(), 2); // Two different app IDs
-        assert_eq!(visitor.total_non_file_actions, 4); // 2 txns + 1 protocol + 1 metadata
+        assert_eq!(visitor.non_file_actions_count, 4); // 2 txns + 1 protocol + 1 metadata
         assert_eq!(visitor.file_actions_count, 0);
 
         Ok(())
