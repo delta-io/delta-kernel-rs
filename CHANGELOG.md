@@ -1,5 +1,118 @@
 # Changelog
 
+## [v0.9.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.9.0/) (2025-04-08)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.8.0...v0.9.0)
+
+### 🏗️ Breaking changes
+1. Change `MetadataValue::Number(i32)` to `MetadataValue::Number(i64)` ([#733])
+2. Get prefix from offset path: `DefaultEngine::new` no longer requires a `table_root` parameter
+   and `list_from` consistently returns keys greater than the offset ([#699])
+3. Make `snapshot.schema()` return a `SchemaRef` ([#751])
+4. Make `visit_expression_internal` private, and `unwrap_kernel_expression` pub(crate) ([#767])
+5. Make actions types `pub(crate)` instead of `pub` ([#405])
+6. New `null_row` ExpressionHandler API ([#662])
+7. Rename enums `ReaderFeatures` -> `ReaderFeature` and `WriterFeatures` -> `WriterFeature` ([#802])
+8. Remove `get_` prefix from engine getters ([#804])
+9. Rename `FileSystemClient` to `StorageHandler` ([#805])
+10. Adopt types for table features (New `ReadFeature::Unknown(String)` and
+    (`WriterFeature::Unknown(String)`) ([#684])
+11. Renamed `ScanData` to `ScanMetadata` ([#817])
+    - rename `ScanData` to `ScanMetadata`
+    - rename `Scan::scan_data()` to `Scan::scan_metadata()`
+    - (ffi) rename `free_kernel_scan_data()` to `free_scan_metadata_iter()`
+    - (ffi) rename `kernel_scan_data_next()` to `scan_metadata_next()`
+    - (ffi) rename `visit_scan_data()` to `visit_scan_metadata()`
+    - (ffi) rename `kernel_scan_data_init()` to `scan_metadata_iter_init()`
+    - (ffi) rename `KernelScanDataIterator` to `ScanMetadataIterator`
+    - (ffi) rename `SharedScanDataIterator` to `SharedScanMetadataIterator`
+12. `ScanMetadata` is now a struct (instead of tuple) with new `FiltereEngineData` type  ([#768])
+
+### 🚀 Features / new APIs
+
+1. (`v2Checkpoint`) Extract & insert sidecar batches in `replay`'s action iterator ([#679])
+2. Support the `v2Checkpoint` reader/writer feature ([#685])
+3. Add check for whether `appendOnly` table feature is supported or enabled  ([#664])
+4. Add basic partition pruning support ([#713])
+5. Add `DeletionVectors` to supported writer features ([#735])
+6. Add writer version 2/invariant table feature support ([#734])
+7. Improved pre-signed URL checks ([#760])
+8. Add `CheckpointMetadata` action ([#781])
+9. Add classic and uuid parquet checkpoint path generation ([#782])
+10. New `Snapshot::try_new_from()` API ([#549])
+
+### 🐛 Bug Fixes
+
+1. Return `Error::unsupported` instead of panic in `Scalar::to_array(MapType)` ([#757])
+2. Remove 'default-members' in workspace, default to all crates ([#752])
+3. Update compilation error and clippy lints for rustc 1.86 ([#800])
+
+### 🚜 Refactor
+
+1. Split up `arrow_expression` module ([#750])
+2. Flatten deeply nested match statement ([#756])
+3. Simplify predicate evaluation by supporting inversion ([#761])
+4. Rename `LogSegment::replay` to `LogSegment::read_actions` ([#766])
+5. Extract deduplication logic from `AddRemoveDedupVisitor` into embeddable `FileActionsDeduplicator` ([#769])
+6. Move testing helper function to `test_utils` mod ([#794])
+7. Rename `_last_checkpoint` from `CheckpointMetadata` to `LastCheckpointHint` ([#789])
+8. Use ExpressionTransform instead of adhoc expression traversals ([#803])
+9. Extract log replay processing structure into `LogReplayProcessor` trait ([#774])
+
+### 🧪 Testing
+
+1. Add V2 checkpoint read support integration tests ([#690])
+
+### ⚙️ Chores/CI
+
+1. Use maintained action to setup rust toolchain ([#585])
+
+### Other
+
+1. Update HDFS dependencies ([#689])
+2. Add .cargo/config.toml with native instruction codegen ([#772])
+
+
+[#679]: https://github.com/delta-io/delta-kernel-rs/pull/679
+[#685]: https://github.com/delta-io/delta-kernel-rs/pull/685
+[#689]: https://github.com/delta-io/delta-kernel-rs/pull/689
+[#664]: https://github.com/delta-io/delta-kernel-rs/pull/664
+[#690]: https://github.com/delta-io/delta-kernel-rs/pull/690
+[#713]: https://github.com/delta-io/delta-kernel-rs/pull/713
+[#735]: https://github.com/delta-io/delta-kernel-rs/pull/735
+[#734]: https://github.com/delta-io/delta-kernel-rs/pull/734
+[#733]: https://github.com/delta-io/delta-kernel-rs/pull/733
+[#585]: https://github.com/delta-io/delta-kernel-rs/pull/585
+[#750]: https://github.com/delta-io/delta-kernel-rs/pull/750
+[#756]: https://github.com/delta-io/delta-kernel-rs/pull/756
+[#757]: https://github.com/delta-io/delta-kernel-rs/pull/757
+[#699]: https://github.com/delta-io/delta-kernel-rs/pull/699
+[#752]: https://github.com/delta-io/delta-kernel-rs/pull/752
+[#751]: https://github.com/delta-io/delta-kernel-rs/pull/751
+[#761]: https://github.com/delta-io/delta-kernel-rs/pull/761
+[#760]: https://github.com/delta-io/delta-kernel-rs/pull/760
+[#766]: https://github.com/delta-io/delta-kernel-rs/pull/766
+[#767]: https://github.com/delta-io/delta-kernel-rs/pull/767
+[#405]: https://github.com/delta-io/delta-kernel-rs/pull/405
+[#772]: https://github.com/delta-io/delta-kernel-rs/pull/772
+[#662]: https://github.com/delta-io/delta-kernel-rs/pull/662
+[#769]: https://github.com/delta-io/delta-kernel-rs/pull/769
+[#794]: https://github.com/delta-io/delta-kernel-rs/pull/794
+[#781]: https://github.com/delta-io/delta-kernel-rs/pull/781
+[#789]: https://github.com/delta-io/delta-kernel-rs/pull/789
+[#800]: https://github.com/delta-io/delta-kernel-rs/pull/800
+[#802]: https://github.com/delta-io/delta-kernel-rs/pull/802
+[#803]: https://github.com/delta-io/delta-kernel-rs/pull/803
+[#774]: https://github.com/delta-io/delta-kernel-rs/pull/774
+[#804]: https://github.com/delta-io/delta-kernel-rs/pull/804
+[#782]: https://github.com/delta-io/delta-kernel-rs/pull/782
+[#805]: https://github.com/delta-io/delta-kernel-rs/pull/805
+[#549]: https://github.com/delta-io/delta-kernel-rs/pull/549
+[#684]: https://github.com/delta-io/delta-kernel-rs/pull/684
+[#817]: https://github.com/delta-io/delta-kernel-rs/pull/817
+[#768]: https://github.com/delta-io/delta-kernel-rs/pull/768
+
+
 ## [v0.8.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.8.0/) (2025-03-04)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.7.0...v0.8.0)
