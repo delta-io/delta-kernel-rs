@@ -1,5 +1,5 @@
 use super::table_changes_action_iter;
-use super::TableChangesScanData;
+use super::TableChangesScanMetadata;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{Add, Cdc, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
@@ -45,8 +45,8 @@ fn get_segment(
     Ok(log_segment.ascending_commit_files)
 }
 
-fn result_to_sv(iter: impl Iterator<Item = DeltaResult<TableChangesScanData>>) -> Vec<bool> {
-    iter.map_ok(|scan_data| scan_data.selection_vector.into_iter())
+fn result_to_sv(iter: impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>) -> Vec<bool> {
+    iter.map_ok(|scan_metadata| scan_metadata.selection_vector.into_iter())
         .flatten_ok()
         .try_collect()
         .unwrap()
@@ -294,10 +294,10 @@ async fn add_remove() {
 
     let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
         .unwrap()
-        .flat_map(|scan_data| {
-            let scan_data = scan_data.unwrap();
-            assert_eq!(scan_data.remove_dvs, HashMap::new().into());
-            scan_data.selection_vector
+        .flat_map(|scan_metadata| {
+            let scan_metadata = scan_metadata.unwrap();
+            assert_eq!(scan_metadata.remove_dvs, HashMap::new().into());
+            scan_metadata.selection_vector
         })
         .collect_vec();
 
@@ -344,10 +344,10 @@ async fn filter_data_change() {
 
     let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
         .unwrap()
-        .flat_map(|scan_data| {
-            let scan_data = scan_data.unwrap();
-            assert_eq!(scan_data.remove_dvs, HashMap::new().into());
-            scan_data.selection_vector
+        .flat_map(|scan_metadata| {
+            let scan_metadata = scan_metadata.unwrap();
+            assert_eq!(scan_metadata.remove_dvs, HashMap::new().into());
+            scan_metadata.selection_vector
         })
         .collect_vec();
 
@@ -390,10 +390,10 @@ async fn cdc_selection() {
 
     let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
         .unwrap()
-        .flat_map(|scan_data| {
-            let scan_data = scan_data.unwrap();
-            assert_eq!(scan_data.remove_dvs, HashMap::new().into());
-            scan_data.selection_vector
+        .flat_map(|scan_metadata| {
+            let scan_metadata = scan_metadata.unwrap();
+            assert_eq!(scan_metadata.remove_dvs, HashMap::new().into());
+            scan_metadata.selection_vector
         })
         .collect_vec();
 
@@ -456,10 +456,10 @@ async fn dv() {
     .into();
     let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
         .unwrap()
-        .flat_map(|scan_data| {
-            let scan_data = scan_data.unwrap();
-            assert_eq!(scan_data.remove_dvs, expected_remove_dvs);
-            scan_data.selection_vector
+        .flat_map(|scan_metadata| {
+            let scan_metadata = scan_metadata.unwrap();
+            assert_eq!(scan_metadata.remove_dvs, expected_remove_dvs);
+            scan_metadata.selection_vector
         })
         .collect_vec();
 
@@ -533,9 +533,9 @@ async fn data_skipping_filter() {
 
     let sv = table_changes_action_iter(engine, commits, logical_schema.into(), predicate)
         .unwrap()
-        .flat_map(|scan_data| {
-            let scan_data = scan_data.unwrap();
-            scan_data.selection_vector
+        .flat_map(|scan_metadata| {
+            let scan_metadata = scan_metadata.unwrap();
+            scan_metadata.selection_vector
         })
         .collect_vec();
 

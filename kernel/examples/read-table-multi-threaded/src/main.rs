@@ -20,7 +20,7 @@ use clap::{Parser, ValueEnum};
 use url::Url;
 
 /// An example program that reads a table using multiple threads. This shows the use of the
-/// scan_data and global_scan_state methods on a Scan, that can be used to partition work to either
+/// scan_metadata and global_scan_state methods on a Scan, that can be used to partition work to either
 /// multiple threads, or workers (in the case of a distributed engine).
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -179,7 +179,7 @@ fn try_main() -> DeltaResult<()> {
     // [`delta_kernel::scan::scan_row_schema`]. Generally engines will not need to interact with
     // this data directly, and can just call [`visit_scan_files`] to get pre-parsed data back from
     // the kernel.
-    let scan_data = scan.scan_data(engine.as_ref())?;
+    let scan_metadata = scan.scan_metadata(engine.as_ref())?;
 
     // get any global state associated with this scan
     let global_state = Arc::new(scan.global_scan_state());
@@ -209,15 +209,9 @@ fn try_main() -> DeltaResult<()> {
     // done sending
     drop(record_batch_tx);
 
-    for res in scan_data {
-        let (data, vector, transforms) = res?;
-        scan_file_tx = delta_kernel::scan::state::visit_scan_files(
-            data.as_ref(),
-            &vector,
-            &transforms,
-            scan_file_tx,
-            send_scan_file,
-        )?;
+    for res in scan_metadata {
+        let scan_metadata = res?;
+        scan_file_tx = scan_metadata.visit_scan_files(scan_file_tx, send_scan_file)?;
     }
 
     // have sent all scan files, drop this so threads will exit when there's no more work
