@@ -1,5 +1,7 @@
+/* Hdfs object store uses object_store 0.11, not compatible
 #[cfg(feature = "cloud")]
 use hdfs_native_object_store::HdfsObjectStore;
+ */
 use object_store::parse_url_opts as parse_url_opts_object_store;
 use object_store::path::Path;
 use object_store::{Error, ObjectStore};
@@ -28,6 +30,9 @@ where
     K: AsRef<str>,
     V: Into<String>,
 {
+    /* HDFS object store uses older object store, so can't use it directly here
+    Needs to be ported
+
     let options_map = options
         .into_iter()
         .map(|(k, v)| (k.as_ref().to_string(), v.into()))
@@ -35,4 +40,10 @@ where
     let store = HdfsObjectStore::with_config(url.as_str(), options_map)?;
     let path = Path::parse(url.path())?;
     Ok((Box::new(store), path))
+     */
+    todo!("Need to update hdfs object store");
 }
+
+
+
+

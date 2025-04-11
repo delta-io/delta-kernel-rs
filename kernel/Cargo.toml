@@ -62,18 +62,7 @@ visibility = "0.1.1"
 tempfile = { version = "3", optional = true }
 
 # Arrow supported versions
-## 53
-# Used in default engine
-arrow_53 = { package = "arrow", version = "53", features = ["chrono-tz", "ffi", "json", "prettyprint"], optional = true }
-# Used in default and sync engine
-parquet_53 = { package = "parquet", version = "53", features = ["async", "object_store"] , optional = true }
-######
-## 54
-arrow_54 = { package = "arrow", version = "54", features = ["chrono-tz", "ffi", "json", "prettyprint"], optional = true }
-parquet_54 = { package = "parquet", version = "54", features = ["async", "object_store"] , optional = true }
-######
-
-## 55
+## 54 (default)
 arrow_55 = { package = "arrow", version = "55", features = ["chrono-tz", "ffi", "json", "prettyprint"], optional = true }
 parquet_55 = { package = "parquet", version = "55", features = ["async", "object_store"] , optional = true }
 ######
@@ -96,11 +85,7 @@ walkdir = { workspace = true, optional = true }
 
 [features]
 # The default version to be expected
-arrow = ["arrow_53"]
-
-arrow_53 = ["dep:arrow_53", "dep:parquet_53"]
-
-arrow_54 = ["dep:arrow_54", "dep:parquet_54"]
+arrow = ["arrow_55"]
 
 arrow_55 = ["dep:arrow_55", "dep:parquet_55"]
 

@@ -423,11 +423,11 @@ mod tests {
             self.inner.get_opts(location, options).await
         }
 
-        async fn get_range(&self, location: &Path, range: Range<usize>) -> Result<Bytes> {
+        async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
             self.inner.get_range(location, range).await
         }
 
-        async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
             self.inner.get_ranges(location, ranges).await
         }
 
@@ -439,7 +439,7 @@ mod tests {
             self.inner.delete(location).await
         }
 
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
             self.inner.list(prefix)
         }
 

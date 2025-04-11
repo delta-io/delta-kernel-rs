@@ -145,7 +145,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
 
         let metadata = self.store.head(&Path::from(path.path())).await?;
         let modification_time = metadata.last_modified.timestamp_millis();
-        if size != metadata.size {
+        if (size as u64) != metadata.size {
             return Err(Error::generic(format!(
                 "Size mismatch after writing parquet file: expected {}, got {}",
                 size, metadata.size
@@ -257,7 +257,8 @@ impl FileOpener for ParquetOpener {
         Ok(Box::pin(async move {
             // TODO avoid IO by converting passed file meta to ObjectMeta
             let meta = store.head(&path).await?;
-            let mut reader = ParquetObjectReader::new(store, meta);
+            let mut reader = ParquetObjectReader::new(store, meta.location)
+                .with_file_size(meta.size);
             let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
             let parquet_schema = metadata.schema();
             let (indices, requested_ordering) =
