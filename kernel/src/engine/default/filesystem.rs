@@ -211,8 +211,8 @@ mod tests {
         let mut url = Url::from_directory_path(tmp.path()).unwrap();
 
         let store = Arc::new(LocalFileSystem::new());
-        let storage =
-            ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let storage = ObjectStoreStorageHandler::new(store, executor);
 
         let mut slices: Vec<FileSlice> = Vec::new();
 
