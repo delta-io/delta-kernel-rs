@@ -14,20 +14,14 @@ use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 #[derive(Debug)]
 pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
     inner: Arc<DynObjectStore>,
-    has_ordered_listing: bool,
     task_executor: Arc<E>,
     readahead: usize,
 }
 
 impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
-    pub(crate) fn new(
-        store: Arc<DynObjectStore>,
-        has_ordered_listing: bool,
-        task_executor: Arc<E>,
-    ) -> Self {
+    pub(crate) fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
         Self {
             inner: store,
-            has_ordered_listing,
             task_executor,
             readahead: 10,
         }
@@ -64,6 +58,26 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
 
         let store = self.inner.clone();
 
+        // HACK to check if we're using a LocalFileSystem from ObjectStore. We need this because
+        // local filesystem doesn't return a sorted list by default. Although the `object_store`
+        // crate explicitly says it _does not_ return a sorted listing, in practice all the cloud
+        // implementations actually do:
+        // - AWS:
+        //   [`ListObjectsV2`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html)
+        //   states: "For general purpose buckets, ListObjectsV2 returns objects in lexicographical
+        //   order based on their key names." (Directory buckets are out of scope for now)
+        // - Azure: Docs state
+        //   [here](https://learn.microsoft.com/en-us/rest/api/storageservices/enumerating-blob-resources):
+        //   "A listing operation returns an XML response that contains all or part of the requested
+        //   list. The operation returns entities in alphabetical order."
+        // - GCP: The [main](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) doc
+        //   doesn't indicate order, but [this
+        //   page](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) does say: "This page
+        //   shows you how to list the [objects](https://cloud.google.com/storage/docs/objects) stored
+        //   in your Cloud Storage buckets, which are ordered in the list lexicographically by name."
+        // So we just need to know if we're local and then if so, we sort the returned file list
+        let has_ordered_listing = path.scheme() != "file";
+
         // This channel will become the iterator
         let (sender, receiver) = std::sync::mpsc::sync_channel(4_000);
         let url = path.clone();
@@ -90,7 +104,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
             }
         });
 
-        if !self.has_ordered_listing {
+        if !has_ordered_listing {
             // This FS doesn't return things in the order we require
             let mut fms: Vec<FileMeta> = receiver.into_iter().try_collect()?;
             fms.sort_unstable();
@@ -197,11 +211,8 @@ mod tests {
         let mut url = Url::from_directory_path(tmp.path()).unwrap();
 
         let store = Arc::new(LocalFileSystem::new());
-        let storage = ObjectStoreStorageHandler::new(
-            store,
-            false, // don't have ordered listing
-            Arc::new(TokioBackgroundExecutor::new()),
-        );
+        let storage =
+            ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
         let mut slices: Vec<FileSlice> = Vec::new();
 

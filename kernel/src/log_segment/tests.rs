@@ -111,11 +111,7 @@ fn build_log_with_paths_and_checkpoint(
         }
     });
 
-    let storage = ObjectStoreStorageHandler::new(
-        store,
-        false, // don't have ordered listing
-        Arc::new(TokioBackgroundExecutor::new()),
-    );
+    let storage = ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();

@@ -625,11 +625,8 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let store = Arc::new(LocalFileSystem::new());
-        let storage = ObjectStoreStorageHandler::new(
-            store,
-            false, // don't have ordered listing
-            Arc::new(TokioBackgroundExecutor::new()),
-        );
+        let storage =
+            ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
         let cp = read_last_checkpoint(&storage, &url).unwrap();
         assert!(cp.is_none())
     }
@@ -662,11 +659,8 @@ mod tests {
                     .expect("put _last_checkpoint");
             });
 
-        let storage = ObjectStoreStorageHandler::new(
-            store,
-            false, // don't have ordered listing
-            Arc::new(TokioBackgroundExecutor::new()),
-        );
+        let storage =
+            ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
         let url = Url::parse("memory:///valid/").expect("valid url");
         let valid = read_last_checkpoint(&storage, &url).expect("read last checkpoint");
         let url = Url::parse("memory:///invalid/").expect("valid url");
