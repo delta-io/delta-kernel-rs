@@ -447,7 +447,7 @@ mod tests {
             &self,
             prefix: Option<&Path>,
             offset: &Path,
-        ) -> BoxStream<'_, Result<ObjectMeta>> {
+        ) -> BoxStream<'static, Result<ObjectMeta>> {
             self.inner.list_with_offset(prefix, offset)
         }
 
@@ -532,7 +532,7 @@ mod tests {
         let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp_millis(),
-            size: meta.size,
+            size: meta.size as usize,
         }];
 
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
@@ -681,7 +681,7 @@ mod tests {
                         FileMeta {
                             location: url,
                             last_modified: meta.last_modified.timestamp_millis(),
-                            size: meta.size,
+                            size: meta.size as usize,
                         }
                     }
                 })
