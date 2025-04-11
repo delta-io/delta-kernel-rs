@@ -38,7 +38,7 @@ pre-release-hook = [
 
 [dependencies]
 bytes = "1.7"
-chrono = "=0.4.39"
+chrono = "0.4.40"
 fix-hidden-lifetime-bug = "0.2"
 indexmap = "2.5.0"
 itertools = "0.13"
@@ -73,6 +73,12 @@ arrow_54 = { package = "arrow", version = "54", features = ["chrono-tz", "ffi", 
 parquet_54 = { package = "parquet", version = "54", features = ["async", "object_store"] , optional = true }
 ######
 
+## 55
+arrow_55 = { package = "arrow", version = "55", features = ["chrono-tz", "ffi", "json", "prettyprint"], optional = true }
+parquet_55 = { package = "parquet", version = "55", features = ["async", "object_store"] , optional = true }
+######
+
+
 futures = { version = "0.3", optional = true }
 object_store = { workspace = true, optional = true }
 hdfs-native-object-store = { workspace = true, optional = true }
@@ -95,6 +101,9 @@ arrow = ["arrow_53"]
 arrow_53 = ["dep:arrow_53", "dep:parquet_53"]
 
 arrow_54 = ["dep:arrow_54", "dep:parquet_54"]
+
+arrow_55 = ["dep:arrow_55", "dep:parquet_55"]
+
 
 need_arrow = []
 arrow-conversion = ["need_arrow"]
