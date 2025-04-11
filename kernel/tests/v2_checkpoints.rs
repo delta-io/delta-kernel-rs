@@ -3,7 +3,6 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::engine::sync::SyncEngine;
 
-use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::{DeltaResult, Table};
 
 mod common;
