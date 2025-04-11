@@ -11,8 +11,8 @@ use crate::expressions::{
     column_expr, joined_column_expr, BinaryOperator, ColumnName, Expression as Expr, ExpressionRef,
     Scalar, VariadicOperator,
 };
-use crate::predicates::{
-    DataSkippingPredicateEvaluator, PredicateEvaluator, PredicateEvaluatorDefaults,
+use crate::kernel_predicates::{
+    DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
 use crate::schema::{DataType, PrimitiveType, SchemaRef, SchemaTransform, StructField, StructType};
 use crate::{Engine, EngineData, ExpressionEvaluator, JsonHandler, RowVisitor as _};
@@ -240,11 +240,11 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
     }
 
     fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
-        PredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted).map(Expr::literal)
+        KernelPredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted).map(Expr::literal)
     }
 
     fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
-        PredicateEvaluatorDefaults::eval_scalar(val, inverted).map(Expr::literal)
+        KernelPredicateEvaluatorDefaults::eval_scalar(val, inverted).map(Expr::literal)
     }
 
     fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Expr> {
@@ -262,7 +262,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         right: &Scalar,
         inverted: bool,
     ) -> Option<Expr> {
-        PredicateEvaluatorDefaults::eval_binary_scalars(op, left, right, inverted)
+        KernelPredicateEvaluatorDefaults::eval_binary_scalars(op, left, right, inverted)
             .map(Expr::literal)
     }
 

@@ -9,8 +9,8 @@ use super::{ScanMetadata, Transform};
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{column_expr, column_name, ColumnName, Expression, ExpressionRef};
+use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::{FileActionDeduplicator, FileActionKey, LogReplayProcessor};
-use crate::predicates::{DefaultPredicateEvaluator, PredicateEvaluator as _};
 use crate::scan::{Scalar, TransformExpr};
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::utils::require;
@@ -190,7 +190,7 @@ impl AddRemoveDedupVisitor<'_> {
             .values()
             .map(|(k, v)| (ColumnName::new([k]), v.clone()))
             .collect();
-        let evaluator = DefaultPredicateEvaluator::from(partition_values);
+        let evaluator = DefaultKernelPredicateEvaluator::from(partition_values);
         evaluator.eval_sql_where(partition_filter) == Some(false)
     }
 

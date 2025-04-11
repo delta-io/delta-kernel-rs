@@ -14,8 +14,8 @@ use crate::actions::deletion_vector::{
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ColumnName, Expression, ExpressionRef, ExpressionTransform, Scalar};
+use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
 use crate::log_replay::HasSelectionVector;
-use crate::predicates::{DefaultPredicateEvaluator, EmptyColumnResolver};
 use crate::scan::state::{DvInfo, Stats};
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
@@ -184,8 +184,9 @@ impl PhysicalPredicate {
 // the predicate allows to statically skip all files. Since this is direct evaluation (not an
 // expression rewrite), we use a `DefaultPredicateEvaluator` with an empty column resolver.
 fn can_statically_skip_all_files(predicate: &Expression) -> bool {
-    use crate::predicates::PredicateEvaluator as _;
-    DefaultPredicateEvaluator::from(EmptyColumnResolver).eval_sql_where(predicate) == Some(false)
+    use crate::kernel_predicates::KernelPredicateEvaluator as _;
+    DefaultKernelPredicateEvaluator::from(EmptyColumnResolver).eval_sql_where(predicate)
+        == Some(false)
 }
 
 // Build the stats read schema filtering the table schema to keep only skipping-eligible
