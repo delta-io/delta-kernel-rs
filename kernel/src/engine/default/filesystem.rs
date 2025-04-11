@@ -79,7 +79,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
                             .send(Ok(FileMeta {
                                 location,
                                 last_modified: meta.last_modified.timestamp_millis(),
-                                size: meta.size,
+                                size: meta.size as usize,
                             }))
                             .ok();
                     }
@@ -136,6 +136,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
                             // have to annotate type here or rustc can't figure it out
                             Ok::<bytes::Bytes, Error>(reqwest::get(url).await?.bytes().await?)
                         } else if let Some(rng) = range {
+                            let rng = rng.start as u64..rng.end as u64;
                             Ok(store.get_range(&path, rng).await?)
                         } else {
                             let result = store.get(&path).await?;

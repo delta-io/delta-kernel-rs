@@ -257,8 +257,8 @@ impl FileOpener for ParquetOpener {
         Ok(Box::pin(async move {
             // TODO avoid IO by converting passed file meta to ObjectMeta
             let meta = store.head(&path).await?;
-            let mut reader = ParquetObjectReader::new(store, meta.location)
-                .with_file_size(meta.size);
+            let mut reader =
+                ParquetObjectReader::new(store, meta.location).with_file_size(meta.size);
             let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
             let parquet_schema = metadata.schema();
             let (indices, requested_ordering) =
@@ -395,7 +395,8 @@ mod tests {
         let location = Path::from(url.path());
         let meta = store.head(&location).await.unwrap();
 
-        let reader = ParquetObjectReader::new(store.clone(), meta.clone());
+        let reader =
+            ParquetObjectReader::new(store.clone(), meta.location).with_file_size(meta.size);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
             .unwrap()
@@ -405,7 +406,7 @@ mod tests {
         let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp(),
-            size: meta.size,
+            size: meta.size as usize,
         }];
 
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
@@ -513,13 +514,14 @@ mod tests {
 
         let filename = location.path().split('/').next_back().unwrap();
         assert_eq!(&expected_location.join(filename).unwrap(), location);
-        assert_eq!(expected_size, size);
+        assert_eq!(expected_size, size as u64);
         assert!(now - last_modified < 10_000);
 
         // check we can read back
         let path = Path::from(location.path());
         let meta = store.head(&path).await.unwrap();
-        let reader = ParquetObjectReader::new(store.clone(), meta.clone());
+        let reader =
+            ParquetObjectReader::new(store.clone(), meta.location).with_file_size(meta.size);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
             .unwrap()

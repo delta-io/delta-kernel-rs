@@ -6,8 +6,5 @@ pub use parquet_55::*;
 
 // if nothing is enabled but we need arrow because of some other feature flag, default to lowest
 // supported version
-#[cfg(all(
-    feature = "need_arrow",
-    not(feature = "arrow_55"),
-))]
+#[cfg(all(feature = "need_arrow", not(feature = "arrow_55"),))]
 compile_error!("Requested a feature that needs arrow without enabling arrow. Please enable the `arrow_53` or `arrow_54` feature");
