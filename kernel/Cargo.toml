@@ -38,7 +38,7 @@ pre-release-hook = [
 
 [dependencies]
 bytes = "1.7"
-chrono = "=0.4.39"
+chrono = "0.4.40"
 fix-hidden-lifetime-bug = "0.2"
 indexmap = "2.5.0"
 itertools = "0.13"
@@ -62,16 +62,11 @@ visibility = "0.1.1"
 tempfile = { version = "3", optional = true }
 
 # Arrow supported versions
-## 53
-# Used in default engine
-arrow_53 = { package = "arrow", version = "53", features = ["chrono-tz", "ffi", "json", "prettyprint"], optional = true }
-# Used in default and sync engine
-parquet_53 = { package = "parquet", version = "53", features = ["async", "object_store"] , optional = true }
+## 54 (default)
+arrow_55 = { package = "arrow", version = "55", features = ["chrono-tz", "ffi", "json", "prettyprint"], optional = true }
+parquet_55 = { package = "parquet", version = "55", features = ["async", "object_store"] , optional = true }
 ######
-## 54
-arrow_54 = { package = "arrow", version = "54", features = ["chrono-tz", "ffi", "json", "prettyprint"], optional = true }
-parquet_54 = { package = "parquet", version = "54", features = ["async", "object_store"] , optional = true }
-######
+
 
 futures = { version = "0.3", optional = true }
 object_store = { workspace = true, optional = true }
@@ -90,11 +85,10 @@ walkdir = { workspace = true, optional = true }
 
 [features]
 # The default version to be expected
-arrow = ["arrow_53"]
+arrow = ["arrow_55"]
 
-arrow_53 = ["dep:arrow_53", "dep:parquet_53"]
+arrow_55 = ["dep:arrow_55", "dep:parquet_55"]
 
-arrow_54 = ["dep:arrow_54", "dep:parquet_54"]
 
 need_arrow = []
 arrow-conversion = ["need_arrow"]
