@@ -87,12 +87,13 @@ struct AddRemoveDedupVisitor<'seen> {
 }
 
 impl AddRemoveDedupVisitor<'_> {
-    // The index position in the row getters for the following columns
-    const ADD_PATH_INDEX: usize = 0;
-    const ADD_PARTITION_VALUES_INDEX: usize = 1;
-    const ADD_DV_START_INDEX: usize = 2;
-    const REMOVE_PATH_INDEX: usize = 5;
-    const REMOVE_DV_START_INDEX: usize = 6;
+    // These index positions correspond to the order of columns defined in
+    // `selected_column_names_and_types()`
+    const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
+    const ADD_PARTITION_VALUES_INDEX: usize = 1; // Position of "add.partitionValues" in getters
+    const ADD_DV_START_INDEX: usize = 2; // Start position of add deletion vector columns
+    const REMOVE_PATH_INDEX: usize = 5; // Position of "remove.path" in getters
+    const REMOVE_DV_START_INDEX: usize = 6; // Start position of remove deletion vector columns
 
     fn new(
         seen: &mut HashSet<FileActionKey>,
