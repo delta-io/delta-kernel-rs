@@ -1,5 +1,6 @@
 //! Traits that engines need to implement in order to pass data between themselves and kernel.
 
+use crate::log_replay::HasSelectionVector;
 use crate::schema::{ColumnName, DataType};
 use crate::{AsAny, DeltaResult, Error};
 
@@ -18,6 +19,13 @@ pub struct FilteredEngineData {
     pub data: Box<dyn EngineData>,
     // The selection vector where `true` marks rows to include in results
     pub selection_vector: Vec<bool>,
+}
+
+impl HasSelectionVector for FilteredEngineData {
+    /// Returns true if any row in the selection vector is marked as selected
+    fn has_selected_rows(&self) -> bool {
+        self.selection_vector.contains(&true)
+    }
 }
 
 /// a trait that an engine exposes to give access to a list

@@ -13,11 +13,13 @@ pub(crate) use require;
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use crate::actions::get_log_schema;
+    use crate::actions::{get_log_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::Engine;
+    use crate::EngineData;
 
     use itertools::Itertools;
     use object_store::local::LocalFileSystem;
@@ -26,12 +28,6 @@ pub(crate) mod test_utils {
     use std::{path::Path, sync::Arc};
     use tempfile::TempDir;
     use test_utils::delta_path_for_version;
-
-    use crate::{
-        actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove},
-        engine::arrow_data::ArrowEngineData,
-        EngineData,
-    };
 
     #[derive(Serialize)]
     pub(crate) enum Action {
