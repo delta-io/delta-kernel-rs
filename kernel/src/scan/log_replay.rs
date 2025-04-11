@@ -339,6 +339,17 @@ fn get_add_transform_expr() -> Expression {
     ])
 }
 
+pub(crate) fn get_scan_metadata_transform_expr() -> Expression {
+    Expression::Struct(vec![Expression::Struct(vec![
+        column_expr!("path"),
+        column_expr!("fileConstantValues.partitionValues"),
+        column_expr!("size"),
+        column_expr!("modificationTime"),
+        column_expr!("stats"),
+        column_expr!("deletionVector"),
+    ])])
+}
+
 impl LogReplayProcessor for ScanLogReplayProcessor {
     type Output = ScanMetadata;
 
