@@ -198,7 +198,7 @@ impl TableChangesScan {
             PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
             PhysicalPredicate::None => None,
         };
-        let schema = self.table_changes.end_snapshot.schema().clone().into();
+        let schema = self.table_changes.end_snapshot.schema().clone();
         let table_configuration = self.table_changes.start_table_config.clone();
         let it = table_changes_action_iter(
             engine,

@@ -61,17 +61,15 @@ pub(crate) fn table_changes_action_iter(
     let process_engine_ref = engine.clone();
     let result = commit_files
         .into_iter()
-        .map(move |commit_file| -> DeltaResult<ProcessedCdfCommit> {
+        .map(move |commit_file| -> DeltaResult<_> {
             ProcessedCdfCommit::try_new(
                 process_engine_ref.as_ref(),
                 commit_file,
                 &table_schema,
                 &mut table_configuration,
-            )
+            )?
+            .into_scan_batches(engine.clone(), filter.clone())
         }) //Iterator-Result-Iterator-Result
-        .map(move |processed_commit| -> DeltaResult<_> {
-            processed_commit?.into_scan_batches(engine.clone(), filter.clone())
-        })
         .flatten_ok() // Iterator-Result-Result
         .map(|x| x?); // Iterator-Result
     Ok(result)
@@ -84,7 +82,7 @@ pub(crate) fn table_changes_action_iter(
 ///   the in-commit timestamp. These are generated when the incommit timestamps table property is
 ///   enabled. This must be done in [`ProcessedCdfCommit::try_new`] instead of the
 ///   [`ProcessedCdfCommit::into_scan_batches`] because it lazily transforms engine data with an
-///   extra timestamp column Thus, the timestamp must be known before the next phase.
+///   extra timestamp column. Thus, the timestamp must be known before the next phase.
 ///   See <https://github.com/delta-io/delta-kernel-rs/issues/559>
 /// - `remove_dvs`, a map from each remove action's path to its [`DvInfo`]. This will be used to
 ///   resolve the deletion vectors to find the rows that were changed this commit.
@@ -143,7 +141,7 @@ impl ProcessedCdfCommit {
         table_schema: &SchemaRef,
         table_configuration: &mut TableConfiguration,
     ) -> DeltaResult<Self> {
-        let visitor_schema = ProcessCdfCommitVisitor::schema();
+        let visitor_schema = ProcessedCdfCommitVisitor::schema();
 
         // Note: We do not perform data skipping yet because we need to visit all add and
         // remove actions for deletion vector resolution to be correct.
@@ -166,7 +164,7 @@ impl ProcessedCdfCommit {
         for actions in action_iter {
             let actions = actions?;
 
-            let mut visitor = ProcessCdfCommitVisitor {
+            let mut visitor = ProcessedCdfCommitVisitor {
                 add_paths: &mut add_paths,
                 remove_dvs: &mut remove_dvs,
                 has_cdc_action: &mut has_cdc_action,
@@ -278,14 +276,14 @@ impl ProcessedCdfCommit {
 }
 
 /// This is a visitor used in [`ProcessedCdfCommit::try_new`].
-struct ProcessCdfCommitVisitor<'a> {
+struct ProcessedCdfCommitVisitor<'a> {
     protocol: Option<Protocol>,
     metadata: Option<Metadata>,
     has_cdc_action: &'a mut bool,
     add_paths: &'a mut HashSet<String>,
     remove_dvs: &'a mut HashMap<String, DvInfo>,
 }
-impl ProcessCdfCommitVisitor<'_> {
+impl ProcessedCdfCommitVisitor<'_> {
     fn schema() -> SchemaRef {
         static PREPARE_PHASE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
             Arc::new(StructType::new(vec![
@@ -300,9 +298,9 @@ impl ProcessCdfCommitVisitor<'_> {
     }
 }
 
-impl RowVisitor for ProcessCdfCommitVisitor<'_> {
+impl RowVisitor for ProcessedCdfCommitVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        // NOTE: The order of the names and types is based on [`ProcessCdfCommitVisitor::schema`]
+        // NOTE: The order of the names and types is based on [`ProcessedCdfCommitVisitor::schema`]
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             const STRING: DataType = DataType::STRING;
             const INTEGER: DataType = DataType::INTEGER;
@@ -340,7 +338,7 @@ impl RowVisitor for ProcessCdfCommitVisitor<'_> {
         require!(
             getters.len() == 18,
             Error::InternalError(format!(
-                "Wrong number of ProcessCdfCommitVisitor getters: {}",
+                "Wrong number of ProcessedCdfCommitVisitor getters: {}",
                 getters.len()
             ))
         );
