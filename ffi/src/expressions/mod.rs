@@ -8,3 +8,6 @@ pub mod kernel;
 
 #[handle_descriptor(target=Expression, mutable=false, sized=true)]
 pub struct SharedExpression;
+
+// TODO: Actually split this out
+pub type SharedPredicate = SharedExpression;
