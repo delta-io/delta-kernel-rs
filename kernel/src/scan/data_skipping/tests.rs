@@ -107,7 +107,7 @@ fn test_eval_binary_comparisons() {
 }
 
 #[test]
-fn test_eval_variadic() {
+fn test_eval_junction() {
     let test_cases = &[
         (&[] as &[Option<bool>], TRUE, FALSE),
         (&[TRUE], TRUE, TRUE),
