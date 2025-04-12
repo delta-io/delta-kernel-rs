@@ -192,8 +192,8 @@ pub(crate) fn evaluate_expression(
             _,
         ) => {
             let reverse_op = Predicate::binary(In, *left.clone(), *right.clone());
-            let reverse_expr = evaluate_expression(&reverse_op, batch, None)?;
-            let result = not(reverse_expr.as_boolean())?;
+            let reverse_pred = evaluate_predicate(&reverse_op, batch)?;
+            let result = not(reverse_pred.as_boolean())?;
             Ok(wrap_comparison_result(result))
         }
         (Binary(BinaryExpression { op, left, right }), _) => {
@@ -227,7 +227,7 @@ pub(crate) fn evaluate_expression(
             };
             preds
                 .iter()
-                .map(|pred| evaluate_expression(pred, batch, result_type))
+                .map(|pred| evaluate_predicate(pred, batch))
                 .reduce(|l, r| {
                     let result = reducer(downcast_to_bool(&l?)?, downcast_to_bool(&r?)?)?;
                     Ok(wrap_comparison_result(result))
@@ -240,4 +240,12 @@ pub(crate) fn evaluate_expression(
             "Junction {expression:?} is expected to return boolean results, got {result_type:?}"
         ))),
     }
+}
+
+pub(crate) fn evaluate_predicate(
+    predicate: &Predicate,
+    batch: &RecordBatch,
+) -> DeltaResult<ArrayRef> {
+    // TODO: Actually split this out
+    evaluate_expression(predicate, batch, Some(&DataType::BOOLEAN))
 }
