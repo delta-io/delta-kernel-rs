@@ -39,11 +39,24 @@ fn wrap_expression(state: &mut KernelExpressionVisitorState, expr: impl Into<Exp
     state.inflight_ids.insert(expr.into())
 }
 
+fn wrap_predicate(state: &mut KernelExpressionVisitorState, pred: impl Into<Predicate>) -> usize {
+    // TODO: Actually split this out
+    wrap_expression(state, pred)
+}
+
 pub(crate) fn unwrap_kernel_expression(
     state: &mut KernelExpressionVisitorState,
     exprid: usize,
 ) -> Option<Expression> {
     state.inflight_ids.take(exprid)
+}
+
+pub(crate) fn unwrap_kernel_predicate(
+    state: &mut KernelExpressionVisitorState,
+    predid: usize,
+) -> Option<Predicate> {
+    // TODO: Actually split this out
+    unwrap_kernel_expression(state, predid)
 }
 
 fn visit_expression_binary(
@@ -60,70 +73,80 @@ fn visit_expression_binary(
     }
 }
 
-fn visit_expression_unary(
+fn visit_predicate_binary(
+    state: &mut KernelExpressionVisitorState,
+    op: BinaryOperator,
+    a: usize,
+    b: usize,
+) -> usize {
+    // TODO: Actually split this out
+    visit_expression_binary(state, op, a, b)
+}
+
+fn visit_predicate_unary(
     state: &mut KernelExpressionVisitorState,
     op: UnaryOperator,
     inner_expr: usize,
 ) -> usize {
     unwrap_kernel_expression(state, inner_expr)
-        .map_or(0, |expr| wrap_expression(state, Predicate::unary(op, expr)))
+        .map_or(0, |expr| wrap_predicate(state, Predicate::unary(op, expr)))
 }
 
 // The EngineIterator is not thread safe, not reentrant, not owned by callee, not freed by callee.
 #[no_mangle]
-pub extern "C" fn visit_expression_and(
+pub extern "C" fn visit_predicate_and(
     state: &mut KernelExpressionVisitorState,
     children: &mut EngineIterator,
 ) -> usize {
     let result = Predicate::and_from(
-        children.flat_map(|child| unwrap_kernel_expression(state, child as usize)),
+        children.flat_map(|child| unwrap_kernel_predicate(state, child as usize)),
     );
-    wrap_expression(state, result)
+    wrap_predicate(state, result)
 }
 
 #[no_mangle]
-pub extern "C" fn visit_expression_lt(
+pub extern "C" fn visit_predicate_lt(
     state: &mut KernelExpressionVisitorState,
     a: usize,
     b: usize,
 ) -> usize {
-    visit_expression_binary(state, BinaryOperator::LessThan, a, b)
+    visit_predicate_binary(state, BinaryOperator::LessThan, a, b)
 }
 
 #[no_mangle]
-pub extern "C" fn visit_expression_le(
+pub extern "C" fn visit_predicate_le(
     state: &mut KernelExpressionVisitorState,
     a: usize,
     b: usize,
 ) -> usize {
-    visit_expression_binary(state, BinaryOperator::LessThanOrEqual, a, b)
+    visit_predicate_binary(state, BinaryOperator::LessThanOrEqual, a, b)
 }
 
 #[no_mangle]
-pub extern "C" fn visit_expression_gt(
+pub extern "C" fn visit_predicate_gt(
     state: &mut KernelExpressionVisitorState,
     a: usize,
     b: usize,
 ) -> usize {
-    visit_expression_binary(state, BinaryOperator::GreaterThan, a, b)
+    visit_predicate_binary(state, BinaryOperator::GreaterThan, a, b)
 }
 
 #[no_mangle]
-pub extern "C" fn visit_expression_ge(
+pub extern "C" fn visit_predicate_ge(
     state: &mut KernelExpressionVisitorState,
     a: usize,
     b: usize,
 ) -> usize {
-    visit_expression_binary(state, BinaryOperator::GreaterThanOrEqual, a, b)
+    visit_predicate_binary(state, BinaryOperator::GreaterThanOrEqual, a, b)
 }
 
 #[no_mangle]
-pub extern "C" fn visit_expression_eq(
+pub extern "C" fn visit_predicate_eq(
     state: &mut KernelExpressionVisitorState,
     a: usize,
     b: usize,
 ) -> usize {
-    visit_expression_binary(state, BinaryOperator::Equal, a, b)
+    visit_predicate_binary(state, BinaryOperator::Equal, a, b)
 }
 
 /// # Safety
@@ -147,19 +170,20 @@ fn visit_expression_column_impl(
 }
 
 #[no_mangle]
-pub extern "C" fn visit_expression_not(
+pub extern "C" fn visit_predicate_not(
     state: &mut KernelExpressionVisitorState,
     inner_pred: usize,
 ) -> usize {
-    visit_expression_unary(state, UnaryOperator::Not, inner_pred)
+    unwrap_kernel_predicate(state, inner_pred)
+        .map_or(0, |pred| wrap_predicate(state, Predicate::not(pred)))
 }
 
 #[no_mangle]
-pub extern "C" fn visit_expression_is_null(
+pub extern "C" fn visit_predicate_is_null(
     state: &mut KernelExpressionVisitorState,
     inner_expr: usize,
 ) -> usize {
-    visit_expression_unary(state, UnaryOperator::IsNull, inner_expr)
+    visit_predicate_unary(state, UnaryOperator::IsNull, inner_expr)
 }
 
 /// # Safety
