@@ -1,6 +1,6 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of  checkpoint and commit
 //! files.
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::identity;
 use std::sync::{Arc, LazyLock};
 
@@ -189,6 +189,86 @@ impl LogSegment {
             ))
         );
         LogSegment::try_new(ascending_commit_files, vec![], log_root, end_version)
+    }
+
+    #[allow(unused)]
+    /// Constructs a [`LogSegment`] to be used for timestamp conversion. This [`LogSegment`] will consist
+    /// only of contiguous commit files. If an `end_version` is specified, the commit range will
+    /// include commits up to the `end_version` commit (inclusive). If present, `limit` specifies the
+    /// maximum length of the returned LogSegment.
+    pub(crate) fn for_timestamp_conversion(
+        storage: &dyn StorageHandler,
+        log_root: Url,
+        end_version: Version,
+        limit: Option<usize>,
+    ) -> DeltaResult<Self> {
+        // Compute the version to start listing from.
+        let start_from = limit
+            .map(|limit| {
+                let Ok(limit) = TryInto::<u64>::try_into(limit) else {
+                    return Err(Error::generic(
+                        "Failed to convert limit into u64
+                         when building log segment in timestamp conversion",
+                    ));
+                };
+                Ok(end_version - limit)
+            })
+            .transpose()?;
+
+        // List the commits greater than or equal to `start_from`. For large tables, listing with
+        // `start_from` can be a significant speedup over listing _all_ the files in the log.
+        let ascending_commit_files =
+            list_log_files(storage, &log_root, start_from, Some(end_version))?
+                .filter_ok(ParsedLogPath::is_commit);
+
+        // If limit is not specified, then use 10 as a default. Typically, there are 10 commits per
+        // checkpoint, so start with that.
+        let mut contiguous_commits: VecDeque<ParsedLogPath> =
+            VecDeque::with_capacity(limit.unwrap_or(10));
+
+        for commit_res in ascending_commit_files {
+            let commit = match commit_res {
+                Ok(commit) => commit,
+                Err(Error::InvalidLogPath(_)) => continue, // Invalid log paths are ignored
+                Err(err) => return Err(err), // All other errors are propagated to the caller
+            };
+
+            if contiguous_commits
+                .back()
+                .is_some_and(|prev_commit| prev_commit.version != commit.version - 1)
+            {
+                // We found a gap, so throw away all earlier versions
+                contiguous_commits.clear();
+            }
+
+            contiguous_commits.push_back(commit);
+
+            // If the number of commits exceeds the limit, remove the earliest one.
+            if limit.is_some_and(|limit| contiguous_commits.len() > limit) {
+                contiguous_commits.pop_front();
+            }
+        }
+
+        // If we have a non-empty commit list and a requested end version, verify they match.
+        //
+        // NOTE: No need to check for an empty commit list, `LogSegment::try_new` fails in that case.
+        if let Some(last_commit) = contiguous_commits
+            .back()
+            .take_if(|last_commit| last_commit.version != end_version)
+        {
+            return Err(Error::generic(format!(
+                "Failed to build LogSegment for timestamp conversion.
+                            Expected end version {end_version}, but found {}",
+                last_commit.version
+            )));
+        }
+
+        LogSegment::try_new(
+            contiguous_commits.into(),
+            vec![],
+            log_root,
+            Some(end_version),
+        )
     }
 
     /// Read a stream of actions from this log segment. This returns an iterator of (EngineData,
