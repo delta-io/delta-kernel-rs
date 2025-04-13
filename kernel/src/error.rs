@@ -204,6 +204,9 @@ pub enum Error {
     LiteralExpressionTransformError(
         #[from] crate::expressions::literal_expression_transform::Error,
     ),
+
+    #[error(transparent)]
+    LogHistoryError(#[from] crate::history_manager::error::LogHistoryError),
 }
 
 // Convenience constructors for Error types that take a String argument

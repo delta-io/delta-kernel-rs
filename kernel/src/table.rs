@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use url::Url;
 
+use crate::history_manager::LogHistoryManager;
 use crate::snapshot::Snapshot;
 use crate::table_changes::TableChanges;
 use crate::transaction::Transaction;
@@ -72,6 +73,10 @@ impl Table {
     /// Fully qualified location of the Delta table.
     pub fn location(&self) -> &Url {
         &self.location
+    }
+
+    pub fn history_manager(&self, engine: &dyn Engine) -> DeltaResult<LogHistoryManager> {
+        LogHistoryManager::try_new(engine, self.location.clone())
     }
 
     /// Create a [`Snapshot`] of the table corresponding to `version`.
