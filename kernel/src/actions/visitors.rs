@@ -16,6 +16,7 @@ use super::{
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 
+#[allow(unused)]
 #[derive(Default)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct MetadataVisitor {
@@ -164,6 +165,7 @@ impl RowVisitor for ProtocolVisitor {
     }
 }
 
+#[allow(unused)]
 #[derive(Default)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct AddVisitor {
@@ -237,6 +239,7 @@ impl RowVisitor for AddVisitor {
     }
 }
 
+#[allow(unused)]
 #[derive(Default)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct RemoveVisitor {
@@ -317,6 +320,7 @@ pub(crate) struct CdcVisitor {
     pub(crate) cdcs: Vec<Cdc>,
 }
 
+#[allow(unused)]
 impl CdcVisitor {
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn visit_cdc<'a>(
