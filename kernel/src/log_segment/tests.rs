@@ -1255,3 +1255,137 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
 
     Ok(())
 }
+
+#[test]
+fn for_timestamp_conversion_gets_commit_range() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(1, "checkpoint.parquet"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "json"),
+            delta_path_for_version(3, "checkpoint.parquet"),
+            delta_path_for_version(4, "json"),
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(5, "checkpoint.parquet"),
+            delta_path_for_version(6, "json"),
+            delta_path_for_version(7, "json"),
+        ],
+        None,
+    );
+
+    let log_segment =
+        LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 7, None).unwrap();
+    let commit_files = log_segment.ascending_commit_files;
+    let checkpoint_parts = log_segment.checkpoint_parts;
+
+    assert!(checkpoint_parts.is_empty());
+
+    let versions = commit_files.iter().map(|x| x.version).collect_vec();
+    assert_eq!(vec![0, 1, 2, 3, 4, 5, 6, 7], versions);
+}
+
+#[test]
+fn for_timestamp_conversion_with_old_end_version() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(1, "checkpoint.parquet"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "json"),
+            delta_path_for_version(3, "checkpoint.parquet"),
+            delta_path_for_version(4, "json"),
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(5, "checkpoint.parquet"),
+            delta_path_for_version(6, "json"),
+            delta_path_for_version(7, "json"),
+        ],
+        None,
+    );
+
+    let log_segment =
+        LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 5, None).unwrap();
+    let commit_files = log_segment.ascending_commit_files;
+    let checkpoint_parts = log_segment.checkpoint_parts;
+
+    assert!(checkpoint_parts.is_empty());
+
+    let versions = commit_files.iter().map(|x| x.version).collect_vec();
+    assert_eq!(vec![0, 1, 2, 3, 4, 5], versions);
+}
+
+#[test]
+fn for_timestamp_conversion_only_contiguous_ranges() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(1, "checkpoint.parquet"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "json"),
+            delta_path_for_version(3, "checkpoint.parquet"),
+            // version 4 is missing
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(5, "checkpoint.parquet"),
+            delta_path_for_version(6, "json"),
+            delta_path_for_version(7, "json"),
+        ],
+        None,
+    );
+
+    let log_segment =
+        LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 7, None).unwrap();
+    let commit_files = log_segment.ascending_commit_files;
+    let checkpoint_parts = log_segment.checkpoint_parts;
+
+    assert!(checkpoint_parts.is_empty());
+
+    let versions = commit_files.iter().map(|x| x.version).collect_vec();
+    assert_eq!(vec![5, 6, 7], versions);
+}
+
+#[test]
+fn for_timestamp_conversion_with_limit() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(1, "checkpoint.parquet"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "json"),
+            delta_path_for_version(3, "checkpoint.parquet"),
+            delta_path_for_version(4, "json"),
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(5, "checkpoint.parquet"),
+            delta_path_for_version(6, "json"),
+            delta_path_for_version(7, "json"),
+        ],
+        None,
+    );
+
+    let log_segment =
+        LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 7, Some(3))
+            .unwrap();
+    let commit_files = log_segment.ascending_commit_files;
+    let checkpoint_parts = log_segment.checkpoint_parts;
+
+    assert!(checkpoint_parts.is_empty());
+
+    let versions = commit_files.iter().map(|x| x.version).collect_vec();
+    assert_eq!(vec![5, 6, 7], versions);
+}
+
+#[test]
+fn for_timestamp_conversion_no_commit_files() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[delta_path_for_version(5, "checkpoint.parquet")],
+        None,
+    );
+
+    let res = LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 0, None);
+    assert!(res.is_err());
+    let msg = res.err().unwrap().to_string();
+    assert!(msg.contains("No files in log segment"))
+}
