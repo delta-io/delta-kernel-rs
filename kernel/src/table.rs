@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use url::Url;
 
+use crate::history_manager::LogTimeConverter;
 use crate::snapshot::Snapshot;
 use crate::table_changes::TableChanges;
 use crate::transaction::Transaction;
@@ -79,6 +80,34 @@ impl Table {
     /// If no version is supplied, a snapshot for the latest version will be created.
     pub fn snapshot(&self, engine: &dyn Engine, version: Option<Version>) -> DeltaResult<Snapshot> {
         Snapshot::try_new(self.location.clone(), engine, version)
+    }
+
+    pub fn timestamp_to_version(
+        &self,
+        engine: &dyn Engine,
+        timestamp: i64,
+    ) -> DeltaResult<Option<Version>> {
+        let history = LogTimeConverter::new(self.location.clone(), timestamp);
+        let Some(range) = history.convert(engine)? else {
+            return Ok(None);
+        };
+        debug_assert!(range.start_timestamp >= timestamp);
+        Ok(Some(range.start_version))
+    }
+
+    pub fn timestamp_range_to_versions(
+        &self,
+        engine: &dyn Engine,
+        start_timestamp: i64,
+        end_timestamp: i64,
+    ) -> DeltaResult<Option<(Version, Version)>> {
+        let history =
+            LogTimeConverter::new_range(self.location.clone(), start_timestamp, end_timestamp);
+        let Some(range) = history.convert(engine)? else {
+            return Ok(None);
+        };
+        debug_assert!(range.start_timestamp >= start_timestamp);
+        Ok(Some((range.start_version, range.end_version.unwrap())))
     }
 
     /// Create a [`TableChanges`] to get a change data feed for the table between `start_version`,
