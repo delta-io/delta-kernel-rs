@@ -196,7 +196,7 @@ impl Expression {
     /// Returns a set of columns referenced by this expression.
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();
-        let _ = references.transform(self);
+        let _ = references.transform_expr(self);
         references.into_inner()
     }
 
