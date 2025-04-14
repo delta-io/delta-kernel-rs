@@ -131,7 +131,6 @@ impl Transaction {
         );
         let add_actions = generate_adds(engine, self.write_metadata.iter().map(|a| a.as_ref()));
 
-        // TODO: should we chain before/after file actions?
         let actions = iter::once(commit_info_actions)
             .chain(add_actions)
             .chain(set_transaction_actions);
