@@ -170,7 +170,7 @@ impl PhysicalPredicate {
         let mut apply_mappings = ApplyColumnMappings {
             column_mappings: get_referenced_fields.column_mappings,
         };
-        if let Some(predicate) = apply_mappings.transform(predicate) {
+        if let Some(predicate) = apply_mappings.transform_pred(predicate) {
             Ok(PhysicalPredicate::Some(
                 Arc::new(predicate.into_owned()),
                 Arc::new(schema.into_owned()),
@@ -239,7 +239,7 @@ struct ApplyColumnMappings {
 impl<'a> ExpressionTransform<'a> for ApplyColumnMappings {
     // NOTE: We already verified all column references. But if the map probe ever did fail, the
     // transform would just delete any expression(s) that reference the invalid column.
-    fn transform_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
         self.column_mappings
             .get(name)
             .map(|physical_name| Cow::Owned(physical_name.clone()))
