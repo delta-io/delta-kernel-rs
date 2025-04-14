@@ -2,11 +2,12 @@
 
 use std::env;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use flate2::read::GzDecoder;
 use tar::Archive;
+use ureq::{Agent, Proxy};
 
 const DAT_EXISTS_FILE_CHECK: &str = "tests/dat/.done";
 const OUTPUT_FOLDER: &str = "tests/dat";
@@ -33,8 +34,9 @@ fn download_dat_files() -> Vec<u8> {
     );
 
     let response = if let Ok(proxy_url) = env::var("HTTPS_PROXY") {
-        let proxy = ureq::Proxy::new(proxy_url).unwrap();
-        let agent = ureq::AgentBuilder::new().proxy(proxy).build();
+        let proxy = Proxy::new(&proxy_url).unwrap();
+        let config = Agent::config_builder().proxy(proxy.into()).build();
+        let agent = Agent::new_with_config(config);
         agent.get(&tarball_url).call().unwrap()
     } else {
         ureq::get(&tarball_url).call().unwrap()
@@ -42,7 +44,8 @@ fn download_dat_files() -> Vec<u8> {
 
     let mut tarball_data: Vec<u8> = Vec::new();
     response
-        .into_reader()
+        .into_body()
+        .as_reader()
         .read_to_end(&mut tarball_data)
         .unwrap();
 

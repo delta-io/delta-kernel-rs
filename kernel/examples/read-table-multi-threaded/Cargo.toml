@@ -14,8 +14,8 @@ delta_kernel = { path = "../../../kernel", features = [
   "sync-engine",
   "developer-visibility",
 ] }
-env_logger = "0.11.5"
-itertools = "0.13"
+env_logger = "0.11.8"
+itertools = "0.14"
 spmc = "0.3.0"
 url = "2"
 
