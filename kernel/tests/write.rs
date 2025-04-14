@@ -7,7 +7,7 @@ use delta_kernel::arrow::array::{
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::transaction::CommitResult;
+
 use itertools::Itertools;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
@@ -721,17 +721,20 @@ async fn test_idempotent_writes() -> Result<(), Box<dyn std::error::Error>> {
         let commit_info = new_commit_info()?;
 
         // can't have duplicate app_id in same transaction
-        assert!(table
-            .new_transaction(&engine)?
-            .with_set_transaction("app_id1".to_string(), 0)?
-            .with_set_transaction("app_id1".to_string(), 1)
-            .is_err());
+        assert!(matches!(
+            table
+                .new_transaction(&engine)?
+                .with_transaction_id("app_id1".to_string(), 0)
+                .with_transaction_id("app_id1".to_string(), 1)
+                .commit(&engine),
+            Err(KernelError::Generic(msg)) if msg == "app_id app_id1 already exists in transaction"
+        ));
 
         let txn = table
             .new_transaction(&engine)?
             .with_commit_info(commit_info)
-            .with_set_transaction("app_id1".to_string(), 1)?
-            .with_set_transaction("app_id2".to_string(), 2)?;
+            .with_transaction_id("app_id1".to_string(), 1)
+            .with_transaction_id("app_id2".to_string(), 2);
 
         // commit!
         txn.commit(&engine)?;
@@ -779,18 +782,6 @@ async fn test_idempotent_writes() -> Result<(), Box<dyn std::error::Error>> {
         ];
 
         assert_eq!(parsed_commits, expected_commit);
-
-        let commit_info = new_commit_info()?;
-        let txn = table
-            .new_transaction(&engine)?
-            .with_commit_info(commit_info)
-            .with_set_transaction("app_id1".to_string(), 1)?;
-
-        // commit should fail since we've already committed (app_id1, 1)
-        assert!(matches!(
-            txn.commit(&engine)?,
-            CommitResult::IdempotentWriteConflict(_, _, 1)
-        ));
     }
     Ok(())
 }

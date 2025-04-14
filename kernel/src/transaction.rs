@@ -1,10 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::actions::schemas::{GetNullableContainerStructField, GetStructField};
-use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::SetTransaction;
 use crate::actions::COMMIT_INFO_NAME;
 use crate::actions::{get_log_add_schema, get_log_commit_info_schema};
@@ -56,10 +55,10 @@ pub struct Transaction {
     operation: Option<String>,
     commit_info: Option<Arc<dyn EngineData>>,
     write_metadata: Vec<Box<dyn EngineData>>,
-    // NB: we could use HashMap<String, SetTransaction> for set_transactions but since the expected
-    // number is small, we will save an allocation and (likely) have better memory locality just
-    // with a Vec. (following rule-of-thumb that 10-100 linear search will do same/better than hash
-    // lookup)
+    // NB: hashmap would require either duplicating the appid or splitting SetTransaction
+    // key/payload. Hashset requires Borrow<&str> and Eq, Ord, and Hash. Plus, HashSet::insert drops
+    // the to-be-inserted value without returning the existing one, which would make error messaging
+    // unnecessarily difficult. Thus, we keep Vec here and deduplicate in the commit method.
     set_transactions: Vec<SetTransaction>,
 }
 
@@ -71,11 +70,6 @@ impl std::fmt::Debug for Transaction {
             self.commit_info.is_some()
         ))
     }
-}
-
-enum SetTransactionResult {
-    Valid,
-    Conflict(SetTransaction),
 }
 
 impl Transaction {
@@ -105,27 +99,23 @@ impl Transaction {
     /// Consume the transaction and commit it to the table. The result is a [CommitResult] which
     /// will include the failed transaction in case of a conflict so the user can retry.
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
-        // step 0: if there are SetTransaction(app_id, version) actions being committed, ensure
-        // that for every app_id, this commit's version is greater than any previous version. if
-        // so, we chain them to our actions iterator.
-        //
-        // TODO: we are currently doing set_transaction validation (another log replay) as a
-        // separate step but we could be smarter and merge this with the snapshot log replay above
-        // to produce a special snapshot with SetTransactions (but how do we know which ones to
-        // care about ahead of time?)
-        match self.validate_set_transactions(engine)? {
-            SetTransactionResult::Valid => {}
-            SetTransactionResult::Conflict(conflict_transaction) => {
-                return Ok(CommitResult::IdempotentWriteConflict(
-                    self,
-                    conflict_transaction.app_id.clone(),
-                    conflict_transaction.version,
-                ));
-            }
+        // step 0: if there are txn(app_id, version) actions being committed, ensure that every
+        // `app_id` is unique.
+        let mut app_ids = HashSet::new();
+        if let Some(dup) = self
+            .set_transactions
+            .iter()
+            .find(|t| !app_ids.insert(&t.app_id))
+        {
+            return Err(Error::generic(format!(
+                "app_id {} already exists in transaction",
+                dup.app_id
+            )));
         }
+
         let set_transaction_actions = self
             .set_transactions
-            .clone() // FIXME?
+            .clone()
             .into_iter()
             .map(|txn| txn.into_engine_data(engine));
 
@@ -160,29 +150,6 @@ impl Transaction {
         }
     }
 
-    /// given an iterator of SetTransaction actions, validate by:
-    /// 1. replaying the log to find the latest version of each app_id
-    /// 2. explode if any app_id has a version that is greater or eq to the current app_id's version
-    ///    (in this transaction)
-    ///
-    /// note that (1) above can be improved in potentially a couple of ways:
-    /// - we could merge this with the snapshot log replay above to avoid a second log replay
-    /// - we could pass a list of app ids to the set transaction scanner so we don't do wasted work
-    fn validate_set_transactions(&self, engine: &dyn Engine) -> DeltaResult<SetTransactionResult> {
-        let scanner = SetTransactionScanner::new(self.read_snapshot.clone());
-        let latest_app_ids = scanner.application_transactions(engine)?;
-
-        for set_transaction in &self.set_transactions {
-            if let Some(existing) = latest_app_ids.get(&set_transaction.app_id) {
-                if existing.version >= set_transaction.version {
-                    return Ok(SetTransactionResult::Conflict(set_transaction.clone()));
-                }
-            }
-        }
-
-        Ok(SetTransactionResult::Valid)
-    }
-
     /// Set the operation that this transaction is performing. This string will be persisted in the
     /// commit and visible to anyone who describes the table history.
     pub fn with_operation(mut self, operation: String) -> Self {
@@ -192,24 +159,12 @@ impl Transaction {
 
     /// Include a SetTransaction (app_id and version) action for this transaction.
     /// Note that each app_id can only appear once per transaction. That is, multiple app_ids with
-    /// different versions are disallowed in a single transaction.
-    pub fn with_set_transaction(mut self, app_id: String, version: i64) -> DeltaResult<Self> {
-        // TODO: do we want to prohibit multiple app_ids in a single transaction? (like we are
-        // doing here) Or just simply overwrite?
+    /// different versions are disallowed in a single transaction. If a duplicate app_id is
+    /// included, the `commit` will fail (that is, we don't eagerly check app_id validity here).
+    pub fn with_transaction_id(mut self, app_id: String, version: i64) -> Self {
         let set_transaction = SetTransaction::new(app_id, version, None);
-        if self
-            .set_transactions
-            .iter()
-            .any(|txn| txn.app_id == set_transaction.app_id)
-        {
-            return Err(Error::generic(format!(
-                "app_id {} already exists in transaction",
-                set_transaction.app_id
-            )));
-        } else {
-            self.set_transactions.push(set_transaction);
-        }
-        Ok(self)
+        self.set_transactions.push(set_transaction);
+        self
     }
 
     /// WARNING: This is an unstable API and will likely change in the future.
@@ -333,11 +288,6 @@ pub enum CommitResult {
     Committed(Version),
     /// This transaction conflicted with an existing version (at the version given).
     Conflict(Transaction, Version),
-    /// This transaction conflicted with a previous transaction's app_id (existing app_id version >
-    /// this transaction's app_id version).
-    /// The tuple provides the transaction (for retry), along with the (app_id, version) conflict.
-    // TODO make these structs.
-    IdempotentWriteConflict(Transaction, String, i64),
 }
 
 // given the engine's commit info we want to create commitInfo action to commit (and append more actions to)
