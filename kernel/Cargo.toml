@@ -37,20 +37,20 @@ pre-release-hook = [
 ]
 
 [dependencies]
-bytes = "1.7"
+bytes = "1.10"
 chrono = "=0.4.39"
 fix-hidden-lifetime-bug = "0.2"
-indexmap = "2.5.0"
-itertools = "0.13"
-roaring = "0.10.6"
+indexmap = "2.9.0"
+itertools = "0.14"
+roaring = "0.10.12"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
-thiserror = "1"
+thiserror = "2"
 # only for structured logging
 tracing = { version = "0.1", features = ["log"] }
 url = "2"
-uuid = { version = "1.10.0", features = ["v4", "fast-rng"] }
-z85 = "3.0.5"
+uuid = { version = "1.16.0", features = ["v4", "fast-rng"] }
+z85 = "3.0.6"
 
 # bring in our derive macros
 delta_kernel_derive = { path = "../derive-macros", version = "0.9.0" }
@@ -77,12 +77,12 @@ futures = { version = "0.3", optional = true }
 object_store = { workspace = true, optional = true }
 hdfs-native-object-store = { workspace = true, optional = true }
 # Used for fetching direct urls (like pre-signed urls)
-reqwest = { version = "0.12.8", default-features = false, optional = true }
-strum = { version = "0.26", features = ["derive"] }
+reqwest = { version = "0.12.15", default-features = false, optional = true }
+strum = { version = "0.27", features = ["derive"] }
 
 
 # optionally used with default engine (though not required)
-tokio = { version = "1.40", optional = true, features = ["rt-multi-thread"] }
+tokio = { version = "1.44", optional = true, features = ["rt-multi-thread"] }
 
 # Used in integration tests
 hdfs-native = { workspace = true, optional = true }
