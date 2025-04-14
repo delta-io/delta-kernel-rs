@@ -93,19 +93,19 @@ pub(crate) mod kernel_predicates;
 pub mod parquet;
 pub(crate) mod utils;
 
-#[cfg(feature = "unstable")]
+#[cfg(feature = "internal-api")]
 pub mod path;
-#[cfg(not(feature = "unstable"))]
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod path;
 
-#[cfg(feature = "unstable")]
+#[cfg(feature = "internal-api")]
 pub mod log_replay;
-#[cfg(not(feature = "unstable"))]
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod log_replay;
 
-#[cfg(feature = "unstable")]
+#[cfg(feature = "internal-api")]
 pub mod log_segment;
-#[cfg(not(feature = "unstable"))]
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod log_segment;
 
 pub use delta_kernel_derive;
