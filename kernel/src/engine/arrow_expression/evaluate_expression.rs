@@ -237,11 +237,8 @@ pub(crate) fn evaluate_expression(
                     evaluate_expression(&Expression::literal(default), batch, result_type)
                 })
         }
-        (Junction(_), _) => {
-            // NOTE: Update this error message if we add support for junction operations on other types
-            Err(Error::Generic(format!(
-                "Junction {expression:?} is expected to return boolean results, got {result_type:?}"
-            )))
-        }
+        (Junction(_), _) => Err(Error::Generic(format!(
+            "Junction {expression:?} is expected to return boolean results, got {result_type:?}"
+        ))),
     }
 }
