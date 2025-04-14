@@ -7,10 +7,13 @@ use std::path::PathBuf;
 
 use url::Url;
 
+use crate::actions::{Metadata, Protocol};
+use crate::path::ParsedLogPath;
 use crate::snapshot::Snapshot;
 use crate::table_changes::TableChanges;
 use crate::transaction::Transaction;
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::IntoEngineData;
+use crate::{schema::Schema, DeltaResult, Engine, Error, Version};
 
 /// In-memory representation of a Delta table, which acts as an immutable root entity for reading
 /// the different versions (see [`Snapshot`]) of the table located in storage.
@@ -28,9 +31,36 @@ impl std::fmt::Debug for Table {
 }
 
 impl Table {
-    /// Create a new Delta table with the given parameters
+    /// Read a Delta table from the given location
     pub fn new(location: Url) -> Self {
         Self { location }
+    }
+
+    /// Create a new Delta table with a given schema (with default protocol/metadata) at the
+    /// location provided
+    pub fn create(
+        name: &str,
+        schema: Schema,
+        location: Url,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Self> {
+        let protocol = Protocol::default();
+        let metadata = Metadata::new(name.to_string(), schema, vec![]);
+
+        let actions = vec![
+            protocol.into_engine_data(engine),
+            metadata.into_engine_data(engine),
+        ];
+
+        let json_handler = engine.json_handler();
+        let commit_path = ParsedLogPath::new_commit(&location, 0)?;
+        json_handler.write_json_file(
+            &commit_path.location,
+            Box::new(actions.into_iter()),
+            false,
+        )?;
+
+        Ok(Self::new(location))
     }
 
     /// Try to create a new table from a string uri. This will do it's best to handle things like

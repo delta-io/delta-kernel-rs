@@ -84,6 +84,7 @@ impl Scalar {
                     None,
                 ))
             }
+            Map(map_data) => todo!(),
             Null(DataType::BYTE) => Arc::new(Int8Array::new_null(num_rows)),
             Null(DataType::SHORT) => Arc::new(Int16Array::new_null(num_rows)),
             Null(DataType::INTEGER) => Arc::new(Int32Array::new_null(num_rows)),

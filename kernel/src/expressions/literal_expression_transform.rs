@@ -160,21 +160,57 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
         Some(Cow::Borrowed(field))
     }
 
-    // arrays unsupported for now
-    fn transform_array(&mut self, _array_type: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
+    // arrays treated as leaves
+    fn transform_array(&mut self, array_type: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
+        // first always check error to terminate early if possible
         self.error.as_ref().ok()?;
-        self.set_error(Error::Unsupported(
-            "ArrayType not yet supported in literal expression transform".to_string(),
-        ));
+        let Some(scalar) = self.scalars.next() else {
+            self.set_error(Error::InsufficientScalars);
+            return None;
+        };
+
+        let DataType::Array(scalar_type) = scalar.data_type() else {
+            self.set_error(Error::Schema(
+                "Non-array scalar type {datatype} provided for array leaf".to_string(),
+            ));
+            return None;
+        };
+        if scalar_type.as_ref() != array_type {
+            self.set_error(Error::Schema(format!(
+                "Mismatched scalar type while creating Expression: expected {:?}, got {:?}",
+                array_type, scalar_type
+            )));
+            return None;
+        }
+
+        self.stack.push(Expression::Literal(scalar.clone()));
         None
     }
 
-    // maps unsupported for now
-    fn transform_map(&mut self, _map_type: &'a MapType) -> Option<Cow<'a, MapType>> {
+    // maps treated as leaves
+    fn transform_map(&mut self, map_type: &'a MapType) -> Option<Cow<'a, MapType>> {
+        // first always check error to terminate early if possible
         self.error.as_ref().ok()?;
-        self.set_error(Error::Unsupported(
-            "MapType not yet supported in literal expression transform".to_string(),
-        ));
+        let Some(scalar) = self.scalars.next() else {
+            self.set_error(Error::InsufficientScalars);
+            return None;
+        };
+
+        let DataType::Map(scalar_type) = scalar.data_type() else {
+            self.set_error(Error::Schema(
+                "Non-map scalar type {datatype} provided for map leaf".to_string(),
+            ));
+            return None;
+        };
+        if scalar_type.as_ref() != map_type {
+            self.set_error(Error::Schema(format!(
+                "Mismatched scalar type while creating Expression: expected {:?}, got {:?}",
+                map_type, scalar_type
+            )));
+            return None;
+        }
+
+        self.stack.push(Expression::Literal(scalar.clone()));
         None
     }
 }

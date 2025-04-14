@@ -333,6 +333,7 @@ fn visit_expression_internal(
                 visit_expression_struct_literal(visitor, struct_data, sibling_list_id)
             }
             Scalar::Array(array) => visit_expression_array(visitor, array, sibling_list_id),
+            Scalar::Map(_map_data) => todo!(),
         }
     }
     fn visit_expression_impl(

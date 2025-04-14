@@ -19,7 +19,7 @@ use crate::{DeltaResult, EngineData, Error, FileMeta, RowVisitor as _};
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
-use delta_kernel_derive::Schema;
+use delta_kernel_derive::{IntoEngineData, Schema};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
@@ -91,7 +91,7 @@ pub(crate) fn get_log_commit_info_schema() -> &'static SchemaRef {
     &LOG_COMMIT_INFO_SCHEMA
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, Schema, IntoEngineData)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 #[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
 pub(crate) struct Format {
@@ -110,7 +110,7 @@ impl Default for Format {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Schema, IntoEngineData)]
 #[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct Metadata {
@@ -133,6 +133,19 @@ pub(crate) struct Metadata {
 }
 
 impl Metadata {
+    pub(crate) fn new(name: String, schema: StructType, partition_columns: Vec<String>) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: Some(name),
+            description: None,
+            format: Format::default(),
+            schema_string: serde_json::to_string(&schema).unwrap_or_default(),
+            partition_columns,
+            created_time: Some(chrono::Utc::now().timestamp_millis()),
+            configuration: HashMap::new(),
+        }
+    }
+
     pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
         let mut visitor = MetadataVisitor::default();
         visitor.visit_rows_of(data)?;
@@ -163,7 +176,7 @@ impl Metadata {
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, Schema, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Schema, Serialize, Deserialize, IntoEngineData)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 // TODO move to another module so that we disallow constructing this struct without using the
@@ -183,6 +196,17 @@ pub(crate) struct Protocol {
     /// write this table (exist only when minWriterVersion is set to 7)
     #[serde(skip_serializing_if = "Option::is_none")]
     writer_features: Option<Vec<WriterFeature>>,
+}
+
+impl Default for Protocol {
+    fn default() -> Self {
+        Protocol {
+            min_reader_version: 3,
+            min_writer_version: 7,
+            reader_features: Some(SUPPORTED_READER_FEATURES.to_vec()),
+            writer_features: Some(SUPPORTED_WRITER_FEATURES.to_vec()),
+        }
+    }
 }
 
 fn parse_features<T>(features: Option<impl IntoIterator<Item = impl ToString>>) -> Option<Vec<T>>
@@ -550,7 +574,7 @@ pub(crate) struct Cdc {
     pub tags: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, Schema, IntoEngineData)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct SetTransaction {
     /// A unique identifier for the application performing the transaction.
@@ -1017,5 +1041,79 @@ mod tests {
             ReaderFeature::unknown("absurD_)(+13%^⚙️"),
         ]);
         assert_eq!(parse_features::<ReaderFeature>(features), expected);
+    }
+
+    #[test]
+    fn test_into_engine_data() {
+        use crate::engine::arrow_expression::ArrowEvaluationHandler;
+        use crate::IntoEngineData;
+        use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
+
+        // duplicated
+        struct ExprEngine(Arc<dyn EvaluationHandler>);
+
+        impl ExprEngine {
+            fn new() -> Self {
+                ExprEngine(Arc::new(ArrowEvaluationHandler))
+            }
+        }
+
+        impl Engine for ExprEngine {
+            fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+                self.0.clone()
+            }
+
+            fn json_handler(&self) -> Arc<dyn JsonHandler> {
+                unimplemented!()
+            }
+
+            fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+                unimplemented!()
+            }
+
+            fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+                unimplemented!()
+            }
+        }
+
+        let engine = ExprEngine::new();
+
+        let set_transaction = SetTransaction {
+            app_id: "app_id".to_string(),
+            version: 0,
+            last_updated: None,
+        };
+
+        let engine_data = set_transaction.into_engine_data(&engine);
+
+        use crate::engine::arrow_data::ArrowEngineData;
+        let record_batch: crate::arrow::array::RecordBatch = engine_data
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        use crate::arrow::array::{Int64Array, StringArray};
+        use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use crate::arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("appId", ArrowDataType::Utf8, false),
+            Field::new("version", ArrowDataType::Int64, false),
+            Field::new("lastUpdated", ArrowDataType::Int64, true),
+        ]));
+
+        let expected = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["app_id"])),
+                Arc::new(Int64Array::from(vec![0_i64])),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(record_batch, expected);
     }
 }

@@ -134,3 +134,60 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
     });
     quote! { #(#schema_fields),* }
 }
+
+/// Derive an IntoEngineData trait for a struct that implements ToDataType and has all fields
+/// implement `Into<Scalar>`.
+#[proc_macro_derive(IntoEngineData)]
+pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let struct_name = &input.ident;
+    let fields = match &input.data {
+        Data::Struct(data) => match &data.fields {
+            Fields::Named(fields) => &fields.named,
+            _ => {
+                return Error::new(
+                    struct_name.span(),
+                    "IntoEngineData can only be derived for structs with named fields",
+                )
+                .to_compile_error()
+                .into()
+            }
+        },
+        _ => {
+            return Error::new(
+                struct_name.span(),
+                "IntoEngineData can only be derived for structs",
+            )
+            .to_compile_error()
+            .into()
+        }
+    };
+
+    let field_idents = fields.iter().map(|f| &f.ident);
+    // let field_types = fields.iter().map(|f| &f.ty);
+
+    let expanded = quote! {
+        use crate::actions::schemas::ToSchema as _;
+        use crate::EvaluationHandlerExtension as _;
+        #[automatically_derived]
+        impl crate::IntoEngineData for #struct_name
+        where
+            Self: crate::actions::schemas::ToSchema,
+            // #(#field_types: Into<crate::expressions::Scalar>),*
+        {
+            fn into_engine_data(
+                self,
+                engine: &dyn crate::Engine)
+            -> crate::DeltaResult<Box<dyn crate::EngineData>> {
+                let values = [
+                    #(self.#field_idents.into()),*
+                ];
+                let evaluator = engine.evaluation_handler();
+                let schema = std::sync::Arc::new(Self::to_schema()); // fixme remove arc
+                evaluator.create_one(schema, &values)
+            }
+        }
+    };
+
+    proc_macro::TokenStream::from(expanded)
+}

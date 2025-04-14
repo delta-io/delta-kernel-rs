@@ -1,9 +1,11 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 
-use crate::schema::{ArrayType, DataType, PrimitiveType, StructField};
+use crate::actions::schemas::ToDataType;
+use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
@@ -21,11 +23,11 @@ pub struct ArrayData {
 }
 
 impl ArrayData {
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub fn new(tpe: ArrayType, elements: impl IntoIterator<Item = impl Into<Scalar>>) -> Self {
         let elements = elements.into_iter().map(Into::into).collect();
         Self { tpe, elements }
     }
+
     pub fn array_type(&self) -> &ArrayType {
         &self.tpe
     }
@@ -88,6 +90,12 @@ impl StructData {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct MapData {
+    data_type: MapType,
+    elements: Vec<(Scalar, Scalar)>,
+}
+
 /// A single value, which can be null. Used for representing literal values
 /// in [Expressions][crate::expressions::Expression].
 #[derive(Debug, Clone)]
@@ -124,6 +132,8 @@ pub enum Scalar {
     Struct(StructData),
     /// Array Value
     Array(ArrayData),
+    /// Map Value
+    Map(MapData),
 }
 
 impl Scalar {
@@ -145,6 +155,7 @@ impl Scalar {
             Self::Null(data_type) => data_type.clone(),
             Self::Struct(data) => DataType::struct_type(data.fields.clone()),
             Self::Array(data) => data.tpe.clone().into(),
+            Self::Map(map_data) => map_data.data_type.clone().into(),
         }
     }
 
@@ -221,6 +232,7 @@ impl Display for Scalar {
                 }
                 write!(f, ")")
             }
+            Self::Map(_map_data) => todo!(),
         }
     }
 }
@@ -268,6 +280,7 @@ impl PartialOrd for Scalar {
             (Null(_), _) => None, // NOTE: NULL values are incomparable by definition
             (Struct(_), _) => None, // TODO: Support Struct?
             (Array(_), _) => None, // TODO: Support Array?
+            (Map(_), _) => None,  // TODO: Support Map?
         }
     }
 }
@@ -335,6 +348,62 @@ impl<T: Into<Scalar> + Copy> From<&T> for Scalar {
 impl From<&[u8]> for Scalar {
     fn from(b: &[u8]) -> Self {
         Self::Binary(b.into())
+    }
+}
+
+impl<T: Into<Scalar> + ToDataType> From<Option<T>> for Scalar {
+    fn from(val: Option<T>) -> Self {
+        match val {
+            Some(v) => v.into(),
+            None => Scalar::Null(T::to_data_type()),
+        }
+    }
+}
+
+impl<T: Into<Scalar> + ToDataType> From<Vec<T>> for Scalar {
+    fn from(v: Vec<T>) -> Self {
+        Scalar::Array(ArrayData::new(ArrayType::new(T::to_data_type(), true), v))
+    }
+}
+
+impl<K, V> From<HashMap<K, V>> for Scalar
+where
+    K: Into<Scalar> + ToDataType,
+    V: Into<Scalar> + ToDataType,
+{
+    fn from(map: HashMap<K, V>) -> Self {
+        Scalar::Map(MapData {
+            data_type: MapType::new(K::to_data_type(), V::to_data_type(), true),
+            elements: map.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
+        })
+    }
+}
+
+use crate::actions::Format;
+impl From<Format> for Scalar {
+    fn from(format: Format) -> Self {
+        let map_type = MapType::new(DataType::STRING, DataType::STRING, true);
+        let fields = vec![
+            StructField::new("provider", DataType::STRING, false),
+            StructField::new("options", DataType::Map(Box::new(map_type)), true),
+        ];
+        let values = vec![
+            Scalar::String(format.provider.to_string()),
+            format.options.into(),
+        ];
+        Scalar::Struct(StructData::try_new(fields, values).unwrap())
+    }
+}
+
+use crate::table_features::{ReaderFeature, WriterFeature};
+impl From<ReaderFeature> for Scalar {
+    fn from(feature: ReaderFeature) -> Self {
+        Scalar::String(feature.to_string())
+    }
+}
+impl From<WriterFeature> for Scalar {
+    fn from(feature: WriterFeature) -> Self {
+        Scalar::String(feature.to_string())
     }
 }
 
