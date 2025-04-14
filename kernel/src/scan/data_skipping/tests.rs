@@ -25,7 +25,7 @@ macro_rules! expect_eq {
 #[test]
 fn test_eval_is_null() {
     let col = &column_expr!("x");
-    let expressions = [Expr::is_null(col.clone()), !Expr::is_null(col.clone())];
+    let expressions = [Expr::is_null(col.clone()), Expr::is_not_null(col.clone())];
 
     let do_test = |nullcount: i64, expected: &[Option<bool>]| {
         let resolver = HashMap::from_iter([
