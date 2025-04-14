@@ -19,9 +19,9 @@ use delta_kernel_ffi_macros::handle_descriptor;
 // cbindgen doesn't understand our use of feature flags here, and by default it parses `mod handle`
 // twice. So we tell it to ignore one of the declarations to avoid double-definition errors.
 /// cbindgen:ignore
-#[cfg(feature = "developer-visibility")]
+#[cfg(feature = "unstable")]
 pub mod handle;
-#[cfg(not(feature = "developer-visibility"))]
+#[cfg(not(feature = "unstable"))]
 pub(crate) mod handle;
 
 use handle::Handle;
