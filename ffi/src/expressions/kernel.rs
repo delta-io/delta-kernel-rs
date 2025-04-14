@@ -19,11 +19,11 @@ pub unsafe extern "C" fn free_kernel_predicate(data: Handle<SharedExpression>) {
 }
 
 type VisitLiteralFn<T> = extern "C" fn(data: *mut c_void, sibling_list_id: usize, value: T);
+type VisitUnaryFn = extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
 type VisitBinaryOpFn =
     extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
 type VisitVariadicFn =
     extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
-type VisitUnaryFn = extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
 
 /// The [`EngineExpressionVisitor`] defines a visitor system to allow engines to build their own
 /// representation of a kernel expression.
@@ -209,184 +209,187 @@ pub unsafe extern "C" fn visit_expression_ref(
     visit_expression_internal(expression, visitor)
 }
 
+macro_rules! call {
+    ( $visitor:ident, $visitor_fn:ident $(, $extra_args:expr) *) => {
+        ($visitor.$visitor_fn)($visitor.data $(, $extra_args) *)
+    };
+}
+
+fn visit_expression_array(
+    visitor: &mut EngineExpressionVisitor,
+    array: &ArrayData,
+    sibling_list_id: usize,
+) {
+    #[allow(deprecated)]
+    let elements = array.array_elements();
+    let child_list_id = call!(visitor, make_field_list, elements.len());
+    for scalar in elements {
+        visit_expression_scalar(visitor, scalar, child_list_id);
+    }
+    call!(visitor, visit_literal_array, sibling_list_id, child_list_id);
+}
+
+fn visit_expression_struct_literal(
+    visitor: &mut EngineExpressionVisitor,
+    struct_data: &StructData,
+    sibling_list_id: usize,
+) {
+    let child_value_list_id = call!(visitor, make_field_list, struct_data.fields().len());
+    let child_field_list_id = call!(visitor, make_field_list, struct_data.fields().len());
+    for (field, value) in struct_data.fields().iter().zip(struct_data.values()) {
+        let field_name = field.name();
+        call!(
+            visitor,
+            visit_literal_string,
+            child_field_list_id,
+            kernel_string_slice!(field_name)
+        );
+        visit_expression_scalar(visitor, value, child_value_list_id);
+    }
+    call!(
+        visitor,
+        visit_literal_struct,
+        sibling_list_id,
+        child_field_list_id,
+        child_value_list_id
+    )
+}
+
+fn visit_expression_struct_expr(
+    visitor: &mut EngineExpressionVisitor,
+    exprs: &[Expression],
+    sibling_list_id: usize,
+) {
+    let child_list_id = call!(visitor, make_field_list, exprs.len());
+    for expr in exprs {
+        visit_expression_impl(visitor, expr, child_list_id);
+    }
+    call!(visitor, visit_struct_expr, sibling_list_id, child_list_id)
+}
+
+fn visit_expression_variadic(
+    visitor: &mut EngineExpressionVisitor,
+    op: &VariadicOperator,
+    exprs: &[Expression],
+    sibling_list_id: usize,
+) {
+    let child_list_id = call!(visitor, make_field_list, exprs.len());
+    for expr in exprs {
+        visit_expression_impl(visitor, expr, child_list_id);
+    }
+
+    let visit_fn = match op {
+        VariadicOperator::And => &visitor.visit_and,
+        VariadicOperator::Or => &visitor.visit_or,
+    };
+    visit_fn(visitor.data, sibling_list_id, child_list_id);
+}
+
+fn visit_expression_scalar(
+    visitor: &mut EngineExpressionVisitor,
+    scalar: &Scalar,
+    sibling_list_id: usize,
+) {
+    match scalar {
+        Scalar::Integer(val) => call!(visitor, visit_literal_int, sibling_list_id, *val),
+        Scalar::Long(val) => call!(visitor, visit_literal_long, sibling_list_id, *val),
+        Scalar::Short(val) => call!(visitor, visit_literal_short, sibling_list_id, *val),
+        Scalar::Byte(val) => call!(visitor, visit_literal_byte, sibling_list_id, *val),
+        Scalar::Float(val) => call!(visitor, visit_literal_float, sibling_list_id, *val),
+        Scalar::Double(val) => {
+            call!(visitor, visit_literal_double, sibling_list_id, *val)
+        }
+        Scalar::String(val) => {
+            let val = kernel_string_slice!(val);
+            call!(visitor, visit_literal_string, sibling_list_id, val)
+        }
+        Scalar::Boolean(val) => call!(visitor, visit_literal_bool, sibling_list_id, *val),
+        Scalar::Timestamp(val) => {
+            call!(visitor, visit_literal_timestamp, sibling_list_id, *val)
+        }
+        Scalar::TimestampNtz(val) => {
+            call!(visitor, visit_literal_timestamp_ntz, sibling_list_id, *val)
+        }
+        Scalar::Date(val) => call!(visitor, visit_literal_date, sibling_list_id, *val),
+        Scalar::Binary(buf) => call!(
+            visitor,
+            visit_literal_binary,
+            sibling_list_id,
+            buf.as_ptr(),
+            buf.len()
+        ),
+        Scalar::Decimal(value, precision, scale) => {
+            call!(
+                visitor,
+                visit_literal_decimal,
+                sibling_list_id,
+                (value >> 64) as i64,
+                *value as u64,
+                *precision,
+                *scale
+            )
+        }
+        Scalar::Null(_) => call!(visitor, visit_literal_null, sibling_list_id),
+        Scalar::Struct(struct_data) => {
+            visit_expression_struct_literal(visitor, struct_data, sibling_list_id)
+        }
+        Scalar::Array(array) => visit_expression_array(visitor, array, sibling_list_id),
+    }
+}
+
+fn visit_expression_impl(
+    visitor: &mut EngineExpressionVisitor,
+    expression: &Expression,
+    sibling_list_id: usize,
+) {
+    match expression {
+        Expression::Literal(scalar) => visit_expression_scalar(visitor, scalar, sibling_list_id),
+        Expression::Column(name) => {
+            let name = name.to_string();
+            let name = kernel_string_slice!(name);
+            call!(visitor, visit_column, sibling_list_id, name)
+        }
+        Expression::Struct(exprs) => visit_expression_struct_expr(visitor, exprs, sibling_list_id),
+        Expression::Binary(BinaryExpression { op, left, right }) => {
+            let child_list_id = call!(visitor, make_field_list, 2);
+            visit_expression_impl(visitor, left, child_list_id);
+            visit_expression_impl(visitor, right, child_list_id);
+            let op = match op {
+                BinaryOperator::Plus => visitor.visit_add,
+                BinaryOperator::Minus => visitor.visit_minus,
+                BinaryOperator::Multiply => visitor.visit_multiply,
+                BinaryOperator::Divide => visitor.visit_divide,
+                BinaryOperator::LessThan => visitor.visit_lt,
+                BinaryOperator::LessThanOrEqual => visitor.visit_le,
+                BinaryOperator::GreaterThan => visitor.visit_gt,
+                BinaryOperator::GreaterThanOrEqual => visitor.visit_ge,
+                BinaryOperator::Equal => visitor.visit_eq,
+                BinaryOperator::NotEqual => visitor.visit_ne,
+                BinaryOperator::Distinct => visitor.visit_distinct,
+                BinaryOperator::In => visitor.visit_in,
+                BinaryOperator::NotIn => visitor.visit_not_in,
+            };
+            op(visitor.data, sibling_list_id, child_list_id);
+        }
+        Expression::Unary(UnaryExpression { op, expr }) => {
+            let child_id_list = call!(visitor, make_field_list, 1);
+            visit_expression_impl(visitor, expr, child_id_list);
+            let op = match op {
+                UnaryOperator::Not => visitor.visit_not,
+                UnaryOperator::IsNull => visitor.visit_is_null,
+            };
+            op(visitor.data, sibling_list_id, child_id_list);
+        }
+        Expression::Variadic(VariadicExpression { op, exprs }) => {
+            visit_expression_variadic(visitor, op, exprs, sibling_list_id)
+        }
+    }
+}
+
 fn visit_expression_internal(
     expression: &Expression,
     visitor: &mut EngineExpressionVisitor,
 ) -> usize {
-    macro_rules! call {
-        ( $visitor:ident, $visitor_fn:ident $(, $extra_args:expr) *) => {
-            ($visitor.$visitor_fn)($visitor.data $(, $extra_args) *)
-        };
-    }
-    fn visit_expression_array(
-        visitor: &mut EngineExpressionVisitor,
-        array: &ArrayData,
-        sibling_list_id: usize,
-    ) {
-        #[allow(deprecated)]
-        let elements = array.array_elements();
-        let child_list_id = call!(visitor, make_field_list, elements.len());
-        for scalar in elements {
-            visit_expression_scalar(visitor, scalar, child_list_id);
-        }
-        call!(visitor, visit_literal_array, sibling_list_id, child_list_id);
-    }
-    fn visit_expression_struct_literal(
-        visitor: &mut EngineExpressionVisitor,
-        struct_data: &StructData,
-        sibling_list_id: usize,
-    ) {
-        let child_value_list_id = call!(visitor, make_field_list, struct_data.fields().len());
-        let child_field_list_id = call!(visitor, make_field_list, struct_data.fields().len());
-        for (field, value) in struct_data.fields().iter().zip(struct_data.values()) {
-            let field_name = field.name();
-            call!(
-                visitor,
-                visit_literal_string,
-                child_field_list_id,
-                kernel_string_slice!(field_name)
-            );
-            visit_expression_scalar(visitor, value, child_value_list_id);
-        }
-        call!(
-            visitor,
-            visit_literal_struct,
-            sibling_list_id,
-            child_field_list_id,
-            child_value_list_id
-        )
-    }
-    fn visit_expression_struct_expr(
-        visitor: &mut EngineExpressionVisitor,
-        exprs: &[Expression],
-        sibling_list_id: usize,
-    ) {
-        let child_list_id = call!(visitor, make_field_list, exprs.len());
-        for expr in exprs {
-            visit_expression_impl(visitor, expr, child_list_id);
-        }
-        call!(visitor, visit_struct_expr, sibling_list_id, child_list_id)
-    }
-    fn visit_expression_variadic(
-        visitor: &mut EngineExpressionVisitor,
-        op: &VariadicOperator,
-        exprs: &[Expression],
-        sibling_list_id: usize,
-    ) {
-        let child_list_id = call!(visitor, make_field_list, exprs.len());
-        for expr in exprs {
-            visit_expression_impl(visitor, expr, child_list_id);
-        }
-
-        let visit_fn = match op {
-            VariadicOperator::And => &visitor.visit_and,
-            VariadicOperator::Or => &visitor.visit_or,
-        };
-        visit_fn(visitor.data, sibling_list_id, child_list_id);
-    }
-    fn visit_expression_scalar(
-        visitor: &mut EngineExpressionVisitor,
-        scalar: &Scalar,
-        sibling_list_id: usize,
-    ) {
-        match scalar {
-            Scalar::Integer(val) => call!(visitor, visit_literal_int, sibling_list_id, *val),
-            Scalar::Long(val) => call!(visitor, visit_literal_long, sibling_list_id, *val),
-            Scalar::Short(val) => call!(visitor, visit_literal_short, sibling_list_id, *val),
-            Scalar::Byte(val) => call!(visitor, visit_literal_byte, sibling_list_id, *val),
-            Scalar::Float(val) => call!(visitor, visit_literal_float, sibling_list_id, *val),
-            Scalar::Double(val) => {
-                call!(visitor, visit_literal_double, sibling_list_id, *val)
-            }
-            Scalar::String(val) => {
-                let val = kernel_string_slice!(val);
-                call!(visitor, visit_literal_string, sibling_list_id, val)
-            }
-            Scalar::Boolean(val) => call!(visitor, visit_literal_bool, sibling_list_id, *val),
-            Scalar::Timestamp(val) => {
-                call!(visitor, visit_literal_timestamp, sibling_list_id, *val)
-            }
-            Scalar::TimestampNtz(val) => {
-                call!(visitor, visit_literal_timestamp_ntz, sibling_list_id, *val)
-            }
-            Scalar::Date(val) => call!(visitor, visit_literal_date, sibling_list_id, *val),
-            Scalar::Binary(buf) => call!(
-                visitor,
-                visit_literal_binary,
-                sibling_list_id,
-                buf.as_ptr(),
-                buf.len()
-            ),
-            Scalar::Decimal(value, precision, scale) => {
-                call!(
-                    visitor,
-                    visit_literal_decimal,
-                    sibling_list_id,
-                    (value >> 64) as i64,
-                    *value as u64,
-                    *precision,
-                    *scale
-                )
-            }
-            Scalar::Null(_) => call!(visitor, visit_literal_null, sibling_list_id),
-            Scalar::Struct(struct_data) => {
-                visit_expression_struct_literal(visitor, struct_data, sibling_list_id)
-            }
-            Scalar::Array(array) => visit_expression_array(visitor, array, sibling_list_id),
-        }
-    }
-    fn visit_expression_impl(
-        visitor: &mut EngineExpressionVisitor,
-        expression: &Expression,
-        sibling_list_id: usize,
-    ) {
-        match expression {
-            Expression::Literal(scalar) => {
-                visit_expression_scalar(visitor, scalar, sibling_list_id)
-            }
-            Expression::Column(name) => {
-                let name = name.to_string();
-                let name = kernel_string_slice!(name);
-                call!(visitor, visit_column, sibling_list_id, name)
-            }
-            Expression::Struct(exprs) => {
-                visit_expression_struct_expr(visitor, exprs, sibling_list_id)
-            }
-            Expression::Binary(BinaryExpression { op, left, right }) => {
-                let child_list_id = call!(visitor, make_field_list, 2);
-                visit_expression_impl(visitor, left, child_list_id);
-                visit_expression_impl(visitor, right, child_list_id);
-                let op = match op {
-                    BinaryOperator::Plus => visitor.visit_add,
-                    BinaryOperator::Minus => visitor.visit_minus,
-                    BinaryOperator::Multiply => visitor.visit_multiply,
-                    BinaryOperator::Divide => visitor.visit_divide,
-                    BinaryOperator::LessThan => visitor.visit_lt,
-                    BinaryOperator::LessThanOrEqual => visitor.visit_le,
-                    BinaryOperator::GreaterThan => visitor.visit_gt,
-                    BinaryOperator::GreaterThanOrEqual => visitor.visit_ge,
-                    BinaryOperator::Equal => visitor.visit_eq,
-                    BinaryOperator::NotEqual => visitor.visit_ne,
-                    BinaryOperator::Distinct => visitor.visit_distinct,
-                    BinaryOperator::In => visitor.visit_in,
-                    BinaryOperator::NotIn => visitor.visit_not_in,
-                };
-                op(visitor.data, sibling_list_id, child_list_id);
-            }
-            Expression::Unary(UnaryExpression { op, expr }) => {
-                let child_id_list = call!(visitor, make_field_list, 1);
-                visit_expression_impl(visitor, expr, child_id_list);
-                let op = match op {
-                    UnaryOperator::Not => visitor.visit_not,
-                    UnaryOperator::IsNull => visitor.visit_is_null,
-                };
-                op(visitor.data, sibling_list_id, child_id_list);
-            }
-            Expression::Variadic(VariadicExpression { op, exprs }) => {
-                visit_expression_variadic(visitor, op, exprs, sibling_list_id)
-            }
-        }
-    }
     let top_level = call!(visitor, make_field_list, 1);
     visit_expression_impl(visitor, expression, top_level);
     top_level
