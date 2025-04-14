@@ -1,6 +1,6 @@
 use crate::expressions::{
-    BinaryExpression, BinaryOperator, ColumnName, Expression as Expr, JunctionExpression,
-    JunctionOperator, Predicate as Pred, Scalar, UnaryExpression, UnaryOperator,
+    BinaryOperator, BinaryPredicate, ColumnName, Expression as Expr, JunctionOperator,
+    JunctionPredicate, Predicate as Pred, Scalar, UnaryOperator, UnaryPredicate,
 };
 use crate::schema::DataType;
 
@@ -231,11 +231,11 @@ pub(crate) trait KernelPredicateEvaluator {
             Literal(val) => self.eval_scalar(val, inverted),
             Column(col) => self.eval_column(col, inverted),
             Struct(_) => None, // not supported
-            Unary(UnaryExpression { op, expr }) => self.eval_unary(*op, expr, inverted),
-            Binary(BinaryExpression { op, left, right }) => {
+            Unary(UnaryPredicate { op, expr }) => self.eval_unary(*op, expr, inverted),
+            Binary(BinaryPredicate { op, left, right }) => {
                 self.eval_binary(*op, left, right, inverted)
             }
-            Junction(JunctionExpression { op, preds }) => self.eval_junction(*op, preds, inverted),
+            Junction(JunctionPredicate { op, preds }) => self.eval_junction(*op, preds, inverted),
         }
     }
 
@@ -344,14 +344,14 @@ pub(crate) trait KernelPredicateEvaluator {
     fn eval_expr_sql_where(&self, pred: &Pred, inverted: bool) -> Option<Self::Output> {
         use Expr::*;
         match pred {
-            Junction(JunctionExpression { op, preds }) => {
+            Junction(JunctionPredicate { op, preds }) => {
                 // Recursively invoke `eval_expr_sql_where` instead of the usual `eval_expr` for AND/OR.
                 let preds = preds
                     .iter()
                     .map(|pred| self.eval_expr_sql_where(pred, inverted));
                 self.finish_eval_junction(*op, preds, inverted)
             }
-            Binary(BinaryExpression { op, left, right }) if op.is_null_intolerant_comparison() => {
+            Binary(BinaryPredicate { op, left, right }) if op.is_null_intolerant_comparison() => {
                 // Perform a nullsafe comparison instead of the usual `eval_binary`
                 let preds = [
                     self.eval_unary(UnaryOperator::IsNull, left, true),
@@ -360,7 +360,7 @@ pub(crate) trait KernelPredicateEvaluator {
                 ];
                 self.finish_eval_junction(JunctionOperator::And, preds, false)
             }
-            Unary(UnaryExpression {
+            Unary(UnaryPredicate {
                 op: UnaryOperator::Not,
                 expr,
             }) => self.eval_expr_sql_where(expr, !inverted),

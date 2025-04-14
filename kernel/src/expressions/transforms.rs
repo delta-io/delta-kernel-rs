@@ -1,6 +1,5 @@
 use crate::expressions::{
-    BinaryExpression, ColumnName, Expression, JunctionExpression, Predicate, Scalar,
-    UnaryExpression,
+    BinaryPredicate, ColumnName, Expression, JunctionPredicate, Predicate, Scalar, UnaryPredicate,
 };
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -43,27 +42,24 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_struct(fields)
     }
 
-    /// Called for each [`UnaryExpression`] encountered during the traversal. Implementations can
+    /// Called for each [`UnaryPredicate`] encountered during the traversal. Implementations can
     /// call [`Self::recurse_into_unary`] if they wish to recursively transform the child.
-    fn transform_unary(&mut self, pred: &'a UnaryExpression) -> Option<Cow<'a, UnaryExpression>> {
+    fn transform_unary(&mut self, pred: &'a UnaryPredicate) -> Option<Cow<'a, UnaryPredicate>> {
         self.recurse_into_unary(pred)
     }
 
-    /// Called for each [`BinaryExpression`] encountered during the traversal. Implementations can
+    /// Called for each [`BinaryPredicate`] encountered during the traversal. Implementations can
     /// call [`Self::recurse_into_binary`] if they wish to recursively transform the children.
-    fn transform_binary(
-        &mut self,
-        pred: &'a BinaryExpression,
-    ) -> Option<Cow<'a, BinaryExpression>> {
+    fn transform_binary(&mut self, pred: &'a BinaryPredicate) -> Option<Cow<'a, BinaryPredicate>> {
         self.recurse_into_binary(pred)
     }
 
-    /// Called for each [`JunctionExpression`] encountered during the traversal. Implementations can
+    /// Called for each [`JunctionPredicate`] encountered during the traversal. Implementations can
     /// call [`Self::recurse_into_junction`] if they wish to recursively transform the children.
     fn transform_junction(
         &mut self,
-        pred: &'a JunctionExpression,
-    ) -> Option<Cow<'a, JunctionExpression>> {
+        pred: &'a JunctionPredicate,
+    ) -> Option<Cow<'a, JunctionPredicate>> {
         self.recurse_into_junction(pred)
     }
 
@@ -113,10 +109,10 @@ pub trait ExpressionTransform<'a> {
 
     /// Recursively transforms a unary predicate's child. Returns `None` if the child was removed,
     /// `Some(Cow::Owned)` if the child was changed, and `Some(Cow::Borrowed)` otherwise.
-    fn recurse_into_unary(&mut self, u: &'a UnaryExpression) -> Option<Cow<'a, UnaryExpression>> {
+    fn recurse_into_unary(&mut self, u: &'a UnaryPredicate) -> Option<Cow<'a, UnaryPredicate>> {
         use Cow::*;
         let u = match self.transform(&u.expr)? {
-            Owned(expr) => Owned(UnaryExpression::new(u.op, expr)),
+            Owned(expr) => Owned(UnaryPredicate::new(u.op, expr)),
             Borrowed(_) => Borrowed(u),
         };
         Some(u)
@@ -125,16 +121,13 @@ pub trait ExpressionTransform<'a> {
     /// Recursively transforms a binary predicate's children. Returns `None` if at least one child
     /// was removed, `Some(Cow::Owned)` if at least one child changed, and `Some(Cow::Borrowed)`
     /// otherwise.
-    fn recurse_into_binary(
-        &mut self,
-        b: &'a BinaryExpression,
-    ) -> Option<Cow<'a, BinaryExpression>> {
+    fn recurse_into_binary(&mut self, b: &'a BinaryPredicate) -> Option<Cow<'a, BinaryPredicate>> {
         use Cow::*;
         let left = self.transform(&b.left)?;
         let right = self.transform(&b.right)?;
         let b = match (&left, &right) {
             (Borrowed(_), Borrowed(_)) => Borrowed(b),
-            _ => Owned(BinaryExpression::new(
+            _ => Owned(BinaryPredicate::new(
                 b.op,
                 left.into_owned(),
                 right.into_owned(),
@@ -148,11 +141,11 @@ pub trait ExpressionTransform<'a> {
     /// `Some(Cow::Borrowed)` otherwise.
     fn recurse_into_junction(
         &mut self,
-        j: &'a JunctionExpression,
-    ) -> Option<Cow<'a, JunctionExpression>> {
+        j: &'a JunctionPredicate,
+    ) -> Option<Cow<'a, JunctionPredicate>> {
         use Cow::*;
         let j = match recurse_into_children(&j.preds, |p| self.transform(p))? {
-            Owned(preds) => Owned(JunctionExpression::new(j.op, preds)),
+            Owned(preds) => Owned(JunctionPredicate::new(j.op, preds)),
             Borrowed(_) => Borrowed(j),
         };
         Some(j)
@@ -268,22 +261,19 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
         self.depth_limited(Self::recurse_into_struct, fields)
     }
 
-    fn transform_unary(&mut self, expr: &'a UnaryExpression) -> Option<Cow<'a, UnaryExpression>> {
-        self.depth_limited(Self::recurse_into_unary, expr)
+    fn transform_unary(&mut self, pred: &'a UnaryPredicate) -> Option<Cow<'a, UnaryPredicate>> {
+        self.depth_limited(Self::recurse_into_unary, pred)
     }
 
-    fn transform_binary(
-        &mut self,
-        expr: &'a BinaryExpression,
-    ) -> Option<Cow<'a, BinaryExpression>> {
-        self.depth_limited(Self::recurse_into_binary, expr)
+    fn transform_binary(&mut self, pred: &'a BinaryPredicate) -> Option<Cow<'a, BinaryPredicate>> {
+        self.depth_limited(Self::recurse_into_binary, pred)
     }
 
     fn transform_junction(
         &mut self,
-        expr: &'a JunctionExpression,
-    ) -> Option<Cow<'a, JunctionExpression>> {
-        self.depth_limited(Self::recurse_into_junction, expr)
+        pred: &'a JunctionPredicate,
+    ) -> Option<Cow<'a, JunctionPredicate>> {
+        self.depth_limited(Self::recurse_into_junction, pred)
     }
 }
 
