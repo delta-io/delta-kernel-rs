@@ -197,7 +197,7 @@ impl DataSkippingFilter {
 struct DataSkippingPredicateCreator;
 
 impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
-    type Output = Expr;
+    type Output = Pred;
     type TypedStat = Expr;
     type IntStat = Expr;
 
@@ -239,15 +239,15 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         Some(Pred::binary(op, col, val.clone()))
     }
 
-    fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
-        KernelPredicateEvaluatorDefaults::eval_scalar(val, inverted).map(Pred::literal)
+    fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
+        KernelPredicateEvaluatorDefaults::eval_pred_scalar(val, inverted).map(Pred::literal)
     }
 
-    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
-        KernelPredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted).map(Pred::literal)
+    fn eval_pred_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
+        KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted).map(Pred::literal)
     }
 
-    fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
+    fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
         let safe_to_skip = match inverted {
             true => self.get_rowcount_stat()?, // all-null
             false => Expr::literal(0i64),      // no-null
@@ -255,18 +255,18 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         Some(Pred::ne(self.get_nullcount_stat(col)?, safe_to_skip))
     }
 
-    fn eval_binary_scalars(
+    fn eval_pred_binary_scalars(
         &self,
         op: BinaryOperator,
         left: &Scalar,
         right: &Scalar,
         inverted: bool,
     ) -> Option<Pred> {
-        KernelPredicateEvaluatorDefaults::eval_binary_scalars(op, left, right, inverted)
+        KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, inverted)
             .map(Pred::literal)
     }
 
-    fn finish_eval_junction(
+    fn finish_eval_pred_junction(
         &self,
         mut op: JunctionOperator,
         preds: impl IntoIterator<Item = Option<Pred>>,

@@ -60,15 +60,15 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
         KernelPredicateEvaluatorDefaults::partial_cmp_scalars(ord, &col, val, inverted)
     }
 
-    fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<bool> {
-        KernelPredicateEvaluatorDefaults::eval_scalar(val, inverted)
+    fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<bool> {
+        KernelPredicateEvaluatorDefaults::eval_pred_scalar(val, inverted)
     }
 
-    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<bool> {
-        KernelPredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted)
+    fn eval_pred_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<bool> {
+        KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted)
     }
 
-    fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<bool> {
+    fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<bool> {
         let safe_to_skip = match inverted {
             true => self.get_rowcount_stat()?, // all-null
             false => 0i64,                     // no-null
@@ -76,22 +76,22 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
         Some(self.get_nullcount_stat(col)? != safe_to_skip)
     }
 
-    fn eval_binary_scalars(
+    fn eval_pred_binary_scalars(
         &self,
         op: BinaryOperator,
         left: &Scalar,
         right: &Scalar,
         inverted: bool,
     ) -> Option<bool> {
-        KernelPredicateEvaluatorDefaults::eval_binary_scalars(op, left, right, inverted)
+        KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, inverted)
     }
 
-    fn finish_eval_junction(
+    fn finish_eval_pred_junction(
         &self,
         op: JunctionOperator,
         preds: impl IntoIterator<Item = Option<bool>>,
         inverted: bool,
     ) -> Option<bool> {
-        KernelPredicateEvaluatorDefaults::finish_eval_junction(op, preds, inverted)
+        KernelPredicateEvaluatorDefaults::finish_eval_pred_junction(op, preds, inverted)
     }
 }

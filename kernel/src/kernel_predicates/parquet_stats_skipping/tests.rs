@@ -99,22 +99,22 @@ fn test_junctions() {
             .collect();
 
         expect_eq!(
-            filter.eval_junction(And, &inputs, false),
+            filter.eval_pred_junction(And, &inputs, false),
             *expect_and,
             "AND({inputs:?})"
         );
         expect_eq!(
-            filter.eval_junction(Or, &inputs, false),
+            filter.eval_pred_junction(Or, &inputs, false),
             *expect_or,
             "OR({inputs:?})"
         );
         expect_eq!(
-            filter.eval_junction(And, &inputs, true),
+            filter.eval_pred_junction(And, &inputs, true),
             expect_and.map(|val| !val),
             "NOT(AND({inputs:?}))"
         );
         expect_eq!(
-            filter.eval_junction(Or, &inputs, true),
+            filter.eval_pred_junction(Or, &inputs, true),
             expect_or.map(|val| !val),
             "NOT(OR({inputs:?}))"
         );
