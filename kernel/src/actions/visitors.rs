@@ -17,13 +17,13 @@ use super::{
 };
 
 #[derive(Default)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) struct MetadataVisitor {
     pub(crate) metadata: Option<Metadata>,
 }
 
 impl MetadataVisitor {
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     fn visit_metadata<'a>(
         row_index: usize,
         id: String,
@@ -112,13 +112,13 @@ impl RowVisitor for SelectionVectorVisitor {
 }
 
 #[derive(Default)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) struct ProtocolVisitor {
     pub(crate) protocol: Option<Protocol>,
 }
 
 impl ProtocolVisitor {
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     pub(crate) fn visit_protocol<'a>(
         row_index: usize,
         min_reader_version: i32,
@@ -166,14 +166,14 @@ impl RowVisitor for ProtocolVisitor {
 
 #[allow(unused)]
 #[derive(Default)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) struct AddVisitor {
     pub(crate) adds: Vec<Add>,
 }
 
 impl AddVisitor {
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[cfg_attr(not(feature = "internal-api"), visibility::make(pub(crate)))]
     fn visit_add<'a>(
         row_index: usize,
         path: String,
@@ -240,13 +240,13 @@ impl RowVisitor for AddVisitor {
 
 #[allow(unused)]
 #[derive(Default)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) struct RemoveVisitor {
     pub(crate) removes: Vec<Remove>,
 }
 
 impl RemoveVisitor {
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     pub(crate) fn visit_remove<'a>(
         row_index: usize,
         path: String,
@@ -315,13 +315,13 @@ impl RowVisitor for RemoveVisitor {
 
 #[allow(unused)]
 #[derive(Default)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) struct CdcVisitor {
     pub(crate) cdcs: Vec<Cdc>,
 }
 
 impl CdcVisitor {
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     pub(crate) fn visit_cdc<'a>(
         row_index: usize,
         path: String,
@@ -372,7 +372,7 @@ pub(crate) type SetTransactionMap = HashMap<String, SetTransaction>;
 /// required.
 ///
 #[derive(Default, Debug)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) struct SetTransactionVisitor {
     pub(crate) set_transactions: SetTransactionMap,
     pub(crate) application_id: Option<String>,
@@ -387,7 +387,7 @@ impl SetTransactionVisitor {
         }
     }
 
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     pub(crate) fn visit_txn<'a>(
         row_index: usize,
         app_id: String,
@@ -439,7 +439,7 @@ impl RowVisitor for SetTransactionVisitor {
 }
 
 #[derive(Default)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) struct SidecarVisitor {
     pub(crate) sidecars: Vec<Sidecar>,
 }

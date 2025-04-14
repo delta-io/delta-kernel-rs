@@ -307,7 +307,7 @@ impl StructType {
     ///
     /// NOTE: This method only traverses through `StructType` fields; `MapType` and `ArrayType`
     /// fields are considered leaves even if they contain `StructType` entries/elements.
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     pub(crate) fn leaves<'s>(&self, own_name: impl Into<Option<&'s str>>) -> ColumnNamesAndTypes {
         let mut get_leaves = GetSchemaLeaves::new(own_name.into());
         let _ = get_leaves.transform_struct(self);
@@ -344,11 +344,11 @@ impl InvariantChecker {
 }
 
 /// Helper for RowVisitor implementations
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 #[derive(Clone, Default)]
 pub(crate) struct ColumnNamesAndTypes(Vec<ColumnName>, Vec<DataType>);
 impl ColumnNamesAndTypes {
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     pub(crate) fn as_ref(&self) -> (&[ColumnName], &[DataType]) {
         (&self.0, &self.1)
     }

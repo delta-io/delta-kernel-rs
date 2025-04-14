@@ -27,28 +27,28 @@ pub mod deletion_vector;
 pub mod set_transaction;
 
 pub(crate) mod schemas;
-#[cfg(feature = "developer-visibility")]
+#[cfg(feature = "internal-api")]
 pub mod visitors;
-#[cfg(not(feature = "developer-visibility"))]
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod visitors;
 
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) const ADD_NAME: &str = "add";
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) const REMOVE_NAME: &str = "remove";
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) const METADATA_NAME: &str = "metaData";
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) const PROTOCOL_NAME: &str = "protocol";
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) const SET_TRANSACTION_NAME: &str = "txn";
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) const COMMIT_INFO_NAME: &str = "commitInfo";
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) const CDC_NAME: &str = "cdc";
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) const SIDECAR_NAME: &str = "sidecar";
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) const CHECKPOINT_METADATA_NAME: &str = "checkpointMetadata";
 
 static LOG_ADD_SCHEMA: LazyLock<SchemaRef> =
@@ -75,15 +75,13 @@ static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     StructType::new([Option::<CommitInfo>::get_struct_field(COMMIT_INFO_NAME)]).into()
 });
 
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-fn get_log_schema() -> &'static SchemaRef {
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
+pub(crate) fn get_log_schema() -> &'static SchemaRef {
     &LOG_SCHEMA
 }
 
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-fn get_log_add_schema() -> &'static SchemaRef {
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
+pub(crate) fn get_log_add_schema() -> &'static SchemaRef {
     &LOG_ADD_SCHEMA
 }
 
@@ -92,7 +90,7 @@ pub(crate) fn get_log_commit_info_schema() -> &'static SchemaRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 #[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
 pub(crate) struct Format {
     /// Name of the encoding for files in this table
@@ -112,7 +110,7 @@ impl Default for Format {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Schema)]
 #[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) struct Metadata {
     /// Unique identifier for this table
     pub(crate) id: String,
@@ -139,7 +137,7 @@ impl Metadata {
         Ok(visitor.metadata)
     }
 
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     #[allow(dead_code)]
     pub(crate) fn configuration(&self) -> &HashMap<String, String> {
         &self.configuration
@@ -149,7 +147,7 @@ impl Metadata {
         Ok(serde_json::from_str(&self.schema_string)?)
     }
 
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     #[allow(dead_code)]
     pub(crate) fn partition_columns(&self) -> &Vec<String> {
         &self.partition_columns
@@ -165,7 +163,7 @@ impl Metadata {
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Schema, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 // TODO move to another module so that we disallow constructing this struct without using the
 // try_new function.
 pub(crate) struct Protocol {
@@ -246,13 +244,13 @@ impl Protocol {
     }
 
     /// This protocol's minimum reader version
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     pub(crate) fn min_reader_version(&self) -> i32 {
         self.min_reader_version
     }
 
     /// This protocol's minimum writer version
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     pub(crate) fn min_writer_version(&self) -> i32 {
         self.min_writer_version
     }
@@ -376,7 +374,7 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct CommitInfo {
     /// The time this logical file was created, as milliseconds since the epoch.
@@ -405,7 +403,7 @@ pub(crate) struct CommitInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) struct Add {
     /// A relative path to a data file from the root of the table or an absolute path to a file
     /// that should be added to the table. The path is a URI as specified by
@@ -461,7 +459,7 @@ pub(crate) struct Add {
 }
 
 impl Add {
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     #[allow(dead_code)]
     pub(crate) fn dv_unique_id(&self) -> Option<String> {
         self.deletion_vector.as_ref().map(|dv| dv.unique_id())
@@ -469,7 +467,7 @@ impl Add {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct Remove {
     /// A relative path to a data file from the root of the table or an absolute path to a file
@@ -519,7 +517,7 @@ pub(crate) struct Remove {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct Cdc {
     /// A relative path to a change data file from the root of the table or an absolute path to a
@@ -551,7 +549,7 @@ pub(crate) struct Cdc {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) struct SetTransaction {
     /// A unique identifier for the application performing the transaction.
     pub(crate) app_id: String,
@@ -568,7 +566,7 @@ pub(crate) struct SetTransaction {
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-file-information
 #[derive(Schema, Debug, PartialEq)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) struct Sidecar {
     /// A path to a sidecar file that can be either:
     /// - A relative path (just the file name) within the `_delta_log/_sidecars` directory.
@@ -612,7 +610,7 @@ impl Sidecar {
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-metadata
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) struct CheckpointMetadata {
     /// The version of the V2 spec checkpoint.
     ///

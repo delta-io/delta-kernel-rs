@@ -11,7 +11,7 @@ delta_kernel = { path = "../../../kernel", features = [
   "cloud",
   "arrow_53",
   "default-engine",
-  "developer-visibility",
+  "internal-api",
 ] }
 env_logger = "0.11.8"
 url = "2"

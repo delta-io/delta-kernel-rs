@@ -21,11 +21,11 @@ pub struct ArrayData {
 }
 
 impl ArrayData {
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub fn new(tpe: ArrayType, elements: impl IntoIterator<Item = impl Into<Scalar>>) -> Self {
         let elements = elements.into_iter().map(Into::into).collect();
         Self { tpe, elements }
     }
+
     pub fn array_type(&self) -> &ArrayType {
         &self.tpe
     }

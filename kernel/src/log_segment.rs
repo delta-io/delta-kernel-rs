@@ -38,7 +38,7 @@ mod tests;
 ///
 /// [`Snapshot`]: crate::snapshot::Snapshot
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
 pub(crate) struct LogSegment {
     pub end_version: Version,
     pub checkpoint_version: Option<Version>,
@@ -122,7 +122,7 @@ impl LogSegment {
     /// - `time_travel_version`: The version of the log that the Snapshot will be at.
     ///
     /// [`Snapshot`]: crate::snapshot::Snapshot
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     pub(crate) fn for_snapshot(
         storage: &dyn StorageHandler,
         log_root: Url,
@@ -152,7 +152,7 @@ impl LogSegment {
     /// `start_version` and `end_version`: Its LogSegment is made of zero checkpoints and all commits
     /// between versions `start_version` (inclusive) and `end_version` (inclusive). If no `end_version`
     /// is specified it will be the most recent version by default.
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     pub(crate) fn for_table_changes(
         storage: &dyn StorageHandler,
         log_root: Url,
@@ -201,7 +201,7 @@ impl LogSegment {
     ///
     /// `meta_predicate` is an optional expression to filter the log files with. It is _NOT_ the
     /// query's predicate, but rather a predicate for filtering log files themselves.
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     pub(crate) fn read_actions(
         &self,
         engine: &dyn Engine,

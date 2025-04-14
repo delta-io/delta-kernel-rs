@@ -242,7 +242,7 @@ impl Snapshot {
     }
 
     /// Log segment this snapshot uses
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     pub(crate) fn log_segment(&self) -> &LogSegment {
         &self.log_segment
     }
@@ -262,14 +262,14 @@ impl Snapshot {
     }
 
     /// Table [`Metadata`] at this `Snapshot`s version.
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     pub(crate) fn metadata(&self) -> &Metadata {
         self.table_configuration.metadata()
     }
 
     /// Table [`Protocol`] at this `Snapshot`s version.
     #[allow(dead_code)]
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     pub(crate) fn protocol(&self) -> &Protocol {
         self.table_configuration.protocol()
     }
@@ -279,7 +279,7 @@ impl Snapshot {
         self.table_configuration().table_properties()
     }
     /// Get the [`TableConfiguration`] for this [`Snapshot`].
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     pub(crate) fn table_configuration(&self) -> &TableConfiguration {
         &self.table_configuration
     }
@@ -304,9 +304,8 @@ impl Snapshot {
 // Note: Schema can not be derived because the checkpoint schema is only known at runtime.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-struct LastCheckpointHint {
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
+pub(crate) struct LastCheckpointHint {
     /// The version of the table when the last checkpoint was made.
     #[allow(unreachable_pub)] // used by acceptance tests (TODO make an fn accessor?)
     pub version: Version,
