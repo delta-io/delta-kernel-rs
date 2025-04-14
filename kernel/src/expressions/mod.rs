@@ -74,11 +74,11 @@ pub enum JunctionOperator {
 }
 
 ////////////////////////////////////////////////////////////////////////
-// Expressions
+// Expressions and predicates
 ////////////////////////////////////////////////////////////////////////
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct UnaryExpression {
+pub struct UnaryPredicate {
     /// The operator.
     pub op: UnaryOperator,
     /// The input expression.
@@ -86,7 +86,7 @@ pub struct UnaryExpression {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct BinaryExpression {
+pub struct BinaryPredicate {
     /// The operator.
     pub op: BinaryOperator,
     /// The left-hand side of the operation.
@@ -95,8 +95,11 @@ pub struct BinaryExpression {
     pub right: Box<Expression>,
 }
 
+// TODO: Actually split this out
+pub type BinaryExpression = BinaryPredicate;
+
 #[derive(Clone, Debug, PartialEq)]
-pub struct JunctionExpression {
+pub struct JunctionPredicate {
     /// The operator.
     pub op: JunctionOperator,
     /// The input predicates.
@@ -117,11 +120,11 @@ pub enum Expression {
     /// A struct computed from a Vec of expressions
     Struct(Vec<Expression>),
     /// A unary operation.
-    Unary(UnaryExpression),
+    Unary(UnaryPredicate),
     /// A binary operation.
-    Binary(BinaryExpression),
+    Binary(BinaryPredicate),
     /// A junction operation (AND/OR).
-    Junction(JunctionExpression),
+    Junction(JunctionPredicate),
     // TODO: support more expressions, such as IS IN, LIKE, etc.
 }
 
@@ -168,14 +171,14 @@ impl JunctionOperator {
     }
 }
 
-impl UnaryExpression {
+impl UnaryPredicate {
     fn new(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
         let expr = Box::new(expr.into());
         Self { op, expr }
     }
 }
 
-impl BinaryExpression {
+impl BinaryPredicate {
     fn new(op: BinaryOperator, left: impl Into<Expression>, right: impl Into<Expression>) -> Self {
         let left = Box::new(left.into());
         let right = Box::new(right.into());
@@ -183,7 +186,7 @@ impl BinaryExpression {
     }
 }
 
-impl JunctionExpression {
+impl JunctionPredicate {
     fn new(op: JunctionOperator, preds: Vec<Predicate>) -> Self {
         Self { op, preds }
     }
@@ -293,7 +296,7 @@ impl Expression {
     /// Creates a new unary predicate OP expr
     pub fn unary(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
         let expr = Box::new(expr.into());
-        Self::Unary(UnaryExpression { op, expr })
+        Self::Unary(UnaryPredicate { op, expr })
     }
 
     /// Creates a new binary predicate lhs OP rhs
@@ -302,17 +305,17 @@ impl Expression {
         lhs: impl Into<Expression>,
         rhs: impl Into<Expression>,
     ) -> Self {
-        Self::Binary(BinaryExpression {
+        Self::Binary(BinaryPredicate {
             op,
             left: Box::new(lhs.into()),
             right: Box::new(rhs.into()),
         })
     }
 
-    /// Creates a new junction expression OP(preds...)
+    /// Creates a new junction predicate OP(preds...)
     pub fn junction(op: JunctionOperator, preds: impl IntoIterator<Item = Self>) -> Self {
         let preds = preds.into_iter().collect();
-        Self::Junction(JunctionExpression { op, preds })
+        Self::Junction(JunctionPredicate { op, preds })
     }
 }
 
@@ -355,17 +358,17 @@ impl Display for Expression {
                 "Struct({})",
                 &exprs.iter().map(|e| format!("{e}")).join(", ")
             ),
-            Binary(BinaryExpression {
+            Binary(BinaryPredicate {
                 op: BinaryOperator::Distinct,
                 left,
                 right,
             }) => write!(f, "DISTINCT({left}, {right})"),
-            Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
-            Unary(UnaryExpression { op, expr }) => match op {
+            Binary(BinaryPredicate { op, left, right }) => write!(f, "{left} {op} {right}"),
+            Unary(UnaryPredicate { op, expr }) => match op {
                 UnaryOperator::Not => write!(f, "NOT {expr}"),
                 UnaryOperator::IsNull => write!(f, "{expr} IS NULL"),
             },
-            Junction(JunctionExpression { op, preds }) => {
+            Junction(JunctionPredicate { op, preds }) => {
                 let preds = &preds.iter().map(|p| format!("{p}")).join(", ");
                 let op = match op {
                     JunctionOperator::And => "AND",

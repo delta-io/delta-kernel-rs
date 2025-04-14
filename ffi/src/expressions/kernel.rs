@@ -5,8 +5,8 @@ use std::ffi::c_void;
 
 use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
 use delta_kernel::expressions::{
-    ArrayData, BinaryExpression, BinaryOperator, Expression, JunctionExpression, JunctionOperator,
-    MapData, Predicate, Scalar, StructData, UnaryExpression, UnaryOperator,
+    ArrayData, BinaryExpression, BinaryOperator, Expression, JunctionOperator, JunctionPredicate,
+    MapData, Predicate, Scalar, StructData, UnaryOperator, UnaryPredicate,
 };
 
 /// Free the memory the passed SharedExpression
@@ -401,7 +401,7 @@ fn visit_expression_impl(
             };
             op(visitor.data, sibling_list_id, child_list_id);
         }
-        Predicate::Unary(UnaryExpression { op, expr }) => {
+        Predicate::Unary(UnaryPredicate { op, expr }) => {
             let child_id_list = call!(visitor, make_field_list, 1);
             visit_expression_impl(visitor, expr, child_id_list);
             let op = match op {
@@ -410,7 +410,7 @@ fn visit_expression_impl(
             };
             op(visitor.data, sibling_list_id, child_id_list);
         }
-        Predicate::Junction(JunctionExpression { op, preds }) => {
+        Predicate::Junction(JunctionPredicate { op, preds }) => {
             visit_expression_junction(visitor, op, preds, sibling_list_id)
         }
     }

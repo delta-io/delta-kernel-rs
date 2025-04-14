@@ -14,8 +14,8 @@ use crate::arrow::error::ArrowError;
 use crate::engine::arrow_utils::prim_array_cmp;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
-    BinaryExpression, BinaryOperator, Expression, JunctionExpression, JunctionOperator, Predicate,
-    Scalar, UnaryExpression, UnaryOperator,
+    BinaryExpression, BinaryOperator, BinaryPredicate, Expression, JunctionOperator,
+    JunctionPredicate, Predicate, Scalar, UnaryOperator, UnaryPredicate,
 };
 use crate::schema::DataType;
 use itertools::Itertools;
@@ -115,7 +115,7 @@ pub(crate) fn evaluate_expression(
         (Struct(_), _) => Err(Error::generic(
             "Data type is required to evaluate struct expressions",
         )),
-        (Unary(UnaryExpression { op, expr }), _) => {
+        (Unary(UnaryPredicate { op, expr }), _) => {
             let arr = evaluate_expression(expr.as_ref(), batch, None)?;
             let result = match op {
                 UnaryOperator::Not => not(downcast_to_bool(&arr)?)?,
@@ -124,7 +124,7 @@ pub(crate) fn evaluate_expression(
             Ok(Arc::new(result))
         }
         (
-            Binary(BinaryExpression {
+            Binary(BinaryPredicate {
                 op: In,
                 left,
                 right,
@@ -184,7 +184,7 @@ pub(crate) fn evaluate_expression(
             ))),
         },
         (
-            Binary(BinaryExpression {
+            Binary(BinaryPredicate {
                 op: NotIn,
                 left,
                 right,
@@ -219,7 +219,7 @@ pub(crate) fn evaluate_expression(
 
             Ok(eval(&left_arr, &right_arr)?)
         }
-        (Junction(JunctionExpression { op, preds }), None | Some(&DataType::BOOLEAN)) => {
+        (Junction(JunctionPredicate { op, preds }), None | Some(&DataType::BOOLEAN)) => {
             type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
             let (reducer, default): (Operation, _) = match op {
                 JunctionOperator::And => (and_kleene, true),
