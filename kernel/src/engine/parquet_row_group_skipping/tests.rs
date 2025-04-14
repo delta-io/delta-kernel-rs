@@ -1,7 +1,7 @@
 use super::*;
 use crate::expressions::{column_expr, column_name};
+use crate::kernel_predicates::DataSkippingPredicateEvaluator as _;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
-use crate::predicates::DataSkippingPredicateEvaluator as _;
 use crate::Expression;
 use std::fs::File;
 
