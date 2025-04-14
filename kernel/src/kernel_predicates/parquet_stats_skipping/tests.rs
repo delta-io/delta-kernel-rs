@@ -1,6 +1,6 @@
 use super::*;
 use crate::expressions::{column_expr, Expression as Expr};
-use crate::predicates::PredicateEvaluator as _;
+use crate::kernel_predicates::KernelPredicateEvaluator as _;
 use crate::DataType;
 
 const TRUE: Option<bool> = Some(true);
