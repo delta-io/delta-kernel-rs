@@ -545,15 +545,6 @@ pub trait ExpressionTransform<'a> {
     }
 }
 
-#[cfg(test)]
-impl std::ops::Not for Expression {
-    type Output = Self;
-
-    fn not(self) -> Self {
-        Self::not(self)
-    }
-}
-
 impl<R: Into<Expression>> std::ops::Add<R> for Expression {
     type Output = Self;
 

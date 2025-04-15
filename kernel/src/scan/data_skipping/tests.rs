@@ -171,7 +171,7 @@ fn test_eval_variadic() {
         let pred = as_data_skipping_predicate(&expr).unwrap();
         expect_eq!(filter.eval_expr(&pred, false), *expect_or, "OR({inputs:?})");
 
-        let expr = !Expr::and_from(inputs.clone());
+        let expr = Expr::not(Expr::and_from(inputs.clone()));
         let pred = as_data_skipping_predicate(&expr).unwrap();
         expect_eq!(
             filter.eval_expr(&pred, false),
@@ -179,7 +179,7 @@ fn test_eval_variadic() {
             "NOT AND({inputs:?})"
         );
 
-        let expr = !Expr::or_from(inputs.clone());
+        let expr = Expr::not(Expr::or_from(inputs.clone()));
         let pred = as_data_skipping_predicate(&expr).unwrap();
         expect_eq!(
             filter.eval_expr(&pred, false),
@@ -202,9 +202,9 @@ fn test_eval_distinct() {
 
     let expressions = [
         Expr::distinct(col.clone(), ten.clone()),
-        !Expr::distinct(col.clone(), ten.clone()),
+        Expr::not(Expr::distinct(col.clone(), ten.clone())),
         Expr::distinct(col.clone(), null.clone()),
-        !Expr::distinct(col.clone(), null.clone()),
+        Expr::not(Expr::distinct(col.clone(), null.clone())),
     ];
 
     let do_test = |min: &Scalar, max: &Scalar, nullcount: i64, expected: &[Option<bool>]| {

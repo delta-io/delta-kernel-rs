@@ -599,7 +599,7 @@ fn test_sql_where() {
     expect_eq!(null_filter.eval_sql_where(expr), Some(true), "{expr}");
 
     // NOT a gets skipped when NULL but not when missing
-    let expr = &!col.clone();
+    let expr = &Expr::not(col.clone());
     expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
     expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
 
