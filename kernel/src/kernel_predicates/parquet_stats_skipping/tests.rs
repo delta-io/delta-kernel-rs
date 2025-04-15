@@ -40,10 +40,10 @@ impl ParquetStatsProvider for UnimplementedTestFilter {
     }
 }
 
-/// Tests apply_variadic and apply_scalar
+/// Tests apply_junction and apply_scalar
 #[test]
 fn test_junctions() {
-    use VariadicOperator::*;
+    use JunctionOperator::*;
 
     let test_cases = &[
         // Every combo of 0, 1 and 2 inputs
@@ -99,22 +99,22 @@ fn test_junctions() {
             .collect();
 
         expect_eq!(
-            filter.eval_variadic(And, &inputs, false),
+            filter.eval_junction(And, &inputs, false),
             *expect_and,
             "AND({inputs:?})"
         );
         expect_eq!(
-            filter.eval_variadic(Or, &inputs, false),
+            filter.eval_junction(Or, &inputs, false),
             *expect_or,
             "OR({inputs:?})"
         );
         expect_eq!(
-            filter.eval_variadic(And, &inputs, true),
+            filter.eval_junction(And, &inputs, true),
             expect_and.map(|val| !val),
             "NOT(AND({inputs:?}))"
         );
         expect_eq!(
-            filter.eval_variadic(Or, &inputs, true),
+            filter.eval_junction(Or, &inputs, true),
             expect_or.map(|val| !val),
             "NOT(OR({inputs:?}))"
         );

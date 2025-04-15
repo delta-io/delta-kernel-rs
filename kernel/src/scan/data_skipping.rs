@@ -9,7 +9,7 @@ use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
 use crate::expressions::{
     column_expr, joined_column_expr, BinaryOperator, ColumnName, Expression as Expr, ExpressionRef,
-    Scalar, VariadicOperator,
+    JunctionOperator, Scalar,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -31,7 +31,7 @@ mod tests;
 ///
 /// Unary `IsNull` checks if the null counts indicate that the column could contain a null.
 ///
-/// The variadic operations are rewritten as follows:
+/// The junction operations are rewritten as follows:
 /// - `AND` is rewritten as a conjunction of the rewritten operands where we just skip operands that
 ///   are not eligible for data skipping.
 /// - `OR` is rewritten only if all operands are eligible for data skipping. Otherwise, the whole OR
@@ -266,9 +266,9 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
             .map(Expr::literal)
     }
 
-    fn finish_eval_variadic(
+    fn finish_eval_junction(
         &self,
-        mut op: VariadicOperator,
+        mut op: JunctionOperator,
         exprs: impl IntoIterator<Item = Option<Expr>>,
         inverted: bool,
     ) -> Option<Expr> {
@@ -292,6 +292,6 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
                 }),
             })
             .collect();
-        Some(Expr::variadic(op, exprs))
+        Some(Expr::junction(op, exprs))
     }
 }

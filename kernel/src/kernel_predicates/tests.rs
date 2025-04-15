@@ -285,7 +285,7 @@ fn test_eval_binary_columns() {
 }
 
 #[test]
-fn test_eval_variadic() {
+fn test_eval_junction() {
     let test_cases: Vec<(&[_], _, _)> = vec![
         // input, AND expect, OR expect
         (&[], Some(true), Some(false)),
@@ -318,12 +318,12 @@ fn test_eval_variadic() {
         for inverted in [true, false] {
             let invert_if_needed = |v: &Option<_>| v.map(|v| v != inverted);
             expect_eq!(
-                filter.eval_variadic(VariadicOperator::And, &inputs, inverted),
+                filter.eval_junction(JunctionOperator::And, &inputs, inverted),
                 invert_if_needed(expect_and),
                 "AND({inputs:?}) (inverted: {inverted})"
             );
             expect_eq!(
-                filter.eval_variadic(VariadicOperator::Or, &inputs, inverted),
+                filter.eval_junction(JunctionOperator::Or, &inputs, inverted),
                 invert_if_needed(expect_or),
                 "OR({inputs:?}) (inverted: {inverted})"
             );
