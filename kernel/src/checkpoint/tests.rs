@@ -1,11 +1,19 @@
 use crate::{
     actions::{Add, Metadata, Protocol, Remove},
-    engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine},
+    engine::{
+        arrow_data::ArrowEngineData,
+        default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine},
+    },
     utils::test_utils::Action,
-    DeltaResult, Table,
+    DeltaResult, EngineData, Table,
+};
+use arrow_53::{
+    array::{Int64Array, RecordBatch},
+    datatypes::{DataType, Field, Schema},
 };
 use object_store::{memory::InMemory, path::Path, ObjectStore};
-use std::sync::{atomic::Ordering, Arc};
+use serde_json::{from_slice, json, Value};
+use std::sync::Arc;
 use test_utils::delta_path_for_version;
 use url::Url;
 
@@ -44,27 +52,24 @@ fn write_commit_to_store(
     Ok(())
 }
 
-// TODO(#850): Uncomment when `finalize` is implemented
 /// Creates a metadata batch with size information for checkpoint
-// fn create_checkpoint_metadata_batch(size_in_bytes: i64) -> DeltaResult<impl EngineData> {
-//     let schema = Schema::new(vec![Field::new("sizeInBytes", DataType::Int64, false)]);
-//     let size_array = Int64Array::from(vec![size_in_bytes]);
-//     let record_batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(size_array)])?;
-//     Ok(ArrowEngineData::new(record_batch))
-// }
+fn create_checkpoint_metadata_batch(size_in_bytes: i64) -> DeltaResult<impl EngineData> {
+    let schema = Schema::new(vec![Field::new("sizeInBytes", DataType::Int64, false)]);
+    let size_array = Int64Array::from(vec![size_in_bytes]);
+    let record_batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(size_array)])?;
+    Ok(ArrowEngineData::new(record_batch))
+}
 
-// TODO(#850): Uncomment when `finalize` is implemented
-// /// Reads the `_last_checkpoint` file from storage
-// fn read_last_checkpoint_file(store: &Arc<InMemory>) -> DeltaResult<Value> {
-//     let path = Path::from("_delta_log/_last_checkpoint");
-//     let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
-//     let byte_data = rt.block_on(async {
-//         let data = store.get(&path).await?;
-//         data.bytes().await
-//     })?;
-//     Ok(from_slice(&byte_data)?)
-// }
-
+/// Reads the `_last_checkpoint` file from storage
+fn read_last_checkpoint_file(store: &Arc<InMemory>) -> DeltaResult<Value> {
+    let path = Path::from("_delta_log/_last_checkpoint");
+    let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
+    let byte_data = rt.block_on(async {
+        let data = store.get(&path).await?;
+        data.bytes().await
+    })?;
+    Ok(from_slice(&byte_data)?)
+}
 /// Create a Protocol action without v2Checkpoint feature support
 fn create_basic_protocol_action() -> Action {
     Action::Protocol(
@@ -122,26 +127,25 @@ fn create_remove_action(path: &str) -> Action {
     })
 }
 
-// TODO(#850): Uncomment when `finalize` is implemented
-// /// Helper to verify the contents of the `_last_checkpoint` file
-// fn assert_last_checkpoint_contents(
-//     store: &Arc<InMemory>,
-//     expected_version: u64,
-//     expected_size: u64,
-//     expected_num_add_files: u64,
-//     expected_size_in_bytes: i64,
-// ) -> DeltaResult<()> {
-//     let last_checkpoint_data = read_last_checkpoint_file(store)?;
-//     let expected_data = json!({
-//         "version": expected_version,
-//         "size": expected_size,
-//         "parts": 1,
-//         "sizeInBytes": expected_size_in_bytes,
-//         "numOfAddFiles": expected_num_add_files,
-//     });
-//     assert_eq!(last_checkpoint_data, expected_data);
-//     Ok(())
-// }
+/// Helper to verify the contents of the `_last_checkpoint` file
+fn assert_last_checkpoint_contents(
+    store: &Arc<InMemory>,
+    expected_version: u64,
+    expected_size: u64,
+    expected_num_add_files: u64,
+    expected_size_in_bytes: i64,
+) -> DeltaResult<()> {
+    let last_checkpoint_data = read_last_checkpoint_file(store)?;
+    let expected_data = json!({
+        "version": expected_version,
+        "size": expected_size,
+        "parts": 1,
+        "sizeInBytes": expected_size_in_bytes,
+        "numOfAddFiles": expected_num_add_files,
+    });
+    assert_eq!(last_checkpoint_data, expected_data);
+    Ok(())
+}
 
 /// Tests the `checkpoint()` API with:
 /// - A table that does not support v2Checkpoint
@@ -196,20 +200,16 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     // contain any true values, as the add action is removed in a following commit.
     assert!(data_iter.next().is_none());
 
-    assert_eq!(writer.total_actions_counter.load(Ordering::Relaxed), 4);
-    assert_eq!(writer.add_actions_counter.load(Ordering::Relaxed), 1);
-
-    // TODO(#850): Uncomment when `finalize` is implemented
     // Finalize and verify checkpoint metadata
-    // let size_in_bytes = 10;
-    // writer.finalize(&engine, &create_checkpoint_metadata_batch(size_in_bytes)?)?;
-    // assert_last_checkpoint_contents(
-    //     &store,
-    //     2,             // version: latest/last version in the log
-    //     4,             // size: 1 metadata + 1 protocol + 1 add action + 1 remove action
-    //     1,             // numOfAddFiles: from the 2nd commit (fake_path_2)
-    //     size_in_bytes, // sizeInBytes: passed to finalize (10)
-    // )?;
+    let size_in_bytes = 10;
+    writer.finalize(&engine, &create_checkpoint_metadata_batch(size_in_bytes)?)?;
+    assert_last_checkpoint_contents(
+        &store,
+        2,             // version: latest/last version in the log
+        4,             // size: 1 metadata + 1 protocol + 1 add action + 1 remove action
+        1,             // numOfAddFiles: from the 2nd commit (fake_path_2)
+        size_in_bytes, // sizeInBytes: passed to finalize (10)
+    )?;
 
     Ok(())
 }
@@ -260,20 +260,16 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     // No more data should exist because we only requested version 0
     assert!(data_iter.next().is_none());
 
-    assert_eq!(writer.total_actions_counter.load(Ordering::Relaxed), 2);
-    assert_eq!(writer.add_actions_counter.load(Ordering::Relaxed), 0);
-
-    // TODO(#850): Uncomment when `finalize` is implemented
     // Finalize and verify
-    // let size_in_bytes = 10;
-    // writer.finalize(&engine, &create_checkpoint_metadata_batch(size_in_bytes)?)?;
-    // assert_last_checkpoint_contents(
-    //     &store,
-    //     0,             // version: specified version (0)
-    //     2,             // size: 1 protocol + 1 metadata from version 0
-    //     0,             // numOfAddFiles: no add files in version 0
-    //     size_in_bytes, // sizeInBytes: passed to finalize (10)
-    // )?;
+    let size_in_bytes = 10;
+    writer.finalize(&engine, &create_checkpoint_metadata_batch(size_in_bytes)?)?;
+    assert_last_checkpoint_contents(
+        &store,
+        0,             // version: specified version (0)
+        2,             // size: 1 protocol + 1 metadata from version 0
+        0,             // numOfAddFiles: no add files in version 0
+        size_in_bytes, // sizeInBytes: passed to finalize (10)
+    )?;
 
     Ok(())
 }
@@ -334,20 +330,16 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     // No more data should exist
     assert!(data_iter.next().is_none());
 
-    assert_eq!(writer.total_actions_counter.load(Ordering::Relaxed), 5);
-    assert_eq!(writer.add_actions_counter.load(Ordering::Relaxed), 1);
-
-    // TODO(#850): Uncomment when `finalize` is implemented
     // Finalize and verify
-    // let size_in_bytes = 10;
-    // writer.finalize(&engine, &create_checkpoint_metadata_batch(size_in_bytes)?)?;
-    // assert_last_checkpoint_contents(
-    //     &store,
-    //     1,             // version: latest version (1) with v2Checkpoint support
-    //     5,             // size: 1 metadata + 1 protocol + 1 add + 1 remove + 1 checkpointMetadata
-    //     1,             // numOfAddFiles: 1 add file from version 0
-    //     size_in_bytes, // sizeInBytes: passed to finalize (10)
-    // )?;
+    let size_in_bytes = 10;
+    writer.finalize(&engine, &create_checkpoint_metadata_batch(size_in_bytes)?)?;
+    assert_last_checkpoint_contents(
+        &store,
+        1,             // version: latest version (1) with v2Checkpoint support
+        5,             // size: 1 metadata + 1 protocol + 1 add + 1 remove + 1 checkpointMetadata
+        1,             // numOfAddFiles: 1 add file from version 0
+        size_in_bytes, // sizeInBytes: passed to finalize (10)
+    )?;
 
     Ok(())
 }

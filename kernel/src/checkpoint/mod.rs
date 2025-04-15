@@ -31,7 +31,7 @@
 //! Handles the actual checkpoint data generation and writing process. It is created via the
 //! [`crate::table::Table::checkpoint`] method and provides the following APIs:
 //! - [`CheckpointWriter::checkpoint_data`] - Returns the checkpoint data and path information
-//! - TODO(#850): [`CheckpointWriter::finalize`] - Writes the `_last_checkpoint` file
+//! - [`CheckpointWriter::finalize`] - Writes the `_last_checkpoint` file
 //!
 //! ## Example: Writing a classic-named V1 checkpoint (no `v2Checkpoints` feature on test table)
 //!
@@ -73,9 +73,8 @@
 //!
 //! /* IMPORTANT: All data must be written before finalizing the checkpoint */
 //!
-//! // TODO(#850): Implement the finalize method
-//! // Finalize the checkpoint. This call will write the _last_checkpoint file
-//! // writer.finalize(&engine, &metadata)?;
+//!  // Finalize the checkpoint. This call will write the _last_checkpoint file
+//! writer.finalize(&engine, &metadata)?;
 //!
 //! # Ok::<_, Error>(())
 //! ```
@@ -96,12 +95,12 @@ use crate::actions::{
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::Scalar;
+use crate::expressions::{column_expr, Scalar};
 use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
-use crate::snapshot::Snapshot;
-use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension};
+use crate::snapshot::{Snapshot, LAST_CHECKPOINT_FILE_NAME};
+use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, Expression};
 use log_replay::CheckpointLogReplayProcessor;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::{
@@ -112,6 +111,24 @@ use url::Url;
 mod log_replay;
 #[cfg(test)]
 mod tests;
+
+/// Schema of the `_last_checkpoint` file
+/// We cannot use `LastCheckpointInfo::to_schema()` as it would include the 'checkpoint_schema'
+/// field, which is only known at runtime.
+static LAST_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    StructType::new([
+        StructField::not_null("version", DataType::LONG),
+        StructField::not_null("size", DataType::LONG),
+        StructField::nullable("parts", DataType::LONG),
+        StructField::nullable("sizeInBytes", DataType::LONG),
+        StructField::nullable("numOfAddFiles", DataType::LONG),
+    ])
+    .into()
+});
+
+/// Schema of metadata passed to the [`CheckpointWriter::finalize()`] method by the engine
+static ENGINE_CHECKPOINT_METADATA_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| StructType::new([StructField::not_null("version", DataType::LONG)]).into());
 
 /// Schema for extracting relevant actions from log files for checkpoint creation
 static CHECKPOINT_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -234,8 +251,6 @@ impl CheckpointWriter {
         })
     }
 
-    /// TODO(#850): Implement the finalize method
-    ///
     /// Finalizes the checkpoint writing process by creating the `_last_checkpoint` file
     ///
     /// The `_last_checkpoint` file is a metadata file that contains information about the
@@ -252,9 +267,38 @@ impl CheckpointWriter {
     ///   - `sizeInBytes` (i64): The size of the written checkpoint file
     ///
     /// # Returns: [`variant@Ok`] if the `_last_checkpoint` file was written successfully
-    #[allow(unused)]
-    fn finalize(self, _engine: &dyn Engine, _metadata: &dyn EngineData) -> DeltaResult<()> {
-        todo!("Implement the finalize method which will write the _last_checkpoint file")
+    pub fn finalize(self, engine: &dyn Engine, metadata: &dyn EngineData) -> DeltaResult<()> {
+        let version = self.snapshot.version().try_into().map_err(|e| {
+            Error::checkpoint_writer(format!(
+                "Failed to convert checkpoint version from u64 {} to i64: {}",
+                self.snapshot.version(),
+                e
+            ))
+        })?;
+
+        // Ordering does not matter as there are no other threads modifying this counter
+        // at this time (since the checkpoint data iterator has been consumed)
+        let checkpoint_metadata = create_last_checkpoint_data(
+            engine,
+            metadata,
+            version,
+            self.total_actions_counter.load(Ordering::Relaxed),
+            self.add_actions_counter.load(Ordering::Relaxed),
+        )?;
+
+        let last_checkpoint_path = self
+            .snapshot
+            .log_segment()
+            .log_root
+            .join(LAST_CHECKPOINT_FILE_NAME)?;
+
+        engine.json_handler().write_json_file(
+            &last_checkpoint_path,
+            Box::new(std::iter::once(Ok(checkpoint_metadata))),
+            true, // overwrite the last checkpoint file
+        )?;
+
+        Ok(())
     }
 
     /// Creates the checkpoint metadata action for V2 checkpoints.
@@ -358,11 +402,67 @@ fn deleted_file_retention_timestamp_with_time(
     Ok(now_ms - retention_ms)
 }
 
+/// Creates the data for the `_last_checkpoint` file containing checkpoint metadata
+///
+/// # Parameters
+/// - `engine`: Engine for data processing
+/// - `metadata`: Single-row data containing `sizeInBytes` (i64)
+/// - `version`: Table version number
+/// - `total_actions_counter`: Total actions count
+/// - `total_add_actions_counter`: Add actions count
+///
+/// # Returns
+/// A new [`EngineData`] batch with the `_last_checkpoint` fields:
+/// - `version` (i64, required): Table version number
+/// - `size` (i64, required): Total actions count
+/// - `parts` (i64, optional): Always 1 for single-file checkpoints
+/// - `sizeInBytes` (i64, optional): Size of checkpoint file in bytes
+/// - `numOfAddFiles` (i64, optional): Number of Add actions
+///
+/// TODO(#838) Add `checksum` field to the `_last_checkpoint` file
+/// TODO(#839) Add `checkpoint_schema` field to the `_last_checkpoint` file
+fn create_last_checkpoint_data(
+    engine: &dyn Engine,
+    metadata: &dyn EngineData,
+    version: i64,
+    total_actions_counter: i64,
+    add_actions_counter: i64,
+) -> DeltaResult<Box<dyn EngineData>> {
+    // Validate metadata has exactly one row
+    if metadata.len() != 1 {
+        return Err(Error::checkpoint_writer(format!(
+            "Engine-collected checkpoint metadata should have exactly one row, found {}",
+            metadata.len()
+        )));
+    }
+
+    let last_checkpoint_exprs = [
+        Expression::literal(version),
+        Expression::literal(total_actions_counter),
+        Expression::literal(1i64), // Single-file checkpoint
+        column_expr!("sizeInBytes"),
+        Expression::literal(add_actions_counter),
+        // TODO(#838): Include the checksum here
+        // TODO(#839): Include the schema here
+    ];
+    let last_checkpoint_expr = Expression::struct_from(last_checkpoint_exprs);
+
+    let last_checkpoint_metadata_evaluator = engine.evaluation_handler().new_expression_evaluator(
+        ENGINE_CHECKPOINT_METADATA_SCHEMA.clone(),
+        last_checkpoint_expr,
+        LAST_CHECKPOINT_SCHEMA.clone().into(),
+    );
+
+    last_checkpoint_metadata_evaluator.evaluate(metadata)
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
     use crate::engine::{arrow_data::ArrowEngineData, sync::SyncEngine};
     use crate::Table;
+    use arrow_53::array::Int64Array;
     use arrow_53::{array::RecordBatch, datatypes::Field};
     use delta_kernel::arrow::array::create_array;
     use std::path::PathBuf;
@@ -458,6 +558,77 @@ mod unit_tests {
         assert!(result.is_none());
         assert_eq!(writer.total_actions_counter.load(Ordering::Relaxed), 0);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_last_checkpoint_metadata() -> DeltaResult<()> {
+        // Setup test data
+        let size_in_bytes: i64 = 1024 * 1024; // 1MB
+        let version = 10;
+        let total_actions_counter = 100;
+        let add_actions_counter = 75;
+        let engine = SyncEngine::new();
+
+        // Create engine metadata with `size_in_bytes`
+        let schema = ArrowSchema::new(vec![Field::new("sizeInBytes", ArrowDataType::Int64, false)]);
+        let size_array = Int64Array::from(vec![size_in_bytes]);
+        let record_batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(size_array)])?;
+        let metadata = ArrowEngineData::new(record_batch);
+
+        // Create last checkpoint metadata
+        let last_checkpoint_batch = create_last_checkpoint_data(
+            &engine,
+            &metadata,
+            version,
+            total_actions_counter,
+            add_actions_counter,
+        )?;
+
+        // Verify the underlying EngineData contains the expected LastCheckpointInfo schema and data
+        let arrow_engine_data = ArrowEngineData::try_from_engine_data(last_checkpoint_batch)?;
+        let record_batch = arrow_engine_data.record_batch();
+
+        // Build the expected RecordBatch
+        let expected_schema = Arc::new(Schema::new(vec![
+            Field::new("version", DataType::Int64, false),
+            Field::new("size", DataType::Int64, false),
+            Field::new("parts", DataType::Int64, true),
+            Field::new("sizeInBytes", DataType::Int64, true),
+            Field::new("numOfAddFiles", DataType::Int64, true),
+        ]));
+        let expected = RecordBatch::try_new(
+            expected_schema,
+            vec![
+                create_array!(Int64, [version]),
+                create_array!(Int64, [total_actions_counter]),
+                create_array!(Int64, [1]),
+                create_array!(Int64, [size_in_bytes]),
+                create_array!(Int64, [add_actions_counter]),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(*record_batch, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_last_checkpoint_metadata_with_invalid_batch() -> DeltaResult<()> {
+        let engine = SyncEngine::new();
+
+        // Create engine metadata with the wrong schema
+        let schema = ArrowSchema::new(vec![Field::new("wrongField", ArrowDataType::Int64, false)]);
+        let size_array = Int64Array::from(vec![0]);
+        let record_batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(size_array)])
+            .expect("Failed to create record batch");
+        let metadata = Box::new(ArrowEngineData::new(record_batch));
+
+        // This should fail because the schema does not match the expected schema
+        let res = create_last_checkpoint_data(&engine, &*metadata, 0, 0, 0);
+
+        // Verify that an error is returned
+        assert!(res.is_err());
         Ok(())
     }
 }
