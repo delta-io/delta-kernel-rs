@@ -1,7 +1,5 @@
 use super::*;
-use crate::expressions::{
-    column_expr, column_name, ArrayData, Expression, StructData, UnaryOperator,
-};
+use crate::expressions::{column_expr, column_name, ArrayData, Expression, StructData};
 use crate::schema::ArrayType;
 use crate::DataType;
 
@@ -367,7 +365,7 @@ fn test_eval_not() {
         let input = input.into();
         for inverted in [true, false] {
             expect_eq!(
-                filter.eval_unary(UnaryOperator::Not, &input, inverted),
+                filter.eval_not(&input, inverted),
                 expect.map(|v| v != inverted),
                 "NOT({input:?}) (inverted: {inverted})"
             );
@@ -377,27 +375,28 @@ fn test_eval_not() {
 
 #[test]
 fn test_eval_is_null() {
+    use crate::expressions::UnaryOperator::IsNull;
     let expr = column_expr!("x");
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
     expect_eq!(
-        filter.eval_unary(UnaryOperator::IsNull, &expr, true),
+        filter.eval_unary(IsNull, &expr, true),
         Some(true),
         "x IS NOT NULL"
     );
     expect_eq!(
-        filter.eval_unary(UnaryOperator::IsNull, &expr, false),
+        filter.eval_unary(IsNull, &expr, false),
         Some(false),
         "x IS NULL"
     );
 
     let expr = Expression::literal(1);
     expect_eq!(
-        filter.eval_unary(UnaryOperator::IsNull, &expr, true),
+        filter.eval_unary(IsNull, &expr, true),
         Some(true),
         "1 IS NOT NULL"
     );
     expect_eq!(
-        filter.eval_unary(UnaryOperator::IsNull, &expr, false),
+        filter.eval_unary(IsNull, &expr, false),
         Some(false),
         "1 IS NULL"
     );
@@ -600,7 +599,7 @@ fn test_sql_where() {
     expect_eq!(null_filter.eval_sql_where(expr), Some(true), "{expr}");
 
     // NOT a gets skipped when NULL but not when missing
-    let expr = &!col.clone();
+    let expr = &Expr::not(col.clone());
     expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
     expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
 

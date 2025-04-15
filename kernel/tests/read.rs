@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::ops::Not;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -861,27 +860,31 @@ fn mixed_not_null() -> Result<(), Box<dyn std::error::Error>> {
 fn and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (
-            column_expr!("number")
-                .gt(4i64)
-                .and(column_expr!("a_float").gt(5.5)),
+            Expression::and(
+                column_expr!("number").gt(4i64),
+                column_expr!("a_float").gt(5.5),
+            ),
             table_for_numbers(vec![6]),
         ),
         (
-            column_expr!("number")
-                .gt(4i64)
-                .and(Expression::not(column_expr!("a_float").gt(5.5))),
+            Expression::and(
+                column_expr!("number").gt(4i64),
+                Expression::not(column_expr!("a_float").gt(5.5)),
+            ),
             table_for_numbers(vec![5]),
         ),
         (
-            column_expr!("number")
-                .gt(4i64)
-                .or(column_expr!("a_float").gt(5.5)),
+            Expression::or(
+                column_expr!("number").gt(4i64),
+                column_expr!("a_float").gt(5.5),
+            ),
             table_for_numbers(vec![5, 6]),
         ),
         (
-            column_expr!("number")
-                .gt(4i64)
-                .or(Expression::not(column_expr!("a_float").gt(5.5))),
+            Expression::or(
+                column_expr!("number").gt(4i64),
+                Expression::not(column_expr!("a_float").gt(5.5)),
+            ),
             table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
         ),
     ];
@@ -900,35 +903,31 @@ fn and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
 fn not_and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (
-            Expression::not(
-                column_expr!("number")
-                    .gt(4i64)
-                    .and(column_expr!("a_float").gt(5.5)),
-            ),
+            Expression::not(Expression::and(
+                column_expr!("number").gt(4i64),
+                column_expr!("a_float").gt(5.5),
+            )),
             table_for_numbers(vec![1, 2, 3, 4, 5]),
         ),
         (
-            Expression::not(
-                column_expr!("number")
-                    .gt(4i64)
-                    .and(Expression::not(column_expr!("a_float").gt(5.5))),
-            ),
+            Expression::not(Expression::and(
+                column_expr!("number").gt(4i64),
+                Expression::not(column_expr!("a_float").gt(5.5)),
+            )),
             table_for_numbers(vec![1, 2, 3, 4, 6]),
         ),
         (
-            Expression::not(
-                column_expr!("number")
-                    .gt(4i64)
-                    .or(column_expr!("a_float").gt(5.5)),
-            ),
+            Expression::not(Expression::or(
+                column_expr!("number").gt(4i64),
+                column_expr!("a_float").gt(5.5),
+            )),
             table_for_numbers(vec![1, 2, 3, 4]),
         ),
         (
-            Expression::not(
-                column_expr!("number")
-                    .gt(4i64)
-                    .or(Expression::not(column_expr!("a_float").gt(5.5))),
-            ),
+            Expression::not(Expression::or(
+                column_expr!("number").gt(4i64),
+                Expression::not(column_expr!("a_float").gt(5.5)),
+            )),
             vec![],
         ),
     ];

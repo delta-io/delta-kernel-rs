@@ -274,25 +274,25 @@ fn test_logical() {
     let column_a = column_expr!("a");
     let column_b = column_expr!("b");
 
-    let expression = column_a.clone().and(column_b.clone());
+    let expression = Expression::and(column_a.clone(), column_b.clone());
     let results =
         evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
     let expected = Arc::new(BooleanArray::from(vec![false, false]));
     assert_eq!(results.as_ref(), expected.as_ref());
 
-    let expression = column_a.clone().and(true);
+    let expression = Expression::and(column_a.clone(), true);
     let results =
         evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
     let expected = Arc::new(BooleanArray::from(vec![true, false]));
     assert_eq!(results.as_ref(), expected.as_ref());
 
-    let expression = column_a.clone().or(column_b);
+    let expression = Expression::or(column_a.clone(), column_b);
     let results =
         evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
     let expected = Arc::new(BooleanArray::from(vec![true, true]));
     assert_eq!(results.as_ref(), expected.as_ref());
 
-    let expression = column_a.clone().or(false);
+    let expression = Expression::or(column_a.clone(), false);
     let results =
         evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
     let expected = Arc::new(BooleanArray::from(vec![true, false]));
