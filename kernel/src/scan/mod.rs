@@ -8,7 +8,7 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
-use self::log_replay::get_scan_metadata_transform_expr;
+use self::log_replay::{get_scan_metadata_transform_expr, DV_SCHEMA};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
@@ -469,13 +469,6 @@ impl Scan {
         static RESTORED_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
             // Note that fields projected out of a nullable struct must be nullable
             let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-            let deletion_vector = StructType::new([
-                StructField::nullable("storageType", DataType::STRING),
-                StructField::nullable("pathOrInlineDv", DataType::STRING),
-                StructField::nullable("offset", DataType::INTEGER),
-                StructField::nullable("sizeInBytes", DataType::INTEGER),
-                StructField::nullable("cardinality", DataType::LONG),
-            ]);
             DataType::struct_type(vec![StructField::nullable(
                 "add",
                 DataType::struct_type(vec![
@@ -484,7 +477,7 @@ impl Scan {
                     StructField::nullable("size", DataType::LONG),
                     StructField::nullable("modificationTime", DataType::LONG),
                     StructField::nullable("stats", DataType::STRING),
-                    StructField::nullable("deletionVector", deletion_vector),
+                    StructField::nullable("deletionVector", DV_SCHEMA.clone()),
                 ]),
             )])
         });
@@ -501,7 +494,7 @@ impl Scan {
         // back into shape as we read it from the log. Since it is already reconciled data,
         // we treat it as if it originated from a checkpoint.
         let transform = engine.evaluation_handler().new_expression_evaluator(
-            Arc::new(scan_row_schema()),
+            scan_row_schema(),
             get_scan_metadata_transform_expr(),
             RESTORED_ADD_SCHEMA.clone(),
         );
@@ -517,26 +510,29 @@ impl Scan {
             )?));
         }
 
+        let log_segment = self.snapshot.log_segment();
+
         // If the current log segment contains a checkpoint newer than the hint version
-        // we disregard the existing data hint, and perform a full scan.
-        if let Some(version) = self.snapshot.log_segment().checkpoint_version {
+        // we disregard the existing data hint, and perform a full scan. The current log segment
+        // only has deltas after the checkpoint, so we cannot update from prior versions.
+        if let Some(version) = log_segment.checkpoint_version {
             if version > hint_version {
                 let scan_iter = self.scan_metadata(engine)?;
                 return Ok(Box::new(scan_iter));
-            };
-        };
+            }
+        }
 
         // create a new log segment containing only the commits added after the version hint.
-        let mut ascending_commit_files = self.snapshot.log_segment().ascending_commit_files.clone();
+        let mut ascending_commit_files = log_segment.ascending_commit_files.clone();
         ascending_commit_files.retain(|f| f.version > hint_version);
-        let log_segment = LogSegment::try_new(
+        let new_log_segment = LogSegment::try_new(
             ascending_commit_files,
             vec![],
-            self.snapshot.log_segment().log_root.clone(),
-            Some(self.snapshot.log_segment().end_version),
+            log_segment.log_root.clone(),
+            Some(log_segment.end_version),
         )?;
 
-        let it = log_segment
+        let it = new_log_segment
             .read_actions(
                 engine,
                 COMMIT_META_READ_SCHEMA.clone(),
@@ -734,8 +730,8 @@ impl Scan {
 ///    }
 /// }
 /// ```
-pub fn scan_row_schema() -> Schema {
-    log_replay::SCAN_ROW_SCHEMA.as_ref().clone()
+pub fn scan_row_schema() -> SchemaRef {
+    log_replay::SCAN_ROW_SCHEMA.clone()
 }
 
 pub(crate) fn parse_partition_value(

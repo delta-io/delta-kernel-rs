@@ -300,6 +300,16 @@ impl RowVisitor for AddRemoveDedupVisitor<'_> {
     }
 }
 
+pub(crate) static DV_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
+    StructType::new([
+        StructField::nullable("storageType", DataType::STRING),
+        StructField::nullable("pathOrInlineDv", DataType::STRING),
+        StructField::nullable("offset", DataType::INTEGER),
+        StructField::nullable("sizeInBytes", DataType::INTEGER),
+        StructField::nullable("cardinality", DataType::LONG),
+    ])
+});
+
 // NB: If you update this schema, ensure you update the comment describing it in the doc comment
 // for `scan_row_schema` in scan/mod.rs! You'll also need to update ScanFileVisitor as the
 // indexes will be off, and [`get_add_transform_expr`] below to match it.
@@ -308,19 +318,12 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
     let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
     let file_constant_values =
         StructType::new([StructField::nullable("partitionValues", partition_values)]);
-    let deletion_vector = StructType::new([
-        StructField::nullable("storageType", DataType::STRING),
-        StructField::nullable("pathOrInlineDv", DataType::STRING),
-        StructField::nullable("offset", DataType::INTEGER),
-        StructField::nullable("sizeInBytes", DataType::INTEGER),
-        StructField::nullable("cardinality", DataType::LONG),
-    ]);
     Arc::new(StructType::new([
         StructField::nullable("path", DataType::STRING),
         StructField::nullable("size", DataType::LONG),
         StructField::nullable("modificationTime", DataType::LONG),
         StructField::nullable("stats", DataType::STRING),
-        StructField::nullable("deletionVector", deletion_vector),
+        StructField::nullable("deletionVector", DV_SCHEMA.clone()),
         StructField::nullable("fileConstantValues", file_constant_values),
     ]))
 });
