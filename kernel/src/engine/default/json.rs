@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_json_file_non_overwrite() -> DeltaResult<()> {
+    async fn test_write_json_file_without_overwrite() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let handler = DefaultJsonHandler::new(store.clone(), executor);

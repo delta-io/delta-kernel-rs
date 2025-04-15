@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_json_file_non_overwrite() -> DeltaResult<()> {
+    fn test_write_json_file_without_overwrite() -> DeltaResult<()> {
         let test_dir = TempDir::new().unwrap();
         let path = test_dir.path().join("00000000000000000001.json");
         let handler = SyncJsonHandler;
