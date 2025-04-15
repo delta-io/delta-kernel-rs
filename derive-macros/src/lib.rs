@@ -1,8 +1,10 @@
 use proc_macro2::{Ident, Span, TokenStream};
-use quote::{quote, quote_spanned};
+use quote::{quote, quote_spanned, ToTokens};
 use syn::parse_macro_input;
 use syn::spanned::Spanned;
-use syn::{Data, DataStruct, DeriveInput, Error, Fields, Item, Meta, PathArguments, Type};
+use syn::{
+    Data, DataStruct, DeriveInput, Error, Fields, Item, Meta, PathArguments, Type, Visibility,
+};
 
 /// Parses a dot-delimited column name into an array of field names. See
 /// `delta_kernel::expressions::column_name::column_name` macro for details.
@@ -161,19 +163,40 @@ pub fn internal_api(
 }
 
 fn make_public(mut item: Item) -> Item {
-    match &mut item {
-        Item::Fn(f) => f.vis = syn::parse_quote!(pub),
-        Item::Struct(s) => s.vis = syn::parse_quote!(pub),
-        Item::Enum(e) => e.vis = syn::parse_quote!(pub),
-        Item::Trait(t) => t.vis = syn::parse_quote!(pub),
-        Item::Type(t) => t.vis = syn::parse_quote!(pub),
-        Item::Mod(m) => m.vis = syn::parse_quote!(pub),
-        Item::Static(s) => s.vis = syn::parse_quote!(pub),
-        Item::Const(c) => c.vis = syn::parse_quote!(pub),
-        Item::Union(u) => u.vis = syn::parse_quote!(pub),
-        Item::Impl(_) => {}       // impls don't have visibility
-        Item::ForeignMod(_) => {} // foreign mods don't have visibility
-        _ => {}
+    fn set_pub(vis: &mut Visibility) -> Result<(), syn::Error> {
+        if matches!(vis, Visibility::Public(_)) {
+            Err(Error::new(
+                vis.span(),
+                "ineligible for #[internal_api]: item is already public",
+            ))
+        } else {
+            *vis = syn::parse_quote!(pub);
+            Ok(())
+        }
+    }
+
+    let result = match &mut item {
+        Item::Fn(f) => set_pub(&mut f.vis),
+        Item::Struct(s) => set_pub(&mut s.vis),
+        Item::Enum(e) => set_pub(&mut e.vis),
+        Item::Trait(t) => set_pub(&mut t.vis),
+        Item::Type(t) => set_pub(&mut t.vis),
+        Item::Mod(m) => set_pub(&mut m.vis),
+        Item::Static(s) => set_pub(&mut s.vis),
+        Item::Const(c) => set_pub(&mut c.vis),
+        Item::Union(u) => set_pub(&mut u.vis),
+        // foreign mod, impl block, and all others not handled
+        _ => Err(Error::new(
+            item.span(),
+            format!("unsupported item type for #[internal_api]: {:?}", item),
+        )),
+    };
+
+    if let Err(err) = result {
+        let error = err.to_compile_error();
+        let mut tokens = item.to_token_stream();
+        tokens.extend(error);
+        return syn::parse_quote!(#tokens);
     }
 
     item
