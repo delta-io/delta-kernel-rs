@@ -1,9 +1,8 @@
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{quote, quote_spanned};
+use syn::parse_macro_input;
 use syn::spanned::Spanned;
-use syn::{
-    parse_macro_input, Data, DataStruct, DeriveInput, Error, Fields, Meta, PathArguments, Type,
-};
+use syn::{Data, DataStruct, DeriveInput, Error, Fields, Item, Meta, PathArguments, Type};
 
 /// Parses a dot-delimited column name into an array of field names. See
 /// `delta_kernel::expressions::column_name::column_name` macro for details.
@@ -133,4 +132,49 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
         }
     });
     quote! { #(#schema_fields),* }
+}
+
+/// Mark items as `internal_api` to make them public iff the `internal-api` feature is enabled.
+/// Note this doesn't work for inline module definitions (see `internal_mod!` macro in delta_kernel
+/// crate - can't export macro_rules! from proc macro crate).
+/// Ref: <https://github.com/rust-lang/rust/issues/54727>
+#[proc_macro_attribute]
+pub fn internal_api(
+    _attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(item as Item);
+
+    // Create a version with public visibility for the unstable feature
+    let public_version = make_public(input.clone());
+
+    // The original item stays as-is for the non-unstable case
+    let output = quote! {
+        #[cfg(feature = "internal-api")]
+        #public_version
+
+        #[cfg(not(feature = "internal-api"))]
+        #input
+    };
+
+    output.into()
+}
+
+fn make_public(mut item: Item) -> Item {
+    match &mut item {
+        Item::Fn(f) => f.vis = syn::parse_quote!(pub),
+        Item::Struct(s) => s.vis = syn::parse_quote!(pub),
+        Item::Enum(e) => e.vis = syn::parse_quote!(pub),
+        Item::Trait(t) => t.vis = syn::parse_quote!(pub),
+        Item::Type(t) => t.vis = syn::parse_quote!(pub),
+        Item::Mod(m) => m.vis = syn::parse_quote!(pub),
+        Item::Static(s) => s.vis = syn::parse_quote!(pub),
+        Item::Const(c) => c.vis = syn::parse_quote!(pub),
+        Item::Union(u) => u.vis = syn::parse_quote!(pub),
+        Item::Impl(_) => {}       // impls don't have visibility
+        Item::ForeignMod(_) => {} // foreign mods don't have visibility
+        _ => {}
+    }
+
+    item
 }

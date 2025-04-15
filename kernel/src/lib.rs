@@ -93,20 +93,9 @@ pub(crate) mod kernel_predicates;
 pub mod parquet;
 pub(crate) mod utils;
 
-#[cfg(feature = "internal-api")]
-pub mod path;
-#[cfg(not(feature = "internal-api"))]
-pub(crate) mod path;
-
-#[cfg(feature = "internal-api")]
-pub mod log_replay;
-#[cfg(not(feature = "internal-api"))]
-pub(crate) mod log_replay;
-
-#[cfg(feature = "internal-api")]
-pub mod log_segment;
-#[cfg(not(feature = "internal-api"))]
-pub(crate) mod log_segment;
+internal_mod!(pub(crate) mod path);
+internal_mod!(pub(crate) mod log_replay);
+internal_mod!(pub(crate) mod log_segment);
 
 pub use delta_kernel_derive;
 pub use engine_data::{EngineData, RowVisitor};
@@ -124,6 +113,29 @@ use schema::{SchemaTransform, StructField, StructType};
     feature = "arrow-conversion"
 ))]
 pub mod engine;
+
+// Macro for `unstable` modules. Note this can't be implemented alongside the `#[internal_api]`
+// macro since proc macro crates can't export macro_rules! macros.
+#[macro_export]
+macro_rules! internal_mod {
+    ($vis:vis mod $name:ident) => {
+        #[cfg(feature = "internal-api")]
+        pub mod $name;
+
+        #[cfg(not(feature = "internal-api"))]
+        $vis mod $name;
+    };
+
+    // allow for a trailing semicolon
+    ($vis:vis mod $name:ident;) => {
+        internal_mod!($vis mod $name);
+    };
+
+    // error if item is already pub
+    (pub mod $name:ident) => {
+        compile_error!("internal_mod!: module is already public");
+    };
+}
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
