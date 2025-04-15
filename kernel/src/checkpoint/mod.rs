@@ -73,7 +73,7 @@
 //!
 //! /* IMPORTANT: All data must be written before finalizing the checkpoint */
 //!
-//!  // Finalize the checkpoint. This call will write the _last_checkpoint file
+//! // Finalize the checkpoint. This call will write the _last_checkpoint file
 //! writer.finalize(&engine, &metadata)?;
 //!
 //! # Ok::<_, Error>(())
@@ -277,7 +277,7 @@ impl CheckpointWriter {
         })?;
 
         // Ordering does not matter as there are no other threads modifying this counter
-        // at this time (since the checkpoint data iterator has been consumed)
+        // at this time (since the checkpoint data iterator should have been consumed)
         let checkpoint_metadata = create_last_checkpoint_data(
             engine,
             metadata,
