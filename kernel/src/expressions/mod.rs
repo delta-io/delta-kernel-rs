@@ -301,6 +301,11 @@ impl Expression {
         Self::variadic(VariadicOperator::Or, exprs)
     }
 
+    /// Logical NOT (boolean inversion)
+    pub fn not(expr: impl Into<Self>) -> Self {
+        Self::unary(UnaryOperator::Not, expr.into())
+    }
+
     /// Create a new expression `self IS NULL`
     pub fn is_null(self) -> Self {
         Self::unary(UnaryOperator::IsNull, self)
@@ -308,7 +313,7 @@ impl Expression {
 
     /// Create a new expression `self IS NOT NULL`
     pub fn is_not_null(self) -> Self {
-        !Self::is_null(self)
+        Self::not(Self::is_null(self))
     }
 
     /// Create a new expression `self == other`
@@ -352,13 +357,13 @@ impl Expression {
     }
 
     /// Create a new expression `self AND other`
-    pub fn and(self, other: impl Into<Self>) -> Self {
-        Self::and_from([self, other.into()])
+    pub fn and(a: impl Into<Self>, b: impl Into<Self>) -> Self {
+        Self::and_from([a.into(), b.into()])
     }
 
     /// Create a new expression `self OR other`
-    pub fn or(self, other: impl Into<Self>) -> Self {
-        Self::or_from([self, other.into()])
+    pub fn or(a: impl Into<Self>, b: impl Into<Self>) -> Self {
+        Self::or_from([a.into(), b.into()])
     }
 
     /// Create a new expression `DISTINCT(self, other)`
@@ -540,14 +545,6 @@ pub trait ExpressionTransform<'a> {
     }
 }
 
-impl std::ops::Not for Expression {
-    type Output = Self;
-
-    fn not(self) -> Self {
-        Self::unary(UnaryOperator::Not, self)
-    }
-}
-
 impl<R: Into<Expression>> std::ops::Add<R> for Expression {
     type Output = Self;
 
@@ -682,7 +679,6 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
 #[cfg(test)]
 mod tests {
     use super::{column_expr, Expression as Expr, ExpressionDepthChecker};
-    use std::ops::Not;
 
     #[test]
     fn test_expression_format() {
@@ -693,7 +689,7 @@ mod tests {
             ((col_ref.clone() - 4).lt(10), "Column(x) - 4 < 10"),
             ((col_ref.clone() + 4) / 10 * 42, "Column(x) + 4 / 10 * 42"),
             (
-                col_ref.clone().gt_eq(2).and(col_ref.clone().lt_eq(10)),
+                Expr::and(col_ref.clone().gt_eq(2), col_ref.clone().lt_eq(10)),
                 "AND(Column(x) >= 2, Column(x) <= 10)",
             ),
             (
@@ -705,7 +701,7 @@ mod tests {
                 "AND(Column(x) >= 2, Column(x) <= 10, Column(x) <= 100)",
             ),
             (
-                col_ref.clone().gt(2).or(col_ref.clone().lt(10)),
+                Expr::or(col_ref.clone().gt(2), col_ref.clone().lt(10)),
                 "OR(Column(x) > 2, Column(x) < 10)",
             ),
             (col_ref.eq("foo"), "Column(x) = 'foo'"),

@@ -25,7 +25,7 @@ macro_rules! expect_eq {
 #[test]
 fn test_eval_is_null() {
     let col = &column_expr!("x");
-    let expressions = [Expr::is_null(col.clone()), !Expr::is_null(col.clone())];
+    let expressions = [Expr::is_null(col.clone()), Expr::is_not_null(col.clone())];
 
     let do_test = |nullcount: i64, expected: &[Option<bool>]| {
         let resolver = HashMap::from_iter([
@@ -171,7 +171,7 @@ fn test_eval_variadic() {
         let pred = as_data_skipping_predicate(&expr).unwrap();
         expect_eq!(filter.eval_expr(&pred, false), *expect_or, "OR({inputs:?})");
 
-        let expr = !Expr::and_from(inputs.clone());
+        let expr = Expr::not(Expr::and_from(inputs.clone()));
         let pred = as_data_skipping_predicate(&expr).unwrap();
         expect_eq!(
             filter.eval_expr(&pred, false),
@@ -179,7 +179,7 @@ fn test_eval_variadic() {
             "NOT AND({inputs:?})"
         );
 
-        let expr = !Expr::or_from(inputs.clone());
+        let expr = Expr::not(Expr::or_from(inputs.clone()));
         let pred = as_data_skipping_predicate(&expr).unwrap();
         expect_eq!(
             filter.eval_expr(&pred, false),
@@ -202,9 +202,9 @@ fn test_eval_distinct() {
 
     let expressions = [
         Expr::distinct(col.clone(), ten.clone()),
-        !Expr::distinct(col.clone(), ten.clone()),
+        Expr::not(Expr::distinct(col.clone(), ten.clone())),
         Expr::distinct(col.clone(), null.clone()),
-        !Expr::distinct(col.clone(), null.clone()),
+        Expr::not(Expr::distinct(col.clone(), null.clone())),
     ];
 
     let do_test = |min: &Scalar, max: &Scalar, nullcount: i64, expected: &[Option<bool>]| {
