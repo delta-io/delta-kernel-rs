@@ -19,9 +19,9 @@ use delta_kernel_ffi_macros::handle_descriptor;
 // cbindgen doesn't understand our use of feature flags here, and by default it parses `mod handle`
 // twice. So we tell it to ignore one of the declarations to avoid double-definition errors.
 /// cbindgen:ignore
-#[cfg(feature = "developer-visibility")]
+#[cfg(feature = "internal-api")]
 pub mod handle;
-#[cfg(not(feature = "developer-visibility"))]
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod handle;
 
 use handle::Handle;
@@ -137,7 +137,7 @@ macro_rules! kernel_string_slice {
         //
         // NOTE: The `do_it` wrapper avoids an "unnecessary `unsafe` block" clippy warning in case
         // the invocation site of this macro is already in an `unsafe` block. We can't just disable
-        // the warning with #[allow(unused_unsafe)] because expression annotation is unstable rust.
+        // the warning with #[allow(unused_unsafe)] because expression annotation is internal-api rust.
         fn do_it(s: &str) -> $crate::KernelStringSlice {
             unsafe { $crate::KernelStringSlice::new_unsafe(s) }
         }
