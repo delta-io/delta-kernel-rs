@@ -16,9 +16,8 @@ const MULTIPART_PART_LEN: usize = 10;
 const UUID_PART_LEN: usize = 36;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-enum LogPathFileType {
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
+pub(crate) enum LogPathFileType {
     Commit,
     SinglePartCheckpoint,
     #[allow(unused)]
@@ -39,9 +38,8 @@ enum LogPathFileType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-struct ParsedLogPath<Location: AsUrl = FileMeta> {
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
+pub(crate) struct ParsedLogPath<Location: AsUrl = FileMeta> {
     pub location: Location,
     #[allow(unused)]
     pub filename: String,
@@ -62,9 +60,8 @@ fn parse_path_part<T: FromStr>(value: &str, expect_len: usize, location: &Url) -
 
 // We normally construct ParsedLogPath from FileMeta, but in testing it's convenient to use
 // a Url directly instead. This trait decouples the two.
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-trait AsUrl {
+#[cfg_attr(feature = "internal-api", visibility::make(pub))]
+pub(crate) trait AsUrl {
     fn as_url(&self) -> &Url;
 }
 
@@ -82,9 +79,8 @@ impl AsUrl for Url {
 
 impl<Location: AsUrl> ParsedLogPath<Location> {
     // NOTE: We can't actually impl TryFrom because Option<T> is a foreign struct even if T is local.
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-    fn try_from(location: Location) -> DeltaResult<Option<ParsedLogPath<Location>>> {
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    pub(crate) fn try_from(location: Location) -> DeltaResult<Option<ParsedLogPath<Location>>> {
         let url = location.as_url();
         let filename = url
             .path_segments()
@@ -155,15 +151,13 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         }))
     }
 
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-    fn is_commit(&self) -> bool {
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    pub(crate) fn is_commit(&self) -> bool {
         matches!(self.file_type, LogPathFileType::Commit)
     }
 
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-    fn is_checkpoint(&self) -> bool {
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    pub(crate) fn is_checkpoint(&self) -> bool {
         matches!(
             self.file_type,
             LogPathFileType::SinglePartCheckpoint
@@ -172,10 +166,9 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         )
     }
 
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
+    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
     #[allow(dead_code)] // currently only used in tests, which don't "count"
-    fn is_unknown(&self) -> bool {
+    pub(crate) fn is_unknown(&self) -> bool {
         matches!(self.file_type, LogPathFileType::Unknown)
     }
 }

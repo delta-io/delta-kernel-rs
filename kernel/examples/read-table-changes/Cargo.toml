@@ -14,6 +14,6 @@ delta_kernel = { path = "../../../kernel", features = [
   "arrow",
   "default-engine",
 ] }
-env_logger = "0.11.3"
+env_logger = "0.11.8"
 url = "2"
-itertools = "0.13"
+itertools = "0.14"

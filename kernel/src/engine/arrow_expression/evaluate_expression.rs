@@ -14,8 +14,8 @@ use crate::arrow::error::ArrowError;
 use crate::engine::arrow_utils::prim_array_cmp;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
-    BinaryExpression, BinaryOperator, Expression, Scalar, UnaryExpression, UnaryOperator,
-    VariadicExpression, VariadicOperator,
+    BinaryExpression, BinaryOperator, Expression, JunctionExpression, JunctionOperator, Scalar,
+    UnaryExpression, UnaryOperator,
 };
 use crate::schema::DataType;
 use itertools::Itertools;
@@ -220,11 +220,11 @@ pub(crate) fn evaluate_expression(
 
             eval(&left_arr, &right_arr).map_err(Error::generic_err)
         }
-        (Variadic(VariadicExpression { op, exprs }), None | Some(&DataType::BOOLEAN)) => {
+        (Junction(JunctionExpression { op, exprs }), None | Some(&DataType::BOOLEAN)) => {
             type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
             let (reducer, default): (Operation, _) = match op {
-                VariadicOperator::And => (and_kleene, true),
-                VariadicOperator::Or => (or_kleene, false),
+                JunctionOperator::And => (and_kleene, true),
+                JunctionOperator::Or => (or_kleene, false),
             };
             exprs
                 .iter()
@@ -237,11 +237,8 @@ pub(crate) fn evaluate_expression(
                     evaluate_expression(&Expression::literal(default), batch, result_type)
                 })
         }
-        (Variadic(_), _) => {
-            // NOTE: Update this error message if we add support for variadic operations on other types
-            Err(Error::Generic(format!(
-                "Variadic {expression:?} is expected to return boolean results, got {result_type:?}"
-            )))
-        }
+        (Junction(_), _) => Err(Error::Generic(format!(
+            "Junction {expression:?} is expected to return boolean results, got {result_type:?}"
+        ))),
     }
 }

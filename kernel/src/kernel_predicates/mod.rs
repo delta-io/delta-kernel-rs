@@ -1,6 +1,6 @@
 use crate::expressions::{
-    BinaryExpression, BinaryOperator, ColumnName, Expression as Expr, Scalar, UnaryExpression,
-    UnaryOperator, VariadicExpression, VariadicOperator,
+    BinaryExpression, BinaryOperator, ColumnName, Expression as Expr, JunctionExpression,
+    JunctionOperator, Scalar, UnaryExpression, UnaryOperator,
 };
 use crate::schema::DataType;
 
@@ -97,14 +97,14 @@ pub(crate) trait KernelPredicateEvaluator {
         inverted: bool,
     ) -> Option<Self::Output>;
 
-    /// Completes evaluation of a (possibly inverted) variadic expression.
+    /// Completes evaluation of a (possibly inverted) junction expression.
     ///
     /// AND and OR are implemented by first evaluating its (possibly inverted) inputs. This part is
-    /// always the same, provided by [`eval_variadic`]). The results are then combined to become the
+    /// always the same, provided by [`eval_junction`]). The results are then combined to become the
     /// expression's output in some implementation-defined way (this method).
-    fn finish_eval_variadic(
+    fn finish_eval_junction(
         &self,
-        op: VariadicOperator,
+        op: JunctionOperator,
         exprs: impl IntoIterator<Item = Option<Self::Output>>,
         inverted: bool,
     ) -> Option<Self::Output>;
@@ -118,10 +118,15 @@ pub(crate) trait KernelPredicateEvaluator {
         self.eval_eq(col, &Scalar::from(inverted), true)
     }
 
+    /// Dispatches a (possibly inverted) NOT expression
+    fn eval_not(&self, expr: &Expr, inverted: bool) -> Option<Self::Output> {
+        self.eval_expr(expr, !inverted)
+    }
+
     /// Dispatches a (possibly inverted) unary expression to each operator's specific implementation.
     fn eval_unary(&self, op: UnaryOperator, expr: &Expr, inverted: bool) -> Option<Self::Output> {
         match op {
-            UnaryOperator::Not => self.eval_expr(expr, !inverted),
+            UnaryOperator::Not => self.eval_not(expr, inverted),
             UnaryOperator::IsNull => match expr {
                 // WARNING: Only literals and columns can be safely null-checked. Attempting to
                 // null-check an expressions such as `a < 10` could wrongly produce FALSE in case
@@ -156,7 +161,7 @@ pub(crate) trait KernelPredicateEvaluator {
                 self.eval_is_null(col, inverted),
                 self.eval_eq(col, val, !inverted),
             ];
-            self.finish_eval_variadic(VariadicOperator::Or, args, inverted)
+            self.finish_eval_junction(JunctionOperator::Or, args, inverted)
         }
     }
 
@@ -206,15 +211,15 @@ pub(crate) trait KernelPredicateEvaluator {
         }
     }
 
-    /// Dispatches a variadic operation, leveraging each implementation's [`finish_eval_variadic`].
-    fn eval_variadic(
+    /// Dispatches a junction operation, leveraging each implementation's [`finish_eval_junction`].
+    fn eval_junction(
         &self,
-        op: VariadicOperator,
+        op: JunctionOperator,
         exprs: &[Expr],
         inverted: bool,
     ) -> Option<Self::Output> {
         let exprs = exprs.iter().map(|expr| self.eval_expr(expr, inverted));
-        self.finish_eval_variadic(op, exprs, inverted)
+        self.finish_eval_junction(op, exprs, inverted)
     }
 
     /// Dispatches an expression to the specific implementation for each expression variant.
@@ -230,7 +235,7 @@ pub(crate) trait KernelPredicateEvaluator {
             Binary(BinaryExpression { op, left, right }) => {
                 self.eval_binary(*op, left, right, inverted)
             }
-            Variadic(VariadicExpression { op, exprs }) => self.eval_variadic(*op, exprs, inverted),
+            Junction(JunctionExpression { op, exprs }) => self.eval_junction(*op, exprs, inverted),
         }
     }
 
@@ -339,13 +344,12 @@ pub(crate) trait KernelPredicateEvaluator {
     fn eval_expr_sql_where(&self, filter: &Expr, inverted: bool) -> Option<Self::Output> {
         use Expr::*;
         match filter {
-            Variadic(v) => {
+            Junction(JunctionExpression { op, exprs }) => {
                 // Recursively invoke `eval_expr_sql_where` instead of the usual `eval_expr` for AND/OR.
-                let exprs = v
-                    .exprs
+                let exprs = exprs
                     .iter()
                     .map(|expr| self.eval_expr_sql_where(expr, inverted));
-                self.finish_eval_variadic(v.op, exprs, inverted)
+                self.finish_eval_junction(*op, exprs, inverted)
             }
             Binary(BinaryExpression { op, left, right }) if op.is_null_intolerant_comparison() => {
                 // Perform a nullsafe comparison instead of the usual `eval_binary`
@@ -354,7 +358,7 @@ pub(crate) trait KernelPredicateEvaluator {
                     self.eval_unary(UnaryOperator::IsNull, right, true),
                     self.eval_binary(*op, left, right, inverted),
                 ];
-                self.finish_eval_variadic(VariadicOperator::And, exprs, false)
+                self.finish_eval_junction(JunctionOperator::And, exprs, false)
             }
             Unary(UnaryExpression {
                 op: UnaryOperator::Not,
@@ -366,7 +370,7 @@ pub(crate) trait KernelPredicateEvaluator {
                     self.eval_unary(UnaryOperator::IsNull, filter, true),
                     self.eval_column(col, inverted),
                 ];
-                self.finish_eval_variadic(VariadicOperator::And, exprs, false)
+                self.finish_eval_junction(JunctionOperator::And, exprs, false)
             }
             Literal(val) if val.is_null() => {
                 // AND(NULL IS NOT NULL, NULL) = AND(FALSE, NULL) = FALSE
@@ -460,22 +464,22 @@ impl KernelPredicateEvaluatorDefaults {
         }
     }
 
-    /// Finishes evaluating a (possibly inverted) variadic operation. See
-    /// [`KernelPredicateEvaluator::finish_eval_variadic`].
+    /// Finishes evaluating a (possibly inverted) junction operation. See
+    /// [`KernelPredicateEvaluator::finish_eval_junction`].
     ///
     /// The inputs were already inverted by the caller, if needed.
     ///
     /// With AND (OR), any FALSE (TRUE) input dominates, forcing a FALSE (TRUE) output.  If there
     /// was no dominating input, then any NULL input forces NULL output.  Otherwise, return the
     /// non-dominant value. Inverting the operation also inverts the dominant value.
-    pub(crate) fn finish_eval_variadic(
-        op: VariadicOperator,
+    pub(crate) fn finish_eval_junction(
+        op: JunctionOperator,
         exprs: impl IntoIterator<Item = Option<bool>>,
         inverted: bool,
     ) -> Option<bool> {
         let dominator = match op {
-            VariadicOperator::And => inverted,
-            VariadicOperator::Or => !inverted,
+            JunctionOperator::And => inverted,
+            JunctionOperator::Or => !inverted,
         };
         let result = exprs.into_iter().try_fold(false, |found_null, val| {
             match val {
@@ -596,13 +600,13 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
         self.eval_binary_scalars(op, &left, &right, inverted)
     }
 
-    fn finish_eval_variadic(
+    fn finish_eval_junction(
         &self,
-        op: VariadicOperator,
+        op: JunctionOperator,
         exprs: impl IntoIterator<Item = Option<bool>>,
         inverted: bool,
     ) -> Option<bool> {
-        KernelPredicateEvaluatorDefaults::finish_eval_variadic(op, exprs, inverted)
+        KernelPredicateEvaluatorDefaults::finish_eval_junction(op, exprs, inverted)
     }
 }
 
@@ -654,10 +658,10 @@ pub(crate) trait DataSkippingPredicateEvaluator {
         inverted: bool,
     ) -> Option<Self::Output>;
 
-    /// See [`KernelPredicateEvaluator::finish_eval_variadic`]
-    fn finish_eval_variadic(
+    /// See [`KernelPredicateEvaluator::finish_eval_junction`]
+    fn finish_eval_junction(
         &self,
-        op: VariadicOperator,
+        op: JunctionOperator,
         exprs: impl IntoIterator<Item = Option<Self::Output>>,
         inverted: bool,
     ) -> Option<Self::Output>;
@@ -750,16 +754,16 @@ pub(crate) trait DataSkippingPredicateEvaluator {
                 self.partial_cmp_min_stat(col, val, Ordering::Equal, true),
                 self.partial_cmp_max_stat(col, val, Ordering::Equal, true),
             ];
-            (VariadicOperator::Or, exprs)
+            (JunctionOperator::Or, exprs)
         } else {
             // Column could compare equal if its min/max values bracket the literal.
             let exprs = [
                 self.partial_cmp_min_stat(col, val, Ordering::Greater, true),
                 self.partial_cmp_max_stat(col, val, Ordering::Less, true),
             ];
-            (VariadicOperator::And, exprs)
+            (JunctionOperator::And, exprs)
         };
-        self.finish_eval_variadic(op, exprs, false)
+        self.finish_eval_junction(op, exprs, false)
     }
 }
 
@@ -810,12 +814,12 @@ impl<T: DataSkippingPredicateEvaluator> KernelPredicateEvaluator for T {
         None // Unsupported
     }
 
-    fn finish_eval_variadic(
+    fn finish_eval_junction(
         &self,
-        op: VariadicOperator,
+        op: JunctionOperator,
         exprs: impl IntoIterator<Item = Option<Self::Output>>,
         inverted: bool,
     ) -> Option<Self::Output> {
-        self.finish_eval_variadic(op, exprs, inverted)
+        self.finish_eval_junction(op, exprs, inverted)
     }
 }
