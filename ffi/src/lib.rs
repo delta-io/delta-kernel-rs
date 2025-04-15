@@ -732,10 +732,8 @@ impl<T> ReferenceSet<T> {
         Default::default()
     }
 
-    // Inserts a new value into the set. This always creates a new entry
-    // because the new value cannot have the same address as any existing value.
-    // Returns a raw pointer to the value. This pointer serves as a key that
-    // can be used later to take() from the set, and should NOT be dereferenced.
+    // Inserts a new value into the set, returning an identifier for the value that can be used
+    // later to take() from the set.
     pub fn insert(&mut self, value: T) -> usize {
         let id = self.next_id;
         self.next_id += 1;
