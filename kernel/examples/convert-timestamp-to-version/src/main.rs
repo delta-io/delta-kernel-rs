@@ -1,13 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
 use clap::Parser;
-use delta_kernel::arrow::array::RecordBatch;
-use delta_kernel::arrow::{compute::filter_record_batch, util::pretty::print_batches};
-use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::{DeltaResult, Table};
-use itertools::Itertools;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -31,18 +27,14 @@ fn main() -> DeltaResult<()> {
         options,
         Arc::new(TokioBackgroundExecutor::new()),
     )?);
-    if let Some(end) = cli.end_timestamp {
-        let ver = table.timestamp_range_to_versions(engine.as_ref(), cli.start_timestamp, end)?;
-        println!(
-            "For start, end timestmaps ({},{}): the version is: {:?}",
-            cli.start_timestamp, end, ver
-        );
-    } else {
-        let ver = table.timestamp_to_version(engine.as_ref(), cli.start_timestamp)?;
-        println!(
-            "For timestmap {}, the version is: {:?}",
-            cli.start_timestamp, ver
-        );
-    }
+    let (start, end) = table.timestamp_range_to_versions(
+        engine.as_ref(),
+        cli.start_timestamp,
+        cli.end_timestamp,
+    )?;
+    println!(
+        "For start, end timestmaps ({},{:?}): the version is: ({:?}, {:?})",
+        cli.start_timestamp, cli.end_timestamp, start, end
+    );
     Ok(())
 }

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use url::Url;
 
-use crate::history_manager::LogTimeConverter;
+use crate::history_manager::{Bound, LogTimeConverter};
 use crate::snapshot::Snapshot;
 use crate::table_changes::TableChanges;
 use crate::transaction::Transaction;
@@ -86,28 +86,39 @@ impl Table {
         &self,
         engine: &dyn Engine,
         timestamp: i64,
-    ) -> DeltaResult<Option<Version>> {
-        let history = LogTimeConverter::new(self.location.clone(), timestamp);
-        let Some(range) = history.convert(engine)? else {
-            return Ok(None);
-        };
-        debug_assert!(range.start_timestamp >= timestamp);
-        Ok(Some(range.start_version))
+    ) -> DeltaResult<Version> {
+        LogTimeConverter::convert(
+            engine,
+            self.location.clone(),
+            timestamp,
+            Bound::GreatestLower,
+        )
     }
 
     pub fn timestamp_range_to_versions(
         &self,
         engine: &dyn Engine,
         start_timestamp: i64,
-        end_timestamp: i64,
-    ) -> DeltaResult<Option<(Version, Version)>> {
-        let history =
-            LogTimeConverter::new_range(self.location.clone(), start_timestamp, end_timestamp);
-        let Some(range) = history.convert(engine)? else {
-            return Ok(None);
+        end_timestamp: Option<i64>,
+    ) -> DeltaResult<(Version, Option<Version>)> {
+        let start = LogTimeConverter::convert(
+            engine,
+            self.location.clone(),
+            start_timestamp,
+            Bound::GreatestLower,
+        )?;
+        let end = if let Some(end) = end_timestamp {
+            let end_version =
+                LogTimeConverter::convert(engine, self.location.clone(), end, Bound::LeastUpper)?;
+            if start > end_version {
+                return Err(Error::generic("No commits found in range"));
+            }
+            Some(end_version)
+        } else {
+            None
         };
-        debug_assert!(range.start_timestamp >= start_timestamp);
-        Ok(Some((range.start_version, range.end_version.unwrap())))
+
+        Ok((start, end))
     }
 
     /// Create a [`TableChanges`] to get a change data feed for the table between `start_version`,
@@ -125,6 +136,20 @@ impl Table {
             start_version,
             end_version.into(),
         )
+    }
+
+    /// Create a [`TableChanges`] to get a change data feed for the table between `start_timestamp`,
+    /// and `end_timestamp`. If no `end_timestamp` is supplied, the latest timestamp will be used as the
+    /// `end_timestamp`.
+    pub fn table_changes_with_timestamp(
+        &self,
+        engine: &dyn Engine,
+        start_timestamp: i64,
+        end_timestamp: Option<i64>,
+    ) -> DeltaResult<TableChanges> {
+        let (start, end) =
+            self.timestamp_range_to_versions(engine, start_timestamp, end_timestamp)?;
+        TableChanges::try_new(self.location.clone(), engine, start, end)
     }
 
     /// Create a new write transaction for this table.
