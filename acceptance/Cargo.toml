@@ -17,7 +17,7 @@ release = false
 delta_kernel = { path = "../kernel", features = [
   "default-engine",
   "arrow_53",
-  "developer-visibility",
+  "internal-api",
 ] }
 futures = "0.3"
 itertools = "0.14"

@@ -230,7 +230,7 @@ impl ParquetStatsProvider for NullCountTestFilter {
 fn test_eval_is_null() {
     let expressions = [
         Expr::is_null(column_expr!("x")),
-        !Expr::is_null(column_expr!("x")),
+        Expr::is_not_null(column_expr!("x")),
     ];
 
     let do_test = |nullcount: i64, expected: &[Option<bool>]| {

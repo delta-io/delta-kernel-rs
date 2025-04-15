@@ -22,7 +22,7 @@ tracing-core = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [ "json" ] }
 url = "2"
 delta_kernel = { path = "../kernel", default-features = false, features = [
-  "developer-visibility",
+  "internal-api",
 ] }
 delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.9.0" }
 
@@ -43,5 +43,5 @@ cloud = ["delta_kernel/cloud"]
 default-engine = ["delta_kernel/default-engine", "delta_kernel/arrow"]
 tracing = [ "tracing-core", "tracing-subscriber" ]
 sync-engine = ["delta_kernel/sync-engine", "delta_kernel/arrow"]
-developer-visibility = []
+internal-api = []
 test-ffi = []

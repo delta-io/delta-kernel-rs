@@ -93,19 +93,19 @@ pub(crate) mod kernel_predicates;
 pub mod parquet;
 pub(crate) mod utils;
 
-#[cfg(feature = "developer-visibility")]
+#[cfg(feature = "internal-api")]
 pub mod path;
-#[cfg(not(feature = "developer-visibility"))]
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod path;
 
-#[cfg(feature = "developer-visibility")]
+#[cfg(feature = "internal-api")]
 pub mod log_replay;
-#[cfg(not(feature = "developer-visibility"))]
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod log_replay;
 
-#[cfg(feature = "developer-visibility")]
+#[cfg(feature = "internal-api")]
 pub mod log_segment;
-#[cfg(not(feature = "developer-visibility"))]
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod log_segment;
 
 pub use delta_kernel_derive;

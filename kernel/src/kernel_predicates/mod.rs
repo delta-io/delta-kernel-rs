@@ -118,10 +118,15 @@ pub(crate) trait KernelPredicateEvaluator {
         self.eval_eq(col, &Scalar::from(inverted), true)
     }
 
+    /// Dispatches a (possibly inverted) NOT expression
+    fn eval_not(&self, expr: &Expr, inverted: bool) -> Option<Self::Output> {
+        self.eval_expr(expr, !inverted)
+    }
+
     /// Dispatches a (possibly inverted) unary expression to each operator's specific implementation.
     fn eval_unary(&self, op: UnaryOperator, expr: &Expr, inverted: bool) -> Option<Self::Output> {
         match op {
-            UnaryOperator::Not => self.eval_expr(expr, !inverted),
+            UnaryOperator::Not => self.eval_not(expr, inverted),
             UnaryOperator::IsNull => match expr {
                 // WARNING: Only literals and columns can be safely null-checked. Attempting to
                 // null-check an expressions such as `a < 10` could wrongly produce FALSE in case
