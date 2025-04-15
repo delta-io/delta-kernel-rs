@@ -761,12 +761,11 @@ mod tests {
         let store = Arc::new(InMemory::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let handler = DefaultJsonHandler::new(store.clone(), executor);
-        let path = Url::parse("memory:///test/data/00000000000000000001.json").unwrap();
+        let path = Url::parse("memory:///test/data/00000000000000000001.json")?;
         let object_path = Path::from("/test/data/00000000000000000001.json");
 
-        let data = create_test_data(vec!["remi", "wilson"])?;
-
         // First write with overwrite=false & no existing file
+        let data = create_test_data(vec!["remi", "wilson"])?;
         let result = handler.write_json_file(&path, Box::new(std::iter::once(Ok(data))), false);
 
         // Verify the first write is successful
@@ -774,9 +773,8 @@ mod tests {
         let json = read_json_file(&store, &object_path).await?;
         assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
 
-        let data = create_test_data(vec!["check", "error"])?;
-
         // Second write with overwrite=false & existing file
+        let data = create_test_data(vec!["check", "error"])?;
         let result = handler.write_json_file(&path, Box::new(std::iter::once(Ok(data))), false);
 
         // Verify the second write fails with FileAlreadyExists error
@@ -795,26 +793,23 @@ mod tests {
         let store = Arc::new(InMemory::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let handler = DefaultJsonHandler::new(store.clone(), executor);
-        let path = Url::parse("memory:///test/data/00000000000000000001.json").unwrap();
+        let path = Url::parse("memory:///test/data/00000000000000000001.json")?;
         let object_path = Path::from("/test/data/00000000000000000001.json");
 
-        let first_batch = create_test_data(vec!["remi", "wilson"])?;
-
         // First write with overwrite=true & no existing file
-        let result =
-            handler.write_json_file(&path, Box::new(std::iter::once(Ok(first_batch))), true);
-        assert!(result.is_ok());
+        let data = create_test_data(vec!["remi", "wilson"])?;
+        let result = handler.write_json_file(&path, Box::new(std::iter::once(Ok(data))), true);
 
         // Verify the first write is successful
+        assert!(result.is_ok());
         let json = read_json_file(&store, &object_path).await?;
         assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
 
         // Second write with overwrite=true & existing file
-        let second_batch = create_test_data(vec!["seb", "tia"])?;
+        let data = create_test_data(vec!["seb", "tia"])?;
+        let result = handler.write_json_file(&path, Box::new(std::iter::once(Ok(data))), true);
 
         // Verify the second write is successful
-        let result =
-            handler.write_json_file(&path, Box::new(std::iter::once(Ok(second_batch))), true);
         assert!(result.is_ok());
         let json = read_json_file(&store, &object_path).await?;
         assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
