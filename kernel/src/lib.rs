@@ -123,7 +123,7 @@ macro_rules! internal_mod {
         compile_error!("internal_mod!: module is already public");
     };
 
-    ($vis:vis mod $name:ident $(;)?) => {
+    ($vis:vis mod $name:ident) => {
         #[cfg(feature = "internal-api")]
         pub mod $name;
 

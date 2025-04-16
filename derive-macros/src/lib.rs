@@ -165,14 +165,13 @@ pub fn internal_api(
 fn make_public(mut item: Item) -> Item {
     fn set_pub(vis: &mut Visibility) -> Result<(), syn::Error> {
         if matches!(vis, Visibility::Public(_)) {
-            Err(Error::new(
+            return Err(Error::new(
                 vis.span(),
                 "ineligible for #[internal_api]: item is already public",
-            ))
-        } else {
-            *vis = syn::parse_quote!(pub);
-            Ok(())
+            ));
         }
+        *vis = syn::parse_quote!(pub);
+        Ok(())
     }
 
     let result = match &mut item {
