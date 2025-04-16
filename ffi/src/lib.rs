@@ -49,8 +49,8 @@ pub(crate) type NullableCvoid = Option<NonNull<c_void>>;
 /// the engine functions. The engine retains ownership of the iterator.
 #[repr(C)]
 pub struct EngineIterator {
-    // Opaque data that will be iterated over. This data will be passed to the get_next function
-    // each time a next item is requested from the iterator
+    /// Opaque data that will be iterated over. This data will be passed to the get_next function
+    /// each time a next item is requested from the iterator
     data: NonNull<c_void>,
     /// A function that should advance the iterator and return the next time from the data
     /// If the iterator is complete, it should return null. It should be safe to
@@ -721,21 +721,20 @@ pub unsafe extern "C" fn free_string_slice_data(data: Handle<StringSliceIterator
     data.drop_handle();
 }
 
-// A set that can identify its contents by address
+/// A set that can identify its contents by address
 pub struct ReferenceSet<T> {
     map: std::collections::HashMap<usize, T>,
     next_id: usize,
 }
 
 impl<T> ReferenceSet<T> {
+    /// Creates a new empty set.
     pub fn new() -> Self {
         Default::default()
     }
 
-    // Inserts a new value into the set. This always creates a new entry
-    // because the new value cannot have the same address as any existing value.
-    // Returns a raw pointer to the value. This pointer serves as a key that
-    // can be used later to take() from the set, and should NOT be dereferenced.
+    /// Inserts a new value into the set, returning an identifier for the value that can be used
+    /// later to take() from the set.
     pub fn insert(&mut self, value: T) -> usize {
         let id = self.next_id;
         self.next_id += 1;
@@ -743,17 +742,17 @@ impl<T> ReferenceSet<T> {
         id
     }
 
-    // Attempts to remove a value from the set, if present.
+    /// Attempts to remove a value from the set, if present.
     pub fn take(&mut self, i: usize) -> Option<T> {
         self.map.remove(&i)
     }
 
-    // True if the set contains an object whose address matches the pointer.
+    /// True if the set contains an object whose address matches the pointer.
     pub fn contains(&self, id: usize) -> bool {
         self.map.contains_key(&id)
     }
 
-    // The current size of the set.
+    /// The current size of the set.
     pub fn len(&self) -> usize {
         self.map.len()
     }

@@ -14,8 +14,8 @@ use crate::arrow::error::ArrowError;
 use crate::engine::arrow_utils::prim_array_cmp;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
-    BinaryExpression, BinaryOperator, Expression, Scalar, UnaryExpression, UnaryOperator,
-    VariadicExpression, VariadicOperator,
+    BinaryExpression, BinaryOperator, Expression, JunctionExpression, JunctionOperator, Scalar,
+    UnaryExpression, UnaryOperator,
 };
 use crate::schema::DataType;
 use itertools::Itertools;
@@ -117,10 +117,11 @@ pub(crate) fn evaluate_expression(
         )),
         (Unary(UnaryExpression { op, expr }), _) => {
             let arr = evaluate_expression(expr.as_ref(), batch, None)?;
-            Ok(match op {
-                UnaryOperator::Not => Arc::new(not(downcast_to_bool(&arr)?)?),
-                UnaryOperator::IsNull => Arc::new(is_null(&arr)?),
-            })
+            let result = match op {
+                UnaryOperator::Not => not(downcast_to_bool(&arr)?)?,
+                UnaryOperator::IsNull => is_null(&arr)?,
+            };
+            Ok(Arc::new(result))
         }
         (
             Binary(BinaryExpression {
@@ -135,9 +136,8 @@ pub(crate) fn evaluate_expression(
                 let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
                 if let Some(string_arr) = left_arr.as_string_opt::<i32>() {
                     if let Some(right_arr) = right_arr.as_list_opt::<i32>() {
-                        return in_list_utf8(string_arr, right_arr)
-                            .map(wrap_comparison_result)
-                            .map_err(Error::generic_err);
+                        let result = in_list_utf8(string_arr, right_arr)?;
+                        return Ok(wrap_comparison_result(result));
                     }
                 }
                 prim_array_cmp! {
@@ -193,9 +193,8 @@ pub(crate) fn evaluate_expression(
         ) => {
             let reverse_op = Expression::binary(In, *left.clone(), *right.clone());
             let reverse_expr = evaluate_expression(&reverse_op, batch, None)?;
-            not(reverse_expr.as_boolean())
-                .map(wrap_comparison_result)
-                .map_err(Error::generic_err)
+            let result = not(reverse_expr.as_boolean())?;
+            Ok(wrap_comparison_result(result))
         }
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
@@ -218,30 +217,27 @@ pub(crate) fn evaluate_expression(
                 In | NotIn => return Err(Error::generic("Invalid expression given")),
             };
 
-            eval(&left_arr, &right_arr).map_err(Error::generic_err)
+            Ok(eval(&left_arr, &right_arr)?)
         }
-        (Variadic(VariadicExpression { op, exprs }), None | Some(&DataType::BOOLEAN)) => {
+        (Junction(JunctionExpression { op, exprs }), None | Some(&DataType::BOOLEAN)) => {
             type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
             let (reducer, default): (Operation, _) = match op {
-                VariadicOperator::And => (and_kleene, true),
-                VariadicOperator::Or => (or_kleene, false),
+                JunctionOperator::And => (and_kleene, true),
+                JunctionOperator::Or => (or_kleene, false),
             };
             exprs
                 .iter()
                 .map(|expr| evaluate_expression(expr, batch, result_type))
                 .reduce(|l, r| {
-                    Ok(reducer(downcast_to_bool(&l?)?, downcast_to_bool(&r?)?)
-                        .map(wrap_comparison_result)?)
+                    let result = reducer(downcast_to_bool(&l?)?, downcast_to_bool(&r?)?)?;
+                    Ok(wrap_comparison_result(result))
                 })
                 .unwrap_or_else(|| {
                     evaluate_expression(&Expression::literal(default), batch, result_type)
                 })
         }
-        (Variadic(_), _) => {
-            // NOTE: Update this error message if we add support for variadic operations on other types
-            Err(Error::Generic(format!(
-                "Variadic {expression:?} is expected to return boolean results, got {result_type:?}"
-            )))
-        }
+        (Junction(_), _) => Err(Error::Generic(format!(
+            "Junction {expression:?} is expected to return boolean results, got {result_type:?}"
+        ))),
     }
 }
