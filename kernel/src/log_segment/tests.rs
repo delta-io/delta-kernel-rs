@@ -25,7 +25,7 @@ use crate::scan::test_utils::{
 use crate::snapshot::LastCheckpointHint;
 use crate::utils::test_utils::{assert_batch_matches, Action};
 use crate::{
-    DeltaResult, Engine, EngineData, Expression, ExpressionRef, FileMeta, RowVisitor,
+    DeltaResult, Engine as _, EngineData, Expression, ExpressionRef, FileMeta, RowVisitor,
     StorageHandler, Table,
 };
 use test_utils::delta_path_for_version;

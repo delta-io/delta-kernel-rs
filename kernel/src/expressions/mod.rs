@@ -94,23 +94,24 @@ impl JunctionOperator {
 
 impl Display for BinaryOperator {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use BinaryOperator::*;
         match self {
-            Self::Plus => write!(f, "+"),
-            Self::Minus => write!(f, "-"),
-            Self::Multiply => write!(f, "*"),
-            Self::Divide => write!(f, "/"),
-            Self::LessThan => write!(f, "<"),
-            Self::LessThanOrEqual => write!(f, "<="),
-            Self::GreaterThan => write!(f, ">"),
-            Self::GreaterThanOrEqual => write!(f, ">="),
-            Self::Equal => write!(f, "="),
-            Self::NotEqual => write!(f, "!="),
+            Plus => write!(f, "+"),
+            Minus => write!(f, "-"),
+            Multiply => write!(f, "*"),
+            Divide => write!(f, "/"),
+            LessThan => write!(f, "<"),
+            LessThanOrEqual => write!(f, "<="),
+            GreaterThan => write!(f, ">"),
+            GreaterThanOrEqual => write!(f, ">="),
+            Equal => write!(f, "="),
+            NotEqual => write!(f, "!="),
             // TODO(roeap): AFAIK DISTINCT does not have a commonly used operator symbol
             // so ideally this would not be used as we use Display for rendering expressions
             // in our code we take care of this, but theirs might not ...
-            Self::Distinct => write!(f, "DISTINCT"),
-            Self::In => write!(f, "IN"),
-            Self::NotIn => write!(f, "NOT IN"),
+            Distinct => write!(f, "DISTINCT"),
+            In => write!(f, "IN"),
+            NotIn => write!(f, "NOT IN"),
         }
     }
 }
@@ -206,25 +207,26 @@ impl From<ColumnName> for Expression {
 
 impl Display for Expression {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use Expression::*;
         match self {
-            Self::Literal(l) => write!(f, "{l}"),
-            Self::Column(name) => write!(f, "Column({name})"),
-            Self::Struct(exprs) => write!(
+            Literal(l) => write!(f, "{l}"),
+            Column(name) => write!(f, "Column({name})"),
+            Struct(exprs) => write!(
                 f,
                 "Struct({})",
                 &exprs.iter().map(|e| format!("{e}")).join(", ")
             ),
-            Self::Binary(BinaryExpression {
+            Binary(BinaryExpression {
                 op: BinaryOperator::Distinct,
                 left,
                 right,
             }) => write!(f, "DISTINCT({left}, {right})"),
-            Self::Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
-            Self::Unary(UnaryExpression { op, expr }) => match op {
+            Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
+            Unary(UnaryExpression { op, expr }) => match op {
                 UnaryOperator::Not => write!(f, "NOT {expr}"),
                 UnaryOperator::IsNull => write!(f, "{expr} IS NULL"),
             },
-            Self::Junction(JunctionExpression { op, exprs }) => {
+            Junction(JunctionExpression { op, exprs }) => {
                 let exprs = &exprs.iter().map(|e| format!("{e}")).join(", ");
                 let op = match op {
                     JunctionOperator::And => "AND",
@@ -257,6 +259,7 @@ impl Expression {
         Self::Literal(value.into())
     }
 
+    /// Creates a NULL literal expression
     pub const fn null_literal(data_type: DataType) -> Self {
         Self::Literal(Scalar::Null(data_type))
     }
@@ -268,10 +271,8 @@ impl Expression {
 
     /// Creates a new unary expression OP expr
     pub fn unary(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
-        Self::Unary(UnaryExpression {
-            op,
-            expr: Box::new(expr.into()),
-        })
+        let expr = Box::new(expr.into());
+        Self::Unary(UnaryExpression { op, expr })
     }
 
     /// Creates a new binary expression lhs OP rhs
@@ -289,7 +290,7 @@ impl Expression {
 
     /// Creates a new junction expression OP(exprs...)
     pub fn junction(op: JunctionOperator, exprs: impl IntoIterator<Item = Self>) -> Self {
-        let exprs = exprs.into_iter().collect::<Vec<_>>();
+        let exprs = exprs.into_iter().collect();
         Self::Junction(JunctionExpression { op, exprs })
     }
 

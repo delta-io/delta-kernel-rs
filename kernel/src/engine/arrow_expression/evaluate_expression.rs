@@ -117,10 +117,11 @@ pub(crate) fn evaluate_expression(
         )),
         (Unary(UnaryExpression { op, expr }), _) => {
             let arr = evaluate_expression(expr.as_ref(), batch, None)?;
-            Ok(match op {
-                UnaryOperator::Not => Arc::new(not(downcast_to_bool(&arr)?)?),
-                UnaryOperator::IsNull => Arc::new(is_null(&arr)?),
-            })
+            let result = match op {
+                UnaryOperator::Not => not(downcast_to_bool(&arr)?)?,
+                UnaryOperator::IsNull => is_null(&arr)?,
+            };
+            Ok(Arc::new(result))
         }
         (
             Binary(BinaryExpression {
@@ -135,9 +136,8 @@ pub(crate) fn evaluate_expression(
                 let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
                 if let Some(string_arr) = left_arr.as_string_opt::<i32>() {
                     if let Some(right_arr) = right_arr.as_list_opt::<i32>() {
-                        return in_list_utf8(string_arr, right_arr)
-                            .map(wrap_comparison_result)
-                            .map_err(Error::generic_err);
+                        let result = in_list_utf8(string_arr, right_arr)?;
+                        return Ok(wrap_comparison_result(result));
                     }
                 }
                 prim_array_cmp! {
@@ -193,9 +193,8 @@ pub(crate) fn evaluate_expression(
         ) => {
             let reverse_op = Expression::binary(In, *left.clone(), *right.clone());
             let reverse_expr = evaluate_expression(&reverse_op, batch, None)?;
-            not(reverse_expr.as_boolean())
-                .map(wrap_comparison_result)
-                .map_err(Error::generic_err)
+            let result = not(reverse_expr.as_boolean())?;
+            Ok(wrap_comparison_result(result))
         }
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
@@ -218,7 +217,7 @@ pub(crate) fn evaluate_expression(
                 In | NotIn => return Err(Error::generic("Invalid expression given")),
             };
 
-            eval(&left_arr, &right_arr).map_err(Error::generic_err)
+            Ok(eval(&left_arr, &right_arr)?)
         }
         (Junction(JunctionExpression { op, exprs }), None | Some(&DataType::BOOLEAN)) => {
             type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
@@ -230,8 +229,8 @@ pub(crate) fn evaluate_expression(
                 .iter()
                 .map(|expr| evaluate_expression(expr, batch, result_type))
                 .reduce(|l, r| {
-                    Ok(reducer(downcast_to_bool(&l?)?, downcast_to_bool(&r?)?)
-                        .map(wrap_comparison_result)?)
+                    let result = reducer(downcast_to_bool(&l?)?, downcast_to_bool(&r?)?)?;
+                    Ok(wrap_comparison_result(result))
                 })
                 .unwrap_or_else(|| {
                     evaluate_expression(&Expression::literal(default), batch, result_type)
