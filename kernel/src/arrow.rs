@@ -1,7 +1,6 @@
 //! This module exists to help re-export the version of arrow used by default-engine and other
 //! parts of kernel that need arrow
 
-#[cfg(all(feature = "arrow_55"))]
 pub use arrow_55::*;
 
 // if nothing is enabled but we need arrow because of some other feature flag, default to lowest

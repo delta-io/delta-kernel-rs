@@ -371,7 +371,7 @@ async fn get_and_check_all_parquet_sizes(store: Arc<dyn ObjectStore>, path: &str
     assert!(parquet_files
         .iter()
         .all(|f| f.as_ref().unwrap().size == size));
-    size.try_into().unwrap()
+    size
 }
 
 #[tokio::test]

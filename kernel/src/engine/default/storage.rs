@@ -22,8 +22,8 @@ where
 
 #[cfg(feature = "cloud")]
 pub fn parse_url_opts_hdfs_native<I, K, V>(
-    url: &Url,
-    options: I,
+    _url: &Url,
+    _options: I,
 ) -> Result<(Box<dyn ObjectStore>, Path), Error>
 where
     I: IntoIterator<Item = (K, V)>,
