@@ -75,7 +75,6 @@ impl SetTransactionScanner {
     }
 
     /// Scan the Delta Log to obtain the latest transaction for all applications
-    #[allow(unused)]
     pub(crate) fn application_transactions(
         &self,
         engine: &dyn Engine,
