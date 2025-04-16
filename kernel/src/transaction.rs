@@ -725,7 +725,4 @@ mod tests {
         ]);
         assert_eq!(*schema, expected.into());
     }
-
-    #[test]
-    fn test_idempotent_writes() {}
 }
