@@ -55,9 +55,6 @@ z85 = "3.0.6"
 # bring in our derive macros
 delta_kernel_derive = { path = "../derive-macros", version = "0.9.0" }
 
-# used for `internal-api` feature flag
-visibility = "0.1.1"
-
 # Used in the sync engine
 tempfile = { version = "3", optional = true }
 

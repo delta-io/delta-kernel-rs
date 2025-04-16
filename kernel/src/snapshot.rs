@@ -1,10 +1,7 @@
 //! In-memory representation of snapshots of tables (snapshot is a table at given point in time, it
 //! has schema etc.)
 
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, warn};
-use url::Url;
 
 use crate::actions::{Metadata, Protocol};
 use crate::log_segment::{self, LogSegment};
@@ -14,6 +11,11 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, Error, StorageHandler, Version};
+use delta_kernel_derive::internal_api;
+
+use serde::{Deserialize, Serialize};
+use tracing::{debug, warn};
+use url::Url;
 
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 // TODO expose methods for accessing the files of a table (with file pruning).
@@ -242,7 +244,7 @@ impl Snapshot {
     }
 
     /// Log segment this snapshot uses
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn log_segment(&self) -> &LogSegment {
         &self.log_segment
     }
@@ -262,14 +264,14 @@ impl Snapshot {
     }
 
     /// Table [`Metadata`] at this `Snapshot`s version.
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn metadata(&self) -> &Metadata {
         self.table_configuration.metadata()
     }
 
     /// Table [`Protocol`] at this `Snapshot`s version.
     #[allow(dead_code)]
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn protocol(&self) -> &Protocol {
         self.table_configuration.protocol()
     }
@@ -278,11 +280,13 @@ impl Snapshot {
     pub fn table_properties(&self) -> &TableProperties {
         self.table_configuration().table_properties()
     }
+
     /// Get the [`TableConfiguration`] for this [`Snapshot`].
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn table_configuration(&self) -> &TableConfiguration {
         &self.table_configuration
     }
+
     /// Get the [column mapping
     /// mode](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping) at this
     /// `Snapshot`s version.
@@ -304,7 +308,7 @@ impl Snapshot {
 // Note: Schema can not be derived because the checkpoint schema is only known at runtime.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "internal-api", visibility::make(pub))]
+#[internal_api]
 pub(crate) struct LastCheckpointHint {
     /// The version of the table when the last checkpoint was made.
     #[allow(unreachable_pub)] // used by acceptance tests (TODO make an fn accessor?)

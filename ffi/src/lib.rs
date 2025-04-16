@@ -137,7 +137,7 @@ macro_rules! kernel_string_slice {
         //
         // NOTE: The `do_it` wrapper avoids an "unnecessary `unsafe` block" clippy warning in case
         // the invocation site of this macro is already in an `unsafe` block. We can't just disable
-        // the warning with #[allow(unused_unsafe)] because expression annotation is internal-api rust.
+        // the warning with #[allow(unused_unsafe)] because expression annotation is unstable rust.
         fn do_it(s: &str) -> $crate::KernelStringSlice {
             unsafe { $crate::KernelStringSlice::new_unsafe(s) }
         }

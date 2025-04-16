@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
+use delta_kernel_derive::internal_api;
 
 pub(crate) mod compare;
 
@@ -307,7 +308,7 @@ impl StructType {
     ///
     /// NOTE: This method only traverses through `StructType` fields; `MapType` and `ArrayType`
     /// fields are considered leaves even if they contain `StructType` entries/elements.
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn leaves<'s>(&self, own_name: impl Into<Option<&'s str>>) -> ColumnNamesAndTypes {
         let mut get_leaves = GetSchemaLeaves::new(own_name.into());
         let _ = get_leaves.transform_struct(self);
@@ -344,11 +345,11 @@ impl InvariantChecker {
 }
 
 /// Helper for RowVisitor implementations
-#[cfg_attr(feature = "internal-api", visibility::make(pub))]
+#[internal_api]
 #[derive(Clone, Default)]
 pub(crate) struct ColumnNamesAndTypes(Vec<ColumnName>, Vec<DataType>);
 impl ColumnNamesAndTypes {
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn as_ref(&self) -> (&[ColumnName], &[DataType]) {
         (&self.0, &self.1)
     }

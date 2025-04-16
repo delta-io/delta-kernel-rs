@@ -1,10 +1,12 @@
 //! Utilities to make working with directory and file paths easier
 
 use std::str::FromStr;
-use url::Url;
-use uuid::Uuid;
 
 use crate::{DeltaResult, Error, FileMeta, Version};
+use delta_kernel_derive::internal_api;
+
+use url::Url;
+use uuid::Uuid;
 
 /// How many characters a version tag has
 const VERSION_LEN: usize = 20;
@@ -16,7 +18,7 @@ const MULTIPART_PART_LEN: usize = 10;
 const UUID_PART_LEN: usize = 36;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "internal-api", visibility::make(pub))]
+#[internal_api]
 pub(crate) enum LogPathFileType {
     Commit,
     SinglePartCheckpoint,
@@ -38,7 +40,7 @@ pub(crate) enum LogPathFileType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "internal-api", visibility::make(pub))]
+#[internal_api]
 pub(crate) struct ParsedLogPath<Location: AsUrl = FileMeta> {
     pub location: Location,
     #[allow(unused)]
@@ -60,7 +62,7 @@ fn parse_path_part<T: FromStr>(value: &str, expect_len: usize, location: &Url) -
 
 // We normally construct ParsedLogPath from FileMeta, but in testing it's convenient to use
 // a Url directly instead. This trait decouples the two.
-#[cfg_attr(feature = "internal-api", visibility::make(pub))]
+#[internal_api]
 pub(crate) trait AsUrl {
     fn as_url(&self) -> &Url;
 }
@@ -79,7 +81,7 @@ impl AsUrl for Url {
 
 impl<Location: AsUrl> ParsedLogPath<Location> {
     // NOTE: We can't actually impl TryFrom because Option<T> is a foreign struct even if T is local.
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn try_from(location: Location) -> DeltaResult<Option<ParsedLogPath<Location>>> {
         let url = location.as_url();
         let filename = url
@@ -151,12 +153,12 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         }))
     }
 
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn is_commit(&self) -> bool {
         matches!(self.file_type, LogPathFileType::Commit)
     }
 
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn is_checkpoint(&self) -> bool {
         matches!(
             self.file_type,
@@ -166,7 +168,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         )
     }
 
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     #[allow(dead_code)] // currently only used in tests, which don't "count"
     pub(crate) fn is_unknown(&self) -> bool {
         matches!(self.file_type, LogPathFileType::Unknown)
