@@ -5,8 +5,8 @@ use std::ffi::c_void;
 
 use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
 use delta_kernel::expressions::{
-    ArrayData, BinaryExpression, BinaryOperator, Expression, Scalar, StructData, UnaryExpression,
-    UnaryOperator, VariadicExpression, VariadicOperator,
+    ArrayData, BinaryExpression, BinaryOperator, Expression, JunctionExpression, JunctionOperator,
+    Scalar, StructData, UnaryExpression, UnaryOperator,
 };
 
 /// Free the memory the passed SharedExpression
@@ -20,9 +20,8 @@ pub unsafe extern "C" fn free_kernel_predicate(data: Handle<SharedExpression>) {
 
 type VisitLiteralFn<T> = extern "C" fn(data: *mut c_void, sibling_list_id: usize, value: T);
 type VisitUnaryFn = extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
-type VisitBinaryOpFn =
-    extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
-type VisitVariadicFn =
+type VisitBinaryFn = extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
+type VisitJunctionFn =
     extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
 
 /// The [`EngineExpressionVisitor`] defines a visitor system to allow engines to build their own
@@ -34,7 +33,7 @@ type VisitVariadicFn =
 /// future.
 ///
 /// Every expression the kernel visits belongs to some list of "sibling" elements. The schema
-/// itself is a list of schema elements, and every complex type (struct expression, array, variadic, etc)
+/// itself is a list of schema elements, and every complex type (struct expression, array, junction, etc)
 /// contains a list of "child" elements.
 ///  1. Before visiting any complex expression type, the kernel asks the engine to allocate a list to
 ///     hold its children
@@ -43,7 +42,7 @@ type VisitVariadicFn =
 ///      - For a struct literal, first visit each struct field and visit each value
 ///      - For a struct expression, visit each sub expression.
 ///      - For an array literal, visit each of the elements.
-///      - For a variadic `and` or `or` expression, visit each sub-expression.
+///      - For a junction `and` or `or` expression, visit each sub-expression.
 ///      - For a binary operator expression, visit the left and right operands.
 ///      - For a unary `is null` or `not` expression, visit the sub-expression.
 ///  3. When visiting a complex expression, the kernel also passes the "child list" containing
@@ -118,10 +117,10 @@ pub struct EngineExpressionVisitor {
     pub visit_literal_null: extern "C" fn(data: *mut c_void, sibling_list_id: usize),
     /// Visits an `and` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expressions of the array are in a list identified by `child_list_id`
-    pub visit_and: VisitVariadicFn,
+    pub visit_and: VisitJunctionFn,
     /// Visits an `or` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expressions of the array are in a list identified by `child_list_id`
-    pub visit_or: VisitVariadicFn,
+    pub visit_or: VisitJunctionFn,
     /// Visits a `not` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expression will be in a _one_ item list identified by `child_list_id`
     pub visit_not: VisitUnaryFn,
@@ -130,43 +129,43 @@ pub struct EngineExpressionVisitor {
     pub visit_is_null: VisitUnaryFn,
     /// Visits the `LessThan` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
-    pub visit_lt: VisitBinaryOpFn,
+    pub visit_lt: VisitBinaryFn,
     /// Visits the `LessThanOrEqual` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
-    pub visit_le: VisitBinaryOpFn,
+    pub visit_le: VisitBinaryFn,
     /// Visits the `GreaterThan` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
-    pub visit_gt: VisitBinaryOpFn,
+    pub visit_gt: VisitBinaryFn,
     /// Visits the `GreaterThanOrEqual` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
-    pub visit_ge: VisitBinaryOpFn,
+    pub visit_ge: VisitBinaryFn,
     /// Visits the `Equal` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
-    pub visit_eq: VisitBinaryOpFn,
+    pub visit_eq: VisitBinaryFn,
     /// Visits the `NotEqual` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
-    pub visit_ne: VisitBinaryOpFn,
+    pub visit_ne: VisitBinaryFn,
     /// Visits the `Distinct` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
-    pub visit_distinct: VisitBinaryOpFn,
+    pub visit_distinct: VisitBinaryFn,
     /// Visits the `In` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
-    pub visit_in: VisitBinaryOpFn,
+    pub visit_in: VisitBinaryFn,
     /// Visits the `NotIn` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
-    pub visit_not_in: VisitBinaryOpFn,
+    pub visit_not_in: VisitBinaryFn,
     /// Visits the `Add` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
-    pub visit_add: VisitBinaryOpFn,
+    pub visit_add: VisitBinaryFn,
     /// Visits the `Minus` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
-    pub visit_minus: VisitBinaryOpFn,
+    pub visit_minus: VisitBinaryFn,
     /// Visits the `Multiply` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
-    pub visit_multiply: VisitBinaryOpFn,
+    pub visit_multiply: VisitBinaryFn,
     /// Visits the `Divide` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
-    pub visit_divide: VisitBinaryOpFn,
+    pub visit_divide: VisitBinaryFn,
     /// Visits the `column` belonging to the list identified by `sibling_list_id`.
     pub visit_column:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
@@ -255,7 +254,7 @@ fn visit_expression_struct_literal(
     )
 }
 
-fn visit_expression_struct_expr(
+fn visit_expression_struct(
     visitor: &mut EngineExpressionVisitor,
     exprs: &[Expression],
     sibling_list_id: usize,
@@ -267,9 +266,9 @@ fn visit_expression_struct_expr(
     call!(visitor, visit_struct_expr, sibling_list_id, child_list_id)
 }
 
-fn visit_expression_variadic(
+fn visit_expression_junction(
     visitor: &mut EngineExpressionVisitor,
-    op: &VariadicOperator,
+    op: &JunctionOperator,
     exprs: &[Expression],
     sibling_list_id: usize,
 ) {
@@ -279,8 +278,8 @@ fn visit_expression_variadic(
     }
 
     let visit_fn = match op {
-        VariadicOperator::And => &visitor.visit_and,
-        VariadicOperator::Or => &visitor.visit_or,
+        JunctionOperator::And => &visitor.visit_and,
+        JunctionOperator::Or => &visitor.visit_or,
     };
     visit_fn(visitor.data, sibling_list_id, child_list_id);
 }
@@ -347,9 +346,9 @@ fn visit_expression_impl(
         Expression::Column(name) => {
             let name = name.to_string();
             let name = kernel_string_slice!(name);
-            call!(visitor, visit_column, sibling_list_id, name)
+            call!(visitor, visit_column, sibling_list_id, name);
         }
-        Expression::Struct(exprs) => visit_expression_struct_expr(visitor, exprs, sibling_list_id),
+        Expression::Struct(exprs) => visit_expression_struct(visitor, exprs, sibling_list_id),
         Expression::Binary(BinaryExpression { op, left, right }) => {
             let child_list_id = call!(visitor, make_field_list, 2);
             visit_expression_impl(visitor, left, child_list_id);
@@ -380,8 +379,8 @@ fn visit_expression_impl(
             };
             op(visitor.data, sibling_list_id, child_id_list);
         }
-        Expression::Variadic(VariadicExpression { op, exprs }) => {
-            visit_expression_variadic(visitor, op, exprs, sibling_list_id)
+        Expression::Junction(JunctionExpression { op, exprs }) => {
+            visit_expression_junction(visitor, op, exprs, sibling_list_id)
         }
     }
 }

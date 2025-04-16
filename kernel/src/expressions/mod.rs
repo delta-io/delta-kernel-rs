@@ -75,14 +75,16 @@ impl BinaryOperator {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum VariadicOperator {
+pub enum JunctionOperator {
+    /// Conjunction
     And,
+    /// Disjunction
     Or,
 }
 
-impl VariadicOperator {
-    pub(crate) fn invert(&self) -> VariadicOperator {
-        use VariadicOperator::*;
+impl JunctionOperator {
+    pub(crate) fn invert(&self) -> JunctionOperator {
+        use JunctionOperator::*;
         match self {
             And => Or,
             Or => And,
@@ -92,23 +94,24 @@ impl VariadicOperator {
 
 impl Display for BinaryOperator {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use BinaryOperator::*;
         match self {
-            Self::Plus => write!(f, "+"),
-            Self::Minus => write!(f, "-"),
-            Self::Multiply => write!(f, "*"),
-            Self::Divide => write!(f, "/"),
-            Self::LessThan => write!(f, "<"),
-            Self::LessThanOrEqual => write!(f, "<="),
-            Self::GreaterThan => write!(f, ">"),
-            Self::GreaterThanOrEqual => write!(f, ">="),
-            Self::Equal => write!(f, "="),
-            Self::NotEqual => write!(f, "!="),
+            Plus => write!(f, "+"),
+            Minus => write!(f, "-"),
+            Multiply => write!(f, "*"),
+            Divide => write!(f, "/"),
+            LessThan => write!(f, "<"),
+            LessThanOrEqual => write!(f, "<="),
+            GreaterThan => write!(f, ">"),
+            GreaterThanOrEqual => write!(f, ">="),
+            Equal => write!(f, "="),
+            NotEqual => write!(f, "!="),
             // TODO(roeap): AFAIK DISTINCT does not have a commonly used operator symbol
             // so ideally this would not be used as we use Display for rendering expressions
             // in our code we take care of this, but theirs might not ...
-            Self::Distinct => write!(f, "DISTINCT"),
-            Self::In => write!(f, "IN"),
-            Self::NotIn => write!(f, "NOT IN"),
+            Distinct => write!(f, "DISTINCT"),
+            In => write!(f, "IN"),
+            NotIn => write!(f, "NOT IN"),
         }
     }
 }
@@ -156,14 +159,14 @@ impl BinaryExpression {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct VariadicExpression {
+pub struct JunctionExpression {
     /// The operator.
-    pub op: VariadicOperator,
+    pub op: JunctionOperator,
     /// The expressions.
     pub exprs: Vec<Expression>,
 }
-impl VariadicExpression {
-    fn new(op: VariadicOperator, exprs: Vec<Expression>) -> Self {
+impl JunctionExpression {
+    fn new(op: JunctionOperator, exprs: Vec<Expression>) -> Self {
         Self { op, exprs }
     }
 }
@@ -185,8 +188,8 @@ pub enum Expression {
     Unary(UnaryExpression),
     /// A binary operation.
     Binary(BinaryExpression),
-    /// A variadic operation.
-    Variadic(VariadicExpression),
+    /// A junction operation (AND/OR).
+    Junction(JunctionExpression),
     // TODO: support more expressions, such as IS IN, LIKE, etc.
 }
 
@@ -204,29 +207,30 @@ impl From<ColumnName> for Expression {
 
 impl Display for Expression {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use Expression::*;
         match self {
-            Self::Literal(l) => write!(f, "{l}"),
-            Self::Column(name) => write!(f, "Column({name})"),
-            Self::Struct(exprs) => write!(
+            Literal(l) => write!(f, "{l}"),
+            Column(name) => write!(f, "Column({name})"),
+            Struct(exprs) => write!(
                 f,
                 "Struct({})",
                 &exprs.iter().map(|e| format!("{e}")).join(", ")
             ),
-            Self::Binary(BinaryExpression {
+            Binary(BinaryExpression {
                 op: BinaryOperator::Distinct,
                 left,
                 right,
             }) => write!(f, "DISTINCT({left}, {right})"),
-            Self::Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
-            Self::Unary(UnaryExpression { op, expr }) => match op {
+            Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
+            Unary(UnaryExpression { op, expr }) => match op {
                 UnaryOperator::Not => write!(f, "NOT {expr}"),
                 UnaryOperator::IsNull => write!(f, "{expr} IS NULL"),
             },
-            Self::Variadic(VariadicExpression { op, exprs }) => {
+            Junction(JunctionExpression { op, exprs }) => {
                 let exprs = &exprs.iter().map(|e| format!("{e}")).join(", ");
                 let op = match op {
-                    VariadicOperator::And => "AND",
-                    VariadicOperator::Or => "OR",
+                    JunctionOperator::And => "AND",
+                    JunctionOperator::Or => "OR",
                 };
                 write!(f, "{op}({exprs})")
             }
@@ -255,6 +259,7 @@ impl Expression {
         Self::Literal(value.into())
     }
 
+    /// Creates a NULL literal expression
     pub const fn null_literal(data_type: DataType) -> Self {
         Self::Literal(Scalar::Null(data_type))
     }
@@ -266,10 +271,8 @@ impl Expression {
 
     /// Creates a new unary expression OP expr
     pub fn unary(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
-        Self::Unary(UnaryExpression {
-            op,
-            expr: Box::new(expr.into()),
-        })
+        let expr = Box::new(expr.into());
+        Self::Unary(UnaryExpression { op, expr })
     }
 
     /// Creates a new binary expression lhs OP rhs
@@ -285,20 +288,25 @@ impl Expression {
         })
     }
 
-    /// Creates a new variadic expression OP(exprs...)
-    pub fn variadic(op: VariadicOperator, exprs: impl IntoIterator<Item = Self>) -> Self {
-        let exprs = exprs.into_iter().collect::<Vec<_>>();
-        Self::Variadic(VariadicExpression { op, exprs })
+    /// Creates a new junction expression OP(exprs...)
+    pub fn junction(op: JunctionOperator, exprs: impl IntoIterator<Item = Self>) -> Self {
+        let exprs = exprs.into_iter().collect();
+        Self::Junction(JunctionExpression { op, exprs })
     }
 
     /// Creates a new expression AND(exprs...)
     pub fn and_from(exprs: impl IntoIterator<Item = Self>) -> Self {
-        Self::variadic(VariadicOperator::And, exprs)
+        Self::junction(JunctionOperator::And, exprs)
     }
 
     /// Creates a new expression OR(exprs...)
     pub fn or_from(exprs: impl IntoIterator<Item = Self>) -> Self {
-        Self::variadic(VariadicOperator::Or, exprs)
+        Self::junction(JunctionOperator::Or, exprs)
+    }
+
+    /// Logical NOT (boolean inversion)
+    pub fn not(expr: impl Into<Self>) -> Self {
+        Self::unary(UnaryOperator::Not, expr.into())
     }
 
     /// Create a new expression `self IS NULL`
@@ -308,7 +316,7 @@ impl Expression {
 
     /// Create a new expression `self IS NOT NULL`
     pub fn is_not_null(self) -> Self {
-        !Self::is_null(self)
+        Self::not(Self::is_null(self))
     }
 
     /// Create a new expression `self == other`
@@ -352,13 +360,13 @@ impl Expression {
     }
 
     /// Create a new expression `self AND other`
-    pub fn and(self, other: impl Into<Self>) -> Self {
-        Self::and_from([self, other.into()])
+    pub fn and(a: impl Into<Self>, b: impl Into<Self>) -> Self {
+        Self::and_from([a.into(), b.into()])
     }
 
     /// Create a new expression `self OR other`
-    pub fn or(self, other: impl Into<Self>) -> Self {
-        Self::or_from([self, other.into()])
+    pub fn or(a: impl Into<Self>, b: impl Into<Self>) -> Self {
+        Self::or_from([a.into(), b.into()])
     }
 
     /// Create a new expression `DISTINCT(self, other)`
@@ -420,13 +428,13 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_binary(expr)
     }
 
-    /// Called for each [`VariadicExpression`] encountered during the traversal. Implementations can
-    /// call [`Self::recurse_into_variadic`] if they wish to recursively transform the children.
-    fn transform_variadic(
+    /// Called for each [`JunctionExpression`] encountered during the traversal. Implementations can
+    /// call [`Self::recurse_into_junction`] if they wish to recursively transform the children.
+    fn transform_junction(
         &mut self,
-        expr: &'a VariadicExpression,
-    ) -> Option<Cow<'a, VariadicExpression>> {
-        self.recurse_into_variadic(expr)
+        expr: &'a JunctionExpression,
+    ) -> Option<Cow<'a, JunctionExpression>> {
+        self.recurse_into_junction(expr)
     }
 
     /// General entry point for transforming an expression. This method will dispatch to the
@@ -455,8 +463,8 @@ pub trait ExpressionTransform<'a> {
                 Owned(b) => Owned(Expression::Binary(b)),
                 Borrowed(_) => Borrowed(expr),
             },
-            Expression::Variadic(v) => match self.transform_variadic(v)? {
-                Owned(v) => Owned(Expression::Variadic(v)),
+            Expression::Junction(j) => match self.transform_junction(j)? {
+                Owned(j) => Owned(Expression::Junction(j)),
                 Borrowed(_) => Borrowed(expr),
             },
         };
@@ -524,27 +532,19 @@ pub trait ExpressionTransform<'a> {
         Some(b)
     }
 
-    /// Recursively transforms a variadic expression's children. Returns `None` if all children were
+    /// Recursively transforms a junction expression's children. Returns `None` if all children were
     /// removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
     /// `Some(Cow::Borrowed)` otherwise.
-    fn recurse_into_variadic(
+    fn recurse_into_junction(
         &mut self,
-        v: &'a VariadicExpression,
-    ) -> Option<Cow<'a, VariadicExpression>> {
+        j: &'a JunctionExpression,
+    ) -> Option<Cow<'a, JunctionExpression>> {
         use Cow::*;
-        let v = match self.recurse_into_struct(&v.exprs)? {
-            Owned(exprs) => Owned(VariadicExpression::new(v.op, exprs)),
-            Borrowed(_) => Borrowed(v),
+        let j = match self.recurse_into_struct(&j.exprs)? {
+            Owned(exprs) => Owned(JunctionExpression::new(j.op, exprs)),
+            Borrowed(_) => Borrowed(j),
         };
-        Some(v)
-    }
-}
-
-impl std::ops::Not for Expression {
-    type Output = Self;
-
-    fn not(self) -> Self {
-        Self::unary(UnaryOperator::Not, self)
+        Some(j)
     }
 }
 
@@ -671,18 +671,17 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
         self.depth_limited(Self::recurse_into_binary, expr)
     }
 
-    fn transform_variadic(
+    fn transform_junction(
         &mut self,
-        expr: &'a VariadicExpression,
-    ) -> Option<Cow<'a, VariadicExpression>> {
-        self.depth_limited(Self::recurse_into_variadic, expr)
+        expr: &'a JunctionExpression,
+    ) -> Option<Cow<'a, JunctionExpression>> {
+        self.depth_limited(Self::recurse_into_junction, expr)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{column_expr, Expression as Expr, ExpressionDepthChecker};
-    use std::ops::Not;
 
     #[test]
     fn test_expression_format() {
@@ -693,7 +692,7 @@ mod tests {
             ((col_ref.clone() - 4).lt(10), "Column(x) - 4 < 10"),
             ((col_ref.clone() + 4) / 10 * 42, "Column(x) + 4 / 10 * 42"),
             (
-                col_ref.clone().gt_eq(2).and(col_ref.clone().lt_eq(10)),
+                Expr::and(col_ref.clone().gt_eq(2), col_ref.clone().lt_eq(10)),
                 "AND(Column(x) >= 2, Column(x) <= 10)",
             ),
             (
@@ -705,7 +704,7 @@ mod tests {
                 "AND(Column(x) >= 2, Column(x) <= 10, Column(x) <= 100)",
             ),
             (
-                col_ref.clone().gt(2).or(col_ref.clone().lt(10)),
+                Expr::or(col_ref.clone().gt(2), col_ref.clone().lt(10)),
                 "OR(Column(x) > 2, Column(x) < 10)",
             ),
             (col_ref.eq("foo"), "Column(x) = 'foo'"),
