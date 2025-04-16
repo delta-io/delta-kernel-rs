@@ -56,9 +56,10 @@ pub struct Transaction {
     commit_info: Option<Arc<dyn EngineData>>,
     write_metadata: Vec<Box<dyn EngineData>>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
-    // key/payload. Hashset requires Borrow<&str> and Eq, Ord, and Hash. Plus, HashSet::insert drops
-    // the to-be-inserted value without returning the existing one, which would make error messaging
-    // unnecessarily difficult. Thus, we keep Vec here and deduplicate in the commit method.
+    // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
+    // HashSet::insert drops the to-be-inserted value without returning the existing one, which
+    // would make error messaging unnecessarily difficult. Thus, we keep Vec here and deduplicate in
+    // the commit method.
     set_transactions: Vec<SetTransaction>,
 }
 
@@ -100,7 +101,9 @@ impl Transaction {
     /// will include the failed transaction in case of a conflict so the user can retry.
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
         // step 0: if there are txn(app_id, version) actions being committed, ensure that every
-        // `app_id` is unique.
+        // `app_id` is unique and create a row of `EngineData` for it.
+        // TODO(zach): we currently do this in two passes - can we do it in one and still keep refs
+        // in the HashSet?
         let mut app_ids = HashSet::new();
         if let Some(dup) = self
             .set_transactions
@@ -112,7 +115,6 @@ impl Transaction {
                 dup.app_id
             )));
         }
-
         let set_transaction_actions = self
             .set_transactions
             .clone()
@@ -156,12 +158,18 @@ impl Transaction {
         self
     }
 
-    /// Include a SetTransaction (app_id and version) action for this transaction.
+    /// Include a SetTransaction (app_id and version) action for this transaction (with an optional
+    /// `last_updated` timestamp).
     /// Note that each app_id can only appear once per transaction. That is, multiple app_ids with
     /// different versions are disallowed in a single transaction. If a duplicate app_id is
     /// included, the `commit` will fail (that is, we don't eagerly check app_id validity here).
-    pub fn with_transaction_id(mut self, app_id: String, version: i64) -> Self {
-        let set_transaction = SetTransaction::new(app_id, version, None);
+    pub fn with_transaction_id(
+        mut self,
+        app_id: String,
+        version: i64,
+        last_updated: impl Into<Option<i64>>,
+    ) -> Self {
+        let set_transaction = SetTransaction::new(app_id, version, last_updated.into());
         self.set_transactions.push(set_transaction);
         self
     }

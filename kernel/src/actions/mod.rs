@@ -16,7 +16,7 @@ use crate::table_features::{
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::EvaluationHandlerExtension;
-use crate::{DataType, DeltaResult, Engine, EngineData, Error, FileMeta, RowVisitor as _, Scalar};
+use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, RowVisitor as _};
 
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
@@ -589,7 +589,7 @@ impl SetTransaction {
         let values = [
             self.app_id.into(),
             self.version.into(),
-            Scalar::Null(DataType::LONG),
+            self.last_updated.into(),
         ];
         let evaluator = engine.evaluation_handler();
         evaluator.create_one(get_log_txn_schema().clone(), &values)

@@ -724,8 +724,8 @@ async fn test_idempotent_writes() -> Result<(), Box<dyn std::error::Error>> {
         assert!(matches!(
             table
                 .new_transaction(&engine)?
-                .with_transaction_id("app_id1".to_string(), 0)
-                .with_transaction_id("app_id1".to_string(), 1)
+                .with_transaction_id("app_id1".to_string(), 0, None)
+                .with_transaction_id("app_id1".to_string(), 1, None)
                 .commit(&engine),
             Err(KernelError::Generic(msg)) if msg == "app_id app_id1 already exists in transaction"
         ));
@@ -733,8 +733,8 @@ async fn test_idempotent_writes() -> Result<(), Box<dyn std::error::Error>> {
         let txn = table
             .new_transaction(&engine)?
             .with_commit_info(commit_info)
-            .with_transaction_id("app_id1".to_string(), 1)
-            .with_transaction_id("app_id2".to_string(), 2);
+            .with_transaction_id("app_id1".to_string(), 1, None)
+            .with_transaction_id("app_id2".to_string(), 2, 123456789);
 
         // commit!
         txn.commit(&engine)?;
@@ -776,7 +776,8 @@ async fn test_idempotent_writes() -> Result<(), Box<dyn std::error::Error>> {
             json!({
                 "txn": {
                     "appId": "app_id2",
-                    "version": 2
+                    "version": 2,
+                    "lastUpdated": 123456789
                 }
             }),
         ];

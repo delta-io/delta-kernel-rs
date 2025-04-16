@@ -12,8 +12,8 @@ pub(crate) struct SetTransactionScanner {
     snapshot: Arc<Snapshot>,
 }
 
+#[allow(dead_code)]
 impl SetTransactionScanner {
-    #[allow(unused)]
     pub(crate) fn new(snapshot: Arc<Snapshot>) -> Self {
         SetTransactionScanner { snapshot }
     }
@@ -64,7 +64,6 @@ impl SetTransactionScanner {
         )
     }
 
-    #[allow(unused)]
     /// Scan the Delta Log for the latest transaction entry of an application
     pub(crate) fn application_transaction(
         &self,
