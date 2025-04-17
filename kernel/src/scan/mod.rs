@@ -1163,7 +1163,11 @@ mod tests {
         let data: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
         assert_eq!(data.len(), 1);
 
-        // Effective predicate pushdown, so no data files should be returned.
+        // TODO(#860): we disable predicate pushdown until we support row indexes. Update this test
+        // accordingly after support is reintroduced.
+        //
+        // Effective predicate pushdown, so no data files should be returned. BUT since we disabled
+        // predicate pushdown, the one data file is still returned.
         let predicate = Arc::new(int_col.lt(value));
         let scan = snapshot
             .scan_builder()
@@ -1171,7 +1175,7 @@ mod tests {
             .build()
             .unwrap();
         let data: Vec<_> = scan.execute(engine).unwrap().try_collect().unwrap();
-        assert_eq!(data.len(), 0);
+        assert_eq!(data.len(), 1);
     }
 
     #[test]
