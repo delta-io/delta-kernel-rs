@@ -67,7 +67,7 @@ fn test_default_partial_cmp_scalars() {
         TimestampNtz(1),
         Date(1),
         Binary(vec![1]),
-        Decimal(1, 10, 10), // invalid value,
+        Scalar::decimal(1, 10, 10).unwrap(),
         Null(DataType::LONG),
         Struct(StructData::try_new(vec![], vec![]).unwrap()),
         Array(ArrayData::new(
@@ -88,7 +88,7 @@ fn test_default_partial_cmp_scalars() {
         TimestampNtz(10),
         Date(10),
         Binary(vec![10]),
-        Decimal(10, 10, 10), // invalid value
+        Scalar::decimal(10, 10, 10).unwrap(),
         Null(DataType::LONG),
         Struct(StructData::try_new(vec![], vec![]).unwrap()),
         Array(ArrayData::new(
