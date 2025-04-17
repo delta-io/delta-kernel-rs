@@ -533,7 +533,6 @@ impl Scan {
 
         let global_state = Arc::new(self.global_scan_state());
         let table_root = self.snapshot.table_root().clone();
-        let physical_predicate = self.physical_predicate();
 
         let scan_metadata_iter = self.scan_metadata(engine.as_ref())?;
         let scan_files_iter = scan_metadata_iter
@@ -562,10 +561,12 @@ impl Scan {
                 // partition columns, but the read schema we use here does _NOT_ include partition
                 // columns. So we cannot safely assume that all column references are valid. See
                 // https://github.com/delta-io/delta-kernel-rs/issues/434 for more details.
+                //
+                // TODO(#860): we disable predicate pushdown until we support row indexes.
                 let read_result_iter = engine.parquet_handler().read_parquet_files(
                     &[meta],
                     global_state.physical_schema.clone(),
-                    physical_predicate.clone(),
+                    None,
                 )?;
 
                 // Arc clones
