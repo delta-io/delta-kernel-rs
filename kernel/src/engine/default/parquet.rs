@@ -5,12 +5,23 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
+use crate::arrow::array::ArrayRef;
+use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray, StructArray};
+use crate::arrow::compute::kernels::aggregate::max as arrow_max;
+use crate::arrow::compute::kernels::aggregate::min as arrow_min;
+use crate::arrow::datatypes::{DataType, Field};
+use crate::parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use crate::parquet::arrow::parquet_to_arrow_schema;
+use crate::parquet::file::metadata::RowGroupMetaData;
+use crate::parquet::format::FileMetaData;
+use crate::parquet::schema::types::from_thrift;
+use crate::parquet::schema::types::SchemaDescriptor;
+
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::DynObjectStore;
@@ -40,11 +51,23 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
 #[derive(Debug)]
 pub struct DataFileMetadata {
     file_meta: FileMeta,
+    file_stats: Option<FileStats>,
+}
+
+#[derive(Debug)]
+pub struct FileStats {
+    num_records: u64,
+    tight_bounds: bool,
+    // includes min, max, null_count
+    column_stats: ArrayRef,
 }
 
 impl DataFileMetadata {
-    pub fn new(file_meta: FileMeta) -> Self {
-        Self { file_meta }
+    pub fn new(file_meta: FileMeta, file_stats: Option<FileStats>) -> Self {
+        Self {
+            file_meta,
+            file_stats,
+        }
     }
 
     // convert DataFileMetadata into a record batch which matches the 'write_metadata' schema
@@ -60,6 +83,7 @@ impl DataFileMetadata {
                     last_modified,
                     size,
                 },
+            file_stats: _,
         } = self;
         let write_metadata_schema = crate::transaction::get_write_metadata_schema();
 
@@ -126,7 +150,9 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let mut buffer = vec![];
         let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
         writer.write(record_batch)?;
-        writer.close()?; // writer must be closed to write footer
+        let file_metadata = writer.close()?; // writer must be closed to write footer
+
+        let stats = Self::gather_stats(file_metadata);
 
         let size = buffer.len();
         let name: String = format!("{}.parquet", Uuid::new_v4());
@@ -153,7 +179,84 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         }
 
         let file_meta = FileMeta::new(path, modification_time, size);
-        Ok(DataFileMetadata::new(file_meta))
+        Ok(DataFileMetadata::new(file_meta, Some(stats)))
+    }
+
+    fn gather_stats(file_metadata: FileMetaData) -> FileStats {
+        let parquet_schema = Arc::new(SchemaDescriptor::new(
+            from_thrift(file_metadata.schema.as_ref()).unwrap(),
+        ));
+        let arrow_schema = parquet_to_arrow_schema(parquet_schema.as_ref(), None).unwrap();
+        let row_group_metadatas = file_metadata
+            .row_groups
+            .into_iter()
+            .map(|rg| RowGroupMetaData::from_thrift(parquet_schema.clone(), rg).unwrap())
+            .collect::<Vec<_>>();
+
+        // delta tracks tight/loose bounds at the file level, so we just check all the row groups
+        let tight_bounds = row_group_metadatas.iter().all(|row_group| {
+            row_group.columns().iter().all(|column| {
+                column
+                    .statistics()
+                    .is_some_and(|stats| stats.max_is_exact() && stats.min_is_exact())
+            })
+        });
+
+        let col_name = "a";
+
+        // statistics are per-colum, per-row group. stats converted helps us collect all the stats
+        // for a column into an array with a value per row group.
+        //
+        // TODO(1): this only works with top-level columns due to a limitation in
+        // [`parquet_column`](crate::parquet::arrow::parquet_column).
+        let stats_converter =
+            StatisticsConverter::try_new(col_name, &arrow_schema, parquet_schema.as_ref()).unwrap();
+
+        let min_stats = stats_converter
+            .row_group_mins(row_group_metadatas.iter())
+            .unwrap();
+        // downcast to the type of the field
+        let min_stats = min_stats
+            .as_ref()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        // TODO(2): aggregations only return native types. annoying we have to round-trip to native
+        // type.
+        let min_stats = arrow_min(&min_stats).unwrap();
+        let min_stats = Int64Array::from(vec![min_stats]);
+
+        let max_stats = stats_converter
+            .row_group_maxes(row_group_metadatas.iter())
+            .unwrap();
+        // downcast to the type of the field
+        let max_stats = max_stats
+            .as_ref()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        let max_stats = arrow_max(&max_stats).unwrap();
+        let max_stats = Int64Array::from(vec![max_stats]);
+
+        let column_stats = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(Field::new("minValues", DataType::Int64, true)),
+                Arc::new(min_stats) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("maxValues", DataType::Int64, true)),
+                Arc::new(max_stats) as ArrayRef,
+            ),
+        ]));
+
+        // need to add null_count
+        FileStats {
+            num_records: file_metadata.num_rows.try_into().unwrap(),
+            tight_bounds,
+            column_stats,
+        }
     }
 
     /// Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
@@ -425,7 +528,7 @@ mod tests {
         let size = 1_000_000;
         let last_modified = 10000000000;
         let file_metadata = FileMeta::new(location.clone(), last_modified, size as usize);
-        let data_file_metadata = DataFileMetadata::new(file_metadata);
+        let data_file_metadata = DataFileMetadata::new(file_metadata, None);
         let partition_values = HashMap::from([("partition1".to_string(), "a".to_string())]);
         let data_change = true;
         let actual = data_file_metadata
@@ -476,10 +579,27 @@ mod tests {
             DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
         let data = Box::new(ArrowEngineData::new(
-            RecordBatch::try_from_iter(vec![(
-                "a",
-                Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
-            )])
+            RecordBatch::try_from_iter(vec![
+                (
+                    "a",
+                    Arc::new(StructArray::from(vec![
+                        (
+                            // Arc::new(Field::new("s", DataType::Utf8, true)),
+                            // Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+                            Arc::new(Field::new("s", DataType::Int64, true)),
+                            Arc::new(Int64Array::from(vec![1, 10, 100])) as ArrayRef,
+                        ),
+                        (
+                            Arc::new(Field::new("i", DataType::Int64, true)),
+                            Arc::new(Int64Array::from(vec![0, 1, 2])) as ArrayRef,
+                        ),
+                    ])) as Arc<dyn Array>,
+                ),
+                (
+                    "b",
+                    Arc::new(Int64Array::from(vec![4, 5, 6])) as Arc<dyn Array>,
+                ),
+            ])
             .unwrap(),
         ));
 
@@ -495,7 +615,14 @@ mod tests {
                     last_modified,
                     size,
                 },
+            file_stats,
         } = write_metadata;
+
+        println!(
+            "parquet_file: {:?}, last_modified: {}, size: {}, file_stats: {:?}",
+            parquet_file, last_modified, size, file_stats
+        );
+
         let expected_location = Url::parse("memory:///data/").unwrap();
 
         // head the object to get metadata
