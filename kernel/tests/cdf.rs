@@ -5,7 +5,6 @@ use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::engine::sync::SyncEngine;
 use itertools::Itertools;
 
-use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::{DeltaResult, Error, ExpressionRef, Table, Version};
 
 mod common;

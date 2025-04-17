@@ -2,10 +2,8 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use arrow::compute::filter_record_batch;
-use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_extensions::ScanExt;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::sync::SyncEngine;
@@ -119,24 +117,7 @@ fn try_main() -> DeltaResult<()> {
         .with_schema_opt(read_schema_opt)
         .build()?;
 
-    let batches: Vec<RecordBatch> = scan
-        .execute(engine)?
-        .map(|scan_result| -> DeltaResult<_> {
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch: RecordBatch = data
-                .into_any()
-                .downcast::<ArrowEngineData>()
-                .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
-                .into();
-            if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
-            } else {
-                Ok(record_batch)
-            }
-        })
-        .try_collect()?;
+    let batches: Vec<_> = scan.execute_arrow(engine)?.try_collect()?;
     print_batches(&batches)?;
     Ok(())
 }

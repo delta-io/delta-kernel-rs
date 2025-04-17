@@ -16,7 +16,7 @@ use std::sync::Arc;
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
-use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Table};
+use delta_kernel::{DeltaResult, Table};
 use futures::{stream::TryStreamExt, StreamExt};
 use object_store::{local::LocalFileSystem, ObjectStore};
 
