@@ -761,6 +761,19 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             .try_into()
             .unwrap();
 
+        // check that last_updated times are identical
+        let last_updated1 = parsed_commits[1]
+            .get("txn")
+            .unwrap()
+            .get("lastUpdated")
+            .unwrap();
+        let last_updated2 = parsed_commits[2]
+            .get("txn")
+            .unwrap()
+            .get("lastUpdated")
+            .unwrap();
+        assert_eq!(last_updated1, last_updated2);
+
         let last_updated = parsed_commits[1]
             .get_mut("txn")
             .unwrap()
