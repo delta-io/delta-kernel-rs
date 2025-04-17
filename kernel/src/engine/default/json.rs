@@ -758,61 +758,48 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_json_file_without_overwrite() -> DeltaResult<()> {
-        let store = Arc::new(InMemory::new());
-        let executor = Arc::new(TokioBackgroundExecutor::new());
-        let handler = DefaultJsonHandler::new(store.clone(), executor);
-        let path = Url::parse("memory:///test/data/00000000000000000001.json")?;
-        let object_path = Path::from("/test/data/00000000000000000001.json");
-
-        // First write with overwrite=false & no existing file
-        let data = create_test_data(vec!["remi", "wilson"])?;
-        let result = handler.write_json_file(&path, Box::new(std::iter::once(Ok(data))), false);
-
-        // Verify the first write is successful
-        assert!(result.is_ok());
-        let json = read_json_file(&store, &object_path).await?;
-        assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
-
-        // Second write with overwrite=false & existing file
-        let data = create_test_data(vec!["check", "error"])?;
-        let result = handler.write_json_file(&path, Box::new(std::iter::once(Ok(data))), false);
-
-        // Verify the second write fails with FileAlreadyExists error
-        match result {
-            Err(Error::FileAlreadyExists(err_path)) => {
-                assert_eq!(err_path, object_path.to_string());
-            }
-            _ => panic!("Expected FileAlreadyExists error, got: {:?}", result),
-        }
-
-        Ok(())
+        do_test_write_json_file(false).await
     }
 
     #[tokio::test]
     async fn test_write_json_file_overwrite() -> DeltaResult<()> {
+        do_test_write_json_file(true).await
+    }
+
+    async fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let handler = DefaultJsonHandler::new(store.clone(), executor);
         let path = Url::parse("memory:///test/data/00000000000000000001.json")?;
         let object_path = Path::from("/test/data/00000000000000000001.json");
 
-        // First write with overwrite=true & no existing file
+        // First write with no existing file
         let data = create_test_data(vec!["remi", "wilson"])?;
-        let result = handler.write_json_file(&path, Box::new(std::iter::once(Ok(data))), true);
+        let result = handler.write_json_file(&path, Box::new(std::iter::once(Ok(data))), overwrite);
 
         // Verify the first write is successful
         assert!(result.is_ok());
         let json = read_json_file(&store, &object_path).await?;
         assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
 
-        // Second write with overwrite=true & existing file
+        // Second write with existing file
         let data = create_test_data(vec!["seb", "tia"])?;
-        let result = handler.write_json_file(&path, Box::new(std::iter::once(Ok(data))), true);
+        let result = handler.write_json_file(&path, Box::new(std::iter::once(Ok(data))), overwrite);
 
-        // Verify the second write is successful
-        assert!(result.is_ok());
-        let json = read_json_file(&store, &object_path).await?;
-        assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
+        if overwrite {
+            // Verify the second write is successful
+            assert!(result.is_ok());
+            let json = read_json_file(&store, &object_path).await?;
+            assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
+        } else {
+            // Verify the second write fails with FileAlreadyExists error
+            match result {
+                Err(Error::FileAlreadyExists(err_path)) => {
+                    assert_eq!(err_path, object_path.to_string());
+                }
+                _ => panic!("Expected FileAlreadyExists error, got: {:?}", result),
+            }
+        }
 
         Ok(())
     }
