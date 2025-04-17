@@ -1,5 +1,8 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of  checkpoint and commit
 //! files.
+use std::collections::HashMap;
+use std::convert::identity;
+use std::sync::{Arc, LazyLock};
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
@@ -14,10 +17,9 @@ use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, ParquetHandler, RowVisitor,
     StorageHandler, Version,
 };
+use delta_kernel_derive::internal_api;
+
 use itertools::Itertools;
-use std::collections::HashMap;
-use std::convert::identity;
-use std::sync::{Arc, LazyLock};
 use tracing::warn;
 use url::Url;
 
@@ -38,7 +40,7 @@ mod tests;
 ///
 /// [`Snapshot`]: crate::snapshot::Snapshot
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "internal-api", visibility::make(pub))]
+#[internal_api]
 pub(crate) struct LogSegment {
     pub end_version: Version,
     pub checkpoint_version: Option<Version>,
@@ -122,7 +124,7 @@ impl LogSegment {
     /// - `time_travel_version`: The version of the log that the Snapshot will be at.
     ///
     /// [`Snapshot`]: crate::snapshot::Snapshot
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn for_snapshot(
         storage: &dyn StorageHandler,
         log_root: Url,
@@ -152,7 +154,7 @@ impl LogSegment {
     /// `start_version` and `end_version`: Its LogSegment is made of zero checkpoints and all commits
     /// between versions `start_version` (inclusive) and `end_version` (inclusive). If no `end_version`
     /// is specified it will be the most recent version by default.
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn for_table_changes(
         storage: &dyn StorageHandler,
         log_root: Url,
@@ -201,7 +203,7 @@ impl LogSegment {
     ///
     /// `meta_predicate` is an optional expression to filter the log files with. It is _NOT_ the
     /// query's predicate, but rather a predicate for filtering log files themselves.
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn read_actions(
         &self,
         engine: &dyn Engine,

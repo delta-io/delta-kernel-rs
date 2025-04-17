@@ -100,9 +100,9 @@ impl LogReplayProcessor for CheckpointLogReplayProcessor {
         );
         visitor.visit_rows_of(batch.as_ref())?;
 
-        // Update the total actions and add actions counters. Relaxed ordering is sufficient
-        // here as we only care about the total count when writing the _last_checkpoint file.
-        // (the ordering is not important for correctness)
+        // Safe to use Relaxed here:
+        // "Incrementing a counter can be safely done by multiple threads using a relaxed fetch_add
+        // if you're not using the counter to synchronize any other accesses." – Rust Atomics and Locks
         self.actions_count.fetch_add(
             visitor.file_actions_count + visitor.non_file_actions_count,
             Ordering::Relaxed,

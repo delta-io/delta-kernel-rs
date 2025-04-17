@@ -41,8 +41,8 @@ fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
     DataSkippingPredicateCreator.eval(expr)
 }
 
-/// Like `as_data_skipping_predicate`, but invokes [`PredicateEvaluator::eval_sql_where`] instead
-/// of [`PredicateEvaluator::eval_expr`].
+/// Like `as_data_skipping_predicate`, but invokes [`KernelPredicateEvaluator::eval_sql_where`]
+/// instead of [`KernelPredicateEvaluator::eval`].
 fn as_sql_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
     DataSkippingPredicateCreator.eval_sql_where(expr)
 }
