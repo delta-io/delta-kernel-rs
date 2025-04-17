@@ -1,15 +1,13 @@
 use std::sync::{Arc, LazyLock};
 
+use crate::actions::get_log_txn_schema;
 use crate::actions::visitors::SetTransactionVisitor;
-use crate::actions::{get_log_schema, SetTransaction, SET_TRANSACTION_NAME};
+use crate::actions::{SetTransaction, SET_TRANSACTION_NAME};
 use crate::snapshot::Snapshot;
-use crate::{
-    DeltaResult, Engine, EngineData, Expression as Expr, ExpressionRef, RowVisitor as _, SchemaRef,
-};
+use crate::{DeltaResult, Engine, EngineData, Expression as Expr, ExpressionRef, RowVisitor as _};
 
 pub(crate) use crate::actions::visitors::SetTransactionMap;
 
-#[allow(dead_code)]
 pub(crate) struct SetTransactionScanner {
     snapshot: Arc<Snapshot>,
 }
@@ -20,17 +18,18 @@ impl SetTransactionScanner {
         SetTransactionScanner { snapshot }
     }
 
-    /// Scan the entire log for all application ids but terminate early if a specific application id is provided
+    /// Scan the entire log for all application ids but terminate early if a specific application id
+    /// is provided
+    // TODO: we could have this track _multiple_ application ids instead of only up to one.
     fn scan_application_transactions(
         &self,
         engine: &dyn Engine,
         application_id: Option<&str>,
     ) -> DeltaResult<SetTransactionMap> {
-        let schema = Self::get_txn_schema()?;
         let mut visitor = SetTransactionVisitor::new(application_id.map(|s| s.to_owned()));
         // If a specific id is requested then we can terminate log replay early as soon as it was
         // found. If all ids are requested then we are forced to replay the entire log.
-        for maybe_data in self.replay_for_app_ids(engine, schema.clone())? {
+        for maybe_data in self.replay_for_app_ids(engine)? {
             let (txns, _) = maybe_data?;
             visitor.visit_rows_of(txns.as_ref())?;
             // if a specific id is requested and a transaction was found, then return
@@ -43,16 +42,11 @@ impl SetTransactionScanner {
     }
 
     // Factored out to facilitate testing
-    fn get_txn_schema() -> DeltaResult<SchemaRef> {
-        get_log_schema().project(&[SET_TRANSACTION_NAME])
-    }
-
-    // Factored out to facilitate testing
     fn replay_for_app_ids(
         &self,
         engine: &dyn Engine,
-        schema: SchemaRef,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
+        let txn_schema = get_log_txn_schema();
         // This meta-predicate should be effective because all the app ids end up in a single
         // checkpoint part when patitioned by `add.path` like the Delta spec requires. There's no
         // point filtering by a particular app id, even if we have one, because app ids are all in
@@ -64,8 +58,8 @@ impl SetTransactionScanner {
         });
         self.snapshot.log_segment().read_actions(
             engine,
-            schema.clone(),
-            schema,
+            txn_schema.clone(), // Arc clone
+            txn_schema.clone(), // Arc clone
             META_PREDICATE.clone(),
         )
     }
@@ -160,11 +154,10 @@ mod tests {
         let table = Table::new(url);
         let snapshot = table.snapshot(&engine, None).unwrap();
         let txn = SetTransactionScanner::new(snapshot.into());
-        let txn_schema = SetTransactionScanner::get_txn_schema().unwrap();
 
         // The checkpoint has five parts, each containing one action. There are two app ids.
         let data: Vec<_> = txn
-            .replay_for_app_ids(&engine, txn_schema.clone())
+            .replay_for_app_ids(&engine)
             .unwrap()
             .try_collect()
             .unwrap();
