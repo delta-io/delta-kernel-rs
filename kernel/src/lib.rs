@@ -74,7 +74,7 @@ use url::Url;
 use self::schema::{DataType, SchemaRef};
 
 pub mod actions;
-mod checkpoint;
+pub mod checkpoint;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
@@ -393,7 +393,7 @@ trait EvaluationHandlerExtension: EvaluationHandler {
 }
 
 // Auto-implement the extension trait for all EvaluationHandlers
-impl<T: EvaluationHandler> EvaluationHandlerExtension for T {}
+impl<T: ?Sized + EvaluationHandler> EvaluationHandlerExtension for T {}
 
 /// Provides file system related functionalities to Delta Kernel.
 ///

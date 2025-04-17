@@ -4,9 +4,11 @@
 use std::borrow::Cow;
 use std::ops::Deref;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use url::Url;
 
+use crate::checkpoint::CheckpointWriter;
 use crate::snapshot::Snapshot;
 use crate::table_changes::TableChanges;
 use crate::transaction::Transaction;
@@ -96,6 +98,24 @@ impl Table {
             start_version,
             end_version.into(),
         )
+    }
+
+    /// Creates a [`CheckpointWriter`] for generating table checkpoints at the specified version.
+    ///
+    /// The checkpoint type is automatically determined based on the table's feature support:
+    /// - Tables supporting `v2Checkpoints` feature -> Creates a Classic-named V2 checkpoint
+    /// - Tables not supporting `v2Checkpoints` feature -> Creates a Classic-named V1 checkpoint
+    ///
+    /// See the [`crate::checkpoint`] module documentation for more details on checkpoint types
+    /// and the overall checkpoint process.    
+    pub fn checkpoint(
+        &self,
+        engine: &dyn Engine,
+        version: Option<Version>,
+    ) -> DeltaResult<CheckpointWriter> {
+        Ok(CheckpointWriter::new(Arc::new(
+            self.snapshot(engine, version)?,
+        )))
     }
 
     /// Create a new write transaction for this table.
