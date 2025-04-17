@@ -16,7 +16,9 @@ use crate::table_features::{
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{DeltaResult, EngineData, Error, FileMeta, RowVisitor as _};
+use crate::EvaluationHandlerExtension;
+use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, RowVisitor as _};
+
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
@@ -73,6 +75,13 @@ static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     StructType::new([Option::<CommitInfo>::get_struct_field(COMMIT_INFO_NAME)]).into()
 });
 
+static LOG_TXN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    StructType::new([Option::<SetTransaction>::get_struct_field(
+        SET_TRANSACTION_NAME,
+    )])
+    .into()
+});
+
 #[internal_api]
 pub(crate) fn get_log_schema() -> &'static SchemaRef {
     &LOG_SCHEMA
@@ -85,6 +94,10 @@ pub(crate) fn get_log_add_schema() -> &'static SchemaRef {
 
 pub(crate) fn get_log_commit_info_schema() -> &'static SchemaRef {
     &LOG_COMMIT_INFO_SCHEMA
+}
+
+pub(crate) fn get_log_txn_schema() -> &'static SchemaRef {
+    &LOG_TXN_SCHEMA
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
@@ -557,6 +570,26 @@ pub(crate) struct SetTransaction {
 
     /// The time when this transaction action was created in milliseconds since the Unix epoch.
     pub(crate) last_updated: Option<i64>,
+}
+
+impl SetTransaction {
+    pub(crate) fn new(app_id: String, version: i64, last_updated: Option<i64>) -> Self {
+        Self {
+            app_id,
+            version,
+            last_updated,
+        }
+    }
+
+    pub(crate) fn into_engine_data(self, engine: &dyn Engine) -> DeltaResult<Box<dyn EngineData>> {
+        let values = [
+            self.app_id.into(),
+            self.version.into(),
+            self.last_updated.into(),
+        ];
+        let evaluator = engine.evaluation_handler();
+        evaluator.create_one(get_log_txn_schema().clone(), &values)
+    }
 }
 
 /// The sidecar action references a sidecar file which provides some of the checkpoint's

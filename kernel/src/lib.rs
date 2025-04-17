@@ -393,7 +393,7 @@ trait EvaluationHandlerExtension: EvaluationHandler {
 }
 
 // Auto-implement the extension trait for all EvaluationHandlers
-impl<T: EvaluationHandler> EvaluationHandlerExtension for T {}
+impl<T: EvaluationHandler + ?Sized> EvaluationHandlerExtension for T {}
 
 /// Provides file system related functionalities to Delta Kernel.
 ///

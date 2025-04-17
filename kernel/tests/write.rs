@@ -7,6 +7,7 @@ use delta_kernel::arrow::array::{
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
+
 use itertools::Itertools;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
@@ -701,6 +702,125 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
                 true,
             _ => false,
         }));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
+    // setup tracing
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // create a simple table: one int column named 'number'
+    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )]));
+
+    for (table, engine, store, table_name) in setup_tables(schema, &[]).await? {
+        let commit_info = new_commit_info()?;
+
+        // can't have duplicate app_id in same transaction
+        assert!(matches!(
+            table
+                .new_transaction(&engine)?
+                .with_transaction_id("app_id1".to_string(), 0)
+                .with_transaction_id("app_id1".to_string(), 1)
+                .commit(&engine),
+            Err(KernelError::Generic(msg)) if msg == "app_id app_id1 already exists in transaction"
+        ));
+
+        let txn = table
+            .new_transaction(&engine)?
+            .with_commit_info(commit_info)
+            .with_transaction_id("app_id1".to_string(), 1)
+            .with_transaction_id("app_id2".to_string(), 2);
+
+        // commit!
+        txn.commit(&engine)?;
+
+        let commit1 = store
+            .get(&Path::from(format!(
+                "/{table_name}/_delta_log/00000000000000000001.json"
+            )))
+            .await?;
+
+        let mut parsed_commits: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
+            .into_iter::<serde_json::Value>()
+            .try_collect()?;
+
+        *parsed_commits[0]
+            .get_mut("commitInfo")
+            .unwrap()
+            .get_mut("timestamp")
+            .unwrap() = serde_json::Value::Number(0.into());
+
+        let time_ms: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+            .try_into()
+            .unwrap();
+
+        // check that last_updated times are identical
+        let last_updated1 = parsed_commits[1]
+            .get("txn")
+            .unwrap()
+            .get("lastUpdated")
+            .unwrap();
+        let last_updated2 = parsed_commits[2]
+            .get("txn")
+            .unwrap()
+            .get("lastUpdated")
+            .unwrap();
+        assert_eq!(last_updated1, last_updated2);
+
+        let last_updated = parsed_commits[1]
+            .get_mut("txn")
+            .unwrap()
+            .get_mut("lastUpdated")
+            .unwrap();
+        // sanity check that last_updated time is within 10s of now
+        assert!((last_updated.as_i64().unwrap() - time_ms).abs() < 10_000);
+        *last_updated = serde_json::Value::Number(1.into());
+
+        let last_updated = parsed_commits[2]
+            .get_mut("txn")
+            .unwrap()
+            .get_mut("lastUpdated")
+            .unwrap();
+        // sanity check that last_updated time is within 10s of now
+        assert!((last_updated.as_i64().unwrap() - time_ms).abs() < 10_000);
+        *last_updated = serde_json::Value::Number(2.into());
+
+        let expected_commit = vec![
+            json!({
+                "commitInfo": {
+                    "timestamp": 0,
+                    "operation": "UNKNOWN",
+                    "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
+                    "operationParameters": {},
+                    "engineCommitInfo": {
+                        "engineInfo": "default engine"
+                    }
+                }
+            }),
+            json!({
+                "txn": {
+                    "appId": "app_id1",
+                    "version": 1,
+                    "lastUpdated": 1
+                }
+            }),
+            json!({
+                "txn": {
+                    "appId": "app_id2",
+                    "version": 2,
+                    "lastUpdated": 2
+                }
+            }),
+        ];
+
+        assert_eq!(parsed_commits, expected_commit);
     }
     Ok(())
 }
