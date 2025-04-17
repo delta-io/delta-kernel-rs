@@ -12,7 +12,6 @@ pub(crate) struct SetTransactionScanner {
     snapshot: Arc<Snapshot>,
 }
 
-#[allow(dead_code)]
 impl SetTransactionScanner {
     pub(crate) fn new(snapshot: Arc<Snapshot>) -> Self {
         SetTransactionScanner { snapshot }
@@ -64,8 +63,8 @@ impl SetTransactionScanner {
         )
     }
 
-    /// Scan the Delta Log for the latest transaction entry of an application
-    pub(crate) fn application_transaction(
+    /// Scan the Delta Log for the latest `txn` action for an application id
+    pub(crate) fn latest_txn(
         &self,
         engine: &dyn Engine,
         application_id: &str,
@@ -74,11 +73,9 @@ impl SetTransactionScanner {
         Ok(transactions.remove(application_id))
     }
 
-    /// Scan the Delta Log to obtain the latest transaction for all applications
-    pub(crate) fn application_transactions(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<SetTransactionMap> {
+    /// Scan the Delta Log to obtain the all of the latest `txn` actions
+    #[allow(unused)]
+    pub(crate) fn latest_txn_map(&self, engine: &dyn Engine) -> DeltaResult<SetTransactionMap> {
         self.scan_application_transactions(engine, None)
     }
 }
@@ -105,8 +102,8 @@ mod tests {
         let txn_scan = SetTransactionScanner::new(snapshot.into());
 
         (
-            txn_scan.application_transactions(&engine).unwrap(),
-            txn_scan.application_transaction(&engine, app_id).unwrap(),
+            txn_scan.latest_txn_map(&engine).unwrap(),
+            txn_scan.latest_txn(&engine, app_id).unwrap(),
         )
     }
 

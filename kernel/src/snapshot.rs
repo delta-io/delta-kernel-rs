@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::{Metadata, Protocol};
 use crate::log_segment::{self, LogSegment};
 use crate::scan::ScanBuilder;
@@ -302,6 +303,17 @@ impl Snapshot {
     /// Consume this `Snapshot` to create a [`ScanBuilder`]
     pub fn into_scan_builder(self) -> ScanBuilder {
         ScanBuilder::new(self)
+    }
+
+    /// Fetch the latest version of the provided `application_id` for this snapshot.
+    pub fn latest_application_id_version(
+        self: Arc<Self>,
+        application_id: &str,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<i64>> {
+        let txn_scanner = SetTransactionScanner::new(self);
+        let txn = txn_scanner.latest_txn(engine, application_id)?;
+        Ok(txn.map(|t| t.version))
     }
 }
 
