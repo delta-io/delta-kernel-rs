@@ -12,9 +12,9 @@ pub(crate) mod parquet_stats_skipping;
 #[cfg(test)]
 mod tests;
 
-/// Evaluates a predicate expression tree against column names that resolve as scalars. Useful for
-/// testing/debugging but also serves as a reference implementation that documents the expression
-/// semantics that kernel relies on for data skipping.
+/// Uses kernel (not engine) logic to evaluate an expression tree against column names that resolve
+/// as scalars. Useful for testing/debugging but also serves as a reference implementation that
+/// documents the expression semantics that kernel relies on for data skipping.
 ///
 /// # Inverted expression semantics
 ///
