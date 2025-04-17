@@ -163,13 +163,15 @@ impl Transaction {
     /// Note that each app_id can only appear once per transaction. That is, multiple app_ids with
     /// different versions are disallowed in a single transaction. If a duplicate app_id is
     /// included, the `commit` will fail (that is, we don't eagerly check app_id validity here).
-    pub fn with_transaction_id(
-        mut self,
-        app_id: String,
-        version: i64,
-        last_updated: impl Into<Option<i64>>,
-    ) -> Self {
-        let set_transaction = SetTransaction::new(app_id, version, last_updated.into());
+    pub fn with_transaction_id(mut self, app_id: String, version: i64) -> Self {
+        let last_updated = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_millis()
+            .try_into()
+            // we can fit billions of years in i64
+            .expect("milliseconds since unix_epoch exceeded i64 size");
+        let set_transaction = SetTransaction::new(app_id, version, Some(last_updated));
         self.set_transactions.push(set_transaction);
         self
     }

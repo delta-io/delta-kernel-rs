@@ -707,7 +707,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 }
 
 #[tokio::test]
-async fn test_idempotent_writes() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -724,8 +724,8 @@ async fn test_idempotent_writes() -> Result<(), Box<dyn std::error::Error>> {
         assert!(matches!(
             table
                 .new_transaction(&engine)?
-                .with_transaction_id("app_id1".to_string(), 0, None)
-                .with_transaction_id("app_id1".to_string(), 1, None)
+                .with_transaction_id("app_id1".to_string(), 0)
+                .with_transaction_id("app_id1".to_string(), 1)
                 .commit(&engine),
             Err(KernelError::Generic(msg)) if msg == "app_id app_id1 already exists in transaction"
         ));
@@ -733,8 +733,8 @@ async fn test_idempotent_writes() -> Result<(), Box<dyn std::error::Error>> {
         let txn = table
             .new_transaction(&engine)?
             .with_commit_info(commit_info)
-            .with_transaction_id("app_id1".to_string(), 1, None)
-            .with_transaction_id("app_id2".to_string(), 2, 123456789);
+            .with_transaction_id("app_id1".to_string(), 1)
+            .with_transaction_id("app_id2".to_string(), 2);
 
         // commit!
         txn.commit(&engine)?;
@@ -755,6 +755,30 @@ async fn test_idempotent_writes() -> Result<(), Box<dyn std::error::Error>> {
             .get_mut("timestamp")
             .unwrap() = serde_json::Value::Number(0.into());
 
+        let time_ms: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+            .try_into()
+            .unwrap();
+
+        let last_updated = parsed_commits[1]
+            .get_mut("txn")
+            .unwrap()
+            .get_mut("lastUpdated")
+            .unwrap();
+        // sanity check that last_updated time is within 10s of now
+        assert!((last_updated.as_i64().unwrap() - time_ms).abs() < 10_000);
+        *last_updated = serde_json::Value::Number(1.into());
+
+        let last_updated = parsed_commits[2]
+            .get_mut("txn")
+            .unwrap()
+            .get_mut("lastUpdated")
+            .unwrap();
+        // sanity check that last_updated time is within 10s of now
+        assert!((last_updated.as_i64().unwrap() - time_ms).abs() < 10_000);
+        *last_updated = serde_json::Value::Number(2.into());
+
         let expected_commit = vec![
             json!({
                 "commitInfo": {
@@ -770,14 +794,15 @@ async fn test_idempotent_writes() -> Result<(), Box<dyn std::error::Error>> {
             json!({
                 "txn": {
                     "appId": "app_id1",
-                    "version": 1
+                    "version": 1,
+                    "lastUpdated": 1
                 }
             }),
             json!({
                 "txn": {
                     "appId": "app_id2",
                     "version": 2,
-                    "lastUpdated": 123456789
+                    "lastUpdated": 2
                 }
             }),
         ];
