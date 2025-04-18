@@ -739,6 +739,17 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         // commit!
         txn.commit(&engine)?;
 
+        let snapshot = Arc::new(table.snapshot(&engine, None)?);
+        assert_eq!(
+            snapshot.clone().get_app_id_version("app_id1", &engine)?,
+            Some(1)
+        );
+        assert_eq!(
+            snapshot.clone().get_app_id_version("app_id2", &engine)?,
+            Some(2)
+        );
+        assert_eq!(snapshot.get_app_id_version("app_id3", &engine)?, None);
+
         let commit1 = store
             .get(&Path::from(format!(
                 "/{table_name}/_delta_log/00000000000000000001.json"
