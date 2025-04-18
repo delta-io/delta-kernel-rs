@@ -359,9 +359,14 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
             } else if let Some(in_commit_timestamp) =
                 getters[16].get_long(i, "commitInfo.inCommitTimestamp")?
             {
-                if self.is_first_batch && i == 0 {
-                    *self.commit_timestamp = in_commit_timestamp;
-                }
+                require!(
+                    self.is_first_batch && i == 0,
+                    Error::InvalidCommitInfo(
+                        "When in-commit timestamps is enabled, CommitInfo must be the first action in a commit, \
+                        but found it in position {i} of the batch.".to_string()
+                    )
+                );
+                *self.commit_timestamp = in_commit_timestamp;
             }
         }
         Ok(())
