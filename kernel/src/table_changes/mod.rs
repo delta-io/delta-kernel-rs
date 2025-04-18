@@ -216,6 +216,7 @@ impl TableChanges {
     pub(crate) fn partition_columns(&self) -> &Vec<String> {
         &self.end_snapshot.metadata().partition_columns
     }
+
     /// Create a [`TableChangesScanBuilder`] for an `Arc<TableChanges>`.
     pub fn scan_builder(self: Arc<Self>) -> TableChangesScanBuilder {
         TableChangesScanBuilder::new(self)

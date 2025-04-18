@@ -190,6 +190,9 @@ impl ProcessedCdfCommit {
                 }
             }
             if metadata_changed {
+                // Currently, schema compatibility is defined as having equal schema types. In the
+                // future, more permissive schema evolution will be supported.
+                // See: https://github.com/delta-io/delta-kernel-rs/issues/523
                 require!(
                     *table_schema == table_configuration.schema(),
                     Error::change_data_feed_incompatible_schema(
