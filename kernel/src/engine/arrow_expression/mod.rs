@@ -15,15 +15,15 @@ use crate::arrow::datatypes::{
 use super::arrow_conversion::LIST_ARRAY_ROOT;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::error::{DeltaResult, Error};
-use crate::expressions::{Expression, Scalar};
+use crate::expressions::{Expression, Predicate, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
-use crate::{EngineData, EvaluationHandler, ExpressionEvaluator};
+use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
 
 use itertools::Itertools;
 use tracing::debug;
 
 use apply_schema::{apply_schema, apply_schema_to};
-use evaluate_expression::evaluate_expression;
+use evaluate_expression::{evaluate_expression, evaluate_predicate};
 
 mod apply_schema;
 mod evaluate_expression;
@@ -134,8 +134,19 @@ impl EvaluationHandler for ArrowEvaluationHandler {
     ) -> Arc<dyn ExpressionEvaluator> {
         Arc::new(DefaultExpressionEvaluator {
             input_schema: schema,
-            expression: Box::new(expression),
+            expression,
             output_type,
+        })
+    }
+
+    fn new_predicate_evaluator(
+        &self,
+        schema: SchemaRef,
+        predicate: Predicate,
+    ) -> Arc<dyn PredicateEvaluator> {
+        Arc::new(DefaultPredicateEvaluator {
+            input_schema: schema,
+            predicate,
         })
     }
 
@@ -156,16 +167,13 @@ impl EvaluationHandler for ArrowEvaluationHandler {
 #[derive(Debug)]
 pub struct DefaultExpressionEvaluator {
     input_schema: SchemaRef,
-    expression: Box<Expression>,
+    expression: Expression,
     output_type: DataType,
 }
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
-        debug!(
-            "Arrow evaluator evaluating: {:#?}",
-            self.expression.as_ref()
-        );
+        debug!("Arrow evaluator evaluating: {:#?}", self.expression);
         let batch = batch
             .any_ref()
             .downcast_ref::<ArrowEngineData>()
@@ -189,6 +197,40 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
             let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
             RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
         };
+        Ok(Box::new(ArrowEngineData::new(batch)))
+    }
+}
+
+#[derive(Debug)]
+pub struct DefaultPredicateEvaluator {
+    input_schema: SchemaRef,
+    predicate: Predicate,
+}
+
+impl PredicateEvaluator for DefaultPredicateEvaluator {
+    fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+        debug!("Arrow evaluator evaluating: {:#?}", self.predicate);
+        let batch = batch
+            .any_ref()
+            .downcast_ref::<ArrowEngineData>()
+            .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))?
+            .record_batch();
+        let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into()?;
+        // TODO: make sure we have matching schemas for validation
+        // if batch.schema().as_ref() != &input_schema {
+        //     return Err(Error::Generic(format!(
+        //         "input schema does not match batch schema: {:?} != {:?}",
+        //         input_schema,
+        //         batch.schema()
+        //     )));
+        // };
+        let array = evaluate_predicate(&self.predicate, batch)?;
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "output",
+            ArrowDataType::Boolean,
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])?;
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
 }

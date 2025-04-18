@@ -1,33 +1,39 @@
 //! Definitions and functions to create and manipulate kernel expressions
 
-use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 
 use itertools::Itertools;
 
 pub use self::column_names::{
-    column_expr, column_name, joined_column_expr, joined_column_name, ColumnName,
+    column_expr, column_name, column_pred, joined_column_expr, joined_column_name, ColumnName,
 };
 pub use self::scalars::{ArrayData, Scalar, StructData};
+use self::transforms::{ExpressionTransform as _, GetColumnReferences};
 use crate::DataType;
 
 mod column_names;
-mod scalars;
-
 pub(crate) mod literal_expression_transform;
+mod scalars;
+pub mod transforms;
 
+pub type ExpressionRef = std::sync::Arc<Expression>;
+pub type PredicateRef = std::sync::Arc<Predicate>;
+
+////////////////////////////////////////////////////////////////////////
+// Operators
+////////////////////////////////////////////////////////////////////////
+
+/// A unary predicate operator.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UnaryPredicateOp {
+    /// Unary Is Null
+    IsNull,
+}
+
+/// A binary predicate operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-/// A binary operator.
-pub enum BinaryOperator {
-    /// Arithmetic Plus
-    Plus,
-    /// Arithmetic Minus
-    Minus,
-    /// Arithmetic Multiply
-    Multiply,
-    /// Arithmetic Divide
-    Divide,
+pub enum BinaryPredicateOp {
     /// Comparison Less Than
     LessThan,
     /// Comparison Less Than Or Equal
@@ -48,127 +54,66 @@ pub enum BinaryOperator {
     NotIn,
 }
 
-impl BinaryOperator {
-    /// True if this is a comparison for which NULL input always produces NULL output
-    pub(crate) fn is_null_intolerant_comparison(&self) -> bool {
-        use BinaryOperator::*;
-        match self {
-            Plus | Minus | Multiply | Divide => false, // not a comparison
-            LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual => true,
-            Equal | NotEqual => true,
-            Distinct | In | NotIn => false, // tolerates NULL input
-        }
-    }
-
-    /// Returns `<op2>` (if any) such that `B <op2> A` is equivalent to `A <op> B`.
-    pub(crate) fn commute(&self) -> Option<BinaryOperator> {
-        use BinaryOperator::*;
-        match self {
-            GreaterThan => Some(LessThan),
-            GreaterThanOrEqual => Some(LessThanOrEqual),
-            LessThan => Some(GreaterThan),
-            LessThanOrEqual => Some(GreaterThanOrEqual),
-            Equal | NotEqual | Distinct | Plus | Multiply => Some(*self),
-            In | NotIn | Minus | Divide => None, // not commutative
-        }
-    }
+/// A binary expression operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BinaryExpressionOp {
+    /// Arithmetic Plus
+    Plus,
+    /// Arithmetic Minus
+    Minus,
+    /// Arithmetic Multiply
+    Multiply,
+    /// Arithmetic Divide
+    Divide,
 }
 
+/// A junction (AND/OR) predicate operator.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum JunctionOperator {
+pub enum JunctionPredicateOp {
     /// Conjunction
     And,
     /// Disjunction
     Or,
 }
 
-impl JunctionOperator {
-    pub(crate) fn invert(&self) -> JunctionOperator {
-        use JunctionOperator::*;
-        match self {
-            And => Or,
-            Or => And,
-        }
-    }
-}
-
-impl Display for BinaryOperator {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        use BinaryOperator::*;
-        match self {
-            Plus => write!(f, "+"),
-            Minus => write!(f, "-"),
-            Multiply => write!(f, "*"),
-            Divide => write!(f, "/"),
-            LessThan => write!(f, "<"),
-            LessThanOrEqual => write!(f, "<="),
-            GreaterThan => write!(f, ">"),
-            GreaterThanOrEqual => write!(f, ">="),
-            Equal => write!(f, "="),
-            NotEqual => write!(f, "!="),
-            // TODO(roeap): AFAIK DISTINCT does not have a commonly used operator symbol
-            // so ideally this would not be used as we use Display for rendering expressions
-            // in our code we take care of this, but theirs might not ...
-            Distinct => write!(f, "DISTINCT"),
-            In => write!(f, "IN"),
-            NotIn => write!(f, "NOT IN"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-/// A unary operator.
-pub enum UnaryOperator {
-    /// Unary Not
-    Not,
-    /// Unary Is Null
-    IsNull,
-}
-
-pub type ExpressionRef = std::sync::Arc<Expression>;
+////////////////////////////////////////////////////////////////////////
+// Expressions and predicates
+////////////////////////////////////////////////////////////////////////
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct UnaryExpression {
+pub struct UnaryPredicate {
     /// The operator.
-    pub op: UnaryOperator,
-    /// The expression.
+    pub op: UnaryPredicateOp,
+    /// The input expression.
     pub expr: Box<Expression>,
 }
-impl UnaryExpression {
-    fn new(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
-        let expr = Box::new(expr.into());
-        Self { op, expr }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct BinaryExpression {
+pub struct BinaryPredicate {
     /// The operator.
-    pub op: BinaryOperator,
+    pub op: BinaryPredicateOp,
     /// The left-hand side of the operation.
     pub left: Box<Expression>,
     /// The right-hand side of the operation.
     pub right: Box<Expression>,
 }
-impl BinaryExpression {
-    fn new(op: BinaryOperator, left: impl Into<Expression>, right: impl Into<Expression>) -> Self {
-        let left = Box::new(left.into());
-        let right = Box::new(right.into());
-        Self { op, left, right }
-    }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BinaryExpression {
+    /// The operator.
+    pub op: BinaryExpressionOp,
+    /// The left-hand side of the operation.
+    pub left: Box<Expression>,
+    /// The right-hand side of the operation.
+    pub right: Box<Expression>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct JunctionExpression {
+pub struct JunctionPredicate {
     /// The operator.
-    pub op: JunctionOperator,
-    /// The expressions.
-    pub exprs: Vec<Expression>,
-}
-impl JunctionExpression {
-    fn new(op: JunctionOperator, exprs: Vec<Expression>) -> Self {
-        Self { op, exprs }
-    }
+    pub op: JunctionPredicateOp,
+    /// The input predicates.
+    pub preds: Vec<Predicate>,
 }
 
 /// A SQL expression.
@@ -182,59 +127,111 @@ pub enum Expression {
     Literal(Scalar),
     /// A column reference by name.
     Column(ColumnName),
+    /// A predicate treated as a boolean expression
+    Predicate(Box<Predicate>),
     /// A struct computed from a Vec of expressions
     Struct(Vec<Expression>),
-    /// A unary operation.
-    Unary(UnaryExpression),
-    /// A binary operation.
+    /// An expression that takes two expressions as input.
     Binary(BinaryExpression),
+}
+
+/// A SQL predicate.
+///
+/// These predicates do not track or validate data types, other than the type
+/// of literals. It is up to the predicate evaluator to validate the
+/// predicate against a schema and add appropriate casts as required.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Predicate {
+    /// A boolean-valued expression, useful for e.g. `AND(<boolean_col1>, <boolean_col2>)`.
+    BooleanExpression(Expression),
+    /// Boolean inversion (true <-> false)
+    ///
+    /// NOTE: NOT is not a normal unary predicate, because it requires a predicate as input (not an
+    /// expression), and is never directly evaluated. Instead, observing that all predicates are
+    /// invertible, NOT is always pushed down into its child predicate, inverting it. For example,
+    /// `NOT (a < b)` pushes down and inverts `<` to `>=`, producing `a >= b`.
+    Not(Box<Predicate>),
+    /// A unary operation.
+    Unary(UnaryPredicate),
+    /// A binary operation.
+    Binary(BinaryPredicate),
     /// A junction operation (AND/OR).
-    Junction(JunctionExpression),
-    // TODO: support more expressions, such as IS IN, LIKE, etc.
+    Junction(JunctionPredicate),
 }
 
-impl<T: Into<Scalar>> From<T> for Expression {
-    fn from(value: T) -> Self {
-        Self::literal(value)
-    }
-}
+////////////////////////////////////////////////////////////////////////
+// Struct/Enum impls
+////////////////////////////////////////////////////////////////////////
 
-impl From<ColumnName> for Expression {
-    fn from(value: ColumnName) -> Self {
-        Self::Column(value)
-    }
-}
-
-impl Display for Expression {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        use Expression::*;
+impl BinaryPredicateOp {
+    /// True if this is a comparison for which NULL input always produces NULL output
+    pub(crate) fn is_null_intolerant(&self) -> bool {
+        use BinaryPredicateOp::*;
         match self {
-            Literal(l) => write!(f, "{l}"),
-            Column(name) => write!(f, "Column({name})"),
-            Struct(exprs) => write!(
-                f,
-                "Struct({})",
-                &exprs.iter().map(|e| format!("{e}")).join(", ")
-            ),
-            Binary(BinaryExpression {
-                op: BinaryOperator::Distinct,
-                left,
-                right,
-            }) => write!(f, "DISTINCT({left}, {right})"),
-            Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
-            Unary(UnaryExpression { op, expr }) => match op {
-                UnaryOperator::Not => write!(f, "NOT {expr}"),
-                UnaryOperator::IsNull => write!(f, "{expr} IS NULL"),
-            },
-            Junction(JunctionExpression { op, exprs }) => {
-                let exprs = &exprs.iter().map(|e| format!("{e}")).join(", ");
-                let op = match op {
-                    JunctionOperator::And => "AND",
-                    JunctionOperator::Or => "OR",
-                };
-                write!(f, "{op}({exprs})")
-            }
+            LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual => true,
+            Equal | NotEqual => true,
+            Distinct | In | NotIn => false, // tolerates NULL input
         }
+    }
+
+    /// Returns `<op2>` (if any) such that `B <op2> A` is equivalent to `A <op> B`.
+    pub(crate) fn commute(&self) -> Option<BinaryPredicateOp> {
+        use BinaryPredicateOp::*;
+        match self {
+            GreaterThan => Some(LessThan),
+            GreaterThanOrEqual => Some(LessThanOrEqual),
+            LessThan => Some(GreaterThan),
+            LessThanOrEqual => Some(GreaterThanOrEqual),
+            Equal | NotEqual | Distinct => Some(*self),
+            In | NotIn => None, // not commutative
+        }
+    }
+}
+
+impl JunctionPredicateOp {
+    pub(crate) fn invert(&self) -> JunctionPredicateOp {
+        use JunctionPredicateOp::*;
+        match self {
+            And => Or,
+            Or => And,
+        }
+    }
+}
+
+impl UnaryPredicate {
+    fn new(op: UnaryPredicateOp, expr: impl Into<Expression>) -> Self {
+        let expr = Box::new(expr.into());
+        Self { op, expr }
+    }
+}
+
+impl BinaryExpression {
+    fn new(
+        op: BinaryExpressionOp,
+        left: impl Into<Expression>,
+        right: impl Into<Expression>,
+    ) -> Self {
+        let left = Box::new(left.into());
+        let right = Box::new(right.into());
+        Self { op, left, right }
+    }
+}
+
+impl BinaryPredicate {
+    fn new(
+        op: BinaryPredicateOp,
+        left: impl Into<Expression>,
+        right: impl Into<Expression>,
+    ) -> Self {
+        let left = Box::new(left.into());
+        let right = Box::new(right.into());
+        Self { op, left, right }
+    }
+}
+
+impl JunctionPredicate {
+    fn new(op: JunctionPredicateOp, preds: Vec<Predicate>) -> Self {
+        Self { op, preds }
     }
 }
 
@@ -242,7 +239,7 @@ impl Expression {
     /// Returns a set of columns referenced by this expression.
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();
-        let _ = references.transform(self);
+        let _ = references.transform_expr(self);
         references.into_inner()
     }
 
@@ -264,20 +261,67 @@ impl Expression {
         Self::Literal(Scalar::Null(data_type))
     }
 
+    /// Wraps a predicate as a boolean-valued expression
+    pub fn predicate(value: Predicate) -> Self {
+        match value {
+            Predicate::BooleanExpression(expr) => expr,
+            _ => Self::Predicate(value.into()),
+        }
+    }
+
     /// Create a new struct expression
     pub fn struct_from(exprs: impl IntoIterator<Item = Self>) -> Self {
         Self::Struct(exprs.into_iter().collect())
     }
 
-    /// Creates a new unary expression OP expr
-    pub fn unary(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
-        let expr = Box::new(expr.into());
-        Self::Unary(UnaryExpression { op, expr })
+    /// Create a new predicate `self IS NULL`
+    pub fn is_null(self) -> Predicate {
+        Predicate::is_null(self)
+    }
+
+    /// Create a new predicate `self IS NOT NULL`
+    pub fn is_not_null(self) -> Predicate {
+        Predicate::is_not_null(self)
+    }
+
+    /// Create a new predicate `self == other`
+    pub fn eq(self, other: impl Into<Self>) -> Predicate {
+        Predicate::eq(self, other)
+    }
+
+    /// Create a new predicate `self != other`
+    pub fn ne(self, other: impl Into<Self>) -> Predicate {
+        Predicate::ne(self, other)
+    }
+
+    /// Create a new predicate `self <= other`
+    pub fn le(self, other: impl Into<Self>) -> Predicate {
+        Predicate::le(self, other)
+    }
+
+    /// Create a new predicate `self < other`
+    pub fn lt(self, other: impl Into<Self>) -> Predicate {
+        Predicate::lt(self, other)
+    }
+
+    /// Create a new predicate `self >= other`
+    pub fn ge(self, other: impl Into<Self>) -> Predicate {
+        Predicate::ge(self, other)
+    }
+
+    /// Create a new predicate `self > other`
+    pub fn gt(self, other: impl Into<Self>) -> Predicate {
+        Predicate::gt(self, other)
+    }
+
+    /// Create a new predicate `DISTINCT(self, other)`
+    pub fn distinct(self, other: impl Into<Self>) -> Predicate {
+        Predicate::distinct(self, other)
     }
 
     /// Creates a new binary expression lhs OP rhs
     pub fn binary(
-        op: BinaryOperator,
+        op: BinaryExpressionOp,
         lhs: impl Into<Expression>,
         rhs: impl Into<Expression>,
     ) -> Self {
@@ -287,264 +331,239 @@ impl Expression {
             right: Box::new(rhs.into()),
         })
     }
+}
 
-    /// Creates a new junction expression OP(exprs...)
-    pub fn junction(op: JunctionOperator, exprs: impl IntoIterator<Item = Self>) -> Self {
-        let exprs = exprs.into_iter().collect();
-        Self::Junction(JunctionExpression { op, exprs })
+impl Predicate {
+    /// Returns a set of columns referenced by this predicate.
+    pub fn references(&self) -> HashSet<&ColumnName> {
+        let mut references = GetColumnReferences::default();
+        let _ = references.transform_pred(self);
+        references.into_inner()
     }
 
-    /// Creates a new expression AND(exprs...)
-    pub fn and_from(exprs: impl IntoIterator<Item = Self>) -> Self {
-        Self::junction(JunctionOperator::And, exprs)
+    /// Creates a new boolean column reference. See also [`Expression::column`].
+    pub fn column<A>(field_names: impl IntoIterator<Item = A>) -> Predicate
+    where
+        ColumnName: FromIterator<A>,
+    {
+        Self::from_expr(ColumnName::new(field_names))
     }
 
-    /// Creates a new expression OR(exprs...)
-    pub fn or_from(exprs: impl IntoIterator<Item = Self>) -> Self {
-        Self::junction(JunctionOperator::Or, exprs)
+    /// Create a new literal boolean value
+    pub const fn literal(value: bool) -> Self {
+        Self::BooleanExpression(Expression::Literal(Scalar::Boolean(value)))
+    }
+
+    /// Creates a NULL literal boolean value
+    pub const fn null_literal() -> Self {
+        Self::BooleanExpression(Expression::Literal(Scalar::Null(DataType::BOOLEAN)))
+    }
+
+    /// Converts a boolean-valued expression into a predicate
+    pub fn from_expr(expr: impl Into<Expression>) -> Self {
+        match expr.into() {
+            Expression::Predicate(p) => *p,
+            expr => Predicate::BooleanExpression(expr),
+        }
     }
 
     /// Logical NOT (boolean inversion)
-    pub fn not(expr: impl Into<Self>) -> Self {
-        Self::unary(UnaryOperator::Not, expr.into())
+    pub fn not(pred: impl Into<Self>) -> Self {
+        Self::Not(pred.into().into())
     }
 
-    /// Create a new expression `self IS NULL`
-    pub fn is_null(self) -> Self {
-        Self::unary(UnaryOperator::IsNull, self)
+    /// Create a new predicate `self IS NULL`
+    pub fn is_null(expr: impl Into<Expression>) -> Predicate {
+        Self::unary(UnaryPredicateOp::IsNull, expr)
     }
 
-    /// Create a new expression `self IS NOT NULL`
-    pub fn is_not_null(self) -> Self {
-        Self::not(Self::is_null(self))
+    /// Create a new predicate `self IS NOT NULL`
+    pub fn is_not_null(expr: impl Into<Expression>) -> Predicate {
+        Self::not(Self::is_null(expr))
     }
 
-    /// Create a new expression `self == other`
-    pub fn eq(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::Equal, self, other)
+    /// Create a new predicate `self == other`
+    pub fn eq(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::Equal, a, b)
     }
 
-    /// Create a new expression `self != other`
-    pub fn ne(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::NotEqual, self, other)
+    /// Create a new predicate `self != other`
+    pub fn ne(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::NotEqual, a, b)
     }
 
-    /// Create a new expression `self <= other`
-    pub fn le(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::LessThanOrEqual, self, other)
+    /// Create a new predicate `self <= other`
+    pub fn le(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::LessThanOrEqual, a, b)
     }
 
-    /// Create a new expression `self < other`
-    pub fn lt(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::LessThan, self, other)
+    /// Create a new predicate `self < other`
+    pub fn lt(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::LessThan, a, b)
     }
 
-    /// Create a new expression `self >= other`
-    pub fn ge(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::GreaterThanOrEqual, self, other)
+    /// Create a new predicate `self >= other`
+    pub fn ge(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::GreaterThanOrEqual, a, b)
     }
 
-    /// Create a new expression `self > other`
-    pub fn gt(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::GreaterThan, self, other)
+    /// Create a new predicate `self > other`
+    pub fn gt(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::GreaterThan, a, b)
     }
 
-    /// Create a new expression `self >= other`
-    pub fn gt_eq(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::GreaterThanOrEqual, self, other)
+    /// Create a new predicate `DISTINCT(self, other)`
+    pub fn distinct(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::Distinct, a, b)
     }
 
-    /// Create a new expression `self <= other`
-    pub fn lt_eq(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::LessThanOrEqual, self, other)
-    }
-
-    /// Create a new expression `self AND other`
+    /// Create a new predicate `self AND other`
     pub fn and(a: impl Into<Self>, b: impl Into<Self>) -> Self {
         Self::and_from([a.into(), b.into()])
     }
 
-    /// Create a new expression `self OR other`
+    /// Create a new predicate `self OR other`
     pub fn or(a: impl Into<Self>, b: impl Into<Self>) -> Self {
         Self::or_from([a.into(), b.into()])
     }
 
-    /// Create a new expression `DISTINCT(self, other)`
-    pub fn distinct(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::Distinct, self, other)
+    /// Creates a new predicate AND(preds...)
+    pub fn and_from(preds: impl IntoIterator<Item = Self>) -> Self {
+        Self::junction(JunctionPredicateOp::And, preds)
+    }
+
+    /// Creates a new predicate OR(preds...)
+    pub fn or_from(preds: impl IntoIterator<Item = Self>) -> Self {
+        Self::junction(JunctionPredicateOp::Or, preds)
+    }
+
+    /// Creates a new unary predicate OP expr
+    pub fn unary(op: UnaryPredicateOp, expr: impl Into<Expression>) -> Self {
+        let expr = Box::new(expr.into());
+        Self::Unary(UnaryPredicate { op, expr })
+    }
+
+    /// Creates a new binary predicate lhs OP rhs
+    pub fn binary(
+        op: BinaryPredicateOp,
+        lhs: impl Into<Expression>,
+        rhs: impl Into<Expression>,
+    ) -> Self {
+        Self::Binary(BinaryPredicate {
+            op,
+            left: Box::new(lhs.into()),
+            right: Box::new(rhs.into()),
+        })
+    }
+
+    /// Creates a new junction predicate OP(preds...)
+    pub fn junction(op: JunctionPredicateOp, preds: impl IntoIterator<Item = Self>) -> Self {
+        let preds = preds.into_iter().collect();
+        Self::Junction(JunctionPredicate { op, preds })
     }
 }
 
-/// Generic framework for recursive bottom-up expression transforms. Transformations return
-/// `Option<Cow>` with the following semantics:
-///
-/// * `Some(Cow::Owned)` -- The input was transformed and the parent should be updated with it.
-/// * `Some(Cow::Borrowed)` -- The input was not transformed.
-/// * `None` -- The input was filtered out and the parent should be updated to not reference it.
-///
-/// The transform can start from the generic [`Self::transform`], or directly from a specific
-/// expression variant (e.g. [`Self::transform_binary`] to start with [`BinaryExpression`]).
-///
-/// The provided `transform_xxx` methods all default to no-op (returning their input as
-/// `Some(Cow::Borrowed)`), and implementations should selectively override specific `transform_xxx`
-/// methods as needed for the task at hand.
-///
-/// The provided `recurse_into_xxx` methods encapsulate the boilerplate work of recursing into the
-/// children of each expression variant. Implementations can call these as needed but will generally
-/// not need to override them.
-pub trait ExpressionTransform<'a> {
-    /// Called for each literal encountered during the expression traversal.
-    fn transform_literal(&mut self, value: &'a Scalar) -> Option<Cow<'a, Scalar>> {
-        Some(Cow::Borrowed(value))
-    }
+////////////////////////////////////////////////////////////////////////
+// Trait impls
+////////////////////////////////////////////////////////////////////////
 
-    /// Called for each column reference encountered during the expression traversal.
-    fn transform_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        Some(Cow::Borrowed(name))
-    }
-
-    /// Called for the expression list of each [`Expression::Struct`] encountered during the
-    /// traversal. Implementations can call [`Self::recurse_into_struct`] if they wish to
-    /// recursively transform child expressions.
-    fn transform_struct(
-        &mut self,
-        fields: &'a Vec<Expression>,
-    ) -> Option<Cow<'a, Vec<Expression>>> {
-        self.recurse_into_struct(fields)
-    }
-
-    /// Called for each [`UnaryExpression`] encountered during the traversal. Implementations can
-    /// call [`Self::recurse_into_unary`] if they wish to recursively transform the child.
-    fn transform_unary(&mut self, expr: &'a UnaryExpression) -> Option<Cow<'a, UnaryExpression>> {
-        self.recurse_into_unary(expr)
-    }
-
-    /// Called for each [`BinaryExpression`] encountered during the traversal. Implementations can
-    /// call [`Self::recurse_into_binary`] if they wish to recursively transform the children.
-    fn transform_binary(
-        &mut self,
-        expr: &'a BinaryExpression,
-    ) -> Option<Cow<'a, BinaryExpression>> {
-        self.recurse_into_binary(expr)
-    }
-
-    /// Called for each [`JunctionExpression`] encountered during the traversal. Implementations can
-    /// call [`Self::recurse_into_junction`] if they wish to recursively transform the children.
-    fn transform_junction(
-        &mut self,
-        expr: &'a JunctionExpression,
-    ) -> Option<Cow<'a, JunctionExpression>> {
-        self.recurse_into_junction(expr)
-    }
-
-    /// General entry point for transforming an expression. This method will dispatch to the
-    /// specific transform for each expression variant. Also invoked internally in order to recurse
-    /// on the child(ren) of non-leaf variants.
-    fn transform(&mut self, expr: &'a Expression) -> Option<Cow<'a, Expression>> {
-        use Cow::*;
-        let expr = match expr {
-            Expression::Literal(s) => match self.transform_literal(s)? {
-                Owned(s) => Owned(Expression::Literal(s)),
-                Borrowed(_) => Borrowed(expr),
-            },
-            Expression::Column(c) => match self.transform_column(c)? {
-                Owned(c) => Owned(Expression::Column(c)),
-                Borrowed(_) => Borrowed(expr),
-            },
-            Expression::Struct(s) => match self.transform_struct(s)? {
-                Owned(s) => Owned(Expression::Struct(s)),
-                Borrowed(_) => Borrowed(expr),
-            },
-            Expression::Unary(u) => match self.transform_unary(u)? {
-                Owned(u) => Owned(Expression::Unary(u)),
-                Borrowed(_) => Borrowed(expr),
-            },
-            Expression::Binary(b) => match self.transform_binary(b)? {
-                Owned(b) => Owned(Expression::Binary(b)),
-                Borrowed(_) => Borrowed(expr),
-            },
-            Expression::Junction(j) => match self.transform_junction(j)? {
-                Owned(j) => Owned(Expression::Junction(j)),
-                Borrowed(_) => Borrowed(expr),
-            },
-        };
-        Some(expr)
-    }
-
-    /// Recursively transforms a struct's child expressions. Returns `None` if all children were
-    /// removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
-    /// `Some(Cow::Borrowed)` otherwise.
-    fn recurse_into_struct(
-        &mut self,
-        fields: &'a Vec<Expression>,
-    ) -> Option<Cow<'a, Vec<Expression>>> {
-        let mut num_borrowed = 0;
-        let new_fields: Vec<_> = fields
-            .iter()
-            .filter_map(|f| self.transform(f))
-            .inspect(|f| {
-                if matches!(f, Cow::Borrowed(_)) {
-                    num_borrowed += 1;
-                }
-            })
-            .collect();
-
-        if new_fields.is_empty() {
-            None // all fields filtered out
-        } else if num_borrowed < fields.len() {
-            // At least one field was changed or filtered out, so make a new field list
-            let fields = new_fields.into_iter().map(|f| f.into_owned()).collect();
-            Some(Cow::Owned(fields))
-        } else {
-            Some(Cow::Borrowed(fields))
+impl Display for BinaryExpressionOp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use BinaryExpressionOp::*;
+        match self {
+            Plus => write!(f, "+"),
+            Minus => write!(f, "-"),
+            Multiply => write!(f, "*"),
+            Divide => write!(f, "/"),
         }
     }
+}
 
-    /// Recursively transforms a unary expression's child. Returns `None` if the child was removed,
-    /// `Some(Cow::Owned)` if the child was changed, and `Some(Cow::Borrowed)` otherwise.
-    fn recurse_into_unary(&mut self, u: &'a UnaryExpression) -> Option<Cow<'a, UnaryExpression>> {
-        use Cow::*;
-        let u = match self.transform(&u.expr)? {
-            Owned(expr) => Owned(UnaryExpression::new(u.op, expr)),
-            Borrowed(_) => Borrowed(u),
-        };
-        Some(u)
+impl Display for BinaryPredicateOp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use BinaryPredicateOp::*;
+        match self {
+            LessThan => write!(f, "<"),
+            LessThanOrEqual => write!(f, "<="),
+            GreaterThan => write!(f, ">"),
+            GreaterThanOrEqual => write!(f, ">="),
+            Equal => write!(f, "="),
+            NotEqual => write!(f, "!="),
+            // TODO(roeap): AFAIK DISTINCT does not have a commonly used operator symbol
+            // so ideally this would not be used as we use Display for rendering expressions
+            // in our code we take care of this, but theirs might not ...
+            Distinct => write!(f, "DISTINCT"),
+            In => write!(f, "IN"),
+            NotIn => write!(f, "NOT IN"),
+        }
     }
+}
 
-    /// Recursively transforms a binary expression's children. Returns `None` if at least one child
-    /// was removed, `Some(Cow::Owned)` if at least one child changed, and `Some(Cow::Borrowed)`
-    /// otherwise.
-    fn recurse_into_binary(
-        &mut self,
-        b: &'a BinaryExpression,
-    ) -> Option<Cow<'a, BinaryExpression>> {
-        use Cow::*;
-        let left = self.transform(&b.left)?;
-        let right = self.transform(&b.right)?;
-        let b = match (&left, &right) {
-            (Borrowed(_), Borrowed(_)) => Borrowed(b),
-            _ => Owned(BinaryExpression::new(
-                b.op,
-                left.into_owned(),
-                right.into_owned(),
-            )),
-        };
-        Some(b)
+impl Display for Expression {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use Expression::*;
+        match self {
+            Literal(l) => write!(f, "{l}"),
+            Column(name) => write!(f, "Column({name})"),
+            Predicate(p) => write!(f, "{p}"),
+            Struct(exprs) => write!(
+                f,
+                "Struct({})",
+                &exprs.iter().map(|e| format!("{e}")).join(", ")
+            ),
+            Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
+        }
     }
+}
 
-    /// Recursively transforms a junction expression's children. Returns `None` if all children were
-    /// removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
-    /// `Some(Cow::Borrowed)` otherwise.
-    fn recurse_into_junction(
-        &mut self,
-        j: &'a JunctionExpression,
-    ) -> Option<Cow<'a, JunctionExpression>> {
-        use Cow::*;
-        let j = match self.recurse_into_struct(&j.exprs)? {
-            Owned(exprs) => Owned(JunctionExpression::new(j.op, exprs)),
-            Borrowed(_) => Borrowed(j),
-        };
-        Some(j)
+impl Display for Predicate {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use Predicate::*;
+        match self {
+            BooleanExpression(expr) => write!(f, "{expr}"),
+            Not(pred) => write!(f, "NOT({pred})"),
+            Binary(BinaryPredicate {
+                op: BinaryPredicateOp::Distinct,
+                left,
+                right,
+            }) => write!(f, "DISTINCT({left}, {right})"),
+            Binary(BinaryPredicate { op, left, right }) => write!(f, "{left} {op} {right}"),
+            Unary(UnaryPredicate { op, expr }) => match op {
+                UnaryPredicateOp::IsNull => write!(f, "{expr} IS NULL"),
+            },
+            Junction(JunctionPredicate { op, preds }) => {
+                let preds = &preds.iter().map(|p| format!("{p}")).join(", ");
+                let op = match op {
+                    JunctionPredicateOp::And => "AND",
+                    JunctionPredicateOp::Or => "OR",
+                };
+                write!(f, "{op}({preds})")
+            }
+        }
+    }
+}
+
+impl From<Scalar> for Expression {
+    fn from(value: Scalar) -> Self {
+        Self::literal(value)
+    }
+}
+
+impl From<ColumnName> for Expression {
+    fn from(value: ColumnName) -> Self {
+        Self::Column(value)
+    }
+}
+
+impl From<Predicate> for Expression {
+    fn from(value: Predicate) -> Self {
+        Self::predicate(value)
+    }
+}
+
+impl From<ColumnName> for Predicate {
+    fn from(value: ColumnName) -> Self {
+        Self::from_expr(value)
     }
 }
 
@@ -552,7 +571,7 @@ impl<R: Into<Expression>> std::ops::Add<R> for Expression {
     type Output = Self;
 
     fn add(self, rhs: R) -> Self::Output {
-        Self::binary(BinaryOperator::Plus, self, rhs)
+        Self::binary(BinaryExpressionOp::Plus, self, rhs)
     }
 }
 
@@ -560,7 +579,7 @@ impl<R: Into<Expression>> std::ops::Sub<R> for Expression {
     type Output = Self;
 
     fn sub(self, rhs: R) -> Self {
-        Self::binary(BinaryOperator::Minus, self, rhs)
+        Self::binary(BinaryExpressionOp::Minus, self, rhs)
     }
 }
 
@@ -568,7 +587,7 @@ impl<R: Into<Expression>> std::ops::Mul<R> for Expression {
     type Output = Self;
 
     fn mul(self, rhs: R) -> Self {
-        Self::binary(BinaryOperator::Multiply, self, rhs)
+        Self::binary(BinaryExpressionOp::Multiply, self, rhs)
     }
 }
 
@@ -576,138 +595,26 @@ impl<R: Into<Expression>> std::ops::Div<R> for Expression {
     type Output = Self;
 
     fn div(self, rhs: R) -> Self {
-        Self::binary(BinaryOperator::Divide, self, rhs)
-    }
-}
-
-/// Retrieves the set of column names referenced by an expression.
-#[derive(Default)]
-pub(crate) struct GetColumnReferences<'a> {
-    references: HashSet<&'a ColumnName>,
-}
-
-impl<'a> GetColumnReferences<'a> {
-    pub(crate) fn into_inner(self) -> HashSet<&'a ColumnName> {
-        self.references
-    }
-}
-
-impl<'a> ExpressionTransform<'a> for GetColumnReferences<'a> {
-    fn transform_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        self.references.insert(name);
-        Some(Cow::Borrowed(name))
-    }
-}
-
-/// An expression "transform" that doesn't actually change the expression at all. Instead, it
-/// measures the maximum depth of a expression, with a depth limit to prevent stack overflow. Useful
-/// for verifying that a expression has reasonable depth before attempting to work with it.
-pub struct ExpressionDepthChecker {
-    depth_limit: usize,
-    max_depth_seen: usize,
-    current_depth: usize,
-    call_count: usize,
-}
-impl ExpressionDepthChecker {
-    /// Depth-checks the given expression against a given depth limit. The return value is the
-    /// largest depth seen, which is capped at one more than the depth limit (indicating the
-    /// recursion was terminated).
-    pub fn check(expr: &Expression, depth_limit: usize) -> usize {
-        Self::check_with_call_count(expr, depth_limit).0
-    }
-
-    // Exposed for testing
-    fn check_with_call_count(expr: &Expression, depth_limit: usize) -> (usize, usize) {
-        let mut checker = Self {
-            depth_limit,
-            max_depth_seen: 0,
-            current_depth: 0,
-            call_count: 0,
-        };
-        checker.transform(expr);
-        (checker.max_depth_seen, checker.call_count)
-    }
-
-    // Triggers the requested recursion only doing so would not exceed the depth limit.
-    fn depth_limited<'a, T: Clone + std::fmt::Debug>(
-        &mut self,
-        recurse: impl FnOnce(&mut Self, &'a T) -> Option<Cow<'a, T>>,
-        arg: &'a T,
-    ) -> Option<Cow<'a, T>> {
-        self.call_count += 1;
-        if self.max_depth_seen < self.current_depth {
-            self.max_depth_seen = self.current_depth;
-            if self.depth_limit < self.current_depth {
-                tracing::warn!(
-                    "Max expression depth {} exceeded by {arg:?}",
-                    self.depth_limit
-                );
-            }
-        }
-        if self.max_depth_seen <= self.depth_limit {
-            self.current_depth += 1;
-            let _ = recurse(self, arg);
-            self.current_depth -= 1;
-        }
-        None
-    }
-}
-impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
-    fn transform_struct(
-        &mut self,
-        fields: &'a Vec<Expression>,
-    ) -> Option<Cow<'a, Vec<Expression>>> {
-        self.depth_limited(Self::recurse_into_struct, fields)
-    }
-
-    fn transform_unary(&mut self, expr: &'a UnaryExpression) -> Option<Cow<'a, UnaryExpression>> {
-        self.depth_limited(Self::recurse_into_unary, expr)
-    }
-
-    fn transform_binary(
-        &mut self,
-        expr: &'a BinaryExpression,
-    ) -> Option<Cow<'a, BinaryExpression>> {
-        self.depth_limited(Self::recurse_into_binary, expr)
-    }
-
-    fn transform_junction(
-        &mut self,
-        expr: &'a JunctionExpression,
-    ) -> Option<Cow<'a, JunctionExpression>> {
-        self.depth_limited(Self::recurse_into_junction, expr)
+        Self::binary(BinaryExpressionOp::Divide, self, rhs)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{column_expr, Expression as Expr, ExpressionDepthChecker};
+    use super::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
 
     #[test]
     fn test_expression_format() {
-        let col_ref = column_expr!("x");
         let cases = [
-            (col_ref.clone(), "Column(x)"),
-            (col_ref.clone().eq(2), "Column(x) = 2"),
-            ((col_ref.clone() - 4).lt(10), "Column(x) - 4 < 10"),
-            ((col_ref.clone() + 4) / 10 * 42, "Column(x) + 4 / 10 * 42"),
+            (column_expr!("x"), "Column(x)"),
             (
-                Expr::and(col_ref.clone().gt_eq(2), col_ref.clone().lt_eq(10)),
-                "AND(Column(x) >= 2, Column(x) <= 10)",
+                (column_expr!("x") + Expr::literal(4)) / Expr::literal(10) * Expr::literal(42),
+                "Column(x) + 4 / 10 * 42",
             ),
             (
-                Expr::and_from([
-                    col_ref.clone().gt_eq(2),
-                    col_ref.clone().lt_eq(10),
-                    col_ref.clone().lt_eq(100),
-                ]),
-                "AND(Column(x) >= 2, Column(x) <= 10, Column(x) <= 100)",
+                Expr::struct_from([column_expr!("x"), Expr::literal(2), Expr::literal(10)]),
+                "Struct(Column(x), 2, 10)",
             ),
-            (
-                Expr::or(col_ref.clone().gt(2), col_ref.clone().lt(10)),
-                "OR(Column(x) > 2, Column(x) < 10)",
-            ),
-            (col_ref.eq("foo"), "Column(x) = 'foo'"),
         ];
 
         for (expr, expected) in cases {
@@ -717,87 +624,45 @@ mod tests {
     }
 
     #[test]
-    fn test_depth_checker() {
-        let expr = Expr::and_from([
-            Expr::struct_from([
-                Expr::and_from([
-                    Expr::lt(Expr::literal(10), column_expr!("x")),
-                    Expr::or_from([Expr::literal(true), column_expr!("b")]),
-                ]),
-                Expr::literal(true),
-                Expr::not(Expr::literal(true)),
-            ]),
-            Expr::and_from([
-                Expr::not(column_expr!("b")),
-                Expr::gt(Expr::literal(10), column_expr!("x")),
-                Expr::or_from([
-                    Expr::and_from([Expr::not(Expr::literal(true)), Expr::literal(10)]),
-                    Expr::literal(10),
-                ]),
-                Expr::literal(true),
-            ]),
-            Expr::ne(
-                Expr::literal(true),
-                Expr::and_from([Expr::literal(true), column_expr!("b")]),
+    fn test_predicate_format() {
+        let cases = [
+            (column_pred!("x"), "Column(x)"),
+            (column_expr!("x").eq(Expr::literal(2)), "Column(x) = 2"),
+            (
+                (column_expr!("x") - Expr::literal(4)).lt(Expr::literal(10)),
+                "Column(x) - 4 < 10",
             ),
-        ]);
+            (
+                Pred::and(
+                    column_expr!("x").ge(Expr::literal(2)),
+                    column_expr!("x").le(Expr::literal(10)),
+                ),
+                "AND(Column(x) >= 2, Column(x) <= 10)",
+            ),
+            (
+                Pred::and_from([
+                    column_expr!("x").ge(Expr::literal(2)),
+                    column_expr!("x").le(Expr::literal(10)),
+                    column_expr!("x").le(Expr::literal(100)),
+                ]),
+                "AND(Column(x) >= 2, Column(x) <= 10, Column(x) <= 100)",
+            ),
+            (
+                Pred::or(
+                    column_expr!("x").gt(Expr::literal(2)),
+                    column_expr!("x").lt(Expr::literal(10)),
+                ),
+                "OR(Column(x) > 2, Column(x) < 10)",
+            ),
+            (
+                column_expr!("x").eq(Expr::literal("foo")),
+                "Column(x) = 'foo'",
+            ),
+        ];
 
-        // Similar to ExpressionDepthChecker::check, but also returns call count
-        let check_with_call_count =
-            |depth_limit| ExpressionDepthChecker::check_with_call_count(&expr, depth_limit);
-
-        // NOTE: The checker ignores leaf nodes!
-
-        // AND
-        //  * STRUCT
-        //    * AND     >LIMIT<
-        //    * NOT
-        //  * AND
-        //  * NE
-        assert_eq!(check_with_call_count(1), (2, 6));
-
-        // AND
-        //  * STRUCT
-        //    * AND
-        //      * LT     >LIMIT<
-        //      * OR
-        //    * NOT
-        //  * AND
-        //  * NE
-        assert_eq!(check_with_call_count(2), (3, 8));
-
-        // AND
-        //  * STRUCT
-        //    * AND
-        //      * LT
-        //      * OR
-        //    * NOT
-        //  * AND
-        //    * NOT
-        //    * GT
-        //    * OR
-        //      * AND
-        //        * NOT     >LIMIT<
-        //  * NE
-        assert_eq!(check_with_call_count(3), (4, 13));
-
-        // Depth limit not hit (full traversal required)
-
-        // AND
-        //  * STRUCT
-        //    * AND
-        //      * LT
-        //      * OR
-        //    * NOT
-        //  * AND
-        //    * NOT
-        //    * GT
-        //    * OR
-        //      * AND
-        //        * NOT
-        //  * NE
-        //    * AND
-        assert_eq!(check_with_call_count(4), (4, 14));
-        assert_eq!(check_with_call_count(5), (4, 14));
+        for (pred, expected) in cases {
+            let result = format!("{}", pred);
+            assert_eq!(result, expected);
+        }
     }
 }

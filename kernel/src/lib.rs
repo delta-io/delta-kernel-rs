@@ -100,7 +100,7 @@ internal_mod!(pub(crate) mod log_segment);
 pub use delta_kernel_derive;
 pub use engine_data::{EngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
-pub use expressions::{Expression, ExpressionRef};
+pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use table::Table;
 
 use expressions::literal_expression_transform::LiteralExpressionTransform;
@@ -330,8 +330,20 @@ impl<T: Any + Send + Sync> AsAny for T {
 pub trait ExpressionEvaluator: AsAny {
     /// Evaluate the expression on a given EngineData.
     ///
-    /// Contains one value for each row of the input.
+    /// Produces one value for each row of the input.
     /// The data type of the output is same as the type output of the expression this evaluator is using.
+    fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>>;
+}
+
+/// Trait for implementing a Predicate evaluator.
+///
+/// It contains one Predicate which can be evaluated on multiple ColumnarBatches.
+/// Connectors can implement this trait to optimize the evaluation using the
+/// connector specific capabilities.
+pub trait PredicateEvaluator: AsAny {
+    /// Evaluate the predicate on a given EngineData.
+    ///
+    /// Produces one boolean value for each row of the input.
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>>;
 }
 
@@ -357,6 +369,21 @@ pub trait EvaluationHandler: AsAny {
         expression: Expression,
         output_type: DataType,
     ) -> Arc<dyn ExpressionEvaluator>;
+
+    /// Create a [`PredicateEvaluator`] that can evaluate the given [`Predicate`] on columnar
+    /// batches with the given [`Schema`] to produce a column of boolean results.
+    ///
+    /// # Parameters
+    ///
+    /// - `schema`: Schema of the input data.
+    /// - `predicate`: Predicate to evaluate.
+    ///
+    /// [`Schema`]: crate::schema::StructType
+    fn new_predicate_evaluator(
+        &self,
+        schema: SchemaRef,
+        predicate: Predicate,
+    ) -> Arc<dyn PredicateEvaluator>;
 
     /// Create a single-row all-null-value [`EngineData`] with the schema specified by
     /// `output_schema`.
@@ -454,7 +481,7 @@ pub trait JsonHandler: AsAny {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        predicate: Option<ExpressionRef>,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
     /// Atomically (!) write a single JSON file. Each row of the input data should be written as a
@@ -505,7 +532,7 @@ pub trait ParquetHandler: AsAny {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        predicate: Option<ExpressionRef>,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 }
 

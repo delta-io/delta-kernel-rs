@@ -4,7 +4,7 @@ use crate::actions::get_log_txn_schema;
 use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{SetTransaction, SET_TRANSACTION_NAME};
 use crate::snapshot::Snapshot;
-use crate::{DeltaResult, Engine, EngineData, Expression as Expr, ExpressionRef, RowVisitor as _};
+use crate::{DeltaResult, Engine, EngineData, Expression as Expr, PredicateRef, RowVisitor as _};
 
 pub(crate) use crate::actions::visitors::SetTransactionMap;
 
@@ -51,7 +51,7 @@ impl SetTransactionScanner {
         // checkpoint part when patitioned by `add.path` like the Delta spec requires. There's no
         // point filtering by a particular app id, even if we have one, because app ids are all in
         // the a single checkpoint part having large min/max range (because they're usually uuids).
-        static META_PREDICATE: LazyLock<Option<ExpressionRef>> = LazyLock::new(|| {
+        static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
             Some(Arc::new(
                 Expr::column([SET_TRANSACTION_NAME, "appId"]).is_not_null(),
             ))
