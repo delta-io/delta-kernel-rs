@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use url::Url;
 
+use crate::history_manager::{convert_timestamp_to_version, Bound};
 use crate::snapshot::Snapshot;
 use crate::table_changes::TableChanges;
 use crate::transaction::Transaction;
@@ -81,6 +82,49 @@ impl Table {
         Snapshot::try_new(self.location.clone(), engine, version)
     }
 
+    pub fn timestamp_to_version(
+        &self,
+        engine: &dyn Engine,
+        timestamp: i64,
+    ) -> DeltaResult<Version> {
+        convert_timestamp_to_version(
+            engine,
+            self.location.clone(),
+            timestamp,
+            Bound::GreatestLower,
+        )
+    }
+
+    pub fn timestamp_range_to_versions(
+        &self,
+        engine: &dyn Engine,
+        start_timestamp: i64,
+        end_timestamp: Option<i64>,
+    ) -> DeltaResult<(Version, Option<Version>)> {
+        let start = convert_timestamp_to_version(
+            engine,
+            self.location.clone(),
+            start_timestamp,
+            Bound::GreatestLower,
+        )?;
+        let end = if let Some(end) = end_timestamp {
+            let end_version = convert_timestamp_to_version(
+                engine,
+                self.location.clone(),
+                end,
+                Bound::LeastUpper,
+            )?;
+            if start > end_version {
+                return Err(Error::generic("No commits found in range"));
+            }
+            Some(end_version)
+        } else {
+            None
+        };
+
+        Ok((start, end))
+    }
+
     /// Create a [`TableChanges`] to get a change data feed for the table between `start_version`,
     /// and `end_version`. If no `end_version` is supplied, the latest version will be used as the
     /// `end_version`.
@@ -96,6 +140,20 @@ impl Table {
             start_version,
             end_version.into(),
         )
+    }
+
+    /// Create a [`TableChanges`] to get a change data feed for the table between `start_timestamp`,
+    /// and `end_timestamp`. If no `end_timestamp` is supplied, the latest timestamp will be used as the
+    /// `end_timestamp`.
+    pub fn table_changes_with_timestamp(
+        &self,
+        engine: &dyn Engine,
+        start_timestamp: i64,
+        end_timestamp: Option<i64>,
+    ) -> DeltaResult<TableChanges> {
+        let (start, end) =
+            self.timestamp_range_to_versions(engine, start_timestamp, end_timestamp)?;
+        TableChanges::try_new(self.location.clone(), engine, start, end)
     }
 
     /// Create a new write transaction for this table.

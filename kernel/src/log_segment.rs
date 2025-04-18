@@ -191,6 +191,31 @@ impl LogSegment {
         LogSegment::try_new(ascending_commit_files, vec![], log_root, end_version)
     }
 
+    pub(crate) fn for_timestamp_conversion(
+        storage: &dyn StorageHandler,
+        log_root: Url,
+    ) -> DeltaResult<Self> {
+        let ascending_commit_files: Vec<_> = list_log_files(storage, &log_root, None, None)?
+            .filter_ok(|x| x.is_commit())
+            .try_collect()?;
+
+        let contiguous_commits = ascending_commit_files
+            .into_iter()
+            .filter(ParsedLogPath::is_commit)
+            .fold(vec![], |mut out, commit| {
+                match out.last() {
+                    None => out.push(commit),
+                    Some(last_commit) if last_commit.version + 1 == commit.version => {
+                        out.push(commit)
+                    }
+                    _ => out.clear(),
+                }
+                out
+            });
+        let end_version = contiguous_commits.last().map(|file| file.version);
+        LogSegment::try_new(contiguous_commits, vec![], log_root, end_version)
+    }
+
     /// Read a stream of actions from this log segment. This returns an iterator of (EngineData,
     /// bool) pairs, where the boolean flag indicates whether the data was read from a commit file
     /// (true) or a checkpoint file (false).
