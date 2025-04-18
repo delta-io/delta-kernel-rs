@@ -183,7 +183,7 @@ mod tests {
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngine;
-    use crate::Engine;
+    use crate::Engine as _;
 
     use itertools::Itertools;
 

@@ -13,11 +13,13 @@ pub(crate) use require;
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use crate::actions::get_log_schema;
+    use crate::actions::{get_log_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::Engine;
+    use crate::EngineData;
 
     use itertools::Itertools;
     use object_store::local::LocalFileSystem;
@@ -26,12 +28,6 @@ pub(crate) mod test_utils {
     use std::{path::Path, sync::Arc};
     use tempfile::TempDir;
     use test_utils::delta_path_for_version;
-
-    use crate::{
-        actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove},
-        engine::arrow_data::ArrowEngineData,
-        EngineData,
-    };
 
     #[derive(Serialize)]
     pub(crate) enum Action {
@@ -130,6 +126,7 @@ pub(crate) mod test_utils {
             r#"{"cdc":{"path":"_change_data/age=21/cdc-00000-93f7fceb-281a-446a-b221-07b88132d203.c000.snappy.parquet","partitionValues":{"age":"21"},"size":1033,"dataChange":false}}"#,
             r#"{"sidecar":{"path":"016ae953-37a9-438e-8683-9a9a4a79a395.parquet","sizeInBytes":9268,"modificationTime":1714496113961,"tags":{"tag_foo":"tag_bar"}}}"#,
             r#"{"txn":{"appId":"myApp","version": 3}}"#,
+            r#"{"checkpointMetadata":{"version":2, "tags":{"tag_foo":"tag_bar"}}}"#,
         ]
         .into();
         parse_json_batch(json_strings)

@@ -5,4 +5,4 @@
 //! avoiding full log replay. This API supports three checkpoint types:
 //!
 //! TODO!(seb): Include docs when implemented
-mod log_replay;
+pub(crate) mod log_replay;
