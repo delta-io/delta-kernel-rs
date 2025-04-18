@@ -4,15 +4,9 @@ use std::fmt::{Display, Formatter};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 
 use crate::actions::schemas::ToDataType;
-use crate::schema::{ArrayType, DataType, PrimitiveType, StructField};
+use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct StructData {
-    fields: Vec<StructField>,
-    values: Vec<Scalar>,
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArrayData {
@@ -37,6 +31,42 @@ impl ArrayData {
     pub fn array_elements(&self) -> &[Scalar] {
         &self.elements
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapData {
+    data_type: MapType,
+    pairs: Vec<(Scalar, Scalar)>,
+}
+
+impl MapData {
+    pub fn try_new(
+        data_type: MapType,
+        values: impl IntoIterator<Item = (impl Into<Scalar>, impl Into<Scalar>)>,
+    ) -> DeltaResult<Self> {
+        // TODO: check that inner types are primitive?
+        let pairs = values
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        Ok(Self { data_type, pairs })
+    }
+
+    // TODO: array.elements is deprecated? do we want to expose this? How will FFI get pairs for
+    // visiting?
+    pub fn pairs(&self) -> &[(Scalar, Scalar)] {
+        &self.pairs
+    }
+
+    pub fn map_type(&self) -> &MapType {
+        &self.data_type
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructData {
+    fields: Vec<StructField>,
+    values: Vec<Scalar>,
 }
 
 impl StructData {
@@ -125,6 +155,8 @@ pub enum Scalar {
     Struct(StructData),
     /// Array Value
     Array(ArrayData),
+    /// Map Value
+    Map(MapData),
 }
 
 impl Scalar {
@@ -146,6 +178,7 @@ impl Scalar {
             Self::Null(data_type) => data_type.clone(),
             Self::Struct(data) => DataType::struct_type(data.fields.clone()),
             Self::Array(data) => data.tpe.clone().into(),
+            Self::Map(data) => data.data_type.clone().into(),
         }
     }
 
@@ -222,6 +255,15 @@ impl Display for Scalar {
                 }
                 write!(f, ")")
             }
+            Self::Map(data) => {
+                write!(f, "{{")?;
+                let mut delim = "";
+                for (key, val) in &data.pairs {
+                    write!(f, "{delim}{key}: {val}")?;
+                    delim = ", ";
+                }
+                write!(f, "}}")
+            }
         }
     }
 }
@@ -269,6 +311,7 @@ impl PartialOrd for Scalar {
             (Null(_), _) => None, // NOTE: NULL values are incomparable by definition
             (Struct(_), _) => None, // TODO: Support Struct?
             (Array(_), _) => None, // TODO: Support Array?
+            (Map(_), _) => None,  // TODO: Support Map?
         }
     }
 }

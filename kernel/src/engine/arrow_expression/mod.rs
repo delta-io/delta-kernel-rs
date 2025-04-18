@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, RecordBatch,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, MapArray, RecordBatch,
     StringArray, StructArray, TimestampMicrosecondArray,
 };
 use crate::arrow::buffer::OffsetBuffer;
@@ -84,6 +84,7 @@ impl Scalar {
                     None,
                 ))
             }
+            Map(data) => todo!(),
             Null(DataType::BYTE) => Arc::new(Int8Array::new_null(num_rows)),
             Null(DataType::SHORT) => Arc::new(Int16Array::new_null(num_rows)),
             Null(DataType::INTEGER) => Arc::new(Int32Array::new_null(num_rows)),

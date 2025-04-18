@@ -6,7 +6,7 @@ use std::ffi::c_void;
 use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryOperator, Expression, JunctionExpression, JunctionOperator,
-    Scalar, StructData, UnaryExpression, UnaryOperator,
+    MapData, Scalar, StructData, UnaryExpression, UnaryOperator,
 };
 
 /// Free the memory the passed SharedExpression
@@ -112,6 +112,10 @@ pub struct EngineExpressionVisitor {
     /// Visit an array literal belonging to the list identified by `sibling_list_id`.
     /// The values of the array are in a list identified by `child_list_id`.
     pub visit_literal_array:
+        extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize),
+    /// Visit a map literal belonging to the list identified by `sibling_list_id`.
+    /// The (key, value) pairs of the map are in order in a list identified by `child_list_id`.
+    pub visit_literal_map:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize),
     /// Visits a null value belonging to the list identified by `sibling_list_id.
     pub visit_literal_null: extern "C" fn(data: *mut c_void, sibling_list_id: usize),
@@ -228,6 +232,20 @@ fn visit_expression_array(
     call!(visitor, visit_literal_array, sibling_list_id, child_list_id);
 }
 
+fn visit_expression_map(
+    visitor: &mut EngineExpressionVisitor,
+    map_data: &MapData,
+    sibling_list_id: usize,
+) {
+    let pairs = map_data.pairs();
+    let child_list_id = call!(visitor, make_field_list, pairs.len() * 2);
+    for (key, val) in pairs {
+        visit_expression_scalar(visitor, key, child_list_id);
+        visit_expression_scalar(visitor, val, child_list_id);
+    }
+    call!(visitor, visit_literal_map, sibling_list_id, child_list_id);
+}
+
 fn visit_expression_struct_literal(
     visitor: &mut EngineExpressionVisitor,
     struct_data: &StructData,
@@ -333,6 +351,7 @@ fn visit_expression_scalar(
             visit_expression_struct_literal(visitor, struct_data, sibling_list_id)
         }
         Scalar::Array(array) => visit_expression_array(visitor, array, sibling_list_id),
+        Scalar::Map(map_data) => visit_expression_map(visitor, map_data, sibling_list_id),
     }
 }
 
