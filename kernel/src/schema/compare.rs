@@ -7,13 +7,13 @@
 //!  # use delta_kernel::schema::StructField;
 //!  # use delta_kernel::schema::DataType;
 //!  let schema = StructType::new([
-//!     StructField::new("id", DataType::LONG, false),
-//!     StructField::new("value", DataType::STRING, true),
+//!     StructField::not_null("id", DataType::LONG),
+//!     StructField::nullable("value", DataType::STRING),
 //!  ]);
 //!  let read_schema = StructType::new([
-//!     StructField::new("id", DataType::LONG, true),
-//!     StructField::new("value", DataType::STRING, true),
-//!     StructField::new("year", DataType::INTEGER, true),
+//!     StructField::nullable("id", DataType::LONG),
+//!     StructField::nullable("value", DataType::STRING),
+//!     StructField::nullable("year", DataType::INTEGER),
 //!  ]);
 //!  // Schemas are compatible since the `read_schema` adds a nullable column `year`
 //!  assert!(schema.can_read_as(&read_schema).is_ok());
@@ -185,21 +185,21 @@ mod tests {
     #[test]
     fn can_read_is_reflexive() {
         let map_key = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
+            StructField::not_null("id", DataType::LONG),
+            StructField::not_null("name", DataType::STRING),
         ]);
-        let map_value = StructType::new([StructField::new("age", DataType::INTEGER, true)]);
+        let map_value = StructType::new([StructField::nullable("age", DataType::INTEGER)]);
         let map_type = MapType::new(map_key, map_value, true);
         let array_type = ArrayType::new(DataType::TIMESTAMP, false);
         let nested_struct = StructType::new([
-            StructField::new("name", DataType::STRING, false),
-            StructField::new("age", DataType::INTEGER, true),
+            StructField::not_null("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
         ]);
         let schema = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("map", map_type, false),
-            StructField::new("array", array_type, false),
-            StructField::new("nested_struct", nested_struct, false),
+            StructField::not_null("id", DataType::LONG),
+            StructField::not_null("map", map_type),
+            StructField::not_null("array", array_type),
+            StructField::not_null("nested_struct", nested_struct),
         ]);
 
         assert!(schema.can_read_as(&schema).is_ok());
@@ -207,30 +207,27 @@ mod tests {
     #[test]
     fn add_nullable_column_to_map_key_and_value() {
         let existing_map_key = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, true),
+            StructField::not_null("id", DataType::LONG),
+            StructField::nullable("name", DataType::STRING),
         ]);
-        let existing_map_value =
-            StructType::new([StructField::new("age", DataType::INTEGER, false)]);
-        let existing_schema = StructType::new([StructField::new(
+        let existing_map_value = StructType::new([StructField::not_null("age", DataType::INTEGER)]);
+        let existing_schema = StructType::new([StructField::not_null(
             "map",
             MapType::new(existing_map_key, existing_map_value, false),
-            false,
         )]);
 
         let read_map_key = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, true),
-            StructField::new("location", DataType::STRING, true),
+            StructField::not_null("id", DataType::LONG),
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("location", DataType::STRING),
         ]);
         let read_map_value = StructType::new([
-            StructField::new("age", DataType::INTEGER, true),
-            StructField::new("years_of_experience", DataType::INTEGER, true),
+            StructField::nullable("age", DataType::INTEGER),
+            StructField::nullable("years_of_experience", DataType::INTEGER),
         ]);
-        let read_schema = StructType::new([StructField::new(
+        let read_schema = StructType::new([StructField::not_null(
             "map",
             MapType::new(read_map_key, read_map_value, false),
-            false,
         )]);
 
         assert!(existing_schema.can_read_as(&read_schema).is_ok());
@@ -238,25 +235,23 @@ mod tests {
     #[test]
     fn map_value_becomes_non_nullable_fails() {
         let map_key = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
+            StructField::not_null("id", DataType::LONG),
+            StructField::not_null("name", DataType::STRING),
         ]);
-        let map_value = StructType::new([StructField::new("age", DataType::INTEGER, true)]);
-        let existing_schema = StructType::new([StructField::new(
+        let map_value = StructType::new([StructField::nullable("age", DataType::INTEGER)]);
+        let existing_schema = StructType::new([StructField::not_null(
             "map",
             MapType::new(map_key, map_value, false),
-            false,
         )]);
 
         let map_key = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
+            StructField::not_null("id", DataType::LONG),
+            StructField::not_null("name", DataType::STRING),
         ]);
-        let map_value = StructType::new([StructField::new("age", DataType::INTEGER, false)]);
-        let read_schema = StructType::new([StructField::new(
+        let map_value = StructType::new([StructField::not_null("age", DataType::INTEGER)]);
+        let read_schema = StructType::new([StructField::not_null(
             "map",
             MapType::new(map_key, map_value, false),
-            false,
         )]);
 
         assert!(matches!(
@@ -268,14 +263,14 @@ mod tests {
     fn different_field_name_case_fails() {
         // names differing only in case are not the same
         let existing_schema = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
-            StructField::new("age", DataType::INTEGER, true),
+            StructField::not_null("id", DataType::LONG),
+            StructField::not_null("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
         ]);
         let read_schema = StructType::new([
-            StructField::new("Id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
-            StructField::new("age", DataType::INTEGER, true),
+            StructField::not_null("Id", DataType::LONG),
+            StructField::not_null("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
         ]);
         assert!(matches!(
             existing_schema.can_read_as(&read_schema),
@@ -285,14 +280,14 @@ mod tests {
     #[test]
     fn different_type_fails() {
         let existing_schema = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
-            StructField::new("age", DataType::INTEGER, true),
+            StructField::not_null("id", DataType::LONG),
+            StructField::not_null("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
         ]);
         let read_schema = StructType::new([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, false),
-            StructField::new("age", DataType::INTEGER, true),
+            StructField::not_null("id", DataType::INTEGER),
+            StructField::not_null("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
         ]);
         assert!(matches!(
             existing_schema.can_read_as(&read_schema),
@@ -302,28 +297,28 @@ mod tests {
     #[test]
     fn set_nullable_to_true() {
         let existing_schema = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
-            StructField::new("age", DataType::INTEGER, true),
+            StructField::not_null("id", DataType::LONG),
+            StructField::not_null("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
         ]);
         let read_schema = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, true),
-            StructField::new("age", DataType::INTEGER, true),
+            StructField::not_null("id", DataType::LONG),
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
         ]);
         assert!(existing_schema.can_read_as(&read_schema).is_ok());
     }
     #[test]
     fn set_nullable_to_false_fails() {
         let existing_schema = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
-            StructField::new("age", DataType::INTEGER, true),
+            StructField::not_null("id", DataType::LONG),
+            StructField::not_null("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
         ]);
         let read_schema = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
-            StructField::new("age", DataType::INTEGER, false),
+            StructField::not_null("id", DataType::LONG),
+            StructField::not_null("name", DataType::STRING),
+            StructField::not_null("age", DataType::INTEGER),
         ]);
         assert!(matches!(
             existing_schema.can_read_as(&read_schema),
@@ -333,16 +328,16 @@ mod tests {
     #[test]
     fn differ_by_nullable_column() {
         let a = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
-            StructField::new("age", DataType::INTEGER, true),
+            StructField::not_null("id", DataType::LONG),
+            StructField::not_null("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
         ]);
 
         let b = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
-            StructField::new("age", DataType::INTEGER, true),
-            StructField::new("location", DataType::STRING, true),
+            StructField::not_null("id", DataType::LONG),
+            StructField::not_null("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
+            StructField::nullable("location", DataType::STRING),
         ]);
 
         // Read `a` as `b`. `b` adds a new nullable column. This is compatible with `a`'s schema.
@@ -357,16 +352,16 @@ mod tests {
     #[test]
     fn differ_by_non_nullable_column() {
         let a = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
-            StructField::new("age", DataType::INTEGER, true),
+            StructField::not_null("id", DataType::LONG),
+            StructField::not_null("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
         ]);
 
         let b = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
-            StructField::new("age", DataType::INTEGER, true),
-            StructField::new("location", DataType::STRING, false),
+            StructField::not_null("id", DataType::LONG),
+            StructField::not_null("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
+            StructField::not_null("location", DataType::STRING),
         ]);
 
         // Read `a` as `b`. `b` has an extra non-nullable column.
@@ -385,17 +380,17 @@ mod tests {
     #[test]
     fn duplicate_field_modulo_case() {
         let existing_schema = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("Id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
-            StructField::new("age", DataType::INTEGER, true),
+            StructField::not_null("id", DataType::LONG),
+            StructField::not_null("Id", DataType::LONG),
+            StructField::not_null("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
         ]);
 
         let read_schema = StructType::new([
-            StructField::new("id", DataType::LONG, false),
-            StructField::new("Id", DataType::LONG, false),
-            StructField::new("name", DataType::STRING, false),
-            StructField::new("age", DataType::INTEGER, true),
+            StructField::not_null("id", DataType::LONG),
+            StructField::not_null("Id", DataType::LONG),
+            StructField::not_null("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
         ]);
         assert!(matches!(
             existing_schema.can_read_as(&read_schema),
