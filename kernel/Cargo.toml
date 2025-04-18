@@ -39,7 +39,6 @@ pre-release-hook = [
 [dependencies]
 bytes = "1.10"
 chrono = "=0.4.39"
-fix-hidden-lifetime-bug = "0.2"
 indexmap = "2.9.0"
 itertools = "0.14"
 roaring = "0.10.12"
@@ -137,9 +136,6 @@ integration-test = [
   "hdfs-native",
   "walkdir",
 ]
-
-[dependencies.home]
-version = "=0.5.9"
 
 [build-dependencies]
 rustc_version = "0.4.1"

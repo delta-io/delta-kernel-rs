@@ -35,11 +35,6 @@ delta-rs
 https://github.com/delta-io/delta-rs/
 Licence: Apache-2.0
 
-fix-hidden-lifetime-bug
-https://github.com/danielhenrymantilla/fix-hidden-lifetime-bug.rs
-Licence: Zlib OR MIT OR Apache-2.0
-Copyright 2021 Daniel Henry-Mantilla
-
 flate2
 https://github.com/rust-lang/flate2-rs
 Licence: MIT OR Apache-2.0
@@ -137,10 +132,6 @@ Licence: MIT OR Apache-2.0
 uuid
 https://github.com/uuid-rs/uuid
 Licence: Apache-2.0 OR MIT
-
-visibility
-https://github.com/danielhenrymantilla/visibility.rs
-Licence: Zlib OR MIT OR Apache-2.0
 
 z85
 https://github.com/decafbad/z85
