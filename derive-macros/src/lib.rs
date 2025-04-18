@@ -1,8 +1,9 @@
 use proc_macro2::{Ident, Span, TokenStream};
-use quote::{quote, quote_spanned};
+use quote::{quote, quote_spanned, ToTokens};
+use syn::parse_macro_input;
 use syn::spanned::Spanned;
 use syn::{
-    parse_macro_input, Data, DataStruct, DeriveInput, Error, Fields, Meta, PathArguments, Type,
+    Data, DataStruct, DeriveInput, Error, Fields, Item, Meta, PathArguments, Type, Visibility,
 };
 
 /// Parses a dot-delimited column name into an array of field names. See
@@ -133,4 +134,69 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
         }
     });
     quote! { #(#schema_fields),* }
+}
+
+/// Mark items as `internal_api` to make them public iff the `internal-api` feature is enabled.
+/// Note this doesn't work for inline module definitions (see `internal_mod!` macro in delta_kernel
+/// crate - can't export macro_rules! from proc macro crate).
+/// Ref: <https://github.com/rust-lang/rust/issues/54727>
+#[proc_macro_attribute]
+pub fn internal_api(
+    _attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(item as Item);
+
+    // Create a version with public visibility for the unstable feature
+    let public_version = make_public(input.clone());
+
+    // The original item stays as-is for the non-unstable case
+    let output = quote! {
+        #[cfg(feature = "internal-api")]
+        #public_version
+
+        #[cfg(not(feature = "internal-api"))]
+        #input
+    };
+
+    output.into()
+}
+
+fn make_public(mut item: Item) -> Item {
+    fn set_pub(vis: &mut Visibility) -> Result<(), syn::Error> {
+        if matches!(vis, Visibility::Public(_)) {
+            return Err(Error::new(
+                vis.span(),
+                "ineligible for #[internal_api]: item is already public",
+            ));
+        }
+        *vis = syn::parse_quote!(pub);
+        Ok(())
+    }
+
+    let result = match &mut item {
+        Item::Fn(f) => set_pub(&mut f.vis),
+        Item::Struct(s) => set_pub(&mut s.vis),
+        Item::Enum(e) => set_pub(&mut e.vis),
+        Item::Trait(t) => set_pub(&mut t.vis),
+        Item::Type(t) => set_pub(&mut t.vis),
+        Item::Mod(m) => set_pub(&mut m.vis),
+        Item::Static(s) => set_pub(&mut s.vis),
+        Item::Const(c) => set_pub(&mut c.vis),
+        Item::Union(u) => set_pub(&mut u.vis),
+        // foreign mod, impl block, and all others not handled
+        _ => Err(Error::new(
+            item.span(),
+            format!("unsupported item type for #[internal_api]: {:?}", item),
+        )),
+    };
+
+    if let Err(err) = result {
+        let error = err.to_compile_error();
+        let mut tokens = item.to_token_stream();
+        tokens.extend(error);
+        return syn::parse_quote!(#tokens);
+    }
+
+    item
 }

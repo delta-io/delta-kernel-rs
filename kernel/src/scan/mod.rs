@@ -182,11 +182,11 @@ impl PhysicalPredicate {
 
 // Evaluates a static data skipping predicate, ignoring any column references, and returns true if
 // the predicate allows to statically skip all files. Since this is direct evaluation (not an
-// expression rewrite), we use a `DefaultPredicateEvaluator` with an empty column resolver.
+// expression rewrite), we use a `DefaultKernelPredicateEvaluator` with an empty column resolver.
 fn can_statically_skip_all_files(predicate: &Expression) -> bool {
     use crate::kernel_predicates::KernelPredicateEvaluator as _;
-    DefaultKernelPredicateEvaluator::from(EmptyColumnResolver).eval_sql_where(predicate)
-        == Some(false)
+    let evaluator = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
+    evaluator.eval_sql_where(predicate) == Some(false)
 }
 
 // Build the stats read schema filtering the table schema to keep only skipping-eligible

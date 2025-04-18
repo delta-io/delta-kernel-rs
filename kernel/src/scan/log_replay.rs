@@ -38,7 +38,7 @@ use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator};
 /// produces a [`ScanMetadata`] result. This result includes the transformed batch, a selection
 /// vector indicating which rows are valid, and any row-level transformation expressions that need
 /// to be applied to the selected rows.
-struct ScanLogReplayProcessor {
+pub(crate) struct ScanLogReplayProcessor {
     partition_filter: Option<ExpressionRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
     add_transform: Arc<dyn ExpressionEvaluator>,
@@ -344,13 +344,13 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 
     fn process_actions_batch(
         &mut self,
-        actions_batch: &dyn EngineData,
+        actions_batch: Box<dyn EngineData>,
         is_log_batch: bool,
     ) -> DeltaResult<Self::Output> {
         // Build an initial selection vector for the batch which has had the data skipping filter
         // applied. The selection vector is further updated by the deduplication visitor to remove
         // rows that are not valid adds.
-        let selection_vector = self.build_selection_vector(actions_batch)?;
+        let selection_vector = self.build_selection_vector(actions_batch.as_ref())?;
         assert_eq!(selection_vector.len(), actions_batch.len());
 
         let mut visitor = AddRemoveDedupVisitor::new(
@@ -361,10 +361,10 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             self.partition_filter.clone(),
             is_log_batch,
         );
-        visitor.visit_rows_of(actions_batch)?;
+        visitor.visit_rows_of(actions_batch.as_ref())?;
 
         // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
-        let result = self.add_transform.evaluate(actions_batch)?;
+        let result = self.add_transform.evaluate(actions_batch.as_ref())?;
         Ok(ScanMetadata::new(
             result,
             visitor.selection_vector,
@@ -381,6 +381,9 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 /// `(engine_data, selection_vec)`. Each row that is selected in the returned `engine_data` _must_
 /// be processed to complete the scan. Non-selected rows _must_ be ignored. The boolean flag
 /// indicates whether the record batch is a log or checkpoint batch.
+///
+/// Note: The iterator of (engine_data, bool) tuples 'action_iter' parameter must be sorted by the
+/// order of the actions in the log from most recent to least recent.
 pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,

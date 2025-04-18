@@ -178,7 +178,9 @@ impl AllocateError for AllocateErrorFn {
     }
 }
 
-impl AllocateError for &dyn ExternEngine {
+// We do this instead of `impl AllocateError for &dyn ExternEngine` since we can then directly use
+// this trait on type T instead of having to cast it to a trait object first.
+impl<T: ExternEngine + ?Sized> AllocateError for &T {
     /// # Safety
     ///
     /// In addition to the usual requirements, the engine handle must be valid.

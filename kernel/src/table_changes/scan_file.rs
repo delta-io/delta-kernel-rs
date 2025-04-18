@@ -252,7 +252,7 @@ mod tests {
     use crate::table_changes::log_replay::table_changes_action_iter;
     use crate::table_configuration::TableConfiguration;
     use crate::utils::test_utils::{Action, LocalMockTable};
-    use crate::Engine;
+    use crate::Engine as _;
 
     #[tokio::test]
     async fn test_scan_file_visiting() {
