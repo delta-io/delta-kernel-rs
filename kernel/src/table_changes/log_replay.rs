@@ -15,6 +15,7 @@ use crate::expressions::{column_name, ColumnName};
 use crate::path::ParsedLogPath;
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
+use crate::schema::compare::SchemaComparison;
 use crate::schema::{ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructType};
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_changes::{check_cdf_table_properties, ensure_cdf_read_supported};
@@ -80,9 +81,8 @@ pub(crate) fn table_changes_action_iter(
 ///       phase, so we must perform it ahead of time in phase 1.
 ///     - Ensure that reading is supported on any protocol updates.
 ///     - Ensure that Change Data Feed is enabled for any metadata update. See  [`TableProperties`]
-///     - Ensure that any schema update is compatible with the provided `schema`. Currently, schema
-///       compatibility is checked through schema equality. This will be expanded in the future to
-///       allow limited schema evolution.
+///     - Ensure that any schema update is compatible with the provided `schema`. To see how schema
+///       compatibility is defined, see [`StructType::can_read_as`].
 ///
 /// Note: We check the protocol, change data feed enablement, and schema compatibility in phase 1
 /// in order to detect errors and fail early.
@@ -182,13 +182,10 @@ impl LogReplayScanner {
             }
             if let Some((schema, configuration)) = visitor.metadata_info {
                 let schema: StructType = serde_json::from_str(&schema)?;
-                // Currently, schema compatibility is defined as having equal schema types. In the
-                // future, more permisive schema evolution will be supported.
-                // See: https://github.com/delta-io/delta-kernel-rs/issues/523
-                require!(
-                    table_schema.as_ref() == &schema,
-                    Error::change_data_feed_incompatible_schema(table_schema, &schema)
-                );
+
+                schema.can_read_as(table_schema).map_err(|err| {
+                    Error::change_data_feed_incompatible_schema(commit_file.version, err)
+                })?;
                 let table_properties = TableProperties::from(configuration);
                 check_cdf_table_properties(&table_properties)
                     .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;

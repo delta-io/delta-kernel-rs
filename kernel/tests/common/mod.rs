@@ -84,8 +84,6 @@ pub(crate) fn test_read(
     Ok(())
 }
 
-// TODO (zach): this is listed as unused for acceptance crate
-#[allow(unused)]
 pub(crate) fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<RecordBatch>> {
     let scan_results = scan.execute(engine)?;
     scan_results
