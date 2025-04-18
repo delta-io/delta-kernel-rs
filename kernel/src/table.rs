@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use url::Url;
 
-use crate::history_manager::{Bound, LogTimeConverter};
+use crate::history_manager::{convert_timestamp_to_version, Bound};
 use crate::snapshot::Snapshot;
 use crate::table_changes::TableChanges;
 use crate::transaction::Transaction;
@@ -87,7 +87,7 @@ impl Table {
         engine: &dyn Engine,
         timestamp: i64,
     ) -> DeltaResult<Version> {
-        LogTimeConverter::convert(
+        convert_timestamp_to_version(
             engine,
             self.location.clone(),
             timestamp,
@@ -101,15 +101,19 @@ impl Table {
         start_timestamp: i64,
         end_timestamp: Option<i64>,
     ) -> DeltaResult<(Version, Option<Version>)> {
-        let start = LogTimeConverter::convert(
+        let start = convert_timestamp_to_version(
             engine,
             self.location.clone(),
             start_timestamp,
             Bound::GreatestLower,
         )?;
         let end = if let Some(end) = end_timestamp {
-            let end_version =
-                LogTimeConverter::convert(engine, self.location.clone(), end, Bound::LeastUpper)?;
+            let end_version = convert_timestamp_to_version(
+                engine,
+                self.location.clone(),
+                end,
+                Bound::LeastUpper,
+            )?;
             if start > end_version {
                 return Err(Error::generic("No commits found in range"));
             }
