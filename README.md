@@ -154,7 +154,7 @@ Some design principles which should be considered:
 ```json
 {
   "editor.formatOnSave": true,
-  "rust-analyzer.cargo.features": ["default-engine", "acceptance"]
+  "rust-analyzer.cargo.features": ["default-engine"]
 }
 ```
 
