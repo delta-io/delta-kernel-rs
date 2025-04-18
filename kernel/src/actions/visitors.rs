@@ -18,7 +18,6 @@ use super::{
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 
-#[allow(unused)]
 #[derive(Default)]
 #[internal_api]
 pub(crate) struct MetadataVisitor {
@@ -321,7 +320,6 @@ pub(crate) struct CdcVisitor {
     pub(crate) cdcs: Vec<Cdc>,
 }
 
-#[allow(unused)]
 impl CdcVisitor {
     #[internal_api]
     pub(crate) fn visit_cdc<'a>(

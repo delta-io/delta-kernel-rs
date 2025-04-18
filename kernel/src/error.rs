@@ -6,7 +6,8 @@ use std::{
     str::Utf8Error,
 };
 
-use crate::schema::{compare::SchemaComparisonError, DataType};
+use crate::schema::compare::SchemaComparisonError;
+use crate::schema::DataType;
 use crate::table_properties::ParseIntervalError;
 use crate::Version;
 
