@@ -306,13 +306,15 @@ impl Snapshot {
     }
 
     /// Fetch the latest version of the provided `application_id` for this snapshot.
-    pub fn latest_application_id_version(
+    ///
+    /// Note that this method performs log replay (fetches and processes metadata from storage).
+    // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
+    pub fn get_app_id_version(
         self: Arc<Self>,
         application_id: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
-        let txn_scanner = SetTransactionScanner::new(self);
-        let txn = txn_scanner.latest_txn(engine, application_id)?;
+        let txn = SetTransactionScanner::get_one(self.log_segment(), application_id, engine)?;
         Ok(txn.map(|t| t.version))
     }
 }
