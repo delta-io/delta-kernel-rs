@@ -1,5 +1,5 @@
 //! An implementation of data skipping that leverages parquet stats from the file footer.
-use crate::expressions::{BinaryOperator, ColumnName, Scalar, VariadicOperator};
+use crate::expressions::{BinaryOperator, ColumnName, JunctionOperator, Scalar};
 use crate::kernel_predicates::{DataSkippingPredicateEvaluator, KernelPredicateEvaluatorDefaults};
 use crate::schema::DataType;
 use std::cmp::Ordering;
@@ -86,12 +86,12 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
         KernelPredicateEvaluatorDefaults::eval_binary_scalars(op, left, right, inverted)
     }
 
-    fn finish_eval_variadic(
+    fn finish_eval_junction(
         &self,
-        op: VariadicOperator,
+        op: JunctionOperator,
         exprs: impl IntoIterator<Item = Option<bool>>,
         inverted: bool,
     ) -> Option<bool> {
-        KernelPredicateEvaluatorDefaults::finish_eval_variadic(op, exprs, inverted)
+        KernelPredicateEvaluatorDefaults::finish_eval_junction(op, exprs, inverted)
     }
 }
