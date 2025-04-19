@@ -13,15 +13,7 @@ use delta_kernel::{
 
 #[derive(Default)]
 pub struct KernelExpressionVisitorState {
-    // TODO: ReferenceSet<Box<dyn MetadataFilterFn>> instead?
-    inflight_expressions: ReferenceSet<Expression>,
-}
-impl KernelExpressionVisitorState {
-    pub fn new() -> Self {
-        Self {
-            inflight_expressions: Default::default(),
-        }
-    }
+    inflight_ids: ReferenceSet<Expression>,
 }
 
 /// A predicate that can be used to skip data when scanning.
@@ -44,14 +36,14 @@ pub struct EnginePredicate {
 }
 
 fn wrap_expression(state: &mut KernelExpressionVisitorState, expr: impl Into<Expression>) -> usize {
-    state.inflight_expressions.insert(expr.into())
+    state.inflight_ids.insert(expr.into())
 }
 
 pub(crate) fn unwrap_kernel_expression(
     state: &mut KernelExpressionVisitorState,
     exprid: usize,
 ) -> Option<Expression> {
-    state.inflight_expressions.take(exprid)
+    state.inflight_ids.take(exprid)
 }
 
 fn visit_expression_binary(

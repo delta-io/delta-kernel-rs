@@ -22,11 +22,11 @@ pub struct ArrayData {
 }
 
 impl ArrayData {
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub fn new(tpe: ArrayType, elements: impl IntoIterator<Item = impl Into<Scalar>>) -> Self {
         let elements = elements.into_iter().map(Into::into).collect();
         Self { tpe, elements }
     }
+
     pub fn array_type(&self) -> &ArrayType {
         &self.tpe
     }
@@ -340,10 +340,10 @@ impl From<&[u8]> for Scalar {
 }
 
 impl<T: Into<Scalar> + ToDataType> From<Option<T>> for Scalar {
-    fn from(val: Option<T>) -> Self {
-        match val {
-            Some(v) => v.into(),
-            None => Scalar::Null(T::to_data_type()),
+    fn from(t: Option<T>) -> Self {
+        match t {
+            Some(t) => t.into(),
+            None => Self::Null(T::to_data_type()),
         }
     }
 }
