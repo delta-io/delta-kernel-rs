@@ -12,7 +12,7 @@ use crate::expressions::{column_expr, Scalar, StructData};
 use crate::path::ParsedLogPath;
 use crate::schema::{SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
-use crate::{DataType, DeltaResult, Engine, EngineData, Expression, Version};
+use crate::{DataType, DeltaResult, Engine, EngineData, Expression, IntoEngineData, Version};
 
 use url::Url;
 
