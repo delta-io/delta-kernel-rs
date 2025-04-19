@@ -395,6 +395,17 @@ trait EvaluationHandlerExtension: EvaluationHandler {
 // Auto-implement the extension trait for all EvaluationHandlers
 impl<T: EvaluationHandler + ?Sized> EvaluationHandlerExtension for T {}
 
+/// A trait that allows converting a type into (single-row) EngineData
+///
+/// This is typically used with the `#[derive(IntoEngineData)]` macro
+/// which leverages the traits `ToDataType` and `Into<Scalar>` for struct fields
+/// to convert a struct into EngineData.
+#[allow(unused)]
+pub(crate) trait IntoEngineData {
+    /// Convert this type into a single-row EngineData using the provided engine
+    fn into_engine_data(self, engine: &dyn Engine) -> DeltaResult<Box<dyn EngineData>>;
+}
+
 /// Provides file system related functionalities to Delta Kernel.
 ///
 /// Delta Kernel uses this handler whenever it needs to access the underlying

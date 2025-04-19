@@ -17,12 +17,12 @@ use crate::table_features::{
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::EvaluationHandlerExtension;
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, RowVisitor as _};
+use crate::{DeltaResult, EngineData, Error, FileMeta, RowVisitor as _};
 
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
-use delta_kernel_derive::{internal_api, Schema};
+use delta_kernel_derive::{internal_api, IntoEngineData, Schema};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
@@ -559,7 +559,7 @@ pub(crate) struct Cdc {
     pub tags: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, Schema, IntoEngineData)]
 #[internal_api]
 pub(crate) struct SetTransaction {
     /// A unique identifier for the application performing the transaction.
@@ -579,16 +579,6 @@ impl SetTransaction {
             version,
             last_updated,
         }
-    }
-
-    pub(crate) fn into_engine_data(self, engine: &dyn Engine) -> DeltaResult<Box<dyn EngineData>> {
-        let values = [
-            self.app_id.into(),
-            self.version.into(),
-            self.last_updated.into(),
-        ];
-        let evaluator = engine.evaluation_handler();
-        evaluator.create_one(get_log_txn_schema().clone(), &values)
     }
 }
 
@@ -1046,5 +1036,79 @@ mod tests {
             ReaderFeature::unknown("absurD_)(+13%^⚙️"),
         ]);
         assert_eq!(parse_features::<ReaderFeature>(features), expected);
+    }
+
+    #[test]
+    fn test_into_engine_data() {
+        use crate::engine::arrow_expression::ArrowEvaluationHandler;
+        use crate::IntoEngineData;
+        use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
+
+        // duplicated
+        struct ExprEngine(Arc<dyn EvaluationHandler>);
+
+        impl ExprEngine {
+            fn new() -> Self {
+                ExprEngine(Arc::new(ArrowEvaluationHandler))
+            }
+        }
+
+        impl Engine for ExprEngine {
+            fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+                self.0.clone()
+            }
+
+            fn json_handler(&self) -> Arc<dyn JsonHandler> {
+                unimplemented!()
+            }
+
+            fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+                unimplemented!()
+            }
+
+            fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+                unimplemented!()
+            }
+        }
+
+        let engine = ExprEngine::new();
+
+        let set_transaction = SetTransaction {
+            app_id: "app_id".to_string(),
+            version: 0,
+            last_updated: None,
+        };
+
+        let engine_data = set_transaction.into_engine_data(&engine);
+
+        use crate::engine::arrow_data::ArrowEngineData;
+        let record_batch: crate::arrow::array::RecordBatch = engine_data
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        use crate::arrow::array::{Int64Array, StringArray};
+        use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use crate::arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("appId", ArrowDataType::Utf8, false),
+            Field::new("version", ArrowDataType::Int64, false),
+            Field::new("lastUpdated", ArrowDataType::Int64, true),
+        ]));
+
+        let expected = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["app_id"])),
+                Arc::new(Int64Array::from(vec![0_i64])),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(record_batch, expected);
     }
 }
