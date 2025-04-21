@@ -9,12 +9,12 @@ use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct DecimalValue {
+pub struct DecimalData {
     bits: i128,
     ty: DecimalType,
 }
 
-impl DecimalValue {
+impl DecimalData {
     pub fn try_new(bits: impl Into<i128>, ty: DecimalType) -> DeltaResult<Self> {
         let bits = bits.into();
         require!(
@@ -194,7 +194,7 @@ pub enum Scalar {
     /// Binary data
     Binary(Vec<u8>),
     /// Decimal value with a given precision and scale.
-    Decimal(DecimalValue),
+    Decimal(DecimalData),
     /// Null value with a given data type.
     Null(DataType),
     /// Struct value
@@ -233,7 +233,7 @@ impl Scalar {
     /// Constructs a Decimal value from raw parts
     pub fn decimal(bits: impl Into<i128>, precision: u8, scale: u8) -> DeltaResult<Self> {
         let dtype = DecimalType::try_new(precision, scale)?;
-        let dval = DecimalValue::try_new(bits, dtype)?;
+        let dval = DecimalData::try_new(bits, dtype)?;
         Ok(Self::Decimal(dval))
     }
 
@@ -400,8 +400,8 @@ impl From<bool> for Scalar {
     }
 }
 
-impl From<DecimalValue> for Scalar {
-    fn from(d: DecimalValue) -> Self {
+impl From<DecimalData> for Scalar {
+    fn from(d: DecimalData) -> Self {
         Self::Decimal(d)
     }
 }
@@ -567,7 +567,7 @@ impl PrimitiveType {
             None => int_part.parse()?,
             Some(frac_part) => format!("{}{}", int_part, frac_part).parse()?,
         };
-        Ok(Scalar::Decimal(DecimalValue::try_new(int, dtype)?))
+        Ok(Scalar::Decimal(DecimalData::try_new(int, dtype)?))
     }
 }
 
@@ -583,7 +583,7 @@ mod tests {
     #[test]
     fn test_bad_decimal() {
         let dtype = DecimalType::try_new(3, 0).unwrap();
-        DecimalValue::try_new(123456789, dtype).expect_err("should have failed");
+        DecimalData::try_new(123456789, dtype).expect_err("should have failed");
         PrimitiveType::parse_decimal("0.12345", dtype).expect_err("should have failed");
         PrimitiveType::parse_decimal("12345", dtype).expect_err("should have failed");
     }

@@ -1,5 +1,5 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer stats.
-use crate::expressions::{ColumnName, DecimalValue, Expression, Scalar};
+use crate::expressions::{ColumnName, DecimalData, Expression, Scalar};
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::parquet::arrow::arrow_reader::ArrowReaderBuilder;
 use crate::parquet::file::metadata::RowGroupMetaData;
@@ -73,7 +73,7 @@ impl<'a> RowGroupFilter<'a> {
         bytes.reverse();
         bytes.resize(16, 0u8);
         let bytes: [u8; 16] = bytes.try_into().ok()?;
-        let value = DecimalValue::try_new(i128::from_le_bytes(bytes), dtype).ok()?;
+        let value = DecimalData::try_new(i128::from_le_bytes(bytes), dtype).ok()?;
         Some(value.into())
     }
 
@@ -124,10 +124,10 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
             (TimestampNtz, Statistics::Int32(s)) => Self::timestamp_from_date(s.min_opt())?,
             (TimestampNtz, _) => return None, // TODO: Int96 timestamps
             (Decimal(d), Statistics::Int32(i)) => {
-                DecimalValue::try_new(*i.min_opt()?, *d).ok()?.into()
+                DecimalData::try_new(*i.min_opt()?, *d).ok()?.into()
             }
             (Decimal(d), Statistics::Int64(i)) => {
-                DecimalValue::try_new(*i.min_opt()?, *d).ok()?.into()
+                DecimalData::try_new(*i.min_opt()?, *d).ok()?.into()
             }
             (Decimal(d), Statistics::FixedLenByteArray(b)) => {
                 Self::decimal_from_bytes(b.min_bytes_opt(), *d)?
@@ -170,10 +170,10 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
             (TimestampNtz, Statistics::Int32(s)) => Self::timestamp_from_date(s.max_opt())?,
             (TimestampNtz, _) => return None, // TODO: Int96 timestamps
             (Decimal(d), Statistics::Int32(i)) => {
-                DecimalValue::try_new(*i.max_opt()?, *d).ok()?.into()
+                DecimalData::try_new(*i.max_opt()?, *d).ok()?.into()
             }
             (Decimal(d), Statistics::Int64(i)) => {
-                DecimalValue::try_new(*i.max_opt()?, *d).ok()?.into()
+                DecimalData::try_new(*i.max_opt()?, *d).ok()?.into()
             }
             (Decimal(d), Statistics::FixedLenByteArray(b)) => {
                 Self::decimal_from_bytes(b.max_bytes_opt(), *d)?
