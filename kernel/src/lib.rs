@@ -404,6 +404,18 @@ impl<T: EvaluationHandler + ?Sized> EvaluationHandlerExtension for T {}
 pub(crate) trait IntoEngineData {
     /// Convert this type into a single-row EngineData using the provided engine
     fn into_engine_data(self, engine: &dyn Engine) -> DeltaResult<Box<dyn EngineData>>;
+
+    /// Convert this type into a single-row single-col (struct) EngineData using the provided engine
+    /// and the name of the top-level struct.
+    ///
+    /// E.g. for `struct Foo { a: i32, b: i32 }`, into_engine_data_struct("bar", true) would produce
+    /// an `EngineData` with a single nullable column named "bar" with a struct with fields a, b.
+    fn into_engine_data_struct(
+        self,
+        name: &str,
+        nullable: bool,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>>;
 }
 
 /// Provides file system related functionalities to Delta Kernel.

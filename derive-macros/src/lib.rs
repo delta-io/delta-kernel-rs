@@ -168,8 +168,10 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
     // let field_types = fields.iter().map(|f| &f.ty);
 
     let expanded = quote! {
+        use std::sync::Arc;
         use crate::actions::schemas::ToSchema as _;
         use crate::EvaluationHandlerExtension as _;
+
         #[automatically_derived]
         impl crate::IntoEngineData for #struct_name
         where
@@ -180,11 +182,36 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
                 self,
                 engine: &dyn crate::Engine)
             -> crate::DeltaResult<Box<dyn crate::EngineData>> {
+                self.into_engine_data_impl(
+                    Arc::new(Self::to_schema()), // FIXME: remove Arc
+                    engine,
+                )
+            }
+
+            fn into_engine_data_struct(
+                self,
+                name: &str,
+                nullable: bool,
+                engine: &dyn crate::Engine)
+            -> crate::DeltaResult<Box<dyn crate::EngineData>> {
+                let schema = Arc::new(crate::schema::StructType::new([
+                    crate::schema::StructField::new(name, Self::to_schema(), nullable)
+                ]));
+                self.into_engine_data_impl(schema, engine)
+            }
+        }
+
+        #[automatically_derived]
+        impl #struct_name {
+            fn into_engine_data_impl(
+                self,
+                schema: crate::schema::SchemaRef,
+                engine: &dyn crate::Engine)
+            -> crate::DeltaResult<Box<dyn crate::EngineData>> {
                 let values = [
                     #(self.#field_idents.into()),*
                 ];
                 let evaluator = engine.evaluation_handler();
-                let schema = std::sync::Arc::new(Self::to_schema()); // fixme remove arc
                 evaluator.create_one(schema, &values)
             }
         }

@@ -130,7 +130,7 @@ impl Transaction {
             .set_transactions
             .clone()
             .into_iter()
-            .map(|txn| txn.into_engine_data(engine));
+            .map(|txn| txn.into_engine_data_struct("txn", true, engine));
 
         // step one: construct the iterator of commit info + file actions we want to commit
         let engine_commit_info = self
