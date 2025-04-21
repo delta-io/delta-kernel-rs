@@ -109,7 +109,7 @@ impl TryFrom<&DataType> for ArrowDataType {
                     PrimitiveType::Binary => Ok(ArrowDataType::Binary),
                     PrimitiveType::Decimal(dtype) => Ok(ArrowDataType::Decimal128(
                         dtype.precision(),
-                        dtype.scale() as i8,
+                        dtype.scale() as i8, // 0..=38
                     )),
                     PrimitiveType::Date => {
                         // A calendar date, represented as a year-month-day triple without a

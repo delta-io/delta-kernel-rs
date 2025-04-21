@@ -48,7 +48,7 @@ impl DecimalData {
 /// Computes the decimal precision of a 128-bit number. The largest possible magnitude is i128::MIN
 /// = -2**127 with 39 decimal digits.
 fn get_decimal_precision(value: i128) -> u8 {
-    // Not sure why checked_ilog10 returns u32 when log10(2**127) = 39 fits easily in u8??
+    // Not sure why checked_ilog10 returns u32 when log10(2**127) = 38 fits easily in u8??
     value.unsigned_abs().checked_ilog10().map_or(0, |p| p + 1) as _
 }
 
