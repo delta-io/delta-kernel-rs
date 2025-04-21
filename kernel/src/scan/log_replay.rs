@@ -407,7 +407,7 @@ mod tests {
         run_with_validate_callback,
     };
     use crate::scan::{get_state_info, Scan};
-    use crate::Expression;
+    use crate::Expression as Expr;
     use crate::{
         engine::sync::SyncEngine,
         schema::{DataType, SchemaRef, StructField, StructType},
@@ -502,17 +502,17 @@ mod tests {
 
         fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {
             assert!(transform.is_some());
-            let Expression::Struct(inner) = transform.unwrap().as_ref() else {
+            let Expr::Struct(inner) = transform.unwrap().as_ref() else {
                 panic!("Transform should always be a struct expr");
             };
             assert_eq!(inner.len(), 2, "expected two items in transform struct");
 
-            let Expression::Column(ref name) = inner[0] else {
+            let Expr::Column(ref name) = inner[0] else {
                 panic!("Expected first expression to be a column");
             };
             assert_eq!(name, &column_name!("value"), "First col should be 'value'");
 
-            let Expression::Literal(ref scalar) = inner[1] else {
+            let Expr::Literal(ref scalar) = inner[1] else {
                 panic!("Expected second expression to be a literal");
             };
             assert_eq!(
