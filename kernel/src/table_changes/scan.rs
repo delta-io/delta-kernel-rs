@@ -276,7 +276,7 @@ fn read_scan_file(
     resolved_scan_file: ResolvedCdfScanFile,
     global_state: &GlobalScanState,
     all_fields: &[ColumnType],
-    physical_predicate: Option<ExpressionRef>,
+    _physical_predicate: Option<ExpressionRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
     let ResolvedCdfScanFile {
         scan_file,
@@ -302,11 +302,11 @@ fn read_scan_file(
         size: 0,
         location,
     };
-    let read_result_iter = engine.parquet_handler().read_parquet_files(
-        &[file],
-        physical_schema,
-        physical_predicate,
-    )?;
+    // TODO(#860): we disable predicate pushdown until we support row indexes.
+    let read_result_iter =
+        engine
+            .parquet_handler()
+            .read_parquet_files(&[file], physical_schema, None)?;
 
     let result = read_result_iter.map(move |batch| -> DeltaResult<_> {
         let batch = batch?;
