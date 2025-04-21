@@ -193,8 +193,8 @@ pub enum Expression {
     // TODO: support more expressions, such as IS IN, LIKE, etc.
 }
 
-impl<T: Into<Scalar>> From<T> for Expression {
-    fn from(value: T) -> Self {
+impl From<Scalar> for Expression {
+    fn from(value: Scalar) -> Self {
         Self::literal(value)
     }
 }
@@ -688,26 +688,38 @@ mod tests {
         let col_ref = column_expr!("x");
         let cases = [
             (col_ref.clone(), "Column(x)"),
-            (col_ref.clone().eq(2), "Column(x) = 2"),
-            ((col_ref.clone() - 4).lt(10), "Column(x) - 4 < 10"),
-            ((col_ref.clone() + 4) / 10 * 42, "Column(x) + 4 / 10 * 42"),
+            (col_ref.clone().eq(Expr::literal(2)), "Column(x) = 2"),
             (
-                Expr::and(col_ref.clone().gt_eq(2), col_ref.clone().lt_eq(10)),
+                (col_ref.clone() - Expr::literal(4)).lt(Expr::literal(10)),
+                "Column(x) - 4 < 10",
+            ),
+            (
+                (col_ref.clone() + Expr::literal(4)) / Expr::literal(10) * Expr::literal(42),
+                "Column(x) + 4 / 10 * 42",
+            ),
+            (
+                Expr::and(
+                    col_ref.clone().gt_eq(Expr::literal(2)),
+                    col_ref.clone().lt_eq(Expr::literal(10)),
+                ),
                 "AND(Column(x) >= 2, Column(x) <= 10)",
             ),
             (
                 Expr::and_from([
-                    col_ref.clone().gt_eq(2),
-                    col_ref.clone().lt_eq(10),
-                    col_ref.clone().lt_eq(100),
+                    col_ref.clone().gt_eq(Expr::literal(2)),
+                    col_ref.clone().lt_eq(Expr::literal(10)),
+                    col_ref.clone().lt_eq(Expr::literal(100)),
                 ]),
                 "AND(Column(x) >= 2, Column(x) <= 10, Column(x) <= 100)",
             ),
             (
-                Expr::or(col_ref.clone().gt(2), col_ref.clone().lt(10)),
+                Expr::or(
+                    col_ref.clone().gt(Expr::literal(2)),
+                    col_ref.clone().lt(Expr::literal(10)),
+                ),
                 "OR(Column(x) > 2, Column(x) < 10)",
             ),
-            (col_ref.eq("foo"), "Column(x) = 'foo'"),
+            (col_ref.eq(Expr::literal("foo")), "Column(x) = 'foo'"),
         ];
 
         for (expr, expected) in cases {
