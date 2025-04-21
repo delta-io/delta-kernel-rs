@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::{Metadata, Protocol};
 use crate::log_segment::{self, LogSegment};
 use crate::scan::ScanBuilder;
@@ -302,6 +303,19 @@ impl Snapshot {
     /// Consume this `Snapshot` to create a [`ScanBuilder`]
     pub fn into_scan_builder(self) -> ScanBuilder {
         ScanBuilder::new(self)
+    }
+
+    /// Fetch the latest version of the provided `application_id` for this snapshot.
+    ///
+    /// Note that this method performs log replay (fetches and processes metadata from storage).
+    // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
+    pub fn get_app_id_version(
+        self: Arc<Self>,
+        application_id: &str,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<i64>> {
+        let txn = SetTransactionScanner::get_one(self.log_segment(), application_id, engine)?;
+        Ok(txn.map(|t| t.version))
     }
 }
 

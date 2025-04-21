@@ -487,6 +487,40 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct DecimalType {
+    precision: u8,
+    scale: u8,
+}
+
+impl DecimalType {
+    /// Check if the given precision and scale are valid for a decimal type.
+    pub fn try_new(precision: u8, scale: u8) -> DeltaResult<Self> {
+        require!(
+            0 < precision && precision <= 38,
+            Error::invalid_decimal(format!(
+                "precision must be in range 1..38 inclusive, found: {}.",
+                precision
+            ))
+        );
+        require!(
+            scale <= precision,
+            Error::invalid_decimal(format!(
+                "scale must be in range 0..{precision} inclusive, found: {scale}."
+            ))
+        );
+        Ok(Self { precision, scale })
+    }
+
+    pub fn precision(&self) -> u8 {
+        self.precision
+    }
+
+    pub fn scale(&self) -> u8 {
+        self.scale
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum PrimitiveType {
@@ -517,18 +551,23 @@ pub enum PrimitiveType {
         deserialize_with = "deserialize_decimal",
         untagged
     )]
-    Decimal(u8, u8),
+    Decimal(DecimalType),
+}
+
+impl PrimitiveType {
+    pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
+        Ok(DecimalType::try_new(precision, scale)?.into())
+    }
 }
 
 fn serialize_decimal<S: serde::Serializer>(
-    precision: &u8,
-    scale: &u8,
+    dtype: &DecimalType,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&format!("decimal({},{})", precision, scale))
+    serializer.serialize_str(&format!("decimal({},{})", dtype.precision(), dtype.scale()))
 }
 
-fn deserialize_decimal<'de, D>(deserializer: D) -> Result<(u8, u8), D::Error>
+fn deserialize_decimal<'de, D>(deserializer: D) -> Result<DecimalType, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -551,8 +590,7 @@ where
         .ok_or_else(|| {
             serde::de::Error::custom(format!("Invalid scale in decimal: {}", str_value))
         })?;
-    PrimitiveType::check_decimal(precision, scale).map_err(serde::de::Error::custom)?;
-    Ok((precision, scale))
+    DecimalType::try_new(precision, scale).map_err(serde::de::Error::custom)
 }
 
 impl Display for PrimitiveType {
@@ -570,8 +608,8 @@ impl Display for PrimitiveType {
             PrimitiveType::Date => write!(f, "date"),
             PrimitiveType::Timestamp => write!(f, "timestamp"),
             PrimitiveType::TimestampNtz => write!(f, "timestamp_ntz"),
-            PrimitiveType::Decimal(precision, scale) => {
-                write!(f, "decimal({},{})", precision, scale)
+            PrimitiveType::Decimal(dtype) => {
+                write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
             }
         }
     }
@@ -592,6 +630,16 @@ pub enum DataType {
     Map(Box<MapType>),
 }
 
+impl From<DecimalType> for PrimitiveType {
+    fn from(dtype: DecimalType) -> Self {
+        PrimitiveType::Decimal(dtype)
+    }
+}
+impl From<DecimalType> for DataType {
+    fn from(dtype: DecimalType) -> Self {
+        PrimitiveType::from(dtype).into()
+    }
+}
 impl From<PrimitiveType> for DataType {
     fn from(ptype: PrimitiveType) -> Self {
         DataType::Primitive(ptype)
@@ -637,10 +685,7 @@ impl DataType {
     pub const TIMESTAMP_NTZ: Self = DataType::Primitive(PrimitiveType::TimestampNtz);
 
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
-        PrimitiveType::check_decimal(precision, scale)?;
-        Ok(DataType::Primitive(PrimitiveType::Decimal(
-            precision, scale,
-        )))
+        Ok(PrimitiveType::decimal(precision, scale)?.into())
     }
 
     // This function assumes that the caller has already checked the precision and scale
@@ -1040,10 +1085,7 @@ mod tests {
         }
         "#;
         let field: StructField = serde_json::from_str(data).unwrap();
-        assert!(matches!(
-            field.data_type,
-            DataType::Primitive(PrimitiveType::Decimal(10, 2))
-        ));
+        assert_eq!(field.data_type, DataType::decimal(10, 2).unwrap());
 
         let json_str = serde_json::to_string(&field).unwrap();
         assert_eq!(
