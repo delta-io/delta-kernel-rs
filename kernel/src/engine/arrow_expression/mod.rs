@@ -134,7 +134,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
     ) -> Arc<dyn ExpressionEvaluator> {
         Arc::new(DefaultExpressionEvaluator {
             input_schema: schema,
-            expression: Box::new(expression),
+            expression,
             output_type,
         })
     }
@@ -156,16 +156,13 @@ impl EvaluationHandler for ArrowEvaluationHandler {
 #[derive(Debug)]
 pub struct DefaultExpressionEvaluator {
     input_schema: SchemaRef,
-    expression: Box<Expression>,
+    expression: Expression,
     output_type: DataType,
 }
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
-        debug!(
-            "Arrow evaluator evaluating: {:#?}",
-            self.expression.as_ref()
-        );
+        debug!("Arrow evaluator evaluating: {:#?}", self.expression);
         let batch = batch
             .any_ref()
             .downcast_ref::<ArrowEngineData>()
