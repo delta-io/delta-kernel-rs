@@ -546,9 +546,9 @@ fn recurse_into_children<'a, T: Clone>(
         .collect();
 
     if new_children.is_empty() {
-        None // all fields filtered out
+        None // all children filtered out
     } else if num_borrowed < children.len() {
-        // At least one field was changed or removed, so make a new field list
+        // At least one child was changed or removed, so make a new child list
         let children = new_children.into_iter().map(Cow::into_owned).collect();
         Some(Cow::Owned(children))
     } else {
