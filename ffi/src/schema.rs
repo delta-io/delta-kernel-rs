@@ -303,8 +303,8 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             DataType::Array(at) => {
                 call!(visit_array, visit_array_item(visitor, at, at.contains_null))
             }
-            DataType::Primitive(PrimitiveType::Decimal(precision, scale)) => {
-                call!(visit_decimal, *precision, *scale)
+            DataType::Primitive(PrimitiveType::Decimal(d)) => {
+                call!(visit_decimal, d.precision(), d.scale())
             }
             &DataType::STRING => call!(visit_string),
             &DataType::LONG => call!(visit_long),

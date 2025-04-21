@@ -152,7 +152,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(8, 3).unwrap()
         ),
-        Some(Scalar::Decimal(11032, 8, 3))
+        Some(Scalar::decimal(11032, 8, 3).unwrap())
     );
 
     assert_eq!(
@@ -160,7 +160,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal64"),
             &DataType::decimal(16, 3).unwrap()
         ),
-        Some(Scalar::Decimal(11064, 16, 3))
+        Some(Scalar::decimal(11064, 16, 3).unwrap())
     );
 
     // type widening!
@@ -169,7 +169,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(16, 3).unwrap()
         ),
-        Some(Scalar::Decimal(11032, 16, 3))
+        Some(Scalar::decimal(11032, 16, 3).unwrap())
     );
 
     assert_eq!(
@@ -177,7 +177,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal128"),
             &DataType::decimal(32, 3).unwrap()
         ),
-        Some(Scalar::Decimal(11128, 32, 3))
+        Some(Scalar::decimal(11128, 32, 3).unwrap())
     );
 
     // type widening!
@@ -186,7 +186,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal64"),
             &DataType::decimal(32, 3).unwrap()
         ),
-        Some(Scalar::Decimal(11064, 32, 3))
+        Some(Scalar::decimal(11064, 32, 3).unwrap())
     );
 
     // type widening!
@@ -195,7 +195,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(32, 3).unwrap()
         ),
-        Some(Scalar::Decimal(11032, 32, 3))
+        Some(Scalar::decimal(11032, 32, 3).unwrap())
     );
 
     assert_eq!(
@@ -324,7 +324,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(8, 3).unwrap()
         ),
-        Some(Scalar::Decimal(15032, 8, 3))
+        Some(Scalar::decimal(15032, 8, 3).unwrap())
     );
 
     assert_eq!(
@@ -332,7 +332,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal64"),
             &DataType::decimal(16, 3).unwrap()
         ),
-        Some(Scalar::Decimal(15064, 16, 3))
+        Some(Scalar::decimal(15064, 16, 3).unwrap())
     );
 
     // type widening!
@@ -341,7 +341,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(16, 3).unwrap()
         ),
-        Some(Scalar::Decimal(15032, 16, 3))
+        Some(Scalar::decimal(15032, 16, 3).unwrap())
     );
 
     assert_eq!(
@@ -349,7 +349,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal128"),
             &DataType::decimal(32, 3).unwrap()
         ),
-        Some(Scalar::Decimal(15128, 32, 3))
+        Some(Scalar::decimal(15128, 32, 3).unwrap())
     );
 
     // type widening!
@@ -358,7 +358,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal64"),
             &DataType::decimal(32, 3).unwrap()
         ),
-        Some(Scalar::Decimal(15064, 32, 3))
+        Some(Scalar::decimal(15064, 32, 3).unwrap())
     );
 
     // type widening!
@@ -367,7 +367,7 @@ fn test_get_stat_values() {
             &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(32, 3).unwrap()
         ),
-        Some(Scalar::Decimal(15032, 32, 3))
+        Some(Scalar::decimal(15032, 32, 3).unwrap())
     );
 
     assert_eq!(

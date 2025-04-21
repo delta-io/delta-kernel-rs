@@ -1,11 +1,11 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer stats.
-use crate::expressions::{ColumnName, Expression, Scalar};
+use crate::expressions::{ColumnName, DecimalData, Expression, Scalar};
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::parquet::arrow::arrow_reader::ArrowReaderBuilder;
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::file::statistics::Statistics;
 use crate::parquet::schema::types::ColumnDescPtr;
-use crate::schema::{DataType, PrimitiveType};
+use crate::schema::{DataType, DecimalType, PrimitiveType};
 use chrono::{DateTime, Days};
 use std::collections::HashMap;
 use tracing::debug;
@@ -66,18 +66,15 @@ impl<'a> RowGroupFilter<'a> {
             .map(|&i| self.row_group.column(i).statistics())
     }
 
-    fn decimal_from_bytes(bytes: Option<&[u8]>, precision: u8, scale: u8) -> Option<Scalar> {
+    fn decimal_from_bytes(bytes: Option<&[u8]>, dtype: DecimalType) -> Option<Scalar> {
         // WARNING: The bytes are stored in big-endian order; reverse and then 0-pad to 16 bytes.
         let bytes = bytes.filter(|b| b.len() <= 16)?;
         let mut bytes = Vec::from(bytes);
         bytes.reverse();
         bytes.resize(16, 0u8);
         let bytes: [u8; 16] = bytes.try_into().ok()?;
-        Some(Scalar::Decimal(
-            i128::from_le_bytes(bytes),
-            precision,
-            scale,
-        ))
+        let value = DecimalData::try_new(i128::from_le_bytes(bytes), dtype).ok()?;
+        Some(value.into())
     }
 
     fn timestamp_from_date(days: Option<&i32>) -> Option<Scalar> {
@@ -126,10 +123,14 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
             (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(*s.min_opt()?),
             (TimestampNtz, Statistics::Int32(s)) => Self::timestamp_from_date(s.min_opt())?,
             (TimestampNtz, _) => return None, // TODO: Int96 timestamps
-            (Decimal(p, s), Statistics::Int32(i)) => Scalar::Decimal(*i.min_opt()? as i128, *p, *s),
-            (Decimal(p, s), Statistics::Int64(i)) => Scalar::Decimal(*i.min_opt()? as i128, *p, *s),
-            (Decimal(p, s), Statistics::FixedLenByteArray(b)) => {
-                Self::decimal_from_bytes(b.min_bytes_opt(), *p, *s)?
+            (Decimal(d), Statistics::Int32(i)) => {
+                DecimalData::try_new(*i.min_opt()?, *d).ok()?.into()
+            }
+            (Decimal(d), Statistics::Int64(i)) => {
+                DecimalData::try_new(*i.min_opt()?, *d).ok()?.into()
+            }
+            (Decimal(d), Statistics::FixedLenByteArray(b)) => {
+                Self::decimal_from_bytes(b.min_bytes_opt(), *d)?
             }
             (Decimal(..), _) => return None,
         };
@@ -168,10 +169,14 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
             (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(*s.max_opt()?),
             (TimestampNtz, Statistics::Int32(s)) => Self::timestamp_from_date(s.max_opt())?,
             (TimestampNtz, _) => return None, // TODO: Int96 timestamps
-            (Decimal(p, s), Statistics::Int32(i)) => Scalar::Decimal(*i.max_opt()? as i128, *p, *s),
-            (Decimal(p, s), Statistics::Int64(i)) => Scalar::Decimal(*i.max_opt()? as i128, *p, *s),
-            (Decimal(p, s), Statistics::FixedLenByteArray(b)) => {
-                Self::decimal_from_bytes(b.max_bytes_opt(), *p, *s)?
+            (Decimal(d), Statistics::Int32(i)) => {
+                DecimalData::try_new(*i.max_opt()?, *d).ok()?.into()
+            }
+            (Decimal(d), Statistics::Int64(i)) => {
+                DecimalData::try_new(*i.max_opt()?, *d).ok()?.into()
+            }
+            (Decimal(d), Statistics::FixedLenByteArray(b)) => {
+                Self::decimal_from_bytes(b.max_bytes_opt(), *d)?
             }
             (Decimal(..), _) => return None,
         };

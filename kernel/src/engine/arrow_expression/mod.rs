@@ -52,9 +52,9 @@ impl Scalar {
             TimestampNtz(val) => Arc::new(TimestampMicrosecondArray::from_value(*val, num_rows)),
             Date(val) => Arc::new(Date32Array::from_value(*val, num_rows)),
             Binary(val) => Arc::new(BinaryArray::from(vec![val.as_slice(); num_rows])),
-            Decimal(val, precision, scale) => Arc::new(
-                Decimal128Array::from_value(*val, num_rows)
-                    .with_precision_and_scale(*precision, *scale as i8)?,
+            Decimal(val) => Arc::new(
+                Decimal128Array::from_value(val.bits(), num_rows)
+                    .with_precision_and_scale(val.precision(), val.scale() as i8)?, // 0..=38
             ),
             Struct(data) => {
                 let arrays = data
@@ -100,9 +100,9 @@ impl Scalar {
             }
             Null(DataType::DATE) => Arc::new(Date32Array::new_null(num_rows)),
             Null(DataType::BINARY) => Arc::new(BinaryArray::new_null(num_rows)),
-            Null(DataType::Primitive(PrimitiveType::Decimal(precision, scale))) => Arc::new(
+            Null(DataType::Primitive(PrimitiveType::Decimal(dtype))) => Arc::new(
                 Decimal128Array::new_null(num_rows)
-                    .with_precision_and_scale(*precision, *scale as i8)?,
+                    .with_precision_and_scale(dtype.precision(), dtype.scale() as i8)?, // 0..=38
             ),
             Null(DataType::Struct(t)) => {
                 let fields: Fields = t.fields().map(ArrowField::try_from).try_collect()?;
