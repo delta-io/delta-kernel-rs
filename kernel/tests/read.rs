@@ -422,7 +422,7 @@ fn read_with_scan_metadata(
 fn read_table_data(
     path: &str,
     select_cols: Option<&[&str]>,
-    predicate: Option<Expression>,
+    predicate: Option<Expr>,
     mut expected: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from(path))?;
@@ -465,7 +465,7 @@ fn read_table_data(
 fn read_table_data_str(
     path: &str,
     select_cols: Option<&[&str]>,
-    predicate: Option<Expression>,
+    predicate: Option<Expr>,
     expected: Vec<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     read_table_data(

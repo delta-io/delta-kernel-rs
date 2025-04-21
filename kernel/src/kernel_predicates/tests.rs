@@ -1,5 +1,5 @@
 use super::*;
-use crate::expressions::{column_expr, column_name, ArrayData, Expression, StructData};
+use crate::expressions::{column_expr, column_name, ArrayData, StructData};
 use crate::schema::ArrayType;
 use crate::DataType;
 
