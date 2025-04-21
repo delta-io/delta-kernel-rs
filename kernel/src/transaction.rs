@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::actions::schemas::{GetNullableContainerStructField, GetStructField};
+use crate::actions::SetTransaction;
 use crate::actions::COMMIT_INFO_NAME;
 use crate::actions::{get_log_add_schema, get_log_commit_info_schema};
 use crate::error::Error;
@@ -13,7 +14,6 @@ use crate::schema::{SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::{DataType, DeltaResult, Engine, EngineData, Expression, Version};
 
-use itertools::chain;
 use url::Url;
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -55,6 +55,15 @@ pub struct Transaction {
     operation: Option<String>,
     commit_info: Option<Arc<dyn EngineData>>,
     write_metadata: Vec<Box<dyn EngineData>>,
+    // NB: hashmap would require either duplicating the appid or splitting SetTransaction
+    // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
+    // HashSet::insert drops the to-be-inserted value without returning the existing one, which
+    // would make error messaging unnecessarily difficult. Thus, we keep Vec here and deduplicate in
+    // the commit method.
+    set_transactions: Vec<SetTransaction>,
+    // commit-wide timestamp (in milliseconds since epoch) - used in ICT, `txn` action, etc. to
+    // keep all timestamps within the same commit consistent.
+    commit_timestamp: i64,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -82,29 +91,63 @@ impl Transaction {
             .table_configuration()
             .ensure_write_supported()?;
 
+        // TODO: unify all these into a (safer) `fn current_time_ms()`
+        let commit_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_millis()).ok())
+            .ok_or_else(|| Error::generic("Failed to get current time for commit_timestamp"))?;
+
         Ok(Transaction {
             read_snapshot,
             operation: None,
             commit_info: None,
             write_metadata: vec![],
+            set_transactions: vec![],
+            commit_timestamp,
         })
     }
 
     /// Consume the transaction and commit it to the table. The result is a [CommitResult] which
     /// will include the failed transaction in case of a conflict so the user can retry.
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
-        // step one: construct the iterator of actions we want to commit
+        // step 0: if there are txn(app_id, version) actions being committed, ensure that every
+        // `app_id` is unique and create a row of `EngineData` for it.
+        // TODO(zach): we currently do this in two passes - can we do it in one and still keep refs
+        // in the HashSet?
+        let mut app_ids = HashSet::new();
+        if let Some(dup) = self
+            .set_transactions
+            .iter()
+            .find(|t| !app_ids.insert(&t.app_id))
+        {
+            return Err(Error::generic(format!(
+                "app_id {} already exists in transaction",
+                dup.app_id
+            )));
+        }
+        let set_transaction_actions = self
+            .set_transactions
+            .clone()
+            .into_iter()
+            .map(|txn| txn.into_engine_data(engine));
+
+        // step one: construct the iterator of commit info + file actions we want to commit
         let engine_commit_info = self
             .commit_info
             .as_ref()
             .ok_or_else(|| Error::MissingCommitInfo)?;
-        let commit_info = generate_commit_info(
+        let commit_info_actions = generate_commit_info(
             engine,
             self.operation.as_deref(),
+            self.commit_timestamp,
             engine_commit_info.as_ref(),
         );
-        let adds = generate_adds(engine, self.write_metadata.iter().map(|a| a.as_ref()));
-        let actions = chain(iter::once(commit_info), adds);
+        let add_actions = generate_adds(engine, self.write_metadata.iter().map(|a| a.as_ref()));
+
+        let actions = iter::once(commit_info_actions)
+            .chain(add_actions)
+            .chain(set_transaction_actions);
 
         // step two: set new commit version (current_version + 1) and path to write
         let commit_version = self.read_snapshot.version() + 1;
@@ -124,6 +167,17 @@ impl Transaction {
     /// commit and visible to anyone who describes the table history.
     pub fn with_operation(mut self, operation: String) -> Self {
         self.operation = Some(operation);
+        self
+    }
+
+    /// Include a SetTransaction (app_id and version) action for this transaction (with an optional
+    /// `last_updated` timestamp).
+    /// Note that each app_id can only appear once per transaction. That is, multiple app_ids with
+    /// different versions are disallowed in a single transaction. If a duplicate app_id is
+    /// included, the `commit` will fail (that is, we don't eagerly check app_id validity here).
+    pub fn with_transaction_id(mut self, app_id: String, version: i64) -> Self {
+        let set_transaction = SetTransaction::new(app_id, version, Some(self.commit_timestamp));
+        self.set_transactions.push(set_transaction);
         self
     }
 
@@ -246,7 +300,7 @@ impl WriteContext {
 pub enum CommitResult {
     /// The transaction was successfully committed at the version.
     Committed(Version),
-    /// The transaction conflicted with an existing version (at the version given).
+    /// This transaction conflicted with an existing version (at the version given).
     Conflict(Transaction, Version),
 }
 
@@ -254,6 +308,7 @@ pub enum CommitResult {
 fn generate_commit_info(
     engine: &dyn Engine,
     operation: Option<&str>,
+    timestamp: i64,
     engine_commit_info: &dyn EngineData,
 ) -> DeltaResult<Box<dyn EngineData>> {
     if engine_commit_info.len() != 1 {
@@ -263,14 +318,7 @@ fn generate_commit_info(
         )));
     }
 
-    let timestamp: i64 = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| Error::generic("time went backwards"))?
-        .as_millis()
-        .try_into()
-        .map_err(|_| Error::generic("milliseconds since unix_epoch exceeded i64 size"))?;
     let commit_info_exprs = [
-        // TODO(zach): we should probably take a timestamp closer to actual commit time?
         Expression::literal(timestamp),
         Expression::literal(operation.unwrap_or(UNKNOWN_OPERATION)),
         // HACK (part 1/2): since we don't have proper map support, we create a literal struct with
@@ -388,7 +436,7 @@ mod tests {
     }
 
     // convert it to JSON just for ease of comparison (and since we ultimately persist as JSON)
-    fn as_json_and_scrub_timestamp(data: Box<dyn EngineData>) -> serde_json::Value {
+    fn as_json(data: Box<dyn EngineData>) -> serde_json::Value {
         let record_batch: RecordBatch = data
             .into_any()
             .downcast::<ArrowEngineData>()
@@ -401,13 +449,7 @@ mod tests {
         writer.finish().unwrap();
         let buf = writer.into_inner();
 
-        let mut result: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        *result
-            .get_mut("commitInfo")
-            .unwrap()
-            .get_mut("timestamp")
-            .unwrap() = serde_json::Value::Number(0.into());
-        result
+        serde_json::from_slice(&buf).unwrap()
     }
 
     #[test]
@@ -439,12 +481,13 @@ mod tests {
         let actions = generate_commit_info(
             &engine,
             Some("test operation"),
+            123456789,
             &ArrowEngineData::new(commit_info_batch),
         )?;
 
         let expected = serde_json::json!({
             "commitInfo": {
-                "timestamp": 0,
+                "timestamp": 123456789,
                 "operation": "test operation",
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                 "operationParameters": {},
@@ -455,7 +498,7 @@ mod tests {
         });
 
         assert_eq!(actions.len(), 1);
-        let result = as_json_and_scrub_timestamp(actions);
+        let result = as_json(actions);
         assert_eq!(result, expected);
 
         Ok(())
@@ -499,12 +542,13 @@ mod tests {
         let actions = generate_commit_info(
             &engine,
             Some("test operation"),
+            123456789,
             &ArrowEngineData::new(commit_info_batch),
         )?;
 
         let expected = serde_json::json!({
             "commitInfo": {
-                "timestamp": 0,
+                "timestamp": 123456789,
                 "operation": "test operation",
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                 "operationParameters": {},
@@ -515,7 +559,7 @@ mod tests {
         });
 
         assert_eq!(actions.len(), 1);
-        let result = as_json_and_scrub_timestamp(actions);
+        let result = as_json(actions);
         assert_eq!(result, expected);
 
         Ok(())
@@ -537,6 +581,7 @@ mod tests {
         let _ = generate_commit_info(
             &engine,
             Some("test operation"),
+            123456789,
             &ArrowEngineData::new(commit_info_batch),
         )
         .map_err(|e| match e {
@@ -565,6 +610,7 @@ mod tests {
         let _ = generate_commit_info(
             &engine,
             Some("test operation"),
+            123456789,
             &ArrowEngineData::new(commit_info_batch),
         )
         .map_err(|e| match e {
@@ -580,12 +626,13 @@ mod tests {
     fn assert_empty_commit_info(
         data: Box<dyn EngineData>,
         write_engine_commit_info: bool,
+        timestamp: i64,
     ) -> DeltaResult<()> {
         assert_eq!(data.len(), 1);
         let expected = if write_engine_commit_info {
             serde_json::json!({
                 "commitInfo": {
-                    "timestamp": 0,
+                    "timestamp": timestamp,
                     "operation": "test operation",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
@@ -595,14 +642,14 @@ mod tests {
         } else {
             serde_json::json!({
                 "commitInfo": {
-                    "timestamp": 0,
+                    "timestamp": timestamp,
                     "operation": "test operation",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
                 }
             })
         };
-        let result = as_json_and_scrub_timestamp(data);
+        let result = as_json(data);
         assert_eq!(result, expected);
         Ok(())
     }
@@ -652,13 +699,15 @@ mod tests {
             let commit_info_batch =
                 RecordBatch::try_new(engine_commit_info_schema, vec![Arc::new(array)])?;
 
+            let timestamp = 123456;
             let actions = generate_commit_info(
                 &engine,
                 Some("test operation"),
+                timestamp,
                 &ArrowEngineData::new(commit_info_batch),
             )?;
 
-            assert_empty_commit_info(actions, is_null)?;
+            assert_empty_commit_info(actions, is_null, timestamp)?;
         }
         Ok(())
     }

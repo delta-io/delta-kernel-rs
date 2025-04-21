@@ -547,7 +547,8 @@ mod tests {
     pub struct MutNotSync;
 
     // Because tests compile as binaries against packages, this test can only run correctly if we
-    // use the `internal-api` feature to make mod handle public. Otherwise it's inaccessible for testing
+    // use the `internal-api` feature to make mod handle public. Otherwise it's inaccessible for
+    // testing
     #[test]
     #[cfg(feature = "internal-api")]
     fn invalid_handle_code() {

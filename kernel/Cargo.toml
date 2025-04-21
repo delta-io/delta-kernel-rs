@@ -39,7 +39,6 @@ pre-release-hook = [
 [dependencies]
 bytes = "1.10"
 chrono = "=0.4.39"
-fix-hidden-lifetime-bug = "0.2"
 indexmap = "2.9.0"
 itertools = "0.14"
 roaring = "0.10.12"
@@ -54,9 +53,6 @@ z85 = "3.0.6"
 
 # bring in our derive macros
 delta_kernel_derive = { path = "../derive-macros", version = "0.9.0" }
-
-# used for `internal-api` feature flag
-visibility = "0.1.1"
 
 # Used in the sync engine
 tempfile = { version = "3", optional = true }
@@ -140,9 +136,6 @@ integration-test = [
   "hdfs-native",
   "walkdir",
 ]
-
-[dependencies.home]
-version = "=0.5.9"
 
 [build-dependencies]
 rustc_version = "0.4.1"
