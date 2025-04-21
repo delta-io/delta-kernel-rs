@@ -556,7 +556,6 @@ fn recurse_into_children<'a, T: Clone>(
     }
 }
 
-
 impl<R: Into<Expression>> std::ops::Add<R> for Expression {
     type Output = Self;
 
