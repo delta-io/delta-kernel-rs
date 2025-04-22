@@ -478,26 +478,7 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         fields: &'a Vec<Expression>,
     ) -> Option<Cow<'a, Vec<Expression>>> {
-        let mut num_borrowed = 0;
-        let new_fields: Vec<_> = fields
-            .iter()
-            .filter_map(|f| self.transform(f))
-            .inspect(|f| {
-                if matches!(f, Cow::Borrowed(_)) {
-                    num_borrowed += 1;
-                }
-            })
-            .collect();
-
-        if new_fields.is_empty() {
-            None // all fields filtered out
-        } else if num_borrowed < fields.len() {
-            // At least one field was changed or filtered out, so make a new field list
-            let fields = new_fields.into_iter().map(|f| f.into_owned()).collect();
-            Some(Cow::Owned(fields))
-        } else {
-            Some(Cow::Borrowed(fields))
-        }
+        recurse_into_children(fields, |f| self.transform(f))
     }
 
     /// Recursively transforms a unary expression's child. Returns `None` if the child was removed,
@@ -540,11 +521,38 @@ pub trait ExpressionTransform<'a> {
         j: &'a JunctionExpression,
     ) -> Option<Cow<'a, JunctionExpression>> {
         use Cow::*;
-        let j = match self.recurse_into_struct(&j.exprs)? {
+        let j = match recurse_into_children(&j.exprs, |e| self.transform(e))? {
             Owned(exprs) => Owned(JunctionExpression::new(j.op, exprs)),
             Borrowed(_) => Borrowed(j),
         };
         Some(j)
+    }
+}
+
+/// Used to recurse into the children of an `Expression::Struct` or `Expression::Junction`.
+fn recurse_into_children<'a, T: Clone>(
+    children: &'a Vec<T>,
+    recurse_fn: impl FnMut(&'a T) -> Option<Cow<'a, T>>,
+) -> Option<Cow<'a, Vec<T>>> {
+    let mut num_borrowed = 0;
+    let new_children: Vec<_> = children
+        .iter()
+        .filter_map(recurse_fn)
+        .inspect(|f| {
+            if matches!(f, Cow::Borrowed(_)) {
+                num_borrowed += 1;
+            }
+        })
+        .collect();
+
+    if new_children.is_empty() {
+        None // all children filtered out
+    } else if num_borrowed < children.len() {
+        // At least one child was changed or removed, so make a new child list
+        let children = new_children.into_iter().map(Cow::into_owned).collect();
+        Some(Cow::Owned(children))
+    } else {
+        Some(Cow::Borrowed(children))
     }
 }
 
