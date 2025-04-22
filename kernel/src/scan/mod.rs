@@ -850,12 +850,12 @@ mod tests {
             (true, Expr::literal(false)),
             (false, Expr::literal(true)),
             (true, NULL),
-            (true, Expr::and(column_expr!("a"), false)),
-            (false, Expr::or(column_expr!("a"), true)),
-            (false, Expr::or(column_expr!("a"), false)),
-            (false, Expr::lt(column_expr!("a"), 10)),
-            (false, Expr::lt(Expr::literal(10), 100)),
-            (true, Expr::gt(Expr::literal(10), 100)),
+            (true, Expr::and(column_expr!("a"), Expr::literal(false))),
+            (false, Expr::or(column_expr!("a"), Expr::literal(true))),
+            (false, Expr::or(column_expr!("a"), Expr::literal(false))),
+            (false, Expr::lt(column_expr!("a"), Expr::literal(10))),
+            (false, Expr::lt(Expr::literal(10), Expr::literal(100))),
+            (true, Expr::gt(Expr::literal(10), Expr::literal(100))),
             (true, Expr::and(NULL, column_expr!("a"))),
         ];
         for (should_skip, predicate) in test_cases {
@@ -975,9 +975,9 @@ mod tests {
                 )),
             ),
             (
-                Expr::and(column_expr!("mapped.n"), true),
+                Expr::and(column_expr!("mapped.n"), Expr::literal(true)),
                 Some(PhysicalPredicate::Some(
-                    Expr::and(column_expr!("phys_mapped.phys_n"), true).into(),
+                    Expr::and(column_expr!("phys_mapped.phys_n"), Expr::literal(true)).into(),
                     StructType::new(vec![StructField::nullable(
                         "phys_mapped",
                         StructType::new(vec![StructField::nullable("phys_n", DataType::LONG)
@@ -994,7 +994,7 @@ mod tests {
                 )),
             ),
             (
-                Expr::and(column_expr!("mapped.n"), false),
+                Expr::and(column_expr!("mapped.n"), Expr::literal(false)),
                 Some(PhysicalPredicate::StaticSkipAll),
             ),
         ];
@@ -1189,7 +1189,7 @@ mod tests {
         //
         // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 - This
         // optimization is currently disabled, so the one data file is still returned.
-        let predicate = Arc::new(column_expr!("missing").lt(1000i64));
+        let predicate = Arc::new(column_expr!("missing").lt(Expr::literal(1000i64)));
         let scan = snapshot
             .clone()
             .scan_builder()
@@ -1200,7 +1200,7 @@ mod tests {
         assert_eq!(data.len(), 1);
 
         // Predicate over a logically missing column fails the scan
-        let predicate = Arc::new(column_expr!("numeric.ints.invalid").lt(1000));
+        let predicate = Arc::new(column_expr!("numeric.ints.invalid").lt(Expr::literal(1000)));
         snapshot
             .scan_builder()
             .with_predicate(predicate)

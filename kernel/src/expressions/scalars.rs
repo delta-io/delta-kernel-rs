@@ -708,10 +708,10 @@ mod tests {
         });
 
         let column = column_expr!("item");
-        let array_op = Expr::binary(BinaryOperator::In, 10, array.clone());
-        let array_not_op = Expr::binary(BinaryOperator::NotIn, 10, array);
-        let column_op = Expr::binary(BinaryOperator::In, PI, column.clone());
-        let column_not_op = Expr::binary(BinaryOperator::NotIn, "Cool", column);
+        let array_op = Expr::binary(BinaryOperator::In, Expr::literal(10), array.clone());
+        let array_not_op = Expr::binary(BinaryOperator::NotIn, Expr::literal(10), array);
+        let column_op = Expr::binary(BinaryOperator::In, Expr::literal(PI), column.clone());
+        let column_not_op = Expr::binary(BinaryOperator::NotIn, Expr::literal("Cool"), column);
         assert_eq!(&format!("{}", array_op), "10 IN (1, 2, 3)");
         assert_eq!(&format!("{}", array_not_op), "10 NOT IN (1, 2, 3)");
         assert_eq!(&format!("{}", column_op), "3.1415927 IN Column(item)");

@@ -230,8 +230,8 @@ pub(crate) fn cdf_scan_row_expression(commit_timestamp: i64, commit_number: i64)
             column_expr!("cdc.path"),
             Expression::struct_from([column_expr!("cdc.partitionValues")]),
         ]),
-        commit_timestamp.into(),
-        commit_number.into(),
+        Expression::literal(commit_timestamp),
+        Expression::literal(commit_number),
     ])
 }
 

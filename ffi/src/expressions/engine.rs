@@ -178,7 +178,7 @@ fn visit_expression_literal_string_impl(
     state: &mut KernelExpressionVisitorState,
     value: DeltaResult<String>,
 ) -> DeltaResult<usize> {
-    Ok(wrap_expression(state, value?))
+    Ok(wrap_expression(state, Expression::literal(value?)))
 }
 
 // We need to get parse.expand working to be able to macro everything below, see issue #255
@@ -188,7 +188,7 @@ pub extern "C" fn visit_expression_literal_int(
     state: &mut KernelExpressionVisitorState,
     value: i32,
 ) -> usize {
-    wrap_expression(state, value)
+    wrap_expression(state, Expression::literal(value))
 }
 
 #[no_mangle]
@@ -196,7 +196,7 @@ pub extern "C" fn visit_expression_literal_long(
     state: &mut KernelExpressionVisitorState,
     value: i64,
 ) -> usize {
-    wrap_expression(state, value)
+    wrap_expression(state, Expression::literal(value))
 }
 
 #[no_mangle]
@@ -204,7 +204,7 @@ pub extern "C" fn visit_expression_literal_short(
     state: &mut KernelExpressionVisitorState,
     value: i16,
 ) -> usize {
-    wrap_expression(state, value)
+    wrap_expression(state, Expression::literal(value))
 }
 
 #[no_mangle]
@@ -212,7 +212,7 @@ pub extern "C" fn visit_expression_literal_byte(
     state: &mut KernelExpressionVisitorState,
     value: i8,
 ) -> usize {
-    wrap_expression(state, value)
+    wrap_expression(state, Expression::literal(value))
 }
 
 #[no_mangle]
@@ -220,7 +220,7 @@ pub extern "C" fn visit_expression_literal_float(
     state: &mut KernelExpressionVisitorState,
     value: f32,
 ) -> usize {
-    wrap_expression(state, value)
+    wrap_expression(state, Expression::literal(value))
 }
 
 #[no_mangle]
@@ -228,7 +228,7 @@ pub extern "C" fn visit_expression_literal_double(
     state: &mut KernelExpressionVisitorState,
     value: f64,
 ) -> usize {
-    wrap_expression(state, value)
+    wrap_expression(state, Expression::literal(value))
 }
 
 #[no_mangle]
@@ -236,5 +236,5 @@ pub extern "C" fn visit_expression_literal_bool(
     state: &mut KernelExpressionVisitorState,
     value: bool,
 ) -> usize {
-    wrap_expression(state, value)
+    wrap_expression(state, Expression::literal(value))
 }
