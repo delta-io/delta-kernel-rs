@@ -349,16 +349,6 @@ impl Expression {
         Self::binary(BinaryOperator::GreaterThan, self, other)
     }
 
-    /// Create a new expression `self >= other`
-    pub fn gt_eq(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::GreaterThanOrEqual, self, other)
-    }
-
-    /// Create a new expression `self <= other`
-    pub fn lt_eq(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::LessThanOrEqual, self, other)
-    }
-
     /// Create a new expression `self AND other`
     pub fn and(a: impl Into<Self>, b: impl Into<Self>) -> Self {
         Self::and_from([a.into(), b.into()])
@@ -707,16 +697,16 @@ mod tests {
             ),
             (
                 Expr::and(
-                    col_ref.clone().gt_eq(Expr::literal(2)),
-                    col_ref.clone().lt_eq(Expr::literal(10)),
+                    col_ref.clone().ge(Expr::literal(2)),
+                    col_ref.clone().le(Expr::literal(10)),
                 ),
                 "AND(Column(x) >= 2, Column(x) <= 10)",
             ),
             (
                 Expr::and_from([
-                    col_ref.clone().gt_eq(Expr::literal(2)),
-                    col_ref.clone().lt_eq(Expr::literal(10)),
-                    col_ref.clone().lt_eq(Expr::literal(100)),
+                    col_ref.clone().ge(Expr::literal(2)),
+                    col_ref.clone().le(Expr::literal(10)),
+                    col_ref.clone().le(Expr::literal(100)),
                 ]),
                 "AND(Column(x) >= 2, Column(x) <= 10, Column(x) <= 100)",
             ),
