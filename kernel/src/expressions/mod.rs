@@ -683,41 +683,47 @@ mod tests {
 
     #[test]
     fn test_expression_format() {
-        let col_ref = column_expr!("x");
         let cases = [
-            (col_ref.clone(), "Column(x)"),
-            (col_ref.clone().eq(Expr::literal(2)), "Column(x) = 2"),
+            (column_expr!("x"), "Column(x)"),
             (
-                (col_ref.clone() - Expr::literal(4)).lt(Expr::literal(10)),
-                "Column(x) - 4 < 10",
-            ),
-            (
-                (col_ref.clone() + Expr::literal(4)) / Expr::literal(10) * Expr::literal(42),
+                (column_expr!("x") + Expr::literal(4)) / Expr::literal(10) * Expr::literal(42),
                 "Column(x) + 4 / 10 * 42",
             ),
             (
+                Expr::struct_from([column_expr!("x"), Expr::literal(2), Expr::literal(10)]),
+                "Struct(Column(x), 2, 10)",
+            ),
+            (column_expr!("x").eq(Expr::literal(2)), "Column(x) = 2"),
+            (
+                (column_expr!("x") - Expr::literal(4)).lt(Expr::literal(10)),
+                "Column(x) - 4 < 10",
+            ),
+            (
                 Expr::and(
-                    col_ref.clone().ge(Expr::literal(2)),
-                    col_ref.clone().le(Expr::literal(10)),
+                    column_expr!("x").ge(Expr::literal(2)),
+                    column_expr!("x").le(Expr::literal(10)),
                 ),
                 "AND(Column(x) >= 2, Column(x) <= 10)",
             ),
             (
                 Expr::and_from([
-                    col_ref.clone().ge(Expr::literal(2)),
-                    col_ref.clone().le(Expr::literal(10)),
-                    col_ref.clone().le(Expr::literal(100)),
+                    column_expr!("x").ge(Expr::literal(2)),
+                    column_expr!("x").le(Expr::literal(10)),
+                    column_expr!("x").le(Expr::literal(100)),
                 ]),
                 "AND(Column(x) >= 2, Column(x) <= 10, Column(x) <= 100)",
             ),
             (
                 Expr::or(
-                    col_ref.clone().gt(Expr::literal(2)),
-                    col_ref.clone().lt(Expr::literal(10)),
+                    column_expr!("x").gt(Expr::literal(2)),
+                    column_expr!("x").lt(Expr::literal(10)),
                 ),
                 "OR(Column(x) > 2, Column(x) < 10)",
             ),
-            (col_ref.eq(Expr::literal("foo")), "Column(x) = 'foo'"),
+            (
+                column_expr!("x").eq(Expr::literal("foo")),
+                "Column(x) = 'foo'",
+            ),
         ];
 
         for (expr, expected) in cases {
@@ -728,27 +734,27 @@ mod tests {
 
     #[test]
     fn test_depth_checker() {
-        let expr = Expr::and_from([
-            Expr::struct_from([
-                Expr::and_from([
+        let expr = Expr::or_from([
+            Expr::and_from([
+                Expr::or(
                     Expr::lt(Expr::literal(10), column_expr!("x")),
-                    Expr::or_from([Expr::literal(true), column_expr!("b")]),
-                ]),
+                    Expr::gt(Expr::literal(20), column_expr!("b")),
+                ),
                 Expr::literal(true),
                 Expr::not(Expr::literal(true)),
             ]),
             Expr::and_from([
-                Expr::not(column_expr!("b")),
+                Expr::is_null(column_expr!("b")),
                 Expr::gt(Expr::literal(10), column_expr!("x")),
-                Expr::or_from([
-                    Expr::and_from([Expr::not(Expr::literal(true)), Expr::literal(10)]),
-                    Expr::literal(10),
-                ]),
+                Expr::or(
+                    Expr::gt(Expr::literal(5) + Expr::literal(10), Expr::literal(20)),
+                    column_expr!("y"),
+                ),
                 Expr::literal(true),
             ]),
             Expr::ne(
-                Expr::literal(true),
-                Expr::and_from([Expr::literal(true), column_expr!("b")]),
+                Expr::literal(42),
+                Expr::struct_from([Expr::literal(10), column_expr!("b")]),
             ),
         ]);
 
@@ -758,55 +764,55 @@ mod tests {
 
         // NOTE: The checker ignores leaf nodes!
 
-        // AND
-        //  * STRUCT
-        //    * AND     >LIMIT<
+        // OR
+        //  * AND
+        //    * OR     >LIMIT<
         //    * NOT
         //  * AND
         //  * NE
         assert_eq!(check_with_call_count(1), (2, 6));
 
-        // AND
-        //  * STRUCT
-        //    * AND
+        // OR
+        //  * AND
+        //    * OR
         //      * LT     >LIMIT<
-        //      * OR
+        //      * GT
         //    * NOT
         //  * AND
         //  * NE
         assert_eq!(check_with_call_count(2), (3, 8));
 
-        // AND
-        //  * STRUCT
-        //    * AND
+        // OR
+        //  * AND
+        //    * OR
         //      * LT
-        //      * OR
+        //      * GT
         //    * NOT
         //  * AND
-        //    * NOT
+        //    * IS NULL
         //    * GT
         //    * OR
-        //      * AND
-        //        * NOT     >LIMIT<
+        //      * GT
+        //        * PLUS     >LIMIT<
         //  * NE
         assert_eq!(check_with_call_count(3), (4, 13));
 
         // Depth limit not hit (full traversal required)
-
-        // AND
-        //  * STRUCT
-        //    * AND
+        //
+        // OR
+        //  * AND
+        //    * OR
         //      * LT
-        //      * OR
+        //      * GT
         //    * NOT
         //  * AND
-        //    * NOT
+        //    * IS_NULL
         //    * GT
         //    * OR
-        //      * AND
-        //        * NOT
+        //      * GT
+        //        * PLUS
         //  * NE
-        //    * AND
+        //    * STRUCT
         assert_eq!(check_with_call_count(4), (4, 14));
         assert_eq!(check_with_call_count(5), (4, 14));
     }
