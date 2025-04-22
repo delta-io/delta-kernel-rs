@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::{Metadata, Protocol};
 use crate::log_segment::{self, LogSegment};
@@ -316,6 +317,17 @@ impl Snapshot {
     ) -> DeltaResult<Option<i64>> {
         let txn = SetTransactionScanner::get_one(self.log_segment(), application_id, engine)?;
         Ok(txn.map(|t| t.version))
+    }
+
+    /// Fetch the configuration for a domain for this snapshot.
+    ///
+    /// Note that this method performs log replay (fetches and processes metadata from storage).
+    pub fn domain_metadata(
+        self: Arc<Self>,
+        domain: &str,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<String>> {
+        domain_metadata_configuration(self.log_segment(), domain, engine)
     }
 }
 

@@ -12,11 +12,9 @@ use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 use super::deletion_vector::DeletionVectorDescriptor;
+use super::domain_metadata::DomainMetadataMap;
 use super::schemas::ToSchema as _;
-use super::{
-    Add, Cdc, Format, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME, CDC_NAME,
-    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
-};
+use super::*;
 
 #[derive(Default)]
 #[internal_api]
@@ -478,6 +476,80 @@ impl RowVisitor for SidecarVisitor {
             // Since path column is required, use it to detect presence of a Sidecar action
             if let Some(path) = getters[0].get_opt(i, "sidecar.path")? {
                 self.sidecars.push(Self::visit_sidecar(i, path, getters)?);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Visit data batches of actions to extract the latest domain metadata for each domain.
+///
+/// Note that this visitor requires that the log (each actions batch) is replayed in reverse order.
+///
+/// This visitor maintains the first entry for each domain it encounters. A domain_filter may be
+/// included to only retain the domain metadata for a specific domain (in order to bound memory
+/// requirements).
+#[derive(Debug, Default)]
+pub(crate) struct DomainMetadataVisitor {
+    pub(crate) domain_metadatas: DomainMetadataMap,
+    domain_filter: Option<String>,
+}
+
+impl DomainMetadataVisitor {
+    /// Create a new visitor. When domain_filter is set then we only retain
+    pub(crate) fn new(domain_filter: Option<String>) -> Self {
+        DomainMetadataVisitor {
+            domain_filter,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn visit_domain_metadata<'a>(
+        row_index: usize,
+        domain: String,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<DomainMetadata> {
+        require!(
+            getters.len() == 3,
+            Error::InternalError(format!(
+                "Wrong number of DomainMetadataVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        let configuration: String = getters[1].get(row_index, "domainMetadata.configuration")?;
+        let removed: bool = getters[2].get(row_index, "domainMetadata.removed")?;
+        Ok(DomainMetadata {
+            domain,
+            configuration,
+            removed,
+        })
+    }
+}
+
+impl RowVisitor for DomainMetadataVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| DomainMetadata::to_schema().leaves(DOMAIN_METADATA_NAME));
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        // Requires that batches are visited in reverse order relative to the log
+        for i in 0..row_count {
+            let domain: Option<String> = getters[0].get_opt(i, "domainMetadata.domain")?;
+            if let Some(domain) = domain {
+                // if caller requested a specific domain then only visit matches
+                if self
+                    .domain_filter
+                    .as_ref()
+                    .map_or(true, |requested| requested == &domain)
+                {
+                    let domain_metadata =
+                        DomainMetadataVisitor::visit_domain_metadata(i, domain.clone(), getters)?;
+                    self.domain_metadatas
+                        .entry(domain)
+                        .or_insert_with(|| domain_metadata);
+                }
             }
         }
         Ok(())
