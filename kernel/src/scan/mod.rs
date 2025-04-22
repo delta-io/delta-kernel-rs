@@ -533,7 +533,6 @@ impl Scan {
 
         let global_state = Arc::new(self.global_scan_state());
         let table_root = self.snapshot.table_root().clone();
-        let physical_predicate = self.physical_predicate();
 
         let scan_metadata_iter = self.scan_metadata(engine.as_ref())?;
         let scan_files_iter = scan_metadata_iter
@@ -562,10 +561,12 @@ impl Scan {
                 // partition columns, but the read schema we use here does _NOT_ include partition
                 // columns. So we cannot safely assume that all column references are valid. See
                 // https://github.com/delta-io/delta-kernel-rs/issues/434 for more details.
+                //
+                // TODO(#860): we disable predicate pushdown until we support row indexes.
                 let read_result_iter = engine.parquet_handler().read_parquet_files(
                     &[meta],
                     global_state.physical_schema.clone(),
-                    physical_predicate.clone(),
+                    None,
                 )?;
 
                 // Arc clones
@@ -849,12 +850,12 @@ mod tests {
             (true, Expr::literal(false)),
             (false, Expr::literal(true)),
             (true, NULL),
-            (true, Expr::and(column_expr!("a"), false)),
-            (false, Expr::or(column_expr!("a"), true)),
-            (false, Expr::or(column_expr!("a"), false)),
-            (false, Expr::lt(column_expr!("a"), 10)),
-            (false, Expr::lt(Expr::literal(10), 100)),
-            (true, Expr::gt(Expr::literal(10), 100)),
+            (true, Expr::and(column_expr!("a"), Expr::literal(false))),
+            (false, Expr::or(column_expr!("a"), Expr::literal(true))),
+            (false, Expr::or(column_expr!("a"), Expr::literal(false))),
+            (false, Expr::lt(column_expr!("a"), Expr::literal(10))),
+            (false, Expr::lt(Expr::literal(10), Expr::literal(100))),
+            (true, Expr::gt(Expr::literal(10), Expr::literal(100))),
             (true, Expr::and(NULL, column_expr!("a"))),
         ];
         for (should_skip, predicate) in test_cases {
@@ -974,9 +975,9 @@ mod tests {
                 )),
             ),
             (
-                Expr::and(column_expr!("mapped.n"), true),
+                Expr::and(column_expr!("mapped.n"), Expr::literal(true)),
                 Some(PhysicalPredicate::Some(
-                    Expr::and(column_expr!("phys_mapped.phys_n"), true).into(),
+                    Expr::and(column_expr!("phys_mapped.phys_n"), Expr::literal(true)).into(),
                     StructType::new(vec![StructField::nullable(
                         "phys_mapped",
                         StructType::new(vec![StructField::nullable("phys_n", DataType::LONG)
@@ -993,7 +994,7 @@ mod tests {
                 )),
             ),
             (
-                Expr::and(column_expr!("mapped.n"), false),
+                Expr::and(column_expr!("mapped.n"), Expr::literal(false)),
                 Some(PhysicalPredicate::StaticSkipAll),
             ),
         ];
@@ -1159,7 +1160,11 @@ mod tests {
         let data: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
         assert_eq!(data.len(), 1);
 
-        // Effective predicate pushdown, so no data files should be returned.
+        // TODO(#860): we disable predicate pushdown until we support row indexes. Update this test
+        // accordingly after support is reintroduced.
+        //
+        // Effective predicate pushdown, so no data files should be returned. BUT since we disabled
+        // predicate pushdown, the one data file is still returned.
         let predicate = Arc::new(int_col.lt(value));
         let scan = snapshot
             .scan_builder()
@@ -1167,7 +1172,7 @@ mod tests {
             .build()
             .unwrap();
         let data: Vec<_> = scan.execute(engine).unwrap().try_collect().unwrap();
-        assert_eq!(data.len(), 0);
+        assert_eq!(data.len(), 1);
     }
 
     #[test]
@@ -1184,7 +1189,7 @@ mod tests {
         //
         // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 - This
         // optimization is currently disabled, so the one data file is still returned.
-        let predicate = Arc::new(column_expr!("missing").lt(1000i64));
+        let predicate = Arc::new(column_expr!("missing").lt(Expr::literal(1000i64)));
         let scan = snapshot
             .clone()
             .scan_builder()
@@ -1195,7 +1200,7 @@ mod tests {
         assert_eq!(data.len(), 1);
 
         // Predicate over a logically missing column fails the scan
-        let predicate = Arc::new(column_expr!("numeric.ints.invalid").lt(1000));
+        let predicate = Arc::new(column_expr!("numeric.ints.invalid").lt(Expr::literal(1000)));
         snapshot
             .scan_builder()
             .with_predicate(predicate)
