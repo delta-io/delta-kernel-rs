@@ -9,7 +9,7 @@ use itertools::Itertools;
 pub use self::column_names::{
     column_expr, column_name, joined_column_expr, joined_column_name, ColumnName,
 };
-pub use self::scalars::{ArrayData, Scalar, StructData};
+pub use self::scalars::{ArrayData, DecimalData, Scalar, StructData};
 use crate::DataType;
 
 mod column_names;

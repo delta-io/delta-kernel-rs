@@ -317,15 +317,15 @@ fn visit_expression_scalar(
             buf.as_ptr(),
             buf.len()
         ),
-        Scalar::Decimal(value, precision, scale) => {
+        Scalar::Decimal(v) => {
             call!(
                 visitor,
                 visit_literal_decimal,
                 sibling_list_id,
-                (value >> 64) as i64,
-                *value as u64,
-                *precision,
-                *scale
+                (v.bits() >> 64) as i64,
+                v.bits() as u64,
+                v.precision(),
+                v.scale()
             )
         }
         Scalar::Null(_) => call!(visitor, visit_literal_null, sibling_list_id),
