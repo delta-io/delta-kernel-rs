@@ -875,5 +875,34 @@ mod tests {
             ),
         ]);
         assert_eq!(actual, expected);
+
+        // test filtering
+        let mut domain_metadata_visitor = DomainMetadataVisitor::new(Some("zach3".to_string()));
+        domain_metadata_visitor
+            .visit_rows_of(batch1.as_ref())
+            .unwrap();
+        domain_metadata_visitor
+            .visit_rows_of(batch2.as_ref())
+            .unwrap();
+        let actual = domain_metadata_visitor.domain_metadatas;
+        let expected = DomainMetadataMap::from([(
+            "zach3".to_string(),
+            DomainMetadata {
+                domain: "zach3".to_string(),
+                configuration: "old_cfg3".to_string(),
+                removed: false,
+            },
+        )]);
+        assert_eq!(actual, expected);
+
+        // test filtering for a domain that is not present
+        let mut domain_metadata_visitor = DomainMetadataVisitor::new(Some("notexist".to_string()));
+        domain_metadata_visitor
+            .visit_rows_of(batch1.as_ref())
+            .unwrap();
+        domain_metadata_visitor
+            .visit_rows_of(batch2.as_ref())
+            .unwrap();
+        assert!(domain_metadata_visitor.domain_metadatas.is_empty());
     }
 }
