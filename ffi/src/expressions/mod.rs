@@ -1,5 +1,6 @@
 //! This module holds functionality for moving expressions across the FFI boundary, both from
 //! engine to kernel, and from kernel to engine.
+use delta_kernel::expressions::{OpaqueExpressionOp, OpaquePredicateOp};
 use delta_kernel::{Expression, Predicate};
 use delta_kernel_ffi_macros::handle_descriptor;
 
@@ -13,6 +14,12 @@ pub struct SharedExpression;
 
 #[handle_descriptor(target=Predicate, mutable=false, sized=true)]
 pub struct SharedPredicate;
+
+#[handle_descriptor(target=dyn OpaquePredicateOp, mutable=false, sized=false)]
+pub struct SharedOpaquePredicateOp;
+
+#[handle_descriptor(target=dyn OpaqueExpressionOp, mutable=false, sized=false)]
+pub struct SharedOpaqueExpressionOp;
 
 /// Free the memory the passed SharedExpression
 ///
@@ -29,5 +36,23 @@ pub unsafe extern "C" fn free_kernel_expression(data: Handle<SharedExpression>) 
 /// Engine is responsible for passing a valid SharedPredicate
 #[no_mangle]
 pub unsafe extern "C" fn free_kernel_predicate(data: Handle<SharedPredicate>) {
+    data.drop_handle();
+}
+
+/// Free the passed SharedOpaqueExpressionOp
+///
+/// # Safety
+/// Engine is responsible for passing a valid SharedOpaqueExpressionOp
+#[no_mangle]
+pub unsafe extern "C" fn free_kernel_opaque_expression_op(data: Handle<SharedOpaqueExpressionOp>) {
+    data.drop_handle();
+}
+
+/// Free the passed SharedOpaquePredicateOp
+///
+/// # Safety
+/// Engine is responsible for passing a valid SharedOpaquePredicateOp
+#[no_mangle]
+pub unsafe extern "C" fn free_kernel_opaque_predicate_op(data: Handle<SharedOpaquePredicateOp>) {
     data.drop_handle();
 }

@@ -179,6 +179,24 @@ pub extern "C" fn visit_predicate_eq(
     visit_predicate_binary(state, BinaryPredicateOp::Equal, a, b)
 }
 
+#[no_mangle]
+pub extern "C" fn visit_predicate_unknown(
+    state: &mut KernelExpressionVisitorState,
+    name: KernelStringSlice,
+) -> usize {
+    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    name.map_or(0, |name| wrap_predicate(state, Predicate::Unknown(name)))
+}
+
+#[no_mangle]
+pub extern "C" fn visit_expression_unknown(
+    state: &mut KernelExpressionVisitorState,
+    name: KernelStringSlice,
+) -> usize {
+    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    name.map_or(0, |name| wrap_expression(state, Expression::Unknown(name)))
+}
+
 /// # Safety
 /// The string slice must be valid
 #[no_mangle]

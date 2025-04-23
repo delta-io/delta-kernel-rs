@@ -2,8 +2,8 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 
 use crate::expressions::{
-    BinaryExpression, BinaryPredicate, ColumnName, Expression, JunctionPredicate, Predicate,
-    Scalar, UnaryPredicate,
+    BinaryExpression, BinaryPredicate, ColumnName, Expression, JunctionPredicate, OpaqueExpression,
+    OpaquePredicate, Predicate, Scalar, UnaryPredicate,
 };
 
 /// Generic framework for recursive bottom-up transforms of expressions and
@@ -43,6 +43,20 @@ pub trait ExpressionTransform<'a> {
         fields: &'a Vec<Expression>,
     ) -> Option<Cow<'a, Vec<Expression>>> {
         self.recurse_into_expr_struct(fields)
+    }
+
+    /// Called for each [`OpaqueExpression`] encountered during the traversal. Implementations can
+    /// call [`Self::recurse_into_expr_opaque`] if they wish to recursively transform the children.
+    fn transform_expr_opaque(
+        &mut self,
+        expr: &'a OpaqueExpression,
+    ) -> Option<Cow<'a, OpaqueExpression>> {
+        self.recurse_into_expr_opaque(expr)
+    }
+
+    /// Called for each [`Expression::Unknown`] encountered during the traversal.
+    fn transform_expr_unknown(&mut self, name: &'a String) -> Option<Cow<'a, String>> {
+        Some(Cow::Borrowed(name))
     }
 
     /// Called for the child predicate of each [`Expression::Predicate`] encountered during the
@@ -95,6 +109,20 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_pred_junction(pred)
     }
 
+    /// Called for each [`OpaquePredicate`] encountered during the traversal. Implementations can
+    /// call [`Self::recurse_into_pred_opaque`] if they wish to recursively transform the children.
+    fn transform_pred_opaque(
+        &mut self,
+        pred: &'a OpaquePredicate,
+    ) -> Option<Cow<'a, OpaquePredicate>> {
+        self.recurse_into_pred_opaque(pred)
+    }
+
+    /// Called for each [`Predicate::Unknown`] encountered during the traversal.
+    fn transform_pred_unknown(&mut self, name: &'a String) -> Option<Cow<'a, String>> {
+        Some(Cow::Borrowed(name))
+    }
+
     /// General entry point for transforming an expression. This method will dispatch to the
     /// specific transform for each expression variant. Also invoked internally in order to recurse
     /// on the child(ren) of non-leaf variants.
@@ -119,6 +147,14 @@ pub trait ExpressionTransform<'a> {
             },
             Expression::Binary(b) => match self.transform_expr_binary(b)? {
                 Owned(b) => Owned(Expression::Binary(b)),
+                Borrowed(_) => Borrowed(expr),
+            },
+            Expression::Opaque(o) => match self.transform_expr_opaque(o)? {
+                Owned(o) => Owned(Expression::Opaque(o)),
+                Borrowed(_) => Borrowed(expr),
+            },
+            Expression::Unknown(u) => match self.transform_expr_unknown(u)? {
+                Owned(u) => Owned(Expression::Unknown(u)),
                 Borrowed(_) => Borrowed(expr),
             },
         };
@@ -151,6 +187,14 @@ pub trait ExpressionTransform<'a> {
                 Owned(j) => Owned(Predicate::Junction(j)),
                 Borrowed(_) => Borrowed(pred),
             },
+            Predicate::Opaque(o) => match self.transform_pred_opaque(o)? {
+                Owned(o) => Owned(Predicate::Opaque(o)),
+                Borrowed(_) => Borrowed(pred),
+            },
+            Predicate::Unknown(u) => match self.transform_pred_unknown(u)? {
+                Owned(u) => Owned(Predicate::Unknown(u)),
+                Borrowed(_) => Borrowed(pred),
+            },
         };
         Some(pred)
     }
@@ -163,6 +207,21 @@ pub trait ExpressionTransform<'a> {
         fields: &'a Vec<Expression>,
     ) -> Option<Cow<'a, Vec<Expression>>> {
         recurse_into_children(fields, |f| self.transform_expr(f))
+    }
+
+    /// Recursively transforms the children of an [`OpaqueExpression`]. Returns `None` if all
+    /// children were removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
+    /// `Some(Cow::Borrowed)` otherwise.
+    fn recurse_into_expr_opaque(
+        &mut self,
+        o: &'a OpaqueExpression,
+    ) -> Option<Cow<'a, OpaqueExpression>> {
+        use Cow::*;
+        let o = match recurse_into_children(&o.exprs, |e| self.transform_expr(e))? {
+            Owned(exprs) => Owned(OpaqueExpression::new(o.op.clone(), exprs)),
+            Borrowed(_) => Borrowed(o),
+        };
+        Some(o)
     }
 
     /// Recursively transforms the child of an [`Expression::Predicate`]. Returns `None` if all
@@ -253,6 +312,21 @@ pub trait ExpressionTransform<'a> {
             Borrowed(_) => Borrowed(j),
         };
         Some(j)
+    }
+
+    /// Recursively transforms the children of an [`OpaquePredicate`]. Returns `None` if all
+    /// children were removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
+    /// `Some(Cow::Borrowed)` otherwise.
+    fn recurse_into_pred_opaque(
+        &mut self,
+        o: &'a OpaquePredicate,
+    ) -> Option<Cow<'a, OpaquePredicate>> {
+        use Cow::*;
+        let o = match recurse_into_children(&o.exprs, |e| self.transform_expr(e))? {
+            Owned(exprs) => Owned(OpaquePredicate::new(o.op.clone(), exprs)),
+            Borrowed(_) => Borrowed(o),
+        };
+        Some(o)
     }
 }
 

@@ -5,12 +5,13 @@
 //! references with stats column references, which log replay will instruct the engine to evaluate.
 use crate::expressions::{
     BinaryPredicate, BinaryPredicateOp, ColumnName, Expression as Expr, JunctionPredicate,
-    JunctionPredicateOp, Predicate as Pred, Scalar, UnaryPredicate, UnaryPredicateOp,
+    JunctionPredicateOp, OpaqueExpression, OpaqueExpressionOpRef, OpaquePredicate,
+    OpaquePredicateOpRef, Predicate as Pred, Scalar, UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
 
 use std::cmp::Ordering;
-use tracing::debug;
+use tracing::{debug, warn};
 
 pub(crate) mod parquet_stats_skipping;
 
@@ -101,6 +102,22 @@ pub(crate) trait KernelPredicateEvaluator {
         inverted: bool,
     ) -> Option<Self::Output>;
 
+    /// Dispatches an opaque predicate.
+    fn eval_pred_opaque(
+        &self,
+        op: &OpaquePredicateOpRef,
+        exprs: &[Expr],
+        inverted: bool,
+    ) -> Option<Self::Output>;
+
+    /// Dispatches an opaque expression used as a predicate
+    fn eval_pred_expr_opaque(
+        &self,
+        op: &OpaqueExpressionOpRef,
+        exprs: &[Expr],
+        inverted: bool,
+    ) -> Option<Self::Output>;
+
     /// Completes evaluation of a (possibly inverted) junction predicate.
     ///
     /// AND and OR are implemented by first evaluating its (possibly inverted) inputs. This part is
@@ -135,7 +152,10 @@ pub(crate) trait KernelPredicateEvaluator {
             Expr::Literal(val) => self.eval_pred_scalar(val, inverted),
             Expr::Column(col) => self.eval_pred_column(col, inverted),
             Expr::Predicate(pred) => self.eval_pred(pred, inverted),
-            Expr::Struct(_) | Expr::Binary(_) => None,
+            Expr::Opaque(OpaqueExpression { op, exprs }) => {
+                self.eval_pred_expr_opaque(op, exprs, inverted)
+            }
+            Expr::Struct(_) | Expr::Binary(_) | Expr::Unknown(_) => None,
         }
     }
 
@@ -155,7 +175,11 @@ pub(crate) trait KernelPredicateEvaluator {
                 // partition pruning encounters a non-partition column.
                 Expr::Literal(val) => self.eval_pred_scalar_is_null(val, inverted),
                 Expr::Column(col) => self.eval_pred_is_null(col, inverted),
-                Expr::Predicate(_) | Expr::Struct(_) | Expr::Binary(_) => {
+                Expr::Predicate(_)
+                | Expr::Struct(_)
+                | Expr::Binary(_)
+                | Expr::Opaque(_)
+                | Expr::Unknown(_) => {
                     debug!("Unsupported operand: IS [NOT] NULL: {expr:?}");
                     None
                 }
@@ -260,6 +284,8 @@ pub(crate) trait KernelPredicateEvaluator {
             Junction(JunctionPredicate { op, preds }) => {
                 self.eval_pred_junction(*op, preds, inverted)
             }
+            Opaque(OpaquePredicate { op, exprs }) => self.eval_pred_opaque(op, exprs, inverted),
+            Unknown(_) => None, // not supported by definition
         }
     }
 
@@ -423,7 +449,7 @@ pub(crate) trait KernelPredicateEvaluator {
     }
 
     /// A convenient non-inverted wrapper for [`eval_pred`]
-    #[cfg(test)]
+    #[allow(unused)]
     fn eval(&self, pred: &Pred) -> Option<Self::Output> {
         self.eval_pred(pred, false)
     }
@@ -558,6 +584,25 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
     fn resolve_column(&self, col: &ColumnName) -> Option<Scalar> {
         self.resolver.resolve_column(col)
     }
+
+    fn eval_expr(&self, expr: &Expr) -> Option<Scalar> {
+        match expr {
+            Expr::Literal(value) => Some(value.clone()),
+            Expr::Column(name) => self.resolve_column(name),
+            Expr::Predicate(pred) => self.eval_pred(pred, false).map(Scalar::from),
+            Expr::Struct(_) => None, // TODO
+            Expr::Binary(_) => None, // TODO
+            Expr::Opaque(OpaqueExpression { op, exprs }) => {
+                let values: Vec<_> = exprs.iter().map(|expr| self.eval_expr(expr)).collect();
+                op.eval_expr_scalar(&values)
+                    .inspect_err(|err| {
+                        warn!("Failed to evaluate {:?}: {err:?}", op.as_ref());
+                    })
+                    .ok()
+            }
+            Expr::Unknown(_) => None,
+        }
+    }
 }
 
 impl<R: ResolveColumnAsScalar + 'static> From<R> for DefaultKernelPredicateEvaluator<R> {
@@ -622,6 +667,45 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
         self.eval_pred_binary_scalars(op, &left, &right, inverted)
     }
 
+    fn eval_pred_opaque(
+        &self,
+        op: &OpaquePredicateOpRef,
+        exprs: &[Expr],
+        inverted: bool,
+    ) -> Option<bool> {
+        let values: Vec<_> = exprs.iter().map(|expr| self.eval_expr(expr)).collect();
+        op.eval_pred_scalar(&values, inverted)
+            .unwrap_or_else(|err| {
+                warn!("Unable to evaluate {:?}: {err:?}", op.as_ref());
+                None
+            })
+    }
+
+    fn eval_pred_expr_opaque(
+        &self,
+        op: &OpaqueExpressionOpRef,
+        exprs: &[Expr],
+        inverted: bool,
+    ) -> Option<bool> {
+        let values: Vec<_> = exprs.iter().map(|expr| self.eval_expr(expr)).collect();
+        match op.eval_expr_scalar(&values) {
+            Ok(Scalar::Boolean(val)) => Some(val != inverted),
+            Ok(Scalar::Null(DataType::BOOLEAN)) => None,
+            Ok(other) => {
+                warn!(
+                    "Expected {:?} to produce a boolean value, but got {:?}",
+                    op.as_ref(),
+                    other.data_type()
+                );
+                None
+            }
+            Err(err) => {
+                warn!("Unable to evaluate {:?}: {err:?}", op.as_ref());
+                None
+            }
+        }
+    }
+
     fn finish_eval_pred_junction(
         &self,
         op: JunctionPredicateOp,
@@ -636,7 +720,7 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
 /// example, comparisons involving a column are converted into comparisons over that column's
 /// min/max stats, and NULL checks are converted into comparisons involving the column's nullcount
 /// and rowcount stats.
-pub(crate) trait DataSkippingPredicateEvaluator {
+pub trait DataSkippingPredicateEvaluator {
     /// The output type produced by this predicate evaluator
     type Output;
     /// The type of min column stats
@@ -675,6 +759,14 @@ pub(crate) trait DataSkippingPredicateEvaluator {
         op: BinaryPredicateOp,
         left: &Scalar,
         right: &Scalar,
+        inverted: bool,
+    ) -> Option<Self::Output>;
+
+    /// See [`KernelPredicateEvaluator::eval_pred_opaque`].
+    fn eval_pred_opaque(
+        &self,
+        op: &OpaquePredicateOpRef,
+        exprs: &[Expr],
         inverted: bool,
     ) -> Option<Self::Output>;
 
@@ -829,6 +921,24 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
         _op: BinaryPredicateOp,
         _a: &ColumnName,
         _b: &ColumnName,
+        _inverted: bool,
+    ) -> Option<Self::Output> {
+        None // Unsupported
+    }
+
+    fn eval_pred_opaque(
+        &self,
+        op: &OpaquePredicateOpRef,
+        exprs: &[Expr],
+        inverted: bool,
+    ) -> Option<Self::Output> {
+        self.eval_pred_opaque(op, exprs, inverted)
+    }
+
+    fn eval_pred_expr_opaque(
+        &self,
+        _op: &OpaqueExpressionOpRef,
+        _exprs: &[Expr],
         _inverted: bool,
     ) -> Option<Self::Output> {
         None // Unsupported

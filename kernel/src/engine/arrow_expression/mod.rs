@@ -14,6 +14,7 @@ use crate::utils::require;
 use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
 
 use itertools::Itertools;
+pub use opaque_operator::ArrowOpaquePredicateOp;
 use tracing::debug;
 
 use apply_schema::{apply_schema, apply_schema_to};
@@ -21,6 +22,7 @@ use evaluate_expression::{evaluate_expression, evaluate_predicate};
 
 mod apply_schema;
 mod evaluate_expression;
+mod opaque_operator;
 
 #[cfg(test)]
 mod tests;
