@@ -546,9 +546,12 @@ impl RowVisitor for DomainMetadataVisitor {
                 {
                     let domain_metadata =
                         DomainMetadataVisitor::visit_domain_metadata(i, domain.clone(), getters)?;
-                    self.domain_metadatas
-                        .entry(domain)
-                        .or_insert_with(|| domain_metadata);
+                    // only process non-removed domain metadata
+                    if !domain_metadata.removed {
+                        self.domain_metadatas
+                            .entry(domain)
+                            .or_insert_with(|| domain_metadata);
+                    }
                 }
             }
         }
@@ -795,5 +798,82 @@ mod tests {
                 last_updated: None,
             })
         );
+    }
+
+    #[test]
+    fn test_parse_domain_metadata() {
+        let json_strings: StringArray = vec![
+            r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
+            r#"{"domainMetadata":{"domain": "zach1","configuration":"cfg1","removed": true}}"#,
+            r#"{"domainMetadata":{"domain": "zach2","configuration":"cfg2","removed": false}}"#,
+            r#"{"domainMetadata":{"domain": "zach3","configuration":"cfg3","removed": true}}"#,
+            r#"{"domainMetadata":{"domain": "zach4","configuration":"cfg4","removed": false}}"#,
+            r#"{"domainMetadata":{"domain": "zach5","configuration":"cfg5","removed": true}}"#,
+            r#"{"domainMetadata":{"domain": "zach6","configuration":"cfg6","removed": false}}"#,
+        ]
+        .into();
+        let batch1 = parse_json_batch(json_strings);
+        let json_strings: StringArray = vec![
+            r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
+            r#"{"domainMetadata":{"domain": "zach1","configuration":"old_cfg1","removed": true}}"#,
+            r#"{"domainMetadata":{"domain": "zach2","configuration":"old_cfg2","removed": false}}"#,
+            r#"{"domainMetadata":{"domain": "zach3","configuration":"old_cfg3","removed": false}}"#,
+            r#"{"domainMetadata":{"domain": "zach4","configuration":"old_cfg4","removed": true}}"#,
+            r#"{"domainMetadata":{"domain": "zach7","configuration":"cfg7","removed": true}}"#,
+            r#"{"domainMetadata":{"domain": "zach8","configuration":"cfg8","removed": false}}"#,
+        ].into();
+        let batch2 = parse_json_batch(json_strings);
+        let mut domain_metadata_visitor = DomainMetadataVisitor::default();
+        // visit batch 1 then 2 (would assume batch 1 is 'newer' in the log)
+        domain_metadata_visitor
+            .visit_rows_of(batch1.as_ref())
+            .unwrap();
+        domain_metadata_visitor
+            .visit_rows_of(batch2.as_ref())
+            .unwrap();
+        let actual = domain_metadata_visitor.domain_metadatas;
+        let expected = DomainMetadataMap::from([
+            (
+                "zach2".to_string(),
+                DomainMetadata {
+                    domain: "zach2".to_string(),
+                    configuration: "cfg2".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach3".to_string(),
+                DomainMetadata {
+                    domain: "zach3".to_string(),
+                    configuration: "old_cfg3".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach4".to_string(),
+                DomainMetadata {
+                    domain: "zach4".to_string(),
+                    configuration: "cfg4".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach6".to_string(),
+                DomainMetadata {
+                    domain: "zach6".to_string(),
+                    configuration: "cfg6".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach8".to_string(),
+                DomainMetadata {
+                    domain: "zach8".to_string(),
+                    configuration: "cfg8".to_string(),
+                    removed: false,
+                },
+            ),
+        ]);
+        assert_eq!(actual, expected);
     }
 }

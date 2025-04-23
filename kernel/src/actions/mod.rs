@@ -902,6 +902,22 @@ mod tests {
     }
 
     #[test]
+    fn test_domain_metadata_schema() {
+        let schema = get_log_schema()
+            .project(&[DOMAIN_METADATA_NAME])
+            .expect("Couldn't get domainMetadata field");
+        let expected = Arc::new(StructType::new([StructField::nullable(
+            "domainMetadata",
+            StructType::new([
+                StructField::not_null("domain", DataType::STRING),
+                StructField::not_null("configuration", DataType::STRING),
+                StructField::not_null("removed", DataType::BOOLEAN),
+            ]),
+        )]));
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
     fn test_validate_protocol() {
         let invalid_protocols = [
             Protocol {
