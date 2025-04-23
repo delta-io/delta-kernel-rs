@@ -136,8 +136,24 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
     quote! { #(#schema_fields),* }
 }
 
-/// Derive an IntoEngineData trait for a struct that implements ToDataType and has all fields
-/// implement `Into<Scalar>`.
+/// Derive an IntoEngineData trait for a struct that has all fields implement `Into<Scalar>`.
+///
+/// This is a relatively simple macro to produce the boilerplate for converting a struct into
+/// EngineData using the `create_one` method.
+///
+/// # Example
+/// ```rust
+/// #[derive(Schema, IntoEngineData)]
+/// struct MyStruct {
+///    a: i32,
+///    b: String,
+/// }
+///
+/// let my_struct = MyStruct { a: 42, b: "Hello".to_string() };
+/// // typically used with ToSchema
+/// let schema = Arc::new(MyStruct::to_schema());
+/// let engine_data = my_struct.into_engine_data(schema, engine);
+/// ```
 #[proc_macro_derive(IntoEngineData)]
 pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -165,45 +181,17 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
     };
 
     let field_idents = fields.iter().map(|f| &f.ident);
-    // let field_types = fields.iter().map(|f| &f.ty);
+    let field_types = fields.iter().map(|f| &f.ty);
 
     let expanded = quote! {
-        use std::sync::Arc;
-        use crate::actions::schemas::ToSchema as _;
         use crate::EvaluationHandlerExtension as _;
-
         #[automatically_derived]
         impl crate::IntoEngineData for #struct_name
         where
-            Self: crate::actions::schemas::ToSchema,
-            // #(#field_types: Into<crate::expressions::Scalar>),*
+            // do we need this Into<Scalar> bound?
+            #(#field_types: Into<crate::expressions::Scalar>),*
         {
             fn into_engine_data(
-                self,
-                engine: &dyn crate::Engine)
-            -> crate::DeltaResult<Box<dyn crate::EngineData>> {
-                self.into_engine_data_impl(
-                    Arc::new(Self::to_schema()), // FIXME: remove Arc
-                    engine,
-                )
-            }
-
-            fn into_engine_data_struct(
-                self,
-                name: &str,
-                nullable: bool,
-                engine: &dyn crate::Engine)
-            -> crate::DeltaResult<Box<dyn crate::EngineData>> {
-                let schema = Arc::new(crate::schema::StructType::new([
-                    crate::schema::StructField::new(name, Self::to_schema(), nullable)
-                ]));
-                self.into_engine_data_impl(schema, engine)
-            }
-        }
-
-        #[automatically_derived]
-        impl #struct_name {
-            fn into_engine_data_impl(
                 self,
                 schema: crate::schema::SchemaRef,
                 engine: &dyn crate::Engine)

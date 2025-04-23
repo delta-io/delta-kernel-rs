@@ -650,6 +650,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::actions::schemas::ToSchema;
     use crate::schema::{ArrayType, DataType, MapType, StructField};
 
     #[test]
@@ -1040,6 +1041,11 @@ mod tests {
 
     #[test]
     fn test_into_engine_data() {
+        use crate::arrow::array::{Int64Array, StringArray};
+        use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use crate::arrow::record_batch::RecordBatch;
+
+        use crate::engine::arrow_data::ArrowEngineData;
         use crate::engine::arrow_expression::ArrowEvaluationHandler;
         use crate::IntoEngineData;
         use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
@@ -1079,19 +1085,15 @@ mod tests {
             last_updated: None,
         };
 
-        let engine_data = set_transaction.into_engine_data(&engine);
+        let engine_data =
+            set_transaction.into_engine_data(SetTransaction::to_schema().into(), &engine);
 
-        use crate::engine::arrow_data::ArrowEngineData;
         let record_batch: crate::arrow::array::RecordBatch = engine_data
             .unwrap()
             .into_any()
             .downcast::<ArrowEngineData>()
             .unwrap()
             .into();
-
-        use crate::arrow::array::{Int64Array, StringArray};
-        use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
-        use crate::arrow::record_batch::RecordBatch;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("appId", ArrowDataType::Utf8, false),
