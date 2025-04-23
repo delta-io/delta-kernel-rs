@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use crate::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, MapArray, RecordBatch,
-    StringArray, StructArray, TimestampMicrosecondArray,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, MapBuilder,
+    RecordBatch, StringArray, StringBuilder, StructArray, TimestampMicrosecondArray,
 };
 use crate::arrow::buffer::OffsetBuffer;
 use crate::arrow::compute::concat;
@@ -84,7 +84,42 @@ impl Scalar {
                     None,
                 ))
             }
-            Map(data) => todo!(),
+            Map(data) => {
+                // TODO(880): for now we only support string->string maps
+                if data.map_type().key_type() != &DataType::STRING
+                    || data.map_type().value_type() != &DataType::STRING
+                {
+                    return Err(Error::unsupported(
+                        "Only string->string maps are currently supported",
+                    ));
+                }
+                let key_builder = StringBuilder::new();
+                let val_builder = StringBuilder::new();
+                let mut builder = MapBuilder::new(None, key_builder, val_builder);
+                for _ in 0..num_rows {
+                    for (key, val) in data.pairs() {
+                        match (key, val) {
+                            (Scalar::String(key), Scalar::String(val)) => {
+                                builder.keys().append_value(key);
+                                builder.values().append_value(val);
+                            }
+                            (Scalar::String(key), Scalar::Null(data_type))
+                                if data_type == &DataType::STRING =>
+                            {
+                                builder.keys().append_value(key);
+                                builder.values().append_null();
+                            }
+                            _ => {
+                                return Err(Error::unsupported(
+                                "Only string->string maps (with non-null keys) are currently supported",
+                            ));
+                            }
+                        }
+                    }
+                    builder.append(true)?;
+                }
+                Arc::new(builder.finish())
+            }
             Null(DataType::BYTE) => Arc::new(Int8Array::new_null(num_rows)),
             Null(DataType::SHORT) => Arc::new(Int16Array::new_null(num_rows)),
             Null(DataType::INTEGER) => Arc::new(Int32Array::new_null(num_rows)),
@@ -113,10 +148,22 @@ impl Scalar {
                 let field = ArrowField::new(LIST_ARRAY_ROOT, t.element_type().try_into()?, true);
                 Arc::new(ListArray::new_null(Arc::new(field), num_rows))
             }
-            Null(DataType::Map { .. }) => {
-                return Err(Error::unsupported(
-                    "Scalar::to_array does not yet support Map types",
-                ));
+            Null(DataType::Map(map_type)) => {
+                // TODO(880): for now we only support string->string maps
+                if map_type.key_type() != &DataType::STRING
+                    || map_type.value_type() != &DataType::STRING
+                {
+                    return Err(Error::unsupported(
+                        "Only string->string maps are currently supported",
+                    ));
+                }
+                let key_builder = StringBuilder::new();
+                let val_builder = StringBuilder::new();
+                let mut builder = MapBuilder::new(None, key_builder, val_builder);
+                for _ in 0..num_rows {
+                    builder.append(false)?;
+                }
+                Arc::new(builder.finish())
             }
         };
         Ok(arr)

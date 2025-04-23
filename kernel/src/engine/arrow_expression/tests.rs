@@ -2,7 +2,7 @@ use std::ops::{Add, Div, Mul, Sub};
 
 use crate::arrow::array::{
     create_array, Array, ArrayRef, BooleanArray, GenericStringArray, Int32Array, ListArray,
-    MapArray, StructArray,
+    MapArray, MapBuilder, MapFieldNames, StringBuilder, StructArray,
 };
 use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
@@ -502,37 +502,46 @@ fn test_create_one_top_level_null() {
     ));
 }
 
-use crate::arrow::array::{Int32Builder, MapBuilder, MapFieldNames, StringBuilder};
-
 #[test]
 fn test_scalar_map() -> DeltaResult<()> {
+    // non-string/string unsupported
     let map_type = MapType::new(DeltaDataTypes::STRING, DeltaDataTypes::INTEGER, true);
+    let map_data = MapData::try_new(map_type, [("key1".to_string(), 1)])?;
+    let scalar_map = Scalar::Map(map_data);
+    assert!(scalar_map.to_array(2).is_err());
+
+    // making an 2-row array each with a map with 2 pairs.
+    // result: { key1: val1, key2: null }, { key1: val1, key2: null }
+    let map_type = MapType::new(DeltaDataTypes::STRING, DeltaDataTypes::STRING, true);
     let map_data = MapData::try_new(
         map_type,
-        [("key1".to_string(), 1.into()), ("key2".to_string(), None)],
+        [
+            ("key1".to_string(), "val1".to_string().into()),
+            ("key2".to_string(), None),
+        ],
     )?;
     let scalar_map = Scalar::Map(map_data);
     let arrow_array = scalar_map.to_array(2)?;
     let map_array = arrow_array.as_any().downcast_ref::<MapArray>().unwrap();
 
     let key_builder = StringBuilder::new();
-    let val_builder = Int32Builder::new();
+    let val_builder = StringBuilder::new();
     let names = MapFieldNames {
         entry: "key_values".to_string(),
-        key: "key".to_string(),
-        value: "value".to_string(),
+        key: "keys".to_string(),
+        value: "values".to_string(),
     };
     let mut builder = MapBuilder::new(Some(names), key_builder, val_builder);
     builder.keys().append_value("key1");
-    builder.values().append_value(1);
+    builder.values().append_value("val1");
     builder.keys().append_value("key2");
     builder.values().append_null();
     builder.append(true).unwrap();
     builder.keys().append_value("key1");
-    builder.values().append_value(1);
+    builder.values().append_value("val1");
     builder.keys().append_value("key2");
     builder.values().append_null();
-    builder.append(false).unwrap();
+    builder.append(true).unwrap();
     let expected = builder.finish();
 
     assert_eq!(map_array, &expected);
@@ -541,7 +550,7 @@ fn test_scalar_map() -> DeltaResult<()> {
 
 #[test]
 fn test_null_scalar_map() -> DeltaResult<()> {
-    let map_type = MapType::new(DeltaDataTypes::STRING, DeltaDataTypes::INTEGER, false);
+    let map_type = MapType::new(DeltaDataTypes::STRING, DeltaDataTypes::STRING, false);
     let null_scalar_map = Scalar::Null(DeltaDataTypes::Map(Box::new(map_type)));
     let arrow_array = null_scalar_map.to_array(1)?;
     let map_array = arrow_array.as_any().downcast_ref::<MapArray>().unwrap();
