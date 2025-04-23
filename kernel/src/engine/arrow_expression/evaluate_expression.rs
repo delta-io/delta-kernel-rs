@@ -126,6 +126,8 @@ pub(crate) fn evaluate_expression(
 
             Ok(eval(&left_arr, &right_arr)?)
         }
+        (Opaque(_), _) => todo!(),
+        (Unknown(name), _) => Err(Error::generic(format!("Unknown expression: {name:?}"))),
     }
 }
 
@@ -251,5 +253,7 @@ pub(crate) fn evaluate_predicate(
                 .reduce(|l, r| Ok(reducer(&l?, &r?)?))
                 .unwrap_or_else(|| Ok(BooleanArray::from(vec![default; batch.num_rows()])))
         }
+        Opaque(_) => todo!(),
+        Unknown(name) => Err(Error::generic(format!("Unknown expression: {name:?}"))),
     }
 }

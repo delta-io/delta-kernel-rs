@@ -4,8 +4,8 @@ use std::ffi::c_void;
 
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
-    Expression, JunctionPredicate, JunctionPredicateOp, MapData, Predicate, Scalar, StructData,
-    UnaryPredicate, UnaryPredicateOp,
+    Expression, JunctionPredicate, JunctionPredicateOp, MapData, OpaqueExpression, OpaquePredicate,
+    Predicate, Scalar, StructData, UnaryPredicate, UnaryPredicateOp,
 };
 
 use crate::expressions::{SharedExpression, SharedPredicate};
@@ -419,6 +419,8 @@ fn visit_expression_impl(
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
+        Expression::Opaque(OpaqueExpression { .. }) => todo!(),
+        Expression::Unknown(_) => todo!(),
     }
 }
 
@@ -462,6 +464,8 @@ fn visit_predicate_impl(
         Predicate::Junction(JunctionPredicate { op, preds }) => {
             visit_predicate_junction(visitor, op, preds, sibling_list_id)
         }
+        Predicate::Opaque(OpaquePredicate { .. }) => todo!(),
+        Predicate::Unknown(_) => todo!(),
     }
 }
 

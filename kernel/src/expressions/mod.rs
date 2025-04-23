@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
 use itertools::Itertools;
 
@@ -10,7 +11,10 @@ pub use self::column_names::{
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use self::transforms::{ExpressionTransform as _, GetColumnReferences};
-use crate::DataType;
+use crate::kernel_predicates::{
+    DirectDataSkippingPredicateEvaluator, IndirectDataSkippingPredicateEvaluator,
+};
+use crate::{DataType, DeltaResult, DynPartialEq, Error};
 
 mod column_names;
 pub(crate) mod literal_expression_transform;
@@ -76,6 +80,86 @@ pub enum JunctionPredicateOp {
     Or,
 }
 
+/// An opaque expression operation (ie defined and implemented by the engine).
+pub trait OpaqueExpressionOp: DynPartialEq + std::fmt::Debug {
+    /// Succinctly identifies this op
+    fn name(&self) -> &str;
+
+    /// Attempts to apply this expression operation to a set of scalar values.
+    ///
+    /// Kernel uses this method to implement partition pruning.
+    ///
+    /// An input of None means kernel was unable to evaluate that particular input arg. Otherwise,
+    /// Some(Scalar) is the result of that evaluation (possibly `Scalar::Null` if NULL).
+    ///
+    /// An output of `Err` indicates an incorrect invocation (e.g. wrong number and/or types of
+    /// arguments, None input, etc), and `Ok(Scalar::Null)` means the operation actually produced a
+    /// legitimately NULL output.
+    fn eval_expr_scalar(&self, _values: &[Option<Scalar>]) -> DeltaResult<Scalar> {
+        Err(Error::Unsupported(format!(
+            "{self:?} does not implement scalar evaluation"
+        )))
+    }
+}
+
+/// An opaque predicate operation (ie defined and implemented by the engine).
+pub trait OpaquePredicateOp: DynPartialEq + std::fmt::Debug {
+    /// Succinctly identifies this op
+    fn name(&self) -> &str;
+
+    /// Attempts to apply this (possibly inverted) opaque predicate to a set of scalar values.
+    ///
+    /// Kernel uses this method to implement partition pruning and to evaluate any opaque data
+    /// skipping predicates returned by [`as_data_skipping_predicate`].
+    /// .
+    ///
+    /// An input of None means kernel was unable to evaluate that particular input arg. Otherwise,
+    /// it is Some Scalar result of that evaluation (possibly `Scalar::Null` if NULL).
+    ///
+    /// An output of `Err` indicates an incorrect or unsupported invocation (e.g. wrong number
+    /// and/or types of arguments, None input, etc), and `Ok(None)` means the operation actually
+    /// produced a legitimately NULL output.
+    fn eval_pred_scalar(
+        &self,
+        _values: &[Option<Scalar>],
+        _inverted: bool,
+    ) -> DeltaResult<Option<bool>> {
+        Err(Error::Unsupported(format!(
+            "{self:?} does not implement scalar evaluation"
+        )))
+    }
+
+    /// Attempts to use this (possibly inverted) opaque predicate for stats-based pruning.
+    ///
+    /// Kernel attempts to implement parquet row group skipping by calling this method.
+    fn eval_as_data_skipping_predicate(
+        &self,
+        _predicate_evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
+        _exprs: &[Expression],
+        _inverted: bool,
+    ) -> Option<bool> {
+        None
+    }
+
+    /// Attempts to convert this (possibly inverted) opaque predicate to a data skipping predicate.
+    ///
+    /// Kernel attempts to implement file pruning by calling this method.
+    fn as_data_skipping_predicate(
+        &self,
+        _predicate_evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+        _exprs: &[Expression],
+        _inverted: bool,
+    ) -> Option<Predicate> {
+        None
+    }
+}
+
+/// A shared reference to an [`OpaqueExpressionOp`] instance.
+pub type OpaqueExpressionOpRef = Arc<dyn OpaqueExpressionOp>;
+
+/// A shared reference to an [`OpaquePredicateOp`] instance.
+pub type OpaquePredicateOpRef = Arc<dyn OpaquePredicateOp>;
+
 ////////////////////////////////////////////////////////////////////////
 // Expressions and predicates
 ////////////////////////////////////////////////////////////////////////
@@ -116,6 +200,30 @@ pub struct JunctionPredicate {
     pub preds: Vec<Predicate>,
 }
 
+#[derive(Clone, Debug)]
+pub struct OpaquePredicate {
+    pub op: OpaquePredicateOpRef,
+    pub exprs: Vec<Expression>,
+}
+
+impl OpaquePredicate {
+    fn new(op: OpaquePredicateOpRef, exprs: Vec<Expression>) -> Self {
+        Self { op, exprs }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OpaqueExpression {
+    pub op: OpaqueExpressionOpRef,
+    pub exprs: Vec<Expression>,
+}
+
+impl OpaqueExpression {
+    fn new(op: OpaqueExpressionOpRef, exprs: Vec<Expression>) -> Self {
+        Self { op, exprs }
+    }
+}
+
 /// A SQL expression.
 ///
 /// These expressions do not track or validate data types, other than the type
@@ -133,6 +241,14 @@ pub enum Expression {
     Struct(Vec<Expression>),
     /// An expression that takes two expressions as input.
     Binary(BinaryExpression),
+    /// An opaque expression (ie defined and implemented by the engine). Kernel does not attempt to
+    /// interpret the expression at all, but will preserve it so the engine can still evaluate it.
+    Opaque(OpaqueExpression),
+    /// An unknown predicate (i.e. one that neither kernel nor engine attempts to evaluate). Kernel
+    /// refuses to evaluate expression trees containing unknown expressions, and engines should do
+    /// the same. Use an `Expression::Opaque` for expressions kernel doesn't understand but which
+    /// engine can still evaluate.
+    Unknown(String),
 }
 
 /// A SQL predicate.
@@ -157,6 +273,16 @@ pub enum Predicate {
     Binary(BinaryPredicate),
     /// A junction operation (AND/OR).
     Junction(JunctionPredicate),
+    /// An opaque predicate (ie defined and implemented by the engine). The predicate is not
+    /// eligible for data skipping, but can participate in partition pruning if it provides scalar
+    /// evaluation.
+    Opaque(OpaquePredicate),
+    /// An unknown predicate (i.e. one that neither kernel nor engine attempts to
+    /// evaluate). Kernel's predicate evaluation implementations treat such predicates just like any
+    /// other predicate that doesn't support data skipping, but engines should refuse to evaluate
+    /// predicate trees containing unknown predicates. Use a `Predicate::Opaque` for predicates
+    /// kernel doesn't understand but which engine can still evaluate.
+    Unknown(String),
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -331,6 +457,22 @@ impl Expression {
             right: Box::new(rhs.into()),
         })
     }
+
+    /// Creates a new opaque expression
+    pub fn opaque<T: OpaqueExpressionOp>(
+        op: impl Into<Arc<T>>,
+        exprs: impl IntoIterator<Item = Expression>,
+    ) -> Self {
+        Self::Opaque(OpaqueExpression {
+            op: op.into(),
+            exprs: exprs.into_iter().collect(),
+        })
+    }
+
+    /// Creates a new unknown expression
+    pub fn unknown(name: impl Into<String>) -> Self {
+        Self::Unknown(name.into())
+    }
 }
 
 impl Predicate {
@@ -461,11 +603,39 @@ impl Predicate {
         let preds = preds.into_iter().collect();
         Self::Junction(JunctionPredicate { op, preds })
     }
+
+    /// Creates a new opaque predicate
+    pub fn opaque<T: OpaquePredicateOp>(
+        op: impl Into<Arc<T>>,
+        exprs: impl IntoIterator<Item = Expression>,
+    ) -> Self {
+        Self::Opaque(OpaquePredicate {
+            op: op.into(),
+            exprs: exprs.into_iter().collect(),
+        })
+    }
+
+    /// Creates a new unknown predicate
+    pub fn unknown(name: impl Into<String>) -> Self {
+        Self::Unknown(name.into())
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////
 // Trait impls
 ////////////////////////////////////////////////////////////////////////
+
+impl PartialEq for OpaquePredicate {
+    fn eq(&self, other: &Self) -> bool {
+        self.op.dyn_eq(other.op.any_ref()) && self.exprs == other.exprs
+    }
+}
+
+impl PartialEq for OpaqueExpression {
+    fn eq(&self, other: &Self) -> bool {
+        self.op.dyn_eq(other.op.any_ref()) && self.exprs == other.exprs
+    }
+}
 
 impl Display for BinaryExpressionOp {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -513,6 +683,10 @@ impl Display for Expression {
             Predicate(p) => write!(f, "{p}"),
             Struct(exprs) => write!(f, "Struct({})", format_child_list(exprs)),
             Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
+            Opaque(OpaqueExpression { op, exprs }) => {
+                write!(f, "{op:?}({})", format_child_list(exprs))
+            }
+            Unknown(name) => write!(f, "<unknown: {name}>"),
         }
     }
 }
@@ -539,6 +713,10 @@ impl Display for Predicate {
                 };
                 write!(f, "{op}({})", format_child_list(preds))
             }
+            Opaque(OpaquePredicate { op, exprs }) => {
+                write!(f, "{op:?}({})", format_child_list(exprs))
+            }
+            Unknown(name) => write!(f, "<unknown: {name}>"),
         }
     }
 }
