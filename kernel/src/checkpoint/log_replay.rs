@@ -103,10 +103,8 @@ impl LogReplayProcessor for CheckpointLogReplayProcessor {
         // Update the total actions and add actions counters. Relaxed ordering is sufficient
         // here as we only care about the total count when writing the _last_checkpoint file.
         // (the ordering is not important for correctness)
-        self.actions_count.fetch_add(
-            visitor.file_actions_count + visitor.non_file_actions_count,
-            Ordering::Relaxed,
-        );
+        self.actions_count
+            .fetch_add(visitor.actions_count, Ordering::Relaxed);
         self.add_actions_count
             .fetch_add(visitor.add_actions_count, Ordering::Relaxed);
 
@@ -195,9 +193,7 @@ pub(crate) struct CheckpointVisitor<'seen> {
     // TODO: _last_checkpoint schema should be updated to use u64 instead of i64
     // for fields that are not expected to be negative. (Issue #786)
     // i64 to match the `_last_checkpoint` file schema
-    non_file_actions_count: i64,
-    // i64 to match the `_last_checkpoint` file schema
-    file_actions_count: i64,
+    actions_count: i64,
     // i64 to match the `_last_checkpoint` file schema
     add_actions_count: i64,
     // i64 for comparison with remove.deletionTimestamp
@@ -245,8 +241,7 @@ impl CheckpointVisitor<'_> {
                 Self::REMOVE_DV_START_INDEX,
             ),
             selection_vector,
-            non_file_actions_count: 0,
-            file_actions_count: 0,
+            actions_count: 0,
             add_actions_count: 0,
             minimum_file_retention_timestamp,
             seen_protocol,
@@ -306,7 +301,6 @@ impl CheckpointVisitor<'_> {
         } else if self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP_INDEX])? {
             return Ok(false); // Skip expired remove tombstones
         }
-        self.file_actions_count += 1;
         Ok(true) // Include this action
     }
 
@@ -334,7 +328,6 @@ impl CheckpointVisitor<'_> {
         }
         // Valid, non-duplicate protocol action to be included
         self.seen_protocol = true;
-        self.non_file_actions_count += 1;
         Ok(true)
     }
 
@@ -360,7 +353,6 @@ impl CheckpointVisitor<'_> {
 
         // Valid, non-duplicate metadata action to be included
         self.seen_metadata = true;
-        self.non_file_actions_count += 1;
         Ok(true)
     }
 
@@ -382,7 +374,6 @@ impl CheckpointVisitor<'_> {
         }
 
         // Valid, non-duplicate txn action to be included
-        self.non_file_actions_count += 1;
         Ok(true)
     }
 
@@ -404,10 +395,16 @@ impl CheckpointVisitor<'_> {
     ) -> DeltaResult<bool> {
         // The `||` operator short-circuits the evaluation, so if any of the checks return true,
         // the rest will not be evaluated.
-        Ok(self.check_file_action(i, getters)?
+        let is_valid = self.check_file_action(i, getters)?
             || self.check_txn_action(i, getters[11])?
             || self.check_protocol_action(i, getters[10])?
-            || self.check_metadata_action(i, getters[9])?)
+            || self.check_metadata_action(i, getters[9])?;
+
+        if is_valid {
+            self.actions_count += 1;
+        }
+
+        Ok(is_valid)
     }
 }
 
@@ -524,12 +521,11 @@ mod tests {
             false, // Row 8 is a checkpointMetadata action (excluded)
         ];
 
-        assert_eq!(visitor.file_actions_count, 2);
+        assert_eq!(visitor.actions_count, 5);
         assert_eq!(visitor.add_actions_count, 1);
         assert!(visitor.seen_protocol);
         assert!(visitor.seen_metadata);
         assert_eq!(visitor.seen_txns.len(), 1);
-        assert_eq!(visitor.non_file_actions_count, 3);
 
         assert_eq!(visitor.selection_vector, expected);
         Ok(())
@@ -570,9 +566,8 @@ mod tests {
         // Only "one_above_threshold" should be kept
         let expected = vec![false, false, true, false];
         assert_eq!(visitor.selection_vector, expected);
-        assert_eq!(visitor.file_actions_count, 1);
+        assert_eq!(visitor.actions_count, 1);
         assert_eq!(visitor.add_actions_count, 0);
-        assert_eq!(visitor.non_file_actions_count, 0);
         Ok(())
     }
 
@@ -600,9 +595,8 @@ mod tests {
 
         let expected = vec![true];
         assert_eq!(visitor.selection_vector, expected);
-        assert_eq!(visitor.file_actions_count, 1);
+        assert_eq!(visitor.actions_count, 1);
         assert_eq!(visitor.add_actions_count, 1);
-        assert_eq!(visitor.non_file_actions_count, 0);
         // The action should NOT be added to the seen_file_keys set as it's a checkpoint batch
         // and actions in checkpoint batches do not conflict with each other.
         // This is a key difference from log batches, where actions can conflict.
@@ -639,9 +633,8 @@ mod tests {
 
         let expected = vec![true, true, true];
         assert_eq!(visitor.selection_vector, expected);
-        assert_eq!(visitor.file_actions_count, 3);
+        assert_eq!(visitor.actions_count, 3);
         assert_eq!(visitor.add_actions_count, 1);
-        assert_eq!(visitor.non_file_actions_count, 0);
 
         Ok(())
     }
@@ -675,8 +668,7 @@ mod tests {
         // All actions should be skipped as they have already been seen
         let expected = vec![false, false, false];
         assert_eq!(visitor.selection_vector, expected);
-        assert_eq!(visitor.non_file_actions_count, 0);
-        assert_eq!(visitor.file_actions_count, 0);
+        assert_eq!(visitor.actions_count, 0);
 
         Ok(())
     }
@@ -714,8 +706,7 @@ mod tests {
         let expected = vec![true, false, true, true, false, true, false];
         assert_eq!(visitor.selection_vector, expected);
         assert_eq!(visitor.seen_txns.len(), 2); // Two different app IDs
-        assert_eq!(visitor.non_file_actions_count, 4); // 2 txns + 1 protocol + 1 metadata
-        assert_eq!(visitor.file_actions_count, 0);
+        assert_eq!(visitor.actions_count, 4); // 2 txns + 1 protocol + 1 metadata
 
         Ok(())
     }
