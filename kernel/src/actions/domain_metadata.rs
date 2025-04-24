@@ -18,30 +18,36 @@ const DOMAIN_METADATA_DOMAIN_FIELD: &str = "domain";
 /// Map from domain to domain metadata
 pub(crate) type DomainMetadataMap = HashMap<String, DomainMetadata>;
 
-/// Read the latest domain metadata for a given domain and return its `configuration`.
+/// Read the latest domain metadata for a given domain and return its `configuration`. This
+/// accounts for 'removed' domain metadata: if the domain is removed, then the configuration is
+/// `None`.
 pub(crate) fn domain_metadata_configuration(
     log_segment: &LogSegment,
     domain: &str,
     engine: &dyn Engine,
 ) -> DeltaResult<Option<String>> {
     let mut domain_metadatas = scan_domain_metadatas(log_segment, Some(domain), engine)?;
+    // note that the resulting domain_metadatas includes removed domains, so we need to filter
+    domain_metadatas.retain(|_, dm| !dm.removed);
     Ok(domain_metadatas
         .remove(domain)
         .map(|domain_metadata| domain_metadata.configuration))
 }
 
 /// Scan the entire log for all domain metadata actions but terminate early if a specific domain
-/// is provided
+/// is provided. Note that this returns the latest domain metadata for each domain, including
+/// tombstones (removed=true). It is up to the caller to filter out removed domains if needed.
 fn scan_domain_metadatas(
     log_segment: &LogSegment,
     domain: Option<&str>,
     engine: &dyn Engine,
 ) -> DeltaResult<DomainMetadataMap> {
     let mut visitor = DomainMetadataVisitor::new(domain.map(|s| s.to_owned()));
-    // If a specific id is requested then we can terminate log replay early as soon as it was
-    // found. If all ids are requested then we are forced to replay the entire log.
+    // If a specific domain is requested then we can terminate log replay early as soon as it was
+    // found. If all domains are requested then we are forced to replay the entire log.
     for actions in replay_for_domain_metadatas(log_segment, engine)? {
-        let (domain_metadatas, _) = actions?; // throw away is_log_batch since we don't care
+        // throw away is_log_batch since we don't care
+        let (domain_metadatas, _) = actions?;
         visitor.visit_rows_of(domain_metadatas.as_ref())?;
         // if a specific domain is requested and it was found, then return. note that we don't need
         // to check if it was the one that was found since the visitor will only keep the requested

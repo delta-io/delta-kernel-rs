@@ -482,7 +482,9 @@ impl RowVisitor for SidecarVisitor {
     }
 }
 
-/// Visit data batches of actions to extract the latest domain metadata for each domain.
+/// Visit data batches of actions to extract the latest domain metadata for each domain. Note that
+/// this will return all domains including 'removed' domains. The caller is responsible for either
+/// using or throwing away these tombstones.
 ///
 /// Note that this visitor requires that the log (each actions batch) is replayed in reverse order.
 ///
@@ -546,12 +548,9 @@ impl RowVisitor for DomainMetadataVisitor {
                 {
                     let domain_metadata =
                         DomainMetadataVisitor::visit_domain_metadata(i, domain.clone(), getters)?;
-                    // only process non-removed domain metadata
-                    if !domain_metadata.removed {
-                        self.domain_metadatas
-                            .entry(domain)
-                            .or_insert_with(|| domain_metadata);
-                    }
+                    self.domain_metadatas
+                        .entry(domain)
+                        .or_insert_with(|| domain_metadata);
                 }
             }
         }
@@ -814,14 +813,14 @@ mod tests {
         .into();
         let batch1 = parse_json_batch(json_strings);
         let json_strings: StringArray = vec![
-            r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
             r#"{"domainMetadata":{"domain": "zach1","configuration":"old_cfg1","removed": true}}"#,
             r#"{"domainMetadata":{"domain": "zach2","configuration":"old_cfg2","removed": false}}"#,
             r#"{"domainMetadata":{"domain": "zach3","configuration":"old_cfg3","removed": false}}"#,
             r#"{"domainMetadata":{"domain": "zach4","configuration":"old_cfg4","removed": true}}"#,
             r#"{"domainMetadata":{"domain": "zach7","configuration":"cfg7","removed": true}}"#,
             r#"{"domainMetadata":{"domain": "zach8","configuration":"cfg8","removed": false}}"#,
-        ].into();
+        ]
+        .into();
         let batch2 = parse_json_batch(json_strings);
         let mut domain_metadata_visitor = DomainMetadataVisitor::default();
         // visit batch 1 then 2 (would assume batch 1 is 'newer' in the log)
@@ -834,6 +833,14 @@ mod tests {
         let actual = domain_metadata_visitor.domain_metadatas;
         let expected = DomainMetadataMap::from([
             (
+                "zach1".to_string(),
+                DomainMetadata {
+                    domain: "zach1".to_string(),
+                    configuration: "cfg1".to_string(),
+                    removed: true,
+                },
+            ),
+            (
                 "zach2".to_string(),
                 DomainMetadata {
                     domain: "zach2".to_string(),
@@ -845,8 +852,8 @@ mod tests {
                 "zach3".to_string(),
                 DomainMetadata {
                     domain: "zach3".to_string(),
-                    configuration: "old_cfg3".to_string(),
-                    removed: false,
+                    configuration: "cfg3".to_string(),
+                    removed: true,
                 },
             ),
             (
@@ -858,11 +865,27 @@ mod tests {
                 },
             ),
             (
+                "zach5".to_string(),
+                DomainMetadata {
+                    domain: "zach5".to_string(),
+                    configuration: "cfg5".to_string(),
+                    removed: true,
+                },
+            ),
+            (
                 "zach6".to_string(),
                 DomainMetadata {
                     domain: "zach6".to_string(),
                     configuration: "cfg6".to_string(),
                     removed: false,
+                },
+            ),
+            (
+                "zach7".to_string(),
+                DomainMetadata {
+                    domain: "zach7".to_string(),
+                    configuration: "cfg7".to_string(),
+                    removed: true,
                 },
             ),
             (
@@ -889,8 +912,8 @@ mod tests {
             "zach3".to_string(),
             DomainMetadata {
                 domain: "zach3".to_string(),
-                configuration: "old_cfg3".to_string(),
-                removed: false,
+                configuration: "cfg3".to_string(),
+                removed: true,
             },
         )]);
         assert_eq!(actual, expected);
