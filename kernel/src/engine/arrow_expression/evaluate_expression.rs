@@ -1,25 +1,22 @@
 //! Expression handling based on arrow-rs compute kernels.
-use crate::arrow::array::types::*;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Datum, RecordBatch, StructArray,
 };
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq};
-use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
 use crate::arrow::compute::{and_kleene, is_null, not, or_kleene};
-use crate::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, IntervalUnit, TimeUnit,
-};
+use crate::arrow::datatypes::Field as ArrowField;
 use crate::arrow::error::ArrowError;
-use crate::engine::arrow_utils::prim_array_cmp;
+use itertools::Itertools;
+use std::sync::Arc;
+
+use super::in_list;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
-    BinaryExpression, BinaryOperator, Expression, JunctionExpression, JunctionOperator, Scalar,
+    BinaryExpression, BinaryOperator, Expression, JunctionExpression, JunctionOperator,
     UnaryExpression, UnaryOperator,
 };
 use crate::schema::DataType;
-use itertools::Itertools;
-use std::sync::Arc;
 
 fn downcast_to_bool(arr: &dyn Array) -> DeltaResult<&BooleanArray> {
     arr.as_any()
@@ -31,7 +28,7 @@ fn wrap_comparison_result(arr: BooleanArray) -> ArrayRef {
     Arc::new(arr) as _
 }
 
-trait ProvidesColumnByName {
+pub(super) trait ProvidesColumnByName {
     fn column_by_name(&self, name: &str) -> Option<&ArrayRef>;
 }
 
@@ -62,7 +59,10 @@ impl ProvidesColumnByName for StructArray {
 // }
 // ```
 // The path ["b", "d", "f"] would retrieve the int64 column while ["a", "b"] would produce an error.
-fn extract_column(mut parent: &dyn ProvidesColumnByName, col: &[String]) -> DeltaResult<ArrayRef> {
+pub(crate) fn extract_column(
+    mut parent: &dyn ProvidesColumnByName,
+    col: &[String],
+) -> DeltaResult<ArrayRef> {
     let mut field_names = col.iter();
     let Some(mut field_name) = field_names.next() else {
         return Err(ArrowError::SchemaError("Empty column path".to_string()))?;
@@ -129,67 +129,15 @@ pub(crate) fn evaluate_expression(
                 left,
                 right,
             }),
-            _,
-        ) => match (left.as_ref(), right.as_ref()) {
-            (Literal(_), Column(_)) => {
-                let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
-                let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
-                if let Some(string_arr) = left_arr.as_string_opt::<i32>() {
-                    if let Some(right_arr) = right_arr.as_list_opt::<i32>() {
-                        let result = in_list_utf8(string_arr, right_arr)?;
-                        return Ok(wrap_comparison_result(result));
-                    }
-                }
-                prim_array_cmp! {
-                    left_arr, right_arr,
-                    (ArrowDataType::Int8, Int8Type),
-                    (ArrowDataType::Int16, Int16Type),
-                    (ArrowDataType::Int32, Int32Type),
-                    (ArrowDataType::Int64, Int64Type),
-                    (ArrowDataType::UInt8, UInt8Type),
-                    (ArrowDataType::UInt16, UInt16Type),
-                    (ArrowDataType::UInt32, UInt32Type),
-                    (ArrowDataType::UInt64, UInt64Type),
-                    (ArrowDataType::Float16, Float16Type),
-                    (ArrowDataType::Float32, Float32Type),
-                    (ArrowDataType::Float64, Float64Type),
-                    (ArrowDataType::Timestamp(TimeUnit::Second, _), TimestampSecondType),
-                    (ArrowDataType::Timestamp(TimeUnit::Millisecond, _), TimestampMillisecondType),
-                    (ArrowDataType::Timestamp(TimeUnit::Microsecond, _), TimestampMicrosecondType),
-                    (ArrowDataType::Timestamp(TimeUnit::Nanosecond, _), TimestampNanosecondType),
-                    (ArrowDataType::Date32, Date32Type),
-                    (ArrowDataType::Date64, Date64Type),
-                    (ArrowDataType::Time32(TimeUnit::Second), Time32SecondType),
-                    (ArrowDataType::Time32(TimeUnit::Millisecond), Time32MillisecondType),
-                    (ArrowDataType::Time64(TimeUnit::Microsecond), Time64MicrosecondType),
-                    (ArrowDataType::Time64(TimeUnit::Nanosecond), Time64NanosecondType),
-                    (ArrowDataType::Duration(TimeUnit::Second), DurationSecondType),
-                    (ArrowDataType::Duration(TimeUnit::Millisecond), DurationMillisecondType),
-                    (ArrowDataType::Duration(TimeUnit::Microsecond), DurationMicrosecondType),
-                    (ArrowDataType::Duration(TimeUnit::Nanosecond), DurationNanosecondType),
-                    (ArrowDataType::Interval(IntervalUnit::DayTime), IntervalDayTimeType),
-                    (ArrowDataType::Interval(IntervalUnit::YearMonth), IntervalYearMonthType),
-                    (ArrowDataType::Interval(IntervalUnit::MonthDayNano), IntervalMonthDayNanoType),
-                    (ArrowDataType::Decimal128(_, _), Decimal128Type),
-                    (ArrowDataType::Decimal256(_, _), Decimal256Type)
-                }
-            }
-            (Literal(lit), Literal(Scalar::Array(ad))) => {
-                #[allow(deprecated)]
-                let exists = ad.array_elements().contains(lit);
-                Ok(Arc::new(BooleanArray::from(vec![exists])))
-            }
-            (l, r) => Err(Error::invalid_expression(format!(
-                "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
-            ))),
-        },
+            None | Some(&DataType::BOOLEAN),
+        ) => in_list::eval_in_list(batch, left, right),
         (
             Binary(BinaryExpression {
                 op: NotIn,
                 left,
                 right,
             }),
-            _,
+            None | Some(&DataType::BOOLEAN),
         ) => {
             let reverse_op = Expression::binary(In, *left.clone(), *right.clone());
             let reverse_expr = evaluate_expression(&reverse_op, batch, None)?;

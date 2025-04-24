@@ -4,14 +4,6 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
-use crate::engine::ensure_data_types::DataTypeCompat;
-use crate::{
-    engine::arrow_data::ArrowEngineData,
-    schema::{DataType, Schema, SchemaRef, StructField, StructType},
-    utils::require,
-    DeltaResult, EngineData, Error,
-};
-
 use crate::arrow::array::{
     cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray,
     OffsetSizeTrait, RecordBatch, StringArray, StructArray,
@@ -27,34 +19,13 @@ use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 use itertools::Itertools;
 use tracing::debug;
 
-macro_rules! prim_array_cmp {
-    ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
-
-        return match $left_arr.data_type() {
-        $(
-            $data_ty => {
-                let prim_array = $left_arr.as_primitive_opt::<$prim_ty>()
-                        .ok_or(Error::invalid_expression(
-                            format!("Cannot cast to primitive array: {}", $left_arr.data_type()))
-                        )?;
-                    let list_array = $right_arr.as_list_opt::<i32>()
-                        .ok_or(Error::invalid_expression(
-                            format!("Cannot cast to list array: {}", $right_arr.data_type()))
-                        )?;
-                crate::arrow::compute::kernels::comparison::in_list(prim_array, list_array).map(wrap_comparison_result)
-            }
-        )+
-            _ => Err(ArrowError::CastError(
-                        format!("Bad Comparison between: {:?} and {:?}",
-                            $left_arr.data_type(),
-                            $right_arr.data_type())
-                        )
-                )
-        }.map_err(Error::generic_err);
-    };
-}
-
-pub(crate) use prim_array_cmp;
+use crate::engine::ensure_data_types::DataTypeCompat;
+use crate::{
+    engine::arrow_data::ArrowEngineData,
+    schema::{DataType, Schema, SchemaRef, StructField, StructType},
+    utils::require,
+    DeltaResult, EngineData, Error,
+};
 
 /// Get the indices in `parquet_schema` of the specified columns in `requested_schema`. This
 /// returns a tuples of (mask_indices: Vec<parquet_schema_index>, reorder_indices:

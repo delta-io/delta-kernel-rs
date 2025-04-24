@@ -27,6 +27,7 @@ use evaluate_expression::evaluate_expression;
 
 mod apply_schema;
 mod evaluate_expression;
+mod in_list;
 
 #[cfg(test)]
 mod tests;

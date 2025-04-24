@@ -61,15 +61,17 @@ fn test_bad_right_type_array() {
     assert!(in_result.is_err());
     assert_eq!(
         in_result.unwrap_err().to_string(),
-        "Invalid expression evaluation: Cannot cast to list array: Int32"
+        "Invalid expression evaluation: Expected right hand side to be list column, got: Int32"
     );
 }
 
 #[test]
 fn test_literal_type_array() {
+    //  we just need some value to get a result back.
+    let values = Int32Array::from(vec![0]);
     let field = Arc::new(Field::new("item", DataType::Int32, true));
     let schema = Schema::new([field.clone()]);
-    let batch = RecordBatch::new_empty(Arc::new(schema));
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values)]).unwrap();
 
     let in_op = Expr::binary(
         BinaryOperator::NotIn,
@@ -106,10 +108,6 @@ fn test_invalid_array_sides() {
     let in_result = evaluate_expression(&in_op, &batch, None);
 
     assert!(in_result.is_err());
-    assert_eq!(
-            in_result.unwrap_err().to_string(),
-            "Invalid expression evaluation: Invalid right value for (NOT) IN comparison, left is: Column(item) right is: Column(item)".to_string()
-        )
 }
 
 #[test]

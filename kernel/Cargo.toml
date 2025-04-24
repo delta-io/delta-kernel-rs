@@ -41,6 +41,7 @@ bytes = "1.10"
 chrono = "=0.4.39"
 indexmap = "2.9.0"
 itertools = "0.14"
+paste = "1.0"
 roaring = "0.10.12"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
@@ -60,13 +61,29 @@ tempfile = { version = "3", optional = true }
 # Arrow supported versions
 ## 53
 # Used in default engine
-arrow_53 = { package = "arrow", version = "53", features = ["chrono-tz", "ffi", "json", "prettyprint"], optional = true }
+arrow_53 = { package = "arrow", version = "53", features = [
+  "chrono-tz",
+  "ffi",
+  "json",
+  "prettyprint",
+], optional = true }
 # Used in default and sync engine
-parquet_53 = { package = "parquet", version = "53", features = ["async", "object_store"] , optional = true }
+parquet_53 = { package = "parquet", version = "53", features = [
+  "async",
+  "object_store",
+], optional = true }
 ######
 ## 54
-arrow_54 = { package = "arrow", version = "54", features = ["chrono-tz", "ffi", "json", "prettyprint"], optional = true }
-parquet_54 = { package = "parquet", version = "54", features = ["async", "object_store"] , optional = true }
+arrow_54 = { package = "arrow", version = "54", features = [
+  "chrono-tz",
+  "ffi",
+  "json",
+  "prettyprint",
+], optional = true }
+parquet_54 = { package = "parquet", version = "54", features = [
+  "async",
+  "object_store",
+], optional = true }
 ######
 
 futures = { version = "0.3", optional = true }
@@ -125,10 +142,7 @@ default-engine-rustls = [
 ]
 
 internal-api = []
-sync-engine = [
-  "need_arrow",
-  "tempfile",
-]
+sync-engine = ["need_arrow", "tempfile"]
 integration-test = [
   "hdfs-native-object-store/integration-test",
   "hdfs-native",
@@ -139,13 +153,19 @@ integration-test = [
 rustc_version = "0.4.1"
 
 [dev-dependencies]
-delta_kernel = { path = ".", features = ["arrow", "default-engine", "sync-engine"] }
+
+delta_kernel = { path = ".", features = [
+  "arrow",
+  "default-engine",
+  "sync-engine",
+] }
 test_utils = { path = "../test-utils" }
 # Used for testing parse_url_opts extensibility
+
+test-log = { version = "0.2", default-features = false, features = ["trace"] }
 hdfs-native-object-store = { workspace = true }
 async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implementation
 paste = "1.0"
-test-log = { version = "0.2", default-features = false, features = ["trace"] }
 tempfile = "3"
 tar = "0.4"
 zstd = "0.13"
