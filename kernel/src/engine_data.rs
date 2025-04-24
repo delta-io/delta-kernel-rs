@@ -21,6 +21,15 @@ pub struct FilteredEngineData {
     pub selection_vector: Vec<bool>,
 }
 
+impl FilteredEngineData {
+    #[cfg(test)]
+    pub(crate) fn new(data: Box<dyn EngineData>, selection_vector: Vec<bool>) -> Self {
+        FilteredEngineData {
+            data,
+            selection_vector,
+        }
+    }
+}
 impl HasSelectionVector for FilteredEngineData {
     /// Returns true if any row in the selection vector is marked as selected
     fn has_selected_rows(&self) -> bool {
