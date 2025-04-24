@@ -44,12 +44,19 @@ impl MapData {
         data_type: MapType,
         values: impl IntoIterator<Item = (impl Into<Scalar>, impl Into<Scalar>)>,
     ) -> DeltaResult<Self> {
-        // TODO: check that inner types are primitive?
-        let pairs = values
-            .into_iter()
-            .map(|(k, v)| (k.into(), v.into()))
-            .collect();
-        Ok(Self { data_type, pairs })
+        if let (DataType::Primitive(_), DataType::Primitive(_)) =
+            (data_type.key_type(), data_type.value_type())
+        {
+            let pairs = values
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect();
+            Ok(Self { data_type, pairs })
+        } else {
+            Err(Error::unsupported(
+                "Unable to construct Scalar MapData: map keys/values must be primitive types",
+            ))
+        }
     }
 
     // TODO: array.elements is deprecated? do we want to expose this? How will FFI get pairs for
