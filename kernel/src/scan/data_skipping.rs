@@ -69,7 +69,7 @@ impl DataSkippingFilter {
     ) -> Option<Self> {
         static STATS_EXPR: LazyLock<Expr> = LazyLock::new(|| column_expr!("add.stats"));
         static FILTER_PRED: LazyLock<Pred> =
-            LazyLock::new(|| column_expr!("predicate").distinct(Expr::literal(false)));
+            LazyLock::new(|| column_expr!("output").distinct(Expr::literal(false)));
 
         let (predicate, referenced_schema) = physical_predicate?;
         debug!("Creating a data skipping filter for {:#?}", predicate);

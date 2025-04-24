@@ -364,6 +364,12 @@ pub trait EvaluationHandler: AsAny {
     /// Create an [`ExpressionEvaluator`] that can evaluate the given [`Expression`]
     /// on columnar batches with the given [`Schema`] to produce data of [`DataType`].
     ///
+    /// If the provided output type is a struct, its fields describe the columns of output produced
+    /// by the evaluator. Otherwise, the output schema is a single column named "output" of the
+    /// specified `output_type`. In all cases, the output schema is only used for its names (all
+    /// field names will be updated to match) and nullability (non-nullable columns can be converted
+    /// to nullable). Any mismatch in types (including number of columns) will produce an error.
+    ///
     /// # Parameters
     ///
     /// - `schema`: Schema of the input data.
@@ -381,6 +387,8 @@ pub trait EvaluationHandler: AsAny {
 
     /// Create a [`PredicateEvaluator`] that can evaluate the given [`Predicate`] on columnar
     /// batches with the given [`Schema`] to produce a column of boolean results.
+    ///
+    /// The output schema is a single nullable boolean column named "output".
     ///
     /// # Parameters
     ///
