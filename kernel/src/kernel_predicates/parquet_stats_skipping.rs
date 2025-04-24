@@ -60,12 +60,12 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
         KernelPredicateEvaluatorDefaults::partial_cmp_scalars(ord, &col, val, inverted)
     }
 
-    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<bool> {
-        KernelPredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted)
-    }
-
     fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<bool> {
         KernelPredicateEvaluatorDefaults::eval_scalar(val, inverted)
+    }
+
+    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<bool> {
+        KernelPredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted)
     }
 
     fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<bool> {

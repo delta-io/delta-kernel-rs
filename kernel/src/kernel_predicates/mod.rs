@@ -58,11 +58,11 @@ mod tests;
 pub(crate) trait KernelPredicateEvaluator {
     type Output;
 
-    /// A (possibly inverted) scalar NULL test, e.g. `<value> IS [NOT] NULL`.
-    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Self::Output>;
-
     /// A (possibly inverted) boolean scalar value, e.g. `[NOT] <value>`.
     fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<Self::Output>;
+
+    /// A (possibly inverted) scalar NULL test, e.g. `<value> IS [NOT] NULL`.
+    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Self::Output>;
 
     /// A (possibly inverted) NULL check, e.g. `<expr> IS [NOT] NULL`.
     fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Self::Output>;
@@ -416,17 +416,17 @@ pub(crate) trait KernelPredicateEvaluator {
 /// reuse by multiple bool-output predicate evaluator implementations.
 pub(crate) struct KernelPredicateEvaluatorDefaults;
 impl KernelPredicateEvaluatorDefaults {
-    /// Directly null-tests a scalar. See [`KernelPredicateEvaluator::eval_scalar_is_null`].
-    pub(crate) fn eval_scalar_is_null(val: &Scalar, inverted: bool) -> Option<bool> {
-        Some(val.is_null() != inverted)
-    }
-
     /// Directly evaluates a boolean scalar. See [`KernelPredicateEvaluator::eval_scalar`].
     pub(crate) fn eval_scalar(val: &Scalar, inverted: bool) -> Option<bool> {
         match val {
             Scalar::Boolean(val) => Some(*val != inverted),
             _ => None,
         }
+    }
+
+    /// Directly null-tests a scalar. See [`KernelPredicateEvaluator::eval_scalar_is_null`].
+    pub(crate) fn eval_scalar_is_null(val: &Scalar, inverted: bool) -> Option<bool> {
+        Some(val.is_null() != inverted)
     }
 
     /// A (possibly inverted) partial comparison of two scalars, leveraging the [`PartialOrd`]
@@ -550,12 +550,12 @@ impl<R: ResolveColumnAsScalar + 'static> From<R> for DefaultKernelPredicateEvalu
 impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredicateEvaluator<R> {
     type Output = bool;
 
-    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<bool> {
-        KernelPredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted)
-    }
-
     fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<bool> {
         KernelPredicateEvaluatorDefaults::eval_scalar(val, inverted)
+    }
+
+    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<bool> {
+        KernelPredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted)
     }
 
     fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<bool> {
@@ -634,11 +634,11 @@ pub(crate) trait DataSkippingPredicateEvaluator {
     /// Retrieves the row count of a column (parquet footers always include this stat).
     fn get_rowcount_stat(&self) -> Option<Self::IntStat>;
 
-    /// See [`KernelPredicateEvaluator::eval_scalar_is_null`]
-    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Self::Output>;
-
     /// See [`KernelPredicateEvaluator::eval_scalar`]
     fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<Self::Output>;
+
+    /// See [`KernelPredicateEvaluator::eval_scalar_is_null`]
+    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Self::Output>;
 
     /// For IS NULL (IS NOT NULL), we can only skip the file if all-null (no-null). Any other
     /// nullcount always forces us to keep the file.
@@ -770,12 +770,12 @@ pub(crate) trait DataSkippingPredicateEvaluator {
 impl<T: DataSkippingPredicateEvaluator> KernelPredicateEvaluator for T {
     type Output = T::Output;
 
-    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Self::Output> {
-        self.eval_scalar_is_null(val, inverted)
-    }
-
     fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<Self::Output> {
         self.eval_scalar(val, inverted)
+    }
+
+    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Self::Output> {
+        self.eval_scalar_is_null(val, inverted)
     }
 
     fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Self::Output> {
