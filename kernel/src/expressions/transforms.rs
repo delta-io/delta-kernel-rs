@@ -136,7 +136,7 @@ pub trait ExpressionTransform<'a> {
                 Borrowed(_) => Borrowed(pred),
             },
             Predicate::Not(p) => match self.transform_pred_not(p)? {
-                Owned(p) => Owned(Predicate::not(p)),
+                Owned(p) => Owned(p),
                 Borrowed(_) => Borrowed(pred),
             },
             Predicate::Unary(u) => match self.transform_pred_unary(u)? {
