@@ -230,8 +230,8 @@ pub(crate) fn cdf_scan_row_expression(commit_timestamp: i64, commit_number: i64)
             column_expr!("cdc.path"),
             Expression::struct_from([column_expr!("cdc.partitionValues")]),
         ]),
-        commit_timestamp.into(),
-        commit_number.into(),
+        Expression::literal(commit_timestamp),
+        Expression::literal(commit_number),
     ])
 }
 
@@ -251,7 +251,7 @@ mod tests {
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::log_replay::table_changes_action_iter;
     use crate::utils::test_utils::{Action, LocalMockTable};
-    use crate::Engine;
+    use crate::Engine as _;
 
     #[tokio::test]
     async fn test_scan_file_visiting() {

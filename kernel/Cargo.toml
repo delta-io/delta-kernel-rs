@@ -39,7 +39,6 @@ pre-release-hook = [
 [dependencies]
 bytes = "1.10"
 chrono = "=0.4.39"
-fix-hidden-lifetime-bug = "0.2"
 indexmap = "2.9.0"
 itertools = "0.14"
 roaring = "0.10.12"
@@ -54,9 +53,6 @@ z85 = "3.0.6"
 
 # bring in our derive macros
 delta_kernel_derive = { path = "../derive-macros", version = "0.9.0" }
-
-# used for `internal-api` feature flag
-visibility = "0.1.1"
 
 # Used in the sync engine
 tempfile = { version = "3", optional = true }
@@ -75,7 +71,6 @@ parquet_54 = { package = "parquet", version = "54", features = ["async", "object
 
 futures = { version = "0.3", optional = true }
 object_store = { workspace = true, optional = true }
-hdfs-native-object-store = { workspace = true, optional = true }
 # Used for fetching direct urls (like pre-signed urls)
 reqwest = { version = "0.12.15", default-features = false, optional = true }
 strum = { version = "0.27", features = ["derive"] }
@@ -105,7 +100,6 @@ cloud = [
   "object_store/azure",
   "object_store/gcp",
   "object_store/http",
-  "hdfs-native-object-store",
 ]
 default = []
 
@@ -141,15 +135,14 @@ integration-test = [
   "walkdir",
 ]
 
-[dependencies.home]
-version = "=0.5.9"
-
 [build-dependencies]
 rustc_version = "0.4.1"
 
 [dev-dependencies]
 delta_kernel = { path = ".", features = ["arrow", "default-engine", "sync-engine"] }
 test_utils = { path = "../test-utils" }
+# Used for testing parse_url_opts extensibility
+hdfs-native-object-store = { workspace = true }
 async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implementation
 paste = "1.0"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }

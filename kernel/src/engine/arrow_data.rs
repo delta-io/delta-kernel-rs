@@ -294,15 +294,12 @@ impl ArrowEngineData {
 
 #[cfg(test)]
 mod tests {
+    use crate::actions::{get_log_schema, Metadata, Protocol};
     use crate::arrow::array::StringArray;
-
+    use crate::engine::sync::SyncEngine;
     use crate::table_features::{ReaderFeature, WriterFeature};
     use crate::utils::test_utils::string_array_to_engine_data;
-    use crate::{
-        actions::{get_log_schema, Metadata, Protocol},
-        engine::sync::SyncEngine,
-        DeltaResult, Engine,
-    };
+    use crate::{DeltaResult, Engine as _};
 
     #[test]
     fn test_md_extract() -> DeltaResult<()> {

@@ -20,6 +20,7 @@ use crate::table_features::{
 };
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error, Version};
+use delta_kernel_derive::internal_api;
 
 /// Holds all the configuration for a table at a specific version. This includes the supported
 /// reader and writer features, table properties, schema, version, and table root. This can be used
@@ -31,7 +32,7 @@ use crate::{DeltaResult, Error, Version};
 /// to validate that Metadata and Protocol are correctly formatted and mutually compatible. If
 /// `try_new` successfully returns `TableConfiguration`, it is also guaranteed that reading the
 /// table is supported.
-#[cfg_attr(feature = "internal-api", visibility::make(pub))]
+#[internal_api]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableConfiguration {
     metadata: Metadata,
@@ -114,50 +115,50 @@ impl TableConfiguration {
     }
 
     /// The [`Metadata`] for this table at this version.
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn metadata(&self) -> &Metadata {
         &self.metadata
     }
 
     /// The [`Protocol`] of this table at this version.
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn protocol(&self) -> &Protocol {
         &self.protocol
     }
 
     /// The logical schema ([`SchemaRef`]) of this table at this version.
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
     /// The [`TableProperties`] of this table at this version.
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn table_properties(&self) -> &TableProperties {
         &self.table_properties
     }
 
     /// The [`ColumnMappingMode`] for this table at this version.
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn column_mapping_mode(&self) -> ColumnMappingMode {
         self.column_mapping_mode
     }
 
     /// The [`Url`] of the table this [`TableConfiguration`] belongs to
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn table_root(&self) -> &Url {
         &self.table_root
     }
 
     /// The [`Version`] which this [`TableConfiguration`] belongs to.
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn version(&self) -> Version {
         self.version
     }
 
     /// Returns `true` if the kernel supports writing to this table. This checks that the
     /// protocol's writer features are all supported.
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
         self.protocol.ensure_write_supported()?;
 
@@ -178,7 +179,7 @@ impl TableConfiguration {
     /// See the documentation of [`TableChanges`] for more details.
     ///
     /// [`TableChanges`]: crate::table_changes::TableChanges
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn is_cdf_read_supported(&self) -> bool {
         static CDF_SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> =
             LazyLock::new(|| vec![ReaderFeature::DeletionVectors]);
@@ -208,7 +209,7 @@ impl TableConfiguration {
     /// both the protocol's readerFeatures and writerFeatures.
     ///
     /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors>
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     #[allow(unused)] // needed to compile w/o default features
     pub(crate) fn is_deletion_vector_supported(&self) -> bool {
         let read_supported = self
@@ -227,7 +228,7 @@ impl TableConfiguration {
     /// table property is set to `true`.
     ///
     /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors>
-    #[cfg_attr(feature = "internal-api", visibility::make(pub))]
+    #[internal_api]
     #[allow(unused)] // needed to compile w/o default features
     pub(crate) fn is_deletion_vector_enabled(&self) -> bool {
         self.is_deletion_vector_supported()
