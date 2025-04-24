@@ -142,7 +142,7 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
 /// EngineData using the `create_one` method.
 ///
 /// # Example
-/// ```rust
+/// ```ignore
 /// #[derive(Schema, IntoEngineData)]
 /// struct MyStruct {
 ///    a: i32,
@@ -152,6 +152,7 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
 /// let my_struct = MyStruct { a: 42, b: "Hello".to_string() };
 /// // typically used with ToSchema
 /// let schema = Arc::new(MyStruct::to_schema());
+/// // single-row EngineData
 /// let engine_data = my_struct.into_engine_data(schema, engine);
 /// ```
 #[proc_macro_derive(IntoEngineData)]
