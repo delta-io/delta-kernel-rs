@@ -4,7 +4,7 @@ default:
 # run tests
 test:
     cargo test --features default-engine
-    cargo test --doc --features developer-visibility
+    cargo test --doc
   
 # lint codebase
 lint:
