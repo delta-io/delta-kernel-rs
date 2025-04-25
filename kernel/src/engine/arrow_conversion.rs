@@ -2,10 +2,11 @@
 
 use std::sync::Arc;
 
-use arrow_schema::{
-    ArrowError, DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+use crate::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
+use crate::arrow::error::ArrowError;
 use itertools::Itertools;
 
 use crate::error::Error;
@@ -106,11 +107,10 @@ impl TryFrom<&DataType> for ArrowDataType {
                     PrimitiveType::Double => Ok(ArrowDataType::Float64),
                     PrimitiveType::Boolean => Ok(ArrowDataType::Boolean),
                     PrimitiveType::Binary => Ok(ArrowDataType::Binary),
-                    PrimitiveType::Decimal(precision, scale) => {
-                        PrimitiveType::check_decimal(*precision, *scale)
-                            .map_err(|e| ArrowError::from_external_error(e.into()))?;
-                        Ok(ArrowDataType::Decimal128(*precision, *scale as i8))
-                    }
+                    PrimitiveType::Decimal(dtype) => Ok(ArrowDataType::Decimal128(
+                        dtype.precision(),
+                        dtype.scale() as i8, // 0..=38
+                    )),
                     PrimitiveType::Date => {
                         // A calendar date, represented as a year-month-day triple without a
                         // timezone. Stored as 4 bytes integer representing days since 1970-01-01
@@ -179,6 +179,7 @@ impl TryFrom<&ArrowDataType> for DataType {
         match arrow_datatype {
             ArrowDataType::Utf8 => Ok(DataType::STRING),
             ArrowDataType::LargeUtf8 => Ok(DataType::STRING),
+            ArrowDataType::Utf8View => Ok(DataType::STRING),
             ArrowDataType::Int64 => Ok(DataType::LONG), // undocumented type
             ArrowDataType::Int32 => Ok(DataType::INTEGER),
             ArrowDataType::Int16 => Ok(DataType::SHORT),
@@ -193,6 +194,7 @@ impl TryFrom<&ArrowDataType> for DataType {
             ArrowDataType::Binary => Ok(DataType::BINARY),
             ArrowDataType::FixedSizeBinary(_) => Ok(DataType::BINARY),
             ArrowDataType::LargeBinary => Ok(DataType::BINARY),
+            ArrowDataType::BinaryView => Ok(DataType::BINARY),
             ArrowDataType::Decimal128(p, s) => {
                 if *s < 0 {
                     return Err(ArrowError::from_external_error(
@@ -216,7 +218,13 @@ impl TryFrom<&ArrowDataType> for DataType {
             ArrowDataType::List(field) => {
                 Ok(ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()).into())
             }
+            ArrowDataType::ListView(field) => {
+                Ok(ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()).into())
+            }
             ArrowDataType::LargeList(field) => {
+                Ok(ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()).into())
+            }
+            ArrowDataType::LargeListView(field) => {
                 Ok(ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()).into())
             }
             ArrowDataType::FixedSizeList(field, _) => {
@@ -255,8 +263,7 @@ mod tests {
     fn test_metadata_string_conversion() -> DeltaResult<()> {
         let mut metadata = HashMap::new();
         metadata.insert("description", "hello world".to_owned());
-        let struct_field =
-            StructField::new("name", DataType::STRING, false).with_metadata(metadata);
+        let struct_field = StructField::not_null("name", DataType::STRING).with_metadata(metadata);
 
         let arrow_field = ArrowField::try_from(&struct_field)?;
         let new_metadata = arrow_field.metadata();

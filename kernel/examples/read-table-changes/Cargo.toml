@@ -1,0 +1,18 @@
+[package]
+name = "read-table-changes"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata.release]
+release = false
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+delta_kernel = { path = "../../../kernel", features = [
+  "cloud",
+  "arrow",
+  "default-engine",
+] }
+url = "2"
+itertools = "0.14"

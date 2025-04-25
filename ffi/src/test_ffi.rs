@@ -1,10 +1,10 @@
 //! Utility functions used for testing ffi code
 
-use std::{ops::Not, sync::Arc};
+use std::sync::Arc;
 
 use crate::{expressions::SharedExpression, handle::Handle};
 use delta_kernel::{
-    expressions::{column_expr, ArrayData, BinaryOperator, Expression, Scalar, StructData},
+    expressions::{column_expr, ArrayData, BinaryOperator, Expression as Expr, Scalar, StructData},
     schema::{ArrayType, DataType, StructField, StructType},
 };
 
@@ -12,12 +12,10 @@ use delta_kernel::{
 /// output expression can be found in `ffi/tests/test_expression_visitor/expected.txt`.
 ///
 /// # Safety
-/// The caller is responsible for freeing the retured memory, either by calling
+/// The caller is responsible for freeing the returned memory, either by calling
 /// [`free_kernel_predicate`], or [`Handle::drop_handle`]
 #[no_mangle]
 pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpression> {
-    use Expression as Expr;
-
     let array_type = ArrayType::new(
         DataType::Primitive(delta_kernel::schema::PrimitiveType::Short),
         false,
@@ -25,18 +23,17 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
     let array_data = ArrayData::new(array_type.clone(), vec![Scalar::Short(5), Scalar::Short(0)]);
 
     let nested_fields = vec![
-        StructField::new("a", DataType::INTEGER, false),
-        StructField::new("b", array_type, false),
+        StructField::not_null("a", DataType::INTEGER),
+        StructField::not_null("b", array_type),
     ];
     let nested_values = vec![Scalar::Integer(500), Scalar::Array(array_data.clone())];
     let nested_struct = StructData::try_new(nested_fields.clone(), nested_values).unwrap();
     let nested_struct_type = StructType::new(nested_fields);
 
     let top_level_struct = StructData::try_new(
-        vec![StructField::new(
+        vec![StructField::nullable(
             "top",
             DataType::Struct(Box::new(nested_struct_type)),
-            true,
         )],
         vec![Scalar::Struct(nested_struct)],
     )
@@ -61,7 +58,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         Scalar::Date(32).into(),
         Scalar::Binary(0x0000deadbeefcafeu64.to_be_bytes().to_vec()).into(),
         // Both the most and least significant u64 of the Decimal value will be 1
-        Scalar::Decimal((1 << 64) + 1, 5, 3).into(),
+        Scalar::decimal((1i128 << 64) + 1, 20, 3).unwrap().into(),
         Expr::null_literal(DataType::SHORT),
         Scalar::Struct(top_level_struct).into(),
         Scalar::Array(array_data).into(),
@@ -69,7 +66,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
             Scalar::Integer(5).into(),
             Scalar::Long(20).into(),
         ])]),
-        Expr::not(Expr::is_null(column_expr!("col"))),
+        Expr::is_not_null(column_expr!("col")),
     ];
     sub_exprs.extend(
         [
@@ -87,8 +84,8 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
             BinaryOperator::GreaterThanOrEqual,
             BinaryOperator::Distinct,
         ]
-        .iter()
-        .map(|op| Expr::binary(*op, Scalar::Integer(0), Scalar::Long(0))),
+        .into_iter()
+        .map(|op| Expr::binary(op, Scalar::Integer(0), Scalar::Long(0))),
     );
 
     Arc::new(Expr::and_from(sub_exprs)).into()

@@ -8,23 +8,34 @@ use itertools::Itertools;
 pub use self::column_names::{
     column_expr, column_name, joined_column_expr, joined_column_name, ColumnName,
 };
-pub use self::scalars::{ArrayData, Scalar, StructData};
+pub use self::scalars::{ArrayData, DecimalData, Scalar, StructData};
+use self::transforms::GetColumnReferences;
+pub use self::transforms::{ExpressionDepthChecker, ExpressionTransform};
 use crate::DataType;
 
 mod column_names;
+pub(crate) mod literal_expression_transform;
 mod scalars;
+pub mod transforms;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub type ExpressionRef = std::sync::Arc<Expression>;
+
+////////////////////////////////////////////////////////////////////////
+// Operators
+////////////////////////////////////////////////////////////////////////
+
+/// A unary operator.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UnaryOperator {
+    /// Unary Not
+    Not,
+    /// Unary Is Null
+    IsNull,
+}
+
 /// A binary operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryOperator {
-    /// Arithmetic Plus
-    Plus,
-    /// Arithmetic Minus
-    Minus,
-    /// Arithmetic Multiply
-    Multiply,
-    /// Arithmetic Divide
-    Divide,
     /// Comparison Less Than
     LessThan,
     /// Comparison Less Than Or Equal
@@ -43,72 +54,53 @@ pub enum BinaryOperator {
     In,
     /// NOT IN
     NotIn,
-}
-
-impl BinaryOperator {
-    /// Returns `<op2>` (if any) such that `B <op2> A` is equivalent to `A <op> B`.
-    pub(crate) fn commute(&self) -> Option<BinaryOperator> {
-        use BinaryOperator::*;
-        match self {
-            GreaterThan => Some(LessThan),
-            GreaterThanOrEqual => Some(LessThanOrEqual),
-            LessThan => Some(GreaterThan),
-            LessThanOrEqual => Some(GreaterThanOrEqual),
-            Equal | NotEqual | Distinct | Plus | Multiply => Some(*self),
-            In | NotIn | Minus | Divide => None, // not commutative
-        }
-    }
+    /// Arithmetic Plus
+    Plus,
+    /// Arithmetic Minus
+    Minus,
+    /// Arithmetic Multiply
+    Multiply,
+    /// Arithmetic Divide
+    Divide,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum VariadicOperator {
+pub enum JunctionOperator {
+    /// Conjunction
     And,
+    /// Disjunction
     Or,
 }
 
-impl VariadicOperator {
-    pub(crate) fn invert(&self) -> VariadicOperator {
-        use VariadicOperator::*;
-        match self {
-            And => Or,
-            Or => And,
-        }
-    }
+////////////////////////////////////////////////////////////////////////
+// Expressions
+////////////////////////////////////////////////////////////////////////
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnaryExpression {
+    /// The operator.
+    pub op: UnaryOperator,
+    /// The expression.
+    pub expr: Box<Expression>,
 }
 
-impl Display for BinaryOperator {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Plus => write!(f, "+"),
-            Self::Minus => write!(f, "-"),
-            Self::Multiply => write!(f, "*"),
-            Self::Divide => write!(f, "/"),
-            Self::LessThan => write!(f, "<"),
-            Self::LessThanOrEqual => write!(f, "<="),
-            Self::GreaterThan => write!(f, ">"),
-            Self::GreaterThanOrEqual => write!(f, ">="),
-            Self::Equal => write!(f, "="),
-            Self::NotEqual => write!(f, "!="),
-            // TODO(roeap): AFAIK DISTINCT does not have a commonly used operator symbol
-            // so ideally this would not be used as we use Display for rendering expressions
-            // in our code we take care of this, but theirs might not ...
-            Self::Distinct => write!(f, "DISTINCT"),
-            Self::In => write!(f, "IN"),
-            Self::NotIn => write!(f, "NOT IN"),
-        }
-    }
+#[derive(Clone, Debug, PartialEq)]
+pub struct BinaryExpression {
+    /// The operator.
+    pub op: BinaryOperator,
+    /// The left-hand side of the operation.
+    pub left: Box<Expression>,
+    /// The right-hand side of the operation.
+    pub right: Box<Expression>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-/// A unary operator.
-pub enum UnaryOperator {
-    /// Unary Not
-    Not,
-    /// Unary Is Null
-    IsNull,
+#[derive(Clone, Debug, PartialEq)]
+pub struct JunctionExpression {
+    /// The operator.
+    pub op: JunctionOperator,
+    /// The expressions.
+    pub exprs: Vec<Expression>,
 }
-
-pub type ExpressionRef = std::sync::Arc<Expression>;
 
 /// A SQL expression.
 ///
@@ -124,86 +116,81 @@ pub enum Expression {
     /// A struct computed from a Vec of expressions
     Struct(Vec<Expression>),
     /// A unary operation.
-    UnaryOperation {
-        /// The operator.
-        op: UnaryOperator,
-        /// The expression.
-        expr: Box<Expression>,
-    },
+    Unary(UnaryExpression),
     /// A binary operation.
-    BinaryOperation {
-        /// The operator.
-        op: BinaryOperator,
-        /// The left-hand side of the operation.
-        left: Box<Expression>,
-        /// The right-hand side of the operation.
-        right: Box<Expression>,
-    },
-    VariadicOperation {
-        /// The operator.
-        op: VariadicOperator,
-        /// The expressions.
-        exprs: Vec<Expression>,
-    },
+    Binary(BinaryExpression),
+    /// A junction operation (AND/OR).
+    Junction(JunctionExpression),
     // TODO: support more expressions, such as IS IN, LIKE, etc.
 }
 
-impl<T: Into<Scalar>> From<T> for Expression {
-    fn from(value: T) -> Self {
-        Self::literal(value)
-    }
-}
+////////////////////////////////////////////////////////////////////////
+// Struct/Enum impls
+////////////////////////////////////////////////////////////////////////
 
-impl From<ColumnName> for Expression {
-    fn from(value: ColumnName) -> Self {
-        Self::Column(value)
-    }
-}
-
-impl Display for Expression {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl BinaryOperator {
+    /// True if this is a comparison for which NULL input always produces NULL output
+    pub(crate) fn is_null_intolerant_comparison(&self) -> bool {
+        use BinaryOperator::*;
         match self {
-            Self::Literal(l) => write!(f, "{l}"),
-            Self::Column(name) => write!(f, "Column({name})"),
-            Self::Struct(exprs) => write!(
-                f,
-                "Struct({})",
-                &exprs.iter().map(|e| format!("{e}")).join(", ")
-            ),
-            Self::BinaryOperation {
-                op: BinaryOperator::Distinct,
-                left,
-                right,
-            } => write!(f, "DISTINCT({left}, {right})"),
-            Self::BinaryOperation { op, left, right } => write!(f, "{left} {op} {right}"),
-            Self::UnaryOperation { op, expr } => match op {
-                UnaryOperator::Not => write!(f, "NOT {expr}"),
-                UnaryOperator::IsNull => write!(f, "{expr} IS NULL"),
-            },
-            Self::VariadicOperation { op, exprs } => {
-                let exprs = &exprs.iter().map(|e| format!("{e}")).join(", ");
-                let op = match op {
-                    VariadicOperator::And => "AND",
-                    VariadicOperator::Or => "OR",
-                };
-                write!(f, "{op}({exprs})")
-            }
+            Plus | Minus | Multiply | Divide => false, // not a comparison
+            LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual => true,
+            Equal | NotEqual => true,
+            Distinct | In | NotIn => false, // tolerates NULL input
         }
+    }
+
+    /// Returns `<op2>` (if any) such that `B <op2> A` is equivalent to `A <op> B`.
+    pub(crate) fn commute(&self) -> Option<BinaryOperator> {
+        use BinaryOperator::*;
+        match self {
+            GreaterThan => Some(LessThan),
+            GreaterThanOrEqual => Some(LessThanOrEqual),
+            LessThan => Some(GreaterThan),
+            LessThanOrEqual => Some(GreaterThanOrEqual),
+            Equal | NotEqual | Distinct | Plus | Multiply => Some(*self),
+            In | NotIn | Minus | Divide => None, // not commutative
+        }
+    }
+}
+
+impl JunctionOperator {
+    pub(crate) fn invert(&self) -> JunctionOperator {
+        use JunctionOperator::*;
+        match self {
+            And => Or,
+            Or => And,
+        }
+    }
+}
+
+impl UnaryExpression {
+    fn new(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
+        let expr = Box::new(expr.into());
+        Self { op, expr }
+    }
+}
+
+impl BinaryExpression {
+    fn new(op: BinaryOperator, left: impl Into<Expression>, right: impl Into<Expression>) -> Self {
+        let left = Box::new(left.into());
+        let right = Box::new(right.into());
+        Self { op, left, right }
+    }
+}
+
+impl JunctionExpression {
+    fn new(op: JunctionOperator, exprs: Vec<Expression>) -> Self {
+        Self { op, exprs }
     }
 }
 
 impl Expression {
     /// Returns a set of columns referenced by this expression.
     pub fn references(&self) -> HashSet<&ColumnName> {
-        let mut set = HashSet::new();
-
-        for expr in self.walk() {
-            if let Self::Column(name) = expr {
-                set.insert(name);
-            }
-        }
-
-        set
+        let mut references = GetColumnReferences::default();
+        let _ = references.transform(self);
+        references.into_inner()
     }
 
     /// Create a new column name expression from input satisfying `FromIterator for ColumnName`.
@@ -219,7 +206,8 @@ impl Expression {
         Self::Literal(value.into())
     }
 
-    pub fn null_literal(data_type: DataType) -> Self {
+    /// Creates a NULL literal expression
+    pub const fn null_literal(data_type: DataType) -> Self {
         Self::Literal(Scalar::Null(data_type))
     }
 
@@ -228,41 +216,9 @@ impl Expression {
         Self::Struct(exprs.into_iter().collect())
     }
 
-    /// Creates a new unary expression OP expr
-    pub fn unary(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
-        Self::UnaryOperation {
-            op,
-            expr: Box::new(expr.into()),
-        }
-    }
-
-    /// Creates a new binary expression lhs OP rhs
-    pub fn binary(
-        op: BinaryOperator,
-        lhs: impl Into<Expression>,
-        rhs: impl Into<Expression>,
-    ) -> Self {
-        Self::BinaryOperation {
-            op,
-            left: Box::new(lhs.into()),
-            right: Box::new(rhs.into()),
-        }
-    }
-
-    /// Creates a new variadic expression OP(exprs...)
-    pub fn variadic(op: VariadicOperator, exprs: impl IntoIterator<Item = Self>) -> Self {
-        let exprs = exprs.into_iter().collect::<Vec<_>>();
-        Self::VariadicOperation { op, exprs }
-    }
-
-    /// Creates a new expression AND(exprs...)
-    pub fn and_from(exprs: impl IntoIterator<Item = Self>) -> Self {
-        Self::variadic(VariadicOperator::And, exprs)
-    }
-
-    /// Creates a new expression OR(exprs...)
-    pub fn or_from(exprs: impl IntoIterator<Item = Self>) -> Self {
-        Self::variadic(VariadicOperator::Or, exprs)
+    /// Logical NOT (boolean inversion)
+    pub fn not(expr: impl Into<Self>) -> Self {
+        Self::unary(UnaryOperator::Not, expr.into())
     }
 
     /// Create a new expression `self IS NULL`
@@ -272,7 +228,7 @@ impl Expression {
 
     /// Create a new expression `self IS NOT NULL`
     pub fn is_not_null(self) -> Self {
-        !Self::is_null(self)
+        Self::not(Self::is_null(self))
     }
 
     /// Create a new expression `self == other`
@@ -305,57 +261,127 @@ impl Expression {
         Self::binary(BinaryOperator::GreaterThan, self, other)
     }
 
-    /// Create a new expression `self >= other`
-    pub fn gt_eq(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::GreaterThanOrEqual, self, other)
-    }
-
-    /// Create a new expression `self <= other`
-    pub fn lt_eq(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::LessThanOrEqual, self, other)
-    }
-
-    /// Create a new expression `self AND other`
-    pub fn and(self, other: impl Into<Self>) -> Self {
-        Self::and_from([self, other.into()])
-    }
-
-    /// Create a new expression `self OR other`
-    pub fn or(self, other: impl Into<Self>) -> Self {
-        Self::or_from([self, other.into()])
-    }
-
     /// Create a new expression `DISTINCT(self, other)`
     pub fn distinct(self, other: impl Into<Self>) -> Self {
         Self::binary(BinaryOperator::Distinct, self, other)
     }
 
-    fn walk(&self) -> impl Iterator<Item = &Self> + '_ {
-        use Expression::*;
-        let mut stack = vec![self];
-        std::iter::from_fn(move || {
-            let expr = stack.pop()?;
-            match expr {
-                Literal(_) => {}
-                Column { .. } => {}
-                Struct(exprs) => stack.extend(exprs),
-                UnaryOperation { expr, .. } => stack.push(expr),
-                BinaryOperation { left, right, .. } => {
-                    stack.push(left);
-                    stack.push(right);
-                }
-                VariadicOperation { exprs, .. } => stack.extend(exprs),
-            }
-            Some(expr)
+    /// Create a new expression `self AND other`
+    pub fn and(a: impl Into<Self>, b: impl Into<Self>) -> Self {
+        Self::and_from([a.into(), b.into()])
+    }
+
+    /// Create a new expression `self OR other`
+    pub fn or(a: impl Into<Self>, b: impl Into<Self>) -> Self {
+        Self::or_from([a.into(), b.into()])
+    }
+
+    /// Creates a new expression AND(exprs...)
+    pub fn and_from(exprs: impl IntoIterator<Item = Self>) -> Self {
+        Self::junction(JunctionOperator::And, exprs)
+    }
+
+    /// Creates a new expression OR(exprs...)
+    pub fn or_from(exprs: impl IntoIterator<Item = Self>) -> Self {
+        Self::junction(JunctionOperator::Or, exprs)
+    }
+
+    /// Creates a new unary expression OP expr
+    pub fn unary(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
+        let expr = Box::new(expr.into());
+        Self::Unary(UnaryExpression { op, expr })
+    }
+
+    /// Creates a new binary expression lhs OP rhs
+    pub fn binary(
+        op: BinaryOperator,
+        lhs: impl Into<Expression>,
+        rhs: impl Into<Expression>,
+    ) -> Self {
+        Self::Binary(BinaryExpression {
+            op,
+            left: Box::new(lhs.into()),
+            right: Box::new(rhs.into()),
         })
+    }
+
+    /// Creates a new junction expression OP(exprs...)
+    pub fn junction(op: JunctionOperator, exprs: impl IntoIterator<Item = Self>) -> Self {
+        let exprs = exprs.into_iter().collect();
+        Self::Junction(JunctionExpression { op, exprs })
     }
 }
 
-impl std::ops::Not for Expression {
-    type Output = Self;
+////////////////////////////////////////////////////////////////////////
+// Trait impls
+////////////////////////////////////////////////////////////////////////
 
-    fn not(self) -> Self {
-        Self::unary(UnaryOperator::Not, self)
+impl Display for BinaryOperator {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use BinaryOperator::*;
+        match self {
+            Plus => write!(f, "+"),
+            Minus => write!(f, "-"),
+            Multiply => write!(f, "*"),
+            Divide => write!(f, "/"),
+            LessThan => write!(f, "<"),
+            LessThanOrEqual => write!(f, "<="),
+            GreaterThan => write!(f, ">"),
+            GreaterThanOrEqual => write!(f, ">="),
+            Equal => write!(f, "="),
+            NotEqual => write!(f, "!="),
+            // TODO(roeap): AFAIK DISTINCT does not have a commonly used operator symbol
+            // so ideally this would not be used as we use Display for rendering expressions
+            // in our code we take care of this, but theirs might not ...
+            Distinct => write!(f, "DISTINCT"),
+            In => write!(f, "IN"),
+            NotIn => write!(f, "NOT IN"),
+        }
+    }
+}
+
+impl Display for Expression {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use Expression::*;
+        match self {
+            Literal(l) => write!(f, "{l}"),
+            Column(name) => write!(f, "Column({name})"),
+            Struct(exprs) => write!(
+                f,
+                "Struct({})",
+                &exprs.iter().map(|e| format!("{e}")).join(", ")
+            ),
+            Binary(BinaryExpression {
+                op: BinaryOperator::Distinct,
+                left,
+                right,
+            }) => write!(f, "DISTINCT({left}, {right})"),
+            Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
+            Unary(UnaryExpression { op, expr }) => match op {
+                UnaryOperator::Not => write!(f, "NOT {expr}"),
+                UnaryOperator::IsNull => write!(f, "{expr} IS NULL"),
+            },
+            Junction(JunctionExpression { op, exprs }) => {
+                let exprs = &exprs.iter().map(|e| format!("{e}")).join(", ");
+                let op = match op {
+                    JunctionOperator::And => "AND",
+                    JunctionOperator::Or => "OR",
+                };
+                write!(f, "{op}({exprs})")
+            }
+        }
+    }
+}
+
+impl From<Scalar> for Expression {
+    fn from(value: Scalar) -> Self {
+        Self::literal(value)
+    }
+}
+
+impl From<ColumnName> for Expression {
+    fn from(value: ColumnName) -> Self {
+        Self::Column(value)
     }
 }
 
@@ -397,29 +423,47 @@ mod tests {
 
     #[test]
     fn test_expression_format() {
-        let col_ref = column_expr!("x");
         let cases = [
-            (col_ref.clone(), "Column(x)"),
-            (col_ref.clone().eq(2), "Column(x) = 2"),
-            ((col_ref.clone() - 4).lt(10), "Column(x) - 4 < 10"),
-            ((col_ref.clone() + 4) / 10 * 42, "Column(x) + 4 / 10 * 42"),
+            (column_expr!("x"), "Column(x)"),
             (
-                col_ref.clone().gt_eq(2).and(col_ref.clone().lt_eq(10)),
+                (column_expr!("x") + Expr::literal(4)) / Expr::literal(10) * Expr::literal(42),
+                "Column(x) + 4 / 10 * 42",
+            ),
+            (
+                Expr::struct_from([column_expr!("x"), Expr::literal(2), Expr::literal(10)]),
+                "Struct(Column(x), 2, 10)",
+            ),
+            (column_expr!("x").eq(Expr::literal(2)), "Column(x) = 2"),
+            (
+                (column_expr!("x") - Expr::literal(4)).lt(Expr::literal(10)),
+                "Column(x) - 4 < 10",
+            ),
+            (
+                Expr::and(
+                    column_expr!("x").ge(Expr::literal(2)),
+                    column_expr!("x").le(Expr::literal(10)),
+                ),
                 "AND(Column(x) >= 2, Column(x) <= 10)",
             ),
             (
                 Expr::and_from([
-                    col_ref.clone().gt_eq(2),
-                    col_ref.clone().lt_eq(10),
-                    col_ref.clone().lt_eq(100),
+                    column_expr!("x").ge(Expr::literal(2)),
+                    column_expr!("x").le(Expr::literal(10)),
+                    column_expr!("x").le(Expr::literal(100)),
                 ]),
                 "AND(Column(x) >= 2, Column(x) <= 10, Column(x) <= 100)",
             ),
             (
-                col_ref.clone().gt(2).or(col_ref.clone().lt(10)),
+                Expr::or(
+                    column_expr!("x").gt(Expr::literal(2)),
+                    column_expr!("x").lt(Expr::literal(10)),
+                ),
                 "OR(Column(x) > 2, Column(x) < 10)",
             ),
-            (col_ref.eq("foo"), "Column(x) = 'foo'"),
+            (
+                column_expr!("x").eq(Expr::literal("foo")),
+                "Column(x) = 'foo'",
+            ),
         ];
 
         for (expr, expected) in cases {

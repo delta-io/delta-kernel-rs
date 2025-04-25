@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use tracing::debug;
@@ -10,13 +9,13 @@ use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
 use crate::expressions::{
     column_expr, joined_column_expr, BinaryOperator, ColumnName, Expression as Expr, ExpressionRef,
-    Scalar, VariadicOperator,
+    JunctionOperator, Scalar,
 };
-use crate::predicates::{
-    DataSkippingPredicateEvaluator, PredicateEvaluator, PredicateEvaluatorDefaults,
+use crate::kernel_predicates::{
+    DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
 use crate::schema::{DataType, PrimitiveType, SchemaRef, SchemaTransform, StructField, StructType};
-use crate::{Engine, EngineData, ExpressionEvaluator, JsonHandler};
+use crate::{Engine, EngineData, ExpressionEvaluator, JsonHandler, RowVisitor as _};
 
 #[cfg(test)]
 mod tests;
@@ -25,20 +24,27 @@ mod tests;
 /// Returns `None` if the predicate is not eligible for data skipping.
 ///
 /// We normalize each binary operation to a comparison between a column and a literal value and
-/// rewite that in terms of the min/max values of the column.
+/// rewrite that in terms of the min/max values of the column.
 /// For example, `1 < a` is rewritten as `minValues.a > 1`.
 ///
 /// For Unary `Not`, we push the Not down using De Morgan's Laws to invert everything below the Not.
 ///
 /// Unary `IsNull` checks if the null counts indicate that the column could contain a null.
 ///
-/// The variadic operations are rewritten as follows:
+/// The junction operations are rewritten as follows:
 /// - `AND` is rewritten as a conjunction of the rewritten operands where we just skip operands that
-///         are not eligible for data skipping.
+///   are not eligible for data skipping.
 /// - `OR` is rewritten only if all operands are eligible for data skipping. Otherwise, the whole OR
-///        expression is dropped.
-fn as_data_skipping_predicate(expr: &Expr, inverted: bool) -> Option<Expr> {
-    DataSkippingPredicateCreator.eval_expr(expr, inverted)
+///   expression is dropped.
+#[cfg(test)]
+fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
+    DataSkippingPredicateCreator.eval(expr)
+}
+
+/// Like `as_data_skipping_predicate`, but invokes [`KernelPredicateEvaluator::eval_sql_where`]
+/// instead of [`KernelPredicateEvaluator::eval`].
+fn as_sql_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
+    DataSkippingPredicateCreator.eval_sql_where(expr)
 }
 
 pub(crate) struct DataSkippingFilter {
@@ -57,53 +63,63 @@ impl DataSkippingFilter {
     /// but using an Option lets the engine easily avoid the overhead of applying trivial filters.
     pub(crate) fn new(
         engine: &dyn Engine,
-        table_schema: &SchemaRef,
-        predicate: Option<ExpressionRef>,
+        physical_predicate: Option<(ExpressionRef, SchemaRef)>,
     ) -> Option<Self> {
         static PREDICATE_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
-            DataType::struct_type([StructField::new("predicate", DataType::BOOLEAN, true)])
+            DataType::struct_type([StructField::nullable("predicate", DataType::BOOLEAN)])
         });
         static STATS_EXPR: LazyLock<Expr> = LazyLock::new(|| column_expr!("add.stats"));
         static FILTER_EXPR: LazyLock<Expr> =
-            LazyLock::new(|| column_expr!("predicate").distinct(false));
+            LazyLock::new(|| column_expr!("predicate").distinct(Expr::literal(false)));
 
-        let predicate = predicate.as_deref()?;
-        debug!("Creating a data skipping filter for {}", &predicate);
-        let field_names: HashSet<_> = predicate.references();
+        let (predicate, referenced_schema) = physical_predicate?;
+        debug!("Creating a data skipping filter for {:#?}", predicate);
 
-        // Build the stats read schema by extracting the column names referenced by the predicate,
-        // extracting the corresponding field from the table schema, and inserting that field.
-        //
-        // TODO: Support nested column names!
-        let data_fields: Vec<_> = table_schema
-            .fields()
-            .filter(|field| field_names.contains([field.name.clone()].as_slice()))
-            .cloned()
-            .collect();
-        if data_fields.is_empty() {
-            // The predicate didn't reference any eligible stats columns, so skip it.
-            return None;
+        // Convert all fields into nullable, as stats may not be available for all columns
+        // (and usually aren't for partition columns).
+        struct NullableStatsTransform;
+        impl<'a> SchemaTransform<'a> for NullableStatsTransform {
+            fn transform_struct_field(
+                &mut self,
+                field: &'a StructField,
+            ) -> Option<Cow<'a, StructField>> {
+                use Cow::*;
+                let field = match self.transform(&field.data_type)? {
+                    Borrowed(_) if field.is_nullable() => Borrowed(field),
+                    data_type => Owned(StructField {
+                        name: field.name.clone(),
+                        data_type: data_type.into_owned(),
+                        nullable: true,
+                        metadata: field.metadata.clone(),
+                    }),
+                };
+                Some(field)
+            }
         }
-        let minmax_schema = StructType::new(data_fields);
 
         // Convert a min/max stats schema into a nullcount schema (all leaf fields are LONG)
         struct NullCountStatsTransform;
-        impl SchemaTransform for NullCountStatsTransform {
-            fn transform_primitive<'a>(
+        impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
+            fn transform_primitive(
                 &mut self,
-                _ptype: Cow<'a, PrimitiveType>,
+                _ptype: &'a PrimitiveType,
             ) -> Option<Cow<'a, PrimitiveType>> {
                 Some(Cow::Owned(PrimitiveType::Long))
             }
         }
+
+        let stats_schema = NullableStatsTransform
+            .transform_struct(&referenced_schema)?
+            .into_owned();
+
         let nullcount_schema = NullCountStatsTransform
-            .transform_struct(Cow::Borrowed(&minmax_schema))?
+            .transform_struct(&stats_schema)?
             .into_owned();
         let stats_schema = Arc::new(StructType::new([
-            StructField::new("numRecords", DataType::LONG, true),
-            StructField::new("nullCount", nullcount_schema, true),
-            StructField::new("minValues", minmax_schema.clone(), true),
-            StructField::new("maxValues", minmax_schema, true),
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", nullcount_schema),
+            StructField::nullable("minValues", stats_schema.clone()),
+            StructField::nullable("maxValues", stats_schema),
         ]));
 
         // Skipping happens in several steps:
@@ -117,20 +133,20 @@ impl DataSkippingFilter {
         //
         // 3. The selection evaluator does DISTINCT(col(predicate), 'false') to produce true (= keep) when
         //    the predicate is true/null and false (= skip) when the predicate is false.
-        let select_stats_evaluator = engine.get_expression_handler().get_evaluator(
+        let select_stats_evaluator = engine.evaluation_handler().new_expression_evaluator(
             // safety: kernel is very broken if we don't have the schema for Add actions
             get_log_add_schema().clone(),
             STATS_EXPR.clone(),
             DataType::STRING,
         );
 
-        let skipping_evaluator = engine.get_expression_handler().get_evaluator(
+        let skipping_evaluator = engine.evaluation_handler().new_expression_evaluator(
             stats_schema.clone(),
-            Expr::struct_from([as_data_skipping_predicate(predicate, false)?]),
+            Expr::struct_from([as_sql_data_skipping_predicate(&predicate)?]),
             PREDICATE_SCHEMA.clone(),
         );
 
-        let filter_evaluator = engine.get_expression_handler().get_evaluator(
+        let filter_evaluator = engine.evaluation_handler().new_expression_evaluator(
             stats_schema.clone(),
             FILTER_EXPR.clone(),
             DataType::BOOLEAN,
@@ -141,7 +157,7 @@ impl DataSkippingFilter {
             select_stats_evaluator,
             skipping_evaluator,
             filter_evaluator,
-            json_handler: engine.get_json_handler(),
+            json_handler: engine.json_handler(),
         })
     }
 
@@ -166,10 +182,7 @@ impl DataSkippingFilter {
 
         // visit the engine's selection vector to produce a Vec<bool>
         let mut visitor = SelectionVectorVisitor::default();
-        let schema = StructType::new([StructField::new("output", DataType::BOOLEAN, false)]);
-        selection_vector
-            .as_ref()
-            .extract(Arc::new(schema), &mut visitor)?;
+        visitor.visit_rows_of(selection_vector.as_ref())?;
         Ok(visitor.selection_vector)
 
         // TODO(zach): add some debug info about data skipping that occurred
@@ -227,7 +240,11 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
     }
 
     fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
-        PredicateEvaluatorDefaults::eval_scalar(val, inverted).map(Expr::literal)
+        KernelPredicateEvaluatorDefaults::eval_scalar(val, inverted).map(Expr::literal)
+    }
+
+    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
+        KernelPredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted).map(Expr::literal)
     }
 
     fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Expr> {
@@ -245,13 +262,13 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         right: &Scalar,
         inverted: bool,
     ) -> Option<Expr> {
-        PredicateEvaluatorDefaults::eval_binary_scalars(op, left, right, inverted)
+        KernelPredicateEvaluatorDefaults::eval_binary_scalars(op, left, right, inverted)
             .map(Expr::literal)
     }
 
-    fn finish_eval_variadic(
+    fn finish_eval_junction(
         &self,
-        mut op: VariadicOperator,
+        mut op: JunctionOperator,
         exprs: impl IntoIterator<Item = Option<Expr>>,
         inverted: bool,
     ) -> Option<Expr> {
@@ -275,6 +292,6 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
                 }),
             })
             .collect();
-        Some(Expr::variadic(op, exprs))
+        Some(Expr::junction(op, exprs))
     }
 }

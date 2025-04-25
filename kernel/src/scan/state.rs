@@ -1,21 +1,25 @@
 //! This module encapsulates the state of a scan
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
+use crate::actions::deletion_vector::deletion_treemap_to_bools;
+use crate::scan::get_transform_for_row;
+use crate::schema::Schema;
+use crate::utils::require;
+use crate::ExpressionRef;
 use crate::{
-    actions::{
-        deletion_vector::{treemap_to_bools, DeletionVectorDescriptor},
-        visitors::visit_deletion_vector_at,
-    },
-    engine_data::{GetData, TypedGetData},
-    schema::SchemaRef,
-    table_features::ColumnMappingMode,
-    DataVisitor, DeltaResult, Engine, EngineData, Error,
+    actions::{deletion_vector::DeletionVectorDescriptor, visitors::visit_deletion_vector_at},
+    engine_data::{GetData, RowVisitor, TypedGetData as _},
+    schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef},
+    DeltaResult, Engine, EngineData, Error,
 };
+use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::log_replay::SCAN_ROW_SCHEMA;
+use super::ScanMetadata;
 
 /// State that doesn't change between scans
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -23,14 +27,20 @@ pub struct GlobalScanState {
     pub table_root: String,
     pub partition_columns: Vec<String>,
     pub logical_schema: SchemaRef,
-    pub read_schema: SchemaRef,
-    pub column_mapping_mode: ColumnMappingMode,
+    pub physical_schema: SchemaRef,
 }
 
 /// this struct can be used by an engine to materialize a selection vector
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct DvInfo {
     pub(crate) deletion_vector: Option<DeletionVectorDescriptor>,
+}
+
+impl From<DeletionVectorDescriptor> for DvInfo {
+    fn from(deletion_vector: DeletionVectorDescriptor) -> Self {
+        let deletion_vector = Some(deletion_vector);
+        DvInfo { deletion_vector }
+    }
 }
 
 /// Give engines an easy way to consume stats
@@ -51,20 +61,27 @@ impl DvInfo {
         self.deletion_vector.is_some()
     }
 
+    pub(crate) fn get_treemap(
+        &self,
+        engine: &dyn Engine,
+        table_root: &url::Url,
+    ) -> DeltaResult<Option<RoaringTreemap>> {
+        self.deletion_vector
+            .as_ref()
+            .map(|dv_descriptor| {
+                let storage = engine.storage_handler();
+                dv_descriptor.read(storage, table_root)
+            })
+            .transpose()
+    }
+
     pub fn get_selection_vector(
         &self,
         engine: &dyn Engine,
         table_root: &url::Url,
     ) -> DeltaResult<Option<Vec<bool>>> {
-        let dv_treemap = self
-            .deletion_vector
-            .as_ref()
-            .map(|dv_descriptor| {
-                let fs_client = engine.get_file_system_client();
-                dv_descriptor.read(fs_client, table_root)
-            })
-            .transpose()?;
-        Ok(dv_treemap.map(treemap_to_bools))
+        let dv_treemap = self.get_treemap(engine, table_root)?;
+        Ok(dv_treemap.map(deletion_treemap_to_bools))
     }
 
     /// Returns a vector of row indexes that should be *removed* from the result set
@@ -76,10 +93,32 @@ impl DvInfo {
         self.deletion_vector
             .as_ref()
             .map(|dv| {
-                let fs_client = engine.get_file_system_client();
-                dv.row_indexes(fs_client, table_root)
+                let storage = engine.storage_handler();
+                dv.row_indexes(storage, table_root)
             })
             .transpose()
+    }
+}
+
+/// utility function for applying a transform expression to convert data from physical to logical
+/// format
+pub fn transform_to_logical(
+    engine: &dyn Engine,
+    physical_data: Box<dyn EngineData>,
+    physical_schema: &SchemaRef,
+    logical_schema: &Schema,
+    transform: &Option<ExpressionRef>,
+) -> DeltaResult<Box<dyn EngineData>> {
+    match transform {
+        Some(ref transform) => engine
+            .evaluation_handler()
+            .new_expression_evaluator(
+                physical_schema.clone(),
+                transform.as_ref().clone(), // TODO: Maybe eval should take a ref
+                logical_schema.clone().into(),
+            )
+            .evaluate(physical_data.as_ref()),
+        None => Ok(physical_data),
     }
 }
 
@@ -89,6 +128,7 @@ pub type ScanCallback<T> = fn(
     size: i64,
     stats: Option<Stats>,
     dv_info: DvInfo,
+    transform: Option<ExpressionRef>,
     partition_values: HashMap<String, String>,
 );
 
@@ -96,10 +136,13 @@ pub type ScanCallback<T> = fn(
 /// scan.
 ///
 /// The arguments to the callback are:
-/// * `context`: an `&mut context` argument. this can be anything that engine needs to pass through to each call
+/// * `context`: an `&mut context` argument. this can be anything that engine needs to pass through
+///   to each call
 /// * `path`: a `&str` which is the path to the file
 /// * `size`: an `i64` which is the size of the file
 /// * `dv_info`: a [`DvInfo`] struct, which allows getting the selection vector for this file
+/// * `transform`: An optional expression that, if present, _must_ be applied to physical data to
+///   convert it to the correct logical format
 /// * `partition_values`: a `HashMap<String, String>` which are partition values
 ///
 /// ## Context
@@ -110,40 +153,47 @@ pub type ScanCallback<T> = fn(
 /// ## Example
 /// ```ignore
 /// let mut context = [my context];
-/// for res in scan_data { // scan data from scan.get_scan_data()
-///     let (data, vector) = res?;
-///     context = delta_kernel::scan::state::visit_scan_files(
-///        data.as_ref(),
-///        vector,
+/// for res in scan_metadata_iter { // scan metadata iterator from scan.scan_metadata()
+///     let scan_metadata = res?;
+///     context = scan_metadata.visit_scan_files(
 ///        context,
 ///        my_callback,
 ///     )?;
 /// }
 /// ```
-pub fn visit_scan_files<T>(
-    data: &dyn EngineData,
-    selection_vector: &[bool],
-    context: T,
-    callback: ScanCallback<T>,
-) -> DeltaResult<T> {
-    let mut visitor = ScanFileVisitor {
-        callback,
-        selection_vector,
-        context,
-    };
-    data.extract(super::log_replay::SCAN_ROW_SCHEMA.clone(), &mut visitor)?;
-    Ok(visitor.context)
+impl ScanMetadata {
+    pub fn visit_scan_files<T>(&self, context: T, callback: ScanCallback<T>) -> DeltaResult<T> {
+        let mut visitor = ScanFileVisitor {
+            callback,
+            selection_vector: &self.scan_files.selection_vector,
+            transforms: &self.scan_file_transforms,
+            context,
+        };
+        visitor.visit_rows_of(self.scan_files.data.as_ref())?;
+        Ok(visitor.context)
+    }
 }
-
 // add some visitor magic for engines
 struct ScanFileVisitor<'a, T> {
     callback: ScanCallback<T>,
     selection_vector: &'a [bool],
+    transforms: &'a [Option<ExpressionRef>],
     context: T,
 }
-
-impl<T> DataVisitor for ScanFileVisitor<'_, T> {
+impl<T> RowVisitor for ScanFileVisitor<'_, T> {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| SCAN_ROW_SCHEMA.leaves(None));
+        NAMES_AND_TYPES.as_ref()
+    }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 10,
+            Error::InternalError(format!(
+                "Wrong number of ScanFileVisitor getters: {}",
+                getters.len()
+            ))
+        );
         for row_index in 0..row_count {
             if !self.selection_vector[row_index] {
                 // skip skipped rows
@@ -175,6 +225,7 @@ impl<T> DataVisitor for ScanFileVisitor<'_, T> {
                     size,
                     stats,
                     dv_info,
+                    get_transform_for_row(row_index, self.transforms),
                     partition_values,
                 )
             }
@@ -187,7 +238,9 @@ impl<T> DataVisitor for ScanFileVisitor<'_, T> {
 mod tests {
     use std::collections::HashMap;
 
+    use crate::actions::get_log_schema;
     use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
+    use crate::ExpressionRef;
 
     use super::{DvInfo, Stats};
 
@@ -202,6 +255,7 @@ mod tests {
         size: i64,
         stats: Option<Stats>,
         dv_info: DvInfo,
+        transform: Option<ExpressionRef>,
         part_vals: HashMap<String, String>,
     ) {
         assert_eq!(
@@ -216,14 +270,17 @@ mod tests {
         assert!(dv_info.deletion_vector.is_some());
         let dv = dv_info.deletion_vector.unwrap();
         assert_eq!(dv.unique_id(), "uvBn[lx{q8@P<9BNH/isA@1");
+        assert!(transform.is_none());
         assert_eq!(context.id, 2);
     }
 
     #[test]
-    fn test_simple_visit_scan_data() {
+    fn test_simple_visit_scan_metadata() {
         let context = TestContext { id: 2 };
         run_with_validate_callback(
-            vec![add_batch_simple()],
+            vec![add_batch_simple(get_log_schema().clone())],
+            None, // not testing schema
+            None, // not testing transform
             &[true, false],
             context,
             validate_visit,

@@ -1,4 +1,4 @@
-//! Defintions of errors that the delta kernel can encounter
+//! Definitions of errors that the delta kernel can encounter
 
 use std::{
     backtrace::{Backtrace, BacktraceStatus},
@@ -6,8 +6,12 @@ use std::{
     str::Utf8Error,
 };
 
-use crate::schema::DataType;
+use crate::schema::{DataType, StructType};
+use crate::table_properties::ParseIntervalError;
 use crate::Version;
+
+#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
+use crate::arrow::error::ArrowError;
 
 /// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
@@ -26,9 +30,9 @@ pub enum Error {
     },
 
     /// An error performing operations on arrow data
-    #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+    #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
     #[error(transparent)]
-    Arrow(arrow_schema::ArrowError),
+    Arrow(ArrowError),
 
     /// User tried to convert engine data to the wrong type
     #[error("Invalid engine data type. Could not convert to {0}")]
@@ -58,9 +62,9 @@ pub enum Error {
     InternalError(String),
 
     /// An error enountered while working with parquet data
-    #[cfg(feature = "parquet")]
+    #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
     #[error("Arrow error: {0}")]
-    Parquet(#[from] parquet::errors::ParquetError),
+    Parquet(#[from] crate::parquet::errors::ParquetError),
 
     /// An error interacting with the object_store crate
     // We don't use [#from] object_store::Error here as our From impl transforms
@@ -74,7 +78,7 @@ pub enum Error {
     #[error("Object store path error: {0}")]
     ObjectStorePath(#[from] object_store::path::Error),
 
-    #[cfg(feature = "default-engine")]
+    #[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
     #[error("Reqwest Error: {0}")]
     Reqwest(#[from] reqwest::Error),
 
@@ -98,7 +102,7 @@ pub enum Error {
     #[error("No table version found.")]
     MissingVersion,
 
-    /// An error occured while working with deletion vectors
+    /// An error occurred while working with deletion vectors
     #[error("Deletion Vector error: {0}")]
     DeletionVector(String),
 
@@ -181,8 +185,25 @@ pub enum Error {
     #[error("Unsupported: {0}")]
     Unsupported(String),
 
+    /// Parsing error when attempting to deserialize an interval
+    #[error(transparent)]
+    ParseIntervalError(#[from] ParseIntervalError),
+
     #[error("Change data feed is unsupported for the table at version {0}")]
     ChangeDataFeedUnsupported(Version),
+
+    #[error("Change data feed encountered incompatible schema. Expected {0}, got {1}")]
+    ChangeDataFeedIncompatibleSchema(String, String),
+
+    /// Invalid checkpoint files
+    #[error("Invalid Checkpoint: {0}")]
+    InvalidCheckpoint(String),
+
+    /// Error while transforming a schema + leaves into an Expression of literals
+    #[error(transparent)]
+    LiteralExpressionTransformError(
+        #[from] crate::expressions::literal_expression_transform::Error,
+    ),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -249,6 +270,16 @@ impl Error {
     pub fn change_data_feed_unsupported(version: impl Into<Version>) -> Self {
         Self::ChangeDataFeedUnsupported(version.into())
     }
+    pub(crate) fn change_data_feed_incompatible_schema(
+        expected: &StructType,
+        actual: &StructType,
+    ) -> Self {
+        Self::ChangeDataFeedIncompatibleSchema(format!("{expected:?}"), format!("{actual:?}"))
+    }
+
+    pub fn invalid_checkpoint(msg: impl ToString) -> Self {
+        Self::InvalidCheckpoint(msg.to_string())
+    }
 
     // Capture a backtrace when the error is constructed.
     #[must_use]
@@ -281,9 +312,9 @@ from_with_backtrace!(
     (std::io::Error, IOError)
 );
 
-#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
-impl From<arrow_schema::ArrowError> for Error {
-    fn from(value: arrow_schema::ArrowError) -> Self {
+#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
+impl From<ArrowError> for Error {
+    fn from(value: ArrowError) -> Self {
         Self::Arrow(value).with_backtrace()
     }
 }

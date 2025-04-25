@@ -1,14 +1,12 @@
-use std::time::SystemTime;
-
 use bytes::Bytes;
 use itertools::Itertools;
 use url::Url;
 
-use crate::{DeltaResult, Error, FileMeta, FileSlice, FileSystemClient};
+use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
-pub(crate) struct SyncFilesystemClient;
+pub(crate) struct SyncStorageHandler;
 
-impl FileSystemClient for SyncFilesystemClient {
+impl StorageHandler for SyncStorageHandler {
     /// List the paths in the same directory that are lexicographically greater or equal to
     /// (UTF-8 sorting) the given `path`. The result is sorted by the file name.
     fn list_from(
@@ -41,7 +39,7 @@ impl FileSystemClient for SyncFilesystemClient {
             let all_ents: Vec<_> = std::fs::read_dir(path_to_read)?
                 .filter(|ent_res| {
                     match (ent_res, min_file_name) {
-                        (Ok(ent), Some(min_file_name)) => ent.file_name() >= *min_file_name,
+                        (Ok(ent), Some(min_file_name)) => ent.file_name() > *min_file_name,
                         _ => true, // Keep unfiltered and/or error entries
                     }
                 })
@@ -49,26 +47,7 @@ impl FileSystemClient for SyncFilesystemClient {
             let it = all_ents
                 .into_iter()
                 .sorted_by_key(|ent| ent.path())
-                .map(|ent| {
-                    ent.metadata().map_err(Error::IOError).and_then(|metadata| {
-                        let last_modified: u64 = metadata
-                            .modified()
-                            .map(
-                                |modified| match modified.duration_since(SystemTime::UNIX_EPOCH) {
-                                    Ok(d) => d.as_secs(),
-                                    Err(_) => 0,
-                                },
-                            )
-                            .unwrap_or(0);
-                        Url::from_file_path(ent.path())
-                            .map(|location| FileMeta {
-                                location,
-                                last_modified: last_modified as i64,
-                                size: metadata.len() as usize,
-                            })
-                            .map_err(|_| Error::Generic(format!("Invalid path: {:?}", ent.path())))
-                    })
-                });
+                .map(TryFrom::try_from);
             Ok(Box::new(it))
         } else {
             Err(Error::generic("Can only read local filesystem"))
@@ -97,14 +76,18 @@ impl FileSystemClient for SyncFilesystemClient {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
     use std::io::Write;
+    use std::time::{Duration, SystemTime};
+    use std::{fs::File, time::UNIX_EPOCH};
 
     use bytes::{BufMut, BytesMut};
+    use itertools::Itertools;
     use url::Url;
 
-    use super::SyncFilesystemClient;
-    use crate::FileSystemClient;
+    use test_utils::abs_diff;
+
+    use super::SyncStorageHandler;
+    use crate::StorageHandler;
 
     /// generate json filenames that follow the spec (numbered padded to 20 chars)
     fn get_json_filename(index: usize) -> String {
@@ -112,8 +95,32 @@ mod tests {
     }
 
     #[test]
+    fn test_file_meta_is_correct() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = SyncStorageHandler;
+        let tmp_dir = tempfile::tempdir().unwrap();
+
+        let begin_time = SystemTime::now().duration_since(UNIX_EPOCH)?;
+
+        let path = tmp_dir.path().join(get_json_filename(1));
+        let mut f = File::create(path)?;
+        writeln!(f, "null")?;
+        f.flush()?;
+
+        let url_path = tmp_dir.path().join(get_json_filename(0));
+        let url = Url::from_file_path(url_path).unwrap();
+        let files: Vec<_> = storage.list_from(&url)?.try_collect()?;
+
+        assert!(!files.is_empty());
+        for meta in files.iter() {
+            let meta_time = Duration::from_millis(meta.last_modified.try_into()?);
+            assert!(abs_diff(meta_time, begin_time) < Duration::from_secs(10));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_list_from() -> Result<(), Box<dyn std::error::Error>> {
-        let client = SyncFilesystemClient;
+        let storage = SyncStorageHandler;
         let tmp_dir = tempfile::tempdir().unwrap();
         let mut expected = vec![];
         for i in 0..3 {
@@ -124,27 +131,27 @@ mod tests {
         }
         let url_path = tmp_dir.path().join(get_json_filename(1));
         let url = Url::from_file_path(url_path).unwrap();
-        let list = client.list_from(&url)?;
+        let list = storage.list_from(&url)?;
         let mut file_count = 0;
         for (i, file) in list.enumerate() {
             // i+1 in index because we started at 0001 in the listing
             assert_eq!(
                 file?.location.to_file_path().unwrap().to_str().unwrap(),
-                expected[i + 1].to_str().unwrap()
+                expected[i + 2].to_str().unwrap()
             );
             file_count += 1;
         }
-        assert_eq!(file_count, 2);
+        assert_eq!(file_count, 1);
 
         let url_path = tmp_dir.path().join("");
         let url = Url::from_file_path(url_path).unwrap();
-        let list = client.list_from(&url)?;
+        let list = storage.list_from(&url)?;
         file_count = list.count();
         assert_eq!(file_count, 3);
 
         let url_path = tmp_dir.path().join(format!("{:020}", 1));
         let url = Url::from_file_path(url_path).unwrap();
-        let list = client.list_from(&url)?;
+        let list = storage.list_from(&url)?;
         file_count = list.count();
         assert_eq!(file_count, 2);
         Ok(())
@@ -152,14 +159,14 @@ mod tests {
 
     #[test]
     fn test_read_files() -> Result<(), Box<dyn std::error::Error>> {
-        let client = SyncFilesystemClient;
+        let storage = SyncStorageHandler;
         let tmp_dir = tempfile::tempdir().unwrap();
         let path = tmp_dir.path().join(get_json_filename(1));
         let mut f = File::create(path.clone())?;
         writeln!(f, "null")?;
         let url = Url::from_file_path(path).unwrap();
         let file_slice = (url.clone(), None);
-        let read = client.read_files(vec![file_slice])?;
+        let read = storage.read_files(vec![file_slice])?;
         let mut file_count = 0;
         let mut buf = BytesMut::with_capacity(16);
         buf.put(&b"null\n"[..]);

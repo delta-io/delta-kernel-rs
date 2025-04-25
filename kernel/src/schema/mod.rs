@@ -1,17 +1,21 @@
 //! Definitions and functions to create and manipulate kernel schema
 
 use std::borrow::Cow;
-use std::fmt::Formatter;
+use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
 use std::sync::Arc;
-use std::{collections::HashMap, fmt::Display};
 
 use indexmap::IndexMap;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::table_features::ColumnMappingMode;
+// re-export because many call sites that use schemas do not necessarily use expressions
+pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
+use delta_kernel_derive::internal_api;
+
+pub(crate) mod compare;
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
@@ -19,7 +23,7 @@ pub type SchemaRef = Arc<StructType>;
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 #[serde(untagged)]
 pub enum MetadataValue {
-    Number(i32),
+    Number(i64),
     String(String),
     Boolean(bool),
     // The [PROTOCOL](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#struct-field) states
@@ -29,8 +33,8 @@ pub enum MetadataValue {
     Other(serde_json::Value),
 }
 
-impl std::fmt::Display for MetadataValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for MetadataValue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             MetadataValue::Number(n) => write!(f, "{n}"),
             MetadataValue::String(s) => write!(f, "{s}"),
@@ -52,8 +56,14 @@ impl From<&String> for MetadataValue {
     }
 }
 
-impl From<i32> for MetadataValue {
-    fn from(value: i32) -> Self {
+impl From<&str> for MetadataValue {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_string())
+    }
+}
+
+impl From<i64> for MetadataValue {
+    fn from(value: i64) -> Self {
         Self::Number(value)
     }
 }
@@ -115,6 +125,16 @@ impl StructField {
         }
     }
 
+    /// Creates a new nullable field
+    pub fn nullable(name: impl Into<String>, data_type: impl Into<DataType>) -> Self {
+        Self::new(name, data_type, true)
+    }
+
+    /// Creates a new non-nullable field
+    pub fn not_null(name: impl Into<String>, data_type: impl Into<DataType>) -> Self {
+        Self::new(name, data_type, false)
+    }
+
     pub fn with_metadata(
         mut self,
         metadata: impl IntoIterator<Item = (impl Into<String>, impl Into<MetadataValue>)>,
@@ -130,20 +150,18 @@ impl StructField {
         self.metadata.get(key.as_ref())
     }
 
-    /// Get the physical name for this field as it should be read from parquet, based on the
-    /// specified column mapping mode.
-    pub fn physical_name(&self, mapping_mode: ColumnMappingMode) -> DeltaResult<&str> {
-        let physical_name_key = ColumnMetadataKey::ColumnMappingPhysicalName.as_ref();
-        let name_mapped_name = self.metadata.get(physical_name_key);
-        match (mapping_mode, name_mapped_name) {
-            (ColumnMappingMode::None, _) => Ok(self.name.as_str()),
-            (ColumnMappingMode::Name, Some(MetadataValue::String(name))) => Ok(name),
-            (ColumnMappingMode::Name, invalid) => Err(Error::generic(format!(
-                "Missing or invalid {physical_name_key}: {invalid:?}"
-            ))),
-            (ColumnMappingMode::Id, _) => {
-                Err(Error::generic("Don't support id column mapping yet"))
-            }
+    /// Get the physical name for this field as it should be read from parquet.
+    ///
+    /// NOTE: Caller affirms that the schema was already validated by
+    /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
+    /// always and only present when column mapping mode is enabled.
+    pub fn physical_name(&self) -> &str {
+        match self
+            .metadata
+            .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+        {
+            Some(MetadataValue::String(physical_name)) => physical_name,
+            _ => &self.name,
         }
     }
 
@@ -187,32 +205,32 @@ impl StructField {
             .collect()
     }
 
-    pub fn make_physical(&self, mapping_mode: ColumnMappingMode) -> DeltaResult<Self> {
-        use ColumnMappingMode::*;
-        match mapping_mode {
-            Id => return Err(Error::generic("Column ID mapping mode not supported")),
-            None => return Ok(self.clone()),
-            Name => {} // fall out
-        }
-
-        struct ApplyNameMapping;
-        impl SchemaTransform for ApplyNameMapping {
-            fn transform_struct_field<'a>(
+    /// Applies physical name mappings to this field
+    ///
+    /// NOTE: Caller affirms that the schema was already validated by
+    /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
+    /// always and only present when column mapping mode is enabled.
+    pub fn make_physical(&self) -> Self {
+        struct MakePhysical;
+        impl<'a> SchemaTransform<'a> for MakePhysical {
+            fn transform_struct_field(
                 &mut self,
-                field: Cow<'a, StructField>,
+                field: &'a StructField,
             ) -> Option<Cow<'a, StructField>> {
                 let field = self.recurse_into_struct_field(field)?;
-                match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
-                    Some(MetadataValue::String(physical_name)) => {
-                        Some(Cow::Owned(field.with_name(physical_name)))
-                    }
-                    _ => Some(field),
-                }
+                Some(Cow::Owned(field.with_name(field.physical_name())))
             }
         }
+        // NOTE: unwrap is safe because the transformer is incapable of returning None
+        MakePhysical
+            .transform_struct_field(self)
+            .unwrap()
+            .into_owned()
+    }
 
-        let field = ApplyNameMapping.transform_struct_field(Cow::Borrowed(self));
-        Ok(field.unwrap().into_owned())
+    fn has_invariants(&self) -> bool {
+        self.metadata
+            .contains_key(ColumnMetadataKey::Invariants.as_ref())
     }
 }
 
@@ -223,7 +241,7 @@ pub struct StructType {
     pub type_name: String,
     /// The type of element stored in this array
     // We use indexmap to preserve the order of fields as they are defined in the schema
-    // while also allowing for fast lookup by name. The atlerative to do a liner search
+    // while also allowing for fast lookup by name. The alternative is to do a linear search
     // for each field by name would be potentially quite expensive for large schemas.
     pub fields: IndexMap<String, StructField>,
 }
@@ -272,6 +290,74 @@ impl StructType {
 
     pub fn fields(&self) -> impl Iterator<Item = &StructField> {
         self.fields.values()
+    }
+
+    pub(crate) fn fields_len(&self) -> usize {
+        // O(1) for indexmap
+        self.fields.len()
+    }
+
+    // Checks if the `StructType` contains a field with the specified name.
+    pub(crate) fn contains(&self, name: impl AsRef<str>) -> bool {
+        self.fields.contains_key(name.as_ref())
+    }
+
+    /// Extracts the name and type of all leaf columns, in schema order. Caller should pass Some
+    /// `own_name` if this schema is embedded in a larger struct (e.g. `add.*`) and None if the
+    /// schema is a top-level result (e.g. `*`).
+    ///
+    /// NOTE: This method only traverses through `StructType` fields; `MapType` and `ArrayType`
+    /// fields are considered leaves even if they contain `StructType` entries/elements.
+    #[internal_api]
+    pub(crate) fn leaves<'s>(&self, own_name: impl Into<Option<&'s str>>) -> ColumnNamesAndTypes {
+        let mut get_leaves = GetSchemaLeaves::new(own_name.into());
+        let _ = get_leaves.transform_struct(self);
+        (get_leaves.names, get_leaves.types).into()
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct InvariantChecker {
+    has_invariants: bool,
+}
+
+impl<'a> SchemaTransform<'a> for InvariantChecker {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        if field.has_invariants() {
+            self.has_invariants = true;
+        } else if !self.has_invariants {
+            let _ = self.recurse_into_struct_field(field);
+        }
+        Some(Cow::Borrowed(field))
+    }
+}
+
+impl InvariantChecker {
+    /// Checks if any column in the schema (including nested columns) has invariants defined.
+    ///
+    /// This traverses the entire schema to check for the presence of the "delta.invariants"
+    /// metadata key.
+    pub(crate) fn has_invariants(schema: &Schema) -> bool {
+        let mut checker = InvariantChecker::default();
+        let _ = checker.transform_struct(schema);
+        checker.has_invariants
+    }
+}
+
+/// Helper for RowVisitor implementations
+#[internal_api]
+#[derive(Clone, Default)]
+pub(crate) struct ColumnNamesAndTypes(Vec<ColumnName>, Vec<DataType>);
+impl ColumnNamesAndTypes {
+    #[internal_api]
+    pub(crate) fn as_ref(&self) -> (&[ColumnName], &[DataType]) {
+        (&self.0, &self.1)
+    }
+}
+
+impl From<(Vec<ColumnName>, Vec<DataType>)> for ColumnNamesAndTypes {
+    fn from((names, fields): (Vec<ColumnName>, Vec<DataType>)) -> Self {
+        ColumnNamesAndTypes(names, fields)
     }
 }
 
@@ -391,7 +477,7 @@ impl MapType {
     /// Create a schema assuming the map is stored as a struct with the specified key and value field names
     pub fn as_struct_schema(&self, key_name: String, val_name: String) -> Schema {
         StructType::new([
-            StructField::new(key_name, self.key_type.clone(), false),
+            StructField::not_null(key_name, self.key_type.clone()),
             StructField::new(val_name, self.value_type.clone(), self.value_contains_null),
         ])
     }
@@ -399,6 +485,40 @@ impl MapType {
 
 fn default_true() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct DecimalType {
+    precision: u8,
+    scale: u8,
+}
+
+impl DecimalType {
+    /// Check if the given precision and scale are valid for a decimal type.
+    pub fn try_new(precision: u8, scale: u8) -> DeltaResult<Self> {
+        require!(
+            0 < precision && precision <= 38,
+            Error::invalid_decimal(format!(
+                "precision must be in range 1..38 inclusive, found: {}.",
+                precision
+            ))
+        );
+        require!(
+            scale <= precision,
+            Error::invalid_decimal(format!(
+                "scale must be in range 0..{precision} inclusive, found: {scale}."
+            ))
+        );
+        Ok(Self { precision, scale })
+    }
+
+    pub fn precision(&self) -> u8 {
+        self.precision
+    }
+
+    pub fn scale(&self) -> u8 {
+        self.scale
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
@@ -431,18 +551,23 @@ pub enum PrimitiveType {
         deserialize_with = "deserialize_decimal",
         untagged
     )]
-    Decimal(u8, u8),
+    Decimal(DecimalType),
+}
+
+impl PrimitiveType {
+    pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
+        Ok(DecimalType::try_new(precision, scale)?.into())
+    }
 }
 
 fn serialize_decimal<S: serde::Serializer>(
-    precision: &u8,
-    scale: &u8,
+    dtype: &DecimalType,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&format!("decimal({},{})", precision, scale))
+    serializer.serialize_str(&format!("decimal({},{})", dtype.precision(), dtype.scale()))
 }
 
-fn deserialize_decimal<'de, D>(deserializer: D) -> Result<(u8, u8), D::Error>
+fn deserialize_decimal<'de, D>(deserializer: D) -> Result<DecimalType, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -465,8 +590,7 @@ where
         .ok_or_else(|| {
             serde::de::Error::custom(format!("Invalid scale in decimal: {}", str_value))
         })?;
-    PrimitiveType::check_decimal(precision, scale).map_err(serde::de::Error::custom)?;
-    Ok((precision, scale))
+    DecimalType::try_new(precision, scale).map_err(serde::de::Error::custom)
 }
 
 impl Display for PrimitiveType {
@@ -484,8 +608,8 @@ impl Display for PrimitiveType {
             PrimitiveType::Date => write!(f, "date"),
             PrimitiveType::Timestamp => write!(f, "timestamp"),
             PrimitiveType::TimestampNtz => write!(f, "timestamp_ntz"),
-            PrimitiveType::Decimal(precision, scale) => {
-                write!(f, "decimal({},{})", precision, scale)
+            PrimitiveType::Decimal(dtype) => {
+                write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
             }
         }
     }
@@ -506,6 +630,16 @@ pub enum DataType {
     Map(Box<MapType>),
 }
 
+impl From<DecimalType> for PrimitiveType {
+    fn from(dtype: DecimalType) -> Self {
+        PrimitiveType::Decimal(dtype)
+    }
+}
+impl From<DecimalType> for DataType {
+    fn from(dtype: DecimalType) -> Self {
+        PrimitiveType::from(dtype).into()
+    }
+}
 impl From<PrimitiveType> for DataType {
     fn from(ptype: PrimitiveType) -> Self {
         DataType::Primitive(ptype)
@@ -551,10 +685,7 @@ impl DataType {
     pub const TIMESTAMP_NTZ: Self = DataType::Primitive(PrimitiveType::TimestampNtz);
 
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
-        PrimitiveType::check_decimal(precision, scale)?;
-        Ok(DataType::Primitive(PrimitiveType::Decimal(
-            precision, scale,
-        )))
+        Ok(PrimitiveType::decimal(precision, scale)?.into())
     }
 
     // This function assumes that the caller has already checked the precision and scale
@@ -616,61 +747,73 @@ impl Display for DataType {
 /// The provided `recurse_into_xxx` methods encapsulate the boilerplate work of recursing into the
 /// child schema elements of each schema element. Implementations can call these as needed but will
 /// generally not need to override them.
-pub trait SchemaTransform {
+pub trait SchemaTransform<'a> {
     /// Called for each primitive encountered during the schema traversal.
-    fn transform_primitive<'a>(
-        &mut self,
-        ptype: Cow<'a, PrimitiveType>,
-    ) -> Option<Cow<'a, PrimitiveType>> {
-        Some(ptype)
+    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
+        Some(Cow::Borrowed(ptype))
     }
 
     /// Called for each struct encountered during the schema traversal. Implementations can call
     /// [`Self::recurse_into_struct`] if they wish to recursively transform the struct's fields.
-    fn transform_struct<'a>(&mut self, stype: Cow<'a, StructType>) -> Option<Cow<'a, StructType>> {
+    fn transform_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
         self.recurse_into_struct(stype)
     }
 
     /// Called for each struct field encountered during the schema traversal. Implementations can
     /// call [`Self::recurse_into_struct_field`] if they wish to recursively transform the field's
     /// data type.
-    fn transform_struct_field<'a>(
-        &mut self,
-        field: Cow<'a, StructField>,
-    ) -> Option<Cow<'a, StructField>> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         self.recurse_into_struct_field(field)
     }
 
     /// Called for each array encountered during the schema traversal. Implementations can call
     /// [`Self::recurse_into_array`] if they wish to recursively transform the array's element type.
-    fn transform_array<'a>(&mut self, atype: Cow<'a, ArrayType>) -> Option<Cow<'a, ArrayType>> {
+    fn transform_array(&mut self, atype: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
         self.recurse_into_array(atype)
+    }
+
+    /// Called for each array element encountered during the schema traversal. Implementations can
+    /// call [`Self::transform`] if they wish to recursively transform the array element type.
+    fn transform_array_element(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
+        self.transform(etype)
     }
 
     /// Called for each map encountered during the schema traversal. Implementations can call
     /// [`Self::recurse_into_map`] if they wish to recursively transform the map's key and/or value
     /// types.
-    fn transform_map<'a>(&mut self, mtype: Cow<'a, MapType>) -> Option<Cow<'a, MapType>> {
+    fn transform_map(&mut self, mtype: &'a MapType) -> Option<Cow<'a, MapType>> {
         self.recurse_into_map(mtype)
+    }
+
+    /// Called for each map key encountered during the schema traversal. Implementations can call
+    /// [`Self::transform`] if they wish to recursively transform the map key type.
+    fn transform_map_key(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
+        self.transform(etype)
+    }
+
+    /// Called for each map value encountered during the schema traversal. Implementations can call
+    /// [`Self::transform`] if they wish to recursively transform the map value type.
+    fn transform_map_value(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
+        self.transform(etype)
     }
 
     /// General entry point for a recursive traversal over any data type. Also invoked internally to
     /// dispatch on nested data types encountered during the traversal.
-    fn transform<'a>(&mut self, data_type: Cow<'a, DataType>) -> Option<Cow<'a, DataType>> {
+    fn transform(&mut self, data_type: &'a DataType) -> Option<Cow<'a, DataType>> {
         use Cow::*;
         use DataType::*;
 
         // quick boilerplate helper
         macro_rules! apply_transform {
             ( $transform_fn:ident, $arg:ident ) => {
-                match self.$transform_fn(Borrowed($arg)) {
-                    Some(Borrowed(_)) => Some(data_type),
+                match self.$transform_fn($arg) {
+                    Some(Borrowed(_)) => Some(Borrowed(data_type)),
                     Some(Owned(inner)) => Some(Owned(inner.into())),
                     None => None,
                 }
             };
         }
-        match data_type.as_ref() {
+        match data_type {
             Primitive(ptype) => apply_transform!(transform_primitive, ptype),
             Array(atype) => apply_transform!(transform_array, atype),
             Struct(stype) => apply_transform!(transform_struct, stype),
@@ -680,13 +823,13 @@ pub trait SchemaTransform {
 
     /// Recursively transforms a struct field's data type. If the data type changes, update the
     /// field to reference it. Otherwise, no-op.
-    fn recurse_into_struct_field<'a>(
+    fn recurse_into_struct_field(
         &mut self,
-        field: Cow<'a, StructField>,
+        field: &'a StructField,
     ) -> Option<Cow<'a, StructField>> {
         use Cow::*;
-        let field = match self.transform(Borrowed(&field.data_type))? {
-            Borrowed(_) => field,
+        let field = match self.transform(&field.data_type)? {
+            Borrowed(_) => Borrowed(field),
             Owned(new_data_type) => Owned(StructField {
                 name: field.name.clone(),
                 data_type: new_data_type,
@@ -699,36 +842,37 @@ pub trait SchemaTransform {
 
     /// Recursively transforms a struct's fields. If one or more fields were changed or removed,
     /// update the struct to reference all surviving fields. Otherwise, no-op.
-    fn recurse_into_struct<'a>(
-        &mut self,
-        stype: Cow<'a, StructType>,
-    ) -> Option<Cow<'a, StructType>> {
+    fn recurse_into_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
         use Cow::*;
         let mut num_borrowed = 0;
         let fields: Vec<_> = stype
             .fields()
-            .filter_map(|field| self.transform_struct_field(Borrowed(field)))
+            .filter_map(|field| self.transform_struct_field(field))
             .inspect(|field| {
-                if matches!(field, Borrowed(_)) {
+                if let Borrowed(_) = field {
                     num_borrowed += 1;
                 }
             })
             .collect();
-        let stype = if num_borrowed < stype.fields.len() {
+
+        if fields.is_empty() {
+            None
+        } else if num_borrowed < stype.fields.len() {
             // At least one field was changed or filtered out, so make a new struct
-            Owned(StructType::new(fields.into_iter().map(|f| f.into_owned())))
+            Some(Owned(StructType::new(
+                fields.into_iter().map(|f| f.into_owned()),
+            )))
         } else {
-            stype
-        };
-        Some(stype)
+            Some(Borrowed(stype))
+        }
     }
 
     /// Recursively transforms an array's element type. If the element type changes, update the
     /// array to reference it. Otherwise, no-op.
-    fn recurse_into_array<'a>(&mut self, atype: Cow<'a, ArrayType>) -> Option<Cow<'a, ArrayType>> {
+    fn recurse_into_array(&mut self, atype: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
         use Cow::*;
-        let atype = match self.transform(Borrowed(&atype.element_type))? {
-            Borrowed(_) => atype,
+        let atype = match self.transform_array_element(&atype.element_type)? {
+            Borrowed(_) => Borrowed(atype),
             Owned(element_type) => Owned(ArrayType {
                 type_name: atype.type_name.clone(),
                 element_type,
@@ -740,12 +884,12 @@ pub trait SchemaTransform {
 
     /// Recursively transforms a map's key and value types. If either one changes, update the map to
     /// reference them. If either one is removed, remove the map as well. Otherwise, no-op.
-    fn recurse_into_map<'a>(&mut self, mtype: Cow<'a, MapType>) -> Option<Cow<'a, MapType>> {
+    fn recurse_into_map(&mut self, mtype: &'a MapType) -> Option<Cow<'a, MapType>> {
         use Cow::*;
-        let key_type = self.transform(Borrowed(&mtype.key_type))?;
-        let value_type = self.transform(Borrowed(&mtype.value_type))?;
+        let key_type = self.transform_map_key(&mtype.key_type)?;
+        let value_type = self.transform_map_value(&mtype.value_type)?;
         let mtype = match (&key_type, &value_type) {
-            (Borrowed(_), Borrowed(_)) => mtype,
+            (Borrowed(_), Borrowed(_)) => Borrowed(mtype),
             _ => Owned(MapType {
                 type_name: mtype.type_name.clone(),
                 key_type: key_type.into_owned(),
@@ -754,6 +898,35 @@ pub trait SchemaTransform {
             }),
         };
         Some(mtype)
+    }
+}
+
+struct GetSchemaLeaves {
+    path: Vec<String>,
+    names: Vec<ColumnName>,
+    types: Vec<DataType>,
+}
+impl GetSchemaLeaves {
+    fn new(own_name: Option<&str>) -> Self {
+        Self {
+            path: own_name.into_iter().map(|s| s.to_string()).collect(),
+            names: vec![],
+            types: vec![],
+        }
+    }
+}
+
+impl<'a> SchemaTransform<'a> for GetSchemaLeaves {
+    fn transform_struct_field(&mut self, field: &StructField) -> Option<Cow<'a, StructField>> {
+        self.path.push(field.name.clone());
+        if let DataType::Struct(_) = field.data_type {
+            let _ = self.recurse_into_struct_field(field);
+        } else {
+            self.names.push(ColumnName::new(&self.path));
+            self.types.push(field.data_type.clone());
+        }
+        self.path.pop();
+        None
     }
 }
 
@@ -782,16 +955,16 @@ impl SchemaDepthChecker {
             current_depth: 0,
             call_count: 0,
         };
-        checker.transform(Cow::Borrowed(data_type));
+        checker.transform(data_type);
         (checker.max_depth_seen, checker.call_count)
     }
 
     // Triggers the requested recursion only doing so would not exceed the depth limit.
-    fn depth_limited<T: std::fmt::Debug>(
+    fn depth_limited<'a, T: Clone + std::fmt::Debug>(
         &mut self,
-        recurse: impl FnOnce(&mut Self, T) -> Option<T>,
-        arg: T,
-    ) -> Option<T> {
+        recurse: impl FnOnce(&mut Self, &'a T) -> Option<Cow<'a, T>>,
+        arg: &'a T,
+    ) -> Option<Cow<'a, T>> {
         self.call_count += 1;
         if self.max_depth_seen < self.current_depth {
             self.max_depth_seen = self.current_depth;
@@ -799,30 +972,25 @@ impl SchemaDepthChecker {
                 tracing::warn!("Max schema depth {} exceeded by {arg:?}", self.depth_limit);
             }
         }
-        if self.depth_limit < self.max_depth_seen {
-            return Some(arg); // back out the recursion, we're done
+        if self.max_depth_seen <= self.depth_limit {
+            self.current_depth += 1;
+            let _ = recurse(self, arg);
+            self.current_depth -= 1;
         }
-
-        self.current_depth += 1;
-        let result = recurse(self, arg);
-        self.current_depth -= 1;
-        result
+        None
     }
 }
-impl SchemaTransform for SchemaDepthChecker {
-    fn transform_struct<'a>(&mut self, stype: Cow<'a, StructType>) -> Option<Cow<'a, StructType>> {
+impl<'a> SchemaTransform<'a> for SchemaDepthChecker {
+    fn transform_struct(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
         self.depth_limited(Self::recurse_into_struct, stype)
     }
-    fn transform_struct_field<'a>(
-        &mut self,
-        field: Cow<'a, StructField>,
-    ) -> Option<Cow<'a, StructField>> {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         self.depth_limited(Self::recurse_into_struct_field, field)
     }
-    fn transform_array<'a>(&mut self, atype: Cow<'a, ArrayType>) -> Option<Cow<'a, ArrayType>> {
+    fn transform_array(&mut self, atype: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
         self.depth_limited(Self::recurse_into_array, atype)
     }
-    fn transform_map<'a>(&mut self, mtype: Cow<'a, MapType>) -> Option<Cow<'a, MapType>> {
+    fn transform_map(&mut self, mtype: &'a MapType) -> Option<Cow<'a, MapType>> {
         self.depth_limited(Self::recurse_into_map, mtype)
     }
 }
@@ -917,10 +1085,7 @@ mod tests {
         }
         "#;
         let field: StructField = serde_json::from_str(data).unwrap();
-        assert!(matches!(
-            field.data_type,
-            DataType::Primitive(PrimitiveType::Decimal(10, 2))
-        ));
+        assert_eq!(field.data_type, DataType::decimal(10, 2).unwrap());
 
         let json_str = serde_json::to_string(&field).unwrap();
         assert_eq!(
@@ -955,21 +1120,27 @@ mod tests {
             "nullable": true,
             "metadata": {
                 "delta.columnMapping.id": 4,
-                "delta.columnMapping.physicalName": "col-5f422f40-de70-45b2-88ab-1d5c90e94db1"
+                "delta.columnMapping.physicalName": "col-5f422f40-de70-45b2-88ab-1d5c90e94db1",
+                "delta.identity.start": 2147483648
             }
         }
         "#;
+
         let field: StructField = serde_json::from_str(data).unwrap();
 
         let col_id = field
             .get_config_value(&ColumnMetadataKey::ColumnMappingId)
             .unwrap();
+        let id_start = field
+            .get_config_value(&ColumnMetadataKey::IdentityStart)
+            .unwrap();
         assert!(matches!(col_id, MetadataValue::Number(num) if *num == 4));
+        assert!(matches!(id_start, MetadataValue::Number(num) if *num == 2147483648i64));
         assert_eq!(
-            field.physical_name(ColumnMappingMode::Name).unwrap(),
+            field.physical_name(),
             "col-5f422f40-de70-45b2-88ab-1d5c90e94db1"
         );
-        let physical_field = field.make_physical(ColumnMappingMode::Name).unwrap();
+        let physical_field = field.make_physical();
         assert_eq!(
             physical_field.name,
             "col-5f422f40-de70-45b2-88ab-1d5c90e94db1"
@@ -1023,73 +1194,65 @@ mod tests {
     #[test]
     fn test_depth_checker() {
         let schema = DataType::struct_type([
-            StructField::new(
+            StructField::nullable(
                 "a",
                 ArrayType::new(
                     DataType::struct_type([
-                        StructField::new("w", DataType::LONG, true),
-                        StructField::new("x", ArrayType::new(DataType::LONG, true), true),
-                        StructField::new(
+                        StructField::nullable("w", DataType::LONG),
+                        StructField::nullable("x", ArrayType::new(DataType::LONG, true)),
+                        StructField::nullable(
                             "y",
                             MapType::new(DataType::LONG, DataType::STRING, true),
-                            true,
                         ),
-                        StructField::new(
+                        StructField::nullable(
                             "z",
                             DataType::struct_type([
-                                StructField::new("n", DataType::LONG, true),
-                                StructField::new("m", DataType::STRING, true),
+                                StructField::nullable("n", DataType::LONG),
+                                StructField::nullable("m", DataType::STRING),
                             ]),
-                            true,
                         ),
                     ]),
                     true,
                 ),
-                true,
             ),
-            StructField::new(
+            StructField::nullable(
                 "b",
                 DataType::struct_type([
-                    StructField::new("o", ArrayType::new(DataType::LONG, true), true),
-                    StructField::new(
+                    StructField::nullable("o", ArrayType::new(DataType::LONG, true)),
+                    StructField::nullable(
                         "p",
                         MapType::new(DataType::LONG, DataType::STRING, true),
-                        true,
                     ),
-                    StructField::new(
+                    StructField::nullable(
                         "q",
                         DataType::struct_type([
-                            StructField::new(
+                            StructField::nullable(
                                 "s",
                                 DataType::struct_type([
-                                    StructField::new("u", DataType::LONG, true),
-                                    StructField::new("v", DataType::LONG, true),
+                                    StructField::nullable("u", DataType::LONG),
+                                    StructField::nullable("v", DataType::LONG),
                                 ]),
-                                true,
                             ),
-                            StructField::new("t", DataType::LONG, true),
+                            StructField::nullable("t", DataType::LONG),
                         ]),
-                        true,
                     ),
-                    StructField::new("r", DataType::LONG, true),
+                    StructField::nullable("r", DataType::LONG),
                 ]),
-                true,
             ),
-            StructField::new(
+            StructField::nullable(
                 "c",
                 MapType::new(
                     DataType::LONG,
                     DataType::struct_type([
-                        StructField::new("f", DataType::LONG, true),
-                        StructField::new("g", DataType::STRING, true),
+                        StructField::nullable("f", DataType::LONG),
+                        StructField::nullable("g", DataType::STRING),
                     ]),
                     true,
                 ),
-                true,
             ),
         ]);
 
-        // Similer to SchemaDepthChecker::check, but also returns call count
+        // Similar to SchemaDepthChecker::check, but also returns call count
         let check_with_call_count =
             |depth_limit| SchemaDepthChecker::check_with_call_count(&schema, depth_limit);
 
@@ -1131,5 +1294,112 @@ mod tests {
             MetadataValue::Other(array_json).to_string(),
             "[\"an\",\"array\"]"
         );
+    }
+
+    #[test]
+    fn test_fields_len() {
+        let schema = StructType::new([]);
+        assert!(schema.fields_len() == 0);
+        let schema = StructType::new([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", DataType::LONG),
+            StructField::nullable("c", DataType::LONG),
+            StructField::nullable("d", DataType::LONG),
+        ]);
+        assert_eq!(schema.fields_len(), 4);
+        let schema = StructType::new([
+            StructField::nullable("b", DataType::LONG),
+            StructField::not_null("b", DataType::LONG),
+            StructField::nullable("c", DataType::LONG),
+            StructField::nullable("c", DataType::LONG),
+        ]);
+        assert_eq!(schema.fields_len(), 2);
+    }
+
+    #[test]
+    fn test_has_invariants() {
+        // Schema with no invariants
+        let schema = StructType::new([
+            StructField::nullable("a", DataType::STRING),
+            StructField::nullable("b", DataType::INTEGER),
+        ]);
+        assert!(!InvariantChecker::has_invariants(&schema));
+
+        // Schema with top-level invariant
+        let mut field = StructField::nullable("c", DataType::STRING);
+        field.metadata.insert(
+            ColumnMetadataKey::Invariants.as_ref().to_string(),
+            MetadataValue::String("c > 0".to_string()),
+        );
+
+        let schema = StructType::new([StructField::nullable("a", DataType::STRING), field]);
+        assert!(InvariantChecker::has_invariants(&schema));
+
+        // Schema with nested invariant in a struct
+        let nested_field = StructField::nullable(
+            "nested_c",
+            DataType::struct_type([{
+                let mut field = StructField::nullable("d", DataType::INTEGER);
+                field.metadata.insert(
+                    ColumnMetadataKey::Invariants.as_ref().to_string(),
+                    MetadataValue::String("d > 0".to_string()),
+                );
+                field
+            }]),
+        );
+
+        let schema = StructType::new([
+            StructField::nullable("a", DataType::STRING),
+            StructField::nullable("b", DataType::INTEGER),
+            nested_field,
+        ]);
+        assert!(InvariantChecker::has_invariants(&schema));
+
+        // Schema with nested invariant in an array of structs
+        let array_field = StructField::nullable(
+            "array_field",
+            ArrayType::new(
+                DataType::struct_type([{
+                    let mut field = StructField::nullable("d", DataType::INTEGER);
+                    field.metadata.insert(
+                        ColumnMetadataKey::Invariants.as_ref().to_string(),
+                        MetadataValue::String("d > 0".to_string()),
+                    );
+                    field
+                }]),
+                true,
+            ),
+        );
+
+        let schema = StructType::new([
+            StructField::nullable("a", DataType::STRING),
+            StructField::nullable("b", DataType::INTEGER),
+            array_field,
+        ]);
+        assert!(InvariantChecker::has_invariants(&schema));
+
+        // Schema with nested invariant in a map value that's a struct
+        let map_field = StructField::nullable(
+            "map_field",
+            MapType::new(
+                DataType::STRING,
+                DataType::struct_type([{
+                    let mut field = StructField::nullable("d", DataType::INTEGER);
+                    field.metadata.insert(
+                        ColumnMetadataKey::Invariants.as_ref().to_string(),
+                        MetadataValue::String("d > 0".to_string()),
+                    );
+                    field
+                }]),
+                true,
+            ),
+        );
+
+        let schema = StructType::new([
+            StructField::nullable("a", DataType::STRING),
+            StructField::nullable("b", DataType::INTEGER),
+            map_field,
+        ]);
+        assert!(InvariantChecker::has_invariants(&schema));
     }
 }

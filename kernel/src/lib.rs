@@ -1,45 +1,57 @@
 //! # Delta Kernel
 //!
 //! Delta-kernel-rs is an experimental [Delta](https://github.com/delta-io/delta/) implementation
-//! focused on interoperability with a wide range of query engines. It currently only supports
-//! reads. This library defines a number of traits which must be implemented to provide a
-//! working "delta reader". They are detailed below. There is a provided "default engine" that
-//! implements all these traits and can be used to ease integration work. See
-//! [`DefaultEngine`](engine/default/index.html) for more information.
+//! focused on interoperability with a wide range of query engines. It supports reads and
+//! (experimental) writes (only blind appends in the write path currently). This library defines a
+//! number of traits which must be implemented to provide a working delta implementation. They are
+//! detailed below. There is a provided "default engine" that implements all these traits and can
+//! be used to ease integration work. See [`DefaultEngine`](engine/default/index.html) for more
+//! information.
 //!
 //! A full `rust` example for reading table data using the default engine can be found in the
 //! [read-table-single-threaded] example (and for a more complex multi-threaded reader see the
-//! [read-table-multi-threaded] example).
+//! [read-table-multi-threaded] example). An example for reading the table changes for a table
+//! using the default engine can be found in the [read-table-changes] example.
 //!
-//! [read-table-single-threaded]: https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/examples/read-table-single-threaded
-//! [read-table-multi-threaded]: https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/examples/read-table-multi-threaded
+//!
+//! [read-table-single-threaded]:
+//! https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/examples/read-table-single-threaded
+//! [read-table-multi-threaded]:
+//! https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/examples/read-table-multi-threaded
+//! [read-table-changes]:
+//! https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/examples/read-table-changes
+//!
+//! Simple write examples can be found in the [`write.rs`] integration tests. Standalone write
+//! examples are coming soon!
+//!
+//! [`write.rs`]: https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/tests/write.rs
 //!
 //! # Engine traits
 //!
-//! The [`Engine`] trait allow connectors to bring their own implementation of functionality such as
-//! reading parquet files, listing files in a file system, parsing a JSON string etc.  This trait
-//! exposes methods to get sub-engines which expose the core functionalities customizable by
+//! The [`Engine`] trait allow connectors to bring their own implementation of functionality such
+//! as reading parquet files, listing files in a file system, parsing a JSON string etc.  This
+//! trait exposes methods to get sub-engines which expose the core functionalities customizable by
 //! connectors.
 //!
 //! ## Expression handling
 //!
-//! Expression handling is done via the [`ExpressionHandler`], which in turn allows the creation
-//! of [`ExpressionEvaluator`]s. These evaluators are created for a specific predicate [`Expression`]
+//! Expression handling is done via the [`EvaluationHandler`], which in turn allows the creation of
+//! [`ExpressionEvaluator`]s. These evaluators are created for a specific predicate [`Expression`]
 //! and allow evaluation of that predicate for a specific batches of data.
 //!
 //! ## File system interactions
 //!
-//! Delta Kernel needs to perform some basic operations against file systems like listing and reading files.
-//! These interactions are encapsulated in the [`FileSystemClient`] trait. Implementors must take
-//! care that all assumptions on the behavior if the functions - like sorted results - are respected.
+//! Delta Kernel needs to perform some basic operations against file systems like listing and
+//! reading files. These interactions are encapsulated in the [`StorageHandler`] trait.
+//! Implementers must take care that all assumptions on the behavior if the functions - like sorted
+//! results - are respected.
 //!
 //! ## Reading log and data files
 //!
-//! Delta Kernel requires the capability to read json and parquet files, which is exposed via the
-//! [`JsonHandler`] and [`ParquetHandler`] respectively. When reading files, connectors are asked to
-//! provide the context information it requires to execute the actual read. This is done by invoking
-//! methods on the [`FileSystemClient`] trait.
-//!
+//! Delta Kernel requires the capability to read and write json files and read parquet files, which
+//! is exposed via the [`JsonHandler`] and [`ParquetHandler`] respectively. When reading files,
+//! connectors are asked to provide the context information it requires to execute the actual
+//! operation. This is done by invoking methods on the [`StorageHandler`] trait.
 
 #![cfg_attr(all(doc, NIGHTLY_CHANNEL), feature(doc_auto_cfg))]
 #![warn(
@@ -50,11 +62,17 @@
     rust_2021_compatibility
 )]
 
+/// This `extern crate` declaration allows the macro to reliably refer to
+/// `delta_kernel::schema::DataType` no matter which crate invokes it. Without that, `delta_kernel`
+/// cannot invoke the macro because `delta_kernel` is an unknown crate identifier (you have to use
+/// `crate` instead). We could make the macro use `crate::schema::DataType` instead, but then the
+/// macro is useless outside the `delta_kernel` crate.
 extern crate self as delta_kernel;
 
 use std::any::Any;
-
+use std::fs::DirEntry;
 use std::sync::Arc;
+use std::time::SystemTime;
 use std::{cmp::Ordering, ops::Range};
 
 use bytes::Bytes;
@@ -63,35 +81,38 @@ use url::Url;
 use self::schema::{DataType, SchemaRef};
 
 pub mod actions;
+mod checkpoint;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
-pub(crate) mod predicates;
-pub mod table_changes;
-pub mod table_features;
-
-#[cfg(feature = "developer-visibility")]
-pub mod path;
-#[cfg(not(feature = "developer-visibility"))]
-pub(crate) mod path;
-
-#[cfg(feature = "developer-visibility")]
-pub mod log_segment;
-#[cfg(not(feature = "developer-visibility"))]
-pub(crate) mod log_segment;
-
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
 pub mod table;
+pub mod table_changes;
+pub mod table_configuration;
+pub mod table_features;
+pub mod table_properties;
 pub mod transaction;
+
+pub mod arrow;
+pub(crate) mod kernel_predicates;
+pub mod parquet;
 pub(crate) mod utils;
 
+internal_mod!(pub(crate) mod path);
+internal_mod!(pub(crate) mod log_replay);
+internal_mod!(pub(crate) mod log_segment);
+
 pub use delta_kernel_derive;
-pub use engine_data::{DataVisitor, EngineData};
+pub use engine_data::{EngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef};
 pub use table::Table;
+
+use expressions::literal_expression_transform::LiteralExpressionTransform;
+use expressions::Scalar;
+use schema::{SchemaTransform, StructField, StructType};
 
 #[cfg(any(
     feature = "default-engine",
@@ -99,6 +120,24 @@ pub use table::Table;
     feature = "arrow-conversion"
 ))]
 pub mod engine;
+
+// Macro for `internal-api` modules. Note this can't be implemented alongside the `#[internal_api]`
+// macro because proc macro crates can't export macro_rules! macros.
+#[macro_export]
+macro_rules! internal_mod {
+    // error if item is already pub
+    (pub mod $name:ident) => {
+        compile_error!("internal_mod!: module is already public");
+    };
+
+    ($vis:vis mod $name:ident) => {
+        #[cfg(feature = "internal-api")]
+        pub mod $name;
+
+        #[cfg(not(feature = "internal-api"))]
+        $vis mod $name;
+    };
+}
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
@@ -136,6 +175,31 @@ impl PartialOrd for FileMeta {
     }
 }
 
+impl TryFrom<DirEntry> for FileMeta {
+    type Error = Error;
+
+    fn try_from(ent: DirEntry) -> DeltaResult<FileMeta> {
+        let metadata = ent.metadata()?;
+        let last_modified = metadata
+            .modified()?
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|_| Error::generic("Failed to convert file timestamp to milliseconds"))?;
+        let location = Url::from_file_path(ent.path())
+            .map_err(|_| Error::generic(format!("Invalid path: {:?}", ent.path())))?;
+        let last_modified = last_modified.as_millis().try_into().map_err(|_| {
+            Error::generic(format!(
+                "Failed to convert file modification time {:?} into i64",
+                last_modified.as_millis()
+            ))
+        })?;
+        Ok(FileMeta {
+            location,
+            last_modified,
+            size: metadata.len() as usize,
+        })
+    }
+}
+
 impl FileMeta {
     /// Create a new instance of `FileMeta`
     pub fn new(location: Url, last_modified: i64, size: usize) -> Self {
@@ -165,7 +229,7 @@ impl FileMeta {
 /// let b: Arc<Bar> = a.downcast().unwrap();
 /// ```
 ///
-/// In contrast, very similer code that relies only on `Any` would fail to compile:
+/// In contrast, very similar code that relies only on `Any` would fail to compile:
 ///
 /// ```fail_compile
 /// # use std::any::Any;
@@ -282,7 +346,7 @@ pub trait ExpressionEvaluator: AsAny {
 ///
 /// Delta Kernel can use this handler to evaluate predicate on partition filters,
 /// fill up partition column values and any computation on data using Expressions.
-pub trait ExpressionHandler: AsAny {
+pub trait EvaluationHandler: AsAny {
     /// Create an [`ExpressionEvaluator`] that can evaluate the given [`Expression`]
     /// on columnar batches with the given [`Schema`] to produce data of [`DataType`].
     ///
@@ -294,22 +358,61 @@ pub trait ExpressionHandler: AsAny {
     ///
     /// [`Schema`]: crate::schema::StructType
     /// [`DataType`]: crate::schema::DataType
-    fn get_evaluator(
+    fn new_expression_evaluator(
         &self,
         schema: SchemaRef,
         expression: Expression,
         output_type: DataType,
     ) -> Arc<dyn ExpressionEvaluator>;
+
+    /// Create a single-row all-null-value [`EngineData`] with the schema specified by
+    /// `output_schema`.
+    // NOTE: we should probably allow DataType instead of SchemaRef, but can expand that in the
+    // future.
+    fn null_row(&self, output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>>;
 }
+
+/// Internal trait to allow us to have a private `create_one` API that's implemented for all
+/// EvaluationHandlers.
+// For some reason rustc doesn't detect it's usage so we allow(dead_code) here...
+#[allow(dead_code)]
+trait EvaluationHandlerExtension: EvaluationHandler {
+    /// Create a single-row [`EngineData`] by applying the given schema to the leaf-values given in
+    /// `values`.
+    // Note: we will stick with a Schema instead of DataType (more constrained can expand in
+    // future)
+    fn create_one(&self, schema: SchemaRef, values: &[Scalar]) -> DeltaResult<Box<dyn EngineData>> {
+        // just get a single int column (arbitrary)
+        let null_row_schema = Arc::new(StructType::new(vec![StructField::nullable(
+            "null_col",
+            DataType::INTEGER,
+        )]));
+        let null_row = self.null_row(null_row_schema.clone())?;
+
+        // Convert schema and leaf values to an expression
+        let mut schema_transform = LiteralExpressionTransform::new(values);
+        schema_transform.transform_struct(schema.as_ref());
+        let row_expr = schema_transform.try_into_expr()?;
+
+        let eval = self.new_expression_evaluator(null_row_schema, row_expr, schema.into());
+        eval.evaluate(null_row.as_ref())
+    }
+}
+
+// Auto-implement the extension trait for all EvaluationHandlers
+impl<T: EvaluationHandler + ?Sized> EvaluationHandlerExtension for T {}
 
 /// Provides file system related functionalities to Delta Kernel.
 ///
-/// Delta Kernel uses this client whenever it needs to access the underlying
+/// Delta Kernel uses this handler whenever it needs to access the underlying
 /// file system where the Delta table is present. Connector implementation of
 /// this trait can hide filesystem specific details from Delta Kernel.
-pub trait FileSystemClient: AsAny {
-    /// List the paths in the same directory that are lexicographically greater or equal to
+pub trait StorageHandler: AsAny {
+    /// List the paths in the same directory that are lexicographically greater than
     /// (UTF-8 sorting) the given `path`. The result should also be sorted by the file name.
+    ///
+    /// If the path is directory-like (ends with '/'), the result should contain
+    /// all the files in the directory.
     fn list_from(&self, path: &Url)
         -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
 
@@ -322,7 +425,7 @@ pub trait FileSystemClient: AsAny {
 
 /// Provides JSON handling functionality to Delta Kernel.
 ///
-/// Delta Kernel can use this client to parse JSON strings into Row or read content from JSON files.
+/// Delta Kernel can use this handler to parse JSON strings into Row or read content from JSON files.
 /// Connectors can leverage this trait to provide their best implementation of the JSON parsing
 /// capability to Delta Kernel.
 pub trait JsonHandler: AsAny {
@@ -334,8 +437,20 @@ pub trait JsonHandler: AsAny {
         output_schema: SchemaRef,
     ) -> DeltaResult<Box<dyn EngineData>>;
 
-    /// Read and parse the JSON format file at given locations and return
-    /// the data as EngineData with the columns requested by physical schema.
+    /// Read and parse the JSON format file at given locations and return the data as EngineData with
+    /// the columns requested by physical schema. Note: The [`FileDataReadResultIterator`] must emit
+    /// data from files in the order that `files` is given. For example if files ["a", "b"] is provided,
+    /// then the engine data iterator must first return all the engine data from file "a", _then_ all
+    /// the engine data from file "b". Moreover, for a given file, all of its [`EngineData`] and
+    /// constituent rows must be in order that they occur in the file. Consider a file with rows
+    /// (1, 2, 3). The following are legal iterator batches:
+    ///    iter: [EngineData(1, 2), EngineData(3)]
+    ///    iter: [EngineData(1), EngineData(2, 3)]
+    ///    iter: [EngineData(1, 2, 3)]
+    /// The following are illegal batches:
+    ///    iter: [EngineData(3), EngineData(1, 2)]
+    ///    iter: [EngineData(1), EngineData(3, 2)]
+    ///    iter: [EngineData(2, 1, 3)]
     ///
     /// # Parameters
     ///
@@ -367,7 +482,7 @@ pub trait JsonHandler: AsAny {
     ///
     /// - `path` - URL specifying the location to write the JSON file
     /// - `data` - Iterator of EngineData to write to the JSON file. Each row should be written as
-    ///   a new JSON object appended to the file. (that is, the file is newline-delimeted JSON, and
+    ///   a new JSON object appended to the file. (that is, the file is newline-delimited JSON, and
     ///   each row is a JSON object on a single line)
     /// - `overwrite` - If true, overwrite the file if it exists. If false, the call must fail if
     ///   the file exists.
@@ -407,19 +522,36 @@ pub trait ParquetHandler: AsAny {
 /// Engines/Connectors are expected to pass an implementation of this trait when reading a Delta
 /// table.
 pub trait Engine: AsAny {
-    /// Get the connector provided [`ExpressionHandler`].
-    fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler>;
+    /// Get the connector provided [`EvaluationHandler`].
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler>;
 
-    /// Get the connector provided [`FileSystemClient`]
-    fn get_file_system_client(&self) -> Arc<dyn FileSystemClient>;
+    /// Get the connector provided [`StorageHandler`]
+    fn storage_handler(&self) -> Arc<dyn StorageHandler>;
 
     /// Get the connector provided [`JsonHandler`].
-    fn get_json_handler(&self) -> Arc<dyn JsonHandler>;
+    fn json_handler(&self) -> Arc<dyn JsonHandler>;
 
     /// Get the connector provided [`ParquetHandler`].
-    fn get_parquet_handler(&self) -> Arc<dyn ParquetHandler>;
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
 }
 
+// we have an 'internal' feature flag: default-engine-base, which is actually just the shared
+// pieces of default-engine and default-engine-rustls. the crate can't compile with _only_
+// default-engine-base, so we give a friendly error here.
+#[cfg(all(
+    feature = "default-engine-base",
+    not(any(feature = "default-engine", feature = "default-engine-rustls",))
+))]
+compile_error!(
+    "The default-engine-base feature flag is not meant to be used directly. \
+    Please use either default-engine or default-engine-rustls."
+);
+
+// Rustdoc's documentation tests can do some things that regular unit tests can't. Here we are
+// using doctests to test macros. Specifically, we are testing for failed macro invocations due
+// to invalid input, not the macro output when the macro invocation is successful (which can/should be
+// done in unit tests). This module is not exclusively for macro tests only so other doctests can also be added.
+// https://doc.rust-lang.org/rustdoc/write-documentation/documentation-tests.html#include-items-only-when-collecting-doctests
 #[cfg(doctest)]
 mod doc_tests {
 

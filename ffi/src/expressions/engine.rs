@@ -13,27 +13,21 @@ use delta_kernel::{
 
 #[derive(Default)]
 pub struct KernelExpressionVisitorState {
-    // TODO: ReferenceSet<Box<dyn MetadataFilterFn>> instead?
-    inflight_expressions: ReferenceSet<Expression>,
-}
-impl KernelExpressionVisitorState {
-    pub fn new() -> Self {
-        Self {
-            inflight_expressions: Default::default(),
-        }
-    }
+    inflight_ids: ReferenceSet<Expression>,
 }
 
 /// A predicate that can be used to skip data when scanning.
 ///
 /// When invoking [`scan::scan`], The engine provides a pointer to the (engine's native) predicate,
 /// along with a visitor function that can be invoked to recursively visit the predicate. This
-/// engine state must be valid until the call to `scan::scan` returns. Inside that method, the
+/// engine state must be valid until the call to [`scan::scan`] returns. Inside that method, the
 /// kernel allocates visitor state, which becomes the second argument to the predicate visitor
 /// invocation along with the engine-provided predicate pointer. The visitor state is valid for the
 /// lifetime of the predicate visitor invocation. Thanks to this double indirection, engine and
 /// kernel each retain ownership of their respective objects, with no need to coordinate memory
 /// lifetimes with the other.
+///
+/// [`scan::scan`]: crate::scan::scan
 #[repr(C)]
 pub struct EnginePredicate {
     pub predicate: *mut c_void,
@@ -42,14 +36,14 @@ pub struct EnginePredicate {
 }
 
 fn wrap_expression(state: &mut KernelExpressionVisitorState, expr: impl Into<Expression>) -> usize {
-    state.inflight_expressions.insert(expr.into())
+    state.inflight_ids.insert(expr.into())
 }
 
-pub fn unwrap_kernel_expression(
+pub(crate) fn unwrap_kernel_expression(
     state: &mut KernelExpressionVisitorState,
     exprid: usize,
 ) -> Option<Expression> {
-    state.inflight_expressions.take(exprid)
+    state.inflight_ids.take(exprid)
 }
 
 fn visit_expression_binary(
@@ -184,7 +178,7 @@ fn visit_expression_literal_string_impl(
     state: &mut KernelExpressionVisitorState,
     value: DeltaResult<String>,
 ) -> DeltaResult<usize> {
-    Ok(wrap_expression(state, value?))
+    Ok(wrap_expression(state, Expression::literal(value?)))
 }
 
 // We need to get parse.expand working to be able to macro everything below, see issue #255
@@ -194,7 +188,7 @@ pub extern "C" fn visit_expression_literal_int(
     state: &mut KernelExpressionVisitorState,
     value: i32,
 ) -> usize {
-    wrap_expression(state, value)
+    wrap_expression(state, Expression::literal(value))
 }
 
 #[no_mangle]
@@ -202,7 +196,7 @@ pub extern "C" fn visit_expression_literal_long(
     state: &mut KernelExpressionVisitorState,
     value: i64,
 ) -> usize {
-    wrap_expression(state, value)
+    wrap_expression(state, Expression::literal(value))
 }
 
 #[no_mangle]
@@ -210,7 +204,7 @@ pub extern "C" fn visit_expression_literal_short(
     state: &mut KernelExpressionVisitorState,
     value: i16,
 ) -> usize {
-    wrap_expression(state, value)
+    wrap_expression(state, Expression::literal(value))
 }
 
 #[no_mangle]
@@ -218,7 +212,7 @@ pub extern "C" fn visit_expression_literal_byte(
     state: &mut KernelExpressionVisitorState,
     value: i8,
 ) -> usize {
-    wrap_expression(state, value)
+    wrap_expression(state, Expression::literal(value))
 }
 
 #[no_mangle]
@@ -226,7 +220,7 @@ pub extern "C" fn visit_expression_literal_float(
     state: &mut KernelExpressionVisitorState,
     value: f32,
 ) -> usize {
-    wrap_expression(state, value)
+    wrap_expression(state, Expression::literal(value))
 }
 
 #[no_mangle]
@@ -234,7 +228,7 @@ pub extern "C" fn visit_expression_literal_double(
     state: &mut KernelExpressionVisitorState,
     value: f64,
 ) -> usize {
-    wrap_expression(state, value)
+    wrap_expression(state, Expression::literal(value))
 }
 
 #[no_mangle]
@@ -242,5 +236,5 @@ pub extern "C" fn visit_expression_literal_bool(
     state: &mut KernelExpressionVisitorState,
     value: bool,
 ) -> usize {
-    wrap_expression(state, value)
+    wrap_expression(state, Expression::literal(value))
 }

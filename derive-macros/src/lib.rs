@@ -1,8 +1,9 @@
 use proc_macro2::{Ident, Span, TokenStream};
-use quote::{quote, quote_spanned};
+use quote::{quote, quote_spanned, ToTokens};
+use syn::parse_macro_input;
 use syn::spanned::Spanned;
 use syn::{
-    parse_macro_input, Data, DataStruct, DeriveInput, Error, Fields, Meta, PathArguments, Type,
+    Data, DataStruct, DeriveInput, Error, Fields, Item, Meta, PathArguments, Type, Visibility,
 };
 
 /// Parses a dot-delimited column name into an array of field names. See
@@ -25,7 +26,7 @@ pub fn parse_column_name(input: proc_macro::TokenStream) -> proc_macro::TokenStr
     err.into_compile_error().into()
 }
 
-/// Derive a `delta_kernel::schemas::ToDataType` implementation for the annotated struct. The actual
+/// Derive a `delta_kernel::schemas::ToSchema` implementation for the annotated struct. The actual
 /// field names in the schema (and therefore of the struct members) are all mandated by the Delta
 /// spec, and so the user of this macro is responsible for ensuring that
 /// e.g. `Metadata::schema_string` is the snake_case-ified version of `schemaString` from [Delta's
@@ -45,10 +46,10 @@ pub fn derive_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream 
     let schema_fields = gen_schema_fields(&input.data);
     let output = quote! {
         #[automatically_derived]
-        impl delta_kernel::actions::schemas::ToDataType for #struct_ident {
-            fn to_data_type() -> delta_kernel::schema::DataType {
+        impl delta_kernel::actions::schemas::ToSchema for #struct_ident {
+            fn to_schema() -> delta_kernel::schema::StructType {
                 use delta_kernel::actions::schemas::{ToDataType, GetStructField, GetNullableContainerStructField};
-                delta_kernel::schema::DataType::struct_type([
+                delta_kernel::schema::StructType::new([
                     #schema_fields
                 ])
             }
@@ -116,21 +117,86 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
                     }
                 });
                 if have_schema_null {
-                    if let Some(first_ident) = type_path.path.segments.first().map(|seg| &seg.ident) {
-                        if first_ident != "HashMap" {
+                    if let Some(last_ident) = type_path.path.segments.last().map(|seg| &seg.ident) {
+                        if last_ident != "HashMap" {
                            return Error::new(
-                                first_ident.span(),
-                                format!("Can only use drop_null_container_values on HashMap fields, not {first_ident}")
+                                last_ident.span(),
+                                format!("Can only use drop_null_container_values on HashMap fields, not {last_ident}")
                             ).to_compile_error()
                         }
                     }
-                    quote_spanned! { field.span() => #(#type_path_quoted),* get_nullable_container_struct_field(stringify!(#name))}
+                    quote_spanned! { field.span() => #(#type_path_quoted)* get_nullable_container_struct_field(stringify!(#name))}
                 } else {
-                    quote_spanned! { field.span() => #(#type_path_quoted),* get_struct_field(stringify!(#name))}
+                    quote_spanned! { field.span() => #(#type_path_quoted)* get_struct_field(stringify!(#name))}
                 }
             }
             _ => Error::new(field.span(), format!("Can't handle type: {:?}", field.ty)).to_compile_error()
         }
     });
     quote! { #(#schema_fields),* }
+}
+
+/// Mark items as `internal_api` to make them public iff the `internal-api` feature is enabled.
+/// Note this doesn't work for inline module definitions (see `internal_mod!` macro in delta_kernel
+/// crate - can't export macro_rules! from proc macro crate).
+/// Ref: <https://github.com/rust-lang/rust/issues/54727>
+#[proc_macro_attribute]
+pub fn internal_api(
+    _attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(item as Item);
+
+    // Create a version with public visibility for the unstable feature
+    let public_version = make_public(input.clone());
+
+    // The original item stays as-is for the non-unstable case
+    let output = quote! {
+        #[cfg(feature = "internal-api")]
+        #public_version
+
+        #[cfg(not(feature = "internal-api"))]
+        #input
+    };
+
+    output.into()
+}
+
+fn make_public(mut item: Item) -> Item {
+    fn set_pub(vis: &mut Visibility) -> Result<(), syn::Error> {
+        if matches!(vis, Visibility::Public(_)) {
+            return Err(Error::new(
+                vis.span(),
+                "ineligible for #[internal_api]: item is already public",
+            ));
+        }
+        *vis = syn::parse_quote!(pub);
+        Ok(())
+    }
+
+    let result = match &mut item {
+        Item::Fn(f) => set_pub(&mut f.vis),
+        Item::Struct(s) => set_pub(&mut s.vis),
+        Item::Enum(e) => set_pub(&mut e.vis),
+        Item::Trait(t) => set_pub(&mut t.vis),
+        Item::Type(t) => set_pub(&mut t.vis),
+        Item::Mod(m) => set_pub(&mut m.vis),
+        Item::Static(s) => set_pub(&mut s.vis),
+        Item::Const(c) => set_pub(&mut c.vis),
+        Item::Union(u) => set_pub(&mut u.vis),
+        // foreign mod, impl block, and all others not handled
+        _ => Err(Error::new(
+            item.span(),
+            format!("unsupported item type for #[internal_api]: {:?}", item),
+        )),
+    };
+
+    if let Err(err) = result {
+        let error = err.to_compile_error();
+        let mut tokens = item.to_token_stream();
+        tokens.extend(error);
+        return syn::parse_quote!(#tokens);
+    }
+
+    item
 }

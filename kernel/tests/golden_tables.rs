@@ -3,41 +3,30 @@
 //! Data (golden tables) are stored in tests/golden_data/<table_name>.tar.zst
 //! Each table directory has a table/ and expected/ subdirectory with the input/output respectively
 
-use arrow::array::AsArray;
-use arrow::{compute::filter_record_batch, record_batch::RecordBatch};
-use arrow_ord::sort::{lexsort_to_indices, SortColumn};
-use arrow_schema::{FieldRef, Schema};
-use arrow_select::{concat::concat_batches, take::take};
+use delta_kernel::arrow::array::{Array, AsArray, StructArray};
+use delta_kernel::arrow::compute::{concat_batches, take};
+use delta_kernel::arrow::compute::{lexsort_to_indices, SortColumn};
+use delta_kernel::arrow::datatypes::{DataType, FieldRef, Schema};
+use delta_kernel::arrow::{compute::filter_record_batch, record_batch::RecordBatch};
 use itertools::Itertools;
 use paste::paste;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use delta_kernel::parquet::arrow::async_reader::{
+    ParquetObjectReader, ParquetRecordBatchStreamBuilder,
+};
 use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Table};
 use futures::{stream::TryStreamExt, StreamExt};
 use object_store::{local::LocalFileSystem, ObjectStore};
-use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 
-use arrow_array::{Array, StructArray};
-use arrow_schema::DataType;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 
 mod common;
-use common::to_arrow;
+use common::{load_test_data, to_arrow};
 
-/// unpack the test data from test_table.tar.zst into a temp dir, and return the dir it was
-/// unpacked into
-fn load_test_data(test_name: &str) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
-    let path = format!("tests/golden_data/{}.tar.zst", test_name);
-    let tar = zstd::Decoder::new(std::fs::File::open(path)?)?;
-    let mut archive = tar::Archive::new(tar);
-    let temp_dir = tempfile::tempdir()?;
-    archive.unpack(temp_dir.path())?;
-    Ok(temp_dir)
-}
-
-// NB adapated from DAT: read all parquet files in the directory and concatenate them
+// NB adapted from DAT: read all parquet files in the directory and concatenate them
 async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
     let store = Arc::new(LocalFileSystem::new_with_prefix(path)?);
     let files = store.list(None).try_collect::<Vec<_>>().await?;
@@ -100,7 +89,7 @@ fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
-// Ensure that two sets of  fields have the same names, and dict_id/ordering.
+// Ensure that two sets of  fields have the same names, and dict_is_ordered
 // We ignore:
 //  - data type: This is checked already in `assert_columns_match`
 //  - nullability: parquet marks many things as nullable that we don't in our schema
@@ -113,10 +102,6 @@ fn assert_fields_match<'a>(
         assert!(
             actual_field.name() == expected_field.name(),
             "Field names don't match"
-        );
-        assert!(
-            actual_field.dict_id() == expected_field.dict_id(),
-            "Field dict_id doesn't match"
         );
         assert!(
             actual_field.dict_is_ordered() == expected_field.dict_is_ordered(),
@@ -180,9 +165,8 @@ async fn latest_snapshot_test(
     expected_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = table.snapshot(&engine, None)?;
-
     let scan = snapshot.into_scan_builder().build()?;
-    let scan_res = scan.execute(&engine)?;
+    let scan_res = scan.execute(Arc::new(engine))?;
     let batches: Vec<RecordBatch> = scan_res
         .map(|scan_result| -> DeltaResult<_> {
             let scan_result = scan_result?;
@@ -219,7 +203,7 @@ fn setup_golden_table(
     Option<PathBuf>,
     tempfile::TempDir,
 ) {
-    let test_dir = load_test_data(test_name).unwrap();
+    let test_dir = load_test_data("tests/golden_data", test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
     let table_path = test_path.join("delta");
     let table = Table::try_from_uri(table_path.to_str().expect("table path to string"))
@@ -289,8 +273,8 @@ async fn canonicalized_paths_test(
         .into_scan_builder()
         .build()
         .expect("build the scan");
-    let mut scan_data = scan.scan_data(&engine).expect("scan data");
-    assert!(scan_data.next().is_none());
+    let mut scan_metadata = scan.scan_metadata(&engine).expect("scan metadata");
+    assert!(scan_metadata.next().is_none());
     Ok(())
 }
 
@@ -305,9 +289,12 @@ async fn checkpoint_test(
         .into_scan_builder()
         .build()
         .expect("build the scan");
-    let scan_data: Vec<_> = scan.scan_data(&engine).expect("scan data").collect();
+    let scan_metadata: Vec<_> = scan
+        .scan_metadata(&engine)
+        .expect("scan metadata")
+        .collect();
     assert_eq!(version, 14);
-    assert!(scan_data.len() == 1);
+    assert!(scan_metadata.len() == 1);
     Ok(())
 }
 
@@ -384,7 +371,7 @@ golden_test!("deltalog-getChanges", latest_snapshot_test);
 
 golden_test!("dv-partitioned-with-checkpoint", latest_snapshot_test);
 golden_test!("dv-with-columnmapping", latest_snapshot_test);
-skip_test!("hive": "test not yet implmented - different file structure");
+skip_test!("hive": "test not yet implemented - different file structure");
 golden_test!("kernel-timestamp-int96", latest_snapshot_test);
 golden_test!("kernel-timestamp-pst", latest_snapshot_test);
 golden_test!("kernel-timestamp-timestamp_micros", latest_snapshot_test);
@@ -424,9 +411,8 @@ golden_test!("time-travel-schema-changes-b", latest_snapshot_test);
 golden_test!("time-travel-start", latest_snapshot_test);
 golden_test!("time-travel-start-start20", latest_snapshot_test);
 golden_test!("time-travel-start-start20-start40", latest_snapshot_test);
-
-skip_test!("v2-checkpoint-json": "v2 checkpoint not supported");
-skip_test!("v2-checkpoint-parquet": "v2 checkpoint not supported");
+golden_test!("v2-checkpoint-json", latest_snapshot_test);
+golden_test!("v2-checkpoint-parquet", latest_snapshot_test);
 
 // BUG:
 // - AddFile: 'file:/some/unqualified/absolute/path'
@@ -452,11 +438,11 @@ skip_test!("canonicalized-paths-special-b": "BUG: path canonicalization");
 // // We added two add files with the same path `foo`. The first should have been removed.
 // // The second should remain, and should have a hard-coded modification time of 1700000000000L
 // assert(foundFiles.find(_.getPath.endsWith("foo")).exists(_.getModificationTime == 1700000000000L))
-skip_test!("delete-re-add-same-file-different-transactions": "test not yet implmented");
+skip_test!("delete-re-add-same-file-different-transactions": "test not yet implemented");
 
 // data file doesn't exist, get the relative path to compare
 // assert(new File(addFileStatus.getPath).getName == "special p@#h")
-skip_test!("log-replay-special-characters-b": "test not yet implmented");
+skip_test!("log-replay-special-characters-b": "test not yet implemented");
 
 negative_test!("deltalog-invalid-protocol-version");
 negative_test!("deltalog-state-reconstruction-from-checkpoint-missing-metadata");
