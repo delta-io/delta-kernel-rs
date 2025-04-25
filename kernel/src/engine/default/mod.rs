@@ -38,7 +38,7 @@ pub struct DefaultEngine<E: TaskExecutor> {
     storage: Arc<ObjectStoreStorageHandler<E>>,
     json: Arc<DefaultJsonHandler<E>>,
     parquet: Arc<DefaultParquetHandler<E>>,
-    expression: Arc<ArrowEvaluationHandler>,
+    evaluation: Arc<ArrowEvaluationHandler>,
 }
 
 impl<E: TaskExecutor> DefaultEngine<E> {
@@ -84,7 +84,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                 task_executor,
             )),
             object_store,
-            expression: Arc::new(ArrowEvaluationHandler {}),
+            evaluation: Arc::new(ArrowEvaluationHandler {}),
         }
     }
 
@@ -121,7 +121,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
 
 impl<E: TaskExecutor> Engine for DefaultEngine<E> {
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        self.expression.clone()
+        self.evaluation.clone()
     }
 
     fn storage_handler(&self) -> Arc<dyn StorageHandler> {

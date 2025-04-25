@@ -16,7 +16,7 @@ And
   TimestampNtz(100)
   Date(32)
   Binary(0000deadbeefcafe)
-  Decimal(1,1,5,3)
+  Decimal(1,1,20,3)
   Null
   Struct
     Field: top
