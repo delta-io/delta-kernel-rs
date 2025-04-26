@@ -29,10 +29,7 @@ use serde::{Deserialize, Serialize};
 pub mod deletion_vector;
 pub mod set_transaction;
 
-#[cfg(feature = "internal-api")]
-pub mod schemas;
-#[cfg(not(feature = "internal-api"))]
-pub(crate) mod schemas;
+internal_mod!(pub(crate) mod schemas);
 internal_mod!(pub(crate) mod visitors);
 
 #[internal_api]
