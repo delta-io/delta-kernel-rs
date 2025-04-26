@@ -20,7 +20,10 @@ pub(crate) type DomainMetadataMap = HashMap<String, DomainMetadata>;
 
 /// Read the latest domain metadata for a given domain and return its `configuration`. This
 /// accounts for 'removed' domain metadata: if the domain is removed, then the configuration is
-/// `None`.
+/// `None`. Additionally, this includes 'internal' (delta.*) domains. The consumer must filter
+/// these before returning domains to the user.
+// TODO we should have some finer-grained unit tests here instead of relying on the top-level
+// snapshot tests.
 pub(crate) fn domain_metadata_configuration(
     log_segment: &LogSegment,
     domain: &str,

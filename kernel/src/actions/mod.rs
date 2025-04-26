@@ -54,6 +54,8 @@ pub(crate) const CHECKPOINT_METADATA_NAME: &str = "checkpointMetadata";
 #[internal_api]
 pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 
+pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
+
 static LOG_ADD_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| StructType::new([Option::<Add>::get_struct_field(ADD_NAME)]).into());
 
@@ -681,6 +683,15 @@ pub(crate) struct DomainMetadata {
     domain: String,
     configuration: String,
     removed: bool,
+}
+
+impl DomainMetadata {
+    // returns true if the domain metadata is an internal/reserved domain (all domains that start
+    // with "delta.")
+    #[allow(unused)]
+    fn is_internal(&self) -> bool {
+        self.domain.starts_with(INTERNAL_DOMAIN_PREFIX)
+    }
 }
 
 #[cfg(test)]
