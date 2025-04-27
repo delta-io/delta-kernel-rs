@@ -2,7 +2,10 @@
 
 use std::str::FromStr;
 
-use crate::{DeltaResult, Error, FileMeta, Version};
+use crate::{
+    actions::visitors::InCommitTimestampVisitor, history_manager::error::LogHistoryError,
+    DeltaResult, Engine, Error, FileMeta, RowVisitor, Version,
+};
 use delta_kernel_derive::internal_api;
 
 use url::Url;
@@ -246,6 +249,62 @@ impl ParsedLogPath<Url> {
             ));
         }
         Ok(path)
+    }
+}
+
+impl ParsedLogPath<FileMeta> {
+    /// Reads the in-commit timestamp for the given `commit_file`.
+    ///
+    /// This returns a [`LogHistoryError::FailedToReadTimestampForCommit`] if this encounters an
+    /// error while reading the file or visiting the rows.
+    ///
+    /// This returns a [`LogHistoryError::InCommitTimestampNotFoundError`] if the in-commit timestamp
+    /// is not present in the commit file, or if the CommitInfo is not the first action in the
+    /// commit.
+    #[allow(unused)]
+    pub(crate) fn read_in_commit_timestamp(
+        &self,
+        engine: &dyn Engine,
+    ) -> Result<i64, LogHistoryError> {
+        debug_assert!(self.is_commit(), "File should be a commit");
+        let wrap_err = |error: Error| LogHistoryError::FailedToReadTimestampForCommit {
+            version: self.version,
+            error: Box::new(error),
+        };
+
+        // Get an iterator over the actions in the commit file
+        let mut action_iter = engine
+            .json_handler()
+            .read_json_files(
+                &[self.location.clone()],
+                InCommitTimestampVisitor::schema(),
+                None,
+            )
+            .map_err(wrap_err)?;
+
+        let not_found = || LogHistoryError::InCommitTimestampNotFoundError {
+            version: self.version,
+        };
+
+        // Take the first non-empty engine data batch
+        match action_iter.next() {
+            Some(Ok(batch)) => {
+                // Visit the rows and get the in-commit timestamp if present
+                let mut visitor = InCommitTimestampVisitor::default();
+                visitor.visit_rows_of(batch.as_ref()).map_err(wrap_err)?;
+                visitor.in_commit_timestamp.ok_or_else(not_found)
+            }
+            Some(Err(err)) => Err(wrap_err(err)),
+            None => Err(not_found()),
+        }
+    }
+
+    /// Returns the file modification timestamp. This makes no guarantee on whether
+    /// in-commit timestamps is enabled for this commit or not
+    #[allow(unused)]
+    pub(crate) fn file_modification_timestamp(&self) -> i64 {
+        debug_assert!(self.is_commit(), "File should be a commit");
+        self.location.last_modified
     }
 }
 

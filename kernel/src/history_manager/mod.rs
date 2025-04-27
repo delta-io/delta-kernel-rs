@@ -5,8 +5,8 @@
 //!
 //! Use this module to:
 //! - Convert timestamps or timestamp ranges into Delta versions or version ranges
-//! - Perform time travel queries using [`Table::snapshot`]
-//! - Execute timestamp-based change data feed queries using [`Table::table_changes`]
+//! - Perform time travel queries using [`Snapshot::try_new`]
+//! - Execute timestamp-based change data feed queries using [`TableChanges::try_new`]
 //!
 //! The history_manager module works with tables regardless of whether they have In-Commit
 //! Timestamps enabled.
@@ -16,44 +16,20 @@
 //!  All timestamp queries are limited to the state captured in the [`Snapshot`]
 //! provided during construction.
 //!
-//! [`Table::snapshot`]: crate::Table::snapshot
-//! [`Table::table_changes`]: crate::Table::table_changes
+//! [`TableChanges::try_new`]: crate::table_changes::TableChanges::try_new
 use std::num::NonZero;
 
 use error::LogHistoryError;
 
-use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::log_segment::LogSegment;
-use crate::path::ParsedLogPath;
 use crate::snapshot::Snapshot;
 use crate::Engine;
-use crate::Error as DeltaError;
-use crate::RowVisitor;
 
 pub(crate) mod search;
 
 pub mod error;
 
 type Timestamp = i64;
-
-/// Gets the timestamp for the `commit_file`. If `read_ict` is false, this returns the file's
-/// modification timestamp. If `read_ict` is true, this reads the file's In-commit timestamp.
-#[allow(unused)]
-fn commit_file_to_timestamp(
-    latest_snapshot: &Snapshot,
-    engine: &dyn Engine,
-    commit_file: &ParsedLogPath,
-    read_ict: bool,
-) -> Result<Timestamp, LogHistoryError> {
-    let commit_timestamp = if read_ict {
-        read_in_commit_timestamp(engine, commit_file)?
-    } else {
-        // By default, the timestamp of a commit is its modification time
-        commit_file.location.last_modified
-    };
-
-    Ok(commit_timestamp)
-}
 
 /// Gets a [`LogSegment`] that has the same `end_version` as the provided [`Snapshot`].
 ///
@@ -95,51 +71,6 @@ fn get_log_segment_for_timestamp_conversion(
     Ok(log_segment)
 }
 
-/// Reads the in-commit timestamp for the given `commit_file`.
-///
-/// This returns a [`LogHistoryError::FailedToReadTimestampForCommit`] if this encounters an
-/// error while reading the file or visiting the rows.
-///
-/// This returns a [`LogHistoryError::InCommitTimestampNotFoundError`] if the in-commit timestamp
-/// is not present in the commit file, or if the CommitInfo is not the first action in the
-/// commit.
-#[allow(unused)]
-fn read_in_commit_timestamp(
-    engine: &dyn Engine,
-    commit_file: &ParsedLogPath,
-) -> Result<Timestamp, LogHistoryError> {
-    debug_assert!(commit_file.is_commit(), "File should be a commit");
-    let wrap_err = |error: DeltaError| LogHistoryError::FailedToReadTimestampForCommit {
-        version: commit_file.version,
-        error: Box::new(error),
-    };
-
-    // Get an iterator over the actions in the commit file
-    let mut action_iter = engine
-        .json_handler()
-        .read_json_files(
-            &[commit_file.location.clone()],
-            InCommitTimestampVisitor::schema(),
-            None,
-        )
-        .map_err(wrap_err)?;
-
-    let not_found = || LogHistoryError::InCommitTimestampNotFoundError {
-        version: commit_file.version,
-    };
-
-    // Take the first non-empty engine data batch
-    match action_iter.next() {
-        Some(Ok(batch)) => {
-            // Visit the rows and get the in-commit timestamp if present
-            let mut visitor = InCommitTimestampVisitor::default();
-            visitor.visit_rows_of(batch.as_ref()).map_err(wrap_err)?;
-            visitor.in_commit_timestamp.ok_or_else(not_found)
-        }
-        Some(Err(err)) => Err(wrap_err(err)),
-        None => Err(not_found()),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -241,7 +172,7 @@ mod tests {
         let commits = log_segment.ascending_commit_files;
 
         // File that has no In-commit timestamps
-        let mut res = read_in_commit_timestamp(&engine, &commits[0]);
+        let mut res = commits[0].read_in_commit_timestamp(&engine);
         assert!(
             matches!(
                 res,
@@ -260,7 +191,7 @@ mod tests {
         };
 
         fake_log_path.location.location = Url::from_file_path(failing_path).unwrap();
-        res = read_in_commit_timestamp(&engine, &fake_log_path);
+        res = fake_log_path.read_in_commit_timestamp(&engine);
         assert!(
             matches!(
                 res,
@@ -273,9 +204,9 @@ mod tests {
         );
 
         // Files with In-commit timestamps
-        res = read_in_commit_timestamp(&engine, &commits[3]);
+        res = commits[3].read_in_commit_timestamp(&engine);
         assert!(matches!(res, Ok(300)), "{res:?}");
-        res = read_in_commit_timestamp(&engine, &commits[4]);
+        res = commits[4].read_in_commit_timestamp(&engine);
         assert!(matches!(res, Ok(400)), "{res:?}");
     }
 
@@ -289,19 +220,19 @@ mod tests {
         let commits = log_segment.ascending_commit_files;
 
         // Read the file modification timestamps
-        let ts = commit_file_to_timestamp(&snapshot, &engine, &commits[0], false);
-        assert!(matches!(ts, Ok(50)));
+        let ts = commits[0].file_modification_timestamp();
+        assert!(matches!(ts, 50));
 
-        let ts = commit_file_to_timestamp(&snapshot, &engine, &commits[1], false);
-        assert!(matches!(ts, Ok(150)));
+        let ts = commits[1].file_modification_timestamp();
+        assert!(matches!(ts, 150));
 
-        let ts = commit_file_to_timestamp(&snapshot, &engine, &commits[2], false);
-        assert!(matches!(ts, Ok(250)));
+        let ts = commits[2].file_modification_timestamp();
+        assert!(matches!(ts, 250));
 
         // Read the in-commit timestamps
-        let ts = commit_file_to_timestamp(&snapshot, &engine, &commits[3], true);
+        let ts = commits[3].read_in_commit_timestamp(&engine);
         assert!(matches!(ts, Ok(300)));
-        let ts = commit_file_to_timestamp(&snapshot, &engine, &commits[4], true);
+        let ts = commits[4].read_in_commit_timestamp(&engine);
         assert!(matches!(ts, Ok(400)));
     }
 }
