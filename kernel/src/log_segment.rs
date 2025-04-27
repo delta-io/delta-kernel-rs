@@ -205,14 +205,10 @@ impl LogSegment {
         LogSegment::try_new(listed_files, log_root, end_version)
     }
 
-    #[allow(unused)]
-    /// Constructs a [`LogSegment`] to be used for timestamp conversion. This [`LogSegment`] will
-    /// consist only of contiguous commit files up to `end_version` (inclusive). If present,
-    /// `limit` specifies the maximum length of the returned log segment. The log segment may be
-    /// shorter than `limit` if there are missing commits.
-    ///
-    // This lists all files starting from `end-limit` if `limit` is defined. For large tables,
-    // listing with a `limit` can be a significant speedup over listing _all_ the files in the log.
+    /// Constructs a [`LogSegment`] to be used for timestamp conversion. This [`LogSegment`] will consist
+    /// only of contiguous commit files. If an `end_version` is specified, the commit range will
+    /// include commits up to the `end_version` commit (inclusive). If present, `limit` specifies the
+    /// maximum length of the returned LogSegment.
     pub(crate) fn for_timestamp_conversion(
         storage: &dyn StorageHandler,
         log_root: Url,
@@ -228,7 +224,7 @@ impl LogSegment {
                          when building log segment in timestamp conversion",
                     ));
                 };
-                match (limit.cmp(&end_version)) {
+                match limit.cmp(&end_version) {
                     Ordering::Less | Ordering::Equal => Ok(end_version - limit),
                     Ordering::Greater => Ok(0),
                 }

@@ -15,7 +15,6 @@ use delta_kernel_derive::internal_api;
 /// * [`Bound::GreatestLower`] - Finds the largest index `i` such that `values[i] <= key`.
 ///   This represents the last element less than or equal to the search key.
 #[internal_api]
-#[allow(unused)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Bound {
     LeastUpper,
@@ -23,7 +22,6 @@ pub(crate) enum Bound {
 }
 
 #[internal_api]
-#[allow(unused)]
 #[derive(Debug)]
 pub(crate) enum SearchError<T: Error> {
     OutOfRange,
@@ -123,7 +121,6 @@ pub(crate) enum SearchError<T: Error> {
 /// assert!(matches!(result, Err(SearchError::KeyFunctionError(_))));
 /// ```
 #[internal_api]
-#[allow(unused)]
 pub(crate) fn binary_search_by_key_with_bounds<'a, T, K: Ord + Debug, E: Error>(
     values: &'a [T],
     key: K,

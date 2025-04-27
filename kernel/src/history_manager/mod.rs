@@ -15,6 +15,8 @@
 //!
 //!  All timestamp queries are limited to the state captured in the [`Snapshot`]
 //! provided during construction.
+
+use delta_kernel_derive::internal_api;
 use error::{LogHistoryError, TimestampOutOfRangeError};
 use search::{binary_search_by_key_with_bounds, Bound, SearchError};
 use std::cmp::Ordering;
@@ -25,7 +27,7 @@ use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::snapshot::Snapshot;
 use crate::utils::require;
-use crate::{Engine, Error as DeltaError, RowVisitor, Version};
+use crate::{DeltaResult, Engine, Error as DeltaError, RowVisitor, Version};
 
 #[cfg(feature = "internal-api")]
 pub mod search;
@@ -39,7 +41,6 @@ pub(crate) mod error;
 
 type Timestamp = i64;
 
-#[allow(unused)]
 #[derive(Debug)]
 enum TimestampSearchBounds {
     ExactMatch(Version),
@@ -53,7 +54,6 @@ enum TimestampSearchBounds {
 
 /// Gets the timestamp for the `commit_file`. If `read_ict` is false, this returns the file's
 /// modification timestamp. If `read_ict` is true, this reads the file's In-commit timestamp.
-#[allow(unused)]
 fn commit_file_to_timestamp(
     engine: &dyn Engine,
     commit_file: &ParsedLogPath,
@@ -71,7 +71,6 @@ fn commit_file_to_timestamp(
 
 /// Gets a [`LogSegment`] that has the same `end_version` as the provided [`Snapshot`].
 /// Note: For large tables, this listing operation can be very expensive.
-#[allow(unused)]
 fn get_log_segment_for_timestamp_conversion(
     engine: &dyn Engine,
     snapshot: &Snapshot,
@@ -107,7 +106,6 @@ fn get_log_segment_for_timestamp_conversion(
 /// This returns a [`LogHistoryError::InCommitTimestampNotFoundError`] if the in-commit timestamp
 /// is not present in the commit file, or if the CommitInfo is not the first action in the
 /// commit.
-#[allow(unused)]
 fn read_in_commit_timestamp(
     engine: &dyn Engine,
     commit_file: &ParsedLogPath,
@@ -191,6 +189,185 @@ fn get_timestamp_search_bounds(
     Ok(result)
 }
 
+/// Gets the latest version that occurs before or at the given `timestamp`.
+///
+/// This finds the version whose timestamp is less than or equal to `timestamp`.
+/// If no such version exists, returns [`LogHistoryError::TimestampOutOfRange`].
+///
+////// # Examples
+/// ```rust
+/// # use delta_kernel::history_manager::error::LogHistoryError;
+/// # use delta_kernel::engine::default::DefaultEngine;
+/// # use test_utils::DefaultEngineExtension;
+/// # use delta_kernel::Table;
+/// # use std::sync::Arc;
+/// # use delta_kernel::history_manager::latest_version_as_of;
+/// # let path = "./tests/data/with_checkpoint_no_last_checkpoint";
+/// # let engine = DefaultEngine::new_local();
+/// let table = Table::try_from_uri(path)?;
+/// let snapshot = table.snapshot(engine.as_ref(), None)?;
+///
+/// // Get the latest version as of January 1, 2023
+/// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
+/// let version_res = latest_version_as_of(&snapshot, engine.as_ref(), timestamp);
+/// # Ok::<(), delta_kernel::Error>(())
+/// ```
+#[internal_api]
+pub(crate) fn latest_version_as_of(
+    snapshot: &Snapshot,
+    engine: &dyn Engine,
+    timestamp: Timestamp,
+) -> DeltaResult<Version> {
+    Ok(timestamp_to_version(
+        snapshot,
+        engine,
+        timestamp,
+        Bound::GreatestLower,
+    )?)
+}
+
+/// Gets the first version that occurs after the given `timestamp` (inclusive).
+///
+/// This finds the version whose timestamp is greater than or equal to `timestamp`.
+/// If no such version exists, returns [`LogHistoryError::TimestampOutOfRange`].
+/// # Examples
+/// ```rust
+/// # use delta_kernel::engine::default::DefaultEngine;
+/// # use test_utils::DefaultEngineExtension;
+/// # use delta_kernel::Table;
+/// # use std::sync::Arc;
+/// # use delta_kernel::history_manager::first_version_after;
+/// # let path = "./tests/data/with_checkpoint_no_last_checkpoint";
+/// # let engine = DefaultEngine::new_local();
+/// let table = Table::try_from_uri(path)?;
+/// let snapshot = table.snapshot(engine.as_ref(), None)?;
+///
+/// // Find the first version that occurred after January 1, 2023
+/// let timestamp = 1672531200000; // Milliseconds since epoch for 2023-01-01
+/// let version_res = first_version_after(&snapshot, engine.as_ref(), timestamp);
+/// # Ok::<(), delta_kernel::Error>(())
+/// ```
+#[internal_api]
+pub(crate) fn first_version_after(
+    snapshot: &Snapshot,
+    engine: &dyn Engine,
+    timestamp: Timestamp,
+) -> DeltaResult<Version> {
+    Ok(timestamp_to_version(
+        snapshot,
+        engine,
+        timestamp,
+        Bound::LeastUpper,
+    )?)
+}
+
+/// Converts a timestamp range to a corresponding version range.
+///
+/// This function finds the version range that corresponds to the given timestamp range.
+/// The returned tuple contains:
+/// - The first (earliest) version with a timestamp greater than or equal to `start_timestamp`
+/// - If `end_timestamp` is provided, the version with a timestamp less than or equal to `end_timestamp`.
+///
+/// # Arguments
+/// * `engine` - The engine used to access version history
+/// * `start_timestamp` - The lower bound timestamp (inclusive)
+/// * `end_timestamp` - The optional upper bound timestamp (inclusive), or `None` to indicate no upper bound
+///
+/// # Returns
+/// A tuple containing the start version and optional end version (inclusive)
+///
+/// # Errors
+/// Returns [`LogHistoryError::TimestampOutOfRange`] if:
+/// - No version exists at or after `start_timestamp`
+/// - `end_timestamp` is provided and no version exists at or before it
+///
+/// Returns [`LogHistoryError::InvalidTimestampRange`] if the entire range [start_timestamp,
+/// end_timestamp]
+///
+/// # Examples
+/// ```rust
+/// # use delta_kernel::engine::default::DefaultEngine;
+/// # use test_utils::DefaultEngineExtension;
+/// # use delta_kernel::Table;
+/// # use std::sync::Arc;
+/// # use delta_kernel::history_manager::timestamp_range_to_versions;
+/// # let path = "./tests/data/with_checkpoint_no_last_checkpoint";
+/// # let engine = DefaultEngine::new_local();
+///
+/// let table = Table::try_from_uri(path)?;
+/// let snapshot = table.snapshot(engine.as_ref(), None)?;
+///
+/// // Find versions between January 1, 2023 and March 1, 2023
+/// let start_timestamp = 1672531200000; // Jan 1, 2023 (milliseconds since epoch)
+/// let end_timestamp = 1677628800000;   // Mar 1, 2023 (milliseconds since epoch)
+///
+/// let version_range_res =
+///     timestamp_range_to_versions(&snapshot, engine.as_ref(), start_timestamp, end_timestamp);
+/// # Ok::<(), delta_kernel::Error>(())
+/// ```
+#[internal_api]
+pub(crate) fn timestamp_range_to_versions(
+    snapshot: &Snapshot,
+    engine: &dyn Engine,
+    start_timestamp: Timestamp,
+    end_timestamp: impl Into<Option<Timestamp>>,
+) -> DeltaResult<(Version, Option<Version>)> {
+    // Check that the start and end timestamps are valid. Timestamps must be positive
+    let end_timestamp = end_timestamp.into();
+    require!(
+        0 <= start_timestamp,
+        LogHistoryError::InvalidTimestamp(start_timestamp).into()
+    );
+    if let Some(end_timestamp) = end_timestamp {
+        require!(
+            0 <= end_timestamp,
+            LogHistoryError::InvalidTimestamp(end_timestamp).into()
+        );
+        // The `start_timestamp` must be no greater than the `end_timestamp`.
+        require!(
+            start_timestamp <= end_timestamp,
+            LogHistoryError::InvalidTimestampRange {
+                start_timestamp,
+                end_timestamp
+            }
+            .into()
+        );
+    }
+
+    // Convert the start timestamp to version
+    let start_version = first_version_after(snapshot, engine, start_timestamp)?;
+
+    // If the end timestamp is present, convert it to an end version
+    let end_version = end_timestamp
+        .map(|end| {
+            let end_version = latest_version_as_of(snapshot, engine, end)?;
+
+            // Verify that the start version is no greater than the end version. This can
+            // happen in the case that the entire timestamp range falls between two commits.
+            // Consider the following history:
+            // |-------------|--------------------|---------------|
+            // v4       start_timestamp      end_timestamp       v5
+            //
+            // The latest version as of the end_timestamp is 4. The first version after the
+            // start_timestamp is 5. Thus in the case where end_version < start_version, we
+            // return and [`LogHistoryError::EmptyTimestampRange`].
+            require!(
+                start_version <= end_version,
+                DeltaError::from(LogHistoryError::EmptyTimestampRange {
+                    end_timestamp: end,
+                    start_timestamp,
+                    between_left: end_version,
+                    between_right: start_version
+                })
+            );
+
+            Ok(end_version)
+        })
+        .transpose()?;
+
+    Ok((start_version, end_version))
+}
+
 /// Converts a timestamp to a version based on the specified bound type.
 ///
 /// This function finds the appropriate commit version that corresponds to the given timestamp
@@ -219,7 +396,6 @@ fn get_timestamp_search_bounds(
 /// happen in the following cases based on the bound:
 /// - `Bound::GreatestLower`: There is no commit whose timestamp is lower than the given `timestamp`.
 /// - `Bound::LeastUpper`: There is no commit whose timestamp is greater than the given `timestamp`.
-#[allow(unused)]
 fn timestamp_to_version(
     snapshot: &Snapshot,
     engine: &dyn Engine,
