@@ -209,8 +209,8 @@ impl LogSegment {
     /// `limit` specifies the maximum length of the returned log segment. The log segment may be
     /// shorter than `limit` if there are missing commits.
     ///
-    // This lists all files starting from `end-limit` if `limit` is defined. For large tables,
-    // listing with a `limit` can be a significant speedup over listing _all_ the files in the log.
+    /// This lists all files starting from `end-limit` if `limit` is defined. For large tables,
+    /// listing with a `limit` can be a significant speedup over listing _all_ the files in the log.
     pub(crate) fn for_timestamp_conversion(
         storage: &dyn StorageHandler,
         log_root: Url,
