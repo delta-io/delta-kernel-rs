@@ -16,7 +16,7 @@ use delta_kernel_derive::internal_api;
 ///   This represents the last element less than or equal to the search key.
 #[internal_api]
 #[allow(unused)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Bound {
     LeastUpper,
     GreatestLower,
