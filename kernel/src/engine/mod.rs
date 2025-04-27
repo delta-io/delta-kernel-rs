@@ -30,8 +30,8 @@ pub mod parquet_row_group_skipping;
 
 #[cfg(test)]
 mod tests {
+    use crate::object_store::path::Path;
     use itertools::Itertools;
-    use object_store::path::Path;
     use std::sync::Arc;
     use url::Url;
 

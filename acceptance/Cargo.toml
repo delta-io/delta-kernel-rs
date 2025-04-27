@@ -16,12 +16,12 @@ release = false
 [dependencies]
 delta_kernel = { path = "../kernel", features = [
   "default-engine",
-  "arrow_53",
+  "arrow",
   "internal-api",
 ] }
 futures = "0.3"
 itertools = "0.14"
-object_store = { workspace = true }
+object_store = "0.11" # must 'match' arrow version above
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

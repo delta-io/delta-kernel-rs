@@ -10,7 +10,6 @@ release = false
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 delta_kernel = { path = "../../../kernel", features = [
-  "cloud",
   "arrow",
   "default-engine",
 ] }

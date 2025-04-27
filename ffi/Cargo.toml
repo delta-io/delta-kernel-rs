@@ -31,7 +31,6 @@ cbindgen = "0.28"
 libc = "0.2.171"
 
 [dev-dependencies]
-object_store = { workspace = true }
 rand = "0.8.5"
 test_utils = { path = "../test-utils" }
 tokio = { version = "1.44" }
@@ -39,7 +38,6 @@ trybuild = "1.0"
 
 [features]
 default = ["default-engine"]
-cloud = ["delta_kernel/cloud"]
 default-engine = ["delta_kernel/default-engine", "delta_kernel/arrow"]
 tracing = [ "tracing-core", "tracing-subscriber" ]
 sync-engine = ["delta_kernel/sync-engine", "delta_kernel/arrow"]

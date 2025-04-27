@@ -37,13 +37,15 @@ pre-release-hook = [
 ]
 
 [dependencies]
+delta_kernel_derive = { path = "../derive-macros", version = "0.9.0" }
 bytes = "1.10"
-chrono = "=0.4.39"
+chrono = "0.4.40"
 indexmap = "2.9.0"
 itertools = "0.14"
 roaring = "0.10.12"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+strum = { version = "0.27", features = ["derive"] }
 thiserror = "2"
 # only for structured logging
 tracing = { version = "0.1", features = ["log"] }
@@ -51,57 +53,62 @@ url = "2"
 uuid = { version = "1.16.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
 
-# bring in our derive macros
-delta_kernel_derive = { path = "../derive-macros", version = "0.9.0" }
-
-# Used in the sync engine
+# optional deps
 tempfile = { version = "3", optional = true }
-
-# Arrow supported versions
-## 53
-# Used in default engine
-arrow_53 = { package = "arrow", version = "53", features = ["chrono-tz", "ffi", "json", "prettyprint"], optional = true }
-# Used in default and sync engine
-parquet_53 = { package = "parquet", version = "53", features = ["async", "object_store"] , optional = true }
-######
-## 54
-arrow_54 = { package = "arrow", version = "54", features = ["chrono-tz", "ffi", "json", "prettyprint"], optional = true }
-parquet_54 = { package = "parquet", version = "54", features = ["async", "object_store"] , optional = true }
-######
-
 futures = { version = "0.3", optional = true }
-object_store = { workspace = true, optional = true }
 # Used for fetching direct urls (like pre-signed urls)
 reqwest = { version = "0.12.15", default-features = false, optional = true }
-strum = { version = "0.27", features = ["derive"] }
-
-
 # optionally used with default engine (though not required)
 tokio = { version = "1.44", optional = true, features = ["rt-multi-thread"] }
 
-# Used in integration tests
-hdfs-native = { workspace = true, optional = true }
-walkdir = { workspace = true, optional = true }
+# arrow 54
+[dependencies.arrow_54]
+package = "arrow"
+version = "54.3"
+features = ["chrono-tz", "ffi", "json", "prettyprint"]
+optional = true
+[dependencies.parquet_54]
+package = "parquet"
+version = "54.3"
+features = ["async", "object_store"]
+optional = true
+[dependencies.object_store_54]
+package = "object_store"
+version = "0.11"
+features = ["aws", "azure", "gcp", "http"]
+optional = true
+
+# arrow 55
+[dependencies.arrow_55]
+package = "arrow"
+version = "55"
+features = ["chrono-tz", "ffi", "json", "prettyprint"]
+optional = true
+[dependencies.parquet_55]
+package = "parquet"
+version = "55"
+features = ["async", "object_store"]
+optional = true
+[dependencies.object_store_55]
+package = "object_store"
+version = "0.12"
+features = ["aws", "azure", "gcp", "http"]
+optional = true
 
 [features]
-# The default version to be expected
-arrow = ["arrow_53"]
-
-arrow_53 = ["dep:arrow_53", "dep:parquet_53"]
-
-arrow_54 = ["dep:arrow_54", "dep:parquet_54"]
-
-need_arrow = []
-arrow-conversion = ["need_arrow"]
-arrow-expression = ["need_arrow"]
-
-cloud = [
-  "object_store/aws",
-  "object_store/azure",
-  "object_store/gcp",
-  "object_store/http",
-]
+# no default features
 default = []
+# internal-api will make everything marked #[internal_api] public
+internal-api = []
+# integration-test turns on a particularly heavy test for hdfs-object-store
+integration-test = ["hdfs-native-object-store/integration-test"]
+
+# The default versions for arrow/parquet/object_store
+arrow = ["arrow-55"]
+arrow-54 = ["dep:arrow_54", "dep:parquet_54", "dep:object_store_54"]
+arrow-55 = ["dep:arrow_55", "dep:parquet_55", "dep:object_store_55"]
+arrow-conversion = ["arrow"]
+arrow-expression = ["arrow"]
 
 # this is an 'internal' feature flag which has all the shared bits from default-engine and
 # default-engine-rustls
@@ -109,30 +116,20 @@ default-engine-base = [
   "arrow-conversion",
   "arrow-expression",
   "futures",
-  "need_arrow",
-  "object_store",
+  "arrow",
   "tokio",
 ]
-
 # the default-engine use the reqwest crate with default features which uses native-tls. if you want
 # to instead use rustls, use 'default-engine-rustls' which has no native-tls dependency
 default-engine = ["default-engine-base", "reqwest/default"]
-
 default-engine-rustls = [
   "default-engine-base",
   "reqwest/rustls-tls-native-roots",
   "reqwest/http2",
 ]
-
-internal-api = []
 sync-engine = [
-  "need_arrow",
+  "arrow",
   "tempfile",
-]
-integration-test = [
-  "hdfs-native-object-store/integration-test",
-  "hdfs-native",
-  "walkdir",
 ]
 
 [build-dependencies]
@@ -142,7 +139,9 @@ rustc_version = "0.4.1"
 delta_kernel = { path = ".", features = ["arrow", "default-engine", "sync-engine"] }
 test_utils = { path = "../test-utils" }
 # Used for testing parse_url_opts extensibility
-hdfs-native-object-store = { workspace = true }
+hdfs-native-object-store = { version = "0.14.0" }
+hdfs-native = "0.11.1"
+walkdir = { version = "2.5.0" }
 async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implementation
 paste = "1.0"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }

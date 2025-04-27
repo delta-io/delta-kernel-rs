@@ -554,7 +554,9 @@ impl Scan {
                     .get_selection_vector(engine.as_ref(), &table_root)?;
                 let meta = FileMeta {
                     last_modified: 0,
-                    size: scan_file.size as usize,
+                    size: scan_file.size.try_into().map_err(|_| {
+                        Error::generic("Unable to convert scan file size into FileSize")
+                    })?,
                     location: file_path,
                 };
 

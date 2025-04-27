@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use self::storage::parse_url_opts;
-use object_store::DynObjectStore;
+use crate::object_store::DynObjectStore;
 use url::Url;
 
 use self::executor::TaskExecutor;
@@ -171,7 +171,7 @@ mod tests {
     use super::executor::tokio::TokioBackgroundExecutor;
     use super::*;
     use crate::engine::tests::test_arrow_engine;
-    use object_store::local::LocalFileSystem;
+    use crate::object_store::local::LocalFileSystem;
 
     #[test]
     fn test_default_engine() {

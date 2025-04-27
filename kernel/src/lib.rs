@@ -88,9 +88,11 @@ pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
 
-pub mod arrow;
+mod arrow_compat;
+#[cfg(any(feature = "arrow-54", feature = "arrow-55"))]
+pub use arrow_compat::*;
+
 pub(crate) mod kernel_predicates;
-pub mod parquet;
 pub(crate) mod utils;
 
 internal_mod!(pub(crate) mod path);
@@ -134,9 +136,11 @@ macro_rules! internal_mod {
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
+pub type FileSize = u64;
+pub type FileIndex = u64;
 
 /// A specification for a range of bytes to read from a file location
-pub type FileSlice = (Url, Option<Range<usize>>);
+pub type FileSlice = (Url, Option<Range<FileIndex>>);
 
 /// Data read from a Delta table file and the corresponding scan file information.
 pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
@@ -153,7 +157,7 @@ pub struct FileMeta {
     /// The last modified time as milliseconds since unix epoch
     pub last_modified: i64,
     /// The size in bytes of the object
-    pub size: usize,
+    pub size: FileSize,
 }
 
 impl Ord for FileMeta {
@@ -185,17 +189,22 @@ impl TryFrom<DirEntry> for FileMeta {
                 last_modified.as_millis()
             ))
         })?;
+        // TODO: remove after arrow 54 is dropped
+        #[allow(clippy::useless_conversion)]
         Ok(FileMeta {
             location,
             last_modified,
-            size: metadata.len() as usize,
+            size: metadata
+                .len()
+                .try_into()
+                .map_err(|_| Error::generic("unable to convert DirEntry metadata to file size"))?,
         })
     }
 }
 
 impl FileMeta {
     /// Create a new instance of `FileMeta`
-    pub fn new(location: Url, last_modified: i64, size: usize) -> Self {
+    pub fn new(location: Url, last_modified: i64, size: u64) -> Self {
         Self {
             location,
             last_modified,

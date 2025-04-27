@@ -46,7 +46,7 @@ consumer's own `Engine` trait, the kernel has a feature flag to enable a default
 delta_kernel = "0.9.0"
 
 # or turn on the default engine, based on arrow
-delta_kernel = { version = "0.9.0", features = ["default-engine"] }
+delta_kernel = { version = "0.9.0", features = ["default-engine", "arrow-55"] }
 ```
 
 ### Feature flags
@@ -77,16 +77,16 @@ versions as we can.
 We allow selecting the version of arrow to use via feature flags. Currently we support the following
 flags:
 
-- `arrow_53`: Use arrow version 53
-- `arrow_54`: Use arrow version 54
+- `arrow-54`: Use arrow version 54
+- `arrow-55`: Use arrow version 55
 
-Note that if more than one `arrow_x` feature is enabled, kernel will default to the _lowest_
+Note that if more than one `arrow-x` feature is enabled, kernel will default to the _lowest_
 specified flag. This also means that if you use `--all-features` you will get the lowest version of
 arrow that kernel supports.
 
-If no arrow feature is enabled, but are least one of `default-engine`, `sync-engine`,
-`arrow-conversion` or, `arrow-expression` is enabled, the lowest supported arrow version will be
-enabled.
+If you enable at least one of `default-engine`, `sync-engine`, `arrow-conversion`, or
+`arrow-expression`, you must enable either `arrow` (we pick default version) or `arrow-54` or
+`arrow-55`.
 
 ### Object Store
 You may also need to patch the `object_store` version used if the version of `parquet` you depend on
