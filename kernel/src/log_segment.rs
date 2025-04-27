@@ -191,7 +191,6 @@ impl LogSegment {
         LogSegment::try_new(ascending_commit_files, vec![], log_root, end_version)
     }
 
-    #[allow(unused)]
     /// Constructs a [`LogSegment`] to be used for timestamp conversion. This [`LogSegment`] will consist
     /// only of contiguous commit files. If an `end_version` is specified, the commit range will
     /// include commits up to the `end_version` commit (inclusive). If present, `limit` specifies the
