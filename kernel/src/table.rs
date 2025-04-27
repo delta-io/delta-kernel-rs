@@ -9,6 +9,7 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::checkpoint::CheckpointWriter;
+use crate::history_manager::LogHistoryManager;
 use crate::snapshot::Snapshot;
 use crate::table_changes::TableChanges;
 use crate::transaction::Transaction;
@@ -76,6 +77,46 @@ impl Table {
         &self.location
     }
 
+    /// Creates a [`LogHistoryManager`] from an existing [`Snapshot`].
+    ///
+    /// This method allows reusing an existing snapshot to create a history manager
+    /// that can resolve timestamps for commits up to and including `snapshot.version()`.
+    ///
+    /// # Parameters
+    /// - `engine`: The [`Engine`] implementation to use for data access
+    /// - `snapshot`: An existing snapshot to initialize the history manager with
+    /// - `limit`: Optional maximum number of versions to track. When specified, the earliest
+    ///            queryable version will be `snapshot.version() - limit`. This allows trading
+    ///            memory usage for historical reach.
+    pub fn history_manager_from_snapshot(
+        &self,
+        engine: &dyn Engine,
+        snapshot: Arc<Snapshot>,
+        limit: Option<usize>,
+    ) -> DeltaResult<LogHistoryManager> {
+        LogHistoryManager::try_new(engine, snapshot, limit)
+    }
+
+    /// Creates a [`LogHistoryManager`] for the latest table version.
+    ///
+    /// This method creates a new snapshot at the latest table version
+    /// and initializes a history manager that can resolve timestamps for commits
+    /// up to and including the current latest version.
+    ///
+    /// # Parameters
+    /// - `engine`: The [`Engine`] implementation to use for data access
+    /// - `limit`: Optional maximum number of versions to track. When specified, the earliest
+    ///            queryable version will be `latest_version - limit`. This allows trading
+    ///            memory usage for historical reach.
+    pub fn history_manager(
+        &self,
+        engine: &dyn Engine,
+        limit: Option<usize>,
+    ) -> DeltaResult<LogHistoryManager> {
+        let snapshot = Arc::new(self.snapshot(engine, None)?);
+        LogHistoryManager::try_new(engine, snapshot, limit)
+    }
+
     /// Create a [`Snapshot`] of the table corresponding to `version`.
     ///
     /// If no version is supplied, a snapshot for the latest version will be created.
@@ -103,7 +144,7 @@ impl Table {
     /// Creates a [`CheckpointWriter`] for generating checkpoints at the specified table version.
     ///
     /// See the [`crate::checkpoint`] module documentation for more details on checkpoint types
-    /// and the overall checkpoint process.    
+    /// and the overall checkpoint process.
     ///
     /// # Parameters
     /// - `engine`: Implementation of [`Engine`] apis.

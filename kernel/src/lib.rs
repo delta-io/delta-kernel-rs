@@ -78,6 +78,7 @@ pub mod checkpoint;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
+pub mod history_manager;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -95,7 +96,6 @@ pub use arrow_compat::*;
 pub(crate) mod kernel_predicates;
 pub(crate) mod utils;
 
-internal_mod!(pub(crate) mod history_manager);
 internal_mod!(pub(crate) mod path);
 internal_mod!(pub(crate) mod log_replay);
 internal_mod!(pub(crate) mod log_segment);

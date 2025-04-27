@@ -14,14 +14,12 @@ use crate::{DeltaResult, Error, RowVisitor};
 ///
 /// Only one row of the engine data is checked because CommitInfo. This is because in-commit
 /// timestamps requires that the CommitInfo containing the ICT be the first action in the log.
-#[allow(unused)]
 #[derive(Default)]
 pub(crate) struct InCommitTimestampVisitor {
     pub(crate) in_commit_timestamp: Option<i64>,
 }
 
 impl InCommitTimestampVisitor {
-    #[allow(unused)]
     /// Get the schema that the visitor expects the data to have.
     pub(crate) fn schema() -> Arc<Schema> {
         static SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
