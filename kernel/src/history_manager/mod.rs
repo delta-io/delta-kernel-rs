@@ -1,13 +1,15 @@
 use error::LogHistoryError;
+use error::TimestampOutOfRangeError;
+use search::{binary_search_by_key_with_bounds, Bound, SearchError};
+use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::snapshot::Snapshot;
-use crate::Error as DeltaError;
-use crate::RowVisitor;
-use crate::{DeltaResult, Engine};
+use crate::utils::require;
+use crate::{DeltaResult, Engine, Error as DeltaError, RowVisitor, Version};
 use timestamp_visitor::InCommitTimestampVisitor;
 
 mod timestamp_visitor;
@@ -49,6 +51,19 @@ pub(crate) struct LogHistoryManager {
     snapshot: Arc<Snapshot>,
 }
 
+#[allow(unused)]
+#[derive(Debug)]
+enum TimestampSearchBounds {
+    ExactMatch(Version),
+    ICTSearchStartingFrom(usize),
+    FileModificationSearch,
+    FileModificationSearchUntil {
+        index: usize,
+        ict_enablement_version: Version,
+    },
+}
+
+/// When doing a search for ICT, we only consider the latest ICT range to be valid
 impl LogHistoryManager {
     /// Creates a new [`LogHistoryManager`] instance that can query for timestamps up to the
     /// provided snapshot's version.
@@ -149,6 +164,148 @@ impl LogHistoryManager {
         visitor.visit_rows_of(batch.as_ref()).map_err(wrap_err)?;
         visitor.in_commit_timestamp.ok_or_else(not_found)
     }
+
+    /// Given a timestamp, this function determines the commit range that timestamp conversion
+    /// should search. A timestamp search may be conducted over one of two version ranges:
+    ///     1) A range of commits whose timestamp is the file modification timestamp
+    ///     2) A range of commits whose timestamp is an in-commit timestamp.
+    #[allow(unused)]
+    fn get_timestamp_search_bounds(
+        &self,
+        timestamp: Timestamp,
+    ) -> Result<TimestampSearchBounds, LogHistoryError> {
+        let table_config = self.snapshot.table_configuration();
+
+        // Get the In-commit timestamp (ICT) enablement version and timestamp. If ICT is not
+        // supported or enabled, we perform a regular file modification search.
+        let Some((ict_version, ict_timestamp)) = table_config
+            .in_commit_timestamp_enablement()
+            .map_err(|err| LogHistoryError::InvalidTableConfiguration(Box::new(err)))?
+        else {
+            return Ok(TimestampSearchBounds::FileModificationSearch);
+        };
+
+        // Helper function to get the of index at which ict was enabled if it is present in this
+        // LogSegment
+        let version_idx = || {
+            self.log_segment
+                .ascending_commit_files
+                .binary_search_by(|x| x.version.cmp(&ict_version))
+                .unwrap_or_else(|idx| idx)
+        };
+
+        // Based on the in-commit timestamp enablement, determine the search bounds. If the
+        // desired timestamp is in the ICT range, we must _only_ search over commits with ICT
+        // enabled. Otherwise, the timestamp range must only consist of commits that use file
+        // modification time as the timestamp.
+        let result = match timestamp.cmp(&ict_timestamp) {
+            Ordering::Equal => TimestampSearchBounds::ExactMatch(ict_version),
+            Ordering::Less => TimestampSearchBounds::FileModificationSearchUntil {
+                index: version_idx(),
+                ict_enablement_version: ict_version,
+            },
+            Ordering::Greater => TimestampSearchBounds::ICTSearchStartingFrom(version_idx()),
+        };
+        Ok(result)
+    }
+
+    /// Converts a timestamp to a version based on the specified bound type.
+    ///
+    /// This function finds the appropriate commit version that corresponds to the given timestamp
+    /// according to the bound parameter:
+    ///
+    /// - `Bound::GreatestLower`: Returns the version with the greatest timestamp that is less than or equal to
+    ///   the given timestamp (the version immediately before or at the timestamp).
+    /// - `Bound::LeastUpper`: Returns the version with the smallest timestamp that is greater than or equal to
+    ///   the given timestamp (the version immediately at or after the timestamp).
+    ///
+    /// # Visual Example:
+    /// ```ignore
+    /// versions:    v0                    v1                    v2
+    ///              |----------|----------|----------|----------|
+    /// timestamp:              t1                    t2
+    /// ```
+    ///
+    /// # Results Table:
+    /// | Timestamp | GreatestLower | LeastUpper |
+    /// |-----------|---------------|------------|
+    /// | t1        | v0            | v1         |
+    /// | t2        | v1            | v2         |
+    ///
+    /// # Errors
+    /// Returns [`LogHistoryError::TimestampOutOfRange`] if the timestamp is out of range. This can
+    /// happen in the following cases based on the bound:
+    /// - `Bound::GreatestLower`: There is no commit whose timestamp is lower than the given `timestamp`.
+    /// - `Bound::LeastUpper`: There is no commit whose timestamp is greater than the given `timestamp`.
+    #[allow(unused)]
+    fn timestamp_to_version(
+        &self,
+        engine: &dyn Engine,
+        timestamp: Timestamp,
+        bound: Bound,
+    ) -> Result<Version, LogHistoryError> {
+        require!(timestamp >= 0, LogHistoryError::InvalidTimestamp(timestamp));
+        let len = self.log_segment.ascending_commit_files.len();
+
+        // Determine the type of timestamp search. The search may either be over file modification
+        // timestamps or over In-Commit Timestamps.
+        let search_bounds = self.get_timestamp_search_bounds(timestamp)?;
+        let (lo, hi, read_ict) = match search_bounds {
+            TimestampSearchBounds::ExactMatch(version) => return Ok(version),
+            TimestampSearchBounds::ICTSearchStartingFrom(lo) => (lo, len, true),
+            TimestampSearchBounds::FileModificationSearch => (0, len, false),
+            TimestampSearchBounds::FileModificationSearchUntil { index: hi, .. } => (0, hi, false),
+        };
+        debug_assert!(lo < hi, "Index range should be non-empty");
+
+        // Declare the key function of the search that finds the timestamp given a commit.
+        let commit_to_ts = |commit| self.commit_file_to_timestamp(engine, commit, read_ict);
+
+        // We only search in the range [lo..hi).
+        let commit_range = &self.log_segment.ascending_commit_files[lo..hi];
+        let search_result =
+            binary_search_by_key_with_bounds(commit_range, timestamp, commit_to_ts, bound);
+
+        // Get the index from the commit range if successful
+        let relative_idx = match search_result {
+            Ok(idx) => idx,
+            Err(SearchError::OutOfRange) => {
+                // Special case: If searching for Least Upper Bound over file modification
+                // timestamp range, and no version was found, then use the in-commit timestamp
+                // enablement version. This is because the enablement version bounds all file
+                // modification timestamps from above.
+                if let (
+                    TimestampSearchBounds::FileModificationSearchUntil {
+                        ict_enablement_version,
+                        ..
+                    },
+                    Bound::LeastUpper,
+                ) = (search_bounds, bound)
+                {
+                    return Ok(ict_enablement_version);
+                }
+
+                return Err(LogHistoryError::TimestampOutOfRange(
+                    TimestampOutOfRangeError::try_new(
+                        commit_range,
+                        timestamp,
+                        commit_to_ts,
+                        bound,
+                        read_ict,
+                    )?,
+                ));
+            }
+            Err(SearchError::KeyFunctionError(error)) => {
+                // Commit to timestamp conversion failed. Return the error
+                return Err(error);
+            }
+        };
+
+        // `relative_idx` holds for the range [lo..hi]. Add back `lo`
+        let idx = lo + relative_idx;
+        debug_assert!(idx < len, "Relative index should become a valid index");
+        Ok(self.log_segment.ascending_commit_files[idx].version)
+    }
 }
 
 #[cfg(test)]
@@ -166,7 +323,10 @@ mod tests {
     use test_utils::delta_path_for_version;
     use url::Url;
 
-    use super::{LogHistoryError, LogHistoryManager, Timestamp};
+    use super::{
+        Bound, LogHistoryError, LogHistoryManager, Timestamp, TimestampOutOfRangeError,
+        TimestampSearchBounds,
+    };
 
     // Helper to set the file modification timestamp of a file
     fn set_mod_time(mock_table: &LocalMockTable, commit_version: Version, timestamp: Timestamp) {
@@ -242,6 +402,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timestamp_search_bounds_no_ict() {
+        let mock_table = mock_table().await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(mock_table.table_root()).unwrap();
+
+        // Set the end version to a time before In-commit timestamps were enabled
+        let snapshot = Snapshot::try_new(path, &engine, Some(2)).unwrap();
+        let manager = LogHistoryManager::try_new(&engine, snapshot.into(), None).unwrap();
+
+        // Before all commits
+        let mut res = manager.get_timestamp_search_bounds(0);
+        assert!(matches!(
+            res,
+            Ok(TimestampSearchBounds::FileModificationSearch)
+        ));
+
+        // Within the timestamp range
+        res = manager.get_timestamp_search_bounds(100);
+        assert!(matches!(
+            res,
+            Ok(TimestampSearchBounds::FileModificationSearch)
+        ));
+
+        // After all commits
+        res = manager.get_timestamp_search_bounds(1000);
+        assert!(matches!(
+            res,
+            Ok(TimestampSearchBounds::FileModificationSearch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn timestamp_search_bounds_with_ict_range() {
+        let mock_table = mock_table().await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(mock_table.table_root()).unwrap();
+        let snapshot = Snapshot::try_new(path, &engine, None).unwrap();
+        let manager = LogHistoryManager::try_new(&engine, snapshot.into(), None).unwrap();
+
+        // Exact match only applies to in-commit timestamp enablement version
+        let mut res = manager.get_timestamp_search_bounds(50);
+        assert!(
+            matches!(
+                res,
+                Ok(TimestampSearchBounds::FileModificationSearchUntil {
+                    index: 3,
+                    ict_enablement_version: 3
+                })
+            ),
+            "{res:?}"
+        );
+
+        // Not exact match, file modification time range
+        res = manager.get_timestamp_search_bounds(60);
+        assert!(
+            matches!(
+                res,
+                Ok(TimestampSearchBounds::FileModificationSearchUntil {
+                    index: 3,
+                    ict_enablement_version: 3
+                })
+            ),
+            "{res:?}"
+        );
+
+        // Edge case: The last timestamp that is file modification time
+        res = manager.get_timestamp_search_bounds(299);
+        assert!(
+            matches!(
+                res,
+                Ok(TimestampSearchBounds::FileModificationSearchUntil {
+                    index: 3,
+                    ict_enablement_version: 3
+                })
+            ),
+            "{res:?}"
+        );
+
+        // Edge case: Timestamp is the enablement timestamp
+        res = manager.get_timestamp_search_bounds(300);
+        assert!(
+            matches!(res, Ok(TimestampSearchBounds::ExactMatch(3))),
+            "{res:?}"
+        );
+
+        // Edge case: The timestamp is 1 + enablement_timestamp. This returns the beginning of the
+        // in-commit timestamp index range.
+        res = manager.get_timestamp_search_bounds(301);
+        assert!(
+            matches!(res, Ok(TimestampSearchBounds::ICTSearchStartingFrom(3))),
+            "{res:?}"
+        );
+
+        // Timestamp is much larger than the last in-commit timestamp
+        res = manager.get_timestamp_search_bounds(1000);
+        assert!(
+            matches!(res, Ok(TimestampSearchBounds::ICTSearchStartingFrom(3))),
+            "{res:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn reading_in_commit_timestamp() {
         let mock_table = mock_table().await;
         let engine = SyncEngine::new();
@@ -306,5 +568,85 @@ mod tests {
         assert!(matches!(ts, Ok(300)));
         let ts = manager.commit_file_to_timestamp(&engine, &commits[4], true);
         assert!(matches!(ts, Ok(400)));
+    }
+
+    #[tokio::test]
+    async fn convert_timestamp_to_version() {
+        let mock_table = mock_table().await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(mock_table.table_root()).unwrap();
+        let snapshot = Snapshot::try_new(path, &engine, None).unwrap();
+        let manager = LogHistoryManager::try_new(&engine, snapshot.into(), None).unwrap();
+
+        // Less than the lowest ICT
+        let mut res = manager.timestamp_to_version(&engine, 0, Bound::LeastUpper);
+        assert!(matches!(res, Ok(0)), "{res:?}");
+
+        // Negative timestamps are not allowed:
+        res = manager.timestamp_to_version(&engine, -1, Bound::LeastUpper);
+        assert!(
+            matches!(res, Err(LogHistoryError::InvalidTimestamp(-1))),
+            "{res:?}"
+        );
+
+        // GreatestLower Bound on timestamp that is less that all commits fails
+        res = manager.timestamp_to_version(&engine, 0, Bound::GreatestLower);
+        assert!(
+            matches!(
+                res,
+                Err(LogHistoryError::TimestampOutOfRange(
+                    TimestampOutOfRangeError {
+                        timestamp: 0,
+                        nearest_timestamp: 50,
+                        nearest_version: 0,
+                        bound: Bound::GreatestLower,
+                        _read_ict: false
+                    }
+                ))
+            ),
+            "{res:?}"
+        );
+
+        // GreatestLower bound on timestamp that is greater than all commits succeeds
+        res = manager.timestamp_to_version(&engine, 1000, Bound::GreatestLower);
+        assert!(matches!(res, Ok(4)), "{res:?}");
+
+        // LeastUpper Bound on timestamp that is greater than all commits fails
+        res = manager.timestamp_to_version(&engine, 1000, Bound::LeastUpper);
+        assert!(
+            matches!(
+                res,
+                Err(LogHistoryError::TimestampOutOfRange(
+                    TimestampOutOfRangeError {
+                        timestamp: 1000,
+                        nearest_timestamp: 400,
+                        nearest_version: 4,
+                        bound: Bound::LeastUpper,
+                        _read_ict: true
+                    }
+                ))
+            ),
+            "{res:?}"
+        );
+
+        // Edge cases: timestamp is between file modification time and in-commit timestamp
+
+        // Right after last file modification timestamp
+        res = manager.timestamp_to_version(&engine, 251, Bound::LeastUpper);
+        assert!(matches!(res, Ok(3)), "{res:?}");
+        res = manager.timestamp_to_version(&engine, 251, Bound::GreatestLower);
+        assert!(matches!(res, Ok(2)), "{res:?}");
+
+        // Right before first in-commit timestamp
+        res = manager.timestamp_to_version(&engine, 299, Bound::LeastUpper);
+        assert!(matches!(res, Ok(3)), "{res:?}");
+        res = manager.timestamp_to_version(&engine, 299, Bound::GreatestLower);
+        assert!(matches!(res, Ok(2)), "{res:?}");
+
+        // Right after first in-commit timestamp
+        res = manager.timestamp_to_version(&engine, 301, Bound::GreatestLower);
+        assert!(matches!(res, Ok(3)), "{res:?}");
+        res = manager.timestamp_to_version(&engine, 301, Bound::LeastUpper);
+        assert!(matches!(res, Ok(4)), "{res:?}");
     }
 }
