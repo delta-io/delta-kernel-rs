@@ -286,22 +286,23 @@ impl CheckpointWriter {
         })
     }
 
-    /// Finalizes checkpoint creation after verifying all data is persisted.
+    /// Finalizes checkpoint creation by saving metadata about the checkpoint.
     ///
+    /// # Important
     /// This method **must** be called only after:
-    /// 1. The checkpoint data iterator has been fully consumed
+    /// 1. The checkpoint data iterator has been fully exhausted
     /// 2. All data has been successfully written to object storage
     ///
     /// # Parameters
     /// - `engine`: Implementation of [`Engine`] apis.
     /// - `metadata`: The metadata of the written checkpoint file
-    /// - `checkpoint_data`: The exhausted checkpoint data iterator (must be fully consumed)
+    /// - `checkpoint_data`: The exhausted checkpoint data iterator
     ///
     /// # Returns: [`variant@Ok`] if the checkpoint was successfully finalized
     // Internally, this method:
-    // 1. Validates that the checkpoint data iterator is fully consumed
+    // 1. Validates that the checkpoint data iterator is fully exhausted
     // 2. Creates the `_last_checkpoint` data with `create_last_checkpoint_data`
-    // 3. Writes the `_last_checkpoint` data to the `_last_checkpoint` file in the table's log
+    // 3. Writes the `_last_checkpoint` data to the `_last_checkpoint` file in the delta log
     #[allow(unused)]
     fn finalize(
         self,
@@ -309,16 +310,15 @@ impl CheckpointWriter {
         metadata: &FileMeta,
         checkpoint_data: CheckpointDataIterator,
     ) -> DeltaResult<()> {
-        // Ensure the checkpoint data iterator is fully consumed
+        // Ensure the checkpoint data iterator is fully exhausted
         if checkpoint_data
             .checkpoint_batch_iterator
             .peekable()
             .peek()
             .is_some()
         {
-            return Err(Error::CheckpointWrite(
-                "The checkpoint data must be fully consumed from the iterator and written to storage before calling finalize"
-                    .to_string(),
+            return Err(Error::checkpoint_write(
+                "The checkpoint data must be fully exhausted from the iterator and written to storage before calling finalize"
             ));
         }
 

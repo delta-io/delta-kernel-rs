@@ -401,6 +401,37 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     Ok(())
 }
 
+#[test]
+fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaResult<()> {
+    let (store, _) = new_in_memory_store();
+    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+    // 1st commit (version 0) - metadata and protocol actions
+    write_commit_to_store(
+        &store,
+        vec![create_basic_protocol_action(), create_metadata_action()],
+        0,
+    )?;
+
+    let table_root = Url::parse("memory:///")?;
+    let table = Table::new(table_root);
+    let writer = table.checkpoint(&engine, Some(0))?;
+    let data_iter = writer.checkpoint_data(&engine)?;
+
+    /* The returned data iterator has batches that we do not consume */
+
+    let size_in_bytes = 10;
+    let metadata = FileMeta {
+        location: Url::parse("memory:///fake_path_2")?,
+        last_modified: 0,
+        size: size_in_bytes,
+    };
+
+    // Attempt to finalize the checkpoint with an iterator that has not been fully consumed
+    assert!(writer.finalize(&engine, &metadata, data_iter).is_err());
+
+    Ok(())
+}
 /// Tests the `checkpoint()` API with:
 /// - A table that does supports v2Checkpoint
 /// - No version specified (latest version is used)
