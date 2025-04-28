@@ -27,6 +27,32 @@ mod tests;
 
 // TODO leverage scalars / Datum
 
+// NOTE: This trait is a disgusting hack, needed because [`array::StructBuilder::field_builders`]
+// was not added until arrow-55. Once we drop support for older arrow versions, we can change
+// [`Scalar::append`] below to take `&mut dyn ArrayBuilder` directly and cast it as needed.
+trait ArrayBuilderAs {
+    fn array_builder_as<T: ArrayBuilder>(&mut self) -> Option<&mut T>;
+}
+
+impl ArrayBuilderAs for Box<dyn ArrayBuilder> {
+    fn array_builder_as<T: ArrayBuilder>(&mut self) -> Option<&mut T> {
+        self.as_any_mut().downcast_mut()
+    }
+}
+
+#[cfg(feature = "arrow-54")]
+struct StructFieldBuilder<'a> {
+    builder: &'a mut array::StructBuilder,
+    field_index: usize,
+}
+
+#[cfg(feature = "arrow-54")]
+impl<'a> ArrayBuilderAs for StructFieldBuilder<'a> {
+    fn array_builder_as<T: ArrayBuilder>(&mut self) -> Option<&mut T> {
+        self.builder.field_builder::<T>(self.field_index)
+    }
+}
+
 impl Scalar {
     /// Convert scalar to arrow array.
     pub fn to_array(&self, num_rows: usize) -> DeltaResult<ArrayRef> {
@@ -36,11 +62,11 @@ impl Scalar {
         Ok(builder.finish())
     }
 
-    fn append(&self, builder: &mut dyn ArrayBuilder, num_rows: usize) -> DeltaResult<()> {
+    fn append(&self, builder: &mut impl ArrayBuilderAs, num_rows: usize) -> DeltaResult<()> {
         use Scalar::*;
         macro_rules! builder_as {
             ($t:ty) => {{
-                builder.as_any_mut().downcast_mut::<$t>().ok_or_else(|| {
+                builder.array_builder_as::<$t>().ok_or_else(|| {
                     Error::invalid_expression(format!("Invalid builder for {}", self.data_type()))
                 })?
             }};
@@ -90,9 +116,24 @@ impl Scalar {
                     Error::generic("Struct builder has wrong number of fields")
                 );
                 for _ in 0..num_rows {
-                    let field_builders = builder.field_builders_mut().iter_mut();
-                    for (builder, value) in field_builders.zip(data.values()) {
-                        value.append(builder, 1)?;
+                    #[cfg(not(feature = "arrow-54"))]
+                    {
+                        let field_builders = builder.field_builders_mut().iter_mut();
+                        for (builder, value) in field_builders.zip(data.values()) {
+                            value.append(builder, 1)?;
+                        }
+                    }
+
+                    // TODO: Get rid of this hideous disgusting hack when we drop arrow-54 support.
+                    #[cfg(feature = "arrow-54")]
+                    {
+                        for (field_index, value) in data.values().iter().enumerate() {
+                            // NOTE: We can't ask for dyn ArrayBuilder directly (not sized), nor can
+                            // we ask for GenericBuilder (the internal builder derefs to &dyn
+                            // ArrayBuilder _before_ being downcast to Any. So we have to manually
+                            let builder = &mut StructFieldBuilder { builder, field_index };
+                            value.append(builder, 1)?;
+                        }
                     }
                     builder.append(true);
                 }
