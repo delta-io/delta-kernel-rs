@@ -86,6 +86,41 @@ fn test_literal_type_array() {
 }
 
 #[test]
+fn test_literal_complex_type_array() {
+    let array_type = ArrayType::new(DeltaDataTypes::INTEGER, false);
+    let array_value = Scalar::Array(ArrayData::new(
+        array_type.clone(),
+        vec![Scalar::Integer(1), Scalar::Integer(2)],
+    ));
+    let struct_fields = vec![
+        StructField::nullable("scalar", DeltaDataTypes::INTEGER),
+        StructField::nullable("list", array_type.clone()),
+    ];
+    let struct_type = StructType::new(struct_fields.clone());
+    let struct_value = Scalar::Struct(
+        crate::expressions::StructData::try_new(
+            struct_fields.clone(),
+            vec![Scalar::Integer(42), array_value],
+        )
+        .unwrap(),
+    );
+    let nested_array_type = ArrayType::new(struct_type.clone().into(), false);
+    let nested_array_value = Scalar::Array(ArrayData::new(
+        nested_array_type.clone(),
+        vec![
+            struct_value.clone(),
+            struct_value.clone(),
+            struct_value.clone(),
+        ],
+    ))
+    .to_array(5)
+    .unwrap();
+    println!("{:?}", nested_array_value);
+    assert_eq!(nested_array_value.len(), 5);
+    panic!("boom");
+}
+
+#[test]
 fn test_invalid_array_sides() {
     let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
     let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6, 9]));

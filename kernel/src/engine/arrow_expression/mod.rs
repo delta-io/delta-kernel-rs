@@ -1,22 +1,16 @@
 //! Expression handling based on arrow-rs compute kernels.
 use std::sync::Arc;
 
-use crate::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, RecordBatch,
-    StringArray, StructArray, TimestampMicrosecondArray,
-};
-use crate::arrow::buffer::OffsetBuffer;
-use crate::arrow::compute::concat;
+use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch};
 use crate::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 
-use super::arrow_conversion::LIST_ARRAY_ROOT;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{Expression, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
+use crate::utils::require;
 use crate::{EngineData, EvaluationHandler, ExpressionEvaluator};
 
 use itertools::Itertools;
@@ -36,89 +30,111 @@ mod tests;
 impl Scalar {
     /// Convert scalar to arrow array.
     pub fn to_array(&self, num_rows: usize) -> DeltaResult<ArrayRef> {
+        let data_type = ArrowDataType::try_from(&self.data_type())?;
+        let mut builder = array::make_builder(&data_type, num_rows);
+        self.append(&mut builder, num_rows)?;
+        Ok(builder.finish())
+    }
+
+    fn append(&self, builder: &mut dyn ArrayBuilder, num_rows: usize) -> DeltaResult<()> {
         use Scalar::*;
-        let arr: ArrayRef = match self {
-            Integer(val) => Arc::new(Int32Array::from_value(*val, num_rows)),
-            Long(val) => Arc::new(Int64Array::from_value(*val, num_rows)),
-            Short(val) => Arc::new(Int16Array::from_value(*val, num_rows)),
-            Byte(val) => Arc::new(Int8Array::from_value(*val, num_rows)),
-            Float(val) => Arc::new(Float32Array::from_value(*val, num_rows)),
-            Double(val) => Arc::new(Float64Array::from_value(*val, num_rows)),
-            String(val) => Arc::new(StringArray::from(vec![val.clone(); num_rows])),
-            Boolean(val) => Arc::new(BooleanArray::from(vec![*val; num_rows])),
-            Timestamp(val) => {
-                Arc::new(TimestampMicrosecondArray::from_value(*val, num_rows).with_timezone("UTC"))
+        macro_rules! builder_as {
+            ($t:ty) => {{
+                builder.as_any_mut().downcast_mut::<$t>().ok_or_else(|| {
+                    Error::invalid_expression(format!("Invalid builder for {}", self.data_type()))
+                })?
+            }};
+        }
+
+        macro_rules! append_val_as {
+            ($t:ty, $val:expr) => {{
+                let builder = builder_as!($t);
+                for _ in 0..num_rows {
+                    builder.append_value($val)
+                }
+            }};
+        }
+
+        macro_rules! append_null_as {
+            ($t:ty) => {{
+                let builder = builder_as!($t);
+                for _ in 0..num_rows {
+                    builder.append_null()
+                }
+            }};
+        }
+
+        type GenericBuilder = Box<dyn ArrayBuilder>;
+
+        match self {
+            Integer(val) => append_val_as!(array::Int32Builder, *val),
+            Long(val) => append_val_as!(array::Int64Builder, *val),
+            Short(val) => append_val_as!(array::Int16Builder, *val),
+            Byte(val) => append_val_as!(array::Int8Builder, *val),
+            Float(val) => append_val_as!(array::Float32Builder, *val),
+            Double(val) => append_val_as!(array::Float64Builder, *val),
+            String(val) => append_val_as!(array::StringBuilder, val),
+            Boolean(val) => append_val_as!(array::BooleanBuilder, *val),
+            Timestamp(val) | TimestampNtz(val) => {
+                // timezone was already set at builder construction time
+                append_val_as!(array::TimestampMicrosecondBuilder, *val)
             }
-            TimestampNtz(val) => Arc::new(TimestampMicrosecondArray::from_value(*val, num_rows)),
-            Date(val) => Arc::new(Date32Array::from_value(*val, num_rows)),
-            Binary(val) => Arc::new(BinaryArray::from(vec![val.as_slice(); num_rows])),
-            Decimal(val) => Arc::new(
-                Decimal128Array::from_value(val.bits(), num_rows)
-                    .with_precision_and_scale(val.precision(), val.scale() as i8)?, // 0..=38
-            ),
+            Date(val) => append_val_as!(array::Date32Builder, *val),
+            Binary(val) => append_val_as!(array::BinaryBuilder, val),
+            // precision and scale were already set at builder construction time
+            Decimal(val) => append_val_as!(array::Decimal128Builder, val.bits()),
             Struct(data) => {
-                let arrays = data
-                    .values()
-                    .iter()
-                    .map(|val| val.to_array(num_rows))
-                    .try_collect()?;
-                let fields: Fields = data
-                    .fields()
-                    .iter()
-                    .map(ArrowField::try_from)
-                    .try_collect()?;
-                Arc::new(StructArray::try_new(fields, arrays, None)?)
+                let builder = builder_as!(array::StructBuilder);
+                require!(
+                    builder.num_fields() == data.fields().len(),
+                    Error::generic("Struct builder has wrong number of fields")
+                );
+                for _ in 0..num_rows {
+                    let field_builders = builder.field_builders_mut().iter_mut();
+                    for (builder, value) in field_builders.zip(data.values()) {
+                        value.append(builder, 1)?;
+                    }
+                    builder.append(true);
+                }
             }
             Array(data) => {
-                #[allow(deprecated)]
-                let values = data.array_elements();
-                let vecs: Vec<_> = values.iter().map(|v| v.to_array(num_rows)).try_collect()?;
-                let values: Vec<_> = vecs.iter().map(|x| x.as_ref()).collect();
-                let offsets: Vec<_> = vecs.iter().map(|v| v.len()).collect();
-                let offset_buffer = OffsetBuffer::from_lengths(offsets);
-                let field = ArrowField::try_from(data.array_type())?;
-                Arc::new(ListArray::new(
-                    Arc::new(field),
-                    offset_buffer,
-                    concat(values.as_slice())?,
-                    None,
-                ))
+                let builder = builder_as!(array::ListBuilder<GenericBuilder>);
+                for _ in 0..num_rows {
+                    #[allow(deprecated)]
+                    for value in data.array_elements() {
+                        value.append(builder.values(), 1)?;
+                    }
+                    builder.append(true);
+                }
             }
-            Null(DataType::BYTE) => Arc::new(Int8Array::new_null(num_rows)),
-            Null(DataType::SHORT) => Arc::new(Int16Array::new_null(num_rows)),
-            Null(DataType::INTEGER) => Arc::new(Int32Array::new_null(num_rows)),
-            Null(DataType::LONG) => Arc::new(Int64Array::new_null(num_rows)),
-            Null(DataType::FLOAT) => Arc::new(Float32Array::new_null(num_rows)),
-            Null(DataType::DOUBLE) => Arc::new(Float64Array::new_null(num_rows)),
-            Null(DataType::STRING) => Arc::new(StringArray::new_null(num_rows)),
-            Null(DataType::BOOLEAN) => Arc::new(BooleanArray::new_null(num_rows)),
-            Null(DataType::TIMESTAMP) => {
-                Arc::new(TimestampMicrosecondArray::new_null(num_rows).with_timezone("UTC"))
+            Null(DataType::INTEGER) => append_null_as!(array::Int32Builder),
+            Null(DataType::LONG) => append_null_as!(array::Int64Builder),
+            Null(DataType::SHORT) => append_null_as!(array::Int16Builder),
+            Null(DataType::BYTE) => append_null_as!(array::Int8Builder),
+            Null(DataType::FLOAT) => append_null_as!(array::Float32Builder),
+            Null(DataType::DOUBLE) => append_null_as!(array::Float64Builder),
+            Null(DataType::STRING) => append_null_as!(array::StringBuilder),
+            Null(DataType::BOOLEAN) => append_null_as!(array::BooleanBuilder),
+            Null(DataType::TIMESTAMP | DataType::TIMESTAMP_NTZ) => {
+                append_null_as!(array::TimestampMicrosecondBuilder)
             }
-            Null(DataType::TIMESTAMP_NTZ) => {
-                Arc::new(TimestampMicrosecondArray::new_null(num_rows))
+            Null(DataType::DATE) => append_null_as!(array::Date32Builder),
+            Null(DataType::BINARY) => append_null_as!(array::BinaryBuilder),
+            Null(DataType::Primitive(PrimitiveType::Decimal(_))) => {
+                append_null_as!(array::Decimal128Builder)
             }
-            Null(DataType::DATE) => Arc::new(Date32Array::new_null(num_rows)),
-            Null(DataType::BINARY) => Arc::new(BinaryArray::new_null(num_rows)),
-            Null(DataType::Primitive(PrimitiveType::Decimal(dtype))) => Arc::new(
-                Decimal128Array::new_null(num_rows)
-                    .with_precision_and_scale(dtype.precision(), dtype.scale() as i8)?, // 0..=38
-            ),
-            Null(DataType::Struct(t)) => {
-                let fields: Fields = t.fields().map(ArrowField::try_from).try_collect()?;
-                Arc::new(StructArray::new_null(fields, num_rows))
+            Null(DataType::Struct(_)) => append_null_as!(array::StructBuilder),
+            Null(DataType::Array(_)) => append_null_as!(array::ListBuilder<GenericBuilder>),
+            Null(DataType::Map(_)) => {
+                // For some reason, there is no `MapBuilder::append_null` method -- even tho
+                // StructBuilder and ListBuilder both provide it.
+                let builder = builder_as!(array::MapBuilder<GenericBuilder, GenericBuilder>);
+                for _ in 0..num_rows {
+                    builder.append(false)?;
+                }
             }
-            Null(DataType::Array(t)) => {
-                let field = ArrowField::new(LIST_ARRAY_ROOT, t.element_type().try_into()?, true);
-                Arc::new(ListArray::new_null(Arc::new(field), num_rows))
-            }
-            Null(DataType::Map { .. }) => {
-                return Err(Error::unsupported(
-                    "Scalar::to_array does not yet support Map types",
-                ));
-            }
-        };
-        Ok(arr)
+        }
+        Ok(())
     }
 }
 
