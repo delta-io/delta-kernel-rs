@@ -314,7 +314,6 @@ impl RowVisitor for RemoveVisitor {
     }
 }
 
-#[allow(unused)]
 #[derive(Default)]
 #[internal_api]
 pub(crate) struct CdcVisitor {

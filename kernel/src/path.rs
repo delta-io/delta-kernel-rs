@@ -22,20 +22,12 @@ const UUID_PART_LEN: usize = 36;
 pub(crate) enum LogPathFileType {
     Commit,
     SinglePartCheckpoint,
-    #[allow(unused)]
     UuidCheckpoint(String),
     // NOTE: Delta spec doesn't actually say, but checkpoint part numbers are effectively 31-bit
     // unsigned integers: Negative values are never allowed, but Java integer types are always
     // signed. Approximate that as u32 here.
-    #[allow(unused)]
-    MultiPartCheckpoint {
-        part_num: u32,
-        num_parts: u32,
-    },
-    #[allow(unused)]
-    CompactedCommit {
-        hi: Version,
-    },
+    MultiPartCheckpoint { part_num: u32, num_parts: u32 },
+    CompactedCommit { hi: Version },
     Unknown,
 }
 
@@ -43,9 +35,7 @@ pub(crate) enum LogPathFileType {
 #[internal_api]
 pub(crate) struct ParsedLogPath<Location: AsUrl = FileMeta> {
     pub location: Location,
-    #[allow(unused)]
     pub filename: String,
-    #[allow(unused)]
     pub extension: String,
     pub version: Version,
     pub file_type: LogPathFileType,
