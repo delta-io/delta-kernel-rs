@@ -79,13 +79,17 @@ flags:
 
 - `arrow-54`: Use arrow version 54
 - `arrow-55`: Use arrow version 55
+- `arrow`: Use the latest arrow version. Note that this is an _unstable_ flag: we will bump this to
+  the latest arrow version at every arrow version release. Only removing old arrow versions will
+  cause a breaking change for kernel. If you require a specific version N of arrow, you should
+  specify it directly with `arrow-N`, e.g. `arrow-55`.
 
-Note that if more than one `arrow-x` feature is enabled, kernel will default to the _lowest_
-specified flag. This also means that if you use `--all-features` you will get the lowest version of
+Note that if more than one `arrow-x` feature is enabled, kernel will use the _highest_ (latest)
+specified flag. This also means that if you use `--all-features` you will get the latest version of
 arrow that kernel supports.
 
 If you enable at least one of `default-engine`, `sync-engine`, `arrow-conversion`, or
-`arrow-expression`, you must enable either `arrow` (we pick default version) or `arrow-54` or
+`arrow-expression`, you must enable either `arrow` (latest arrow version) or `arrow-54` or
 `arrow-55`.
 
 ### Object Store
