@@ -8,11 +8,11 @@ use std::task::Poll;
 use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::arrow::json::ReaderBuilder;
 use crate::arrow::record_batch::RecordBatch;
+use crate::object_store::path::Path;
+use crate::object_store::{self, DynObjectStore, GetResultPayload, PutMode};
 use bytes::{Buf, Bytes};
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
-use object_store::path::Path;
-use object_store::{DynObjectStore, GetResultPayload};
 use tracing::warn;
 use url::Url;
 
@@ -137,19 +137,20 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         &self,
         path: &Url,
         data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + '_>,
-        _overwrite: bool,
+        overwrite: bool,
     ) -> DeltaResult<()> {
         let buffer = to_json_bytes(data)?;
-        // Put if absent
+        let put_mode = if overwrite {
+            PutMode::Overwrite
+        } else {
+            PutMode::Create
+        };
+
         let store = self.store.clone(); // cheap Arc
         let path = Path::from_url_path(path.path())?;
         let path_str = path.to_string();
         self.task_executor
-            .block_on(async move {
-                store
-                    .put_opts(&path, buffer.into(), object_store::PutMode::Create.into())
-                    .await
-            })
+            .block_on(async move { store.put_opts(&path, buffer.into(), put_mode.into()).await })
             .map_err(|e| match e {
                 object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path_str),
                 e => e.into(),
@@ -257,15 +258,16 @@ mod tests {
     use crate::engine::default::executor::tokio::{
         TokioBackgroundExecutor, TokioMultiThreadExecutor,
     };
-    use crate::utils::test_utils::string_array_to_engine_data;
-    use futures::future;
-    use itertools::Itertools;
-    use object_store::local::LocalFileSystem;
-    use object_store::memory::InMemory;
-    use object_store::{
+    use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::{
         GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
         PutMultipartOpts, PutOptions, PutPayload, PutResult, Result,
     };
+    use crate::utils::test_utils::string_array_to_engine_data;
+    use futures::future;
+    use itertools::Itertools;
+    use serde_json::json;
 
     // TODO: should just use the one from test_utils, but running into dependency issues
     fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
@@ -423,11 +425,11 @@ mod tests {
             self.inner.get_opts(location, options).await
         }
 
-        async fn get_range(&self, location: &Path, range: Range<usize>) -> Result<Bytes> {
+        async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
             self.inner.get_range(location, range).await
         }
 
-        async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
             self.inner.get_ranges(location, ranges).await
         }
 
@@ -439,7 +441,7 @@ mod tests {
             self.inner.delete(location).await
         }
 
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
             self.inner.list(prefix)
         }
 
@@ -447,7 +449,7 @@ mod tests {
             &self,
             prefix: Option<&Path>,
             offset: &Path,
-        ) -> BoxStream<'_, Result<ObjectMeta>> {
+        ) -> BoxStream<'static, Result<ObjectMeta>> {
             self.inner.list_with_offset(prefix, offset)
         }
 
@@ -529,10 +531,12 @@ mod tests {
         let location = Path::from(url.path());
         let meta = store.head(&location).await.unwrap();
 
+        // TODO: remove after arrow 54 support is dropped
+        #[allow(clippy::useless_conversion)]
         let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp_millis(),
-            size: meta.size,
+            size: meta.size.try_into().unwrap(),
         }];
 
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
@@ -678,10 +682,12 @@ mod tests {
                         let url = Url::parse(&format!("memory:/{}", path)).unwrap();
                         let location = Path::from(path.as_ref());
                         let meta = store.head(&location).await.unwrap();
+                        // TODO: remove after dropping support for arrow 54
+                        #[allow(clippy::useless_conversion)]
                         FileMeta {
                             location: url,
                             last_modified: meta.last_modified.timestamp_millis(),
-                            size: meta.size,
+                            size: meta.size.try_into().unwrap(),
                         }
                     }
                 })
@@ -721,5 +727,84 @@ mod tests {
                 .collect();
             assert_eq!(all_values, (0..1000).collect_vec());
         }
+    }
+
+    // Helper function to create test data
+    fn create_test_data(values: Vec<&str>) -> DeltaResult<Box<dyn EngineData>> {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "dog",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(values))])?;
+        Ok(Box::new(ArrowEngineData::new(batch)))
+    }
+
+    // Helper function to read JSON file asynchronously
+    async fn read_json_file(
+        store: &Arc<InMemory>,
+        path: &Path,
+    ) -> DeltaResult<Vec<serde_json::Value>> {
+        let content = store.get(path).await?;
+        let file_bytes = content.bytes().await?;
+        let file_string =
+            String::from_utf8(file_bytes.to_vec()).map_err(|e| object_store::Error::Generic {
+                store: "memory",
+                source: Box::new(e),
+            })?;
+        let json: Vec<_> = serde_json::Deserializer::from_str(&file_string)
+            .into_iter::<serde_json::Value>()
+            .flatten()
+            .collect();
+        Ok(json)
+    }
+
+    #[tokio::test]
+    async fn test_write_json_file_without_overwrite() -> DeltaResult<()> {
+        do_test_write_json_file(false).await
+    }
+
+    #[tokio::test]
+    async fn test_write_json_file_overwrite() -> DeltaResult<()> {
+        do_test_write_json_file(true).await
+    }
+
+    async fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let handler = DefaultJsonHandler::new(store.clone(), executor);
+        let path = Url::parse("memory:///test/data/00000000000000000001.json")?;
+        let object_path = Path::from("/test/data/00000000000000000001.json");
+
+        // First write with no existing file
+        let data = create_test_data(vec!["remi", "wilson"])?;
+        let result = handler.write_json_file(&path, Box::new(std::iter::once(Ok(data))), overwrite);
+
+        // Verify the first write is successful
+        assert!(result.is_ok());
+        let json = read_json_file(&store, &object_path).await?;
+        assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
+
+        // Second write with existing file
+        let data = create_test_data(vec!["seb", "tia"])?;
+        let result = handler.write_json_file(&path, Box::new(std::iter::once(Ok(data))), overwrite);
+
+        if overwrite {
+            // Verify the second write is successful
+            assert!(result.is_ok());
+            let json = read_json_file(&store, &object_path).await?;
+            assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
+        } else {
+            // Verify the second write fails with FileAlreadyExists error
+            match result {
+                Err(Error::FileAlreadyExists(err_path)) => {
+                    assert_eq!(err_path, object_path.to_string());
+                }
+                _ => panic!("Expected FileAlreadyExists error, got: {:?}", result),
+            }
+        }
+
+        Ok(())
     }
 }

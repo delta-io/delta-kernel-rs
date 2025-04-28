@@ -29,7 +29,7 @@ test_arrow_version() {
   fi
 }
 
-FEATURES=$(cat ../kernel/Cargo.toml | grep -e ^arrow_ | awk '{ print $1 }' | sort -u)
+FEATURES=$(cat ../kernel/Cargo.toml | grep -e  "^arrow-[0-9]\+" | awk '{ print $1 }' | sort -u)
 
 
 echo "[features]" >> Cargo.toml

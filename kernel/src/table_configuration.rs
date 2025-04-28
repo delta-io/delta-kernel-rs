@@ -269,17 +269,13 @@ impl TableConfiguration {
     /// both the protocol's readerFeatures and writerFeatures.
     ///
     /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#v2-checkpoint-table-feature>
-    #[internal_api]
-    #[allow(unused)] // needed to compile w/o default features
-    pub(crate) fn is_v2_checkpoint_supported(&self) -> bool {
+    pub(crate) fn is_v2_checkpoint_write_supported(&self) -> bool {
         let read_supported = self
             .protocol()
-            .has_reader_feature(&ReaderFeature::V2Checkpoint)
-            && self.protocol.min_reader_version() == 3;
+            .has_reader_feature(&ReaderFeature::V2Checkpoint);
         let write_supported = self
             .protocol()
-            .has_writer_feature(&WriterFeature::V2Checkpoint)
-            && self.protocol.min_writer_version() == 7;
+            .has_writer_feature(&WriterFeature::V2Checkpoint);
         read_supported && write_supported
     }
 }
