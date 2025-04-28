@@ -88,18 +88,18 @@
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::actions::CHECKPOINT_METADATA_NAME;
 use crate::actions::{
     schemas::GetStructField, Add, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME,
-    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
+    CHECKPOINT_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
+    SIDECAR_NAME,
 };
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{column_expr, Scalar};
+use crate::expressions::Scalar;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
-use crate::snapshot::Snapshot;
-use crate::{DeltaResult, Engine, Error, EvaluationHandlerExtension, FileMeta};
+use crate::snapshot::{Snapshot, LAST_CHECKPOINT_FILE_NAME};
+use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 use log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};
 
 use url::Url;
@@ -114,6 +114,20 @@ const HOURS_PER_DAY: u64 = 24;
 /// The default retention period for deleted files in seconds.
 /// This is set to 7 days, which is the default in delta-spark.
 const DEFAULT_RETENTION_SECS: u64 = 7 * HOURS_PER_DAY * MINUTES_PER_HOUR * SECONDS_PER_MINUTE;
+
+/// Schema of the `_last_checkpoint` file
+/// We cannot use `LastCheckpointInfo::to_schema()` as it would include the 'checkpoint_schema'
+/// field, which is only known at runtime.
+static LAST_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    StructType::new([
+        StructField::not_null("version", DataType::LONG),
+        StructField::not_null("size", DataType::LONG),
+        StructField::nullable("parts", DataType::LONG),
+        StructField::nullable("sizeInBytes", DataType::LONG),
+        StructField::nullable("numOfAddFiles", DataType::LONG),
+    ])
+    .into()
+});
 
 /// Schema for extracting relevant actions from log files for checkpoint creation
 static CHECKPOINT_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -188,9 +202,26 @@ impl Iterator for CheckpointDataIterator {
 pub struct CheckpointWriter {
     /// Reference to the snapshot (i.e. version) of the table being checkpointed
     pub(crate) snapshot: Arc<Snapshot>,
+
+    /// The version of the snapshot being checkpointed.
+    /// Note: Although the version is stored as a u64 in the snapshot, it is stored as an i64
+    /// field here to avoid multiple type conversions.
+    version: i64,
 }
 
 impl CheckpointWriter {
+    /// Creates a new [`CheckpointWriter`] for the given snapshot.
+    pub(crate) fn try_new(snapshot: Arc<Snapshot>) -> DeltaResult<Self> {
+        let version: i64 = snapshot.version().try_into().map_err(|e| {
+            Error::CheckpointWrite(format!(
+                "Failed to convert checkpoint version from u64 {} to i64: {}",
+                snapshot.version(),
+                e
+            ))
+        })?;
+
+        Ok(Self { snapshot, version })
+    }
     /// Returns the URL where the checkpoint file should be written.
     ///
     /// This method generates the checkpoint path based on the table's root and the version
@@ -255,8 +286,6 @@ impl CheckpointWriter {
         })
     }
 
-    /// TODO(#850): Implement the finalize method
-    ///
     /// Finalizes checkpoint creation after verifying all data is persisted.
     ///
     /// This method **must** be called only after:
@@ -269,20 +298,59 @@ impl CheckpointWriter {
     /// - `checkpoint_data`: The exhausted checkpoint data iterator (must be fully consumed)
     ///
     /// # Returns: [`variant@Ok`] if the checkpoint was successfully finalized
+    // Internally, this method:
+    // 1. Validates that the checkpoint data iterator is fully consumed
+    // 2. Creates the `_last_checkpoint` data with `create_last_checkpoint_data`
+    // 3. Writes the `_last_checkpoint` data to the `_last_checkpoint` file in the table's log
     #[allow(unused)]
     fn finalize(
         self,
-        _engine: &dyn Engine,
-        _metadata: &FileMeta,
-        _checkpoint_data: CheckpointDataIterator,
+        engine: &dyn Engine,
+        metadata: &FileMeta,
+        checkpoint_data: CheckpointDataIterator,
     ) -> DeltaResult<()> {
-        // Verify the iterator is exhausted (optional)
-        // Implementation will use checkpoint_data.actions_count and checkpoint_data.add_actions_count
+        // Ensure the checkpoint data iterator is fully consumed
+        if checkpoint_data
+            .checkpoint_batch_iterator
+            .peekable()
+            .peek()
+            .is_some()
+        {
+            return Err(Error::CheckpointWrite(
+                "The checkpoint data must be fully consumed from the iterator and written to storage before calling finalize"
+                    .to_string(),
+            ));
+        }
 
-        // TODO(#850): Implement the actual finalization logic
-        Err(Error::checkpoint_write(
-            "Checkpoint finalization is not yet implemented",
-        ))
+        let size_in_bytes: i64 = metadata.size.try_into().map_err(|e| {
+            Error::CheckpointWrite(format!(
+                "Failed to convert checkpoint size in bytes from u64 {} to i64: {}, when writing _last_checkpoint",
+                metadata.size, e
+            ))
+        })?;
+
+        let data = create_last_checkpoint_data(
+            engine,
+            self.version,
+            checkpoint_data.actions_count,
+            checkpoint_data.add_actions_count,
+            size_in_bytes,
+        );
+
+        let last_checkpoint_path = self
+            .snapshot
+            .log_segment()
+            .log_root
+            .join(LAST_CHECKPOINT_FILE_NAME)?;
+
+        // Write the `_last_checkpoint` file to the table root
+        engine.json_handler().write_json_file(
+            &last_checkpoint_path,
+            Box::new(std::iter::once(data)),
+            true,
+        );
+
+        Ok(())
     }
 
     /// Creates the checkpoint metadata action for V2 checkpoints.
@@ -390,4 +458,43 @@ fn deleted_file_retention_timestamp_with_time(
 
     // Simple subtraction - will produce negative values if retention > now
     Ok(now_ms - retention_ms)
+}
+
+/// Creates the data for the `_last_checkpoint` file containing checkpoint
+/// metadata with the `create_one` method. Factored out to facilitate testing.
+///
+/// # Parameters
+/// - `engine`: Engine for data processing
+/// - `version`: Table version number
+/// - `actions_counter`: Total actions count
+/// - `add_actions_counter`: Add actions count
+/// - `size_in_bytes`: Size of the checkpoint file in bytes
+///
+/// # Returns
+/// A new [`EngineData`] batch with the `_last_checkpoint` fields:
+/// - `version` (i64, required): Table version number
+/// - `size` (i64, required): Total actions count
+/// - `parts` (i64, optional): Always 1 for single-file checkpoints
+/// - `sizeInBytes` (i64, optional): Size of checkpoint file in bytes
+/// - `numOfAddFiles` (i64, optional): Number of Add actions
+///
+/// TODO(#838) Add `checksum` field to `_last_checkpoint` file
+/// TODO(#839) Add `checkpoint_schema` field to `_last_checkpoint` file
+pub(crate) fn create_last_checkpoint_data(
+    engine: &dyn Engine,
+    version: i64,
+    actions_counter: i64,
+    add_actions_counter: i64,
+    size_in_bytes: i64,
+) -> DeltaResult<Box<dyn EngineData>> {
+    engine.evaluation_handler().create_one(
+        LAST_CHECKPOINT_SCHEMA.clone(),
+        &[
+            version.into(),
+            actions_counter.into(),
+            1i64.into(),
+            size_in_bytes.into(),
+            add_actions_counter.into(),
+        ],
+    )
 }

@@ -103,7 +103,7 @@ impl Table {
     /// Creates a [`CheckpointWriter`] for generating checkpoints at the specified table version.
     ///
     /// See the [`crate::checkpoint`] module documentation for more details on checkpoint types
-    /// and the overall checkpoint process.    
+    /// and the overall checkpoint process.
     ///
     /// # Parameters
     /// - `engine`: Implementation of [`Engine`] apis.
@@ -115,7 +115,7 @@ impl Table {
         version: impl Into<Option<Version>>,
     ) -> DeltaResult<CheckpointWriter> {
         let snapshot = Arc::new(self.snapshot(engine, version.into())?);
-        Ok(CheckpointWriter { snapshot })
+        CheckpointWriter::try_new(snapshot)
     }
 
     /// Create a new write transaction for this table.
