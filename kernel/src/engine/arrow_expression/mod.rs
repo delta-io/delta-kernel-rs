@@ -47,11 +47,13 @@ struct StructFieldBuilder<'a> {
 }
 
 #[cfg(feature = "arrow-54")]
-impl<'a> ArrayBuilderAs for StructFieldBuilder<'a> {
+impl ArrayBuilderAs for StructFieldBuilder<'_> {
     fn array_builder_as<T: ArrayBuilder>(&mut self) -> Option<&mut T> {
         self.builder.field_builder::<T>(self.field_index)
     }
 }
+
+type GenericBuilder = Box<dyn ArrayBuilder>;
 
 impl Scalar {
     /// Convert scalar to arrow array.
@@ -76,21 +78,10 @@ impl Scalar {
             ($t:ty, $val:expr) => {{
                 let builder = builder_as!($t);
                 for _ in 0..num_rows {
-                    builder.append_value($val)
+                    builder.append_value($val);
                 }
             }};
         }
-
-        macro_rules! append_null_as {
-            ($t:ty) => {{
-                let builder = builder_as!($t);
-                for _ in 0..num_rows {
-                    builder.append_null()
-                }
-            }};
-        }
-
-        type GenericBuilder = Box<dyn ArrayBuilder>;
 
         match self {
             Integer(val) => append_val_as!(array::Int32Builder, *val),
@@ -116,24 +107,25 @@ impl Scalar {
                     Error::generic("Struct builder has wrong number of fields")
                 );
                 for _ in 0..num_rows {
-                    #[cfg(not(feature = "arrow-54"))]
-                    {
-                        let field_builders = builder.field_builders_mut().iter_mut();
-                        for (builder, value) in field_builders.zip(data.values()) {
-                            value.append(builder, 1)?;
-                        }
+                    // TODO: Get rid of this disgusting hack when we drop arrow-54 support.
+                    #[cfg(feature = "arrow-54")]
+                    for (field_index, value) in data.values().iter().enumerate() {
+                        // NOTE: We can't ask for dyn ArrayBuilder directly (not sized), nor can we
+                        // ask for GenericBuilder (the internal builder derefs to &dyn ArrayBuilder
+                        // _before_ being downcast to Any. Instead, we wrap the builder in a trait
+                        // that can call `StructBuilder::field_builder` once the type is known.
+                        let builder = &mut StructFieldBuilder {
+                            builder,
+                            field_index,
+                        };
+                        value.append(builder, 1)?;
                     }
 
-                    // TODO: Get rid of this hideous disgusting hack when we drop arrow-54 support.
-                    #[cfg(feature = "arrow-54")]
-                    {
-                        for (field_index, value) in data.values().iter().enumerate() {
-                            // NOTE: We can't ask for dyn ArrayBuilder directly (not sized), nor can
-                            // we ask for GenericBuilder (the internal builder derefs to &dyn
-                            // ArrayBuilder _before_ being downcast to Any. So we have to manually
-                            let builder = &mut StructFieldBuilder { builder, field_index };
-                            value.append(builder, 1)?;
-                        }
+                    #[cfg(not(feature = "arrow-54"))]
+                    let field_builders = builder.field_builders_mut().iter_mut();
+                    #[cfg(not(feature = "arrow-54"))]
+                    for (builder, value) in field_builders.zip(data.values()) {
+                        value.append(builder, 1)?;
                     }
                     builder.append(true);
                 }
@@ -148,25 +140,86 @@ impl Scalar {
                     builder.append(true);
                 }
             }
-            Null(DataType::INTEGER) => append_null_as!(array::Int32Builder),
-            Null(DataType::LONG) => append_null_as!(array::Int64Builder),
-            Null(DataType::SHORT) => append_null_as!(array::Int16Builder),
-            Null(DataType::BYTE) => append_null_as!(array::Int8Builder),
-            Null(DataType::FLOAT) => append_null_as!(array::Float32Builder),
-            Null(DataType::DOUBLE) => append_null_as!(array::Float64Builder),
-            Null(DataType::STRING) => append_null_as!(array::StringBuilder),
-            Null(DataType::BOOLEAN) => append_null_as!(array::BooleanBuilder),
-            Null(DataType::TIMESTAMP | DataType::TIMESTAMP_NTZ) => {
+            Null(data_type) => Self::append_null(builder, data_type, num_rows)?,
+        }
+
+        Ok(())
+    }
+
+    fn append_null(
+        builder: &mut impl ArrayBuilderAs,
+        data_type: &DataType,
+        num_rows: usize,
+    ) -> DeltaResult<()> {
+        // Almost the same as above -- differs only in the data type parameter
+        macro_rules! builder_as {
+            ($t:ty) => {{
+                builder.array_builder_as::<$t>().ok_or_else(|| {
+                    Error::invalid_expression(format!("Invalid builder for {data_type}"))
+                })?
+            }};
+        }
+
+        macro_rules! append_null_as {
+            ($t:ty) => {{
+                let builder = builder_as!($t);
+                for _ in 0..num_rows {
+                    builder.append_null()
+                }
+            }};
+        }
+
+        match *data_type {
+            DataType::INTEGER => append_null_as!(array::Int32Builder),
+            DataType::LONG => append_null_as!(array::Int64Builder),
+            DataType::SHORT => append_null_as!(array::Int16Builder),
+            DataType::BYTE => append_null_as!(array::Int8Builder),
+            DataType::FLOAT => append_null_as!(array::Float32Builder),
+            DataType::DOUBLE => append_null_as!(array::Float64Builder),
+            DataType::STRING => append_null_as!(array::StringBuilder),
+            DataType::BOOLEAN => append_null_as!(array::BooleanBuilder),
+            DataType::TIMESTAMP | DataType::TIMESTAMP_NTZ => {
                 append_null_as!(array::TimestampMicrosecondBuilder)
             }
-            Null(DataType::DATE) => append_null_as!(array::Date32Builder),
-            Null(DataType::BINARY) => append_null_as!(array::BinaryBuilder),
-            Null(DataType::Primitive(PrimitiveType::Decimal(_))) => {
+            DataType::DATE => append_null_as!(array::Date32Builder),
+            DataType::BINARY => append_null_as!(array::BinaryBuilder),
+            DataType::Primitive(PrimitiveType::Decimal(_)) => {
                 append_null_as!(array::Decimal128Builder)
             }
-            Null(DataType::Struct(_)) => append_null_as!(array::StructBuilder),
-            Null(DataType::Array(_)) => append_null_as!(array::ListBuilder<GenericBuilder>),
-            Null(DataType::Map(_)) => {
+            DataType::Struct(ref stype) => {
+                // WARNING: Unlike ArrayBuilder and MapBuilder, StructBuilder always requires us to
+                // insert an entry for each child builder, even when we're inserting NULL.
+                let builder = builder_as!(array::StructBuilder);
+                require!(
+                    builder.num_fields() == stype.fields_len(),
+                    Error::generic("Struct builder has wrong number of fields")
+                );
+                for _ in 0..num_rows {
+                    // TODO: Get rid of this disgusting hack when we drop arrow-54 support.
+                    #[cfg(feature = "arrow-54")]
+                    for (field_index, field) in stype.fields().enumerate() {
+                        // NOTE: We can't ask for dyn ArrayBuilder directly (not sized), nor can we
+                        // ask for GenericBuilder (the internal builder derefs to &dyn ArrayBuilder
+                        // _before_ being downcast to Any. Instead, we wrap the builder in a trait
+                        // that can call `StructBuilder::field_builder` once the type is known.
+                        let builder = &mut StructFieldBuilder {
+                            builder,
+                            field_index,
+                        };
+                        Self::append_null(builder, &field.data_type, 1)?;
+                    }
+
+                    #[cfg(not(feature = "arrow-54"))]
+                    let field_builders = builder.field_builders_mut().iter_mut();
+                    #[cfg(not(feature = "arrow-54"))]
+                    for (builder, field) in field_builders.zip(stype.fields()) {
+                        Self::append_null(builder, &field.data_type, 1)?;
+                    }
+                    builder.append(false);
+                }
+            }
+            DataType::Array(_) => append_null_as!(array::ListBuilder<GenericBuilder>),
+            DataType::Map(_) => {
                 // For some reason, there is no `MapBuilder::append_null` method -- even tho
                 // StructBuilder and ListBuilder both provide it.
                 let builder = builder_as!(array::MapBuilder<GenericBuilder, GenericBuilder>);
