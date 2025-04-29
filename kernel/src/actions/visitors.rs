@@ -12,7 +12,7 @@ use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 use super::deletion_vector::DeletionVectorDescriptor;
-use super::domain_metadata::DomainMetadataMap;
+use super::domain_metadata::DomainMetadataSet;
 use super::schemas::ToSchema as _;
 use super::*;
 
@@ -491,7 +491,7 @@ impl RowVisitor for SidecarVisitor {
 /// requirements).
 #[derive(Debug, Default)]
 pub(crate) struct DomainMetadataVisitor {
-    pub(crate) domain_metadatas: DomainMetadataMap,
+    pub(crate) domain_metadatas: DomainMetadataSet,
     domain_filter: Option<String>,
 }
 
@@ -548,9 +548,8 @@ impl RowVisitor for DomainMetadataVisitor {
                         DomainMetadataVisitor::visit_domain_metadata(i, domain.clone(), getters)?;
                     // only process non-removed domain metadata
                     if !domain_metadata.removed {
-                        self.domain_metadatas
-                            .entry(domain)
-                            .or_insert_with(|| domain_metadata);
+                        // NB: insert will only do the insert if it doesn't already exist
+                        self.domain_metadatas.insert(domain_metadata.into());
                     }
                 }
             }
