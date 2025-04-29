@@ -12,10 +12,10 @@
 4. Rename VariadicExpression to JunctionExpression ([#841])
 5. Enforce precision/scale correctness of Decimal types and values ([#857])
 6. Expression system refactors
-   a. Make literal expressions more strict (removed `Into` trait impl) ([#867])
-   b. Remove nearly-unused expression `lt_eq`/`gt_eq` overloads ([#871])
-   c. Move expression transforms (`ExpressionTransform` and `ExpressionDepthChecker`) to own module ([#878])
-   d. Code movement in expression-related code (Reordered variants of the `BinaryExpressionOp` enum) ([#879])
+   - Make literal expressions more strict (removed `Into` trait impl) ([#867])
+   - Remove nearly-unused expression `lt_eq`/`gt_eq` overloads ([#871])
+   - Move expression transforms (`ExpressionTransform` and `ExpressionDepthChecker`) to own module ([#878])
+   - Code movement in expression-related code (Reordered variants of the `BinaryExpressionOp` enum) ([#879])
 7. Introduce the ability for consumers to add ObjectStore url handlers ([#873])
 8. Update to arrow 55, drop arrow 53 support ([#885], [#903])
 
