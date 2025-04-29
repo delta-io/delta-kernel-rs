@@ -20,7 +20,7 @@ const DOMAIN_METADATA_DOMAIN_FIELD: &str = "domain";
 pub(crate) type DomainMetadataSet = HashSet<DomainMetadataHashSetEntry>;
 
 #[derive(Debug)]
-struct DomainMetadataHashSetEntry(DomainMetadata);
+pub(crate) struct DomainMetadataHashSetEntry(DomainMetadata);
 
 impl PartialEq for DomainMetadataHashSetEntry {
     fn eq(&self, other: &Self) -> bool {

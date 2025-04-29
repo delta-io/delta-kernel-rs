@@ -831,47 +831,37 @@ mod tests {
             .visit_rows_of(batch2.as_ref())
             .unwrap();
         let actual = domain_metadata_visitor.domain_metadatas;
-        let expected = DomainMetadataMap::from([
-            (
-                "zach2".to_string(),
-                DomainMetadata {
-                    domain: "zach2".to_string(),
-                    configuration: "cfg2".to_string(),
-                    removed: false,
-                },
-            ),
-            (
-                "zach3".to_string(),
-                DomainMetadata {
-                    domain: "zach3".to_string(),
-                    configuration: "old_cfg3".to_string(),
-                    removed: false,
-                },
-            ),
-            (
-                "zach4".to_string(),
-                DomainMetadata {
-                    domain: "zach4".to_string(),
-                    configuration: "cfg4".to_string(),
-                    removed: false,
-                },
-            ),
-            (
-                "zach6".to_string(),
-                DomainMetadata {
-                    domain: "zach6".to_string(),
-                    configuration: "cfg6".to_string(),
-                    removed: false,
-                },
-            ),
-            (
-                "zach8".to_string(),
-                DomainMetadata {
-                    domain: "zach8".to_string(),
-                    configuration: "cfg8".to_string(),
-                    removed: false,
-                },
-            ),
+        let expected = DomainMetadataSet::from([
+            DomainMetadata {
+                domain: "zach2".to_string(),
+                configuration: "cfg2".to_string(),
+                removed: false,
+            }
+            .into(),
+            DomainMetadata {
+                domain: "zach3".to_string(),
+                configuration: "old_cfg3".to_string(),
+                removed: false,
+            }
+            .into(),
+            DomainMetadata {
+                domain: "zach4".to_string(),
+                configuration: "cfg4".to_string(),
+                removed: false,
+            }
+            .into(),
+            DomainMetadata {
+                domain: "zach6".to_string(),
+                configuration: "cfg6".to_string(),
+                removed: false,
+            }
+            .into(),
+            DomainMetadata {
+                domain: "zach8".to_string(),
+                configuration: "cfg8".to_string(),
+                removed: false,
+            }
+            .into(),
         ]);
         assert_eq!(actual, expected);
 
@@ -884,14 +874,12 @@ mod tests {
             .visit_rows_of(batch2.as_ref())
             .unwrap();
         let actual = domain_metadata_visitor.domain_metadatas;
-        let expected = DomainMetadataMap::from([(
-            "zach3".to_string(),
-            DomainMetadata {
-                domain: "zach3".to_string(),
-                configuration: "old_cfg3".to_string(),
-                removed: false,
-            },
-        )]);
+        let expected = DomainMetadataSet::from([DomainMetadata {
+            domain: "zach3".to_string(),
+            configuration: "old_cfg3".to_string(),
+            removed: false,
+        }
+        .into()]);
         assert_eq!(actual, expected);
 
         // test filtering for a domain that is not present
