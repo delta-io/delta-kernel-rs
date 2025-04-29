@@ -1,5 +1,92 @@
 # Changelog
 
+## [v0.10.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.10.0/) (2025-04-28)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.9.0...v0.10.0)
+
+
+### 🏗️ Breaking changes
+1. Updated dependencies, breaking updates: `itertools 0.14`, `thiserror 2`, and `strum 0.27` ([#814])
+2. Rename `developer-visibility` feature flag to `internal-api` ([#834])
+3. Tidy up AND/OR/NOT API and usage ([#842])
+4. Rename VariadicExpression to JunctionExpression ([#841])
+5. Enforce precision/scale correctness of Decimal types and values ([#857])
+6. Expression system refactors
+   - Make literal expressions more strict (removed `Into` trait impl) ([#867])
+   - Remove nearly-unused expression `lt_eq`/`gt_eq` overloads ([#871])
+   - Move expression transforms (`ExpressionTransform` and `ExpressionDepthChecker`) to own module ([#878])
+   - Code movement in expression-related code (Reordered variants of the `BinaryExpressionOp` enum) ([#879])
+7. Introduce the ability for consumers to add ObjectStore url handlers ([#873])
+8. Update to arrow 55, drop arrow 53 support ([#885], [#903])
+
+### 🚀 Features / new APIs
+
+1. Add `CheckpointVisitor` in new `checkpoint` mod ([#738])
+2. Add `CheckpointLogReplayProcessor` in new `checkpoints` mod ([#744])
+3. Add `transaction.with_transaction_id()` API ([#824])
+4. Add `snapshot.get_app_id_version(app_id, engine)` ([#862])
+5. Overwrite logic in `write_json_file` for default & sync engine  ([#849])
+
+### 🐛 Bug Fixes
+
+1. default engine: Sort list results based on URL scheme ([#820])
+2. `impl AllocateError for T: ExternEngine` ([#856])
+3. Disable predicate pushdown in `Scan::execute` ([#861])
+
+### 📚 Documentation
+
+1. Correct docstring for `DefaultEngine::new` ([#821])
+2. Remove `acceptance` from `rust-analyzer.cargo.features` in README ([#858])
+
+### 🚜 Refactor
+
+1. Rename `predicates` mod to `kernel_predicates` ([#822])
+2. Code movement to tidy up ffi ([#840])
+3. Grab bag of cosmetic tweaks and comment updates ([#848])
+4. New `#[internal_api]` macro instead of `visibility` crate ([#835])
+5. Expression transforms use new recurse_into_children helper ([#869])
+6. Minor test improvements ([#872])
+
+### ⚙️ Chores/CI
+
+1. Remove unused dependencies ([#863])
+2. Test code uses Expr shorthand for Expression ([#866])
+3. Arrow DefaultExpressionEvaluator need not box its inner expression ([#868])
+
+
+[#738]: https://github.com/delta-io/delta-kernel-rs/pull/738
+[#821]: https://github.com/delta-io/delta-kernel-rs/pull/821
+[#822]: https://github.com/delta-io/delta-kernel-rs/pull/822
+[#820]: https://github.com/delta-io/delta-kernel-rs/pull/820
+[#814]: https://github.com/delta-io/delta-kernel-rs/pull/814
+[#744]: https://github.com/delta-io/delta-kernel-rs/pull/744
+[#840]: https://github.com/delta-io/delta-kernel-rs/pull/840
+[#834]: https://github.com/delta-io/delta-kernel-rs/pull/834
+[#842]: https://github.com/delta-io/delta-kernel-rs/pull/842
+[#841]: https://github.com/delta-io/delta-kernel-rs/pull/841
+[#848]: https://github.com/delta-io/delta-kernel-rs/pull/848
+[#835]: https://github.com/delta-io/delta-kernel-rs/pull/835
+[#856]: https://github.com/delta-io/delta-kernel-rs/pull/856
+[#824]: https://github.com/delta-io/delta-kernel-rs/pull/824
+[#849]: https://github.com/delta-io/delta-kernel-rs/pull/849
+[#863]: https://github.com/delta-io/delta-kernel-rs/pull/863
+[#858]: https://github.com/delta-io/delta-kernel-rs/pull/858
+[#862]: https://github.com/delta-io/delta-kernel-rs/pull/862
+[#866]: https://github.com/delta-io/delta-kernel-rs/pull/866
+[#857]: https://github.com/delta-io/delta-kernel-rs/pull/857
+[#861]: https://github.com/delta-io/delta-kernel-rs/pull/861
+[#867]: https://github.com/delta-io/delta-kernel-rs/pull/867
+[#868]: https://github.com/delta-io/delta-kernel-rs/pull/868
+[#869]: https://github.com/delta-io/delta-kernel-rs/pull/869
+[#871]: https://github.com/delta-io/delta-kernel-rs/pull/871
+[#872]: https://github.com/delta-io/delta-kernel-rs/pull/872
+[#878]: https://github.com/delta-io/delta-kernel-rs/pull/878
+[#873]: https://github.com/delta-io/delta-kernel-rs/pull/873
+[#879]: https://github.com/delta-io/delta-kernel-rs/pull/879
+[#885]: https://github.com/delta-io/delta-kernel-rs/pull/885
+[#903]: https://github.com/delta-io/delta-kernel-rs/pull/903
+
+
 ## [v0.9.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.9.0/) (2025-04-08)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.8.0...v0.9.0)

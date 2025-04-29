@@ -43,10 +43,10 @@ consumer's own `Engine` trait, the kernel has a feature flag to enable a default
 ```toml
 # fewer dependencies, requires consumer to implement Engine trait.
 # allows consumers to implement their own in-memory format
-delta_kernel = "0.9.0"
+delta_kernel = "0.10.0"
 
 # or turn on the default engine, based on arrow
-delta_kernel = { version = "0.9.0", features = ["default-engine", "arrow-55"] }
+delta_kernel = { version = "0.10.0", features = ["default-engine", "arrow-55"] }
 ```
 
 ### Feature flags
