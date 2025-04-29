@@ -3,6 +3,7 @@ use crate::object_store::path::Path;
 use crate::object_store::{Error, ObjectStore};
 use url::Url;
 
+use crate::Error as DeltaError;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
 
@@ -25,12 +26,13 @@ static URL_REGISTRY: LazyLock<RwLock<Handlers>> = LazyLock::new(|| RwLock::new(H
 pub fn insert_url_handler(
     scheme: impl AsRef<str>,
     handler_closure: HandlerClosure,
-) -> Result<(), Error> {
-    if let Ok(mut lock) = URL_REGISTRY.write() {
-        (*lock).insert(scheme.as_ref().into(), handler_closure);
-    } else {
-        panic!("Failed to acquire lock for adding a URL handler!");
-    }
+) -> Result<(), DeltaError> {
+    let Ok(mut registry) = URL_REGISTRY.write() else {
+        return Err(DeltaError::generic(
+            "failed to acquire lock for adding a URL handler!",
+        ));
+    };
+    registry.insert(scheme.as_ref().into(), handler_closure);
     Ok(())
 }
 
