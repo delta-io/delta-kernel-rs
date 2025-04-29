@@ -249,7 +249,7 @@ fn test_binary_cmp() {
     let expected = Arc::new(BooleanArray::from(vec![true, false, false]));
     assert_eq!(results.as_ref(), expected.as_ref());
 
-    let expression = column.clone().lt_eq(Expr::literal(2));
+    let expression = column.clone().le(Expr::literal(2));
     let results = evaluate_expression(&expression, &batch, None).unwrap();
     let expected = Arc::new(BooleanArray::from(vec![true, true, false]));
     assert_eq!(results.as_ref(), expected.as_ref());
@@ -259,7 +259,7 @@ fn test_binary_cmp() {
     let expected = Arc::new(BooleanArray::from(vec![false, false, true]));
     assert_eq!(results.as_ref(), expected.as_ref());
 
-    let expression = column.clone().gt_eq(Expr::literal(2));
+    let expression = column.clone().ge(Expr::literal(2));
     let results = evaluate_expression(&expression, &batch, None).unwrap();
     let expected = Arc::new(BooleanArray::from(vec![false, true, true]));
     assert_eq!(results.as_ref(), expected.as_ref());
