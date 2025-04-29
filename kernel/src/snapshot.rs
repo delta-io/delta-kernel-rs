@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::{Metadata, Protocol};
+use crate::checkpoint::CheckpointWriter;
 use crate::log_segment::{self, LogSegment};
 use crate::scan::ScanBuilder;
 use crate::schema::{Schema, SchemaRef};
@@ -18,7 +19,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use url::Url;
 
-const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
+/// Name of the _last_checkpoint file that provides metadata about the last checkpoint
+/// created for the table. This file is used as a hint for the engine to quickly locate
+/// the latest checkpoint without a full directory listing.
+pub(crate) const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
+
 // TODO expose methods for accessing the files of a table (with file pruning).
 /// In-memory representation of a specific snapshot of a Delta table. While a `DeltaTable` exists
 /// throughout time, `Snapshot`s represent a view of a table at a specific point in time; they
@@ -242,6 +247,14 @@ impl Snapshot {
             log_segment,
             table_configuration,
         })
+    }
+
+    /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.
+    ///
+    /// See the [`crate::checkpoint`] module documentation for more details on checkpoint types
+    /// and the overall checkpoint process.    
+    pub fn checkpoint(self: Arc<Self>) -> DeltaResult<CheckpointWriter> {
+        Ok(CheckpointWriter { snapshot: self })
     }
 
     /// Log segment this snapshot uses
