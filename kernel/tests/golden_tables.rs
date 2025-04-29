@@ -13,12 +13,12 @@ use paste::paste;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use delta_kernel::object_store::{local::LocalFileSystem, ObjectStore};
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
 use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Table};
 use futures::{stream::TryStreamExt, StreamExt};
-use object_store::{local::LocalFileSystem, ObjectStore};
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
@@ -35,7 +35,7 @@ async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
     for meta in files.into_iter() {
         if let Some(ext) = meta.location.extension() {
             if ext == "parquet" {
-                let reader = ParquetObjectReader::new(store.clone(), meta);
+                let reader = ParquetObjectReader::new(store.clone(), meta.location);
                 let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
                 if schema.is_none() {
                     schema = Some(builder.schema().clone());
