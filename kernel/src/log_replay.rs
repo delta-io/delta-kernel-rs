@@ -20,7 +20,7 @@
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::scan::data_skipping::DataSkippingFilter;
-use crate::{DeltaResult, EngineData, LogReplayBatch};
+use crate::{DeltaResult, EngineData, LogReplayBatch, Version};
 
 use std::collections::HashSet;
 
@@ -56,8 +56,8 @@ pub(crate) struct FileActionDeduplicator<'seen> {
     seen_file_keys: &'seen mut HashSet<FileActionKey>,
     // TODO: Consider renaming to `is_commit_batch`, `deduplicate_batch`, or `save_batch`
     // to better reflect its role in deduplication logic.
-    /// Whether we're processing a log batch (as opposed to a checkpoint)
-    is_log_batch: bool,
+    /// Track commit versions of log batches (checkpoint batches have no associated version)
+    log_file_version: Option<Version>,
     /// Index of the getter containing the add.path column
     add_path_index: usize,
     /// Index of the getter containing the remove.path column
@@ -71,7 +71,7 @@ pub(crate) struct FileActionDeduplicator<'seen> {
 impl<'seen> FileActionDeduplicator<'seen> {
     pub(crate) fn new(
         seen_file_keys: &'seen mut HashSet<FileActionKey>,
-        is_log_batch: bool,
+        log_file_version: Option<Version>,
         add_path_index: usize,
         remove_path_index: usize,
         add_dv_start_index: usize,
@@ -79,7 +79,7 @@ impl<'seen> FileActionDeduplicator<'seen> {
     ) -> Self {
         Self {
             seen_file_keys,
-            is_log_batch,
+            log_file_version,
             add_path_index,
             remove_path_index,
             add_dv_start_index,
@@ -96,18 +96,21 @@ impl<'seen> FileActionDeduplicator<'seen> {
         // unique Add + Remove pair in the log. For example:
         // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
 
+        // TODO: Deduplication between versions only needs to track path, but deduplication within
+        // versions needs to track (path, dv_unique_id) pairs. For now we track pairs everywhere,
+        // but in theory we could use commit versions to split the deduplication.
         if self.seen_file_keys.contains(&key) {
             debug!(
-                "Ignoring duplicate ({}, {:?}) in scan, is log {}",
-                key.path, key.dv_unique_id, self.is_log_batch
+                "Ignoring duplicate ({}, {:?}) in scan, commit version {:?}",
+                key.path, key.dv_unique_id, self.log_file_version
             );
             true
         } else {
             debug!(
-                "Including ({}, {:?}) in scan, is log {}",
-                key.path, key.dv_unique_id, self.is_log_batch
+                "Including ({}, {:?}) in scan, commit version {:?}",
+                key.path, key.dv_unique_id, self.log_file_version
             );
-            if self.is_log_batch {
+            if self.is_log_batch() {
                 // Remember file actions from this batch so we can ignore duplicates as we process
                 // batches from older commit and/or checkpoint files. We don't track checkpoint
                 // batches because they are already the oldest actions and never replace anything.
@@ -191,7 +194,7 @@ impl<'seen> FileActionDeduplicator<'seen> {
     /// `true` indicates we are processing a batch from a commit file.
     /// `false` indicates we are processing a batch from a checkpoint.
     pub(crate) fn is_log_batch(&self) -> bool {
-        self.is_log_batch
+        self.log_file_version.is_some()
     }
 }
 
@@ -254,7 +257,7 @@ pub(crate) trait LogReplayProcessor: Sized {
     ///
     /// # Parameters
     /// - `actions_batch` - A boxed [`EngineData`] instance representing a batch of actions.
-    /// - `is_log_batch` - `true` if the batch originates from a commit log, `false` if from a checkpoint.
+    /// - `log_file_version` - `Some(version)` if the batch originates from a commit log, or `None` if from a checkpoint.
     ///
     /// Returns a [`DeltaResult`] containing the processor’s output, which includes only selected actions.
     ///
@@ -262,7 +265,7 @@ pub(crate) trait LogReplayProcessor: Sized {
     fn process_actions_batch(
         &mut self,
         actions_batch: Box<dyn EngineData>,
-        is_log_batch: bool,
+        log_file_version: Option<Version>,
     ) -> DeltaResult<Self::Output>;
 
     /// Applies the processor to an actions iterator and filters out empty results.
@@ -286,8 +289,8 @@ pub(crate) trait LogReplayProcessor: Sized {
     ) -> impl Iterator<Item = DeltaResult<Self::Output>> {
         action_iter
             .map(move |action_res| {
-                let (batch, is_log_batch) = action_res?;
-                self.process_actions_batch(batch, is_log_batch)
+                let (batch, log_file_version) = action_res?;
+                self.process_actions_batch(batch, log_file_version)
             })
             .filter(|res| {
                 // TODO: Leverage .is_none_or() when msrv = 1.82

@@ -150,10 +150,10 @@ pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
 pub type FileDataReadResultIterator =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
 
-/// A batch of data produced by log replay. The boolean flag indicates whether the data came from a
-/// log file (true) or checkpoint false).
+/// A batch of data produced by log replay. Batches produced from commit files include Some
+/// associated commit version, while checkpoint files have None.
 #[internal_api]
-pub(crate) type LogReplayBatch = (Box<dyn EngineData>, bool);
+pub(crate) type LogReplayBatch = (Box<dyn EngineData>, Option<Version>);
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]

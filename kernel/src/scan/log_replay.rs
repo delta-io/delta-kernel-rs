@@ -14,7 +14,7 @@ use crate::log_replay::{FileActionDeduplicator, FileActionKey, LogReplayProcesso
 use crate::scan::{Scalar, TransformExpr};
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator, LogReplayBatch};
+use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator, LogReplayBatch, Version};
 
 /// [`ScanLogReplayProcessor`] performs log replay (processes actions) specifically for doing a table scan.
 ///
@@ -101,12 +101,12 @@ impl AddRemoveDedupVisitor<'_> {
         logical_schema: SchemaRef,
         transform: Option<Arc<Transform>>,
         partition_filter: Option<ExpressionRef>,
-        is_log_batch: bool,
+        log_file_version: Option<Version>,
     ) -> AddRemoveDedupVisitor<'_> {
         AddRemoveDedupVisitor {
             deduplicator: FileActionDeduplicator::new(
                 seen,
-                is_log_batch,
+                log_file_version,
                 Self::ADD_PATH_INDEX,
                 Self::REMOVE_PATH_INDEX,
                 Self::ADD_DV_START_INDEX,
@@ -345,7 +345,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
     fn process_actions_batch(
         &mut self,
         actions_batch: Box<dyn EngineData>,
-        is_log_batch: bool,
+        log_file_version: Option<Version>,
     ) -> DeltaResult<Self::Output> {
         // Build an initial selection vector for the batch which has had the data skipping filter
         // applied. The selection vector is further updated by the deduplication visitor to remove
@@ -359,7 +359,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             self.logical_schema.clone(),
             self.transform.clone(),
             self.partition_filter.clone(),
-            is_log_batch,
+            log_file_version,
         );
         visitor.visit_rows_of(actions_batch.as_ref())?;
 
@@ -468,7 +468,7 @@ mod tests {
         let logical_schema = Arc::new(crate::schema::StructType::new(vec![]));
         let iter = scan_action_iter(
             &SyncEngine::new(),
-            batch.into_iter().map(|batch| Ok((batch as _, true))),
+            batch.into_iter().map(|batch| Ok((batch as _, Some(1)))),
             logical_schema,
             None,
             None,
@@ -494,7 +494,7 @@ mod tests {
         let batch = vec![add_batch_with_partition_col()];
         let iter = scan_action_iter(
             &SyncEngine::new(),
-            batch.into_iter().map(|batch| Ok((batch as _, true))),
+            batch.into_iter().map(|batch| Ok((batch as _, Some(1)))),
             schema,
             static_transform,
             None,

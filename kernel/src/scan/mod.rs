@@ -816,7 +816,7 @@ pub(crate) mod test_utils {
             logical_schema.unwrap_or_else(|| Arc::new(crate::schema::StructType::new(vec![])));
         let iter = scan_action_iter(
             &SyncEngine::new(),
-            batch.into_iter().map(|batch| Ok((batch as _, true))),
+            batch.into_iter().map(|batch| Ok((batch as _, Some(1)))),
             logical_schema,
             transform,
             None,
