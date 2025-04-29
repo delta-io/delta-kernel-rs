@@ -29,7 +29,7 @@
 //! 2. Get the checkpoint data from [`CheckpointWriter::checkpoint_data`]
 //! 3. Write the data to the path in object storage (engine-specific)
 //! 4. Collect metadata ([`FileMeta`]) from the write operation
-//! 5. Pass the metadata and exhausted data iterator to `CheckpointWriter::finalize`
+//! 5. Pass the metadata and exhausted data iterator to [`CheckpointWriter::finalize`]
 //!
 //! ```no_run
 //! # use std::sync::Arc;
@@ -64,7 +64,8 @@
 //!
 //! /* IMPORTANT: All data must be written before finalizing the checkpoint */
 //!
-//! // writer.finalize(&engine, &metadata, checkpoint_data)?;
+//! // Finalize the checkpoint by passing the metadata and exhausted data iterator
+//! writer.finalize(engine, &metadata, checkpoint_data)?;
 //!
 //! # Ok::<_, Error>(())
 //! ```
@@ -159,7 +160,7 @@ static CHECKPOINT_METADATA_ACTION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(||
 /// # Warning
 /// The [`CheckpointDataIterator`] must be fully consumed to ensure proper collection of statistics for
 /// the checkpoint. Additionally, all yielded data must be written to the specified path before calling
-/// `CheckpointWriter::finalize`. Failing to do so may result in data loss or corruption.
+/// [`CheckpointWriter::finalize`]. Failing to do so may result in data loss or corruption.
 pub struct CheckpointDataIterator {
     /// The nested iterator that yields checkpoint batches with action counts
     checkpoint_batch_iterator: Box<dyn Iterator<Item = DeltaResult<CheckpointBatch>>>,
@@ -177,7 +178,7 @@ impl Iterator for CheckpointDataIterator {
     /// This implementation transforms the `CheckpointBatch` items from the nested iterator into
     /// [`FilteredEngineData`] items for the engine to write, while accumulating action counts from
     /// each batch. The [`CheckpointDataIterator`] is passed back to the kernel on call to
-    /// `CheckpointWriter::finalize` for counts to be read and written to the `_last_checkpoint` file
+    /// [`CheckpointWriter::finalize`] for counts to be read and written to the `_last_checkpoint` file
     fn next(&mut self) -> Option<Self::Item> {
         Some(self.checkpoint_batch_iterator.next()?.map(|batch| {
             self.actions_count += batch.actions_count;
@@ -194,7 +195,7 @@ impl Iterator for CheckpointDataIterator {
 /// supports the `v2Checkpoints` reader/writer feature.
 ///
 /// # Warning
-/// The checkpoint data must be fully written to storage before calling `CheckpointWriter::finalize()`.
+/// The checkpoint data must be fully written to storage before calling [`CheckpointWriter::finalize`].
 /// Failing to do so may result in data loss or corruption.
 ///
 /// # See Also
@@ -303,8 +304,7 @@ impl CheckpointWriter {
     // 1. Validates that the checkpoint data iterator is fully exhausted
     // 2. Creates the `_last_checkpoint` data with `create_last_checkpoint_data`
     // 3. Writes the `_last_checkpoint` data to the `_last_checkpoint` file in the delta log
-    #[allow(unused)]
-    fn finalize(
+    pub fn finalize(
         self,
         engine: &dyn Engine,
         metadata: &FileMeta,
@@ -348,7 +348,7 @@ impl CheckpointWriter {
             &last_checkpoint_path,
             Box::new(std::iter::once(data)),
             true,
-        );
+        )?;
 
         Ok(())
     }
@@ -460,7 +460,7 @@ fn deleted_file_retention_timestamp_with_time(
     Ok(now_ms - retention_ms)
 }
 
-/// Creates the data for the `_last_checkpoint` file containing checkpoint
+/// Creates the data for the _last_checkpoint file containing checkpoint
 /// metadata with the `create_one` method. Factored out to facilitate testing.
 ///
 /// # Parameters
