@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::set_transaction::SetTransactionScanner;
-use crate::actions::{Metadata, Protocol};
+use crate::actions::{Metadata, Protocol, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
 use crate::log_segment::{self, LogSegment};
 use crate::scan::ScanBuilder;
@@ -253,7 +253,7 @@ impl Snapshot {
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.
     ///
     /// See the [`crate::checkpoint`] module documentation for more details on checkpoint types
-    /// and the overall checkpoint process.    
+    /// and the overall checkpoint process.
     pub fn checkpoint(self: Arc<Self>) -> DeltaResult<CheckpointWriter> {
         Ok(CheckpointWriter { snapshot: self })
     }
@@ -324,7 +324,7 @@ impl Snapshot {
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
     pub fn get_app_id_version(
-        self: Arc<Self>,
+        &self,
         application_id: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
@@ -335,11 +335,17 @@ impl Snapshot {
     /// Fetch the configuration for a domain for this snapshot.
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
-    pub fn domain_metadata(
-        self: Arc<Self>,
+    pub fn domain_metadata_config(
+        &self,
         domain: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<String>> {
+        if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
+            return Err(Error::generic(
+                "User DomainMetadata are not allowed to use internal 'delta.*' domain",
+            ));
+        }
+
         domain_metadata_configuration(self.log_segment(), domain, engine)
     }
 }
@@ -741,5 +747,111 @@ mod tests {
             .version,
             3,
         );
+    }
+
+    #[tokio::test]
+    async fn test_domain_metadata() -> DeltaResult<()> {
+        let url = Url::parse("memory:///")?;
+        let store = Arc::new(InMemory::new());
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+        // commit0
+        // - domain1: not removed
+        // - domain2: not removed
+        let commit = [
+            json!({
+                "protocol": {
+                    "minReaderVersion": 1,
+                    "minWriterVersion": 1
+                }
+            }),
+            json!({
+                "metaData": {
+                    "id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+                    "format": { "provider": "parquet", "options": {} },
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
+                    "partitionColumns": [],
+                    "configuration": {},
+                    "createdTime": 1587968585495i64
+                }
+            }),
+            json!({
+                "domainMetadata": {
+                    "domain": "domain1",
+                    "configuration": "domain1_commit0",
+                    "removed": false
+                }
+            }),
+            json!({
+                "domainMetadata": {
+                    "domain": "domain2",
+                    "configuration": "domain2_commit0",
+                    "removed": false
+                }
+            }),
+            json!({
+                "domainMetadata": {
+                    "domain": "domain3",
+                    "configuration": "domain3_commit0",
+                    "removed": false
+                }
+            }),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<String>>()
+        .join("\n");
+        add_commit(store.clone().as_ref(), 0, commit).await.unwrap();
+
+        // commit1
+        // - domain1: removed
+        // - domain2: not-removed
+        // - internal domain
+        let commit = [
+            json!({
+                "domainMetadata": {
+                    "domain": "domain1",
+                    "configuration": "domain1_commit1",
+                    "removed": true
+                }
+            }),
+            json!({
+                "domainMetadata": {
+                    "domain": "domain2",
+                    "configuration": "domain2_commit1",
+                    "removed": false
+                }
+            }),
+            json!({
+                "domainMetadata": {
+                    "domain": "delta.domain3",
+                    "configuration": "domain3_commit1",
+                    "removed": false
+                }
+            }),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<String>>()
+        .join("\n");
+        add_commit(store.as_ref(), 1, commit).await.unwrap();
+
+        let snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, None)?);
+
+        assert_eq!(snapshot.domain_metadata_config("domain1", &engine)?, None);
+        assert_eq!(
+            snapshot.domain_metadata_config("domain2", &engine)?,
+            Some("domain2_commit1".to_string())
+        );
+        assert_eq!(
+            snapshot.domain_metadata_config("domain3", &engine)?,
+            Some("domain3_commit0".to_string())
+        );
+        let err = snapshot
+            .domain_metadata_config("delta.domain3", &engine)
+            .unwrap_err();
+        assert!(matches!(err, Error::Generic(msg) if
+                msg == "User DomainMetadata are not allowed to use internal 'delta.*' domain"));
+        Ok(())
     }
 }
