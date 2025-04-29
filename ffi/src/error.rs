@@ -53,6 +53,7 @@ pub enum KernelError {
     ChangeDataFeedIncompatibleSchema,
     InvalidCheckpoint,
     LiteralExpressionTransformError,
+    CheckpointWriteError,
 }
 
 impl From<Error> for KernelError {
@@ -61,6 +62,7 @@ impl From<Error> for KernelError {
             // NOTE: By definition, no kernel Error maps to FFIError
             #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
             Error::Arrow(_) => KernelError::ArrowError,
+            Error::CheckpointWrite(_) => KernelError::CheckpointWriteError,
             Error::EngineDataType(_) => KernelError::EngineDataTypeError,
             Error::Extract(..) => KernelError::ExtractError,
             Error::Generic(_) => KernelError::GenericError,

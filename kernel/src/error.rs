@@ -36,6 +36,9 @@ pub enum Error {
     #[error(transparent)]
     Arrow(ArrowError),
 
+    #[error("Error writing checkpoint: {0}")]
+    CheckpointWrite(String),
+
     /// User tried to convert engine data to the wrong type
     #[error("Invalid engine data type. Could not convert to {0}")]
     EngineDataType(String),
@@ -210,6 +213,10 @@ pub enum Error {
 
 // Convenience constructors for Error types that take a String argument
 impl Error {
+    pub(crate) fn checkpoint_write(msg: impl ToString) -> Self {
+        Self::CheckpointWrite(msg.to_string())
+    }
+
     pub fn generic_err(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self::GenericError {
             source: source.into(),
