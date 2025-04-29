@@ -466,17 +466,18 @@ mod tests {
     use super::*;
     use crate::arrow::array::StringArray;
     use crate::utils::test_utils::{action_batch, parse_json_batch};
+    use crate::LogReplayBatch;
     use std::collections::HashSet;
 
     /// Helper function to create test batches from JSON strings
-    fn create_batch(json_strings: Vec<&str>) -> DeltaResult<(Box<dyn EngineData>, bool)> {
+    fn create_batch(json_strings: Vec<&str>) -> DeltaResult<LogReplayBatch> {
         Ok((parse_json_batch(StringArray::from(json_strings)), true))
     }
 
     /// Helper function which applies the [`CheckpointLogReplayProcessor`] to a set of
     /// input batches and returns the results.
     fn run_checkpoint_test(
-        input_batches: Vec<(Box<dyn EngineData>, bool)>,
+        input_batches: Vec<LogReplayBatch>,
     ) -> DeltaResult<(Vec<FilteredEngineData>, i64, i64)> {
         let actions_count = Arc::new(AtomicI64::new(0));
         let add_actions_count = Arc::new(AtomicI64::new(0));

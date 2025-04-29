@@ -20,7 +20,7 @@
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::scan::data_skipping::DataSkippingFilter;
-use crate::{DeltaResult, EngineData};
+use crate::{DeltaResult, EngineData, LogReplayBatch};
 
 use std::collections::HashSet;
 
@@ -282,7 +282,7 @@ pub(crate) trait LogReplayProcessor: Sized {
     /// (batches where at least one row was selected).
     fn process_actions_iter(
         mut self,
-        action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
+        action_iter: impl Iterator<Item = DeltaResult<LogReplayBatch>>,
     ) -> impl Iterator<Item = DeltaResult<Self::Output>> {
         action_iter
             .map(move |action_res| {

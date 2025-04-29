@@ -14,7 +14,7 @@ use crate::log_replay::{FileActionDeduplicator, FileActionKey, LogReplayProcesso
 use crate::scan::{Scalar, TransformExpr};
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator};
+use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator, LogReplayBatch};
 
 /// [`ScanLogReplayProcessor`] performs log replay (processes actions) specifically for doing a table scan.
 ///
@@ -386,7 +386,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 /// order of the actions in the log from most recent to least recent.
 pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
-    action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
+    action_iter: impl Iterator<Item = DeltaResult<LogReplayBatch>>,
     logical_schema: SchemaRef,
     transform: Option<Arc<Transform>>,
     physical_predicate: Option<(ExpressionRef, SchemaRef)>,
