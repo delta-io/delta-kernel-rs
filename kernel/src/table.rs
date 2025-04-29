@@ -5,9 +5,11 @@ use std::borrow::Cow;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Arc;
 
 use url::Url;
 
+use crate::checkpoint::CheckpointWriter;
 use crate::checkpoint::CheckpointWriter;
 use crate::snapshot::Snapshot;
 use crate::table_changes::TableChanges;

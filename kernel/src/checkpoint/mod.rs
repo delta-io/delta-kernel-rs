@@ -21,6 +21,29 @@
 //! - [`CheckpointDataIterator`] - Iterator over the checkpoint data to be written
 //!
 //! ## Usage
+//! This module implements the API for writing single-file checkpoints.
+//!
+//! The entry-points for this API are:
+//! 1. [`Snapshot::checkpoint`]
+//! 2. [`Table::checkpoint`]
+//!
+//! ## Checkpoint Types and Selection Logic
+//! This API supports two checkpoint types, selected based on table features:
+//!
+//! | Table Feature    | Resulting Checkpoint Type    | Description                                                                 |
+//! |------------------|-------------------------------|-----------------------------------------------------------------------------|
+//! | No v2Checkpoints | Single-file Classic-named V1 | Follows V1 specification without [`CheckpointMetadata`] action             |
+//! | v2Checkpoints    | Single-file Classic-named V2 | Follows V2 specification with [`CheckpointMetadata`] action while maintaining backward compatibility via classic naming |
+//!
+//! For more information on the V1/V2 specifications, see the following protocol section:
+//! <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-specs>
+//!
+//! ## Architecture
+//!
+//! - [`CheckpointWriter`] - Core component that manages the checkpoint creation workflow
+//! - [`CheckpointDataIterator`] - Iterator over the checkpoint data to be written
+//!
+//! ## Usage
 //!
 //! The following steps outline the process of creating a checkpoint:
 //!
