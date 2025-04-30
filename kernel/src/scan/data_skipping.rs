@@ -70,7 +70,7 @@ impl DataSkippingFilter {
         });
         static STATS_EXPR: LazyLock<Expr> = LazyLock::new(|| column_expr!("add.stats"));
         static FILTER_EXPR: LazyLock<Expr> =
-            LazyLock::new(|| column_expr!("predicate").distinct(false));
+            LazyLock::new(|| column_expr!("predicate").distinct(Expr::literal(false)));
 
         let (predicate, referenced_schema) = physical_predicate?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
@@ -239,12 +239,12 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         Some(Expr::binary(op, col, val.clone()))
     }
 
-    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
-        KernelPredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted).map(Expr::literal)
-    }
-
     fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
         KernelPredicateEvaluatorDefaults::eval_scalar(val, inverted).map(Expr::literal)
+    }
+
+    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
+        KernelPredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted).map(Expr::literal)
     }
 
     fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Expr> {

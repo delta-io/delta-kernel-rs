@@ -8,11 +8,11 @@ use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
 
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::ObjectStore;
 use itertools::Itertools;
-use object_store::local::LocalFileSystem;
-use object_store::memory::InMemory;
-use object_store::path::Path;
-use object_store::ObjectStore;
 use serde_json::Deserializer;
 use serde_json::{json, to_vec};
 use url::Url;
@@ -372,7 +372,7 @@ async fn get_and_check_all_parquet_sizes(store: Arc<dyn ObjectStore>, path: &str
     assert!(parquet_files
         .iter()
         .all(|f| f.as_ref().unwrap().size == size));
-    size.try_into().unwrap()
+    size
 }
 
 #[tokio::test]
@@ -738,6 +738,17 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
 
         // commit!
         txn.commit(&engine)?;
+
+        let snapshot = Arc::new(table.snapshot(&engine, None)?);
+        assert_eq!(
+            snapshot.clone().get_app_id_version("app_id1", &engine)?,
+            Some(1)
+        );
+        assert_eq!(
+            snapshot.clone().get_app_id_version("app_id2", &engine)?,
+            Some(2)
+        );
+        assert_eq!(snapshot.get_app_id_version("app_id3", &engine)?, None);
 
         let commit1 = store
             .get(&Path::from(format!(
