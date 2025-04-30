@@ -90,6 +90,8 @@ pub enum WriterFeature {
     ColumnMapping,
     /// ID Columns
     IdentityColumns,
+    /// Monotonically increasing timestamps in the CommitInfo
+    InCommitTimestamp,
     /// Deletion vectors for merge, update, delete
     DeletionVectors,
     /// Row tracking on tables
@@ -244,6 +246,7 @@ mod tests {
             (WriterFeature::GeneratedColumns, "generatedColumns"),
             (WriterFeature::ColumnMapping, "columnMapping"),
             (WriterFeature::IdentityColumns, "identityColumns"),
+            (WriterFeature::InCommitTimestamp, "inCommitTimestamp"),
             (WriterFeature::DeletionVectors, "deletionVectors"),
             (WriterFeature::RowTracking, "rowTracking"),
             (WriterFeature::TimestampWithoutTimezone, "timestampNtz"),
