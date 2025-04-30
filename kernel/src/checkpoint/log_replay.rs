@@ -120,7 +120,7 @@ impl LogReplayProcessor for CheckpointLogReplayProcessor {
 
         Ok(CheckpointBatch {
             filtered_data,
-            actions_count: visitor.non_file_actions_count + visitor.file_actions_count,
+            actions_count: visitor.actions_count,
             add_actions_count: visitor.add_actions_count,
         })
     }
