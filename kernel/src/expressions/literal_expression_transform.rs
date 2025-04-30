@@ -191,11 +191,13 @@ mod tests {
 
     use paste::paste;
 
+    use Expression as Expr;
+
     // helper to take values/schema to pass to `create_one` and assert the result = expected
     fn assert_single_row_transform(
         values: &[Scalar],
         schema: SchemaRef,
-        expected: Result<Expression, ()>,
+        expected: Result<Expr, ()>,
     ) {
         let mut schema_transform = LiteralExpressionTransform::new(values);
         let datatype = schema.into();
@@ -221,15 +223,14 @@ mod tests {
             "col_1",
             DeltaDataTypes::INTEGER,
         )]));
-        let expected = Expression::null_literal(schema.clone().into());
+        let expected = Expr::null_literal(schema.clone().into());
         assert_single_row_transform(values, schema, Ok(expected));
 
         let schema = Arc::new(StructType::new([StructField::nullable(
             "col_1",
             DeltaDataTypes::INTEGER,
         )]));
-        let expected =
-            Expression::struct_from(vec![Expression::null_literal(DeltaDataTypes::INTEGER)]);
+        let expected = Expr::struct_from(vec![Expr::null_literal(DeltaDataTypes::INTEGER)]);
         assert_single_row_transform(values, schema, Ok(expected));
     }
 
@@ -283,9 +284,9 @@ mod tests {
                 ]),
             ),
         ]));
-        let expected = Expression::struct_from(vec![
-            Expression::struct_from(vec![Expression::literal(1), Expression::literal(2)]),
-            Expression::struct_from(vec![Expression::literal(3), Expression::literal(4)]),
+        let expected = Expr::struct_from(vec![
+            Expr::struct_from(vec![Expr::literal(1), Expr::literal(2)]),
+            Expr::struct_from(vec![Expr::literal(3), Expr::literal(4)]),
         ]);
         assert_single_row_transform(values, schema, Ok(expected));
     }
@@ -327,16 +328,16 @@ mod tests {
 
         let expected_result = match expected {
             Expected::Noop => {
-                let nested_struct = Expression::struct_from(vec![
-                    Expression::literal(values[0].clone()),
-                    Expression::literal(values[1].clone()),
+                let nested_struct = Expr::struct_from(vec![
+                    Expr::literal(values[0].clone()),
+                    Expr::literal(values[1].clone()),
                 ]);
-                Ok(Expression::struct_from([nested_struct]))
+                Ok(Expr::struct_from([nested_struct]))
             }
-            Expected::Null => Ok(Expression::null_literal(schema.clone().into())),
+            Expected::Null => Ok(Expr::null_literal(schema.clone().into())),
             Expected::NullStruct => {
-                let nested_null = Expression::null_literal(field_x.data_type().clone());
-                Ok(Expression::struct_from([nested_null]))
+                let nested_null = Expr::null_literal(field_x.data_type().clone());
+                Ok(Expr::struct_from([nested_null]))
             }
             Expected::Error => Err(()),
         };

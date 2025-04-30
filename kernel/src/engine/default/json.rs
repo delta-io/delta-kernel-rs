@@ -8,11 +8,11 @@ use std::task::Poll;
 use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::arrow::json::ReaderBuilder;
 use crate::arrow::record_batch::RecordBatch;
+use crate::object_store::path::Path;
+use crate::object_store::{self, DynObjectStore, GetResultPayload, PutMode};
 use bytes::{Buf, Bytes};
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
-use object_store::path::Path;
-use object_store::{DynObjectStore, GetResultPayload, PutMode};
 use tracing::warn;
 use url::Url;
 
@@ -258,15 +258,15 @@ mod tests {
     use crate::engine::default::executor::tokio::{
         TokioBackgroundExecutor, TokioMultiThreadExecutor,
     };
-    use crate::utils::test_utils::string_array_to_engine_data;
-    use futures::future;
-    use itertools::Itertools;
-    use object_store::local::LocalFileSystem;
-    use object_store::memory::InMemory;
-    use object_store::{
+    use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::{
         GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
         PutMultipartOpts, PutOptions, PutPayload, PutResult, Result,
     };
+    use crate::utils::test_utils::string_array_to_engine_data;
+    use futures::future;
+    use itertools::Itertools;
     use serde_json::json;
 
     // TODO: should just use the one from test_utils, but running into dependency issues
@@ -425,11 +425,11 @@ mod tests {
             self.inner.get_opts(location, options).await
         }
 
-        async fn get_range(&self, location: &Path, range: Range<usize>) -> Result<Bytes> {
+        async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
             self.inner.get_range(location, range).await
         }
 
-        async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
             self.inner.get_ranges(location, ranges).await
         }
 
@@ -441,7 +441,7 @@ mod tests {
             self.inner.delete(location).await
         }
 
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
             self.inner.list(prefix)
         }
 
@@ -449,7 +449,7 @@ mod tests {
             &self,
             prefix: Option<&Path>,
             offset: &Path,
-        ) -> BoxStream<'_, Result<ObjectMeta>> {
+        ) -> BoxStream<'static, Result<ObjectMeta>> {
             self.inner.list_with_offset(prefix, offset)
         }
 
@@ -531,10 +531,12 @@ mod tests {
         let location = Path::from(url.path());
         let meta = store.head(&location).await.unwrap();
 
+        // TODO: remove after arrow 54 support is dropped
+        #[allow(clippy::useless_conversion)]
         let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp_millis(),
-            size: meta.size,
+            size: meta.size.try_into().unwrap(),
         }];
 
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
@@ -680,10 +682,12 @@ mod tests {
                         let url = Url::parse(&format!("memory:/{}", path)).unwrap();
                         let location = Path::from(path.as_ref());
                         let meta = store.head(&location).await.unwrap();
+                        // TODO: remove after dropping support for arrow 54
+                        #[allow(clippy::useless_conversion)]
                         FileMeta {
                             location: url,
                             last_modified: meta.last_modified.timestamp_millis(),
-                            size: meta.size,
+                            size: meta.size.try_into().unwrap(),
                         }
                     }
                 })

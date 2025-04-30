@@ -19,8 +19,8 @@ fn get_cdf_columns(scan_file: &CdfScanFile) -> DeltaResult<HashMap<&str, Express
     let version = scan_file.commit_version;
     let change_type: Expression = match scan_file.scan_type {
         CdfScanFileType::Cdc => Expression::column([CHANGE_TYPE_COL_NAME]),
-        CdfScanFileType::Add => ADD_CHANGE_TYPE.into(),
-        CdfScanFileType::Remove => REMOVE_CHANGE_TYPE.into(),
+        CdfScanFileType::Add => Expression::literal(ADD_CHANGE_TYPE),
+        CdfScanFileType::Remove => Expression::literal(REMOVE_CHANGE_TYPE),
     };
     let expressions = [
         (CHANGE_TYPE_COL_NAME, change_type),
@@ -81,7 +81,7 @@ pub(crate) fn scan_file_physical_schema(
 mod tests {
     use std::collections::HashMap;
 
-    use crate::expressions::{column_expr, Expression, Scalar};
+    use crate::expressions::{column_expr, Expression as Expr, Scalar};
     use crate::scan::ColumnType;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::physical_to_logical::physical_to_logical_expr;
@@ -119,20 +119,20 @@ mod tests {
             ];
             let phys_to_logical_expr =
                 physical_to_logical_expr(&scan_file, &logical_schema, &all_fields).unwrap();
-            let expected_expr = Expression::struct_from([
+            let expected_expr = Expr::struct_from([
                 column_expr!("id"),
                 Scalar::Long(20).into(),
                 expected_expr,
-                Expression::literal(42i64),
+                Expr::literal(42i64),
                 Scalar::TimestampNtz(1234000).into(), // Microsecond is 1000x millisecond
             ]);
 
             assert_eq!(phys_to_logical_expr, expected_expr)
         };
 
-        let cdc_change_type = Expression::column([CHANGE_TYPE_COL_NAME]);
-        test(CdfScanFileType::Add, ADD_CHANGE_TYPE.into());
-        test(CdfScanFileType::Remove, REMOVE_CHANGE_TYPE.into());
+        let cdc_change_type = Expr::column([CHANGE_TYPE_COL_NAME]);
+        test(CdfScanFileType::Add, Expr::literal(ADD_CHANGE_TYPE));
+        test(CdfScanFileType::Remove, Expr::literal(REMOVE_CHANGE_TYPE));
         test(CdfScanFileType::Cdc, cdc_change_type);
     }
 }

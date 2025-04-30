@@ -14,4 +14,3 @@ release = false
 [dependencies]
 delta_kernel = { path = "../kernel", features = [ "default-engine", "arrow" ] }
 itertools = "0.14.0"
-object_store = { workspace = true }
