@@ -13,7 +13,8 @@ use crate::actions::deletion_vector::{
 };
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{ColumnName, Expression, ExpressionRef, ExpressionTransform, Scalar};
+use crate::expressions::transforms::ExpressionTransform;
+use crate::expressions::{ColumnName, Expression, ExpressionRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
 use crate::log_replay::HasSelectionVector;
 use crate::scan::state::{DvInfo, Stats};
@@ -533,7 +534,6 @@ impl Scan {
 
         let global_state = Arc::new(self.global_scan_state());
         let table_root = self.snapshot.table_root().clone();
-        let physical_predicate = self.physical_predicate();
 
         let scan_metadata_iter = self.scan_metadata(engine.as_ref())?;
         let scan_files_iter = scan_metadata_iter
@@ -554,7 +554,9 @@ impl Scan {
                     .get_selection_vector(engine.as_ref(), &table_root)?;
                 let meta = FileMeta {
                     last_modified: 0,
-                    size: scan_file.size as usize,
+                    size: scan_file.size.try_into().map_err(|_| {
+                        Error::generic("Unable to convert scan file size into FileSize")
+                    })?,
                     location: file_path,
                 };
 
@@ -562,10 +564,12 @@ impl Scan {
                 // partition columns, but the read schema we use here does _NOT_ include partition
                 // columns. So we cannot safely assume that all column references are valid. See
                 // https://github.com/delta-io/delta-kernel-rs/issues/434 for more details.
+                //
+                // TODO(#860): we disable predicate pushdown until we support row indexes.
                 let read_result_iter = engine.parquet_handler().read_parquet_files(
                     &[meta],
                     global_state.physical_schema.clone(),
-                    physical_predicate.clone(),
+                    None,
                 )?;
 
                 // Arc clones
@@ -835,7 +839,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::column_expr;
+    use crate::expressions::{column_expr, Expression as Expr};
     use crate::schema::{ColumnMetadataKey, PrimitiveType};
     use crate::Table;
 
@@ -843,19 +847,19 @@ mod tests {
 
     #[test]
     fn test_static_skipping() {
-        const NULL: Expression = Expression::null_literal(DataType::BOOLEAN);
+        const NULL: Expression = Expr::null_literal(DataType::BOOLEAN);
         let test_cases = [
             (false, column_expr!("a")),
-            (true, Expression::literal(false)),
-            (false, Expression::literal(true)),
+            (true, Expr::literal(false)),
+            (false, Expr::literal(true)),
             (true, NULL),
-            (true, Expression::and(column_expr!("a"), false)),
-            (false, Expression::or(column_expr!("a"), true)),
-            (false, Expression::or(column_expr!("a"), false)),
-            (false, Expression::lt(column_expr!("a"), 10)),
-            (false, Expression::lt(Expression::literal(10), 100)),
-            (true, Expression::gt(Expression::literal(10), 100)),
-            (true, Expression::and(NULL, column_expr!("a"))),
+            (true, Expr::and(column_expr!("a"), Expr::literal(false))),
+            (false, Expr::or(column_expr!("a"), Expr::literal(true))),
+            (false, Expr::or(column_expr!("a"), Expr::literal(false))),
+            (false, Expr::lt(column_expr!("a"), Expr::literal(10))),
+            (false, Expr::lt(Expr::literal(10), Expr::literal(100))),
+            (true, Expr::gt(Expr::literal(10), Expr::literal(100))),
+            (true, Expr::and(NULL, column_expr!("a"))),
         ];
         for (should_skip, predicate) in test_cases {
             assert_eq!(
@@ -906,11 +910,8 @@ mod tests {
         // NOTE: We break several column mapping rules here because they don't matter for this
         // test. For example, we do not provide field ids, and not all columns have physical names.
         let test_cases = [
-            (Expression::literal(true), Some(PhysicalPredicate::None)),
-            (
-                Expression::literal(false),
-                Some(PhysicalPredicate::StaticSkipAll),
-            ),
+            (Expr::literal(true), Some(PhysicalPredicate::None)),
+            (Expr::literal(false), Some(PhysicalPredicate::StaticSkipAll)),
             (column_expr!("x"), None), // no such column
             (
                 column_expr!("a"),
@@ -977,9 +978,9 @@ mod tests {
                 )),
             ),
             (
-                Expression::and(column_expr!("mapped.n"), true),
+                Expr::and(column_expr!("mapped.n"), Expr::literal(true)),
                 Some(PhysicalPredicate::Some(
-                    Expression::and(column_expr!("phys_mapped.phys_n"), true).into(),
+                    Expr::and(column_expr!("phys_mapped.phys_n"), Expr::literal(true)).into(),
                     StructType::new(vec![StructField::nullable(
                         "phys_mapped",
                         StructType::new(vec![StructField::nullable("phys_n", DataType::LONG)
@@ -996,7 +997,7 @@ mod tests {
                 )),
             ),
             (
-                Expression::and(column_expr!("mapped.n"), false),
+                Expr::and(column_expr!("mapped.n"), Expr::literal(false)),
                 Some(PhysicalPredicate::StaticSkipAll),
             ),
         ];
@@ -1151,7 +1152,7 @@ mod tests {
 
         // Ineffective predicate pushdown attempted, so the one data file should be returned.
         let int_col = column_expr!("numeric.ints.int32");
-        let value = Expression::literal(1000i32);
+        let value = Expr::literal(1000i32);
         let predicate = Arc::new(int_col.clone().gt(value.clone()));
         let scan = snapshot
             .clone()
@@ -1162,7 +1163,11 @@ mod tests {
         let data: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
         assert_eq!(data.len(), 1);
 
-        // Effective predicate pushdown, so no data files should be returned.
+        // TODO(#860): we disable predicate pushdown until we support row indexes. Update this test
+        // accordingly after support is reintroduced.
+        //
+        // Effective predicate pushdown, so no data files should be returned. BUT since we disabled
+        // predicate pushdown, the one data file is still returned.
         let predicate = Arc::new(int_col.lt(value));
         let scan = snapshot
             .scan_builder()
@@ -1170,7 +1175,7 @@ mod tests {
             .build()
             .unwrap();
         let data: Vec<_> = scan.execute(engine).unwrap().try_collect().unwrap();
-        assert_eq!(data.len(), 0);
+        assert_eq!(data.len(), 1);
     }
 
     #[test]
@@ -1187,7 +1192,7 @@ mod tests {
         //
         // WARNING: https://github.com/delta-io/delta-kernel-rs/issues/434 - This
         // optimization is currently disabled, so the one data file is still returned.
-        let predicate = Arc::new(column_expr!("missing").lt(1000i64));
+        let predicate = Arc::new(column_expr!("missing").lt(Expr::literal(1000i64)));
         let scan = snapshot
             .clone()
             .scan_builder()
@@ -1198,7 +1203,7 @@ mod tests {
         assert_eq!(data.len(), 1);
 
         // Predicate over a logically missing column fails the scan
-        let predicate = Arc::new(column_expr!("numeric.ints.invalid").lt(1000));
+        let predicate = Arc::new(column_expr!("numeric.ints.invalid").lt(Expr::literal(1000)));
         snapshot
             .scan_builder()
             .with_predicate(predicate)
