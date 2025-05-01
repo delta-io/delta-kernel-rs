@@ -86,6 +86,80 @@ fn test_literal_type_array() {
 }
 
 #[test]
+fn test_literal_complex_type_array() {
+    use crate::arrow::array::{Array as _, AsArray as _};
+    use crate::arrow::datatypes::Int32Type;
+
+    let array_type = ArrayType::new(DeltaDataTypes::INTEGER, true);
+    let array_value = Scalar::Array(ArrayData::new(
+        array_type.clone(),
+        vec![
+            Scalar::from(1),
+            Scalar::from(2),
+            Scalar::Null(DeltaDataTypes::INTEGER),
+            Scalar::from(3),
+        ],
+    ));
+    let struct_fields = vec![
+        StructField::nullable("scalar", DeltaDataTypes::INTEGER),
+        StructField::nullable("list", array_type.clone()),
+        StructField::nullable("null_list", array_type.clone()),
+    ];
+    let struct_type = StructType::new(struct_fields.clone());
+    let struct_value = Scalar::Struct(
+        crate::expressions::StructData::try_new(
+            struct_fields.clone(),
+            vec![
+                Scalar::Integer(42),
+                array_value,
+                Scalar::Null(array_type.clone().into()),
+            ],
+        )
+        .unwrap(),
+    );
+    let nested_array_type = ArrayType::new(struct_type.clone().into(), true);
+    let nested_array_value = Scalar::Array(ArrayData::new(
+        nested_array_type.clone(),
+        vec![
+            struct_value.clone(),
+            Scalar::Null(struct_type.clone().into()),
+            struct_value.clone(),
+        ],
+    ))
+    .to_array(5)
+    .unwrap();
+    assert_eq!(nested_array_value.len(), 5);
+
+    let struct_values = nested_array_value.as_list::<i32>().values();
+    let struct_values = struct_values.as_struct();
+    assert_eq!(struct_values.len(), 5 * 3); // five rows, three elements per row
+
+    // each nested array value has three elements, the middle one NULL
+    let expected_valid = [true, false, true];
+    let expected_valid = (0..5).flat_map(|_| expected_valid.iter().cloned());
+    assert!(expected_valid
+        .zip(struct_values.nulls().unwrap())
+        .all(|(a, b)| a == b));
+
+    let expected_values = [Some(42), None, Some(42)];
+    let expected_values = (0..5).flat_map(|_| expected_values.iter().cloned());
+    assert!(expected_values
+        .zip(struct_values.column(0).as_primitive::<Int32Type>())
+        .all(|(a, b)| a == b));
+    assert_eq!(struct_values.column(2).null_count(), 15);
+
+    // The leaf value column has 40 elements (not 60) becuase 1/3 of the parent structs are NULL.
+    let list_values = struct_values.column(1);
+    let list_values = list_values.as_list::<i32>().values();
+    assert_eq!(list_values.len(), 40);
+    let expected_values = [Some(1), Some(2), None, Some(3)];
+    let expected_values = (0..10).flat_map(|_| expected_values.iter().cloned());
+    assert!(expected_values
+        .zip(list_values.as_primitive::<Int32Type>())
+        .all(|(a, b)| a == b));
+}
+
+#[test]
 fn test_invalid_array_sides() {
     let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
     let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6, 9]));
