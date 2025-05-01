@@ -332,7 +332,8 @@ impl Snapshot {
         Ok(txn.map(|t| t.version))
     }
 
-    /// Fetch the configuration for a domain for this snapshot.
+    /// Fetch the domainMetadata for a specific domain in this snapshot. This returns the latest
+    /// configuration for the domain, or None if the domain does not exist.
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     pub fn domain_metadata_config(
@@ -342,7 +343,7 @@ impl Snapshot {
     ) -> DeltaResult<Option<String>> {
         if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
             return Err(Error::generic(
-                "User DomainMetadata are not allowed to use internal 'delta.*' domain",
+                "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain",
             ));
         }
 
