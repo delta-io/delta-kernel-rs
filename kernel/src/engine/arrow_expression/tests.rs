@@ -75,10 +75,13 @@ fn test_literal_type_array() {
     let in_op = Expr::binary(
         BinaryOperator::NotIn,
         Expr::literal(5),
-        Scalar::Array(ArrayData::new(
-            ArrayType::new(DeltaDataTypes::INTEGER, false),
-            vec![Scalar::Integer(1), Scalar::Integer(2)],
-        )),
+        Scalar::Array(
+            ArrayData::try_new(
+                ArrayType::new(DeltaDataTypes::INTEGER, false),
+                vec![Scalar::Integer(1), Scalar::Integer(2)],
+            )
+            .unwrap(),
+        ),
     );
 
     let in_result = evaluate_expression(&in_op, &batch, None).unwrap();

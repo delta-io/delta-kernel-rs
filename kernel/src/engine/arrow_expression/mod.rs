@@ -98,22 +98,16 @@ impl Scalar {
                 let mut builder = MapBuilder::new(None, key_builder, val_builder);
                 for _ in 0..num_rows {
                     for (key, val) in data.pairs() {
-                        match (key, val) {
-                            (Scalar::String(key), Scalar::String(val)) => {
-                                builder.keys().append_value(key);
-                                builder.values().append_value(val);
-                            }
-                            (Scalar::String(key), Scalar::Null(data_type))
-                                if data_type == &DataType::STRING =>
-                            {
-                                builder.keys().append_value(key);
-                                builder.values().append_null();
-                            }
+                        match key {
+                            Scalar::String(key) => builder.keys().append_value(key),
                             _ => {
-                                return Err(Error::unsupported(
-                                "Only string->string maps (with non-null keys) are currently supported",
-                            ));
+                                return Err(Error::unsupported("Maps require non-null string keys"))
                             }
+                        }
+                        match val {
+                            Scalar::String(val) => builder.values().append_value(val),
+                            Scalar::Null(DataType::STRING) => builder.values().append_null(),
+                            _ => return Err(Error::unsupported("Maps require string values")),
                         }
                     }
                     builder.append(true)?;

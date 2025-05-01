@@ -22,7 +22,8 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         DataType::Primitive(delta_kernel::schema::PrimitiveType::Short),
         false,
     );
-    let array_data = ArrayData::new(array_type.clone(), vec![Scalar::Short(5), Scalar::Short(0)]);
+    let array_data =
+        ArrayData::try_new(array_type.clone(), vec![Scalar::Short(5), Scalar::Short(0)]).unwrap();
 
     let map_type = MapType::new(DataType::STRING, DataType::STRING, false);
     let map_data = MapData::try_new(

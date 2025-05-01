@@ -60,9 +60,26 @@ pub struct ArrayData {
 }
 
 impl ArrayData {
-    pub fn new(tpe: ArrayType, elements: impl IntoIterator<Item = impl Into<Scalar>>) -> Self {
-        let elements = elements.into_iter().map(Into::into).collect();
-        Self { tpe, elements }
+    pub fn try_new(
+        tpe: ArrayType,
+        elements: impl IntoIterator<Item = impl Into<Scalar>>,
+    ) -> DeltaResult<Self> {
+        let elements = elements
+            .into_iter()
+            .map(Into::into)
+            .map(|v| {
+                if *tpe.element_type() == v.data_type() {
+                    Ok(v)
+                } else {
+                    Err(Error::Generic(format!(
+                        "Array scalar type mismatch: expected {}, got {}",
+                        tpe.element_type(),
+                        v.data_type()
+                    )))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { tpe, elements })
     }
 
     pub fn array_type(&self) -> &ArrayType {
@@ -88,13 +105,26 @@ impl MapData {
         data_type: MapType,
         values: impl IntoIterator<Item = (impl Into<Scalar>, impl Into<Scalar>)>,
     ) -> DeltaResult<Self> {
-        if let (DataType::Primitive(_), DataType::Primitive(_)) =
+        if let (key_type @ DataType::Primitive(_), val_type @ DataType::Primitive(_)) =
             (data_type.key_type(), data_type.value_type())
         {
             let pairs = values
                 .into_iter()
                 .map(|(k, v)| (k.into(), v.into()))
-                .collect();
+                .map(|(k, v)| {
+                    if k.data_type() == *key_type && v.data_type() == *val_type {
+                        Ok((k, v))
+                    } else {
+                        Err(Error::Generic(format!(
+                            "Map scalar type mismatch: expected keys {}, vals {} got keys {}, vals {}",
+                            key_type,
+                            val_type,
+                            k.data_type(),
+                            v.data_type()
+                        )))
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(Self { data_type, pairs })
         } else {
             Err(Error::unsupported(
@@ -766,6 +796,24 @@ mod tests {
         assert_eq!(&format!("{}", array_not_op), "10 NOT IN (1, 2, 3)");
         assert_eq!(&format!("{}", column_op), "3.1415927 IN Column(item)");
         assert_eq!(&format!("{}", column_not_op), "'Cool' NOT IN Column(item)");
+    }
+
+    #[test]
+    fn test_invalid_array() {
+        assert!(ArrayData::try_new(
+            ArrayType::new(DataType::INTEGER, false),
+            [Scalar::Integer(1), Scalar::String("s".to_string())],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_invalid_map() {
+        assert!(MapData::try_new(
+            MapType::new(DataType::STRING, DataType::INTEGER, false),
+            [(Scalar::Integer(1), Scalar::String("s".to_string())),],
+        )
+        .is_err());
     }
 
     #[test]
