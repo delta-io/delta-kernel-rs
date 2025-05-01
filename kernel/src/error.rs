@@ -19,6 +19,7 @@ use crate::object_store;
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
 
 /// All the types of errors that the kernel can run into
+#[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     /// This is an error that includes a backtrace. To have a particular type of error include such
