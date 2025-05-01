@@ -336,7 +336,7 @@ impl Snapshot {
     /// configuration for the domain, or None if the domain does not exist.
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
-    pub fn domain_metadata_config(
+    pub fn get_domain_metadata(
         &self,
         domain: &str,
         engine: &dyn Engine,
@@ -839,20 +839,20 @@ mod tests {
 
         let snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, None)?);
 
-        assert_eq!(snapshot.domain_metadata_config("domain1", &engine)?, None);
+        assert_eq!(snapshot.get_domain_metadata("domain1", &engine)?, None);
         assert_eq!(
-            snapshot.domain_metadata_config("domain2", &engine)?,
+            snapshot.get_domain_metadata("domain2", &engine)?,
             Some("domain2_commit1".to_string())
         );
         assert_eq!(
-            snapshot.domain_metadata_config("domain3", &engine)?,
+            snapshot.get_domain_metadata("domain3", &engine)?,
             Some("domain3_commit0".to_string())
         );
         let err = snapshot
-            .domain_metadata_config("delta.domain3", &engine)
+            .get_domain_metadata("delta.domain3", &engine)
             .unwrap_err();
         assert!(matches!(err, Error::Generic(msg) if
-                msg == "User DomainMetadata are not allowed to use internal 'delta.*' domain"));
+                msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
         Ok(())
     }
 }
