@@ -4,9 +4,7 @@
 //! For now, this module only exposes the ability to read a single domain at once from the log. In
 //! the future this should allow for reading all domains from the log at once.
 
-use std::borrow::Borrow;
-use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::get_log_domain_metadata_schema;
@@ -14,48 +12,10 @@ use crate::actions::visitors::DomainMetadataVisitor;
 use crate::actions::{DomainMetadata, DOMAIN_METADATA_NAME};
 use crate::log_segment::LogSegment;
 use crate::{DeltaResult, Engine, EngineData, Expression as Expr, ExpressionRef, RowVisitor as _};
-use std::ops::Deref;
 
 const DOMAIN_METADATA_DOMAIN_FIELD: &str = "domain";
 
-pub(crate) type DomainMetadataSet = HashSet<DomainMetadataHashSetEntry>;
-
-#[derive(Debug)]
-pub(crate) struct DomainMetadataHashSetEntry(DomainMetadata);
-
-impl PartialEq for DomainMetadataHashSetEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.domain == other.0.domain
-    }
-}
-
-impl Eq for DomainMetadataHashSetEntry {}
-
-impl Hash for DomainMetadataHashSetEntry {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.domain.hash(state);
-    }
-}
-
-impl Borrow<str> for DomainMetadataHashSetEntry {
-    fn borrow(&self) -> &str {
-        &self.0.domain
-    }
-}
-
-impl Deref for DomainMetadataHashSetEntry {
-    type Target = DomainMetadata;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl From<DomainMetadata> for DomainMetadataHashSetEntry {
-    fn from(metadata: DomainMetadata) -> Self {
-        DomainMetadataHashSetEntry(metadata)
-    }
-}
+pub(crate) type DomainMetadataMap = HashMap<String, DomainMetadata>;
 
 /// Read the latest domain metadata for a given domain and return its `configuration`. This
 /// accounts for 'removed' domain metadata: if the domain is removed, then the configuration is
@@ -70,10 +30,10 @@ pub(crate) fn domain_metadata_configuration(
 ) -> DeltaResult<Option<String>> {
     let mut domain_metadatas = scan_domain_metadatas(log_segment, Some(domain), engine)?;
     // note that the resulting domain_metadatas includes removed domains, so we need to filter
-    domain_metadatas.retain(|dm| !dm.removed);
+    domain_metadatas.retain(|_, dm| !dm.removed);
     Ok(domain_metadatas
-        .take(domain)
-        .map(|domain_metadata| domain_metadata.0.configuration))
+        .remove(domain)
+        .map(|domain_metadata| domain_metadata.configuration))
 }
 
 /// Scan the entire log for all domain metadata actions but terminate early if a specific domain
@@ -83,7 +43,7 @@ fn scan_domain_metadatas(
     log_segment: &LogSegment,
     domain: Option<&str>,
     engine: &dyn Engine,
-) -> DeltaResult<DomainMetadataSet> {
+) -> DeltaResult<DomainMetadataMap> {
     let mut visitor = DomainMetadataVisitor::new(domain.map(|s| s.to_owned()));
     // If a specific domain is requested then we can terminate log replay early as soon as it was
     // found. If all domains are requested then we are forced to replay the entire log.

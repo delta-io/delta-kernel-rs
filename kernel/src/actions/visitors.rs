@@ -12,7 +12,7 @@ use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 use super::deletion_vector::DeletionVectorDescriptor;
-use super::domain_metadata::DomainMetadataSet;
+use super::domain_metadata::DomainMetadataMap;
 use super::schemas::ToSchema as _;
 use super::*;
 
@@ -493,7 +493,7 @@ impl RowVisitor for SidecarVisitor {
 /// requirements).
 #[derive(Debug, Default)]
 pub(crate) struct DomainMetadataVisitor {
-    pub(crate) domain_metadatas: DomainMetadataSet,
+    pub(crate) domain_metadatas: DomainMetadataMap,
     domain_filter: Option<String>,
 }
 
@@ -548,8 +548,9 @@ impl RowVisitor for DomainMetadataVisitor {
                 {
                     let domain_metadata =
                         DomainMetadataVisitor::visit_domain_metadata(i, domain.clone(), getters)?;
-                    // NB: insert will only do the insert if it doesn't already exist
-                    self.domain_metadatas.insert(domain_metadata.into());
+                    self.domain_metadatas
+                        .entry(domain)
+                        .or_insert(domain_metadata);
                 }
             }
         }
@@ -800,6 +801,8 @@ mod tests {
 
     #[test]
     fn test_parse_domain_metadata() {
+        // note: we process commit_1, commit_0 since the visitor expects things in reverse order.
+        // these come from the 'more recent' commit
         let json_strings: StringArray = vec![
             r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
             r#"{"domainMetadata":{"domain": "zach1","configuration":"cfg1","removed": true}}"#,
@@ -810,7 +813,8 @@ mod tests {
             r#"{"domainMetadata":{"domain": "zach6","configuration":"cfg6","removed": false}}"#,
         ]
         .into();
-        let batch1 = parse_json_batch(json_strings);
+        let commit_1 = parse_json_batch(json_strings);
+        // these come from the 'older' commit
         let json_strings: StringArray = vec![
             r#"{"domainMetadata":{"domain": "zach1","configuration":"old_cfg1","removed": true}}"#,
             r#"{"domainMetadata":{"domain": "zach2","configuration":"old_cfg2","removed": false}}"#,
@@ -820,92 +824,110 @@ mod tests {
             r#"{"domainMetadata":{"domain": "zach8","configuration":"cfg8","removed": false}}"#,
         ]
         .into();
-        let batch2 = parse_json_batch(json_strings);
+        let commit_0 = parse_json_batch(json_strings);
         let mut domain_metadata_visitor = DomainMetadataVisitor::default();
-        // visit batch 1 then 2 (would assume batch 1 is 'newer' in the log)
+        // visit commit 1 then 0
         domain_metadata_visitor
-            .visit_rows_of(batch1.as_ref())
+            .visit_rows_of(commit_1.as_ref())
             .unwrap();
         domain_metadata_visitor
-            .visit_rows_of(batch2.as_ref())
+            .visit_rows_of(commit_0.as_ref())
             .unwrap();
         let actual = domain_metadata_visitor.domain_metadatas;
-        let expected = DomainMetadataSet::from([
-            DomainMetadata {
-                domain: "zach1".to_string(),
-                configuration: "cfg1".to_string(),
-                removed: true,
-            }
-            .into(),
-            DomainMetadata {
-                domain: "zach2".to_string(),
-                configuration: "cfg2".to_string(),
-                removed: false,
-            }
-            .into(),
-            DomainMetadata {
-                domain: "zach3".to_string(),
-                configuration: "cfg3".to_string(),
-                removed: true,
-            }
-            .into(),
-            DomainMetadata {
-                domain: "zach4".to_string(),
-                configuration: "cfg4".to_string(),
-                removed: false,
-            }
-            .into(),
-            DomainMetadata {
-                domain: "zach5".to_string(),
-                configuration: "cfg5".to_string(),
-                removed: true,
-            }
-            .into(),
-            DomainMetadata {
-                domain: "zach6".to_string(),
-                configuration: "cfg6".to_string(),
-                removed: false,
-            }
-            .into(),
-            DomainMetadata {
-                domain: "zach7".to_string(),
-                configuration: "cfg7".to_string(),
-                removed: true,
-            }
-            .into(),
-            DomainMetadata {
-                domain: "zach8".to_string(),
-                configuration: "cfg8".to_string(),
-                removed: false,
-            }
-            .into(),
+        let expected = DomainMetadataMap::from([
+            (
+                "zach1".to_string(),
+                DomainMetadata {
+                    domain: "zach1".to_string(),
+                    configuration: "cfg1".to_string(),
+                    removed: true,
+                },
+            ),
+            (
+                "zach2".to_string(),
+                DomainMetadata {
+                    domain: "zach2".to_string(),
+                    configuration: "cfg2".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach3".to_string(),
+                DomainMetadata {
+                    domain: "zach3".to_string(),
+                    configuration: "cfg3".to_string(),
+                    removed: true,
+                },
+            ),
+            (
+                "zach4".to_string(),
+                DomainMetadata {
+                    domain: "zach4".to_string(),
+                    configuration: "cfg4".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach5".to_string(),
+                DomainMetadata {
+                    domain: "zach5".to_string(),
+                    configuration: "cfg5".to_string(),
+                    removed: true,
+                },
+            ),
+            (
+                "zach6".to_string(),
+                DomainMetadata {
+                    domain: "zach6".to_string(),
+                    configuration: "cfg6".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach7".to_string(),
+                DomainMetadata {
+                    domain: "zach7".to_string(),
+                    configuration: "cfg7".to_string(),
+                    removed: true,
+                },
+            ),
+            (
+                "zach8".to_string(),
+                DomainMetadata {
+                    domain: "zach8".to_string(),
+                    configuration: "cfg8".to_string(),
+                    removed: false,
+                },
+            ),
         ]);
         assert_eq!(actual, expected);
 
         // test filtering
         let mut domain_metadata_visitor = DomainMetadataVisitor::new(Some("zach3".to_string()));
         domain_metadata_visitor
-            .visit_rows_of(batch1.as_ref())
+            .visit_rows_of(commit_1.as_ref())
             .unwrap();
         domain_metadata_visitor
-            .visit_rows_of(batch2.as_ref())
+            .visit_rows_of(commit_0.as_ref())
             .unwrap();
         let actual = domain_metadata_visitor.domain_metadatas;
-        let expected = DomainMetadataSet::from([DomainMetadata {
-            domain: "zach3".to_string(),
-            configuration: "old_cfg3".to_string(),
-            removed: false,
-        }
-        .into()]);
+        let expected = DomainMetadataMap::from([(
+            "zach3".to_string(),
+            DomainMetadata {
+                domain: "zach3".to_string(),
+                configuration: "cfg3".to_string(),
+                removed: true,
+            },
+        )]);
         assert_eq!(actual, expected);
 
         // test filtering for a domain that is not present
         let mut domain_metadata_visitor = DomainMetadataVisitor::new(Some("notexist".to_string()));
         domain_metadata_visitor
-            .visit_rows_of(batch1.as_ref())
+            .visit_rows_of(commit_1.as_ref())
             .unwrap();
         domain_metadata_visitor
-            .visit_rows_of(batch2.as_ref())
+            .visit_rows_of(commit_0.as_ref())
             .unwrap();
         assert!(domain_metadata_visitor.domain_metadatas.is_empty());
     }
