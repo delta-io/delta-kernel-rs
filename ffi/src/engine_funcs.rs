@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use delta_kernel::schema::{DataType, Schema, SchemaRef};
 use delta_kernel::{
-    DeltaResult, EngineData, Expression, ExpressionEvaluator, FileDataReadResultIterator,
+    DeltaResult, EngineData, Error, Expression, ExpressionEvaluator, FileDataReadResultIterator,
 };
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
@@ -122,10 +122,15 @@ fn read_parquet_file_impl(
     let engine = extern_engine.engine();
     let parquet_handler = engine.parquet_handler();
     let location = Url::parse(path?)?;
+    // TODO: remove after arrow 54 is dropped
+    #[allow(clippy::useless_conversion)]
     let delta_fm = delta_kernel::FileMeta {
         location,
         last_modified: file.last_modified,
-        size: file.size,
+        size: file
+            .size
+            .try_into()
+            .map_err(|_| Error::generic_err("unable to convert to FileSize"))?,
     };
     // TODO: Plumb the predicate through the FFI?
     let data = parquet_handler.read_parquet_files(&[delta_fm], physical_schema, None)?;

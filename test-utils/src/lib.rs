@@ -5,11 +5,11 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::object_store::{path::Path, ObjectStore};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::EngineData;
 use itertools::Itertools;
-use object_store::{path::Path, ObjectStore};
 
 /// A common useful initial metadata and protocol. Also includes a single commitInfo
 pub const METADATA: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
@@ -129,14 +129,4 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
     ArrowEngineData::try_from_engine_data(engine_data)
         .unwrap()
         .into()
-}
-
-/// We implement abs_diff here so we don't have to bump our msrv.
-/// TODO: Remove and use std version when msrv >= 1.81.0
-pub fn abs_diff(self_dur: std::time::Duration, other: std::time::Duration) -> std::time::Duration {
-    if let Some(res) = self_dur.checked_sub(other) {
-        res
-    } else {
-        other.checked_sub(self_dur).unwrap()
-    }
 }
