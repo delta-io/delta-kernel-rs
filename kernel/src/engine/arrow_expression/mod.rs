@@ -27,9 +27,17 @@ mod tests;
 
 // TODO leverage scalars / Datum
 
-// NOTE: This trait is a disgusting hack, needed because [`array::StructBuilder::field_builders`]
-// was not added until arrow-55. Once we drop support for older arrow versions, we can change
-// [`Scalar::append`] below to take `&mut dyn ArrayBuilder` directly and cast it as needed.
+// This trait is a hack, needed because [`array::StructBuilder::field_builders`] was not added until
+// arrow-55, and `StructBuilder::field_builder` (available in all versions) only works for concrete
+// builders. We can't ask for `dyn ArrayBuilder` directly (the method requires `Sized` types), nor
+// can we ask for `Box<dyn ArrayBuilder>` (which is what the builder actually stores internally),
+// because the `Box` derefs `&dyn ArrayBuilder` _before_ being downcast to `Any`. Instead, we must
+// wrap the builder in a trait that can call `StructBuilder::field_builder` once the type is known,
+// with a trivial implementation of the same trait for `Box<dyn ArrayBuilder>` that
+// `array::make_builder` returns (and populates list and map builders with).
+//
+// Once we drop support for older arrow versions, we can change [`Scalar::append`] below to take
+// `&mut dyn ArrayBuilder` directly and cast it as needed.
 trait ArrayBuilderAs {
     fn array_builder_as<T: ArrayBuilder>(&mut self) -> Option<&mut T>;
 }
@@ -40,20 +48,18 @@ impl ArrayBuilderAs for Box<dyn ArrayBuilder> {
     }
 }
 
-#[cfg(feature = "arrow-54")]
+#[cfg(not(feature = "arrow-55"))]
 struct StructFieldBuilder<'a> {
     builder: &'a mut array::StructBuilder,
     field_index: usize,
 }
 
-#[cfg(feature = "arrow-54")]
+#[cfg(not(feature = "arrow-55"))]
 impl ArrayBuilderAs for StructFieldBuilder<'_> {
     fn array_builder_as<T: ArrayBuilder>(&mut self) -> Option<&mut T> {
         self.builder.field_builder::<T>(self.field_index)
     }
 }
-
-type GenericBuilder = Box<dyn ArrayBuilder>;
 
 impl Scalar {
     /// Convert scalar to arrow array.
@@ -64,6 +70,28 @@ impl Scalar {
         Ok(builder.finish())
     }
 
+    // Arrow uses composable "builders" to assemble arrays one row at a time. Each concrete `Array`
+    // type has a corresponding concrete `ArrayBuilder` type. For primitive types, the builder just
+    // needs to `append` one value per row. For complex types, the builder needs to recursively
+    // append values to each of its children as needed, and then its own `append` only defines the
+    // validity for the row. Unfortunately, there is no generic way to append values to builders;
+    // the `ArrayBuilder` trait only knows how to `finalize` itself to produce an `ArrayRef`. So we
+    // have to cast each builder to the appropriate type, based on the scalar's data type. For
+    // details, refer to the arrow documentation:
+    //
+    // https://docs.rs/arrow/latest/arrow/array/struct.PrimitiveBuilder.html
+    // https://docs.rs/arrow/latest/arrow/array/struct.GenericListBuilder.html
+    // https://docs.rs/arrow/latest/arrow/array/struct.StructBuilder.html
+    //
+    // NOTE: `ListBuilder` and `MapBuilder` are take generic element/key/value builders in order to
+    // work with specific builder types directly. However, `array::make_builder` instantiates them
+    // with `Box<dyn Builder>` instead, which greatly simplifies our job in working with them. We
+    // can just extract the builder trait,and let recursive calls cast it to the desired type.
+    //
+    // WARNING: List and map builders do _NOT_ require appending any child entries to NULL list/map
+    // rows, because empty list/map is a valid state. But struct builders _DO_ require appending
+    // (possibly NULL) entries in order to preserve consistent row counts between the struct and its
+    // fields.
     fn append(&self, builder: &mut impl ArrayBuilderAs, num_rows: usize) -> DeltaResult<()> {
         use Scalar::*;
         macro_rules! builder_as {
@@ -107,13 +135,9 @@ impl Scalar {
                     Error::generic("Struct builder has wrong number of fields")
                 );
                 for _ in 0..num_rows {
-                    // TODO: Get rid of this disgusting hack when we drop arrow-54 support.
-                    #[cfg(feature = "arrow-54")]
+                    // TODO: Get rid of this alternate code path when we drop arrow-54 support.
+                    #[cfg(not(feature = "arrow-55"))]
                     for (field_index, value) in data.values().iter().enumerate() {
-                        // NOTE: We can't ask for dyn ArrayBuilder directly (not sized), nor can we
-                        // ask for GenericBuilder (the internal builder derefs to &dyn ArrayBuilder
-                        // _before_ being downcast to Any. Instead, we wrap the builder in a trait
-                        // that can call `StructBuilder::field_builder` once the type is known.
                         let builder = &mut StructFieldBuilder {
                             builder,
                             field_index,
@@ -121,9 +145,9 @@ impl Scalar {
                         value.append(builder, 1)?;
                     }
 
-                    #[cfg(not(feature = "arrow-54"))]
+                    #[cfg(feature = "arrow-55")]
                     let field_builders = builder.field_builders_mut().iter_mut();
-                    #[cfg(not(feature = "arrow-54"))]
+                    #[cfg(feature = "arrow-55")]
                     for (builder, value) in field_builders.zip(data.values()) {
                         value.append(builder, 1)?;
                     }
@@ -131,7 +155,7 @@ impl Scalar {
                 }
             }
             Array(data) => {
-                let builder = builder_as!(array::ListBuilder<GenericBuilder>);
+                let builder = builder_as!(array::ListBuilder<Box<dyn ArrayBuilder>>);
                 for _ in 0..num_rows {
                     #[allow(deprecated)]
                     for value in data.array_elements() {
@@ -195,13 +219,9 @@ impl Scalar {
                     Error::generic("Struct builder has wrong number of fields")
                 );
                 for _ in 0..num_rows {
-                    // TODO: Get rid of this disgusting hack when we drop arrow-54 support.
-                    #[cfg(feature = "arrow-54")]
+                    // TODO: Get rid of this alternate code path when we drop arrow-54 support.
+                    #[cfg(not(feature = "arrow-55"))]
                     for (field_index, field) in stype.fields().enumerate() {
-                        // NOTE: We can't ask for dyn ArrayBuilder directly (not sized), nor can we
-                        // ask for GenericBuilder (the internal builder derefs to &dyn ArrayBuilder
-                        // _before_ being downcast to Any. Instead, we wrap the builder in a trait
-                        // that can call `StructBuilder::field_builder` once the type is known.
                         let builder = &mut StructFieldBuilder {
                             builder,
                             field_index,
@@ -209,20 +229,21 @@ impl Scalar {
                         Self::append_null(builder, &field.data_type, 1)?;
                     }
 
-                    #[cfg(not(feature = "arrow-54"))]
+                    #[cfg(feature = "arrow-55")]
                     let field_builders = builder.field_builders_mut().iter_mut();
-                    #[cfg(not(feature = "arrow-54"))]
+                    #[cfg(feature = "arrow-55")]
                     for (builder, field) in field_builders.zip(stype.fields()) {
                         Self::append_null(builder, &field.data_type, 1)?;
                     }
                     builder.append(false);
                 }
             }
-            DataType::Array(_) => append_null_as!(array::ListBuilder<GenericBuilder>),
+            DataType::Array(_) => append_null_as!(array::ListBuilder<Box<dyn ArrayBuilder>>),
             DataType::Map(_) => {
                 // For some reason, there is no `MapBuilder::append_null` method -- even tho
                 // StructBuilder and ListBuilder both provide it.
-                let builder = builder_as!(array::MapBuilder<GenericBuilder, GenericBuilder>);
+                let builder =
+                    builder_as!(array::MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>);
                 for _ in 0..num_rows {
                     builder.append(false)?;
                 }
