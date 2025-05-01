@@ -686,7 +686,7 @@ pub(crate) struct DomainMetadata {
 }
 
 impl DomainMetadata {
-    // returns true if the domain metadata is an internal/reserved domain (all domains that start
+    // returns true if the domain metadata is an system-controlled domain (all domains that start
     // with "delta.")
     #[allow(unused)]
     fn is_internal(&self) -> bool {
