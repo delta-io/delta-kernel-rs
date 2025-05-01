@@ -153,57 +153,55 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
 /// // typically used with ToSchema
 /// let schema = Arc::new(MyStruct::to_schema());
 /// // single-row EngineData
+/// let engine = todo!(); // create an engine
 /// let engine_data = my_struct.into_engine_data(schema, engine);
 /// ```
 #[proc_macro_derive(IntoEngineData)]
 pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let struct_name = &input.ident;
-    let fields = match &input.data {
-        Data::Struct(data) => match &data.fields {
-            Fields::Named(fields) => &fields.named,
-            _ => {
-                return Error::new(
-                    struct_name.span(),
-                    "IntoEngineData can only be derived for structs with named fields",
-                )
-                .to_compile_error()
-                .into()
-            }
-        },
-        _ => {
-            return Error::new(
-                struct_name.span(),
-                "IntoEngineData can only be derived for structs",
-            )
-            .to_compile_error()
-            .into()
-        }
+
+    let Data::Struct(DataStruct {
+        fields: Fields::Named(fields),
+        ..
+    }) = &input.data
+    else {
+        return Error::new(
+            struct_name.span(),
+            "IntoEngineData can only be derived for structs with named fields",
+        )
+        .to_compile_error()
+        .into();
     };
 
+    let fields = &fields.named;
     let field_idents = fields.iter().map(|f| &f.ident);
     let field_types = fields.iter().map(|f| &f.ty);
 
     let expanded = quote! {
-        use crate::EvaluationHandlerExtension as _;
-        #[automatically_derived]
-        impl crate::IntoEngineData for #struct_name
-        where
-            // do we need this Into<Scalar> bound?
-            #(#field_types: Into<crate::expressions::Scalar>),*
-        {
-            fn into_engine_data(
-                self,
-                schema: crate::schema::SchemaRef,
-                engine: &dyn crate::Engine)
-            -> crate::DeltaResult<Box<dyn crate::EngineData>> {
-                let values = [
-                    #(self.#field_idents.into()),*
-                ];
-                let evaluator = engine.evaluation_handler();
-                evaluator.create_one(schema, &values)
+        // Wrap the whole thing in a const block so we don't pollute the caller's namespace (e.g.
+        // with our EvaluationHandlerExtension import). Note that impls are globally defined no
+        // matter how deeply they're nested, so we can just leave it all inside the const block.
+        const _: () = {
+            use crate::EvaluationHandlerExtension as _;
+            #[automatically_derived]
+            impl crate::IntoEngineData for #struct_name
+            where
+                #(#field_types: Into<crate::expressions::Scalar>),*
+            {
+                fn into_engine_data(
+                    self,
+                    schema: crate::schema::SchemaRef,
+                    engine: &dyn crate::Engine)
+                -> crate::DeltaResult<Box<dyn crate::EngineData>> {
+                    let values = [
+                        #(self.#field_idents.into()),*
+                    ];
+                    let evaluator = engine.evaluation_handler();
+                    evaluator.create_one(schema, &values)
+                }
             }
-        }
+        };
     };
 
     proc_macro::TokenStream::from(expanded)

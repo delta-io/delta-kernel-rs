@@ -16,7 +16,6 @@ use crate::table_features::{
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::EvaluationHandlerExtension;
 use crate::{DeltaResult, EngineData, Error, FileMeta, RowVisitor as _};
 
 use url::Url;
@@ -650,7 +649,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::actions::schemas::ToSchema;
+    use crate::actions::schemas::ToSchema as _;
     use crate::schema::{ArrayType, DataType, MapType, StructField};
 
     #[test]
