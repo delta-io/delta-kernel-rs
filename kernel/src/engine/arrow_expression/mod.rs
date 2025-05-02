@@ -169,9 +169,6 @@ impl Scalar {
                     builder_as!(array::MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>);
                 for _ in 0..num_rows {
                     for (key, val) in data.pairs() {
-                        if let Scalar::Null(_) = key {
-                            return Err(Error::unsupported("Maps require non-null string keys"));
-                        }
                         key.append(builder.keys(), 1)?;
                         val.append(builder.values(), 1)?;
                     }
