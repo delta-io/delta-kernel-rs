@@ -66,7 +66,7 @@ impl Scalar {
     pub fn to_array(&self, num_rows: usize) -> DeltaResult<ArrayRef> {
         let data_type = ArrowDataType::try_from(&self.data_type())?;
         let mut builder = array::make_builder(&data_type, num_rows);
-        self.append(&mut builder, num_rows)?;
+        self.append_to(&mut builder, num_rows)?;
         Ok(builder.finish())
     }
 
@@ -92,7 +92,7 @@ impl Scalar {
     // rows, because empty list/map is a valid state. But struct builders _DO_ require appending
     // (possibly NULL) entries in order to preserve consistent row counts between the struct and its
     // fields.
-    fn append(&self, builder: &mut impl ArrayBuilderAs, num_rows: usize) -> DeltaResult<()> {
+    fn append_to(&self, builder: &mut impl ArrayBuilderAs, num_rows: usize) -> DeltaResult<()> {
         use Scalar::*;
         macro_rules! builder_as {
             ($t:ty) => {{
@@ -149,7 +149,7 @@ impl Scalar {
                     let field_builders = builder.field_builders_mut().iter_mut();
                     #[cfg(feature = "arrow-55")]
                     for (builder, value) in field_builders.zip(data.values()) {
-                        value.append(builder, 1)?;
+                        value.append_to(builder, 1)?;
                     }
                     builder.append(true);
                 }
@@ -159,7 +159,7 @@ impl Scalar {
                 for _ in 0..num_rows {
                     #[allow(deprecated)]
                     for value in data.array_elements() {
-                        value.append(builder.values(), 1)?;
+                        value.append_to(builder.values(), 1)?;
                     }
                     builder.append(true);
                 }
@@ -169,8 +169,8 @@ impl Scalar {
                     builder_as!(array::MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>);
                 for _ in 0..num_rows {
                     for (key, val) in data.pairs() {
-                        key.append(builder.keys(), 1)?;
-                        val.append(builder.values(), 1)?;
+                        key.append_to(builder.keys(), 1)?;
+                        val.append_to(builder.values(), 1)?;
                     }
                     builder.append(true)?;
                 }
