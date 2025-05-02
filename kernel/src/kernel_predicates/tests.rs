@@ -70,10 +70,7 @@ fn test_default_partial_cmp_scalars() {
         Scalar::decimal(1, 10, 10).unwrap(),
         Null(DataType::LONG),
         Struct(StructData::try_new(vec![], vec![]).unwrap()),
-        Array(ArrayData::new(
-            ArrayType::new(DataType::LONG, false),
-            &[] as &[i64],
-        )),
+        Array(ArrayData::try_new(ArrayType::new(DataType::LONG, false), &[] as &[i64]).unwrap()),
     ];
     let larger_values = &[
         Integer(10),
@@ -91,10 +88,7 @@ fn test_default_partial_cmp_scalars() {
         Scalar::decimal(10, 10, 10).unwrap(),
         Null(DataType::LONG),
         Struct(StructData::try_new(vec![], vec![]).unwrap()),
-        Array(ArrayData::new(
-            ArrayType::new(DataType::LONG, false),
-            &[] as &[i64],
-        )),
+        Array(ArrayData::try_new(ArrayType::new(DataType::LONG, false), &[] as &[i64]).unwrap()),
     ];
 
     // scalars of different types are always incomparable

@@ -30,6 +30,9 @@ And
   Array
     Short(5)
     Short(0)
+  Map
+    String(key1): String(val1)
+    String(key2): String(val2)
   StructExpression
     Or
       Integer(5)

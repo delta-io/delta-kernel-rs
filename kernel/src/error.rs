@@ -210,6 +210,10 @@ pub enum Error {
     LiteralExpressionTransformError(
         #[from] crate::expressions::literal_expression_transform::Error,
     ),
+
+    /// Schema mismatch has occurred or invalid schema used somewhere
+    #[error("Schema error: {0}")]
+    Schema(String),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -289,6 +293,10 @@ impl Error {
 
     pub fn invalid_checkpoint(msg: impl ToString) -> Self {
         Self::InvalidCheckpoint(msg.to_string())
+    }
+
+    pub(crate) fn schema(msg: impl ToString) -> Self {
+        Self::Schema(msg.to_string())
     }
 
     // Capture a backtrace when the error is constructed.

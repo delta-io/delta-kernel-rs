@@ -1,14 +1,15 @@
 use std::ops::{Add, Div, Mul, Sub};
 
 use crate::arrow::array::{
-    create_array, ArrayRef, BooleanArray, GenericStringArray, Int32Array, ListArray, StructArray,
+    create_array, Array, ArrayRef, BooleanArray, GenericStringArray, Int32Array, Int32Builder,
+    ListArray, MapArray, MapBuilder, MapFieldNames, StringBuilder, StructArray,
 };
 use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
 
 use super::*;
 use crate::expressions::*;
-use crate::schema::{ArrayType, StructField, StructType};
+use crate::schema::{ArrayType, MapType, StructField, StructType};
 use crate::DataType as DeltaDataTypes;
 use crate::EvaluationHandlerExtension as _;
 
@@ -74,10 +75,13 @@ fn test_literal_type_array() {
     let in_op = Expr::binary(
         BinaryOperator::NotIn,
         Expr::literal(5),
-        Scalar::Array(ArrayData::new(
-            ArrayType::new(DeltaDataTypes::INTEGER, false),
-            vec![Scalar::Integer(1), Scalar::Integer(2)],
-        )),
+        Scalar::Array(
+            ArrayData::try_new(
+                ArrayType::new(DeltaDataTypes::INTEGER, false),
+                vec![Scalar::Integer(1), Scalar::Integer(2)],
+            )
+            .unwrap(),
+        ),
     );
 
     let in_result = evaluate_expression(&in_op, &batch, None).unwrap();
@@ -91,19 +95,42 @@ fn test_literal_complex_type_array() {
     use crate::arrow::datatypes::Int32Type;
 
     let array_type = ArrayType::new(DeltaDataTypes::INTEGER, true);
-    let array_value = Scalar::Array(ArrayData::new(
-        array_type.clone(),
-        vec![
-            Scalar::from(1),
-            Scalar::from(2),
-            Scalar::Null(DeltaDataTypes::INTEGER),
-            Scalar::from(3),
-        ],
-    ));
+    let array_value = Scalar::Array(
+        ArrayData::try_new(
+            array_type.clone(),
+            vec![
+                Scalar::from(1),
+                Scalar::from(2),
+                Scalar::Null(DeltaDataTypes::INTEGER),
+                Scalar::from(3),
+            ],
+        )
+        .unwrap(),
+    );
+    let map_type = MapType::new(
+        DeltaDataTypes::STRING,
+        DeltaDataTypes::Array(Box::new(array_type.clone())),
+        true,
+    );
+    let map_value = Scalar::Map(
+        MapData::try_new(
+            map_type.clone(),
+            [
+                ("array".to_string(), array_value.clone()),
+                (
+                    "null_array".to_string(),
+                    Scalar::Null(array_type.clone().into()),
+                ),
+            ],
+        )
+        .unwrap(),
+    );
     let struct_fields = vec![
         StructField::nullable("scalar", DeltaDataTypes::INTEGER),
         StructField::nullable("list", array_type.clone()),
         StructField::nullable("null_list", array_type.clone()),
+        StructField::nullable("map", map_type.clone()),
+        StructField::nullable("null_map", map_type.clone()),
     ];
     let struct_type = StructType::new(struct_fields.clone());
     let struct_value = Scalar::Struct(
@@ -113,19 +140,24 @@ fn test_literal_complex_type_array() {
                 Scalar::Integer(42),
                 array_value,
                 Scalar::Null(array_type.clone().into()),
+                map_value,
+                Scalar::Null(map_type.clone().into()),
             ],
         )
         .unwrap(),
     );
     let nested_array_type = ArrayType::new(struct_type.clone().into(), true);
-    let nested_array_value = Scalar::Array(ArrayData::new(
-        nested_array_type.clone(),
-        vec![
-            struct_value.clone(),
-            Scalar::Null(struct_type.clone().into()),
-            struct_value.clone(),
-        ],
-    ))
+    let nested_array_value = Scalar::Array(
+        ArrayData::try_new(
+            nested_array_type.clone(),
+            vec![
+                struct_value.clone(),
+                Scalar::Null(struct_type.clone().into()),
+                struct_value.clone(),
+            ],
+        )
+        .unwrap(),
+    )
     .to_array(5)
     .unwrap();
     assert_eq!(nested_array_value.len(), 5);
@@ -157,6 +189,30 @@ fn test_literal_complex_type_array() {
     assert!(expected_values
         .zip(list_values.as_primitive::<Int32Type>())
         .all(|(a, b)| a == b));
+
+    let map_values = struct_values.column(3);
+    let map_array = map_values.as_map();
+    assert_eq!(map_array.keys().len(), 5 * 2 * 2);
+    // values len = keys len
+    assert_eq!(map_array.values().len(), 5 * 2 * 2);
+    // this should be 5 rows * 2 non-null parents * 1 non-null per map * 4 elements
+    // NOTE: one of those elements is NULL but primitive arrays don't care about that
+    assert_eq!(
+        map_array.values().as_list::<i32>().values().len(),
+        5 * 2 * 4
+    );
+    let expected_keys = ["array", "null_array"];
+    let expected_values = [Some(1), Some(2), None, Some(3)];
+    let expected_keys = (0..10).flat_map(|_| expected_keys.iter().cloned());
+    let expected_values = (0..10).flat_map(|_| expected_values.iter().cloned());
+    let map_keys = map_array.keys().as_string::<i32>();
+    assert!(expected_keys.zip(map_keys).all(|(a, b)| a == b.unwrap()));
+    let map_values = map_array
+        .values()
+        .as_list::<i32>()
+        .values()
+        .as_primitive::<Int32Type>();
+    assert!(expected_values.zip(map_values).all(|(a, b)| a == b));
 }
 
 #[test]
@@ -591,4 +647,55 @@ fn test_create_one_top_level_null() {
         handler.create_one(schema, values),
         Err(Error::InvalidStructData(_))
     ));
+}
+
+#[test]
+fn test_scalar_map() -> DeltaResult<()> {
+    // making an 2-row array each with a map with 2 pairs.
+    // result: { key1: 1, key2: null }, { key1: 1, key2: null }
+    let map_type = MapType::new(DeltaDataTypes::STRING, DeltaDataTypes::INTEGER, true);
+    let map_data = MapData::try_new(
+        map_type,
+        [("key1".to_string(), 1.into()), ("key2".to_string(), None)],
+    )?;
+    let scalar_map = Scalar::Map(map_data);
+    let arrow_array = scalar_map.to_array(2)?;
+    let map_array = arrow_array.as_any().downcast_ref::<MapArray>().unwrap();
+
+    let key_builder = StringBuilder::new();
+    let val_builder = Int32Builder::new();
+    let names = MapFieldNames {
+        entry: "key_values".to_string(),
+        key: "keys".to_string(),
+        value: "values".to_string(),
+    };
+    let mut builder = MapBuilder::new(Some(names), key_builder, val_builder);
+    builder.keys().append_value("key1");
+    builder.values().append_value(1);
+    builder.keys().append_value("key2");
+    builder.values().append_null();
+    builder.append(true).unwrap();
+    builder.keys().append_value("key1");
+    builder.values().append_value(1);
+    builder.keys().append_value("key2");
+    builder.values().append_null();
+    builder.append(true).unwrap();
+    let expected = builder.finish();
+
+    assert_eq!(map_array, &expected);
+    Ok(())
+}
+
+#[test]
+fn test_null_scalar_map() -> DeltaResult<()> {
+    let map_type = MapType::new(DeltaDataTypes::STRING, DeltaDataTypes::STRING, false);
+    let null_scalar_map = Scalar::Null(DeltaDataTypes::Map(Box::new(map_type)));
+    let arrow_array = null_scalar_map.to_array(1)?;
+    let map_array = arrow_array.as_any().downcast_ref::<MapArray>().unwrap();
+
+    assert_eq!(map_array.len(), 1);
+    assert_eq!(map_array.null_count(), 1);
+    assert!(map_array.is_null(0));
+
+    Ok(())
 }
