@@ -193,7 +193,14 @@ fn test_literal_complex_type_array() {
     let map_values = struct_values.column(3);
     let map_array = map_values.as_map();
     assert_eq!(map_array.keys().len(), 5 * 2 * 2);
-    assert_eq!(map_array.values().len(), 5 * 2 * 2); // I would think this should be 5 * 2 * 1
+    // values len = keys len
+    assert_eq!(map_array.values().len(), 5 * 2 * 2);
+    // this should be 5 rows * 2 non-null parents * 1 non-null per map * 4 elements
+    // NOTE: one of those elements is NULL but primitive arrays don't care about that
+    assert_eq!(
+        map_array.values().as_list::<i32>().values().len(),
+        5 * 2 * 4
+    );
     let expected_keys = ["array", "null_array"];
     let expected_values = [Some(1), Some(2), None, Some(3)];
     let expected_keys = (0..10).flat_map(|_| expected_keys.iter().cloned());
