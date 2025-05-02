@@ -107,10 +107,30 @@ fn test_literal_complex_type_array() {
         )
         .unwrap(),
     );
+    let map_type = MapType::new(
+        DeltaDataTypes::STRING,
+        DeltaDataTypes::Array(Box::new(array_type.clone())),
+        true,
+    );
+    let map_value = Scalar::Map(
+        MapData::try_new(
+            map_type.clone(),
+            [
+                ("array".to_string(), array_value.clone()),
+                (
+                    "null_array".to_string(),
+                    Scalar::Null(array_type.clone().into()),
+                ),
+            ],
+        )
+        .unwrap(),
+    );
     let struct_fields = vec![
         StructField::nullable("scalar", DeltaDataTypes::INTEGER),
         StructField::nullable("list", array_type.clone()),
         StructField::nullable("null_list", array_type.clone()),
+        StructField::nullable("map", map_type.clone()),
+        StructField::nullable("null_map", map_type.clone()),
     ];
     let struct_type = StructType::new(struct_fields.clone());
     let struct_value = Scalar::Struct(
@@ -120,6 +140,8 @@ fn test_literal_complex_type_array() {
                 Scalar::Integer(42),
                 array_value,
                 Scalar::Null(array_type.clone().into()),
+                map_value,
+                Scalar::Null(map_type.clone().into()),
             ],
         )
         .unwrap(),
@@ -167,6 +189,23 @@ fn test_literal_complex_type_array() {
     assert!(expected_values
         .zip(list_values.as_primitive::<Int32Type>())
         .all(|(a, b)| a == b));
+
+    let map_values = struct_values.column(3);
+    let map_array = map_values.as_map();
+    assert_eq!(map_array.keys().len(), 5 * 2 * 2);
+    assert_eq!(map_array.values().len(), 5 * 2 * 2); // I would think this should be 5 * 2 * 1
+    let expected_keys = ["array", "null_array"];
+    let expected_values = [Some(1), Some(2), None, Some(3)];
+    let expected_keys = (0..10).flat_map(|_| expected_keys.iter().cloned());
+    let expected_values = (0..10).flat_map(|_| expected_values.iter().cloned());
+    let map_keys = map_array.keys().as_string::<i32>();
+    assert!(expected_keys.zip(map_keys).all(|(a, b)| a == b.unwrap()));
+    let map_values = map_array
+        .values()
+        .as_list::<i32>()
+        .values()
+        .as_primitive::<Int32Type>();
+    assert!(expected_values.zip(map_values).all(|(a, b)| a == b));
 }
 
 #[test]

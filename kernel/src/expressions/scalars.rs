@@ -67,8 +67,8 @@ impl ArrayData {
     ) -> DeltaResult<Self> {
         let elements = elements
             .into_iter()
-            .map(Into::into)
             .map(|v| {
+                let v = v.into();
                 if *tpe.element_type() == v.data_type() {
                     Ok(v)
                 } else {
@@ -106,32 +106,26 @@ impl MapData {
         data_type: MapType,
         values: impl IntoIterator<Item = (impl Into<Scalar>, impl Into<Scalar>)>,
     ) -> DeltaResult<Self> {
-        if let (key_type @ DataType::Primitive(_), val_type @ DataType::Primitive(_)) =
-            (data_type.key_type(), data_type.value_type())
-        {
-            let pairs = values
-                .into_iter()
-                .map(|(k, v)| (k.into(), v.into()))
-                .map(|(k, v)| {
-                    if k.data_type() == *key_type && v.data_type() == *val_type {
-                        Ok((k, v))
-                    } else {
-                        Err(Error::Generic(format!(
-                            "Map scalar type mismatch: expected keys {}, vals {} got keys {}, vals {}",
-                            key_type,
-                            val_type,
-                            k.data_type(),
-                            v.data_type()
-                        )))
-                    }
-                })
-                .try_collect()?;
-            Ok(Self { data_type, pairs })
-        } else {
-            Err(Error::unsupported(
-                "Unable to construct Scalar MapData: map keys/values must be primitive types",
-            ))
-        }
+        let key_type = data_type.key_type();
+        let val_type = data_type.value_type();
+        let pairs = values
+            .into_iter()
+            .map(|(k, v)| {
+                let (k, v) = (k.into(), v.into());
+                match k {
+                    Scalar::Null(_) => Err(Error::schema("Map key cannot be null")),
+                    _ if k.data_type() == *key_type && v.data_type() == *val_type => Ok((k, v)),
+                    _ => Err(Error::Generic(format!(
+                        "Map scalar type mismatch: expected keys {}, vals {} got keys {}, vals {}",
+                        key_type,
+                        val_type,
+                        k.data_type(),
+                        v.data_type()
+                    ))),
+                }
+            })
+            .try_collect()?;
+        Ok(Self { data_type, pairs })
     }
 
     // TODO: array.elements is deprecated? do we want to expose this? How will FFI get pairs for
@@ -810,9 +804,20 @@ mod tests {
 
     #[test]
     fn test_invalid_map() {
+        // incorrect schema
         assert!(MapData::try_new(
             MapType::new(DataType::STRING, DataType::INTEGER, false),
             [(Scalar::Integer(1), Scalar::String("s".to_string())),],
+        )
+        .is_err());
+
+        // key must be non-null
+        assert!(MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, true),
+            [(
+                Scalar::Null(DataType::STRING),
+                Scalar::String("s".to_string())
+            ),],
         )
         .is_err());
     }
