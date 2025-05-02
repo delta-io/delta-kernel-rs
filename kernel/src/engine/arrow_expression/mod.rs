@@ -142,7 +142,7 @@ impl Scalar {
                             builder,
                             field_index,
                         };
-                        value.append(builder, 1)?;
+                        value.append_to(builder, 1)?;
                     }
 
                     #[cfg(feature = "arrow-55")]
