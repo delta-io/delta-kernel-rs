@@ -69,18 +69,20 @@ impl ArrayData {
             .into_iter()
             .map(|v| {
                 let v = v.into();
+                // disallow nulls if the type is not allowed to contain nulls
                 if !tpe.contains_null() && v.is_null() {
                     Err(Error::schema(
                         "Array element cannot be null for non-nullable array",
                     ))
-                } else if *tpe.element_type() == v.data_type() {
-                    Ok(v)
-                } else {
+                // check element types match
+                } else if *tpe.element_type() != v.data_type() {
                     Err(Error::Schema(format!(
                         "Array scalar type mismatch: expected {}, got {}",
                         tpe.element_type(),
                         v.data_type()
                     )))
+                } else {
+                    Ok(v)
                 }
             })
             .try_collect()?;
@@ -116,19 +118,30 @@ impl MapData {
             .into_iter()
             .map(|(key, val)| {
                 let (k, v) = (key.into(), val.into());
-                match (&k, &v) {
-                    (Scalar::Null(_), _) => Err(Error::schema("Map key cannot be null")),
-                    (_, Scalar::Null(_)) if !data_type.value_contains_null => Err(Error::schema(
-                        "Null map value disallowed if map value_contains_null is false",
-                    )),
-                    _ if k.data_type() == *key_type && v.data_type() == *val_type => Ok((k, v)),
-                    _ => Err(Error::Generic(format!(
-                        "Map scalar type mismatch: expected keys {}, vals {} got keys {}, vals {}",
+                // check key types match
+                if k.data_type() != *key_type {
+                    Err(Error::Schema(format!(
+                        "Map scalar type mismatch: expected key type {}, got key type {}",
                         key_type,
+                        k.data_type()
+                    )))
+                // keys can't be null
+                } else if k.is_null() {
+                    Err(Error::schema("Map key cannot be null"))
+                // check val types match
+                } else if v.data_type() != *val_type {
+                    Err(Error::Schema(format!(
+                        "Map scalar type mismatch: expected value type {}, got value type {}",
                         val_type,
-                        k.data_type(),
                         v.data_type()
-                    ))),
+                    )))
+                // vals can only be null if value_contains_null is true
+                } else if v.is_null() && !data_type.value_contains_null {
+                    Err(Error::schema(
+                        "Null map value disallowed if map value_contains_null is false",
+                    ))
+                } else {
+                    Ok((k, v))
                 }
             })
             .try_collect()?;
