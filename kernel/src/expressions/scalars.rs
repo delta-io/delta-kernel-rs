@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use itertools::Itertools;
 
 use crate::actions::schemas::ToDataType;
 use crate::schema::{ArrayType, DataType, DecimalType, MapType, PrimitiveType, StructField};
@@ -78,7 +79,7 @@ impl ArrayData {
                     )))
                 }
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .try_collect()?;
         Ok(Self { tpe, elements })
     }
 
@@ -124,7 +125,7 @@ impl MapData {
                         )))
                     }
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .try_collect()?;
             Ok(Self { data_type, pairs })
         } else {
             Err(Error::unsupported(

@@ -2,7 +2,6 @@
 
 #include "delta_kernel_ffi.h"
 #include <assert.h>
-#include <stdint.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
