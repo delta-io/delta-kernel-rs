@@ -69,10 +69,14 @@ impl ArrayData {
             .into_iter()
             .map(|v| {
                 let v = v.into();
-                if *tpe.element_type() == v.data_type() {
+                if !tpe.contains_null() && v.is_null() {
+                    Err(Error::schema(
+                        "Array element cannot be null for non-nullable array",
+                    ))
+                } else if *tpe.element_type() == v.data_type() {
                     Ok(v)
                 } else {
-                    Err(Error::Generic(format!(
+                    Err(Error::Schema(format!(
                         "Array scalar type mismatch: expected {}, got {}",
                         tpe.element_type(),
                         v.data_type()
@@ -110,10 +114,13 @@ impl MapData {
         let val_type = data_type.value_type();
         let pairs = values
             .into_iter()
-            .map(|(k, v)| {
-                let (k, v) = (k.into(), v.into());
-                match k {
-                    Scalar::Null(_) => Err(Error::schema("Map key cannot be null")),
+            .map(|(key, val)| {
+                let (k, v) = (key.into(), val.into());
+                match (&k, &v) {
+                    (Scalar::Null(_), _) => Err(Error::schema("Map key cannot be null")),
+                    (_, Scalar::Null(_)) if !data_type.value_contains_null => Err(Error::schema(
+                        "Null map value disallowed if map value_contains_null is false",
+                    )),
                     _ if k.data_type() == *key_type && v.data_type() == *val_type => Ok((k, v)),
                     _ => Err(Error::Generic(format!(
                         "Map scalar type mismatch: expected keys {}, vals {} got keys {}, vals {}",
@@ -800,6 +807,10 @@ mod tests {
             [Scalar::Integer(1), Scalar::String("s".to_string())],
         )
         .is_err());
+
+        assert!(
+            ArrayData::try_new(ArrayType::new(DataType::INTEGER, false), [1.into(), None]).is_err()
+        );
     }
 
     #[test]
@@ -815,8 +826,18 @@ mod tests {
         assert!(MapData::try_new(
             MapType::new(DataType::STRING, DataType::STRING, true),
             [(
-                Scalar::Null(DataType::STRING),
-                Scalar::String("s".to_string())
+                Scalar::Null(DataType::STRING),  // key
+                Scalar::String("s".to_string())  // val
+            ),],
+        )
+        .is_err());
+
+        // val must be non-null if we have value_contains_null = false
+        assert!(MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, false),
+            [(
+                Scalar::String("s".to_string()), // key
+                Scalar::Null(DataType::STRING)   // val
             ),],
         )
         .is_err());
