@@ -53,7 +53,8 @@ enum LitType {
   Decimal,
   Null,
   Struct,
-  Array
+  Array,
+  Map
 };
 enum ExpressionType { BinOp, Variadic, Literal, Unary, Column };
 enum VariadicType {
@@ -103,6 +104,10 @@ struct Struct {
 struct ArrayData {
   ExpressionItemList exprs;
 };
+struct MapData {
+  ExpressionItemList keys;
+  ExpressionItemList vals;
+};
 struct Literal {
   enum LitType type;
   union LiteralValue {
@@ -116,6 +121,7 @@ struct Literal {
     char* string_data;
     struct Struct struct_data;
     struct ArrayData array_data;
+    struct MapData map_data;
     struct BinaryData binary;
     struct Decimal decimal;
   } value;
@@ -275,6 +281,18 @@ void visit_expr_array_literal(void* data, uintptr_t sibling_list_id, uintptr_t c
   put_expr_item(data, sibling_list_id, literal, Literal);
 }
 
+void visit_expr_map_literal(void* data,
+                            uintptr_t sibling_list_id,
+                            uintptr_t key_list_id,
+                            uintptr_t value_list_id) {
+  struct Literal* literal = malloc(sizeof(struct Literal));
+  literal->type = Map;
+  struct MapData* map = &(literal->value.map_data);
+  map->keys = get_expr_list(data, key_list_id);
+  map->vals = get_expr_list(data, value_list_id);
+  put_expr_item(data, sibling_list_id, literal, Literal);
+}
+
 /*************************************************************
  * Unary Expressions
  ************************************************************/
@@ -339,6 +357,7 @@ ExpressionItemList construct_predicate(SharedExpression* predicate) {
     .visit_literal_string = visit_expr_string_literal,
     .visit_literal_struct = visit_expr_struct_literal,
     .visit_literal_array = visit_expr_array_literal,
+    .visit_literal_map = visit_expr_map_literal,
     .visit_and = visit_expr_and,
     .visit_or = visit_expr_or,
     .visit_not = visit_expr_not,
@@ -392,6 +411,12 @@ void free_expression_item(ExpressionItem ref) {
         case Array: {
           struct ArrayData* array = &lit->value.array_data;
           free_expression_list(array->exprs);
+          break;
+        }
+        case Map: {
+          struct MapData* map = &lit->value.map_data;
+          free_expression_list(map->keys);
+          free_expression_list(map->vals);
           break;
         }
         case String: {
