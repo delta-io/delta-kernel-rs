@@ -22,6 +22,8 @@ pub mod sync;
 #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
 pub mod arrow_data;
 #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
+pub mod arrow_extensions;
+#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
 pub(crate) mod arrow_get_data;
 #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
 pub(crate) mod ensure_data_types;

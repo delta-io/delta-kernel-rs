@@ -3,7 +3,7 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use itertools::Itertools;
 
-use crate::ArrowEngineData;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::scan::Scan;
 use delta_kernel::{DeltaResult, Engine, EngineData, Table};
 

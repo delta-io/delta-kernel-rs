@@ -17,7 +17,7 @@ use delta_kernel::object_store::{local::LocalFileSystem, ObjectStore};
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
-use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Table};
+use delta_kernel::{DeltaResult, Table};
 use futures::{stream::TryStreamExt, StreamExt};
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
