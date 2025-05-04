@@ -4,7 +4,9 @@ use crate::actions::get_log_txn_schema;
 use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{SetTransaction, SET_TRANSACTION_NAME};
 use crate::log_segment::LogSegment;
-use crate::{DeltaResult, Engine, EngineData, Expression as Expr, ExpressionRef, RowVisitor as _};
+use crate::{
+    DeltaResult, Engine, Expression as Expr, ExpressionRef, LogReplayBatch, RowVisitor as _,
+};
 
 pub(crate) use crate::actions::visitors::SetTransactionMap;
 
@@ -64,7 +66,7 @@ fn scan_application_transactions(
 fn replay_for_app_ids(
     log_segment: &LogSegment,
     engine: &dyn Engine,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
+) -> DeltaResult<impl Iterator<Item = DeltaResult<LogReplayBatch>> + Send> {
     let txn_schema = get_log_txn_schema();
     // This meta-predicate should be effective because all the app ids end up in a single
     // checkpoint part when patitioned by `add.path` like the Delta spec requires. There's no

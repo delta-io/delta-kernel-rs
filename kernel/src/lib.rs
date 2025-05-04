@@ -100,6 +100,7 @@ internal_mod!(pub(crate) mod log_replay);
 internal_mod!(pub(crate) mod log_segment);
 
 pub use delta_kernel_derive;
+use delta_kernel_derive::internal_api;
 pub use engine_data::{EngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef};
@@ -148,6 +149,11 @@ pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
 /// An iterator of data read from specified files
 pub type FileDataReadResultIterator =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
+
+/// A batch of data produced by log replay. Batches produced from commit files include Some
+/// associated commit version, while checkpoint files have None.
+#[internal_api]
+pub(crate) type LogReplayBatch = (Box<dyn EngineData>, Option<Version>);
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]

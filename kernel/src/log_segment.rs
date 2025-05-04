@@ -14,7 +14,7 @@ use crate::schema::SchemaRef;
 use crate::snapshot::LastCheckpointHint;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, ParquetHandler, RowVisitor,
+    DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, LogReplayBatch, ParquetHandler, RowVisitor,
     StorageHandler, Version,
 };
 use delta_kernel_derive::internal_api;
@@ -210,19 +210,29 @@ impl LogSegment {
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<ExpressionRef>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<LogReplayBatch>> + Send> {
         // `replay` expects commit files to be sorted in descending order, so we reverse the sorted
-        // commit files
+        // commit files. Also, materialize it so the returned iterator doesn't try to capture `self`.
+        let json_handler = engine.json_handler();
+        let json_meta_predicate = meta_predicate.clone();
         let commit_files: Vec<_> = self
             .ascending_commit_files
             .iter()
             .rev()
-            .map(|f| f.location.clone())
+            .map(|f| (f.location.clone(), f.version))
             .collect();
-        let commit_stream = engine
-            .json_handler()
-            .read_json_files(&commit_files, commit_read_schema, meta_predicate.clone())?
-            .map_ok(|batch| (batch, true));
+        let commit_stream = commit_files
+            .into_iter()
+            .map(move |(f, v)| {
+                let result = json_handler.read_json_files(
+                    [f].as_slice(),
+                    commit_read_schema.clone(),
+                    json_meta_predicate.clone(),
+                )?; // iter-result
+                Ok(result.map_ok(move |batch| (batch, Some(v)))) // result-iter-result
+            }) // iter-result-iter-result
+            .flatten_ok() // iter-result-result
+            .map(|result: DeltaResult<_>| result?); // iter-result
 
         let checkpoint_stream =
             self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate)?;
@@ -246,7 +256,7 @@ impl LogSegment {
         engine: &dyn Engine,
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<ExpressionRef>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<LogReplayBatch>> + Send> {
         let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
             || checkpoint_read_schema.contains(REMOVE_NAME);
         require!(
@@ -320,9 +330,8 @@ impl LogSegment {
 
                 let combined_batches = std::iter::once(Ok(checkpoint_batch))
                     .chain(sidecar_content.into_iter().flatten())
-                    // The boolean flag indicates whether the batch originated from a commit file
-                    // (true) or a checkpoint file (false).
-                    .map_ok(|sidecar_batch| (sidecar_batch, false));
+                    // Passing None indicates that the batch originated from a checkpoint file.
+                    .map_ok(|sidecar_batch| (sidecar_batch, None));
 
                 Ok(combined_batches)
             })
@@ -404,7 +413,7 @@ impl LogSegment {
     fn replay_for_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<LogReplayBatch>> + Send> {
         let schema = get_log_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
         // filter out log files that do not contain metadata or protocol information
         static META_PREDICATE: LazyLock<Option<ExpressionRef>> = LazyLock::new(|| {
