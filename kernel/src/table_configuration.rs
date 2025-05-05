@@ -278,6 +278,63 @@ impl TableConfiguration {
             .has_writer_feature(&WriterFeature::V2Checkpoint);
         read_supported && write_supported
     }
+
+    /// Returns `true` if the table supports writing in-commit timestamps.
+    ///
+    /// To support this feature the table must:
+    /// - Have a min_writer_version of 7
+    /// - Have the [`WriterFeature::InCommitTimestamp`] writer feature.
+    #[allow(unused)]
+    pub(crate) fn is_in_commit_timestamps_supported(&self) -> bool {
+        self.protocol().min_writer_version() == 7
+            && self
+                .protocol()
+                .has_writer_feature(&WriterFeature::InCommitTimestamp)
+    }
+
+    /// Returns `true` if in-commit timestamps is supported and it is enabled. In-commit timestamps
+    /// is enabled when the `delta.enableInCommitTimestamps` configuration is set to `true`.
+    #[allow(unused)]
+    pub(crate) fn is_in_commit_timestamps_enabled(&self) -> bool {
+        self.is_in_commit_timestamps_supported()
+            && self
+                .table_properties()
+                .enable_in_commit_timestamps
+                .unwrap_or(false)
+    }
+
+    /// If in-commit timestamps is enabled, returns a tuple of the in-commit timestamp enablement
+    /// version and timestamp.
+    ///
+    /// If in-commit timestamps is not supported, or not enabled, this returns `None`.
+    /// If in-commit timestams is enabled, but the enablement version or timestamp is not present,
+    /// this returns an error.
+    #[allow(unused)]
+    pub(crate) fn in_commit_timestamp_enablement(&self) -> DeltaResult<Option<(Version, i64)>> {
+        if !self.is_in_commit_timestamps_enabled() {
+            return Ok(None);
+        }
+        let enablement_version = self
+            .table_properties()
+            .in_commit_timestamp_enablement_version;
+        let enablement_timestamp = self
+            .table_properties()
+            .in_commit_timestamp_enablement_timestamp;
+
+        let ict_error = |err: &str| {
+            Error::generic(format!(
+                "In-commit timestamp enabled, but missing Enablement version or timestamp. {err}"
+            ))
+        };
+        match (enablement_version, enablement_timestamp) {
+            (Some(version), Some(timestamp)) => Ok(Some((version, timestamp))),
+            (Some(_), None) => Err(ict_error("Enablement timestamp is not present")),
+            (None, Some(_)) => Err(ict_error("Enablement version is not present")),
+            (None, None) => Err(ict_error(
+                "Enablement version and timestamp are not present.",
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +346,7 @@ mod test {
     use crate::actions::{Metadata, Protocol};
     use crate::table_features::{ReaderFeature, WriterFeature};
     use crate::table_properties::TableProperties;
+    use crate::Error;
 
     use super::TableConfiguration;
 
@@ -339,6 +397,75 @@ mod test {
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_deletion_vector_supported());
         assert!(table_config.is_deletion_vector_enabled());
+    }
+    #[test]
+    fn ict_supported_and_enabled() {
+        let metadata = Metadata {
+            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
+            configuration: HashMap::from_iter([(
+                "delta.enableInCommitTimestamps".to_string(),
+                "true".to_string(),
+            ),
+                ("delta.inCommitTimestampEnablementVersion".to_string(), "5".to_string()),
+                ("delta.inCommitTimestampEnablementTimestamp".to_string(), "100".to_string())]),
+            ..Default::default()
+        };
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some([WriterFeature::InCommitTimestamp]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        assert!(table_config.is_in_commit_timestamps_supported());
+        assert!(table_config.is_in_commit_timestamps_enabled());
+        let enablement = table_config.in_commit_timestamp_enablement().unwrap();
+        assert_eq!(enablement, Some((5, 100)))
+    }
+    #[test]
+    fn ict_supported_and_enabled_without_enablement_info() {
+        let metadata = Metadata {
+            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
+            configuration: HashMap::from_iter([(
+                "delta.enableInCommitTimestamps".to_string(),
+                "true".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some([WriterFeature::InCommitTimestamp]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        assert!(table_config.is_in_commit_timestamps_supported());
+        assert!(table_config.is_in_commit_timestamps_enabled());
+        assert!(matches!(
+                table_config.in_commit_timestamp_enablement(),
+                Err(Error::Generic(msg)) if msg.contains("Enablement version and timestamp are not present.")));
+    }
+    #[test]
+    fn ict_supported_and_not_enabled() {
+        let metadata = Metadata {
+            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
+            ..Default::default()
+        };
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some([WriterFeature::InCommitTimestamp]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        assert!(table_config.is_in_commit_timestamps_supported());
+        assert!(!table_config.is_in_commit_timestamps_enabled());
     }
     #[test]
     fn fails_on_unsupported_feature() {
