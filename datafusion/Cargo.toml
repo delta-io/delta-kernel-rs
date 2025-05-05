@@ -1,0 +1,21 @@
+[package]
+name = "delta-kernel-datafusion"
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+delta_kernel = { path = "../kernel", features = [
+    "default-engine",
+    "arrow",
+    "internal-api",
+] }
+
+datafusion = { version = "47" }
+datafusion-common = { version = "47" }
+datafusion-expr = { version = "47" }
