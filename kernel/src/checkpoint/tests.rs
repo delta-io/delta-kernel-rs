@@ -326,13 +326,12 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
         size: size_in_bytes,
     };
     writer.finalize(&engine, &metadata, data_iter)?;
-    assert_last_checkpoint_contents(
-        &store,
-        2,                                 // version: latest/last version in the log
-        4, // size: 1 metadata + 1 protocol + 1 add action + 1 remove action
-        1, // numOfAddFiles: from the 2nd commit (fake_path_2)
-        size_in_bytes.try_into().unwrap(), // sizeInBytes: passed to finalize (10)
-    )?;
+    // Asserts the checkpoint file contents:
+    // - version: latest version (2)
+    // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action
+    // - numOfAddFiles: 1 add file from 2nd commit (fake_path_2)
+    // - sizeInBytes: passed to finalize (10)
+    assert_last_checkpoint_contents(&store, 2, 4, 1, size_in_bytes.try_into().unwrap())?;
 
     Ok(())
 }
@@ -390,13 +389,12 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
         size: size_in_bytes,
     };
     writer.finalize(&engine, &metadata, data_iter)?;
-    assert_last_checkpoint_contents(
-        &store,
-        0,                                 // version: specified version (0)
-        2,                                 // size: 1 protocol + 1 metadata from version 0
-        0,                                 // numOfAddFiles: no add files in version 0
-        size_in_bytes.try_into().unwrap(), // sizeInBytes: passed to finalize (10)
-    )?;
+    // Asserts the checkpoint file contents:
+    // - version: specified version (0)
+    // - size: 1 metadata + 1 protocol
+    // - numOfAddFiles: no add files in version 0
+    // - sizeInBytes: passed to finalize (10)
+    assert_last_checkpoint_contents(&store, 0, 2, 0, size_in_bytes.try_into().unwrap())?;
 
     Ok(())
 }
@@ -428,7 +426,9 @@ fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaR
     };
 
     // Attempt to finalize the checkpoint with an iterator that has not been fully consumed
-    assert!(writer.finalize(&engine, &metadata, data_iter).is_err());
+    writer.finalize(&engine, &metadata, data_iter).expect_err(
+        "The checkpoint data must be fully exhausted from the iterator and written to storage before calling finalize",
+    );
 
     Ok(())
 }
@@ -496,13 +496,12 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
         size: size_in_bytes,
     };
     writer.finalize(&engine, &metadata, data_iter)?;
-    assert_last_checkpoint_contents(
-        &store,
-        1,                                 // version: latest version (1) with v2Checkpoint support
-        5, // size: 1 metadata + 1 protocol + 1 add + 1 remove + 1 checkpointMetadata
-        1, // numOfAddFiles: 1 add file from version 0
-        size_in_bytes.try_into().unwrap(), // sizeInBytes: passed to finalize (10)
-    )?;
+    // Asserts the checkpoint file contents:
+    // - version: latest version (1)
+    // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action + 1 checkpointMetadata
+    // - numOfAddFiles: 1 add file from version 0
+    // - sizeInBytes: passed to finalize (10)
+    assert_last_checkpoint_contents(&store, 1, 5, 1, size_in_bytes.try_into().unwrap())?;
 
     Ok(())
 }

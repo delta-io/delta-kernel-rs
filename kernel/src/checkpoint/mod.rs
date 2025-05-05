@@ -308,15 +308,10 @@ impl CheckpointWriter {
         self,
         engine: &dyn Engine,
         metadata: &FileMeta,
-        checkpoint_data: CheckpointDataIterator,
+        mut checkpoint_data: CheckpointDataIterator,
     ) -> DeltaResult<()> {
         // Ensure the checkpoint data iterator is fully exhausted
-        if checkpoint_data
-            .checkpoint_batch_iterator
-            .peekable()
-            .peek()
-            .is_some()
-        {
+        if checkpoint_data.checkpoint_batch_iterator.next().is_some() {
             return Err(Error::checkpoint_write(
                 "The checkpoint data must be fully exhausted from the iterator and written to storage before calling finalize"
             ));
@@ -343,7 +338,7 @@ impl CheckpointWriter {
             .log_root
             .join(LAST_CHECKPOINT_FILE_NAME)?;
 
-        // Write the `_last_checkpoint` file to the table root
+        // Write the `_last_checkpoint` file to `table/_delta_log/_last_checkpoint`
         engine.json_handler().write_json_file(
             &last_checkpoint_path,
             Box::new(std::iter::once(data)),
@@ -492,7 +487,7 @@ pub(crate) fn create_last_checkpoint_data(
         &[
             version.into(),
             actions_counter.into(),
-            1i64.into(),
+            1i64.into(), // parts = 1 since we only support single-part checkpoint here
             size_in_bytes.into(),
             add_actions_counter.into(),
         ],
