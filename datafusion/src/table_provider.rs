@@ -355,7 +355,7 @@ async fn get_parquet_access_plan(
     // Create a ParquetAccessPlan that will be used to skip rows based on the selection vector
     let mut row_groups: Vec<RowGroupAccess> = vec![];
     let mut row_group_row_start = 0;
-    for (i, row_group) in parquet_metadata.row_groups().iter().enumerate() {
+    for (_idx, row_group) in parquet_metadata.row_groups().iter().enumerate() {
         // If all rows in the row group are deleted, skip the row group
         let row_group_access = get_row_group_access(
             &selection_vector,
