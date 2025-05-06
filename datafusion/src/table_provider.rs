@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
+use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::datasource::physical_plan::parquet::{
     DefaultParquetFileReaderFactory, ParquetAccessPlan, RowGroupAccess,
 };
@@ -14,7 +15,7 @@ use datafusion::physical_expr::PhysicalExprRef;
 use datafusion::physical_plan::{union::UnionExec, ExecutionPlan};
 use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::error::{DataFusionError, Result};
-use datafusion_common::{DFSchema, HashMap};
+use datafusion_common::{DFSchema, HashMap, ScalarValue};
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource::PartitionedFile;
 use datafusion_execution::object_store::ObjectStoreUrl;
@@ -29,20 +30,30 @@ use delta_kernel::{Engine, ExpressionRef};
 use url::Url;
 
 use crate::error::to_df_err;
+use crate::exec::{DeltaScanExec, FILE_ID_COLUMN};
 use crate::expressions::{to_delta_predicate, to_df_expr};
 
-#[derive(Debug)]
 pub struct DeltaTableProvider {
     snapshot: Arc<Snapshot>,
     table_schema: ArrowSchemaRef,
+    engine: Arc<dyn Engine>,
+}
+
+impl std::fmt::Debug for DeltaTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeltaTableProvider")
+            .field("snapshot", &self.snapshot)
+            .finish()
+    }
 }
 
 impl DeltaTableProvider {
-    pub fn try_new(snapshot: Arc<Snapshot>) -> Result<Self> {
+    pub fn try_new(snapshot: Arc<Snapshot>, engine: Arc<dyn Engine>) -> Result<Self> {
         let table_schema = snapshot.schema().as_ref().try_into()?;
         Ok(Self {
             snapshot,
             table_schema: Arc::new(table_schema),
+            engine,
         })
     }
 }
@@ -91,17 +102,18 @@ impl TableProvider for DeltaTableProvider {
         let scan_state = scan.global_scan_state();
         let table_root = Url::parse(&scan_state.table_root)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let read_schema: ArrowSchemaRef = Arc::new(scan_state.physical_schema.as_ref().try_into()?);
+        let file_schema: ArrowSchemaRef = Arc::new(scan_state.physical_schema.as_ref().try_into()?);
 
-        let engine = get_engine(state)?;
         let mut context = ScanContext::new(
             state,
-            engine.clone(),
+            self.engine.clone(),
             table_root,
-            read_schema.clone().try_into()?,
+            file_schema.clone().try_into()?,
         );
 
-        let meta = scan.scan_metadata(engine.as_ref()).map_err(to_df_err)?;
+        let meta = scan
+            .scan_metadata(self.engine.as_ref())
+            .map_err(to_df_err)?;
         for scan_meta in meta {
             let scan_meta = scan_meta.map_err(to_df_err)?;
             context = scan_meta
@@ -115,6 +127,9 @@ impl TableProvider for DeltaTableProvider {
 
         let source = Arc::new(ParquetSource::default());
         let mut plans = Vec::new();
+        let mut transforms = HashMap::new();
+        let file_id_field = Field::new(FILE_ID_COLUMN, DataType::Utf8, true);
+
         for (store_url, mut files) in context.files.into_iter() {
             let store = state.runtime_env().object_store(&store_url)?;
             let reader_factory = Arc::new(DefaultParquetFileReaderFactory::new(store))
@@ -131,25 +146,35 @@ impl TableProvider for DeltaTableProvider {
                         .partitioned_file
                         .clone()
                         .with_extensions(Arc::new(access_plan));
+                    if let Some(transform) = &file.transform {
+                        transforms.insert(file.file_id.clone(), transform.clone());
+                    }
                 }
             }
-            let config = FileScanConfigBuilder::new(store_url, read_schema.clone(), source.clone())
+            // TODO: convert passed predicate to an expression in terms of physical columns
+            // and add it to the FileScanConfig
+            let config = FileScanConfigBuilder::new(store_url, file_schema.clone(), source.clone())
                 .with_file_group(files.into_iter().map(|f| f.partitioned_file).collect())
+                .with_table_partition_cols(vec![file_id_field.clone()])
                 .with_limit(limit)
                 .build();
             let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
             plans.push(plan);
         }
 
-        match plans.len() {
-            1 => Ok(plans.remove(0)),
-            _ => Ok(Arc::new(UnionExec::new(plans))),
-        }
-    }
-}
+        let read_schema: ArrowSchemaRef = Arc::new(scan_state.logical_schema.as_ref().try_into()?);
 
-fn get_engine(state: &dyn Session) -> Result<Arc<dyn Engine>> {
-    todo!()
+        let plan = match plans.len() {
+            1 => plans.remove(0),
+            _ => Arc::new(UnionExec::new(plans)),
+        };
+
+        Ok(Arc::new(DeltaScanExec::new(
+            read_schema,
+            plan,
+            Arc::new(transforms),
+        )))
+    }
 }
 
 fn project_delta_schema(
@@ -225,6 +250,7 @@ struct PartitionFileContext {
     partitioned_file: PartitionedFile,
     selection_vector: Option<Vec<bool>>,
     transform: Option<PhysicalExprRef>,
+    file_id: String,
 }
 
 fn visit_scan_file(
@@ -253,18 +279,23 @@ fn visit_scan_file(
         e_tag: None,
         version: None,
     };
-    let partitioned_file = PartitionedFile::from(object_meta);
+    let mut partitioned_file = PartitionedFile::from(object_meta);
+    partitioned_file.partition_values = vec![ScalarValue::Utf8(Some(path.to_string()))];
 
     // Get the selection vector (i.e. inverse deletion vector)
     let Ok(selection_vector) =
         dv_info.get_selection_vector(context.engine.as_ref(), &context.table_root)
     else {
-        context.errs.push(DataFusionError::Execution("Error getting selection vector".to_string()));
+        context.errs.push(DataFusionError::Execution(
+            "Error getting selection vector".to_string(),
+        ));
         return;
     };
 
     let Ok(transform) = transform.map(|t| to_df_expr(&t)).transpose() else {
-        context.errs.push(DataFusionError::Execution("Error converting transform to Delta expression".to_string()));
+        context.errs.push(DataFusionError::Execution(
+            "Error converting transform to Delta expression".to_string(),
+        ));
         return;
     };
 
@@ -292,6 +323,7 @@ fn visit_scan_file(
             partitioned_file,
             selection_vector,
             transform,
+            file_id: path.to_string(),
         });
 }
 

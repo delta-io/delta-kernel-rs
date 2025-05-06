@@ -29,8 +29,6 @@ pub struct DeltaScanExec {
     transforms: Arc<HashMap<String, PhysicalExprRef>>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
-    /// common plan properties like equivalences, output partitioning etc.
-    properties: PlanProperties,
 }
 
 impl DisplayAs for DeltaScanExec {
@@ -46,6 +44,21 @@ impl DisplayAs for DeltaScanExec {
     }
 }
 
+impl DeltaScanExec {
+    pub(crate) fn new(
+        schema: SchemaRef,
+        input: Arc<dyn ExecutionPlan>,
+        transforms: Arc<HashMap<String, PhysicalExprRef>>,
+    ) -> Self {
+        Self {
+            schema,
+            input,
+            transforms,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+}
+
 impl ExecutionPlan for DeltaScanExec {
     fn name(&self) -> &'static str {
         "DeltaScanExec"
@@ -56,7 +69,9 @@ impl ExecutionPlan for DeltaScanExec {
     }
 
     fn properties(&self) -> &PlanProperties {
-        &self.properties
+        // TODO: check individual properties and see if it is correct
+        // to just forward them
+        &self.input.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -112,7 +127,6 @@ impl ExecutionPlan for DeltaScanExec {
             schema: Arc::clone(&self.schema),
             input: self.input.execute(partition, context)?,
             baseline_metrics: BaselineMetrics::new(&self.metrics, partition),
-            // engine: Arc::clone(&self.engine),
             transforms: Arc::clone(&self.transforms),
         }))
     }
@@ -157,34 +171,33 @@ struct DeltaScanStream {
 }
 
 impl DeltaScanStream {
-    fn batch_project(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn batch_project(&self, mut batch: RecordBatch) -> Result<RecordBatch> {
         // Records time on drop
         let _timer = self.baseline_metrics.elapsed_compute().timer();
 
-        let file_id = batch
-            .column_by_name(FILE_ID_COLUMN)
+        let file_id_idx = batch
+            .schema_ref()
+            .fields()
+            .iter()
+            .position(|f| f.name() == FILE_ID_COLUMN)
             .ok_or_else(|| {
                 DataFusionError::Internal(
                     "Expected column 'file_id' to be present in the input".to_string(),
                 )
-            })?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                DataFusionError::Internal(
-                    "Expected column 'file_id' to be a StringArray".to_string(),
-                )
-            })?
-            .value(0);
+            })?;
 
-        let transform = self.transforms.get(file_id).ok_or_else(|| {
-            DataFusionError::Internal(format!(
-                "Expected partition values for file_id '{}'",
-                file_id
-            ))
-        })?;
+        let file_id = batch
+            .column(file_id_idx)
+            .as_string::<i32>()
+            .value(0)
+            .to_string();
+        batch.remove_column(file_id_idx);
 
-        let ColumnarValue::Array(logical) = transform.evaluate(batch)? else {
+        let Some(transform) = self.transforms.get(&file_id) else {
+            return Ok(batch);
+        };
+
+        let ColumnarValue::Array(logical) = transform.evaluate(&batch)? else {
             return Err(DataFusionError::Internal(
                 "Expected transformation result to be an array".to_string(),
             ));
@@ -206,7 +219,7 @@ impl Stream for DeltaScanStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let poll = self.input.poll_next_unpin(cx).map(|x| match x {
-            Some(Ok(batch)) => Some(self.batch_project(&batch)),
+            Some(Ok(batch)) => Some(self.batch_project(batch)),
             other => other,
         });
         self.baseline_metrics.record_poll(poll)
