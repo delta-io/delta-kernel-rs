@@ -2,9 +2,10 @@ use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use itertools::Itertools;
 
 use crate::actions::schemas::ToDataType;
-use crate::schema::{ArrayType, DataType, DecimalType, PrimitiveType, StructField};
+use crate::schema::{ArrayType, DataType, DecimalType, MapType, PrimitiveType, StructField};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
@@ -52,12 +53,6 @@ fn get_decimal_precision(value: i128) -> u8 {
     value.unsigned_abs().checked_ilog10().map_or(0, |p| p + 1) as _
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct StructData {
-    fields: Vec<StructField>,
-    values: Vec<Scalar>,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArrayData {
     tpe: ArrayType,
@@ -66,9 +61,32 @@ pub struct ArrayData {
 }
 
 impl ArrayData {
-    pub fn new(tpe: ArrayType, elements: impl IntoIterator<Item = impl Into<Scalar>>) -> Self {
-        let elements = elements.into_iter().map(Into::into).collect();
-        Self { tpe, elements }
+    pub fn try_new(
+        tpe: ArrayType,
+        elements: impl IntoIterator<Item = impl Into<Scalar>>,
+    ) -> DeltaResult<Self> {
+        let elements = elements
+            .into_iter()
+            .map(|v| {
+                let v = v.into();
+                // disallow nulls if the type is not allowed to contain nulls
+                if !tpe.contains_null() && v.is_null() {
+                    Err(Error::schema(
+                        "Array element cannot be null for non-nullable array",
+                    ))
+                // check element types match
+                } else if *tpe.element_type() != v.data_type() {
+                    Err(Error::Schema(format!(
+                        "Array scalar type mismatch: expected {}, got {}",
+                        tpe.element_type(),
+                        v.data_type()
+                    )))
+                } else {
+                    Ok(v)
+                }
+            })
+            .try_collect()?;
+        Ok(Self { tpe, elements })
     }
 
     pub fn array_type(&self) -> &ArrayType {
@@ -81,6 +99,70 @@ impl ArrayData {
     pub fn array_elements(&self) -> &[Scalar] {
         &self.elements
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapData {
+    data_type: MapType,
+    pairs: Vec<(Scalar, Scalar)>,
+}
+
+impl MapData {
+    pub fn try_new(
+        data_type: MapType,
+        values: impl IntoIterator<Item = (impl Into<Scalar>, impl Into<Scalar>)>,
+    ) -> DeltaResult<Self> {
+        let key_type = data_type.key_type();
+        let val_type = data_type.value_type();
+        let pairs = values
+            .into_iter()
+            .map(|(key, val)| {
+                let (k, v) = (key.into(), val.into());
+                // check key types match
+                if k.data_type() != *key_type {
+                    Err(Error::Schema(format!(
+                        "Map scalar type mismatch: expected key type {}, got key type {}",
+                        key_type,
+                        k.data_type()
+                    )))
+                // keys can't be null
+                } else if k.is_null() {
+                    Err(Error::schema("Map key cannot be null"))
+                // check val types match
+                } else if v.data_type() != *val_type {
+                    Err(Error::Schema(format!(
+                        "Map scalar type mismatch: expected value type {}, got value type {}",
+                        val_type,
+                        v.data_type()
+                    )))
+                // vals can only be null if value_contains_null is true
+                } else if v.is_null() && !data_type.value_contains_null {
+                    Err(Error::schema(
+                        "Null map value disallowed if map value_contains_null is false",
+                    ))
+                } else {
+                    Ok((k, v))
+                }
+            })
+            .try_collect()?;
+        Ok(Self { data_type, pairs })
+    }
+
+    // TODO: array.elements is deprecated? do we want to expose this? How will FFI get pairs for
+    // visiting?
+    pub fn pairs(&self) -> &[(Scalar, Scalar)] {
+        &self.pairs
+    }
+
+    pub fn map_type(&self) -> &MapType {
+        &self.data_type
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructData {
+    fields: Vec<StructField>,
+    values: Vec<Scalar>,
 }
 
 impl StructData {
@@ -169,6 +251,8 @@ pub enum Scalar {
     Struct(StructData),
     /// Array Value
     Array(ArrayData),
+    /// Map Value
+    Map(MapData),
 }
 
 impl Scalar {
@@ -190,6 +274,7 @@ impl Scalar {
             Self::Null(data_type) => data_type.clone(),
             Self::Struct(data) => DataType::struct_type(data.fields.clone()),
             Self::Array(data) => data.tpe.clone().into(),
+            Self::Map(data) => data.data_type.clone().into(),
         }
     }
 
@@ -275,6 +360,15 @@ impl Display for Scalar {
                 }
                 write!(f, ")")
             }
+            Self::Map(data) => {
+                write!(f, "{{")?;
+                let mut delim = "";
+                for (key, val) in &data.pairs {
+                    write!(f, "{delim}{key}: {val}")?;
+                    delim = ", ";
+                }
+                write!(f, "}}")
+            }
         }
     }
 }
@@ -322,6 +416,7 @@ impl PartialOrd for Scalar {
             (Null(_), _) => None, // NOTE: NULL values are incomparable by definition
             (Struct(_), _) => None, // TODO: Support Struct?
             (Array(_), _) => None, // TODO: Support Array?
+            (Map(_), _) => None,  // TODO: Support Map?
         }
     }
 }
@@ -716,6 +811,49 @@ mod tests {
         assert_eq!(&format!("{}", array_not_op), "10 NOT IN (1, 2, 3)");
         assert_eq!(&format!("{}", column_op), "3.1415927 IN Column(item)");
         assert_eq!(&format!("{}", column_not_op), "'Cool' NOT IN Column(item)");
+    }
+
+    #[test]
+    fn test_invalid_array() {
+        assert!(ArrayData::try_new(
+            ArrayType::new(DataType::INTEGER, false),
+            [Scalar::Integer(1), Scalar::String("s".to_string())],
+        )
+        .is_err());
+
+        assert!(
+            ArrayData::try_new(ArrayType::new(DataType::INTEGER, false), [1.into(), None]).is_err()
+        );
+    }
+
+    #[test]
+    fn test_invalid_map() {
+        // incorrect schema
+        assert!(MapData::try_new(
+            MapType::new(DataType::STRING, DataType::INTEGER, false),
+            [(Scalar::Integer(1), Scalar::String("s".to_string())),],
+        )
+        .is_err());
+
+        // key must be non-null
+        assert!(MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, true),
+            [(
+                Scalar::Null(DataType::STRING),  // key
+                Scalar::String("s".to_string())  // val
+            ),],
+        )
+        .is_err());
+
+        // val must be non-null if we have value_contains_null = false
+        assert!(MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, false),
+            [(
+                Scalar::String("s".to_string()), // key
+                Scalar::Null(DataType::STRING)   // val
+            ),],
+        )
+        .is_err());
     }
 
     #[test]

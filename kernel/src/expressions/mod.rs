@@ -8,7 +8,7 @@ use itertools::Itertools;
 pub use self::column_names::{
     column_expr, column_name, joined_column_expr, joined_column_name, ColumnName,
 };
-pub use self::scalars::{ArrayData, DecimalData, Scalar, StructData};
+pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use self::transforms::GetColumnReferences;
 pub use self::transforms::{ExpressionDepthChecker, ExpressionTransform};
 use crate::DataType;
