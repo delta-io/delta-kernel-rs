@@ -485,9 +485,13 @@ mod tests {
             .try_collect()
             .unwrap();
         assert_eq!(data.len(), 4);
-        let data: Vec<_> = data.into_iter().map(|batch| {
-            batch.column_by_name("row_index").unwrap().as_primitive::<Int64Type>().values().to_vec()
-        }).collect();
+        let data: Vec<_> = data
+            .into_iter()
+            .map(|batch| {
+                let column = batch.column_by_name("row_index").unwrap();
+                column.as_primitive::<Int64Type>().values().to_vec()
+            })
+            .collect();
         assert_eq!(data[0], &[0, 1, 2]);
         assert_eq!(data[1], &[0]);
         assert_eq!(data[2], &[0, 1]);
