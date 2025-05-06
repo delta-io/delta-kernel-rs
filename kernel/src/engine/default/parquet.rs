@@ -19,7 +19,9 @@ use uuid::Uuid;
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use super::UrlExt;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::{fixup_parquet_read, generate_mask, get_requested_indices};
+use crate::engine::arrow_utils::{
+    fixup_parquet_read, generate_mask, get_requested_indices, RowIndexBuilder,
+};
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
@@ -291,16 +293,18 @@ impl FileOpener for ParquetOpener {
                 builder = builder.with_projection(mask)
             }
 
+            let mut row_indexes = RowIndexBuilder::new(builder.metadata().row_groups());
             if let Some(ref predicate) = predicate {
-                builder = builder.with_row_group_filter(predicate);
+                builder = builder.with_row_group_filter(predicate, &mut row_indexes);
             }
             if let Some(limit) = limit {
                 builder = builder.with_limit(limit)
             }
 
+            let mut row_indexes = row_indexes.into_iter();
             let stream = builder.with_batch_size(batch_size).build()?;
-
-            let stream = stream.map(move |rbr| fixup_parquet_read(rbr?, &requested_ordering));
+            let stream = stream
+                .map(move |rbr| fixup_parquet_read(rbr?, &requested_ordering, &mut row_indexes));
             Ok(stream.boxed())
         }))
     }
@@ -359,8 +363,9 @@ impl FileOpener for PresignedUrlOpener {
                 builder = builder.with_projection(mask)
             }
 
+            let mut row_indexes = RowIndexBuilder::new(builder.metadata().row_groups());
             if let Some(ref predicate) = predicate {
-                builder = builder.with_row_group_filter(predicate);
+                builder = builder.with_row_group_filter(predicate, &mut row_indexes);
             }
             if let Some(limit) = limit {
                 builder = builder.with_limit(limit)
@@ -368,8 +373,10 @@ impl FileOpener for PresignedUrlOpener {
 
             let reader = builder.with_batch_size(batch_size).build()?;
 
+            let mut row_indexes = row_indexes.into_iter();
             let stream = futures::stream::iter(reader);
-            let stream = stream.map(move |rbr| fixup_parquet_read(rbr?, &requested_ordering));
+            let stream = stream
+                .map(move |rbr| fixup_parquet_read(rbr?, &requested_ordering, &mut row_indexes));
             Ok(stream.boxed())
         }))
     }
@@ -436,6 +443,55 @@ mod tests {
 
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].num_rows(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_read_parquet_row_indexes() {
+        use crate::arrow::array::AsArray as _;
+        use crate::arrow::datatypes::Int64Type;
+
+        let store = Arc::new(LocalFileSystem::new());
+        let urls = [
+            "./tests/data/data-reader-timestamp_ntz/tsNtzPartition=__HIVE_DEFAULT_PARTITION__/part-00001-53fd3b3b-7773-459a-921c-bb64bf0bbd03.c000.snappy.parquet",
+            "./tests/data/data-reader-timestamp_ntz/tsNtzPartition=2013-07-05 17%3A01%3A00.123456/part-00000-6240e68e-2304-449a-a1e6-0e24866d3508.c000.snappy.parquet",
+            "./tests/data/data-reader-timestamp_ntz/tsNtzPartition=2013-07-05 17%3A01%3A00.123456/part-00001-336e3e5f-a202-4bd9-b117-28d871bbb639.c000.snappy.parquet",
+            "./tests/data/data-reader-timestamp_ntz/tsNtzPartition=2021-11-18 02%3A30%3A00.123456/part-00000-65fcd5cb-f2f3-44f4-96ef-f43825143ba9.c000.snappy.parquet",
+        ].map(|p| {
+            //println!("p: {:?}", std::fs::canonicalize(PathBuf::from(p)).unwrap());
+            url::Url::from_file_path(std::fs::canonicalize(PathBuf::from(p)).unwrap()).unwrap()
+        });
+        let mut metas = vec![];
+        for url in urls {
+            println!("url: {}", url);
+            let location = Path::from_url_path(url.path()).unwrap();
+            let meta = store.head(&location).await.unwrap();
+            metas.push(FileMeta {
+                location: url.clone(),
+                last_modified: meta.last_modified.timestamp(),
+                size: meta.size.try_into().unwrap(),
+            });
+        }
+
+        let schema = Arc::new(crate::schema::StructType::new([
+            crate::schema::StructField::nullable("id", crate::schema::DataType::INTEGER),
+            crate::schema::InternalMetadataColumn::RowIndex.as_struct_field("row_index"),
+            crate::schema::StructField::nullable("tsNtz", crate::schema::DataType::TIMESTAMP_NTZ),
+        ]));
+        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let data: Vec<RecordBatch> = handler
+            .read_parquet_files(&metas, schema, None)
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+        assert_eq!(data.len(), 4);
+        let data: Vec<_> = data.into_iter().map(|batch| {
+            batch.column_by_name("row_index").unwrap().as_primitive::<Int64Type>().values().to_vec()
+        }).collect();
+        assert_eq!(data[0], &[0, 1, 2]);
+        assert_eq!(data[1], &[0]);
+        assert_eq!(data[2], &[0, 1]);
+        assert_eq!(data[3], &[0, 1, 2]);
     }
 
     #[test]

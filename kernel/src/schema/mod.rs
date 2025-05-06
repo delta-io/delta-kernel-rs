@@ -15,6 +15,8 @@ use crate::utils::require;
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
+use strum::{AsRefStr, EnumString};
+
 pub(crate) mod compare;
 
 pub type Schema = StructType;
@@ -84,6 +86,56 @@ pub enum ColumnMetadataKey {
     IdentityHighWaterMark,
     IdentityAllowExplicitInsert,
     Invariants,
+}
+
+/// When present in a [`StructField::metadata`], identifies which internal Delta metadata column the
+/// field represents.
+pub(crate) const INTERNAL_METADATA_COLUMN_KEY: &str = "delta.__internal__.metadata_column";
+
+#[derive(Clone, Copy, Debug, PartialEq, AsRefStr, EnumString)]
+#[allow(clippy::enum_variant_names)] // "all variants have the same prefix: 'Row'"
+pub(crate) enum InternalMetadataColumn {
+    /// The file-local row index of a row in a parquet file
+    #[strum(to_string = "delta.__internal__.metadata_column.row_index")]
+    RowIndex,
+    /// The logical row ID column of a data file
+    #[strum(to_string = "delta.__internal__.metadata_column.row_id")]
+    #[allow(unused)] // TODO: support row tracking
+    RowId,
+    /// The logical row commit version column of a data file
+    #[strum(to_string = "delta.__internal__.metadata_column.row_commit_version")]
+    #[allow(unused)] // TODO: support row tracking
+    RowCommitVersion,
+}
+
+impl InternalMetadataColumn {
+    #[cfg(test)] // TODO: Actually use this in prod code
+    pub(crate) fn as_struct_field(&self, name: impl Into<String>) -> StructField {
+        let (data_type, nullable) = match self {
+            Self::RowIndex => (DataType::LONG, false),
+            Self::RowId => (DataType::LONG, true),
+            Self::RowCommitVersion => (DataType::LONG, true),
+        };
+        StructField::new(name, data_type, nullable)
+            .with_metadata([(INTERNAL_METADATA_COLUMN_KEY, self.as_ref())])
+    }
+}
+
+impl TryFrom<&StructField> for InternalMetadataColumn {
+    type Error = Error;
+
+    fn try_from(field: &StructField) -> DeltaResult<Self> {
+        let metadata = field.metadata.get(INTERNAL_METADATA_COLUMN_KEY);
+        if let Some(MetadataValue::String(s)) = metadata {
+            if let Ok(column) = s.parse() {
+                return Ok(column);
+            }
+        }
+        Err(Error::internal_error(format!(
+            "Invalid metadata value for {}: {metadata:?}",
+            INTERNAL_METADATA_COLUMN_KEY
+        )))
+    }
 }
 
 impl AsRef<str> for ColumnMetadataKey {
@@ -1112,6 +1164,14 @@ mod tests {
                                 "delta.columnMapping.id": 5,
                                 "delta.columnMapping.physicalName": "col-a7f4159c-53be-4cb0-b81a-f7e5240cfc49"
                             }
+                        },
+                        {
+                            "name": "row_index",
+                            "type": "long",
+                            "nullable": false,
+                            "metadata": {
+                                "delta.__internal__.metadata_column": "delta.__internal__.metadata_column.row_index"
+                            }
                         }
                     ]
                 },
@@ -1154,6 +1214,10 @@ mod tests {
         assert_eq!(
             stype.fields.get_index(0).unwrap().1.name,
             "col-a7f4159c-53be-4cb0-b81a-f7e5240cfc49"
+        );
+        assert_eq!(
+            InternalMetadataColumn::try_from(stype.fields.get_index(1).unwrap().1).unwrap(),
+            InternalMetadataColumn::RowIndex
         );
     }
 
