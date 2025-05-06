@@ -29,16 +29,14 @@ pub(crate) fn domain_metadata_configuration(
     engine: &dyn Engine,
 ) -> DeltaResult<Option<String>> {
     let mut domain_metadatas = scan_domain_metadatas(log_segment, Some(domain), engine)?;
-    // note that the resulting domain_metadatas includes removed domains, so we need to filter
-    domain_metadatas.retain(|_, dm| !dm.removed);
     Ok(domain_metadatas
         .remove(domain)
         .map(|domain_metadata| domain_metadata.configuration))
 }
 
 /// Scan the entire log for all domain metadata actions but terminate early if a specific domain
-/// is provided. Note that this returns the latest domain metadata for each domain, including
-/// tombstones (removed=true). It is up to the caller to filter out removed domains if needed.
+/// is provided. Note that this returns the latest domain metadata for each domain, accounting for
+/// tombstones (removed=true) - that is, removed domain metadatas will _never_ be returned.
 fn scan_domain_metadatas(
     log_segment: &LogSegment,
     domain: Option<&str>,
@@ -54,12 +52,12 @@ fn scan_domain_metadatas(
         // if a specific domain is requested and it was found, then return. note that we don't need
         // to check if it was the one that was found since the visitor will only keep the requested
         // domain
-        if domain.is_some() && !visitor.domain_metadatas.is_empty() {
+        if domain.is_some() && !visitor.is_empty() {
             break;
         }
     }
 
-    Ok(visitor.domain_metadatas)
+    Ok(visitor.into_domain_metadatas())
 }
 
 fn replay_for_domain_metadatas(

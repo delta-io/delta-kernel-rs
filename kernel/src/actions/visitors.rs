@@ -493,7 +493,7 @@ impl RowVisitor for SidecarVisitor {
 /// requirements).
 #[derive(Debug, Default)]
 pub(crate) struct DomainMetadataVisitor {
-    pub(crate) domain_metadatas: DomainMetadataMap,
+    domain_metadatas: DomainMetadataMap,
     domain_filter: Option<String>,
 }
 
@@ -525,6 +525,16 @@ impl DomainMetadataVisitor {
             configuration,
             removed,
         })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.domain_metadatas.is_empty()
+    }
+
+    pub(crate) fn into_domain_metadatas(mut self) -> DomainMetadataMap {
+        // note that the resulting visitor.domain_metadatas includes removed domains, so we need to filter
+        self.domain_metadatas.retain(|_, dm| !dm.removed);
+        self.domain_metadatas
     }
 }
 
@@ -833,7 +843,7 @@ mod tests {
         domain_metadata_visitor
             .visit_rows_of(commit_0.as_ref())
             .unwrap();
-        let actual = domain_metadata_visitor.domain_metadatas;
+        let actual = domain_metadata_visitor.domain_metadatas.clone();
         let expected = DomainMetadataMap::from([
             (
                 "zach1".to_string(),
@@ -902,6 +912,42 @@ mod tests {
         ]);
         assert_eq!(actual, expected);
 
+        let expected = DomainMetadataMap::from([
+            (
+                "zach2".to_string(),
+                DomainMetadata {
+                    domain: "zach2".to_string(),
+                    configuration: "cfg2".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach4".to_string(),
+                DomainMetadata {
+                    domain: "zach4".to_string(),
+                    configuration: "cfg4".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach6".to_string(),
+                DomainMetadata {
+                    domain: "zach6".to_string(),
+                    configuration: "cfg6".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach8".to_string(),
+                DomainMetadata {
+                    domain: "zach8".to_string(),
+                    configuration: "cfg8".to_string(),
+                    removed: false,
+                },
+            ),
+        ]);
+        assert_eq!(domain_metadata_visitor.into_domain_metadatas(), expected);
+
         // test filtering
         let mut domain_metadata_visitor = DomainMetadataVisitor::new(Some("zach3".to_string()));
         domain_metadata_visitor
@@ -910,7 +956,7 @@ mod tests {
         domain_metadata_visitor
             .visit_rows_of(commit_0.as_ref())
             .unwrap();
-        let actual = domain_metadata_visitor.domain_metadatas;
+        let actual = domain_metadata_visitor.domain_metadatas.clone();
         let expected = DomainMetadataMap::from([(
             "zach3".to_string(),
             DomainMetadata {
@@ -920,6 +966,8 @@ mod tests {
             },
         )]);
         assert_eq!(actual, expected);
+        let expected = DomainMetadataMap::from([]);
+        assert_eq!(domain_metadata_visitor.into_domain_metadatas(), expected);
 
         // test filtering for a domain that is not present
         let mut domain_metadata_visitor = DomainMetadataVisitor::new(Some("notexist".to_string()));
