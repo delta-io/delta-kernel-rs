@@ -4,8 +4,10 @@ use std::sync::Arc;
 
 use crate::{expressions::SharedExpression, handle::Handle};
 use delta_kernel::{
-    expressions::{column_expr, ArrayData, BinaryOperator, Expression as Expr, Scalar, StructData},
-    schema::{ArrayType, DataType, StructField, StructType},
+    expressions::{
+        column_expr, ArrayData, BinaryOperator, Expression as Expr, MapData, Scalar, StructData,
+    },
+    schema::{ArrayType, DataType, MapType, StructField, StructType},
 };
 
 /// Constructs a kernel expression that is passed back as a SharedExpression handle. The expected
@@ -20,7 +22,18 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         DataType::Primitive(delta_kernel::schema::PrimitiveType::Short),
         false,
     );
-    let array_data = ArrayData::new(array_type.clone(), vec![Scalar::Short(5), Scalar::Short(0)]);
+    let array_data =
+        ArrayData::try_new(array_type.clone(), vec![Scalar::Short(5), Scalar::Short(0)]).unwrap();
+
+    let map_type = MapType::new(DataType::STRING, DataType::STRING, false);
+    let map_data = MapData::try_new(
+        map_type.clone(),
+        [
+            ("key1".to_string(), "val1".to_string()),
+            ("key2".to_string(), "val2".to_string()),
+        ],
+    )
+    .unwrap();
 
     let nested_fields = vec![
         StructField::not_null("a", DataType::INTEGER),
@@ -62,6 +75,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         Expr::null_literal(DataType::SHORT),
         Scalar::Struct(top_level_struct).into(),
         Scalar::Array(array_data).into(),
+        Scalar::Map(map_data).into(),
         Expr::struct_from(vec![Expr::or_from(vec![
             Scalar::Integer(5).into(),
             Scalar::Long(20).into(),
