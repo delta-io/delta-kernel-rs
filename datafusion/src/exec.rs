@@ -13,7 +13,7 @@ use datafusion_expr::ColumnarValue;
 use datafusion_physical_plan::execution_plan::CardinalityEffect;
 use datafusion_physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, Statistics};
-use delta_kernel::arrow::array::{AsArray, RecordBatch, StringArray};
+use delta_kernel::arrow::array::{AsArray, RecordBatch};
 use delta_kernel::arrow::datatypes::SchemaRef;
 use futures::stream::{Stream, StreamExt};
 

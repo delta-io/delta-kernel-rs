@@ -300,10 +300,7 @@ fn scalar_to_df_scalar(scalar: &Scalar) -> DFResult<Expr> {
 mod tests {
     use super::*;
     use datafusion_expr::{col, lit};
-    use delta_kernel::expressions::{
-        BinaryExpression, BinaryOperator, JunctionExpression, JunctionOperator, UnaryExpression,
-        UnaryOperator,
-    };
+    use delta_kernel::expressions::{BinaryExpression, BinaryOperator, JunctionOperator};
 
     fn assert_junction_expr(expr: &Expr, expected_op: JunctionOperator, expected_children: usize) {
         let delta_expr = to_delta_expression(expr).unwrap();
