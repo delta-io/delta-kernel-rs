@@ -5,7 +5,6 @@ mod to_datafusion;
 mod to_delta;
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
     use datafusion_expr::{col, lit};
@@ -16,7 +15,7 @@ mod tests {
         let df_expr = col("a").eq(lit(1)).and(col("b").eq(lit(2)));
         let delta_expr = to_delta_expression(&df_expr).unwrap();
         let df_expr_roundtrip = to_datafusion_expr(&delta_expr).unwrap();
-        assert_eq!(df_expr, df_expr_roundtrip);
+        assert_eq!(df_expr, df_expr_roundtrip[0]);
     }
 
     #[test]
@@ -28,7 +27,7 @@ mod tests {
             .and(col("d").eq(lit(4)));
         let delta_expr = to_delta_expression(&df_expr).unwrap();
         let df_expr_roundtrip = to_datafusion_expr(&delta_expr).unwrap();
-        assert_eq!(df_expr, df_expr_roundtrip);
+        assert_eq!(df_expr, df_expr_roundtrip[0]);
     }
 
     #[test]
@@ -39,7 +38,7 @@ mod tests {
             .or(col("c").eq(lit(3)).and(col("d").eq(lit(4))));
         let delta_expr = to_delta_expression(&df_expr).unwrap();
         let df_expr_roundtrip = to_datafusion_expr(&delta_expr).unwrap();
-        assert_eq!(df_expr, df_expr_roundtrip);
+        assert_eq!(df_expr, df_expr_roundtrip[0]);
     }
 
     #[test]
@@ -47,7 +46,7 @@ mod tests {
         let df_expr = !col("a").eq(lit(1));
         let delta_expr = to_delta_expression(&df_expr).unwrap();
         let df_expr_roundtrip = to_datafusion_expr(&delta_expr).unwrap();
-        assert_eq!(df_expr, df_expr_roundtrip);
+        assert_eq!(df_expr, df_expr_roundtrip[0]);
     }
 
     #[test]
@@ -55,7 +54,7 @@ mod tests {
         let df_expr = col("a").is_null();
         let delta_expr = to_delta_expression(&df_expr).unwrap();
         let df_expr_roundtrip = to_datafusion_expr(&delta_expr).unwrap();
-        assert_eq!(df_expr, df_expr_roundtrip);
+        assert_eq!(df_expr, df_expr_roundtrip[0]);
     }
 
     #[test]
@@ -63,7 +62,7 @@ mod tests {
         let df_expr = col("a") + col("b") * col("c");
         let delta_expr = to_delta_expression(&df_expr).unwrap();
         let df_expr_roundtrip = to_datafusion_expr(&delta_expr).unwrap();
-        assert_eq!(df_expr, df_expr_roundtrip);
+        assert_eq!(df_expr, df_expr_roundtrip[0]);
     }
 
     #[test]
@@ -71,7 +70,7 @@ mod tests {
         let df_expr = col("a").gt(col("b")).and(col("c").lt_eq(col("d")));
         let delta_expr = to_delta_expression(&df_expr).unwrap();
         let df_expr_roundtrip = to_datafusion_expr(&delta_expr).unwrap();
-        assert_eq!(df_expr, df_expr_roundtrip);
+        assert_eq!(df_expr, df_expr_roundtrip[0]);
     }
 
     #[test]
@@ -96,15 +95,6 @@ mod tests {
             left: Box::new(Expression::Column("a".parse().unwrap())),
             right: Box::new(Expression::Column("b".parse().unwrap())),
         });
-        assert!(to_datafusion_expr(&delta_expr).is_err());
-    }
-
-    #[test]
-    fn test_unsupported_struct() {
-        let delta_expr = Expression::Struct(vec![
-            Expression::Column("a".parse().unwrap()),
-            Expression::Column("b".parse().unwrap()),
-        ]);
         assert!(to_datafusion_expr(&delta_expr).is_err());
     }
 }

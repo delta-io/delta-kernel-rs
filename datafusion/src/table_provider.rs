@@ -21,12 +21,14 @@ use datafusion_datasource::PartitionedFile;
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion_physical_plan::PhysicalExpr;
 use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use delta_kernel::object_store::{path::Path as ObjectStorePath, ObjectMeta};
 use delta_kernel::scan::state::{DvInfo, Stats};
 use delta_kernel::schema::{Schema as DeltaSchema, SchemaRef as DeltaSchemaRef};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{Engine, ExpressionRef};
+use futures::stream::{StreamExt, TryStreamExt};
 use url::Url;
 
 use crate::error::to_df_err;
@@ -130,31 +132,34 @@ impl TableProvider for DeltaTableProvider {
         let mut transforms = HashMap::new();
         let file_id_field = Field::new(FILE_ID_COLUMN, DataType::Utf8, true);
 
-        for (store_url, mut files) in context.files.into_iter() {
+        for (store_url, files) in context.files.into_iter() {
+            transforms.extend(
+                files
+                    .iter()
+                    .filter_map(|f| f.transform.clone().map(|t| (f.file_id.clone(), t))),
+            );
+
             let store = state.runtime_env().object_store(&store_url)?;
-            let reader_factory = Arc::new(DefaultParquetFileReaderFactory::new(store))
-                as Arc<dyn ParquetFileReaderFactory>;
-            for file in files.iter_mut() {
-                if let Some(selection_vector) = &file.selection_vector {
-                    let access_plan = get_parquet_access_plan(
-                        &reader_factory,
-                        &file.partitioned_file,
-                        selection_vector.clone(),
-                    )
-                    .await?;
-                    file.partitioned_file = file
-                        .partitioned_file
-                        .clone()
-                        .with_extensions(Arc::new(access_plan));
-                    if let Some(transform) = &file.transform {
-                        transforms.insert(file.file_id.clone(), transform.clone());
+            let reader_factory: Arc<dyn ParquetFileReaderFactory> =
+                Arc::new(DefaultParquetFileReaderFactory::new(store));
+
+            // Create a stream of futures for computing parquet access plans
+            let file_group = futures::stream::iter(files)
+                // NOTE: using filter_map here since 'map' somehow does not accept futures.
+                .filter_map(|file| async {
+                    if let Some(sv) = file.selection_vector {
+                        Some(pq_access_plan(&reader_factory, file.partitioned_file, sv).await)
+                    } else {
+                        Some(Ok(file.partitioned_file))
                     }
-                }
-            }
+                })
+                .try_collect::<Vec<_>>()
+                .await?;
+
             // TODO: convert passed predicate to an expression in terms of physical columns
             // and add it to the FileScanConfig
             let config = FileScanConfigBuilder::new(store_url, file_schema.clone(), source.clone())
-                .with_file_group(files.into_iter().map(|f| f.partitioned_file).collect())
+                .with_file_group(file_group.into_iter().collect())
                 .with_table_partition_cols(vec![file_id_field.clone()])
                 .with_limit(limit)
                 .build();
@@ -201,6 +206,9 @@ struct ScanContext<'a> {
     /// Datafusion schema for data as read from the data file.
     physical_schema_df: DFSchema,
     /// Files to be scanned.
+    ///
+    /// The key is a store url which identifies the specific object store
+    /// the file belongs to.
     files: HashMap<ObjectStoreUrl, Vec<PartitionFileContext>>,
     /// Errors encountered during the scan.
     errs: Vec<DataFusionError>,
@@ -235,7 +243,10 @@ impl<'a> ScanContext<'a> {
             Err(_) => {
                 // we have a relative path
                 let base_path = ObjectStorePath::from_url_path(self.table_root.path())?;
-                let path = base_path.child(path);
+                let path = base_path
+                    .parts()
+                    .chain(ObjectStorePath::from_url_path(path)?.parts())
+                    .collect();
                 let mut obj_url = self.table_root.clone();
                 obj_url.set_path("/");
                 (ObjectStoreUrl::parse(&obj_url)?, path)
@@ -247,12 +258,12 @@ impl<'a> ScanContext<'a> {
 struct PartitionFileContext {
     partitioned_file: PartitionedFile,
     selection_vector: Option<Vec<bool>>,
-    transform: Option<PhysicalExprRef>,
+    transform: Option<Vec<PhysicalExprRef>>,
     file_id: String,
 }
 
 fn visit_scan_file(
-    context: &mut ScanContext,
+    ctx: &mut ScanContext,
     path: &str,
     size: i64,
     _stats: Option<Stats>,
@@ -262,10 +273,10 @@ fn visit_scan_file(
     // all required transformations are now part of the transform field
     _: std::collections::HashMap<String, String>,
 ) {
-    let (store_url, location) = match context.parse_path(path) {
+    let (store_url, location) = match ctx.parse_path(path) {
         Ok(v) => v,
         Err(e) => {
-            context.errs.push(e);
+            ctx.errs.push(e);
             return;
         }
     };
@@ -278,43 +289,27 @@ fn visit_scan_file(
         version: None,
     };
     let mut partitioned_file = PartitionedFile::from(object_meta);
+
+    // Asssign file path as partition value to track the data source in downstream operations
     partitioned_file.partition_values = vec![ScalarValue::Utf8(Some(path.to_string()))];
 
     // Get the selection vector (i.e. inverse deletion vector)
-    let Ok(selection_vector) =
-        dv_info.get_selection_vector(context.engine.as_ref(), &context.table_root)
+    let Ok(selection_vector) = dv_info.get_selection_vector(ctx.engine.as_ref(), &ctx.table_root)
     else {
-        context.errs.push(DataFusionError::Execution(
+        ctx.errs.push(DataFusionError::Execution(
             "Error getting selection vector".to_string(),
         ));
         return;
     };
 
-    let Ok(transform) = transform.map(|t| to_datafusion_expr(&t)).transpose() else {
-        context.errs.push(DataFusionError::Execution(
-            "Error converting transform to Delta expression".to_string(),
-        ));
-        return;
+    // Convert the transform to datafusion physical expressions
+    // These are later applied to the record batches we read from the file
+    let transform = match get_physical_transform(ctx, transform) {
+        Some(value) => value,
+        None => return,
     };
 
-    let transform = transform
-        .map(|t| {
-            context
-                .session
-                .create_physical_expr(t, &context.physical_schema_df)
-        })
-        .transpose();
-
-    let transform = match transform {
-        Ok(transform) => transform,
-        Err(e) => {
-            context.errs.push(e);
-            return;
-        }
-    };
-
-    context
-        .files
+    ctx.files
         .entry(store_url)
         .or_insert_with(Vec::new)
         .push(PartitionFileContext {
@@ -325,23 +320,49 @@ fn visit_scan_file(
         });
 }
 
-async fn get_parquet_access_plan(
-    parquet_file_reader_factory: &Arc<dyn ParquetFileReaderFactory>,
-    partitioned_file: &PartitionedFile,
+// convert a delta expression to a datafusion physical expression
+// we return a vector of expressions implicitly representing structs,
+// as there is no top-level Struct expression type in datafusion
+fn get_physical_transform(
+    ctx: &mut ScanContext<'_>,
+    transform: Option<Arc<delta_kernel::Expression>>,
+) -> Option<Option<Vec<Arc<dyn PhysicalExpr>>>> {
+    let Ok(transform) = transform.map(|t| to_datafusion_expr(&t)).transpose() else {
+        ctx.errs.push(DataFusionError::Execution(
+            "Error converting transform to Delta expression".to_string(),
+        ));
+        return None;
+    };
+    let to_physical = |expr: Expr| {
+        ctx.session
+            .create_physical_expr(expr, &ctx.physical_schema_df)
+    };
+    let transform = transform
+        .map(|exprs| exprs.into_iter().map(to_physical).collect())
+        .transpose();
+    let transform = match transform {
+        Ok(transform) => transform,
+        Err(e) => {
+            ctx.errs.push(e);
+            return None;
+        }
+    };
+    Some(transform)
+}
+
+async fn pq_access_plan(
+    reader_factory: &Arc<dyn ParquetFileReaderFactory>,
+    partitioned_file: PartitionedFile,
     selection_vector: Vec<bool>,
-) -> Result<ParquetAccessPlan> {
-    let mut parquet_file_reader = parquet_file_reader_factory.create_reader(
+) -> Result<PartitionedFile> {
+    let mut parquet_file_reader = reader_factory.create_reader(
         0,
         partitioned_file.object_meta.clone().into(),
         None,
         &ExecutionPlanMetricsSet::new(),
     )?;
 
-    let parquet_metadata = parquet_file_reader
-        .get_metadata(None)
-        .await
-        .map_err(|e| DataFusionError::Execution(format!("Error getting parquet metadata: {e}")))?;
-
+    let parquet_metadata = parquet_file_reader.get_metadata(None).await?;
     let total_rows = parquet_metadata
         .row_groups()
         .iter()
@@ -364,31 +385,22 @@ async fn get_parquet_access_plan(
         row_group_row_start += row_group.num_rows() as usize;
     }
 
-    Ok(ParquetAccessPlan::new(row_groups))
+    let plan = ParquetAccessPlan::new(row_groups);
+
+    Ok(partitioned_file.with_extensions(Arc::new(plan)))
 }
 
-fn get_row_group_access(
-    selection_vector: &[bool],
-    row_group_row_start: usize,
-    row_group_num_rows: usize,
-) -> RowGroupAccess {
+fn get_row_group_access(selection_vector: &[bool], start: usize, offset: usize) -> RowGroupAccess {
     // If all rows in the row group are deleted (i.e. not selected), skip the row group
-    if selection_vector[row_group_row_start..row_group_row_start + row_group_num_rows]
-        .iter()
-        .all(|&x| !x)
-    {
+    if !selection_vector[start..start + offset].iter().any(|&x| x) {
         return RowGroupAccess::Skip;
     }
     // If all rows in the row group are present (i.e. selected), scan the full row group
-    if selection_vector[row_group_row_start..row_group_row_start + row_group_num_rows]
-        .iter()
-        .all(|&x| x)
-    {
+    if selection_vector[start..start + offset].iter().all(|&x| x) {
         return RowGroupAccess::Scan;
     }
 
-    let mask =
-        selection_vector[row_group_row_start..row_group_row_start + row_group_num_rows].to_vec();
+    let mask = selection_vector[start..start + offset].to_vec();
 
     // If some rows are deleted, get a row selection that skips the deleted rows
     let row_selection = RowSelection::from_filters(&[mask.into()]);

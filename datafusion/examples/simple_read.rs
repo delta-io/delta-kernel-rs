@@ -10,7 +10,7 @@ use delta_kernel_datafusion::DeltaTableProvider;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = "file:////Users/robert.pack/code/delta-kernel-rs/acceptance/tests/dat/out/reader_tests/generated/all_primitive_types/delta";
+    let path = "file:///Users/robert.pack/code/delta-kernel-rs/acceptance/tests/dat/out/reader_tests/generated/column_mapping/delta";
 
     // build a table and get the latest snapshot from it
     let table = Table::try_from_uri(&path)?;

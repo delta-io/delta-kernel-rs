@@ -26,7 +26,7 @@ pub struct DeltaScanExec {
     /// Execution plan yielding the raw data read from data files.
     input: Arc<dyn ExecutionPlan>,
     /// Transforms to be applied to data eminating from individual files
-    transforms: Arc<HashMap<String, PhysicalExprRef>>,
+    transforms: Arc<HashMap<String, Vec<PhysicalExprRef>>>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
 }
@@ -48,7 +48,7 @@ impl DeltaScanExec {
     pub(crate) fn new(
         logical_schema: SchemaRef,
         input: Arc<dyn ExecutionPlan>,
-        transforms: Arc<HashMap<String, PhysicalExprRef>>,
+        transforms: Arc<HashMap<String, Vec<PhysicalExprRef>>>,
     ) -> Self {
         Self {
             logical_schema,
@@ -167,7 +167,7 @@ struct DeltaScanStream {
     input: SendableRecordBatchStream,
     baseline_metrics: BaselineMetrics,
     /// Transforms to be applied to data eminating from individual files
-    transforms: Arc<HashMap<String, PhysicalExprRef>>,
+    transforms: Arc<HashMap<String, Vec<PhysicalExprRef>>>,
 }
 
 impl DeltaScanStream {
@@ -194,23 +194,26 @@ impl DeltaScanStream {
         batch.remove_column(file_id_idx);
 
         let Some(transform) = self.transforms.get(&file_id) else {
+            println!("no transform for file: {}", file_id);
+            println!("transforms: {:?}", self.transforms);
+            let batch = RecordBatch::try_new(self.schema.clone(), batch.columns().to_vec())?;
             return Ok(batch);
         };
 
-        let ColumnarValue::Array(logical) = transform.evaluate(&batch)? else {
-            return Err(DataFusionError::Internal(
-                "Expected transformation result to be an array".to_string(),
-            ));
-        };
+        let arrays = transform
+            .iter()
+            .map(|t| {
+                t.evaluate(&batch).and_then(|value| match value {
+                    ColumnarValue::Array(array) => Ok(array),
+                    ColumnarValue::Scalar(scalar) => {
+                        // Convert scalar to array by repeating the value for each row
+                        scalar.to_array_of_size(batch.num_rows())
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        Ok(logical
-            .as_struct_opt()
-            .ok_or_else(|| {
-                DataFusionError::Internal(
-                    "Expected transformation result to be a struct".to_string(),
-                )
-            })?
-            .into())
+        Ok(RecordBatch::try_new(self.schema.clone(), arrays)?)
     }
 }
 
