@@ -522,19 +522,17 @@ pub(crate) fn generate_mask(
 /// NOT in ascending order (so we have to reorder things), or if we need to do any transformation on
 /// the data read from parquet. The check is recursive over `Nested` transforms.
 fn ordering_needs_transform(requested_ordering: &[ReorderIndex]) -> bool {
-    requested_ordering
-        .iter()
-        .enumerate()
-        .any(|(i, ReorderIndex { index, transform })| {
-            use ReorderIndexTransform::*;
-            match (index, transform) {
-                (index, _) if *index != i => (),
-                (_, Cast(_) | Missing(_) | RowIndex(_)) => (),
-                (_, Nested(ref children)) if ordering_needs_transform(children) => (),
-                (_, Identity | Nested(_)) => return false, // fully ordered and trivial so far
-            }
-            true // out of order or non-trivial transform detected
-        })
+    let requested_ordering = &mut requested_ordering.iter().enumerate();
+    requested_ordering.any(|(i, ReorderIndex { index, transform })| {
+        use ReorderIndexTransform::*;
+        match (index, transform) {
+            (index, _) if *index != i => (),
+            (_, Cast(_) | Missing(_) | RowIndex(_)) => (),
+            (_, Nested(ref children)) if ordering_needs_transform(children) => (),
+            (_, Identity | Nested(_)) => return false, // fully ordered and trivial so far
+        }
+        true // out of order or non-trivial transform detected
+    })
 }
 
 // we use this as a placeholder for an array and its associated field. We can fill in a Vec of None
@@ -1018,9 +1016,11 @@ mod tests {
 
     #[test]
     fn simple_row_index_field() {
+        let row_index_field = InternalMetadataColumn::RowIndex.as_struct_field("my_row_index");
+        let arrow_row_index_field = ArrowField::try_from(&row_index_field).unwrap();
         let requested_schema = Arc::new(StructType::new([
             StructField::not_null("i", DataType::INTEGER),
-            StructField::nullable("s", DataType::STRING),
+            row_index_field,
             StructField::nullable("i2", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
@@ -1033,7 +1033,7 @@ mod tests {
         let expect_reorder = vec![
             ReorderIndex::identity(0),
             ReorderIndex::identity(2),
-            ReorderIndex::missing(1, Arc::new(ArrowField::new("s", ArrowDataType::Utf8, true))),
+            ReorderIndex::row_index(1, Arc::new(arrow_row_index_field)),
         ];
         assert_eq!(mask_indices, expect_mask);
         assert_eq!(reorder_indices, expect_reorder);

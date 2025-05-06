@@ -109,7 +109,7 @@ pub(crate) enum InternalMetadataColumn {
 }
 
 impl InternalMetadataColumn {
-    #[cfg(test)] // TODO: Actually use this in prod code
+    #[cfg(test)]
     pub(crate) fn as_struct_field(&self, name: impl Into<String>) -> StructField {
         let (data_type, nullable) = match self {
             Self::RowIndex => (DataType::LONG, false),
