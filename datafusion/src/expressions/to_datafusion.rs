@@ -10,13 +10,13 @@ use delta_kernel::schema::{DataType, DecimalType, PrimitiveType};
 
 use crate::error::to_df_err;
 
-pub(crate) fn to_df_expr(expr: &Expression) -> DFResult<Expr> {
+pub(crate) fn to_datafusion_expr(expr: &Expression) -> DFResult<Expr> {
     match expr {
         Expression::Column(name) => Ok(col(name.to_string())),
         Expression::Literal(scalar) => scalar_to_df_scalar(scalar),
         Expression::Binary(BinaryExpression { left, op, right }) => {
-            let left_expr = to_df_expr(left)?;
-            let right_expr = to_df_expr(right)?;
+            let left_expr = to_datafusion_expr(left)?;
+            let right_expr = to_datafusion_expr(right)?;
             Ok(match op {
                 BinaryOperator::Equal => left_expr.eq(right_expr),
                 BinaryOperator::NotEqual => left_expr.not_eq(right_expr),
@@ -40,14 +40,14 @@ pub(crate) fn to_df_expr(expr: &Expression) -> DFResult<Expr> {
             })
         }
         Expression::Unary(UnaryExpression { op, expr }) => {
-            let inner_expr = to_df_expr(expr)?;
+            let inner_expr = to_datafusion_expr(expr)?;
             Ok(match op {
                 UnaryOperator::IsNull => inner_expr.is_null(),
                 UnaryOperator::Not => !inner_expr,
             })
         }
         Expression::Junction(JunctionExpression { op, exprs }) => {
-            let df_exprs: DFResult<Vec<_>> = exprs.iter().map(to_df_expr).collect();
+            let df_exprs: DFResult<Vec<_>> = exprs.iter().map(to_datafusion_expr).collect();
             let df_exprs = df_exprs?;
 
             match op {
@@ -62,7 +62,7 @@ pub(crate) fn to_df_expr(expr: &Expression) -> DFResult<Expr> {
             }
         }
         Expression::Struct(fields) => {
-            let df_exprs: DFResult<Vec<_>> = fields.iter().map(to_df_expr).collect();
+            let df_exprs: DFResult<Vec<_>> = fields.iter().map(to_datafusion_expr).collect();
             let df_exprs = df_exprs?;
             Err(DataFusionError::NotImplemented(format!(
                 "Struct expressions not supported: {:?}",

@@ -31,7 +31,7 @@ use url::Url;
 
 use crate::error::to_df_err;
 use crate::exec::{DeltaScanExec, FILE_ID_COLUMN};
-use crate::expressions::{to_delta_predicate, to_df_expr};
+use crate::expressions::{to_datafusion_expr, to_delta_predicate};
 
 pub struct DeltaTableProvider {
     snapshot: Arc<Snapshot>,
@@ -162,15 +162,13 @@ impl TableProvider for DeltaTableProvider {
             plans.push(plan);
         }
 
-        let read_schema: ArrowSchemaRef = Arc::new(scan_state.logical_schema.as_ref().try_into()?);
-
         let plan = match plans.len() {
             1 => plans.remove(0),
             _ => Arc::new(UnionExec::new(plans)),
         };
 
         Ok(Arc::new(DeltaScanExec::new(
-            read_schema,
+            Arc::new(scan_state.logical_schema.as_ref().try_into()?),
             plan,
             Arc::new(transforms),
         )))
@@ -201,7 +199,7 @@ struct ScanContext<'a> {
     /// Table root URL
     table_root: Url,
     /// Datafusion schema for data as read from the data file.
-    read_schema_df: DFSchema,
+    physical_schema_df: DFSchema,
     /// Files to be scanned.
     files: HashMap<ObjectStoreUrl, Vec<PartitionFileContext>>,
     /// Errors encountered during the scan.
@@ -213,13 +211,13 @@ impl<'a> ScanContext<'a> {
         session: &'a dyn Session,
         engine: Arc<dyn Engine>,
         table_root: Url,
-        read_schema_df: DFSchema,
+        physical_schema_df: DFSchema,
     ) -> Self {
         Self {
             session,
             engine,
             table_root,
-            read_schema_df,
+            physical_schema_df,
             files: HashMap::new(),
             errs: Vec::new(),
         }
@@ -292,7 +290,7 @@ fn visit_scan_file(
         return;
     };
 
-    let Ok(transform) = transform.map(|t| to_df_expr(&t)).transpose() else {
+    let Ok(transform) = transform.map(|t| to_datafusion_expr(&t)).transpose() else {
         context.errs.push(DataFusionError::Execution(
             "Error converting transform to Delta expression".to_string(),
         ));
@@ -303,7 +301,7 @@ fn visit_scan_file(
         .map(|t| {
             context
                 .session
-                .create_physical_expr(t, &context.read_schema_df)
+                .create_physical_expr(t, &context.physical_schema_df)
         })
         .transpose();
 

@@ -22,7 +22,7 @@ pub(crate) const FILE_ID_COLUMN: &str = "file_id";
 #[derive(Clone, Debug)]
 pub struct DeltaScanExec {
     /// Output schema for processed data.
-    schema: SchemaRef,
+    logical_schema: SchemaRef,
     /// Execution plan yielding the raw data read from data files.
     input: Arc<dyn ExecutionPlan>,
     /// Transforms to be applied to data eminating from individual files
@@ -46,12 +46,12 @@ impl DisplayAs for DeltaScanExec {
 
 impl DeltaScanExec {
     pub(crate) fn new(
-        schema: SchemaRef,
+        logical_schema: SchemaRef,
         input: Arc<dyn ExecutionPlan>,
         transforms: Arc<HashMap<String, PhysicalExprRef>>,
     ) -> Self {
         Self {
-            schema,
+            logical_schema,
             input,
             transforms,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -124,7 +124,7 @@ impl ExecutionPlan for DeltaScanExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         Ok(Box::pin(DeltaScanStream {
-            schema: Arc::clone(&self.schema),
+            schema: Arc::clone(&self.logical_schema),
             input: self.input.execute(partition, context)?,
             baseline_metrics: BaselineMetrics::new(&self.metrics, partition),
             transforms: Arc::clone(&self.transforms),
