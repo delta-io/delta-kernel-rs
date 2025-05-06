@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use datafusion_common::{DataFusionError, Result as DFResult, ScalarValue};
-use datafusion_expr::{BinaryExpr, Expr, Operator};
+use datafusion_expr::{utils::conjunction, BinaryExpr, Expr, Operator};
 use delta_kernel::expressions::{
     BinaryExpression, BinaryOperator, DecimalData, Expression, JunctionExpression,
     JunctionOperator, Scalar, UnaryExpression, UnaryOperator,
@@ -11,19 +11,10 @@ use delta_kernel::schema::{DataType, DecimalType, PrimitiveType};
 use crate::error::to_df_err;
 
 pub(crate) fn to_delta_predicate(filters: &[Expr]) -> DFResult<Arc<Expression>> {
-    if filters.is_empty() {
+    let Some(expr) = conjunction(filters.iter().cloned()) else {
         return Ok(Arc::new(Expression::Literal(Scalar::Boolean(true))));
-    }
-    if filters.len() == 1 {
-        return to_delta_expression(&filters[0]).map(Arc::new);
-    }
-    Ok(Arc::new(Expression::Junction(JunctionExpression {
-        op: JunctionOperator::And,
-        exprs: filters
-            .iter()
-            .map(|filter| to_delta_expression(filter))
-            .collect::<DFResult<Vec<_>>>()?,
-    })))
+    };
+    to_delta_expression(&expr).map(Arc::new)
 }
 
 /// Convert a DataFusion expression to a Delta expression.
