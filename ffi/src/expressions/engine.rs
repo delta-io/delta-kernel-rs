@@ -11,7 +11,7 @@ use delta_kernel::expressions::{
 };
 use delta_kernel::DeltaResult;
 
-pub enum ExpressionOrPredicate {
+pub(crate) enum ExpressionOrPredicate {
     Expression(Expression),
     Predicate(Predicate),
 }

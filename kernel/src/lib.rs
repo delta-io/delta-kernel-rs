@@ -372,7 +372,7 @@ pub trait EvaluationHandler: AsAny {
     ///
     /// # Parameters
     ///
-    /// - `schema`: Schema of the input data.
+    /// - `input_schema`: Schema of the input data.
     /// - `expression`: Expression to evaluate.
     /// - `output_type`: Expected result data type.
     ///
@@ -380,7 +380,7 @@ pub trait EvaluationHandler: AsAny {
     /// [`DataType`]: crate::schema::DataType
     fn new_expression_evaluator(
         &self,
-        schema: SchemaRef,
+        input_schema: SchemaRef,
         expression: Expression,
         output_type: DataType,
     ) -> Arc<dyn ExpressionEvaluator>;
@@ -392,13 +392,13 @@ pub trait EvaluationHandler: AsAny {
     ///
     /// # Parameters
     ///
-    /// - `schema`: Schema of the input data.
+    /// - `input_schema`: Schema of the input data.
     /// - `predicate`: Predicate to evaluate.
     ///
     /// [`Schema`]: crate::schema::StructType
     fn new_predicate_evaluator(
         &self,
-        schema: SchemaRef,
+        input_schema: SchemaRef,
         predicate: Predicate,
     ) -> Arc<dyn PredicateEvaluator>;
 

@@ -116,7 +116,7 @@ pub(crate) fn evaluate_expression(
             Ok(Arc::new(result))
         }
         (Predicate(_), Some(data_type)) => Err(Error::generic(format!(
-            "Unexpected data type: {data_type:?}"
+            "Predicate evaluation produces boolean output, but caller expects {data_type:?}"
         ))),
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
