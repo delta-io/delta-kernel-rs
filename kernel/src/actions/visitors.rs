@@ -527,8 +527,8 @@ impl DomainMetadataVisitor {
         })
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.domain_metadatas.is_empty()
+    pub(crate) fn filter_found(&self) -> bool {
+        self.domain_filter.is_some() && !self.domain_metadatas.is_empty()
     }
 
     pub(crate) fn into_domain_metadatas(mut self) -> DomainMetadataMap {
@@ -551,11 +551,8 @@ impl RowVisitor for DomainMetadataVisitor {
             let domain: Option<String> = getters[0].get_opt(i, "domainMetadata.domain")?;
             if let Some(domain) = domain {
                 // if caller requested a specific domain then only visit matches
-                if self
-                    .domain_filter
-                    .as_ref()
-                    .map_or(true, |requested| requested == &domain)
-                {
+                let filter = self.domain_filter.as_ref();
+                if filter.map_or(true, |requested| requested == &domain) {
                     let domain_metadata =
                         DomainMetadataVisitor::visit_domain_metadata(i, domain.clone(), getters)?;
                     self.domain_metadatas

@@ -409,6 +409,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::path::Path;
     use crate::object_store::ObjectStore;
+    use itertools::Itertools;
     use serde_json::json;
 
     use crate::arrow::array::StringArray;
@@ -800,7 +801,6 @@ mod tests {
         ]
         .iter()
         .map(ToString::to_string)
-        .collect::<Vec<String>>()
         .join("\n");
         add_commit(store.clone().as_ref(), 0, commit).await.unwrap();
 
@@ -833,7 +833,6 @@ mod tests {
         ]
         .iter()
         .map(ToString::to_string)
-        .collect::<Vec<String>>()
         .join("\n");
         add_commit(store.as_ref(), 1, commit).await.unwrap();
 

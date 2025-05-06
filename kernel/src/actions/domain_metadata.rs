@@ -52,7 +52,7 @@ fn scan_domain_metadatas(
         // if a specific domain is requested and it was found, then return. note that we don't need
         // to check if it was the one that was found since the visitor will only keep the requested
         // domain
-        if domain.is_some() && !visitor.is_empty() {
+        if visitor.filter_found() {
             break;
         }
     }
