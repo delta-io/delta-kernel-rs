@@ -20,9 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         HashMap::<String, String>::new(),
         Arc::new(TokioBackgroundExecutor::new()),
     )?);
-
     let snapshot = table.snapshot(engine.as_ref(), None)?;
-
     let provider = DeltaTableProvider::try_new(snapshot.into(), engine.clone())?;
 
     let ctx = SessionContext::new();

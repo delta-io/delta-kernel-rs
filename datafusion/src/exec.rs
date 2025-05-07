@@ -203,10 +203,7 @@ impl DeltaScanStream {
             .map(|t| {
                 t.evaluate(&batch).and_then(|value| match value {
                     ColumnarValue::Array(array) => Ok(array),
-                    ColumnarValue::Scalar(scalar) => {
-                        // Convert scalar to array by repeating the value for each row
-                        scalar.to_array_of_size(batch.num_rows())
-                    }
+                    ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(batch.num_rows()),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
