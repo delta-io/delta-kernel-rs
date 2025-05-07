@@ -527,7 +527,7 @@ mod tests {
         ))
         .unwrap();
         let url = Url::from_file_path(path).unwrap();
-        let location = Path::from(url.path());
+        let location = Path::from_url_path(url.path()).unwrap();
         let meta = store.head(&location).await.unwrap();
 
         // TODO: remove after arrow 54 support is dropped

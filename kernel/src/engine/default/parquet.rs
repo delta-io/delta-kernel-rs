@@ -145,10 +145,10 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let path = path.join(&name)?;
 
         self.store
-            .put(&Path::from(path.path()), buffer.into())
+            .put(&Path::from_url_path(path.path())?, buffer.into())
             .await?;
 
-        let metadata = self.store.head(&Path::from(path.path())).await?;
+        let metadata = self.store.head(&Path::from_url_path(path.path())?).await?;
         let modification_time = metadata.last_modified.timestamp_millis();
         // TODO: remove after dropping arrow 54 support
         #[allow(clippy::useless_conversion)]
@@ -408,7 +408,7 @@ mod tests {
             "./tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
         )).unwrap();
         let url = url::Url::from_file_path(path).unwrap();
-        let location = Path::from(url.path());
+        let location = Path::from_url_path(url.path()).unwrap();
         let meta = store.head(&location).await.unwrap();
 
         let reader = ParquetObjectReader::new(store.clone(), location);
@@ -518,7 +518,10 @@ mod tests {
         let expected_location = Url::parse("memory:///data/").unwrap();
 
         // head the object to get metadata
-        let meta = store.head(&Path::from(location.path())).await.unwrap();
+        let meta = store
+            .head(&Path::from_url_path(location.path()).unwrap())
+            .await
+            .unwrap();
         let expected_size = meta.size;
 
         // check that last_modified is within 10s of now
@@ -535,7 +538,7 @@ mod tests {
         assert!(now - last_modified < 10_000);
 
         // check we can read back
-        let path = Path::from(location.path());
+        let path = Path::from_url_path(location.path()).unwrap();
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
