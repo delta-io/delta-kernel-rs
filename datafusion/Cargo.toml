@@ -28,6 +28,8 @@ datafusion-physical-plan = { version = "47" }
 async-trait = "0.1"
 chrono = "0.4.40"
 futures = "0.3"
+itertools = "0.14"
+tokio = { version = "1", features = ["full"] }
 url = "2.4"
 
 [dev-dependencies]

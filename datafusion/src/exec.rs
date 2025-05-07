@@ -194,8 +194,6 @@ impl DeltaScanStream {
         batch.remove_column(file_id_idx);
 
         let Some(transform) = self.transforms.get(&file_id) else {
-            println!("no transform for file: {}", file_id);
-            println!("transforms: {:?}", self.transforms);
             let batch = RecordBatch::try_new(self.schema.clone(), batch.columns().to_vec())?;
             return Ok(batch);
         };
