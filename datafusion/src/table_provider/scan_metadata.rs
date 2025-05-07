@@ -1,13 +1,11 @@
 use std::sync::Arc;
 
-use chrono::{TimeZone, Utc};
 use datafusion_catalog::Session;
-use datafusion_common::error::{DataFusionError, Result};
-use datafusion_common::{HashMap, ScalarValue};
-use datafusion_datasource::PartitionedFile;
-use datafusion_execution::object_store::ObjectStoreUrl;
+use datafusion_common::{
+    error::{DataFusionError, DataFusionErrorBuilder, Result},
+    exec_datafusion_err as exec_err,
+};
 use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use delta_kernel::object_store::{path::Path as ObjectStorePath, ObjectMeta};
 use delta_kernel::scan::state::{DvInfo, Stats};
 use delta_kernel::schema::{Schema as DeltaSchema, SchemaRef as DeltaSchemaRef};
 use delta_kernel::snapshot::Snapshot;
@@ -15,6 +13,36 @@ use delta_kernel::{Engine, Expression, ExpressionRef};
 use url::Url;
 
 use crate::error::to_df_err;
+
+pub struct ScanFileContext {
+    pub selection_vector: Option<Vec<bool>>,
+    pub transform: Option<ExpressionRef>,
+    pub file_url: Url,
+    pub stats: Option<Stats>,
+    pub size: u64,
+}
+
+/// The metadata required to plan a table scan.
+pub struct TableScan {
+    /// Files included in the scan.
+    ///
+    /// These are filtered on a best effort basis to match the predicate passed to the scan.
+    /// Files are grouped by the object store they are stored in.
+    pub files: Vec<ScanFileContext>,
+    /// The physical schema of the table.
+    ///
+    /// Data read from disk should be presented in this schema.
+    /// While in most cases this corresponds to the data present in the file,
+    /// the reader may be required to cast data to include columns not present
+    /// in the file (i.e. the table may have undergone schema evolution),
+    /// or type widening may have been applied.
+    pub physical_schema: ArrowSchemaRef,
+    /// The logical schema of the table.
+    ///
+    /// This is the schema as it is presented to the end user.
+    /// This includes any geneated or implicit columns, mapped names, etc.
+    pub logical_schema: ArrowSchemaRef,
+}
 
 #[async_trait::async_trait]
 pub trait TableSnapshot: std::fmt::Debug + Send + Sync {
@@ -24,6 +52,7 @@ pub trait TableSnapshot: std::fmt::Debug + Send + Sync {
     /// This includes any geneated or implicit columns, mapped names, etc.
     fn table_schema(&self) -> &ArrowSchemaRef;
 
+    /// Produce the metadata required to plan a table scan.
     async fn scan_metadata(
         &self,
         state: &dyn Session,
@@ -66,12 +95,11 @@ impl TableSnapshot for DeltaTableSnapshot {
 
     async fn scan_metadata(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         predicate: Arc<Expression>,
     ) -> Result<TableScan> {
         scan_metadata(
-            state,
             &self.engine,
             &self.snapshot,
             projection,
@@ -82,14 +110,7 @@ impl TableSnapshot for DeltaTableSnapshot {
     }
 }
 
-pub struct TableScan {
-    pub(crate) files: HashMap<ObjectStoreUrl, Vec<ScanFileContext>>,
-    pub(crate) physical_schema: ArrowSchemaRef,
-    pub(crate) logical_schema: ArrowSchemaRef,
-}
-
 async fn scan_metadata(
-    _state: &dyn Session,
     engine: &Arc<dyn Engine>,
     snapshot: &Arc<Snapshot>,
     projection: Option<&Vec<usize>>,
@@ -113,9 +134,8 @@ async fn scan_metadata(
 
     let engine = engine.clone();
 
-    let files = tokio::task::spawn_blocking(move || {
+    let scan_inner = move || {
         let mut context = ScanContext::new(engine.clone(), table_root);
-
         let meta = scan.scan_metadata(engine.as_ref()).map_err(to_df_err)?;
         for scan_meta in meta {
             let scan_meta = scan_meta.map_err(to_df_err)?;
@@ -123,15 +143,11 @@ async fn scan_metadata(
                 .visit_scan_files(context, visit_scan_file)
                 .map_err(to_df_err)?;
         }
-
-        if let Some(err) = context.errs.into_iter().next() {
-            return Err(err);
-        }
-
-        Ok(context.files)
-    })
-    .await
-    .map_err(|e| DataFusionError::External(Box::new(e)))??;
+        context.errs.error_or(context.files)
+    };
+    let files = tokio::task::spawn_blocking(scan_inner)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))??;
 
     Ok(TableScan {
         files,
@@ -146,12 +162,9 @@ struct ScanContext {
     /// Table root URL
     table_root: Url,
     /// Files to be scanned.
-    ///
-    /// The key is a store url which identifies the specific object store
-    /// the file belongs to.
-    files: HashMap<ObjectStoreUrl, Vec<ScanFileContext>>,
+    files: Vec<ScanFileContext>,
     /// Errors encountered during the scan.
-    errs: Vec<DataFusionError>,
+    errs: DataFusionErrorBuilder,
 }
 
 impl ScanContext {
@@ -159,98 +172,59 @@ impl ScanContext {
         Self {
             engine,
             table_root,
-            files: HashMap::new(),
-            errs: Vec::new(),
+            files: Vec::new(),
+            errs: DataFusionErrorBuilder::new(),
         }
     }
 
-    fn parse_path(&self, path: &str) -> Result<(ObjectStoreUrl, ObjectStorePath)> {
+    fn parse_path(&self, path: &str) -> Result<Url> {
         Ok(match Url::parse(path) {
-            Ok(mut url) => {
-                // we have a fully qualified url
-                let path = ObjectStorePath::from_url_path(url.path())?;
-                url.set_path("/");
-                let url = ObjectStoreUrl::parse(&url)?;
-                (url, path)
-            }
+            Ok(url) => url,
             Err(_) => {
-                // we have a relative path
-                let base_path = ObjectStorePath::from_url_path(self.table_root.path())?;
-                let path = base_path
-                    .parts()
-                    .chain(ObjectStorePath::from_url_path(path)?.parts())
-                    .collect();
-                let mut obj_url = self.table_root.clone();
-                obj_url.set_path("/");
-                (ObjectStoreUrl::parse(&obj_url)?, path)
+                let file_url = self
+                    .table_root
+                    .join(path)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                file_url
             }
         })
     }
-}
-
-pub(crate) struct ScanFileContext {
-    pub(crate) partitioned_file: PartitionedFile,
-    pub(crate) selection_vector: Option<Vec<bool>>,
-    pub(crate) transform: Option<ExpressionRef>,
-    pub(crate) file_id: String,
 }
 
 fn visit_scan_file(
     ctx: &mut ScanContext,
     path: &str,
     size: i64,
-    _stats: Option<Stats>,
+    stats: Option<Stats>,
     dv_info: DvInfo,
     transform: Option<ExpressionRef>,
     // NB: partition values are passed for backwards compatibility
     // all required transformations are now part of the transform field
     _: std::collections::HashMap<String, String>,
 ) {
-    let (store_url, location) = match ctx.parse_path(path) {
+    let file_url = match ctx.parse_path(path) {
         Ok(v) => v,
         Err(e) => {
-            ctx.errs.push(e);
+            ctx.errs.add_error(e);
             return;
         }
     };
 
-    let object_meta = ObjectMeta {
-        location,
-        last_modified: Utc.timestamp_nanos(0),
-        size: size as u64,
-        e_tag: None,
-        version: None,
-    };
-    let mut partitioned_file = PartitionedFile::from(object_meta);
-
-    // Asssign file path as partition value to track the data source in downstream operations
-    partitioned_file.partition_values = vec![ScalarValue::Utf8(Some(path.to_string()))];
-
     // Get the selection vector (i.e. inverse deletion vector)
     let Ok(selection_vector) = dv_info.get_selection_vector(ctx.engine.as_ref(), &ctx.table_root)
     else {
-        ctx.errs.push(DataFusionError::Execution(
-            "Error getting selection vector".to_string(),
-        ));
+        ctx.errs
+            .add_error(exec_err!("Failed to get selection vector"));
         return;
     };
 
-    // Convert the transform to datafusion physical expressions
-    // These are later applied to the record batches we read from the file
-    // let transform = match get_physical_transform(ctx, transform) {
-    //     Some(value) => value,
-    //     None => return,
-    // };
-
-    ctx.files
-        .entry(store_url)
-        .or_insert_with(Vec::new)
-        .push(ScanFileContext {
-            partitioned_file,
-            selection_vector,
-            transform,
-            file_id: path.to_string(),
-        });
+    ctx.files.push(ScanFileContext {
+        selection_vector,
+        transform,
+        stats,
+        file_url,
+        size: size as u64,
+    });
 }
 
 fn project_delta_schema(

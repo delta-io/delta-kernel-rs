@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{TimeZone, Utc};
 use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::datasource::physical_plan::parquet::{
     DefaultParquetFileReaderFactory, ParquetAccessPlan, RowGroupAccess,
@@ -13,13 +14,15 @@ use datafusion::parquet::file::metadata::RowGroupMetaData;
 use datafusion::physical_plan::{union::UnionExec, ExecutionPlan};
 use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::error::Result;
-use datafusion_common::{DFSchema, DataFusionError};
+use datafusion_common::{DFSchema, DataFusionError, ScalarValue};
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource::PartitionedFile;
+use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::PhysicalExpr;
 use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use delta_kernel::object_store::{path::Path as ObjectStorePath, ObjectMeta};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{Engine, ExpressionRef};
 use futures::stream::{StreamExt, TryStreamExt};
@@ -80,64 +83,106 @@ impl TableProvider for DeltaTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let predicate = to_delta_predicate(filters)?;
         let table_scan = self
             .snapshot
-            .scan_metadata(state, projection, predicate)
+            .scan_metadata(state, projection, to_delta_predicate(filters)?)
             .await?;
 
         // Convert the delta expressions from the scan into a map of file id to datafusion physical expression
         // these will be applied to convert the raw data read from disk into the logical table schema
-        let fs = table_scan.physical_schema.clone().try_into()?;
-        let map_file = |f: &ScanFileContext| {
-            f.transform
-                .as_ref()
-                .map(|t| Ok((f.file_id.clone(), to_physical(state, &fs, t)?)))
+        let physical_schema_df = table_scan.physical_schema.clone().try_into()?;
+        let file_transform = |file_ctx: &ScanFileContext| {
+            file_ctx.transform.as_ref().map(|t| {
+                to_physical(state, &physical_schema_df, t)
+                    .map(|expr| (file_ctx.file_url.to_string(), expr))
+            })
         };
-        let transforms = table_scan
+        let transform_by_file = table_scan
             .files
-            .values()
-            .flat_map(|files| files.iter().filter_map(map_file))
+            .iter()
+            .filter_map(file_transform)
             .try_collect::<_, _, DataFusionError>()?;
 
-        // Create DataSourceExec plans to read all files included in the scan.
-        // A dedicated DataSourceExec plan needs to be created for each store (e.g. s3 bucket).
-        // When data is distributed across multiple stores, a UnionExec will be used to combine the results.
-        let metrics = ExecutionPlanMetricsSet::new();
-        let source = Arc::new(ParquetSource::default());
-        let mut plans = Vec::new();
-        let file_id_field = Field::new(FILE_ID_COLUMN, DataType::Utf8, true);
-        for (store_url, files) in table_scan.files.into_iter() {
-            let store = state.runtime_env().object_store(&store_url)?;
-            let reader_factory: Arc<dyn ParquetFileReaderFactory> =
-                Arc::new(DefaultParquetFileReaderFactory::new(store));
-            let file_group = compute_parquet_access_plans(&reader_factory, files, &metrics).await?;
-
-            // TODO: convert passed predicate to an expression in terms of physical columns
-            // and add it to the FileScanConfig
-            let config = FileScanConfigBuilder::new(
-                store_url,
-                table_scan.physical_schema.clone(),
-                source.clone(),
-            )
-            .with_file_group(file_group.into_iter().collect())
-            .with_table_partition_cols(vec![file_id_field.clone()])
-            .with_limit(limit)
-            .build();
-            let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
-            plans.push(plan);
-        }
-        let plan = match plans.len() {
-            1 => plans.remove(0),
-            _ => Arc::new(UnionExec::new(plans)),
+        // Convert the files into datafusions `PartitionedFile`s grouped by the object store they are stored in
+        // this is used to create a DataSourceExec plan for each store
+        // To correlate the data with the original file, we add the file url as a partition value
+        // This is required to apply the correct transform to the data in downstream processing.
+        let to_partitioned_file = |f: ScanFileContext| {
+            let object_meta = ObjectMeta {
+                location: ObjectStorePath::from_url_path(f.file_url.path())?,
+                last_modified: Utc.timestamp_nanos(0),
+                e_tag: None,
+                version: None,
+                size: f.size,
+            };
+            let mut partitioned_file = PartitionedFile::from(object_meta);
+            partitioned_file.partition_values =
+                vec![ScalarValue::Utf8(Some(f.file_url.to_string()))];
+            Ok::<_, DataFusionError>((
+                get_store_url(&f.file_url)?,
+                (partitioned_file, f.selection_vector),
+            ))
         };
+        let files_by_store = table_scan
+            .files
+            .into_iter()
+            .map(to_partitioned_file)
+            .flatten()
+            .into_group_map();
+        let plan = get_read_plan(files_by_store, &table_scan.physical_schema, state, limit).await?;
 
         Ok(Arc::new(DeltaScanExec::new(
             table_scan.logical_schema,
             plan,
-            Arc::new(transforms),
+            Arc::new(transform_by_file),
         )))
     }
+}
+
+async fn get_read_plan(
+    files_by_store: impl IntoIterator<
+        Item = (ObjectStoreUrl, Vec<(PartitionedFile, Option<Vec<bool>>)>),
+    >,
+    physical_schema: &ArrowSchemaRef,
+    state: &dyn Session,
+    limit: Option<usize>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    // Create DataSourceExec plans to read all files included in the scan.
+    // A dedicated DataSourceExec plan needs to be created for each store (e.g. s3 bucket).
+    // When data is distributed across multiple stores, a UnionExec will be used to combine the results.
+    let metrics = ExecutionPlanMetricsSet::new();
+    let source = Arc::new(ParquetSource::default());
+    let mut plans = Vec::new();
+    let file_id_field = Field::new(FILE_ID_COLUMN, DataType::Utf8, true);
+    for (store_url, files) in files_by_store.into_iter() {
+        let store = state.runtime_env().object_store(&store_url)?;
+        let reader_factory: Arc<dyn ParquetFileReaderFactory> =
+            Arc::new(DefaultParquetFileReaderFactory::new(store));
+
+        let file_group = compute_parquet_access_plans(&reader_factory, files, &metrics).await?;
+
+        // TODO: convert passed predicate to an expression in terms of physical columns
+        // and add it to the FileScanConfig
+        let config = FileScanConfigBuilder::new(store_url, physical_schema.clone(), source.clone())
+            .with_file_group(file_group.into_iter().collect())
+            .with_table_partition_cols(vec![file_id_field.clone()])
+            .with_limit(limit)
+            .build();
+        let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
+        plans.push(plan);
+    }
+    Ok(match plans.len() {
+        1 => plans.remove(0),
+        _ => Arc::new(UnionExec::new(plans)),
+    })
+}
+
+fn get_store_url(url: &url::Url) -> Result<ObjectStoreUrl> {
+    ObjectStoreUrl::parse(format!(
+        "{}://{}",
+        url.scheme(),
+        &url[url::Position::BeforeHost..url::Position::AfterPort],
+    ))
 }
 
 // convert a delta expression to a datafusion physical expression
@@ -156,16 +201,16 @@ fn to_physical(
 
 async fn compute_parquet_access_plans(
     reader_factory: &Arc<dyn ParquetFileReaderFactory>,
-    files: Vec<ScanFileContext>,
+    files: Vec<(PartitionedFile, Option<Vec<bool>>)>,
     metrics: &ExecutionPlanMetricsSet,
 ) -> Result<Vec<PartitionedFile>> {
     futures::stream::iter(files)
         // NOTE: using filter_map here since 'map' somehow does not accept futures.
-        .filter_map(|file| async {
-            if let Some(sv) = file.selection_vector {
-                Some(pq_access_plan(reader_factory, file.partitioned_file, sv, metrics).await)
+        .filter_map(|(partitioned_file, selection_vector)| async {
+            if let Some(sv) = selection_vector {
+                Some(pq_access_plan(reader_factory, partitioned_file, sv, metrics).await)
             } else {
-                Some(Ok(file.partitioned_file))
+                Some(Ok(partitioned_file))
             }
         })
         .try_collect::<Vec<_>>()
