@@ -19,6 +19,7 @@ use crate::object_store;
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
 
 /// All the types of errors that the kernel can run into
+#[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     /// This is an error that includes a backtrace. To have a particular type of error include such
@@ -209,6 +210,10 @@ pub enum Error {
     LiteralExpressionTransformError(
         #[from] crate::expressions::literal_expression_transform::Error,
     ),
+
+    /// Schema mismatch has occurred or invalid schema used somewhere
+    #[error("Schema error: {0}")]
+    Schema(String),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -288,6 +293,10 @@ impl Error {
 
     pub fn invalid_checkpoint(msg: impl ToString) -> Self {
         Self::InvalidCheckpoint(msg.to_string())
+    }
+
+    pub(crate) fn schema(msg: impl ToString) -> Self {
+        Self::Schema(msg.to_string())
     }
 
     // Capture a backtrace when the error is constructed.
