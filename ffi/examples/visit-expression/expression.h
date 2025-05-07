@@ -53,7 +53,8 @@ enum LitType {
   Decimal,
   Null,
   Struct,
-  Array
+  Array,
+  Map
 };
 enum ExpressionType { BinOp, Variadic, Literal, Unary, Column };
 enum VariadicType {
@@ -103,6 +104,10 @@ struct Struct {
 struct ArrayData {
   ExpressionItemList exprs;
 };
+struct MapData {
+  ExpressionItemList keys;
+  ExpressionItemList vals;
+};
 struct Literal {
   enum LitType type;
   union LiteralValue {
@@ -116,6 +121,7 @@ struct Literal {
     char* string_data;
     struct Struct struct_data;
     struct ArrayData array_data;
+    struct MapData map_data;
     struct BinaryData binary;
     struct Decimal decimal;
   } value;
@@ -275,6 +281,18 @@ void visit_expr_array_literal(void* data, uintptr_t sibling_list_id, uintptr_t c
   put_expr_item(data, sibling_list_id, literal, Literal);
 }
 
+void visit_expr_map_literal(void* data,
+                            uintptr_t sibling_list_id,
+                            uintptr_t key_list_id,
+                            uintptr_t value_list_id) {
+  struct Literal* literal = malloc(sizeof(struct Literal));
+  literal->type = Map;
+  struct MapData* map = &(literal->value.map_data);
+  map->keys = get_expr_list(data, key_list_id);
+  map->vals = get_expr_list(data, value_list_id);
+  put_expr_item(data, sibling_list_id, literal, Literal);
+}
+
 /*************************************************************
  * Unary Expressions
  ************************************************************/
@@ -318,7 +336,55 @@ uintptr_t make_field_list(void* data, uintptr_t reserve) {
   return id;
 }
 
-ExpressionItemList construct_predicate(SharedExpression* predicate) {
+ExpressionItemList construct_expression(SharedExpression* expression) {
+  ExpressionBuilder data = { 0 };
+  EngineExpressionVisitor visitor = {
+    .data = &data,
+    .make_field_list = make_field_list,
+    .visit_literal_int = visit_expr_int_literal,
+    .visit_literal_long = visit_expr_long_literal,
+    .visit_literal_short = visit_expr_short_literal,
+    .visit_literal_byte = visit_expr_byte_literal,
+    .visit_literal_float = visit_expr_float_literal,
+    .visit_literal_double = visit_expr_double_literal,
+    .visit_literal_bool = visit_expr_boolean_literal,
+    .visit_literal_timestamp = visit_expr_timestamp_literal,
+    .visit_literal_timestamp_ntz = visit_expr_timestamp_ntz_literal,
+    .visit_literal_date = visit_expr_date_literal,
+    .visit_literal_binary = visit_expr_binary_literal,
+    .visit_literal_null = visit_expr_null_literal,
+    .visit_literal_decimal = visit_expr_decimal_literal,
+    .visit_literal_string = visit_expr_string_literal,
+    .visit_literal_struct = visit_expr_struct_literal,
+    .visit_literal_array = visit_expr_array_literal,
+    .visit_literal_map = visit_expr_map_literal,
+    .visit_and = visit_expr_and,
+    .visit_or = visit_expr_or,
+    .visit_not = visit_expr_not,
+    .visit_is_null = visit_expr_is_null,
+    .visit_lt = visit_expr_lt,
+    .visit_le = visit_expr_le,
+    .visit_gt = visit_expr_gt,
+    .visit_ge = visit_expr_ge,
+    .visit_eq = visit_expr_eq,
+    .visit_ne = visit_expr_ne,
+    .visit_distinct = visit_expr_distinct,
+    .visit_in = visit_expr_in,
+    .visit_not_in = visit_expr_not_in,
+    .visit_add = visit_expr_add,
+    .visit_minus = visit_expr_minus,
+    .visit_multiply = visit_expr_multiply,
+    .visit_divide = visit_expr_divide,
+    .visit_column = visit_expr_column,
+    .visit_struct_expr = visit_expr_struct_expr,
+  };
+  uintptr_t top_level_id = visit_expression(&expression, &visitor);
+  ExpressionItemList top_level_expr = data.lists[top_level_id];
+  free(data.lists);
+  return top_level_expr;
+}
+
+ExpressionItemList construct_predicate(SharedPredicate* predicate) {
   ExpressionBuilder data = { 0 };
   EngineExpressionVisitor visitor = {
     .data = &data,
@@ -359,7 +425,7 @@ ExpressionItemList construct_predicate(SharedExpression* predicate) {
     .visit_column = visit_expr_column,
     .visit_struct_expr = visit_expr_struct_expr,
   };
-  uintptr_t top_level_id = visit_expression(&predicate, &visitor);
+  uintptr_t top_level_id = visit_predicate(&predicate, &visitor);
   ExpressionItemList top_level_expr = data.lists[top_level_id];
   free(data.lists);
   return top_level_expr;
@@ -392,6 +458,12 @@ void free_expression_item(ExpressionItem ref) {
         case Array: {
           struct ArrayData* array = &lit->value.array_data;
           free_expression_list(array->exprs);
+          break;
+        }
+        case Map: {
+          struct MapData* map = &lit->value.map_data;
+          free_expression_list(map->keys);
+          free_expression_list(map->vals);
           break;
         }
         case String: {

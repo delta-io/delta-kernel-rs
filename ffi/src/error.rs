@@ -4,6 +4,7 @@ use crate::{kernel_string_slice, ExternEngine, KernelStringSlice};
 
 #[repr(C)]
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum KernelError {
     UnknownError, // catch-all for unrecognized kernel Error types
     FFIError,     // errors encountered in the code layer that supports FFI
@@ -54,6 +55,7 @@ pub enum KernelError {
     InvalidCheckpoint,
     LiteralExpressionTransformError,
     CheckpointWriteError,
+    SchemaError,
 }
 
 impl From<Error> for KernelError {
@@ -116,6 +118,8 @@ impl From<Error> for KernelError {
             Error::LiteralExpressionTransformError(_) => {
                 KernelError::LiteralExpressionTransformError
             }
+            Error::Schema(_) => KernelError::SchemaError,
+            _ => KernelError::UnknownError,
         }
     }
 }

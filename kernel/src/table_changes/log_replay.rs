@@ -20,7 +20,7 @@ use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_sche
 use crate::table_changes::{check_cdf_table_properties, ensure_cdf_read_supported};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef, RowVisitor};
+use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
 
 use itertools::Itertools;
 
@@ -51,7 +51,7 @@ pub(crate) fn table_changes_action_iter(
     engine: Arc<dyn Engine>,
     commit_files: impl IntoIterator<Item = ParsedLogPath>,
     table_schema: SchemaRef,
-    physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+    physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
     let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
     let result = commit_files
