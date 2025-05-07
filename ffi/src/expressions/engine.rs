@@ -41,15 +41,13 @@ pub struct EnginePredicate {
 }
 
 fn wrap_expression(state: &mut KernelExpressionVisitorState, expr: impl Into<Expression>) -> usize {
-    state
-        .inflight_ids
-        .insert(ExpressionOrPredicate::Expression(expr.into()))
+    let expr = ExpressionOrPredicate::Expression(expr.into());
+    state.inflight_ids.insert(expr)
 }
 
 fn wrap_predicate(state: &mut KernelExpressionVisitorState, pred: impl Into<Predicate>) -> usize {
-    state
-        .inflight_ids
-        .insert(ExpressionOrPredicate::Predicate(pred.into()))
+    let pred = ExpressionOrPredicate::Predicate(pred.into());
+    state.inflight_ids.insert(pred)
 }
 
 pub(crate) fn unwrap_kernel_expression(
@@ -78,11 +76,11 @@ fn visit_expression_binary(
     a: usize,
     b: usize,
 ) -> usize {
-    let left = unwrap_kernel_expression(state, a);
-    let right = unwrap_kernel_expression(state, b);
-    match left.zip(right) {
-        Some((left, right)) => wrap_expression(state, Expression::binary(op, left, right)),
-        None => 0, // invalid child => invalid node
+    let a = unwrap_kernel_expression(state, a);
+    let b = unwrap_kernel_expression(state, b);
+    match (a, b) {
+        (Some(a), Some(b)) => wrap_expression(state, Expression::binary(op, a, b)),
+        _ => 0, // invalid child => invalid node
     }
 }
 
@@ -92,11 +90,11 @@ fn visit_predicate_binary(
     a: usize,
     b: usize,
 ) -> usize {
-    let left = unwrap_kernel_expression(state, a);
-    let right = unwrap_kernel_expression(state, b);
-    match left.zip(right) {
-        Some((left, right)) => wrap_predicate(state, Predicate::binary(op, left, right)),
-        None => 0, // invalid child => invalid node
+    let a = unwrap_kernel_expression(state, a);
+    let b = unwrap_kernel_expression(state, b);
+    match (a, b) {
+        (Some(a), Some(b)) => wrap_predicate(state, Predicate::binary(op, a, b)),
+        _ => 0, // invalid child => invalid node
     }
 }
 

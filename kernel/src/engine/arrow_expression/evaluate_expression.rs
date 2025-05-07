@@ -21,12 +21,6 @@ use crate::schema::DataType;
 use itertools::Itertools;
 use std::sync::Arc;
 
-fn downcast_to_bool(arr: &dyn Array) -> DeltaResult<&BooleanArray> {
-    arr.as_any()
-        .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| Error::generic("expected boolean array"))
-}
-
 trait ProvidesColumnByName {
     fn column_by_name(&self, name: &str) -> Option<&ArrayRef>;
 }
@@ -144,9 +138,13 @@ pub(crate) fn evaluate_predicate(
     match predicate {
         BooleanExpression(expr) => {
             // Grr -- there's no way to cast an `Arc<dyn Array>` back to its native type, so we
-            // can't use `Arc::into_inner` here and must unconditionally clone instead.
+            // can't use `Arc::into_inner` here and must clone instead. At least the inner `Buffer`
+            // instances are still cheaply clonable.
             let arr = evaluate_expression(expr, batch, Some(&DataType::BOOLEAN))?;
-            Ok(downcast_to_bool(&arr)?.clone())
+            match arr.as_any().downcast_ref::<BooleanArray>() {
+                Some(arr) => Ok(arr.clone()),
+                None => Err(Error::generic("expected boolean array")),
+            }
         }
         Not(pred) => Ok(not(&evaluate_predicate(pred, batch)?)?),
         Unary(UnaryPredicate { op, expr }) => {

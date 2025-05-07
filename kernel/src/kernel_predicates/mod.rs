@@ -1,3 +1,8 @@
+//! Support for kernel-driven predicate evaluation via the [`KernelPredicateEvaluator`]
+//! trait. Various trait implementations are used for partition pruning, stats-based data skipping,
+//! and parquet row group filtering. The evaluation is normally performed over [`Scalar`] values,
+//! but data skipping "evaluation" actually produces a transformed predicate that replaces column
+//! references with stats column references, which log replay will instruct the engine to evaluate.
 use crate::expressions::{
     BinaryPredicate, BinaryPredicateOp, ColumnName, Expression as Expr, JunctionPredicate,
     JunctionPredicateOp, Predicate as Pred, Scalar, UnaryPredicate, UnaryPredicateOp,

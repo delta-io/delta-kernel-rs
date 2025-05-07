@@ -428,13 +428,13 @@ fn visit_expression_impl(
             let child_list_id = call!(visitor, make_field_list, 2);
             visit_expression_impl(visitor, left, child_list_id);
             visit_expression_impl(visitor, right, child_list_id);
-            let op = match op {
+            let visit_fn = match op {
                 BinaryExpressionOp::Plus => visitor.visit_add,
                 BinaryExpressionOp::Minus => visitor.visit_minus,
                 BinaryExpressionOp::Multiply => visitor.visit_multiply,
                 BinaryExpressionOp::Divide => visitor.visit_divide,
             };
-            op(visitor.data, sibling_list_id, child_list_id);
+            visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
     }
 }
@@ -454,16 +454,16 @@ fn visit_predicate_impl(
         Predicate::Unary(UnaryPredicate { op, expr }) => {
             let child_list_id = call!(visitor, make_field_list, 1);
             visit_expression_impl(visitor, expr, child_list_id);
-            let op = match op {
+            let visit_fn = match op {
                 UnaryPredicateOp::IsNull => visitor.visit_is_null,
             };
-            op(visitor.data, sibling_list_id, child_list_id);
+            visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
         Predicate::Binary(BinaryPredicate { op, left, right }) => {
             let child_list_id = call!(visitor, make_field_list, 2);
             visit_expression_impl(visitor, left, child_list_id);
             visit_expression_impl(visitor, right, child_list_id);
-            let op = match op {
+            let visit_fn = match op {
                 BinaryPredicateOp::LessThan => visitor.visit_lt,
                 BinaryPredicateOp::LessThanOrEqual => visitor.visit_le,
                 BinaryPredicateOp::GreaterThan => visitor.visit_gt,
@@ -474,7 +474,7 @@ fn visit_predicate_impl(
                 BinaryPredicateOp::In => visitor.visit_in,
                 BinaryPredicateOp::NotIn => visitor.visit_not_in,
             };
-            op(visitor.data, sibling_list_id, child_list_id);
+            visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
         Predicate::Junction(JunctionPredicate { op, preds }) => {
             visit_predicate_junction(visitor, op, preds, sibling_list_id)
