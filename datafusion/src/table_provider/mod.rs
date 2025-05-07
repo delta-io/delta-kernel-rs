@@ -25,16 +25,14 @@ use delta_kernel::{Engine, ExpressionRef};
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 
-use self::scan_metadata::{scan_metadata, PartitionFileContext};
+use self::scan_metadata::{DeltaTableSnapshot, ScanFileContext, TableSnapshot};
 use crate::exec::{DeltaScanExec, FILE_ID_COLUMN};
 use crate::expressions::{to_datafusion_expr, to_delta_predicate};
 
 mod scan_metadata;
 
 pub struct DeltaTableProvider {
-    snapshot: Arc<Snapshot>,
-    table_schema: ArrowSchemaRef,
-    engine: Arc<dyn Engine>,
+    snapshot: Arc<DeltaTableSnapshot>,
 }
 
 impl std::fmt::Debug for DeltaTableProvider {
@@ -47,11 +45,9 @@ impl std::fmt::Debug for DeltaTableProvider {
 
 impl DeltaTableProvider {
     pub fn try_new(snapshot: Arc<Snapshot>, engine: Arc<dyn Engine>) -> Result<Self> {
-        let table_schema = snapshot.schema().as_ref().try_into()?;
+        let snapshot = DeltaTableSnapshot::try_new(snapshot, engine)?;
         Ok(Self {
-            snapshot,
-            table_schema: Arc::new(table_schema),
-            engine,
+            snapshot: Arc::new(snapshot),
         })
     }
 }
@@ -63,7 +59,7 @@ impl TableProvider for DeltaTableProvider {
     }
 
     fn schema(&self) -> ArrowSchemaRef {
-        Arc::clone(&self.table_schema)
+        Arc::clone(&self.snapshot.table_schema())
     }
 
     fn table_type(&self) -> TableType {
@@ -85,25 +81,21 @@ impl TableProvider for DeltaTableProvider {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let predicate = to_delta_predicate(filters)?;
-        let (scan_metadata, physical_schema, logical_schema) = scan_metadata(
-            state,
-            &self.engine,
-            &self.snapshot,
-            projection,
-            predicate,
-            &self.table_schema,
-        )
-        .await?;
+        let table_scan = self
+            .snapshot
+            .scan_metadata(state, projection, predicate)
+            .await?;
 
         // Convert the delta expressions from the scan into a map of file id to datafusion physical expression
         // these will be applied to convert the raw data read from disk into the logical table schema
-        let fs = physical_schema.clone().try_into()?;
-        let map_file = |f: &PartitionFileContext| {
+        let fs = table_scan.physical_schema.clone().try_into()?;
+        let map_file = |f: &ScanFileContext| {
             f.transform
                 .as_ref()
                 .map(|t| Ok((f.file_id.clone(), to_physical(state, &fs, t)?)))
         };
-        let transforms = scan_metadata
+        let transforms = table_scan
+            .files
             .values()
             .flat_map(|files| files.iter().filter_map(map_file))
             .try_collect::<_, _, DataFusionError>()?;
@@ -115,7 +107,7 @@ impl TableProvider for DeltaTableProvider {
         let source = Arc::new(ParquetSource::default());
         let mut plans = Vec::new();
         let file_id_field = Field::new(FILE_ID_COLUMN, DataType::Utf8, true);
-        for (store_url, files) in scan_metadata.into_iter() {
+        for (store_url, files) in table_scan.files.into_iter() {
             let store = state.runtime_env().object_store(&store_url)?;
             let reader_factory: Arc<dyn ParquetFileReaderFactory> =
                 Arc::new(DefaultParquetFileReaderFactory::new(store));
@@ -123,12 +115,15 @@ impl TableProvider for DeltaTableProvider {
 
             // TODO: convert passed predicate to an expression in terms of physical columns
             // and add it to the FileScanConfig
-            let config =
-                FileScanConfigBuilder::new(store_url, physical_schema.clone(), source.clone())
-                    .with_file_group(file_group.into_iter().collect())
-                    .with_table_partition_cols(vec![file_id_field.clone()])
-                    .with_limit(limit)
-                    .build();
+            let config = FileScanConfigBuilder::new(
+                store_url,
+                table_scan.physical_schema.clone(),
+                source.clone(),
+            )
+            .with_file_group(file_group.into_iter().collect())
+            .with_table_partition_cols(vec![file_id_field.clone()])
+            .with_limit(limit)
+            .build();
             let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
             plans.push(plan);
         }
@@ -138,7 +133,7 @@ impl TableProvider for DeltaTableProvider {
         };
 
         Ok(Arc::new(DeltaScanExec::new(
-            logical_schema,
+            table_scan.logical_schema,
             plan,
             Arc::new(transforms),
         )))
@@ -161,7 +156,7 @@ fn to_physical(
 
 async fn compute_parquet_access_plans(
     reader_factory: &Arc<dyn ParquetFileReaderFactory>,
-    files: Vec<PartitionFileContext>,
+    files: Vec<ScanFileContext>,
     metrics: &ExecutionPlanMetricsSet,
 ) -> Result<Vec<PartitionedFile>> {
     futures::stream::iter(files)

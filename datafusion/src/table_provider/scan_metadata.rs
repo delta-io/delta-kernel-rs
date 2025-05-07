@@ -16,18 +16,86 @@ use url::Url;
 
 use crate::error::to_df_err;
 
-pub(crate) async fn scan_metadata(
+#[async_trait::async_trait]
+pub trait TableSnapshot {
+    /// The logical schema of the table.
+    ///
+    /// This is the fully resolved schema as it is presented to the end user.
+    /// This includes any geneated or implicit columns, mapped names, etc.
+    fn table_schema(&self) -> &ArrowSchemaRef;
+
+    async fn scan_metadata(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        predicate: Arc<Expression>,
+    ) -> Result<TableScan>;
+}
+
+pub struct DeltaTableSnapshot {
+    snapshot: Arc<Snapshot>,
+    engine: Arc<dyn Engine>,
+    table_schema: ArrowSchemaRef,
+}
+
+impl std::fmt::Debug for DeltaTableSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeltaTableSnapshot")
+            .field("snapshot", &self.snapshot)
+            .field("table_schema", &self.table_schema)
+            .finish()
+    }
+}
+
+impl DeltaTableSnapshot {
+    pub fn try_new(snapshot: Arc<Snapshot>, engine: Arc<dyn Engine>) -> Result<Self> {
+        let table_schema = Arc::new(snapshot.schema().as_ref().try_into()?);
+        Ok(Self {
+            snapshot,
+            engine,
+            table_schema,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl TableSnapshot for DeltaTableSnapshot {
+    fn table_schema(&self) -> &ArrowSchemaRef {
+        &self.table_schema
+    }
+
+    async fn scan_metadata(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        predicate: Arc<Expression>,
+    ) -> Result<TableScan> {
+        scan_metadata(
+            state,
+            &self.engine,
+            &self.snapshot,
+            projection,
+            predicate,
+            &self.table_schema,
+        )
+        .await
+    }
+}
+
+pub struct TableScan {
+    pub(crate) files: HashMap<ObjectStoreUrl, Vec<ScanFileContext>>,
+    pub(crate) physical_schema: ArrowSchemaRef,
+    pub(crate) logical_schema: ArrowSchemaRef,
+}
+
+async fn scan_metadata(
     _state: &dyn Session,
     engine: &Arc<dyn Engine>,
     snapshot: &Arc<Snapshot>,
     projection: Option<&Vec<usize>>,
     predicate: Arc<Expression>,
     table_schema: &ArrowSchemaRef,
-) -> Result<(
-    HashMap<ObjectStoreUrl, Vec<PartitionFileContext>>,
-    ArrowSchemaRef,
-    ArrowSchemaRef,
-)> {
+) -> Result<TableScan> {
     let projected_delta_schema = project_delta_schema(table_schema, snapshot.schema(), projection);
 
     let scan = snapshot
@@ -41,7 +109,7 @@ pub(crate) async fn scan_metadata(
     let scan_state = scan.global_scan_state();
     let table_root =
         Url::parse(&scan_state.table_root).map_err(|e| DataFusionError::External(Box::new(e)))?;
-    let file_schema: ArrowSchemaRef = Arc::new(scan_state.physical_schema.as_ref().try_into()?);
+    let physical_schema: ArrowSchemaRef = Arc::new(scan_state.physical_schema.as_ref().try_into()?);
 
     let engine = engine.clone();
 
@@ -65,11 +133,11 @@ pub(crate) async fn scan_metadata(
     .await
     .map_err(|e| DataFusionError::External(Box::new(e)))??;
 
-    Ok((
+    Ok(TableScan {
         files,
-        file_schema,
-        Arc::new(scan_state.logical_schema.as_ref().try_into()?),
-    ))
+        physical_schema,
+        logical_schema: Arc::new(scan_state.logical_schema.as_ref().try_into()?),
+    })
 }
 
 struct ScanContext {
@@ -81,7 +149,7 @@ struct ScanContext {
     ///
     /// The key is a store url which identifies the specific object store
     /// the file belongs to.
-    files: HashMap<ObjectStoreUrl, Vec<PartitionFileContext>>,
+    files: HashMap<ObjectStoreUrl, Vec<ScanFileContext>>,
     /// Errors encountered during the scan.
     errs: Vec<DataFusionError>,
 }
@@ -120,7 +188,7 @@ impl ScanContext {
     }
 }
 
-pub(crate) struct PartitionFileContext {
+pub(crate) struct ScanFileContext {
     pub(crate) partitioned_file: PartitionedFile,
     pub(crate) selection_vector: Option<Vec<bool>>,
     pub(crate) transform: Option<ExpressionRef>,
@@ -177,7 +245,7 @@ fn visit_scan_file(
     ctx.files
         .entry(store_url)
         .or_insert_with(Vec::new)
-        .push(PartitionFileContext {
+        .push(ScanFileContext {
             partitioned_file,
             selection_vector,
             transform,
