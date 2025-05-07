@@ -1,5 +1,8 @@
 use super::*;
-use crate::expressions::{column_expr, column_name, ArrayData, StructData};
+use crate::expressions::{
+    column_expr, column_name, column_pred, ArrayData, Expression as Expr, Predicate as Pred,
+    StructData,
+};
 use crate::schema::ArrayType;
 use crate::DataType;
 
@@ -41,7 +44,7 @@ fn test_default_eval_scalar() {
     ];
     for (value, inverted, expect) in test_cases.into_iter() {
         assert_eq!(
-            KernelPredicateEvaluatorDefaults::eval_scalar(&value, inverted),
+            KernelPredicateEvaluatorDefaults::eval_pred_scalar(&value, inverted),
             expect,
             "value: {value:?} inverted: {inverted}"
         );
@@ -181,11 +184,11 @@ fn test_default_partial_cmp_scalars() {
 // Verifies that eval_binary_scalars uses partial_cmp_scalars correctly
 #[test]
 fn test_eval_binary_scalars() {
-    use BinaryOperator::*;
+    use BinaryPredicateOp::*;
     let smaller_value = Scalar::Long(1);
     let larger_value = Scalar::Long(10);
     for inverted in [true, false] {
-        let compare = KernelPredicateEvaluatorDefaults::eval_binary_scalars;
+        let compare = KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars;
         expect_eq!(
             compare(Equal, &smaller_value, &smaller_value, inverted),
             Some(!inverted),
@@ -266,12 +269,12 @@ fn test_eval_binary_columns() {
     let y = column_expr!("y");
     for inverted in [true, false] {
         assert_eq!(
-            filter.eval_binary(BinaryOperator::Equal, &x, &y, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::Equal, &x, &y, inverted),
             Some(inverted),
             "x = y (inverted: {inverted})"
         );
         assert_eq!(
-            filter.eval_binary(BinaryOperator::Equal, &x, &x, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::Equal, &x, &x, inverted),
             Some(!inverted),
             "x = x (inverted: {inverted})"
         );
@@ -305,19 +308,19 @@ fn test_eval_junction() {
             .iter()
             .cloned()
             .map(|v| match v {
-                Some(v) => Expr::literal(v),
-                None => Expr::null_literal(DataType::BOOLEAN),
+                Some(v) => Pred::literal(v),
+                None => Pred::null_literal(),
             })
             .collect();
         for inverted in [true, false] {
             let invert_if_needed = |v: &Option<_>| v.map(|v| v != inverted);
             expect_eq!(
-                filter.eval_junction(JunctionOperator::And, &inputs, inverted),
+                filter.eval_pred_junction(JunctionPredicateOp::And, &inputs, inverted),
                 invert_if_needed(expect_and),
                 "AND({inputs:?}) (inverted: {inverted})"
             );
             expect_eq!(
-                filter.eval_junction(JunctionOperator::Or, &inputs, inverted),
+                filter.eval_pred_junction(JunctionPredicateOp::Or, &inputs, inverted),
                 invert_if_needed(expect_or),
                 "OR({inputs:?}) (inverted: {inverted})"
             );
@@ -338,7 +341,7 @@ fn test_eval_column() {
         let filter = DefaultKernelPredicateEvaluator::from(input.clone());
         for inverted in [true, false] {
             expect_eq!(
-                filter.eval_column(col, inverted),
+                filter.eval_pred_column(col, inverted),
                 expect.map(|v| v != inverted),
                 "{input:?} (inverted: {inverted})"
             );
@@ -356,10 +359,10 @@ fn test_eval_not() {
     ];
     let filter = DefaultKernelPredicateEvaluator::from(UnimplementedColumnResolver);
     for (input, expect) in test_cases {
-        let input = input.into();
+        let input = Pred::from_expr(input);
         for inverted in [true, false] {
             expect_eq!(
-                filter.eval_not(&input, inverted),
+                filter.eval_pred_not(&input, inverted),
                 expect.map(|v| v != inverted),
                 "NOT({input:?}) (inverted: {inverted})"
             );
@@ -369,28 +372,28 @@ fn test_eval_not() {
 
 #[test]
 fn test_eval_is_null() {
-    use crate::expressions::UnaryOperator::IsNull;
+    use crate::expressions::UnaryPredicateOp::IsNull;
     let expr = column_expr!("x");
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
     expect_eq!(
-        filter.eval_unary(IsNull, &expr, true),
+        filter.eval_pred_unary(IsNull, &expr, true),
         Some(true),
         "x IS NOT NULL"
     );
     expect_eq!(
-        filter.eval_unary(IsNull, &expr, false),
+        filter.eval_pred_unary(IsNull, &expr, false),
         Some(false),
         "x IS NULL"
     );
 
     let expr = Expr::literal(1);
     expect_eq!(
-        filter.eval_unary(IsNull, &expr, true),
+        filter.eval_pred_unary(IsNull, &expr, true),
         Some(true),
         "1 IS NOT NULL"
     );
     expect_eq!(
-        filter.eval_unary(IsNull, &expr, false),
+        filter.eval_pred_unary(IsNull, &expr, false),
         Some(false),
         "1 IS NULL"
     );
@@ -404,54 +407,54 @@ fn test_eval_distinct() {
     let filter = DefaultKernelPredicateEvaluator::from(one.clone());
     let col = &column_name!("x");
     expect_eq!(
-        filter.eval_distinct(col, one, true),
+        filter.eval_pred_distinct(col, one, true),
         Some(true),
         "NOT DISTINCT(x, 1) (x = 1)"
     );
     expect_eq!(
-        filter.eval_distinct(col, one, false),
+        filter.eval_pred_distinct(col, one, false),
         Some(false),
         "DISTINCT(x, 1) (x = 1)"
     );
     expect_eq!(
-        filter.eval_distinct(col, two, true),
+        filter.eval_pred_distinct(col, two, true),
         Some(false),
         "NOT DISTINCT(x, 2) (x = 1)"
     );
     expect_eq!(
-        filter.eval_distinct(col, two, false),
+        filter.eval_pred_distinct(col, two, false),
         Some(true),
         "DISTINCT(x, 2) (x = 1)"
     );
     expect_eq!(
-        filter.eval_distinct(col, null, true),
+        filter.eval_pred_distinct(col, null, true),
         Some(false),
         "NOT DISTINCT(x, NULL) (x = 1)"
     );
     expect_eq!(
-        filter.eval_distinct(col, null, false),
+        filter.eval_pred_distinct(col, null, false),
         Some(true),
         "DISTINCT(x, NULL) (x = 1)"
     );
 
     let filter = DefaultKernelPredicateEvaluator::from(null.clone());
     expect_eq!(
-        filter.eval_distinct(col, one, true),
+        filter.eval_pred_distinct(col, one, true),
         Some(false),
         "NOT DISTINCT(x, 1) (x = NULL)"
     );
     expect_eq!(
-        filter.eval_distinct(col, one, false),
+        filter.eval_pred_distinct(col, one, false),
         Some(true),
         "DISTINCT(x, 1) (x = NULL)"
     );
     expect_eq!(
-        filter.eval_distinct(col, null, true),
+        filter.eval_pred_distinct(col, null, true),
         Some(true),
         "NOT DISTINCT(x, NULL) (x = NULL)"
     );
     expect_eq!(
-        filter.eval_distinct(col, null, false),
+        filter.eval_pred_distinct(col, null, false),
         Some(false),
         "DISTINCT(x, NULL) (x = NULL)"
     );
@@ -461,102 +464,81 @@ fn test_eval_distinct() {
 // test_eval_binary_scalars.
 #[test]
 fn eval_binary() {
+    use crate::expressions::BinaryPredicateOp;
+
     let col = column_expr!("x");
     let val = Expr::literal(10);
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
 
-    // unsupported
-    expect_eq!(
-        filter.eval_binary(BinaryOperator::Plus, &col, &val, false),
-        None,
-        "x + 10"
-    );
-    expect_eq!(
-        filter.eval_binary(BinaryOperator::Minus, &col, &val, false),
-        None,
-        "x - 10"
-    );
-    expect_eq!(
-        filter.eval_binary(BinaryOperator::Multiply, &col, &val, false),
-        None,
-        "x * 10"
-    );
-    expect_eq!(
-        filter.eval_binary(BinaryOperator::Divide, &col, &val, false),
-        None,
-        "x / 10"
-    );
-
-    // supported
     for inverted in [true, false] {
         expect_eq!(
-            filter.eval_binary(BinaryOperator::LessThan, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::LessThan, &col, &val, inverted),
             Some(!inverted),
             "x < 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::LessThanOrEqual, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::LessThanOrEqual, &col, &val, inverted),
             Some(!inverted),
             "x <= 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::Equal, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::Equal, &col, &val, inverted),
             Some(inverted),
             "x = 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::NotEqual, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::NotEqual, &col, &val, inverted),
             Some(!inverted),
             "x != 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::GreaterThanOrEqual, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::GreaterThanOrEqual, &col, &val, inverted),
             Some(inverted),
             "x >= 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::GreaterThan, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::GreaterThan, &col, &val, inverted),
             Some(inverted),
             "x > 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::Distinct, &col, &val, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::Distinct, &col, &val, inverted),
             Some(!inverted),
             "DISTINCT(x, 10) (inverted: {inverted})"
         );
 
         expect_eq!(
-            filter.eval_binary(BinaryOperator::LessThan, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::LessThan, &val, &col, inverted),
             Some(inverted),
             "10 < x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::LessThanOrEqual, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::LessThanOrEqual, &val, &col, inverted),
             Some(inverted),
             "10 <= x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::Equal, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::Equal, &val, &col, inverted),
             Some(inverted),
             "10 = x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::NotEqual, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::NotEqual, &val, &col, inverted),
             Some(!inverted),
             "10 != x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::GreaterThanOrEqual, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::GreaterThanOrEqual, &val, &col, inverted),
             Some(!inverted),
             "10 >= x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::GreaterThan, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::GreaterThan, &val, &col, inverted),
             Some(!inverted),
             "10 > x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_binary(BinaryOperator::Distinct, &val, &col, inverted),
+            filter.eval_pred_binary(BinaryPredicateOp::Distinct, &val, &col, inverted),
             Some(!inverted),
             "DISTINCT(10, x) (inverted: {inverted})"
         );
@@ -574,77 +556,94 @@ impl ResolveColumnAsScalar for NullColumnResolver {
 #[test]
 fn test_sql_where() {
     let col = &column_expr!("x");
+    let col_pred = &column_pred!("x");
     const VAL: Expr = Expr::Literal(Scalar::Integer(1));
-    const NULL: Expr = Expr::Literal(Scalar::Null(DataType::BOOLEAN));
-    const FALSE: Expr = Expr::Literal(Scalar::Boolean(false));
-    const TRUE: Expr = Expr::Literal(Scalar::Boolean(true));
+    const NULL: Pred = Pred::null_literal();
+    const FALSE: Pred = Pred::literal(false);
+    const TRUE: Pred = Pred::literal(true);
     let null_filter = DefaultKernelPredicateEvaluator::from(NullColumnResolver);
     let empty_filter = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
 
     // Basic sanity check
-    expect_eq!(null_filter.eval_sql_where(&VAL), None, "WHERE {VAL}");
-    expect_eq!(empty_filter.eval_sql_where(&VAL), None, "WHERE {VAL}");
+    expect_eq!(
+        null_filter.eval_sql_where(&Pred::from_expr(VAL)),
+        None,
+        "WHERE {VAL}"
+    );
+    expect_eq!(
+        empty_filter.eval_sql_where(&Pred::from_expr(VAL)),
+        None,
+        "WHERE {VAL}"
+    );
 
-    expect_eq!(null_filter.eval_sql_where(col), Some(false), "WHERE {col}");
-    expect_eq!(empty_filter.eval_sql_where(col), None, "WHERE {col}");
+    expect_eq!(
+        null_filter.eval_sql_where(col_pred),
+        Some(false),
+        "WHERE {col_pred}"
+    );
+    expect_eq!(
+        empty_filter.eval_sql_where(col_pred),
+        None,
+        "WHERE {col_pred}"
+    );
 
     // SQL eval does not modify behavior of IS NULL
-    let expr = &Expr::is_null(col.clone());
-    expect_eq!(null_filter.eval_sql_where(expr), Some(true), "{expr}");
+    let pred = &Pred::is_null(col.clone());
+    expect_eq!(null_filter.eval_sql_where(pred), Some(true), "{pred}");
 
     // NOT a gets skipped when NULL but not when missing
-    let expr = &Expr::not(col.clone());
-    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
-    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
+    let pred = &Pred::not(col_pred.clone());
+    expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     // Injected NULL checks only short circuit if inputs are NULL
-    let expr = &Expr::lt(FALSE, TRUE);
-    expect_eq!(null_filter.eval_sql_where(expr), Some(true), "{expr}");
-    expect_eq!(empty_filter.eval_sql_where(expr), Some(true), "{expr}");
+    let pred = &Pred::lt(FALSE, TRUE);
+    expect_eq!(null_filter.eval_sql_where(pred), Some(true), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), Some(true), "{pred}");
 
     // Contrast normal vs SQL WHERE semantics - comparison
-    let expr = &Expr::lt(col.clone(), VAL);
-    expect_eq!(null_filter.eval(expr), None, "{expr}");
-    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
+    let pred = &Pred::lt(col.clone(), VAL);
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
     // NULL check produces NULL due to missing column
-    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
-    let expr = &Expr::lt(VAL, col.clone());
-    expect_eq!(null_filter.eval(expr), None, "{expr}");
-    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
-    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
+    let pred = &Pred::lt(VAL, col.clone());
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
-    let expr = &Expr::distinct(VAL, col.clone());
-    expect_eq!(null_filter.eval(expr), Some(true), "{expr}");
-    expect_eq!(null_filter.eval_sql_where(expr), Some(true), "{expr}");
-    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
+    let pred = &Pred::distinct(VAL, col.clone());
+    expect_eq!(null_filter.eval(pred), Some(true), "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), Some(true), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
-    let expr = &Expr::distinct(NULL, col.clone());
-    expect_eq!(null_filter.eval(expr), Some(false), "{expr}");
-    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
-    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
+    let pred = &Pred::distinct(NULL, col.clone());
+    expect_eq!(null_filter.eval(pred), Some(false), "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     // Contrast normal vs SQL WHERE semantics - comparison inside AND
-    let expr = &Expr::and(TRUE, Expr::lt(col.clone(), VAL));
-    expect_eq!(null_filter.eval(expr), None, "{expr}");
-    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
-    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
+    let pred = &Pred::and(TRUE, Pred::lt(col.clone(), VAL));
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     // NULL allows static skipping under SQL semantics
-    let expr = &Expr::and(NULL, Expr::lt(col.clone(), VAL));
-    expect_eq!(null_filter.eval(expr), None, "{expr}");
-    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
-    expect_eq!(empty_filter.eval_sql_where(expr), Some(false), "{expr}");
+    let pred = &Pred::and(NULL, Pred::lt(col.clone(), VAL));
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), Some(false), "{pred}");
 
     // Contrast normal vs. SQL WHERE semantics - comparison inside AND inside AND
-    let expr = &Expr::and(TRUE, Expr::and(TRUE, Expr::lt(col.clone(), VAL)));
-    expect_eq!(null_filter.eval(expr), None, "{expr}");
-    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
-    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
+    let pred = &Pred::and(TRUE, Pred::and(TRUE, Pred::lt(col.clone(), VAL)));
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 
     // Ditto for comparison inside OR inside AND
-    let expr = &Expr::or(FALSE, Expr::and(TRUE, Expr::lt(col.clone(), VAL)));
-    expect_eq!(null_filter.eval(expr), None, "{expr}");
-    expect_eq!(null_filter.eval_sql_where(expr), Some(false), "{expr}");
-    expect_eq!(empty_filter.eval_sql_where(expr), None, "{expr}");
+    let pred = &Pred::or(FALSE, Pred::and(TRUE, Pred::lt(col.clone(), VAL)));
+    expect_eq!(null_filter.eval(pred), None, "{pred}");
+    expect_eq!(null_filter.eval_sql_where(pred), Some(false), "{pred}");
+    expect_eq!(empty_filter.eval_sql_where(pred), None, "{pred}");
 }
