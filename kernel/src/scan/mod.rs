@@ -14,7 +14,7 @@ use crate::actions::deletion_vector::{
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
-use crate::expressions::{ColumnName, Expression, ExpressionRef, Scalar};
+use crate::expressions::{ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
 use crate::log_replay::HasSelectionVector;
 use crate::scan::state::{DvInfo, Stats};
@@ -37,7 +37,7 @@ pub mod state;
 pub struct ScanBuilder {
     snapshot: Arc<Snapshot>,
     schema: Option<SchemaRef>,
-    predicate: Option<ExpressionRef>,
+    predicate: Option<PredicateRef>,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -86,7 +86,7 @@ impl ScanBuilder {
     ///
     /// NOTE: The filtering is best-effort and can produce false positives (rows that should should
     /// have been filtered out but were kept).
-    pub fn with_predicate(mut self, predicate: impl Into<Option<ExpressionRef>>) -> Self {
+    pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();
         self
     }
@@ -123,7 +123,7 @@ impl ScanBuilder {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PhysicalPredicate {
-    Some(ExpressionRef, SchemaRef),
+    Some(PredicateRef, SchemaRef),
     StaticSkipAll,
     None,
 }
@@ -137,7 +137,7 @@ impl PhysicalPredicate {
     /// NOTE: It is possible the predicate resolves to FALSE even ignoring column references,
     /// e.g. `col > 10 AND FALSE`. Such predicates can statically skip the whole query.
     pub(crate) fn try_new(
-        predicate: &Expression,
+        predicate: &Predicate,
         logical_schema: &Schema,
     ) -> DeltaResult<PhysicalPredicate> {
         if can_statically_skip_all_files(predicate) {
@@ -170,7 +170,7 @@ impl PhysicalPredicate {
         let mut apply_mappings = ApplyColumnMappings {
             column_mappings: get_referenced_fields.column_mappings,
         };
-        if let Some(predicate) = apply_mappings.transform(predicate) {
+        if let Some(predicate) = apply_mappings.transform_pred(predicate) {
             Ok(PhysicalPredicate::Some(
                 Arc::new(predicate.into_owned()),
                 Arc::new(schema.into_owned()),
@@ -184,7 +184,7 @@ impl PhysicalPredicate {
 // Evaluates a static data skipping predicate, ignoring any column references, and returns true if
 // the predicate allows to statically skip all files. Since this is direct evaluation (not an
 // expression rewrite), we use a `DefaultKernelPredicateEvaluator` with an empty column resolver.
-fn can_statically_skip_all_files(predicate: &Expression) -> bool {
+fn can_statically_skip_all_files(predicate: &Predicate) -> bool {
     use crate::kernel_predicates::KernelPredicateEvaluator as _;
     let evaluator = DefaultKernelPredicateEvaluator::from(EmptyColumnResolver);
     evaluator.eval_sql_where(predicate) == Some(false)
@@ -239,7 +239,7 @@ struct ApplyColumnMappings {
 impl<'a> ExpressionTransform<'a> for ApplyColumnMappings {
     // NOTE: We already verified all column references. But if the map probe ever did fail, the
     // transform would just delete any expression(s) that reference the invalid column.
-    fn transform_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
         self.column_mappings
             .get(name)
             .map(|physical_name| Cow::Owned(physical_name.clone()))
@@ -396,7 +396,7 @@ impl Scan {
     }
 
     /// Get the predicate [`Expression`] of the scan.
-    pub fn physical_predicate(&self) -> Option<ExpressionRef> {
+    pub fn physical_predicate(&self) -> Option<PredicateRef> {
         if let PhysicalPredicate::Some(ref predicate, _) = self.physical_predicate {
             Some(predicate.clone())
         } else {
@@ -839,7 +839,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::{column_expr, Expression as Expr};
+    use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
     use crate::schema::{ColumnMetadataKey, PrimitiveType};
     use crate::Table;
 
@@ -847,19 +847,19 @@ mod tests {
 
     #[test]
     fn test_static_skipping() {
-        const NULL: Expression = Expr::null_literal(DataType::BOOLEAN);
+        const NULL: Pred = Pred::null_literal();
         let test_cases = [
-            (false, column_expr!("a")),
-            (true, Expr::literal(false)),
-            (false, Expr::literal(true)),
+            (false, column_pred!("a")),
+            (true, Pred::literal(false)),
+            (false, Pred::literal(true)),
             (true, NULL),
-            (true, Expr::and(column_expr!("a"), Expr::literal(false))),
-            (false, Expr::or(column_expr!("a"), Expr::literal(true))),
-            (false, Expr::or(column_expr!("a"), Expr::literal(false))),
-            (false, Expr::lt(column_expr!("a"), Expr::literal(10))),
-            (false, Expr::lt(Expr::literal(10), Expr::literal(100))),
-            (true, Expr::gt(Expr::literal(10), Expr::literal(100))),
-            (true, Expr::and(NULL, column_expr!("a"))),
+            (true, Pred::and(column_pred!("a"), Pred::literal(false))),
+            (false, Pred::or(column_pred!("a"), Pred::literal(true))),
+            (false, Pred::or(column_pred!("a"), Pred::literal(false))),
+            (false, Pred::lt(column_expr!("a"), Expr::literal(10))),
+            (false, Pred::lt(Expr::literal(10), Expr::literal(100))),
+            (true, Pred::gt(Expr::literal(10), Expr::literal(100))),
+            (true, Pred::and(NULL, column_pred!("a"))),
         ];
         for (should_skip, predicate) in test_cases {
             assert_eq!(
@@ -910,20 +910,20 @@ mod tests {
         // NOTE: We break several column mapping rules here because they don't matter for this
         // test. For example, we do not provide field ids, and not all columns have physical names.
         let test_cases = [
-            (Expr::literal(true), Some(PhysicalPredicate::None)),
-            (Expr::literal(false), Some(PhysicalPredicate::StaticSkipAll)),
-            (column_expr!("x"), None), // no such column
+            (Pred::literal(true), Some(PhysicalPredicate::None)),
+            (Pred::literal(false), Some(PhysicalPredicate::StaticSkipAll)),
+            (column_pred!("x"), None), // no such column
             (
-                column_expr!("a"),
+                column_pred!("a"),
                 Some(PhysicalPredicate::Some(
-                    column_expr!("a").into(),
+                    column_pred!("a").into(),
                     StructType::new(vec![StructField::nullable("a", DataType::LONG)]).into(),
                 )),
             ),
             (
-                column_expr!("b"),
+                column_pred!("b"),
                 Some(PhysicalPredicate::Some(
-                    column_expr!("phys_b").into(),
+                    column_pred!("phys_b").into(),
                     StructType::new(vec![StructField::nullable("phys_b", DataType::LONG)
                         .with_metadata([(
                             ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -933,9 +933,9 @@ mod tests {
                 )),
             ),
             (
-                column_expr!("nested.x"),
+                column_pred!("nested.x"),
                 Some(PhysicalPredicate::Some(
-                    column_expr!("nested.x").into(),
+                    column_pred!("nested.x").into(),
                     StructType::new(vec![StructField::nullable(
                         "nested",
                         StructType::new(vec![StructField::nullable("x", DataType::LONG)]),
@@ -944,9 +944,9 @@ mod tests {
                 )),
             ),
             (
-                column_expr!("nested.y"),
+                column_pred!("nested.y"),
                 Some(PhysicalPredicate::Some(
-                    column_expr!("nested.phys_y").into(),
+                    column_pred!("nested.phys_y").into(),
                     StructType::new(vec![StructField::nullable(
                         "nested",
                         StructType::new(vec![StructField::nullable("phys_y", DataType::LONG)
@@ -959,9 +959,9 @@ mod tests {
                 )),
             ),
             (
-                column_expr!("mapped.n"),
+                column_pred!("mapped.n"),
                 Some(PhysicalPredicate::Some(
-                    column_expr!("phys_mapped.phys_n").into(),
+                    column_pred!("phys_mapped.phys_n").into(),
                     StructType::new(vec![StructField::nullable(
                         "phys_mapped",
                         StructType::new(vec![StructField::nullable("phys_n", DataType::LONG)
@@ -978,9 +978,9 @@ mod tests {
                 )),
             ),
             (
-                Expr::and(column_expr!("mapped.n"), Expr::literal(true)),
+                Pred::and(column_pred!("mapped.n"), Pred::literal(true)),
                 Some(PhysicalPredicate::Some(
-                    Expr::and(column_expr!("phys_mapped.phys_n"), Expr::literal(true)).into(),
+                    Pred::and(column_pred!("phys_mapped.phys_n"), Pred::literal(true)).into(),
                     StructType::new(vec![StructField::nullable(
                         "phys_mapped",
                         StructType::new(vec![StructField::nullable("phys_n", DataType::LONG)
@@ -997,7 +997,7 @@ mod tests {
                 )),
             ),
             (
-                Expr::and(column_expr!("mapped.n"), Expr::literal(false)),
+                Pred::and(column_pred!("mapped.n"), Pred::literal(false)),
                 Some(PhysicalPredicate::StaticSkipAll),
             ),
         ];

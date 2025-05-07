@@ -6,7 +6,7 @@ use delta_kernel::engine::sync::SyncEngine;
 use itertools::Itertools;
 
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::{DeltaResult, Error, ExpressionRef, Table, Version};
+use delta_kernel::{DeltaResult, Error, PredicateRef, Table, Version};
 
 mod common;
 use common::{load_test_data, to_arrow};
@@ -15,7 +15,7 @@ fn read_cdf_for_table(
     test_name: impl AsRef<str>,
     start_version: Version,
     end_version: impl Into<Option<Version>>,
-    predicate: impl Into<Option<ExpressionRef>>,
+    predicate: impl Into<Option<PredicateRef>>,
 ) -> DeltaResult<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
     let test_path = test_dir.path().join(test_name.as_ref());

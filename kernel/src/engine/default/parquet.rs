@@ -24,8 +24,8 @@ use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, ExpressionRef, FileDataReadResultIterator, FileMeta,
-    ParquetHandler,
+    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetHandler,
+    PredicateRef,
 };
 
 #[derive(Debug)]
@@ -189,7 +189,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        predicate: Option<ExpressionRef>,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         if files.is_empty() {
             return Ok(Box::new(std::iter::empty()));
@@ -232,7 +232,7 @@ struct ParquetOpener {
     // projection: Arc<[usize]>,
     batch_size: usize,
     table_schema: SchemaRef,
-    predicate: Option<ExpressionRef>,
+    predicate: Option<PredicateRef>,
     limit: Option<usize>,
     store: Arc<DynObjectStore>,
 }
@@ -241,7 +241,7 @@ impl ParquetOpener {
     pub(crate) fn new(
         batch_size: usize,
         table_schema: SchemaRef,
-        predicate: Option<ExpressionRef>,
+        predicate: Option<PredicateRef>,
         store: Arc<DynObjectStore>,
     ) -> Self {
         Self {
@@ -309,7 +309,7 @@ impl FileOpener for ParquetOpener {
 /// Implements [`FileOpener`] for a opening a parquet file from a presigned URL
 struct PresignedUrlOpener {
     batch_size: usize,
-    predicate: Option<ExpressionRef>,
+    predicate: Option<PredicateRef>,
     limit: Option<usize>,
     table_schema: SchemaRef,
     client: reqwest::Client,
@@ -319,7 +319,7 @@ impl PresignedUrlOpener {
     pub(crate) fn new(
         batch_size: usize,
         schema: SchemaRef,
-        predicate: Option<ExpressionRef>,
+        predicate: Option<PredicateRef>,
     ) -> Self {
         Self {
             batch_size,

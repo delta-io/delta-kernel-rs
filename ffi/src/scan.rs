@@ -12,7 +12,7 @@ use tracing::debug;
 use url::Url;
 
 use crate::expressions::engine::{
-    unwrap_kernel_expression, EnginePredicate, KernelExpressionVisitorState,
+    unwrap_kernel_predicate, EnginePredicate, KernelExpressionVisitorState,
 };
 use crate::expressions::SharedExpression;
 use crate::{
@@ -94,7 +94,7 @@ fn scan_impl(
     if let Some(predicate) = predicate {
         let mut visitor_state = KernelExpressionVisitorState::default();
         let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
-        let predicate = unwrap_kernel_expression(&mut visitor_state, pred_id);
+        let predicate = unwrap_kernel_predicate(&mut visitor_state, pred_id);
         debug!("Got predicate: {:#?}", predicate);
         scan_builder = scan_builder.with_predicate(predicate.map(Arc::new));
     }

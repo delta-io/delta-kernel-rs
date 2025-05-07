@@ -11,7 +11,7 @@ use crate::actions::get_log_domain_metadata_schema;
 use crate::actions::visitors::DomainMetadataVisitor;
 use crate::actions::{DomainMetadata, DOMAIN_METADATA_NAME};
 use crate::log_segment::LogSegment;
-use crate::{DeltaResult, Engine, EngineData, Expression as Expr, ExpressionRef, RowVisitor as _};
+use crate::{DeltaResult, Engine, EngineData, Expression as Expr, PredicateRef, RowVisitor as _};
 
 const DOMAIN_METADATA_DOMAIN_FIELD: &str = "domain";
 
@@ -65,7 +65,7 @@ fn replay_for_domain_metadatas(
     engine: &dyn Engine,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
     let schema = get_log_domain_metadata_schema();
-    static META_PREDICATE: LazyLock<Option<ExpressionRef>> = LazyLock::new(|| {
+    static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
         Some(Arc::new(
             Expr::column([DOMAIN_METADATA_NAME, DOMAIN_METADATA_DOMAIN_FIELD]).is_not_null(),
         ))

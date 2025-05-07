@@ -14,6 +14,7 @@ use crate::DataType as DeltaDataTypes;
 use crate::EvaluationHandlerExtension as _;
 
 use Expression as Expr;
+use Predicate as Pred;
 
 #[test]
 fn test_array_column() {
@@ -27,21 +28,25 @@ fn test_array_column() {
     let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
-    let not_op = Expr::binary(
-        BinaryOperator::NotIn,
+    let not_op = Pred::binary(
+        BinaryPredicateOp::NotIn,
         Expr::literal(5),
         column_expr!("item"),
     );
 
-    let in_op = Expr::binary(BinaryOperator::In, Expr::literal(5), column_expr!("item"));
+    let in_op = Pred::binary(
+        BinaryPredicateOp::In,
+        Expr::literal(5),
+        column_expr!("item"),
+    );
 
-    let result = evaluate_expression(&not_op, &batch, None).unwrap();
+    let result = evaluate_predicate(&not_op, &batch).unwrap();
     let expected = BooleanArray::from(vec![true, false, true]);
-    assert_eq!(result.as_ref(), &expected);
+    assert_eq!(result, expected);
 
-    let in_result = evaluate_expression(&in_op, &batch, None).unwrap();
-    let in_expected = BooleanArray::from(vec![false, true, false]);
-    assert_eq!(in_result.as_ref(), &in_expected);
+    let result = evaluate_predicate(&in_op, &batch).unwrap();
+    let expected = BooleanArray::from(vec![false, true, false]);
+    assert_eq!(result, expected);
 }
 
 #[test]
@@ -51,13 +56,13 @@ fn test_bad_right_type_array() {
     let schema = Schema::new([field.clone()]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
 
-    let in_op = Expr::binary(
-        BinaryOperator::NotIn,
+    let in_op = Pred::binary(
+        BinaryPredicateOp::NotIn,
         Expr::literal(5),
         column_expr!("item"),
     );
 
-    let in_result = evaluate_expression(&in_op, &batch, None);
+    let in_result = evaluate_predicate(&in_op, &batch);
 
     assert!(in_result.is_err());
     assert_eq!(
@@ -72,8 +77,8 @@ fn test_literal_type_array() {
     let schema = Schema::new([field.clone()]);
     let batch = RecordBatch::new_empty(Arc::new(schema));
 
-    let in_op = Expr::binary(
-        BinaryOperator::NotIn,
+    let in_op = Pred::binary(
+        BinaryPredicateOp::NotIn,
         Expr::literal(5),
         Scalar::Array(
             ArrayData::try_new(
@@ -84,9 +89,9 @@ fn test_literal_type_array() {
         ),
     );
 
-    let in_result = evaluate_expression(&in_op, &batch, None).unwrap();
+    let in_result = evaluate_predicate(&in_op, &batch).unwrap();
     let in_expected = BooleanArray::from(vec![true]);
-    assert_eq!(in_result.as_ref(), &in_expected);
+    assert_eq!(in_result, in_expected);
 }
 
 #[test]
@@ -227,13 +232,13 @@ fn test_invalid_array_sides() {
     let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
-    let in_op = Expr::binary(
-        BinaryOperator::NotIn,
+    let in_op = Pred::binary(
+        BinaryPredicateOp::NotIn,
         column_expr!("item"),
         column_expr!("item"),
     );
 
-    let in_result = evaluate_expression(&in_op, &batch, None);
+    let in_result = evaluate_predicate(&in_op, &batch);
 
     assert!(in_result.is_err());
     assert_eq!(
@@ -254,25 +259,25 @@ fn test_str_arrays() {
     let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
-    let str_not_op = Expr::binary(
-        BinaryOperator::NotIn,
+    let str_not_op = Pred::binary(
+        BinaryPredicateOp::NotIn,
         Expr::literal("bye"),
         column_expr!("item"),
     );
 
-    let str_in_op = Expr::binary(
-        BinaryOperator::In,
+    let str_in_op = Pred::binary(
+        BinaryPredicateOp::In,
         Expr::literal("hi"),
         column_expr!("item"),
     );
 
-    let result = evaluate_expression(&str_in_op, &batch, None).unwrap();
+    let result = evaluate_predicate(&str_in_op, &batch).unwrap();
     let expected = BooleanArray::from(vec![true, true, true]);
-    assert_eq!(result.as_ref(), &expected);
+    assert_eq!(result, expected);
 
-    let in_result = evaluate_expression(&str_not_op, &batch, None).unwrap();
-    let in_expected = BooleanArray::from(vec![false, false, false]);
-    assert_eq!(in_result.as_ref(), &in_expected);
+    let result = evaluate_predicate(&str_not_op, &batch).unwrap();
+    let expected = BooleanArray::from(vec![false, false, false]);
+    assert_eq!(result, expected);
 }
 
 #[test]
@@ -374,35 +379,35 @@ fn test_binary_cmp() {
     let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
     let column = column_expr!("a");
 
-    let expression = column.clone().lt(Expr::literal(2));
-    let results = evaluate_expression(&expression, &batch, None).unwrap();
-    let expected = Arc::new(BooleanArray::from(vec![true, false, false]));
-    assert_eq!(results.as_ref(), expected.as_ref());
+    let predicate = column.clone().lt(Expr::literal(2));
+    let results = evaluate_predicate(&predicate, &batch).unwrap();
+    let expected = BooleanArray::from(vec![true, false, false]);
+    assert_eq!(results, expected);
 
-    let expression = column.clone().le(Expr::literal(2));
-    let results = evaluate_expression(&expression, &batch, None).unwrap();
-    let expected = Arc::new(BooleanArray::from(vec![true, true, false]));
-    assert_eq!(results.as_ref(), expected.as_ref());
+    let predicate = column.clone().le(Expr::literal(2));
+    let results = evaluate_predicate(&predicate, &batch).unwrap();
+    let expected = BooleanArray::from(vec![true, true, false]);
+    assert_eq!(results, expected);
 
-    let expression = column.clone().gt(Expr::literal(2));
-    let results = evaluate_expression(&expression, &batch, None).unwrap();
-    let expected = Arc::new(BooleanArray::from(vec![false, false, true]));
-    assert_eq!(results.as_ref(), expected.as_ref());
+    let predicate = column.clone().gt(Expr::literal(2));
+    let results = evaluate_predicate(&predicate, &batch).unwrap();
+    let expected = BooleanArray::from(vec![false, false, true]);
+    assert_eq!(results, expected);
 
-    let expression = column.clone().ge(Expr::literal(2));
-    let results = evaluate_expression(&expression, &batch, None).unwrap();
-    let expected = Arc::new(BooleanArray::from(vec![false, true, true]));
-    assert_eq!(results.as_ref(), expected.as_ref());
+    let predicate = column.clone().ge(Expr::literal(2));
+    let results = evaluate_predicate(&predicate, &batch).unwrap();
+    let expected = BooleanArray::from(vec![false, true, true]);
+    assert_eq!(results, expected);
 
-    let expression = column.clone().eq(Expr::literal(2));
-    let results = evaluate_expression(&expression, &batch, None).unwrap();
-    let expected = Arc::new(BooleanArray::from(vec![false, true, false]));
-    assert_eq!(results.as_ref(), expected.as_ref());
+    let predicate = column.clone().eq(Expr::literal(2));
+    let results = evaluate_predicate(&predicate, &batch).unwrap();
+    let expected = BooleanArray::from(vec![false, true, false]);
+    assert_eq!(results, expected);
 
-    let expression = column.clone().ne(Expr::literal(2));
-    let results = evaluate_expression(&expression, &batch, None).unwrap();
-    let expected = Arc::new(BooleanArray::from(vec![true, false, true]));
-    assert_eq!(results.as_ref(), expected.as_ref());
+    let predicate = column.clone().ne(Expr::literal(2));
+    let results = evaluate_predicate(&predicate, &batch).unwrap();
+    let expected = BooleanArray::from(vec![true, false, true]);
+    assert_eq!(results, expected);
 }
 
 #[test]
@@ -419,32 +424,28 @@ fn test_logical() {
         ],
     )
     .unwrap();
-    let column_a = column_expr!("a");
-    let column_b = column_expr!("b");
+    let column_a = column_pred!("a");
+    let column_b = column_pred!("b");
 
-    let expression = Expr::and(column_a.clone(), column_b.clone());
-    let results =
-        evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
-    let expected = Arc::new(BooleanArray::from(vec![false, false]));
-    assert_eq!(results.as_ref(), expected.as_ref());
+    let pred = Pred::and(column_a.clone(), column_b.clone());
+    let results = evaluate_predicate(&pred, &batch).unwrap();
+    let expected = BooleanArray::from(vec![false, false]);
+    assert_eq!(results, expected);
 
-    let expression = Expr::and(column_a.clone(), Expr::literal(true));
-    let results =
-        evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
-    let expected = Arc::new(BooleanArray::from(vec![true, false]));
-    assert_eq!(results.as_ref(), expected.as_ref());
+    let pred = Pred::and(column_a.clone(), Pred::literal(true));
+    let results = evaluate_predicate(&pred, &batch).unwrap();
+    let expected = BooleanArray::from(vec![true, false]);
+    assert_eq!(results, expected);
 
-    let expression = Expr::or(column_a.clone(), column_b);
-    let results =
-        evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
-    let expected = Arc::new(BooleanArray::from(vec![true, true]));
-    assert_eq!(results.as_ref(), expected.as_ref());
+    let pred = Pred::or(column_a.clone(), column_b);
+    let results = evaluate_predicate(&pred, &batch).unwrap();
+    let expected = BooleanArray::from(vec![true, true]);
+    assert_eq!(results, expected);
 
-    let expression = Expr::or(column_a.clone(), Expr::literal(false));
-    let results =
-        evaluate_expression(&expression, &batch, Some(&crate::schema::DataType::BOOLEAN)).unwrap();
-    let expected = Arc::new(BooleanArray::from(vec![true, false]));
-    assert_eq!(results.as_ref(), expected.as_ref());
+    let pred = Pred::or(column_a.clone(), Pred::literal(false));
+    let results = evaluate_predicate(&pred, &batch).unwrap();
+    let expected = BooleanArray::from(vec![true, false]);
+    assert_eq!(results, expected);
 }
 
 #[test]

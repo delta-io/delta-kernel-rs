@@ -638,8 +638,8 @@ impl PrimitiveType {
 mod tests {
     use std::f32::consts::PI;
 
-    use crate::expressions::{column_expr, BinaryOperator};
-    use crate::Expression as Expr;
+    use crate::expressions::{column_expr, BinaryPredicateOp};
+    use crate::{Expression as Expr, Predicate as Pred};
 
     use super::*;
 
@@ -803,10 +803,10 @@ mod tests {
         });
 
         let column = column_expr!("item");
-        let array_op = Expr::binary(BinaryOperator::In, Expr::literal(10), array.clone());
-        let array_not_op = Expr::binary(BinaryOperator::NotIn, Expr::literal(10), array);
-        let column_op = Expr::binary(BinaryOperator::In, Expr::literal(PI), column.clone());
-        let column_not_op = Expr::binary(BinaryOperator::NotIn, Expr::literal("Cool"), column);
+        let array_op = Pred::binary(BinaryPredicateOp::In, Expr::literal(10), array.clone());
+        let array_not_op = Pred::binary(BinaryPredicateOp::NotIn, Expr::literal(10), array);
+        let column_op = Pred::binary(BinaryPredicateOp::In, Expr::literal(PI), column.clone());
+        let column_not_op = Pred::binary(BinaryPredicateOp::NotIn, Expr::literal("Cool"), column);
         assert_eq!(&format!("{}", array_op), "10 IN (1, 2, 3)");
         assert_eq!(&format!("{}", array_not_op), "10 NOT IN (1, 2, 3)");
         assert_eq!(&format!("{}", column_op), "3.1415927 IN Column(item)");

@@ -1,5 +1,5 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer stats.
-use crate::expressions::{ColumnName, DecimalData, Expression, Scalar};
+use crate::expressions::{ColumnName, DecimalData, Predicate, Scalar};
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::parquet::arrow::arrow_reader::ArrowReaderBuilder;
 use crate::parquet::file::metadata::RowGroupMetaData;
@@ -17,10 +17,10 @@ mod tests;
 pub(crate) trait ParquetRowGroupSkipping {
     /// Instructs the parquet reader to perform row group skipping, eliminating any row group whose
     /// stats prove that none of the group's rows can satisfy the given `predicate`.
-    fn with_row_group_filter(self, predicate: &Expression) -> Self;
+    fn with_row_group_filter(self, predicate: &Predicate) -> Self;
 }
 impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
-    fn with_row_group_filter(self, predicate: &Expression) -> Self {
+    fn with_row_group_filter(self, predicate: &Predicate) -> Self {
         let indices = self
             .metadata()
             .row_groups()
@@ -46,7 +46,7 @@ struct RowGroupFilter<'a> {
 
 impl<'a> RowGroupFilter<'a> {
     /// Creates a new row group filter for the given row group and predicate.
-    fn new(row_group: &'a RowGroupMetaData, predicate: &Expression) -> Self {
+    fn new(row_group: &'a RowGroupMetaData, predicate: &Predicate) -> Self {
         Self {
             row_group,
             field_indices: compute_field_indices(row_group.schema_descr().columns(), predicate),
@@ -54,7 +54,7 @@ impl<'a> RowGroupFilter<'a> {
     }
 
     /// Applies a filtering predicate to a row group. Return value false means to skip it.
-    fn apply(row_group: &'a RowGroupMetaData, predicate: &Expression) -> bool {
+    fn apply(row_group: &'a RowGroupMetaData, predicate: &Predicate) -> bool {
         use crate::kernel_predicates::KernelPredicateEvaluator as _;
         RowGroupFilter::new(row_group, predicate).eval_sql_where(predicate) != Some(false)
     }
@@ -221,19 +221,19 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
     }
 }
 
-/// Given a filter expression of interest and a set of parquet column descriptors, build a column ->
-/// index mapping for columns the expression references. This ensures O(1) lookup times, for an
-/// overall O(n) cost to evaluate an expression tree with n nodes.
+/// Given a predicate of interest and a set of parquet column descriptors, build a column ->
+/// index mapping for columns the predicate references. This ensures O(1) lookup times, for an
+/// overall O(n) cost to evaluate a predicate tree with n nodes.
 pub(crate) fn compute_field_indices(
     fields: &[ColumnDescPtr],
-    expression: &Expression,
+    predicate: &Predicate,
 ) -> HashMap<ColumnName, usize> {
     // Build up a set of requested column paths, then take each found path as the corresponding map
     // key (avoids unnecessary cloning).
     //
     // NOTE: If a requested column was not available, it is silently ignored. These missing columns
     // are implied all-null, so we will infer their min/max stats as NULL and nullcount == rowcount.
-    let mut requested_columns = expression.references();
+    let mut requested_columns = predicate.references();
     fields
         .iter()
         .enumerate()

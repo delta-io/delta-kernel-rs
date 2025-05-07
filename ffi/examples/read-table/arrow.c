@@ -122,7 +122,7 @@ static ExclusiveEngineData* apply_transform(
     context->read_schema, // input schema
     context->arrow_context->cur_transform,
     context->logical_schema); // output schema
-  ExternResultHandleExclusiveEngineData transformed_res = evaluate(
+  ExternResultHandleExclusiveEngineData transformed_res = evaluate_expression(
     context->engine,
     &data,
     evaluator);

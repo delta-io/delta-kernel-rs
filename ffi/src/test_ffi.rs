@@ -2,20 +2,20 @@
 
 use std::sync::Arc;
 
-use crate::{expressions::SharedExpression, handle::Handle};
-use delta_kernel::{
-    expressions::{
-        column_expr, ArrayData, BinaryOperator, Expression as Expr, MapData, Scalar, StructData,
-    },
-    schema::{ArrayType, DataType, MapType, StructField, StructType},
+use crate::expressions::{SharedExpression, SharedPredicate};
+use crate::handle::Handle;
+use delta_kernel::expressions::{
+    column_expr, column_pred, ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr,
+    MapData, Predicate as Pred, Scalar, StructData,
 };
+use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
-/// Constructs a kernel expression that is passed back as a SharedExpression handle. The expected
+/// Constructs a kernel expression that is passed back as a [`SharedExpression`] handle. The expected
 /// output expression can be found in `ffi/tests/test_expression_visitor/expected.txt`.
 ///
 /// # Safety
 /// The caller is responsible for freeing the returned memory, either by calling
-/// [`free_kernel_predicate`], or [`Handle::drop_handle`]
+/// [`crate::expressions::free_kernel_expression`], or [`crate::handles::Handle::drop_handle`].
 #[no_mangle]
 pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpression> {
     let array_type = ArrayType::new(
@@ -53,6 +53,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
     .unwrap();
 
     let mut sub_exprs = vec![
+        column_expr!("col"),
         Expr::literal(i8::MAX),
         Expr::literal(i8::MIN),
         Expr::literal(f32::MAX),
@@ -76,31 +77,70 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         Scalar::Struct(top_level_struct).into(),
         Scalar::Array(array_data).into(),
         Scalar::Map(map_data).into(),
-        Expr::struct_from(vec![Expr::or_from(vec![
-            Scalar::Integer(5).into(),
-            Scalar::Long(20).into(),
-        ])]),
-        Expr::is_not_null(column_expr!("col")),
+        Expr::struct_from([Expr::literal(5_i32), Expr::literal(20_i64)]),
     ];
     sub_exprs.extend(
         [
-            BinaryOperator::In,
-            BinaryOperator::Plus,
-            BinaryOperator::Minus,
-            BinaryOperator::Equal,
-            BinaryOperator::NotEqual,
-            BinaryOperator::NotIn,
-            BinaryOperator::Divide,
-            BinaryOperator::Multiply,
-            BinaryOperator::LessThan,
-            BinaryOperator::LessThanOrEqual,
-            BinaryOperator::GreaterThan,
-            BinaryOperator::GreaterThanOrEqual,
-            BinaryOperator::Distinct,
+            BinaryExpressionOp::Divide,
+            BinaryExpressionOp::Multiply,
+            BinaryExpressionOp::Plus,
+            BinaryExpressionOp::Minus,
         ]
         .into_iter()
-        .map(|op| Expr::binary(op, Scalar::Integer(0), Scalar::Long(0))),
+        .map(|op| Expr::binary(op, Expr::literal(0), Expr::literal(0))),
     );
 
-    Arc::new(Expr::and_from(sub_exprs)).into()
+    Arc::new(Expr::struct_from(sub_exprs)).into()
+}
+
+/// Constructs a kernel predicate that is passed back as a [`SharedPredicate`] handle. The expected
+/// output predicate can be found in `ffi/tests/test_predicate_visitor/expected.txt`.
+///
+/// # Safety
+/// The caller is responsible for freeing the returned memory, either by calling
+/// [`crate::expressions::free_kernel_predicate`], or [`crate::handles::Handle::drop_handle`].
+#[no_mangle]
+pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicate> {
+    let array_type = ArrayType::new(
+        DataType::Primitive(delta_kernel::schema::PrimitiveType::Short),
+        false,
+    );
+    let array_data =
+        ArrayData::try_new(array_type.clone(), vec![Scalar::Short(5), Scalar::Short(0)]).unwrap();
+
+    let mut sub_exprs = vec![
+        column_pred!("col"),
+        Pred::literal(true),
+        Pred::literal(false),
+        Pred::binary(
+            BinaryPredicateOp::In,
+            Expr::literal(10),
+            Scalar::Array(array_data.clone()),
+        ),
+        Pred::binary(
+            BinaryPredicateOp::NotIn,
+            Expr::literal(10),
+            Scalar::Array(array_data),
+        ),
+        Pred::or_from(vec![
+            Pred::eq(Expr::literal(5), Expr::literal(10)),
+            Pred::ne(Expr::literal(20), Expr::literal(10)),
+        ]),
+        Pred::is_not_null(column_expr!("col")),
+    ];
+    sub_exprs.extend(
+        [
+            BinaryPredicateOp::Equal,
+            BinaryPredicateOp::NotEqual,
+            BinaryPredicateOp::LessThan,
+            BinaryPredicateOp::LessThanOrEqual,
+            BinaryPredicateOp::GreaterThan,
+            BinaryPredicateOp::GreaterThanOrEqual,
+            BinaryPredicateOp::Distinct,
+        ]
+        .into_iter()
+        .map(|op| Pred::binary(op, Expr::literal(0), Expr::literal(0))),
+    );
+
+    Arc::new(Pred::and_from(sub_exprs)).into()
 }

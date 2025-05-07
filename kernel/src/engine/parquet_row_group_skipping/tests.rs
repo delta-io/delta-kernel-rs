@@ -1,8 +1,8 @@
 use super::*;
-use crate::expressions::{column_expr, column_name};
+use crate::expressions::{column_name, column_pred};
 use crate::kernel_predicates::DataSkippingPredicateEvaluator as _;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
-use crate::Expression;
+use crate::Predicate;
 use std::fs::File;
 
 /// Performs an exhaustive set of reads against a specially crafted parquet file.
@@ -39,23 +39,23 @@ fn test_get_stat_values() {
     let file = File::open("./tests/data/parquet_row_group_skipping/part-00000-b92e017a-50ba-4676-8322-48fc371c2b59-c000.snappy.parquet").unwrap();
     let metadata = ArrowReaderMetadata::load(&file, Default::default()).unwrap();
 
-    // The expression doesn't matter -- it just needs to mention all the columns we care about.
-    let columns = Expression::and_from(vec![
-        column_expr!("varlen.utf8"),
-        column_expr!("numeric.ints.int64"),
-        column_expr!("numeric.ints.int32"),
-        column_expr!("numeric.ints.int16"),
-        column_expr!("numeric.ints.int8"),
-        column_expr!("numeric.floats.float32"),
-        column_expr!("numeric.floats.float64"),
-        column_expr!("bool"),
-        column_expr!("varlen.binary"),
-        column_expr!("numeric.decimals.decimal32"),
-        column_expr!("numeric.decimals.decimal64"),
-        column_expr!("numeric.decimals.decimal128"),
-        column_expr!("chrono.date32"),
-        column_expr!("chrono.timestamp"),
-        column_expr!("chrono.timestamp_ntz"),
+    // The predicate doesn't matter -- it just needs to mention all the columns we care about.
+    let columns = Predicate::and_from(vec![
+        column_pred!("varlen.utf8"),
+        column_pred!("numeric.ints.int64"),
+        column_pred!("numeric.ints.int32"),
+        column_pred!("numeric.ints.int16"),
+        column_pred!("numeric.ints.int8"),
+        column_pred!("numeric.floats.float32"),
+        column_pred!("numeric.floats.float64"),
+        column_pred!("bool"),
+        column_pred!("varlen.binary"),
+        column_pred!("numeric.decimals.decimal32"),
+        column_pred!("numeric.decimals.decimal64"),
+        column_pred!("numeric.decimals.decimal128"),
+        column_pred!("chrono.date32"),
+        column_pred!("chrono.timestamp"),
+        column_pred!("chrono.timestamp_ntz"),
     ]);
     let filter = RowGroupFilter::new(metadata.metadata().row_group(0), &columns);
 

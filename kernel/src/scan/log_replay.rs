@@ -8,7 +8,9 @@ use super::data_skipping::DataSkippingFilter;
 use super::{ScanMetadata, Transform};
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{column_expr, column_name, ColumnName, Expression, ExpressionRef};
+use crate::expressions::{
+    column_expr, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
+};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::{FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::scan::{Scalar, TransformExpr};
@@ -39,7 +41,7 @@ use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator};
 /// vector indicating which rows are valid, and any row-level transformation expressions that need
 /// to be applied to the selected rows.
 pub(crate) struct ScanLogReplayProcessor {
-    partition_filter: Option<ExpressionRef>,
+    partition_filter: Option<PredicateRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
     add_transform: Arc<dyn ExpressionEvaluator>,
     logical_schema: SchemaRef,
@@ -54,7 +56,7 @@ impl ScanLogReplayProcessor {
     /// Create a new [`ScanLogReplayProcessor`] instance
     fn new(
         engine: &dyn Engine,
-        physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+        physical_predicate: Option<(PredicateRef, SchemaRef)>,
         logical_schema: SchemaRef,
         transform: Option<Arc<Transform>>,
     ) -> Self {
@@ -82,7 +84,7 @@ struct AddRemoveDedupVisitor<'seen> {
     selection_vector: Vec<bool>,
     logical_schema: SchemaRef,
     transform: Option<Arc<Transform>>,
-    partition_filter: Option<ExpressionRef>,
+    partition_filter: Option<PredicateRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
 }
 
@@ -100,7 +102,7 @@ impl AddRemoveDedupVisitor<'_> {
         selection_vector: Vec<bool>,
         logical_schema: SchemaRef,
         transform: Option<Arc<Transform>>,
-        partition_filter: Option<ExpressionRef>,
+        partition_filter: Option<PredicateRef>,
         is_log_batch: bool,
     ) -> AddRemoveDedupVisitor<'_> {
         AddRemoveDedupVisitor {
@@ -389,7 +391,7 @@ pub(crate) fn scan_action_iter(
     action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
     logical_schema: SchemaRef,
     transform: Option<Arc<Transform>>,
-    physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+    physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> impl Iterator<Item = DeltaResult<ScanMetadata>> {
     ScanLogReplayProcessor::new(engine, physical_predicate, logical_schema, transform)
         .process_actions_iter(action_iter)
