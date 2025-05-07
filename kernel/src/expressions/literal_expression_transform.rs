@@ -88,7 +88,7 @@ macro_rules! transform_leaf {
             return None;
         };
 
-        // NOTE: Grab a reference here so code below can leverage the blanket Deref impl for &T
+        // NOTE: Grab a reference here so code below can leverage the blanket impl<T> Deref for &T
         let $type_variant(ref scalar_type) = scalar.data_type() else {
             $self.set_error(Error::Schema(format!(
                 "Mismatched scalar type while creating Expression: expected {}({:?}), got {:?}",
@@ -99,7 +99,7 @@ macro_rules! transform_leaf {
             return None;
         };
 
-        // NOTE: &T and &Box<T> both deref-coerce to &T
+        // NOTE: &T and &Box<T> both deref to &T
         if scalar_type.deref() != $type {
             $self.set_error(Error::Schema(format!(
                 "Mismatched scalar type while creating Expression: expected {:?}, got {:?}",
