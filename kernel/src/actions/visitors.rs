@@ -12,11 +12,9 @@ use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 use super::deletion_vector::DeletionVectorDescriptor;
+use super::domain_metadata::DomainMetadataMap;
 use super::schemas::ToSchema as _;
-use super::{
-    Add, Cdc, Format, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME, CDC_NAME,
-    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
-};
+use super::*;
 
 #[derive(Default)]
 #[internal_api]
@@ -484,6 +482,89 @@ impl RowVisitor for SidecarVisitor {
     }
 }
 
+/// Visit data batches of actions to extract the latest domain metadata for each domain. Note that
+/// this will return all domains including 'removed' domains. The caller is responsible for either
+/// using or throwing away these tombstones.
+///
+/// Note that this visitor requires that the log (each actions batch) is replayed in reverse order.
+///
+/// This visitor maintains the first entry for each domain it encounters. A domain_filter may be
+/// included to only retain the domain metadata for a specific domain (in order to bound memory
+/// requirements).
+#[derive(Debug, Default)]
+pub(crate) struct DomainMetadataVisitor {
+    domain_metadatas: DomainMetadataMap,
+    domain_filter: Option<String>,
+}
+
+impl DomainMetadataVisitor {
+    /// Create a new visitor. When domain_filter is set then we only retain
+    pub(crate) fn new(domain_filter: Option<String>) -> Self {
+        DomainMetadataVisitor {
+            domain_filter,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn visit_domain_metadata<'a>(
+        row_index: usize,
+        domain: String,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<DomainMetadata> {
+        require!(
+            getters.len() == 3,
+            Error::InternalError(format!(
+                "Wrong number of DomainMetadataVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        let configuration: String = getters[1].get(row_index, "domainMetadata.configuration")?;
+        let removed: bool = getters[2].get(row_index, "domainMetadata.removed")?;
+        Ok(DomainMetadata {
+            domain,
+            configuration,
+            removed,
+        })
+    }
+
+    pub(crate) fn filter_found(&self) -> bool {
+        self.domain_filter.is_some() && !self.domain_metadatas.is_empty()
+    }
+
+    pub(crate) fn into_domain_metadatas(mut self) -> DomainMetadataMap {
+        // note that the resulting visitor.domain_metadatas includes removed domains, so we need to filter
+        self.domain_metadatas.retain(|_, dm| !dm.removed);
+        self.domain_metadatas
+    }
+}
+
+impl RowVisitor for DomainMetadataVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| DomainMetadata::to_schema().leaves(DOMAIN_METADATA_NAME));
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        // Requires that batches are visited in reverse order relative to the log
+        for i in 0..row_count {
+            let domain: Option<String> = getters[0].get_opt(i, "domainMetadata.domain")?;
+            if let Some(domain) = domain {
+                // if caller requested a specific domain then only visit matches
+                let filter = self.domain_filter.as_ref();
+                if filter.map_or(true, |requested| requested == &domain) {
+                    let domain_metadata =
+                        DomainMetadataVisitor::visit_domain_metadata(i, domain.clone(), getters)?;
+                    self.domain_metadatas
+                        .entry(domain)
+                        .or_insert(domain_metadata);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Get a DV out of some engine data. The caller is responsible for slicing the `getters` slice such
 /// that the first element contains the `storageType` element of the deletion vector.
 pub(crate) fn visit_deletion_vector_at<'a>(
@@ -723,5 +804,176 @@ mod tests {
                 last_updated: None,
             })
         );
+    }
+
+    #[test]
+    fn test_parse_domain_metadata() {
+        // note: we process commit_1, commit_0 since the visitor expects things in reverse order.
+        // these come from the 'more recent' commit
+        let json_strings: StringArray = vec![
+            r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
+            r#"{"domainMetadata":{"domain": "zach1","configuration":"cfg1","removed": true}}"#,
+            r#"{"domainMetadata":{"domain": "zach2","configuration":"cfg2","removed": false}}"#,
+            r#"{"domainMetadata":{"domain": "zach3","configuration":"cfg3","removed": true}}"#,
+            r#"{"domainMetadata":{"domain": "zach4","configuration":"cfg4","removed": false}}"#,
+            r#"{"domainMetadata":{"domain": "zach5","configuration":"cfg5","removed": true}}"#,
+            r#"{"domainMetadata":{"domain": "zach6","configuration":"cfg6","removed": false}}"#,
+        ]
+        .into();
+        let commit_1 = parse_json_batch(json_strings);
+        // these come from the 'older' commit
+        let json_strings: StringArray = vec![
+            r#"{"domainMetadata":{"domain": "zach1","configuration":"old_cfg1","removed": true}}"#,
+            r#"{"domainMetadata":{"domain": "zach2","configuration":"old_cfg2","removed": false}}"#,
+            r#"{"domainMetadata":{"domain": "zach3","configuration":"old_cfg3","removed": false}}"#,
+            r#"{"domainMetadata":{"domain": "zach4","configuration":"old_cfg4","removed": true}}"#,
+            r#"{"domainMetadata":{"domain": "zach7","configuration":"cfg7","removed": true}}"#,
+            r#"{"domainMetadata":{"domain": "zach8","configuration":"cfg8","removed": false}}"#,
+        ]
+        .into();
+        let commit_0 = parse_json_batch(json_strings);
+        let mut domain_metadata_visitor = DomainMetadataVisitor::default();
+        // visit commit 1 then 0
+        domain_metadata_visitor
+            .visit_rows_of(commit_1.as_ref())
+            .unwrap();
+        domain_metadata_visitor
+            .visit_rows_of(commit_0.as_ref())
+            .unwrap();
+        let actual = domain_metadata_visitor.domain_metadatas.clone();
+        let expected = DomainMetadataMap::from([
+            (
+                "zach1".to_string(),
+                DomainMetadata {
+                    domain: "zach1".to_string(),
+                    configuration: "cfg1".to_string(),
+                    removed: true,
+                },
+            ),
+            (
+                "zach2".to_string(),
+                DomainMetadata {
+                    domain: "zach2".to_string(),
+                    configuration: "cfg2".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach3".to_string(),
+                DomainMetadata {
+                    domain: "zach3".to_string(),
+                    configuration: "cfg3".to_string(),
+                    removed: true,
+                },
+            ),
+            (
+                "zach4".to_string(),
+                DomainMetadata {
+                    domain: "zach4".to_string(),
+                    configuration: "cfg4".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach5".to_string(),
+                DomainMetadata {
+                    domain: "zach5".to_string(),
+                    configuration: "cfg5".to_string(),
+                    removed: true,
+                },
+            ),
+            (
+                "zach6".to_string(),
+                DomainMetadata {
+                    domain: "zach6".to_string(),
+                    configuration: "cfg6".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach7".to_string(),
+                DomainMetadata {
+                    domain: "zach7".to_string(),
+                    configuration: "cfg7".to_string(),
+                    removed: true,
+                },
+            ),
+            (
+                "zach8".to_string(),
+                DomainMetadata {
+                    domain: "zach8".to_string(),
+                    configuration: "cfg8".to_string(),
+                    removed: false,
+                },
+            ),
+        ]);
+        assert_eq!(actual, expected);
+
+        let expected = DomainMetadataMap::from([
+            (
+                "zach2".to_string(),
+                DomainMetadata {
+                    domain: "zach2".to_string(),
+                    configuration: "cfg2".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach4".to_string(),
+                DomainMetadata {
+                    domain: "zach4".to_string(),
+                    configuration: "cfg4".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach6".to_string(),
+                DomainMetadata {
+                    domain: "zach6".to_string(),
+                    configuration: "cfg6".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach8".to_string(),
+                DomainMetadata {
+                    domain: "zach8".to_string(),
+                    configuration: "cfg8".to_string(),
+                    removed: false,
+                },
+            ),
+        ]);
+        assert_eq!(domain_metadata_visitor.into_domain_metadatas(), expected);
+
+        // test filtering
+        let mut domain_metadata_visitor = DomainMetadataVisitor::new(Some("zach3".to_string()));
+        domain_metadata_visitor
+            .visit_rows_of(commit_1.as_ref())
+            .unwrap();
+        domain_metadata_visitor
+            .visit_rows_of(commit_0.as_ref())
+            .unwrap();
+        let actual = domain_metadata_visitor.domain_metadatas.clone();
+        let expected = DomainMetadataMap::from([(
+            "zach3".to_string(),
+            DomainMetadata {
+                domain: "zach3".to_string(),
+                configuration: "cfg3".to_string(),
+                removed: true,
+            },
+        )]);
+        assert_eq!(actual, expected);
+        let expected = DomainMetadataMap::from([]);
+        assert_eq!(domain_metadata_visitor.into_domain_metadatas(), expected);
+
+        // test filtering for a domain that is not present
+        let mut domain_metadata_visitor = DomainMetadataVisitor::new(Some("notexist".to_string()));
+        domain_metadata_visitor
+            .visit_rows_of(commit_1.as_ref())
+            .unwrap();
+        domain_metadata_visitor
+            .visit_rows_of(commit_0.as_ref())
+            .unwrap();
+        assert!(domain_metadata_visitor.domain_metadatas.is_empty());
     }
 }
