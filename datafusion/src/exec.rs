@@ -71,7 +71,7 @@ impl ExecutionPlan for DeltaScanExec {
     fn properties(&self) -> &PlanProperties {
         // TODO: check individual properties and see if it is correct
         // to just forward them
-        &self.input.properties()
+        self.input.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

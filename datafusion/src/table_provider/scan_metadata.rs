@@ -17,7 +17,7 @@ use url::Url;
 use crate::error::to_df_err;
 
 #[async_trait::async_trait]
-pub trait TableSnapshot {
+pub trait TableSnapshot: std::fmt::Debug + Send + Sync {
     /// The logical schema of the table.
     ///
     /// This is the fully resolved schema as it is presented to the end user.

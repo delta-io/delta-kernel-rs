@@ -32,7 +32,7 @@ use crate::expressions::{to_datafusion_expr, to_delta_predicate};
 mod scan_metadata;
 
 pub struct DeltaTableProvider {
-    snapshot: Arc<DeltaTableSnapshot>,
+    snapshot: Arc<dyn TableSnapshot>,
 }
 
 impl std::fmt::Debug for DeltaTableProvider {
@@ -59,7 +59,7 @@ impl TableProvider for DeltaTableProvider {
     }
 
     fn schema(&self) -> ArrowSchemaRef {
-        Arc::clone(&self.snapshot.table_schema())
+        Arc::clone(self.snapshot.table_schema())
     }
 
     fn table_type(&self) -> TableType {
@@ -148,7 +148,7 @@ fn to_physical(
     physical_schema_df: &DFSchema,
     transform: &ExpressionRef,
 ) -> Result<Vec<Arc<dyn PhysicalExpr>>> {
-    to_datafusion_expr(&transform)?
+    to_datafusion_expr(transform)?
         .into_iter()
         .map(|expr: Expr| state.create_physical_expr(expr, physical_schema_df))
         .collect::<Result<Vec<_>>>()
@@ -197,7 +197,7 @@ async fn pq_access_plan(
     // Create a ParquetAccessPlan that will be used to skip rows based on the selection vector
     let mut row_groups: Vec<RowGroupAccess> = vec![];
     let mut row_group_row_start = 0;
-    for (_idx, row_group) in parquet_metadata.row_groups().iter().enumerate() {
+    for row_group in parquet_metadata.row_groups().iter() {
         // If all rows in the row group are deleted, skip the row group
         let row_group_access = get_row_group_access(
             &selection_vector,
