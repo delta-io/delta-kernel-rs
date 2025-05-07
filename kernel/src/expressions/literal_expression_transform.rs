@@ -3,6 +3,7 @@
 
 use std::borrow::Cow;
 use std::mem;
+use std::ops::Deref as _;
 
 use tracing::debug;
 
@@ -76,35 +77,48 @@ impl<'a, I: Iterator<Item = &'a Scalar>> LiteralExpressionTransform<'a, I> {
     }
 }
 
+// All leaf types (primitive, array, map) share the same "shape" of transformation logic
+macro_rules! transform_leaf {
+    ($self:ident, $type_variant:path, $type:ident) => {{
+        // first always check error to terminate early if possible
+        $self.error.as_ref().ok()?;
+
+        let Some(scalar) = $self.scalars.next() else {
+            $self.set_error(Error::InsufficientScalars);
+            return None;
+        };
+
+        // NOTE: Grab a reference here so code below can leverage the blanket Deref impl for &T
+        let $type_variant(ref scalar_type) = scalar.data_type() else {
+            $self.set_error(Error::Schema(format!(
+                "Mismatched scalar type while creating Expression: expected {}({:?}), got {:?}",
+                stringify!($type_variant),
+                $type,
+                scalar.data_type()
+            )));
+            return None;
+        };
+
+        // NOTE: &T and &Box<T> both deref-coerce to &T
+        if scalar_type.deref() != $type {
+            $self.set_error(Error::Schema(format!(
+                "Mismatched scalar type while creating Expression: expected {:?}, got {:?}",
+                $type, scalar_type
+            )));
+            return None;
+        }
+
+        $self.stack.push(Expression::Literal(scalar.clone()));
+        None
+    }};
+}
+
 impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressionTransform<'a, T> {
     fn transform_primitive(
         &mut self,
         prim_type: &'a PrimitiveType,
     ) -> Option<Cow<'a, PrimitiveType>> {
-        // first always check error to terminate early if possible
-        self.error.as_ref().ok()?;
-
-        let Some(scalar) = self.scalars.next() else {
-            self.set_error(Error::InsufficientScalars);
-            return None;
-        };
-
-        let DataType::Primitive(scalar_type) = scalar.data_type() else {
-            self.set_error(Error::Schema(
-                "Non-primitive scalar type {datatype} provided".to_string(),
-            ));
-            return None;
-        };
-        if scalar_type != *prim_type {
-            self.set_error(Error::Schema(format!(
-                "Mismatched scalar type while creating Expression: expected {}, got {}",
-                prim_type, scalar_type
-            )));
-            return None;
-        }
-
-        self.stack.push(Expression::Literal(scalar.clone()));
-        None
+        transform_leaf!(self, DataType::Primitive, prim_type)
     }
 
     fn transform_struct(&mut self, struct_type: &'a StructType) -> Option<Cow<'a, StructType>> {
@@ -162,56 +176,12 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
 
     // arrays treated as leaves
     fn transform_array(&mut self, array_type: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
-        // first always check error to terminate early if possible
-        self.error.as_ref().ok()?;
-        let Some(scalar) = self.scalars.next() else {
-            self.set_error(Error::InsufficientScalars);
-            return None;
-        };
-
-        let DataType::Array(scalar_type) = scalar.data_type() else {
-            self.set_error(Error::Schema(
-                "Non-array scalar type {datatype} provided for array leaf".to_string(),
-            ));
-            return None;
-        };
-        if scalar_type.as_ref() != array_type {
-            self.set_error(Error::Schema(format!(
-                "Mismatched scalar type while creating Expression: expected {:?}, got {:?}",
-                array_type, scalar_type
-            )));
-            return None;
-        }
-
-        self.stack.push(Expression::Literal(scalar.clone()));
-        None
+        transform_leaf!(self, DataType::Array, array_type)
     }
 
     // maps treated as leaves
     fn transform_map(&mut self, map_type: &'a MapType) -> Option<Cow<'a, MapType>> {
-        // first always check error to terminate early if possible
-        self.error.as_ref().ok()?;
-        let Some(scalar) = self.scalars.next() else {
-            self.set_error(Error::InsufficientScalars);
-            return None;
-        };
-
-        let DataType::Map(scalar_type) = scalar.data_type() else {
-            self.set_error(Error::Schema(
-                "Non-map scalar type {datatype} provided for map leaf".to_string(),
-            ));
-            return None;
-        };
-        if scalar_type.as_ref() != map_type {
-            self.set_error(Error::Schema(format!(
-                "Mismatched scalar type while creating Expression: expected {:?}, got {:?}",
-                map_type, scalar_type
-            )));
-            return None;
-        }
-
-        self.stack.push(Expression::Literal(scalar.clone()));
-        None
+        transform_leaf!(self, DataType::Map, map_type)
     }
 }
 
