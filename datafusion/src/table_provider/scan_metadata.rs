@@ -181,11 +181,11 @@ impl ScanContext {
         Ok(match Url::parse(path) {
             Ok(url) => url,
             Err(_) => {
-                let file_url = self
+                
+                self
                     .table_root
                     .join(path)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                file_url
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?
             }
         })
     }

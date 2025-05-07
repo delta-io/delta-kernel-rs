@@ -93,7 +93,7 @@ impl EvaluationHandler for DataFusionEvaluationHandler {
 
         let df_schema: DFSchema = match arrow_schema.try_into() {
             Ok(v) => v,
-            Err(e) => return with_error(e.into()),
+            Err(e) => return with_error(e),
         };
 
         let state = self.state.read();
@@ -142,8 +142,7 @@ impl DataFusionExpressionEvaluator {
             0 => Ok(()),
             _ => Err(self
                 .init_errors
-                .iter()
-                .next()
+                .first()
                 .map(|e| DeltaError::generic(e.to_string()))
                 .expect("length matched 1")),
         }
@@ -152,11 +151,13 @@ impl DataFusionExpressionEvaluator {
 impl ExpressionEvaluator for DataFusionExpressionEvaluator {
     fn evaluate(&self, data: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         self.raise_errors()?;
+
         let batch = data
             .any_ref()
             .downcast_ref::<ArrowEngineData>()
             .ok_or_else(|| DeltaError::engine_data_type("ArrowEngineData"))?
             .record_batch();
+
         let results = self
             .physical_expressions
             .iter()
@@ -200,13 +201,6 @@ mod tests {
         let a = Int32Array::from(vec![Some(1), Some(2), None]);
         let b = StringArray::from(vec![Some("x"), Some("y"), Some("z")]);
         RecordBatch::try_new(schema, vec![Arc::new(a), Arc::new(b)]).unwrap()
-    }
-
-    fn create_test_schema() -> SchemaRef {
-        Arc::new(StructType::new(vec![
-            StructField::new("a", DataType::Primitive(PrimitiveType::Integer), true),
-            StructField::new("b", DataType::Primitive(PrimitiveType::String), true),
-        ]))
     }
 
     #[test]

@@ -126,8 +126,7 @@ impl TableProvider for DeltaTableProvider {
         let files_by_store = table_scan
             .files
             .into_iter()
-            .map(to_partitioned_file)
-            .flatten()
+            .flat_map(to_partitioned_file)
             .into_group_map();
         let plan = get_read_plan(files_by_store, &table_scan.physical_schema, state, limit).await?;
 
