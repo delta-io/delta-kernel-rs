@@ -1,106 +1,113 @@
-//! Provides engine implementation that implement the required traits. These engines can optionally
-//! be built into the kernel by setting the `default-engine` or `sync-engine` feature flags. See the
-//! related modules for more information.
+//! A simple, single threaded, [`Engine`] that can only read from the local filesystem
 
-#[cfg(feature = "arrow-conversion")]
-pub(crate) mod arrow_conversion;
+use super::arrow_expression::ArrowEvaluationHandler;
+use crate::engine::arrow_data::ArrowEngineData;
+use crate::{
+    DeltaResult, Engine, Error, EvaluationHandler, FileDataReadResultIterator, FileMeta,
+    JsonHandler, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
+};
 
-#[cfg(all(
-    feature = "arrow-expression",
-    any(feature = "default-engine-base", feature = "sync-engine")
-))]
-pub mod arrow_expression;
-#[cfg(feature = "arrow-expression")]
-pub(crate) mod arrow_utils;
+use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use itertools::Itertools;
+use std::fs::File;
+use std::sync::Arc;
+use tracing::debug;
 
-#[cfg(feature = "default-engine-base")]
-pub mod default;
+pub(crate) mod json;
+mod parquet;
+mod storage;
 
-#[cfg(feature = "sync-engine")]
-pub mod sync;
+/// This is a simple implementation of [`Engine`]. It only supports reading data from the local
+/// filesystem, and internally represents data using `Arrow`.
+pub struct SyncEngine {
+    storage_handler: Arc<storage::SyncStorageHandler>,
+    json_handler: Arc<json::SyncJsonHandler>,
+    parquet_handler: Arc<parquet::SyncParquetHandler>,
+    evaluation_handler: Arc<ArrowEvaluationHandler>,
+}
 
-#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
-pub mod arrow_data;
-#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
-pub(crate) mod arrow_get_data;
-#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
-pub(crate) mod ensure_data_types;
-#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
-pub mod parquet_row_group_skipping;
+impl SyncEngine {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        SyncEngine {
+            storage_handler: Arc::new(storage::SyncStorageHandler {}),
+            json_handler: Arc::new(json::SyncJsonHandler {}),
+            parquet_handler: Arc::new(parquet::SyncParquetHandler {}),
+            evaluation_handler: Arc::new(ArrowEvaluationHandler {}),
+        }
+    }
+}
+
+impl Engine for SyncEngine {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+        self.evaluation_handler.clone()
+    }
+
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        self.storage_handler.clone()
+    }
+
+    /// Get the connector provided [`ParquetHandler`].
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        self.parquet_handler.clone()
+    }
+
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        self.json_handler.clone()
+    }
+}
+
+fn read_files<F, I>(
+    files: &[FileMeta],
+    schema: SchemaRef,
+    predicate: Option<PredicateRef>,
+    mut try_create_from_file: F,
+) -> DeltaResult<FileDataReadResultIterator>
+where
+    I: Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static,
+    F: FnMut(File, SchemaRef, ArrowSchemaRef, Option<PredicateRef>) -> DeltaResult<I>
+        + Send
+        + 'static,
+{
+    debug!("Reading files: {files:#?} with schema {schema:#?} and predicate {predicate:#?}");
+    if files.is_empty() {
+        return Ok(Box::new(std::iter::empty()));
+    }
+    let arrow_schema = Arc::new(ArrowSchema::try_from(&*schema)?);
+    let files = files.to_vec();
+    let result = files
+        .into_iter()
+        // Produces Iterator<DeltaResult<Iterator<DeltaResult<ArrowEngineData>>>>
+        .map(move |file| {
+            let location = file.location;
+            debug!("Reading {location:#?} with schema {schema:#?} and predicate {predicate:#?}");
+            let path = location
+                .to_file_path()
+                .map_err(|_| Error::generic("can only read local files"))?;
+            try_create_from_file(
+                File::open(path)?,
+                schema.clone(),
+                arrow_schema.clone(),
+                predicate.clone(),
+            )
+        })
+        // Flatten to Iterator<DeltaResult<DeltaResult<ArrowEngineData>>>
+        .flatten_ok()
+        // Double unpack and map Iterator<DeltaResult<Box<EngineData>>>
+        .map(|data| Ok(Box::new(ArrowEngineData::new(data??.into())) as _));
+    Ok(Box::new(result))
+}
 
 #[cfg(test)]
 mod tests {
-    use crate::object_store::path::Path;
-    use itertools::Itertools;
-    use std::sync::Arc;
-    use url::Url;
+    use super::*;
+    use crate::engine::tests::test_arrow_engine;
 
-    use crate::arrow::array::{RecordBatch, StringArray};
-    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-    use crate::engine::arrow_data::ArrowEngineData;
-    use crate::{Engine, EngineData};
-
-    use test_utils::delta_path_for_version;
-
-    fn test_list_from_should_sort_and_filter(
-        engine: &dyn Engine,
-        base_url: &Url,
-        engine_data: impl Fn() -> Box<dyn EngineData>,
-    ) {
-        let json = engine.json_handler();
-        let get_data = || Box::new(std::iter::once(Ok(engine_data())));
-
-        let expected_names: Vec<Path> = (1..4)
-            .map(|i| delta_path_for_version(i, "json"))
-            .collect_vec();
-
-        for i in expected_names.iter().rev() {
-            let path = base_url.join(i.as_ref()).unwrap();
-            json.write_json_file(&path, get_data(), false).unwrap();
-        }
-        let path = base_url.join("other").unwrap();
-        json.write_json_file(&path, get_data(), false).unwrap();
-
-        let storage = engine.storage_handler();
-
-        // list files after an offset
-        let test_url = base_url.join(expected_names[0].as_ref()).unwrap();
-        let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().unwrap();
-        assert_eq!(files.len(), expected_names.len() - 1);
-        for (file, expected) in files.iter().zip(expected_names.iter().skip(1)) {
-            assert_eq!(file.location, base_url.join(expected.as_ref()).unwrap());
-        }
-
-        let test_url = base_url
-            .join(delta_path_for_version(0, "json").as_ref())
-            .unwrap();
-        let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().unwrap();
-        assert_eq!(files.len(), expected_names.len());
-
-        // list files inside a directory / key prefix
-        let test_url = base_url.join("_delta_log/").unwrap();
-        let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().unwrap();
-        assert_eq!(files.len(), expected_names.len());
-        for (file, expected) in files.iter().zip(expected_names.iter()) {
-            assert_eq!(file.location, base_url.join(expected.as_ref()).unwrap());
-        }
-    }
-
-    fn get_arrow_data() -> Box<dyn EngineData> {
-        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "dog",
-            ArrowDataType::Utf8,
-            true,
-        )]));
-        let data = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(StringArray::from(vec!["remi", "wilson"]))],
-        )
-        .unwrap();
-        Box::new(ArrowEngineData::new(data))
-    }
-
-    pub(crate) fn test_arrow_engine(engine: &dyn Engine, base_url: &Url) {
-        test_list_from_should_sort_and_filter(engine, base_url, get_arrow_data);
+    #[test]
+    fn test_sync_engine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = url::Url::from_directory_path(tmp.path()).unwrap();
+        let engine = SyncEngine::new();
+        test_arrow_engine(&engine, &url);
     }
 }

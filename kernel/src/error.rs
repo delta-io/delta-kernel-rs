@@ -10,11 +10,6 @@ use crate::schema::{DataType, StructType};
 use crate::table_properties::ParseIntervalError;
 use crate::Version;
 
-#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
-use crate::arrow::error::ArrowError;
-#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
-use crate::object_store;
-
 /// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
 
@@ -31,11 +26,6 @@ pub enum Error {
         source: Box<Self>,
         backtrace: Box<Backtrace>,
     },
-
-    /// An error performing operations on arrow data
-    #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
-    #[error(transparent)]
-    Arrow(ArrowError),
 
     #[error("Error writing checkpoint: {0}")]
     CheckpointWrite(String),
@@ -66,27 +56,6 @@ pub enum Error {
     /// An internal error that means kernel found an unexpected situation, which is likely a bug
     #[error("Internal error {0}. This is a kernel bug, please report.")]
     InternalError(String),
-
-    /// An error enountered while working with parquet data
-    #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
-    #[error("Arrow error: {0}")]
-    Parquet(#[from] crate::parquet::errors::ParquetError),
-
-    /// An error interacting with the object_store crate
-    // We don't use [#from] object_store::Error here as our From impl transforms
-    // object_store::Error::NotFound into Self::FileNotFound
-    #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
-    #[error("Error interacting with object store: {0}")]
-    ObjectStore(object_store::Error),
-
-    /// An error working with paths from the object_store crate
-    #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
-    #[error("Object store path error: {0}")]
-    ObjectStorePath(#[from] object_store::path::Error),
-
-    #[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
-    #[error("Reqwest Error: {0}")]
-    Reqwest(#[from] reqwest::Error),
 
     /// A specified file could not be found
     #[error("File not found: {0}")]
@@ -329,20 +298,3 @@ from_with_backtrace!(
     (serde_json::Error, MalformedJson),
     (std::io::Error, IOError)
 );
-
-#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
-impl From<ArrowError> for Error {
-    fn from(value: ArrowError) -> Self {
-        Self::Arrow(value).with_backtrace()
-    }
-}
-
-#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
-impl From<object_store::Error> for Error {
-    fn from(value: object_store::Error) -> Self {
-        match value {
-            object_store::Error::NotFound { path, .. } => Self::file_not_found(path),
-            err => Self::ObjectStore(err),
-        }
-    }
-}
