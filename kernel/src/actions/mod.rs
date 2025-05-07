@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 pub mod deletion_vector;
 pub mod set_transaction;
 
+pub(crate) mod domain_metadata;
 pub(crate) mod schemas;
 internal_mod!(pub(crate) mod visitors);
 
@@ -50,6 +51,10 @@ pub(crate) const CDC_NAME: &str = "cdc";
 pub(crate) const SIDECAR_NAME: &str = "sidecar";
 #[internal_api]
 pub(crate) const CHECKPOINT_METADATA_NAME: &str = "checkpointMetadata";
+#[internal_api]
+pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
+
+pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
 static LOG_ADD_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| StructType::new([Option::<Add>::get_struct_field(ADD_NAME)]).into());
@@ -65,8 +70,7 @@ static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         Option::<Cdc>::get_struct_field(CDC_NAME),
         Option::<Sidecar>::get_struct_field(SIDECAR_NAME),
         Option::<CheckpointMetadata>::get_struct_field(CHECKPOINT_METADATA_NAME),
-        // We don't support the following actions yet
-        //Option::<DomainMetadata>::get_struct_field(DOMAIN_METADATA_NAME),
+        Option::<DomainMetadata>::get_struct_field(DOMAIN_METADATA_NAME),
     ])
     .into()
 });
@@ -78,6 +82,13 @@ static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 static LOG_TXN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     StructType::new([Option::<SetTransaction>::get_struct_field(
         SET_TRANSACTION_NAME,
+    )])
+    .into()
+});
+
+static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    StructType::new([Option::<DomainMetadata>::get_struct_field(
+        DOMAIN_METADATA_NAME,
     )])
     .into()
 });
@@ -98,6 +109,10 @@ pub(crate) fn get_log_commit_info_schema() -> &'static SchemaRef {
 
 pub(crate) fn get_log_txn_schema() -> &'static SchemaRef {
     &LOG_TXN_SCHEMA
+}
+
+pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
+    &LOG_DOMAIN_METADATA_SCHEMA
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
@@ -655,6 +670,30 @@ pub(crate) struct CheckpointMetadata {
     pub(crate) tags: Option<HashMap<String, String>>,
 }
 
+/// The [DomainMetadata] action contains a configuration (string) for a named metadata domain. Two
+/// overlapping transactions conflict if they both contain a domain metadata action for the same
+/// metadata domain.
+///
+/// Note that the `delta.*` domain is reserved for internal use.
+///
+/// [DomainMetadata]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#domain-metadata
+#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[internal_api]
+pub(crate) struct DomainMetadata {
+    domain: String,
+    configuration: String,
+    removed: bool,
+}
+
+impl DomainMetadata {
+    // returns true if the domain metadata is an system-controlled domain (all domains that start
+    // with "delta.")
+    #[allow(unused)]
+    fn is_internal(&self) -> bool {
+        self.domain.starts_with(INTERNAL_DOMAIN_PREFIX)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -868,6 +907,22 @@ mod tests {
                     "engineCommitInfo",
                     MapType::new(DataType::STRING, DataType::STRING, false),
                 ),
+            ]),
+        )]));
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn test_domain_metadata_schema() {
+        let schema = get_log_schema()
+            .project(&[DOMAIN_METADATA_NAME])
+            .expect("Couldn't get domainMetadata field");
+        let expected = Arc::new(StructType::new([StructField::nullable(
+            "domainMetadata",
+            StructType::new([
+                StructField::not_null("domain", DataType::STRING),
+                StructField::not_null("configuration", DataType::STRING),
+                StructField::not_null("removed", DataType::BOOLEAN),
             ]),
         )]));
         assert_eq!(schema, expected);
