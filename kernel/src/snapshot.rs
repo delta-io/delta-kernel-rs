@@ -324,7 +324,7 @@ impl Snapshot {
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
     pub fn get_app_id_version(
-        &self,
+        self: Arc<Self>,
         application_id: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
