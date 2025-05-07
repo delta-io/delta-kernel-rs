@@ -241,7 +241,7 @@ fn assert_last_checkpoint_contents(
     expected_version: u64,
     expected_size: u64,
     expected_num_add_files: u64,
-    expected_size_in_bytes: i64,
+    expected_size_in_bytes: u64,
 ) -> DeltaResult<()> {
     let last_checkpoint_data = read_last_checkpoint_file(store)?;
     let expected_data = json!({
@@ -331,7 +331,7 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action
     // - numOfAddFiles: 1 add file from 2nd commit (fake_path_2)
     // - sizeInBytes: passed to finalize (10)
-    assert_last_checkpoint_contents(&store, 2, 4, 1, size_in_bytes.try_into().unwrap())?;
+    assert_last_checkpoint_contents(&store, 2, 4, 1, size_in_bytes)?;
 
     Ok(())
 }
@@ -394,7 +394,7 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     // - size: 1 metadata + 1 protocol
     // - numOfAddFiles: no add files in version 0
     // - sizeInBytes: passed to finalize (10)
-    assert_last_checkpoint_contents(&store, 0, 2, 0, size_in_bytes.try_into().unwrap())?;
+    assert_last_checkpoint_contents(&store, 0, 2, 0, size_in_bytes)?;
 
     Ok(())
 }
@@ -426,8 +426,11 @@ fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaR
     };
 
     // Attempt to finalize the checkpoint with an iterator that has not been fully consumed
-    writer.finalize(&engine, &metadata, data_iter).expect_err(
-        "The checkpoint data must be fully exhausted from the iterator and written to storage before calling finalize",
+    let err = writer
+        .finalize(&engine, &metadata, data_iter)
+        .expect_err("finalize should fail");
+    assert!(
+        err.to_string().contains("Error writing checkpoint: The checkpoint data iterator must be fully consumed and written to storage before calling finalize")
     );
 
     Ok(())
@@ -501,7 +504,7 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action + 1 checkpointMetadata
     // - numOfAddFiles: 1 add file from version 0
     // - sizeInBytes: passed to finalize (10)
-    assert_last_checkpoint_contents(&store, 1, 5, 1, size_in_bytes.try_into().unwrap())?;
+    assert_last_checkpoint_contents(&store, 1, 5, 1, size_in_bytes)?;
 
     Ok(())
 }

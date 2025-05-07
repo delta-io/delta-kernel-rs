@@ -213,7 +213,7 @@ pub struct CheckpointWriter {
 impl CheckpointWriter {
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
     pub(crate) fn try_new(snapshot: Arc<Snapshot>) -> DeltaResult<Self> {
-        let version: i64 = snapshot.version().try_into().map_err(|e| {
+        let version = i64::try_from(snapshot.version()).map_err(|e| {
             Error::CheckpointWrite(format!(
                 "Failed to convert checkpoint version from u64 {} to i64: {}",
                 snapshot.version(),
@@ -313,11 +313,11 @@ impl CheckpointWriter {
         // Ensure the checkpoint data iterator is fully exhausted
         if checkpoint_data.checkpoint_batch_iterator.next().is_some() {
             return Err(Error::checkpoint_write(
-                "The checkpoint data must be fully exhausted from the iterator and written to storage before calling finalize"
+                "The checkpoint data iterator must be fully consumed and written to storage before calling finalize"
             ));
         }
 
-        let size_in_bytes: i64 = metadata.size.try_into().map_err(|e| {
+        let size_in_bytes = i64::try_from(metadata.size).map_err(|e| {
             Error::CheckpointWrite(format!(
                 "Failed to convert checkpoint size in bytes from u64 {} to i64: {}, when writing _last_checkpoint",
                 metadata.size, e
@@ -368,17 +368,9 @@ impl CheckpointWriter {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<CheckpointBatch> {
-        let version: i64 = self.snapshot.version().try_into().map_err(|e| {
-            Error::CheckpointWrite(format!(
-                "Failed to convert checkpoint version from u64 {} to i64: {}",
-                self.snapshot.version(),
-                e
-            ))
-        })?;
-
         let checkpoint_metadata_batch = engine.evaluation_handler().create_one(
             CHECKPOINT_METADATA_ACTION_SCHEMA.clone(),
-            &[Scalar::from(version)],
+            &[Scalar::from(self.version)],
         )?;
 
         let filtered_data = FilteredEngineData {
@@ -441,14 +433,10 @@ fn deleted_file_retention_timestamp_with_time(
         retention_duration.unwrap_or_else(|| Duration::from_secs(DEFAULT_RETENTION_SECS));
 
     // Convert to milliseconds for remove action deletion_timestamp comparison
-    let now_ms: i64 = now_duration
-        .as_millis()
-        .try_into()
+    let now_ms = i64::try_from(now_duration.as_millis())
         .map_err(|_| Error::checkpoint_write("Current timestamp exceeds i64 millisecond range"))?;
 
-    let retention_ms: i64 = retention_duration
-        .as_millis()
-        .try_into()
+    let retention_ms = i64::try_from(retention_duration.as_millis())
         .map_err(|_| Error::checkpoint_write("Retention duration exceeds i64 millisecond range"))?;
 
     // Simple subtraction - will produce negative values if retention > now
