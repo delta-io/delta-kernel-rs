@@ -1,4 +1,5 @@
-And
+StructExpression
+  Column(col)
   Byte(127)
   Byte(-128)
   Float(340282346638528859811704183484516925440.000000)
@@ -34,48 +35,62 @@ And
     String(key1): String(val1)
     String(key2): String(val2)
   StructExpression
-    Or
+    Integer(5)
+    Long(20)
+  Divide
+    Integer(0)
+    Integer(0)
+  Multiply
+    Integer(0)
+    Integer(0)
+  Add
+    Integer(0)
+    Integer(0)
+  Minus
+    Integer(0)
+    Integer(0)
+And
+  Column(col)
+  Boolean(1)
+  Boolean(0)
+  In
+    Integer(10)
+    Array
+      Short(5)
+      Short(0)
+  NotIn
+    Integer(10)
+    Array
+      Short(5)
+      Short(0)
+  Or
+    Equal
       Integer(5)
-      Long(20)
+      Integer(10)
+    NotEqual
+      Integer(20)
+      Integer(10)
   Not
     IsNull
       Column(col)
-  In
-    Integer(0)
-    Long(0)
-  Add
-    Integer(0)
-    Long(0)
-  Minus
-    Integer(0)
-    Long(0)
   Equal
     Integer(0)
-    Long(0)
+    Integer(0)
   NotEqual
     Integer(0)
-    Long(0)
-  NotIn
     Integer(0)
-    Long(0)
-  Divide
-    Integer(0)
-    Long(0)
-  Multiply
-    Integer(0)
-    Long(0)
   LessThan
     Integer(0)
-    Long(0)
+    Integer(0)
   LessThanOrEqual
     Integer(0)
-    Long(0)
+    Integer(0)
   GreaterThan
     Integer(0)
-    Long(0)
+    Integer(0)
   GreaterThanOrEqual
     Integer(0)
-    Long(0)
+    Integer(0)
   Distinct
     Integer(0)
-    Long(0)
+    Integer(0)
