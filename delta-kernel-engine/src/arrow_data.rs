@@ -10,6 +10,8 @@ use delta_kernel::engine_data::{EngineData, EngineList, EngineMap, GetData, RowV
 use delta_kernel::schema::{ColumnName, DataType};
 use tracing::debug;
 
+use crate::arrow_get_data::*;
+
 use delta_kernel::{DeltaResult, Error};
 
 pub use crate::arrow_utils::fix_nested_null_masks;
@@ -67,16 +69,16 @@ impl From<Box<ArrowEngineData>> for RecordBatch {
     }
 }
 
-impl<OffsetSize> EngineList for GenericListArray<OffsetSize>
+impl<OffsetSize> EngineList for ArrowListArray<'_, OffsetSize>
 where
     OffsetSize: OffsetSizeTrait,
 {
     fn len(&self, row_index: usize) -> usize {
-        self.value(row_index).len()
+        self.0.value(row_index).len()
     }
 
     fn get(&self, row_index: usize, index: usize) -> String {
-        let arry = self.value(row_index);
+        let arry = self.0.value(row_index);
         let sarry = arry.as_string::<i32>();
         sarry.value(index).to_string()
     }
@@ -90,17 +92,17 @@ where
     }
 }
 
-impl EngineMap for MapArray {
+impl EngineMap for ArrowMapArray<'_> {
     fn get<'a>(&'a self, row_index: usize, key: &str) -> Option<&'a str> {
-        let offsets = self.offsets();
+        let offsets = self.0.offsets();
         let start_offset = offsets[row_index] as usize;
         let count = offsets[row_index + 1] as usize - start_offset;
-        let keys = self.keys().as_string::<i32>();
+        let keys = self.0.keys().as_string::<i32>();
         for (idx, map_key) in keys.iter().enumerate().skip(start_offset).take(count) {
             if let Some(map_key) = map_key {
                 if key == map_key {
                     // found the item
-                    let vals = self.values().as_string::<i32>();
+                    let vals = self.0.values().as_string::<i32>();
                     return Some(vals.value(idx));
                 }
             }
@@ -110,7 +112,7 @@ impl EngineMap for MapArray {
 
     fn materialize(&self, row_index: usize) -> HashMap<String, String> {
         let mut ret = HashMap::new();
-        let map_val = self.value(row_index);
+        let map_val = self.0.value(row_index);
         let keys = map_val.column(0).as_string::<i32>();
         let values = map_val.column(1).as_string::<i32>();
         for (key, value) in keys.iter().zip(values.iter()) {
@@ -215,7 +217,8 @@ impl ArrowEngineData {
                 } else {
                     let data_type = &leaf_types[getters.len()];
                     let getter = Self::extract_leaf_column(path, data_type, column)?;
-                    getters.push(getter);
+                    // FIXME: i think we need getters to keep a Vec of Boxes
+                    getters.push(Box::leak(getter));
                 }
             } else {
                 debug!("Skipping unmasked path {}", ColumnName::new(path.iter()));
@@ -229,41 +232,47 @@ impl ArrowEngineData {
         path: &[String],
         data_type: &DataType,
         col: &'a dyn Array,
-    ) -> DeltaResult<&'a dyn GetData<'a>> {
+    ) -> DeltaResult<Box<dyn GetData<'a> + 'a>> {
         use ArrowDataType::Utf8;
         let col_as_list = || {
             if let Some(array) = col.as_list_opt::<i32>() {
-                (array.value_type() == Utf8).then_some(array as _)
+                // NOTE: all of these `as _` casts are doing: as Box<dyn GetData<'a> + 'a>
+                (array.value_type() == Utf8).then_some(Box::new(ArrowListArray(array)) as _)
             } else if let Some(array) = col.as_list_opt::<i64>() {
-                (array.value_type() == Utf8).then_some(array as _)
+                (array.value_type() == Utf8).then_some(Box::new(ArrowListArray(array)) as _)
             } else {
                 None
             }
         };
         let col_as_map = || {
             col.as_map_opt().and_then(|array| {
-                (array.key_type() == &Utf8 && array.value_type() == &Utf8).then_some(array as _)
+                (array.key_type() == &Utf8 && array.value_type() == &Utf8)
+                    .then_some(Box::new(ArrowMapArray(array)) as _)
             })
         };
-        let result: Result<&'a dyn GetData<'a>, _> = match data_type {
+        let result: Result<Box<dyn GetData<'a> + 'a>, _> = match data_type {
             &DataType::BOOLEAN => {
                 debug!("Pushing boolean array for {}", ColumnName::new(path));
-                col.as_boolean_opt().map(|a| a as _).ok_or("bool")
+                col.as_boolean_opt()
+                    .map(|a| Box::new(ArrowBooleanArray(a)) as _)
+                    .ok_or("bool")
             }
             &DataType::STRING => {
                 debug!("Pushing string array for {}", ColumnName::new(path));
-                col.as_string_opt().map(|a| a as _).ok_or("string")
+                col.as_string_opt()
+                    .map(|a| Box::new(ArrowStringArray(a)) as _)
+                    .ok_or("string")
             }
             &DataType::INTEGER => {
                 debug!("Pushing int32 array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Int32Type>()
-                    .map(|a| a as _)
+                    .map(|a| Box::new(ArrowPrimitiveArrayInt32(a)) as _)
                     .ok_or("int")
             }
             &DataType::LONG => {
                 debug!("Pushing int64 array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Int64Type>()
-                    .map(|a| a as _)
+                    .map(|a| Box::new(ArrowPrimitiveArrayInt64(a)) as _)
                     .ok_or("long")
             }
             DataType::Array(_) => {
