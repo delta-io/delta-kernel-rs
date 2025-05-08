@@ -47,7 +47,7 @@ pub(crate) struct LogSegment {
     pub log_root: Url,
     /// Sorted commit files in the log segment (ascending)
     pub ascending_commit_files: Vec<ParsedLogPath>,
-    /// Sorted (by end version) compaction files in the log segment (ascending)
+    /// Sorted (by start version) compaction files in the log segment (ascending)
     pub ascending_compaction_files: Vec<ParsedLogPath>,
     /// Checkpoint files in the log segment.
     pub checkpoint_parts: Vec<ParsedLogPath>,
@@ -59,7 +59,11 @@ impl LogSegment {
         log_root: Url,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        let ListedLogFiles { mut ascending_commit_files, ascending_compaction_files, checkpoint_parts } = listed_files;
+        let ListedLogFiles {
+            mut ascending_commit_files,
+            ascending_compaction_files,
+            checkpoint_parts,
+        } = listed_files;
 
         // Commit file versions must be greater than the most recent checkpoint version if it exists
         let checkpoint_version = checkpoint_parts.first().map(|checkpoint_file| {
@@ -137,22 +141,15 @@ impl LogSegment {
     ) -> DeltaResult<Self> {
         let time_travel_version = time_travel_version.into();
 
-        let listed_files =
-            match (checkpoint_hint.into(), time_travel_version) {
-                (Some(cp), None) => list_log_files_with_checkpoint(&cp, storage, &log_root, None)?,
-                (Some(cp), Some(end_version)) if cp.version <= end_version => {
-                    list_log_files_with_checkpoint(&cp, storage, &log_root, Some(end_version))?
-                }
-                _ => list_log_files_with_version(storage, &log_root, None, time_travel_version)?,
-            };
+        let listed_files = match (checkpoint_hint.into(), time_travel_version) {
+            (Some(cp), None) => list_log_files_with_checkpoint(&cp, storage, &log_root, None)?,
+            (Some(cp), Some(end_version)) if cp.version <= end_version => {
+                list_log_files_with_checkpoint(&cp, storage, &log_root, Some(end_version))?
+            }
+            _ => list_log_files_with_version(storage, &log_root, None, time_travel_version)?,
+        };
 
-        println!("Listed files here: {listed_files:#?}");
-
-        LogSegment::try_new(
-            listed_files,
-            log_root,
-            time_travel_version,
-        )
+        LogSegment::try_new(listed_files, log_root, time_travel_version)
     }
 
     /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between versions
@@ -482,9 +479,6 @@ pub(crate) fn list_log_files_with_version(
     // We expect 10 commit files per checkpoint, so start with that size. We could adjust this based
     // on config at some point
 
-    println!("start version: {:?}", start_version);
-    println!("end version: {:?}", end_version);
-
     let log_files = list_log_files(storage, log_root, start_version, end_version)?;
 
     log_files.process_results(|iter| {
@@ -503,7 +497,7 @@ pub(crate) fn list_log_files_with_version(
                 } else if file.is_compaction() {
                     let include = if let Some(end_version) = end_version {
                         // validate this compaction doesn't extend too far
-                        if let LogPathFileType::CompactedCommit{ hi } = file.file_type {
+                        if let LogPathFileType::CompactedCommit { hi } = file.file_type {
                             hi <= end_version
                         } else {
                             warn!("Found compaction file with type != CompactedCommit");
@@ -513,7 +507,7 @@ pub(crate) fn list_log_files_with_version(
                         true
                     };
                     if include {
-                           compaction_files.push(file);
+                        compaction_files.push(file);
                     }
                 } else if file.is_checkpoint() {
                     new_checkpoint_parts.push(file);
