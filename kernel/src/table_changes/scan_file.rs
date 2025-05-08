@@ -244,12 +244,14 @@ mod tests {
 
     use super::{scan_metadata_to_scan_file, CdfScanFile, CdfScanFileType};
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
-    use crate::actions::{Add, Cdc, Remove};
+    use crate::actions::{Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
     use crate::scan::state::DvInfo;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::log_replay::table_changes_action_iter;
+    use crate::table_configuration::TableConfiguration;
+    use crate::table_features::WriterFeature;
     use crate::utils::test_utils::{Action, LocalMockTable};
     use crate::Engine as _;
 
@@ -312,6 +314,12 @@ mod tests {
             ..Default::default()
         };
 
+        let cdc_timestamp = 12345678;
+        let commit_info = CommitInfo {
+            in_commit_timestamp: Some(cdc_timestamp),
+            ..Default::default()
+        };
+
         mock_table
             .commit([
                 Action::Remove(remove_paired.clone()),
@@ -319,7 +327,12 @@ mod tests {
                 Action::Remove(remove.clone()),
             ])
             .await;
-        mock_table.commit([Action::Cdc(cdc.clone())]).await;
+        mock_table
+            .commit([
+                Action::CommitInfo(commit_info.clone()),
+                Action::Cdc(cdc.clone()),
+            ])
+            .await;
         mock_table
             .commit([Action::Remove(remove_no_partition.clone())])
             .await;
@@ -329,15 +342,44 @@ mod tests {
         let log_segment =
             LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, None)
                 .unwrap();
+
         let table_schema = StructType::new([
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),
         ]);
+
+        let schema_string = serde_json::to_string(&table_schema).unwrap();
+        let metadata = Metadata {
+            schema_string,
+            configuration: HashMap::from([
+                ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+                (
+                    "delta.enableDeletionVectors".to_string(),
+                    "true".to_string(),
+                ),
+                ("delta.columnMapping.mode".to_string(), "none".to_string()),
+                (
+                    "delta.enableInCommitTimestamps".to_string(),
+                    "true".to_string(),
+                ),
+            ]),
+            ..Default::default()
+        };
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some(vec![WriterFeature::InCommitTimestamp]),
+        )
+        .unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
         let scan_metadata = table_changes_action_iter(
             Arc::new(engine),
             log_segment.ascending_commit_files.clone(),
             table_schema.into(),
             None,
+            table_config,
         )
         .unwrap();
         let scan_files: Vec<_> = scan_metadata_to_scan_file(scan_metadata)
@@ -384,7 +426,7 @@ mod tests {
                 },
                 partition_values: cdc.partition_values,
                 commit_version: 1,
-                commit_timestamp: timestamps[1],
+                commit_timestamp: cdc_timestamp,
                 remove_dv: None,
             },
             CdfScanFile {
