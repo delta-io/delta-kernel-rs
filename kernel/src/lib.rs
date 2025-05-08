@@ -78,6 +78,7 @@ pub mod checkpoint;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
+pub mod kernel_predicates;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -88,7 +89,6 @@ pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
 
-pub(crate) mod kernel_predicates;
 pub(crate) mod utils;
 
 internal_mod!(pub(crate) mod path);

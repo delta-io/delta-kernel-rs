@@ -15,6 +15,17 @@ pub(crate) mod arrow_get_data;
 pub(crate) mod arrow_utils;
 pub(crate) mod ensure_data_types;
 
+/// convenient way to return an error if a condition isn't true
+// TODO: duplicated from kernel::utils
+macro_rules! require {
+    ( $cond:expr, $err:expr ) => {
+        if !($cond) {
+            return Err($err);
+        }
+    };
+}
+pub(crate) use require;
+
 #[cfg(test)]
 mod tests {
     use crate::object_store::path::Path;

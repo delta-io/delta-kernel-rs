@@ -15,7 +15,7 @@ use itertools::Itertools;
 use tracing::debug;
 
 use crate::arrow_data::ArrowEngineData;
-use crate::utils::require;
+use crate::require;
 use apply_schema::{apply_schema, apply_schema_to};
 use evaluate_expression::{evaluate_expression, evaluate_predicate};
 

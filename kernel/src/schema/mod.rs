@@ -10,7 +10,8 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 // re-export because many call sites that use schemas do not necessarily use expressions
-pub(crate) use crate::expressions::{column_name, ColumnName};
+// TODO: should we just export from expressions?
+pub use crate::expressions::{column_name, ColumnName};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;

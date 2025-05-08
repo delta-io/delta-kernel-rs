@@ -10,7 +10,7 @@ mod tests;
 /// A helper trait (mostly exposed for testing). It provides the four stats getters needed by
 /// [`DataSkippingStatsProvider`]. From there, we can automatically derive a
 /// [`DataSkippingPredicateEvaluator`].
-pub(crate) trait ParquetStatsProvider {
+pub trait ParquetStatsProvider {
     /// The min-value stat for this column, if the column exists in this file, has the expected
     /// type, and the parquet footer provides stats for it.
     fn get_parquet_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar>;

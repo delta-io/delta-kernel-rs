@@ -19,7 +19,6 @@ use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 
 use delta_kernel::{
     schema::{DataType, Schema, SchemaRef, StructField, StructType},
-    utils::require,
     DeltaResult, EngineData, Error,
 };
 
@@ -28,6 +27,7 @@ use tracing::debug;
 
 use crate::arrow_data::ArrowEngineData;
 use crate::ensure_data_types::DataTypeCompat;
+use crate::require;
 
 macro_rules! prim_array_cmp {
     ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
