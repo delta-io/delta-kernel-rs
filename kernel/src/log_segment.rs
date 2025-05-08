@@ -482,8 +482,8 @@ pub(crate) fn list_log_files_with_version(
     let log_files = list_log_files(storage, log_root, start_version, end_version)?;
 
     log_files.process_results(|iter| {
-        let mut commit_files = Vec::with_capacity(10);
-        let mut compaction_files = Vec::with_capacity(2);
+        let mut ascending_commit_files = Vec::with_capacity(10);
+        let mut ascending_compaction_files = Vec::with_capacity(2);
         let mut checkpoint_parts = vec![];
 
         // Group log files by version
@@ -493,7 +493,7 @@ pub(crate) fn list_log_files_with_version(
             let mut new_checkpoint_parts = vec![];
             for file in files {
                 if file.is_commit() {
-                    commit_files.push(file);
+                    ascending_commit_files.push(file);
                 } else if file.is_compaction() {
                     let include = if let Some(end_version) = end_version {
                         // validate this compaction doesn't extend too far
@@ -507,7 +507,7 @@ pub(crate) fn list_log_files_with_version(
                         true
                     };
                     if include {
-                        compaction_files.push(file);
+                        ascending_compaction_files.push(file);
                     }
                 } else if file.is_checkpoint() {
                     new_checkpoint_parts.push(file);
@@ -528,14 +528,14 @@ pub(crate) fn list_log_files_with_version(
             {
                 checkpoint_parts = complete_checkpoint;
                 // Log replay only uses commits/compactions after a complete checkpoint
-                commit_files.clear();
-                compaction_files.clear();
+                ascending_commit_files.clear();
+                ascending_compaction_files.clear();
             }
         }
 
         ListedLogFiles {
-            ascending_commit_files: commit_files,
-            ascending_compaction_files: compaction_files,
+            ascending_commit_files,
+            ascending_compaction_files,
             checkpoint_parts,
         }
     })
