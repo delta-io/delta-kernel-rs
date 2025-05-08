@@ -14,7 +14,6 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, IntervalUnit, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
-use crate::arrow_utils::prim_array_cmp;
 
 use delta_kernel::error::{DeltaResult, Error};
 use delta_kernel::expressions::{
@@ -22,6 +21,9 @@ use delta_kernel::expressions::{
     JunctionPredicate, JunctionPredicateOp, Predicate, Scalar, UnaryPredicate, UnaryPredicateOp,
 };
 use delta_kernel::schema::DataType;
+
+use crate::arrow_expression::scalar_to_array;
+use crate::arrow_utils::prim_array_cmp;
 
 use itertools::Itertools;
 
@@ -84,7 +86,7 @@ pub(crate) fn evaluate_expression(
     use BinaryExpressionOp::*;
     use Expression::*;
     match (expression, result_type) {
-        (Literal(scalar), _) => Ok(scalar.to_array(batch.num_rows())?),
+        (Literal(scalar), _) => Ok(scalar_to_array(scalar, batch.num_rows())?),
         (Column(name), _) => extract_column(batch, name),
         (Struct(fields), Some(DataType::Struct(output_schema))) => {
             let columns = fields

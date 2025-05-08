@@ -293,7 +293,7 @@ impl StructType {
         self.fields.values()
     }
 
-    pub(crate) fn fields_len(&self) -> usize {
+    pub fn fields_len(&self) -> usize {
         // O(1) for indexmap
         self.fields.len()
     }

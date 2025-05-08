@@ -152,18 +152,20 @@ fn test_literal_complex_type_array() {
         .unwrap(),
     );
     let nested_array_type = ArrayType::new(struct_type.clone().into(), true);
-    let nested_array_value = Scalar::Array(
-        ArrayData::try_new(
-            nested_array_type.clone(),
-            vec![
-                struct_value.clone(),
-                Scalar::Null(struct_type.clone().into()),
-                struct_value.clone(),
-            ],
-        )
-        .unwrap(),
+    let nested_array_value = scalar_to_array(
+        &Scalar::Array(
+            ArrayData::try_new(
+                nested_array_type.clone(),
+                vec![
+                    struct_value.clone(),
+                    Scalar::Null(struct_type.clone().into()),
+                    struct_value.clone(),
+                ],
+            )
+            .unwrap(),
+        ),
+        5,
     )
-    .to_array(5)
     .unwrap();
     assert_eq!(nested_array_value.len(), 5);
 
@@ -660,7 +662,7 @@ fn test_scalar_map() -> DeltaResult<()> {
         [("key1".to_string(), 1.into()), ("key2".to_string(), None)],
     )?;
     let scalar_map = Scalar::Map(map_data);
-    let arrow_array = scalar_map.to_array(2)?;
+    let arrow_array = scalar_to_array(&scalar_map, 2)?;
     let map_array = arrow_array.as_any().downcast_ref::<MapArray>().unwrap();
 
     let key_builder = StringBuilder::new();
@@ -691,7 +693,7 @@ fn test_scalar_map() -> DeltaResult<()> {
 fn test_null_scalar_map() -> DeltaResult<()> {
     let map_type = MapType::new(DeltaDataTypes::STRING, DeltaDataTypes::STRING, false);
     let null_scalar_map = Scalar::Null(DeltaDataTypes::Map(Box::new(map_type)));
-    let arrow_array = null_scalar_map.to_array(1)?;
+    let arrow_array = scalar_to_array(&null_scalar_map, 1)?;
     let map_array = arrow_array.as_any().downcast_ref::<MapArray>().unwrap();
 
     assert_eq!(map_array.len(), 1);

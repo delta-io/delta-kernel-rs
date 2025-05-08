@@ -61,207 +61,209 @@ impl ArrayBuilderAs for StructFieldBuilder<'_> {
     }
 }
 
-impl Scalar {
-    /// Convert scalar to arrow array.
-    pub fn to_array(&self, num_rows: usize) -> DeltaResult<ArrayRef> {
-        let data_type = ArrowDataType::try_from(&self.data_type())?;
-        let mut builder = array::make_builder(&data_type, num_rows);
-        self.append_to(&mut builder, num_rows)?;
-        Ok(builder.finish())
+/// Convert scalar to arrow array.
+pub fn scalar_to_array(scalar: &Scalar, num_rows: usize) -> DeltaResult<ArrayRef> {
+    let data_type = ArrowDataType::try_from(&scalar.data_type())?;
+    let mut builder = array::make_builder(&data_type, num_rows);
+    scalar.append_to(&mut builder, num_rows)?;
+    Ok(builder.finish())
+}
+
+// Arrow uses composable "builders" to assemble arrays one row at a time. Each concrete `Array`
+// type has a corresponding concrete `ArrayBuilder` type. For primitive types, the builder just
+// needs to `append` one value per row. For complex types, the builder needs to recursively
+// append values to each of its children as needed, and then its own `append` only defines the
+// validity for the row. Unfortunately, there is no generic way to append values to builders;
+// the `ArrayBuilder` trait only knows how to `finalize` itself to produce an `ArrayRef`. So we
+// have to cast each builder to the appropriate type, based on the scalar's data type. For
+// details, refer to the arrow documentation:
+//
+// https://docs.rs/arrow/latest/arrow/array/struct.PrimitiveBuilder.html
+// https://docs.rs/arrow/latest/arrow/array/struct.GenericListBuilder.html
+// https://docs.rs/arrow/latest/arrow/array/struct.StructBuilder.html
+//
+// NOTE: `ListBuilder` and `MapBuilder` are take generic element/key/value builders in order to
+// work with specific builder types directly. However, `array::make_builder` instantiates them
+// with `Box<dyn Builder>` instead, which greatly simplifies our job in working with them. We
+// can just extract the builder trait,and let recursive calls cast it to the desired type.
+//
+// WARNING: List and map builders do _NOT_ require appending any child entries to NULL list/map
+// rows, because empty list/map is a valid state. But struct builders _DO_ require appending
+// (possibly NULL) entries in order to preserve consistent row counts between the struct and its
+// fields.
+fn scalar_append_to(
+    scalar: &Scalar,
+    builder: &mut impl ArrayBuilderAs,
+    num_rows: usize,
+) -> DeltaResult<()> {
+    use Scalar::*;
+    macro_rules! builder_as {
+        ($t:ty) => {{
+            builder.array_builder_as::<$t>().ok_or_else(|| {
+                Error::invalid_expression(format!("Invalid builder for {}", scalar.data_type()))
+            })?
+        }};
     }
 
-    // Arrow uses composable "builders" to assemble arrays one row at a time. Each concrete `Array`
-    // type has a corresponding concrete `ArrayBuilder` type. For primitive types, the builder just
-    // needs to `append` one value per row. For complex types, the builder needs to recursively
-    // append values to each of its children as needed, and then its own `append` only defines the
-    // validity for the row. Unfortunately, there is no generic way to append values to builders;
-    // the `ArrayBuilder` trait only knows how to `finalize` itself to produce an `ArrayRef`. So we
-    // have to cast each builder to the appropriate type, based on the scalar's data type. For
-    // details, refer to the arrow documentation:
-    //
-    // https://docs.rs/arrow/latest/arrow/array/struct.PrimitiveBuilder.html
-    // https://docs.rs/arrow/latest/arrow/array/struct.GenericListBuilder.html
-    // https://docs.rs/arrow/latest/arrow/array/struct.StructBuilder.html
-    //
-    // NOTE: `ListBuilder` and `MapBuilder` are take generic element/key/value builders in order to
-    // work with specific builder types directly. However, `array::make_builder` instantiates them
-    // with `Box<dyn Builder>` instead, which greatly simplifies our job in working with them. We
-    // can just extract the builder trait,and let recursive calls cast it to the desired type.
-    //
-    // WARNING: List and map builders do _NOT_ require appending any child entries to NULL list/map
-    // rows, because empty list/map is a valid state. But struct builders _DO_ require appending
-    // (possibly NULL) entries in order to preserve consistent row counts between the struct and its
-    // fields.
-    fn append_to(&self, builder: &mut impl ArrayBuilderAs, num_rows: usize) -> DeltaResult<()> {
-        use Scalar::*;
-        macro_rules! builder_as {
-            ($t:ty) => {{
-                builder.array_builder_as::<$t>().ok_or_else(|| {
-                    Error::invalid_expression(format!("Invalid builder for {}", self.data_type()))
-                })?
-            }};
-        }
-
-        macro_rules! append_val_as {
-            ($t:ty, $val:expr) => {{
-                let builder = builder_as!($t);
-                for _ in 0..num_rows {
-                    builder.append_value($val);
-                }
-            }};
-        }
-
-        match self {
-            Integer(val) => append_val_as!(array::Int32Builder, *val),
-            Long(val) => append_val_as!(array::Int64Builder, *val),
-            Short(val) => append_val_as!(array::Int16Builder, *val),
-            Byte(val) => append_val_as!(array::Int8Builder, *val),
-            Float(val) => append_val_as!(array::Float32Builder, *val),
-            Double(val) => append_val_as!(array::Float64Builder, *val),
-            String(val) => append_val_as!(array::StringBuilder, val),
-            Boolean(val) => append_val_as!(array::BooleanBuilder, *val),
-            Timestamp(val) | TimestampNtz(val) => {
-                // timezone was already set at builder construction time
-                append_val_as!(array::TimestampMicrosecondBuilder, *val)
+    macro_rules! append_val_as {
+        ($t:ty, $val:expr) => {{
+            let builder = builder_as!($t);
+            for _ in 0..num_rows {
+                builder.append_value($val);
             }
-            Date(val) => append_val_as!(array::Date32Builder, *val),
-            Binary(val) => append_val_as!(array::BinaryBuilder, val),
-            // precision and scale were already set at builder construction time
-            Decimal(val) => append_val_as!(array::Decimal128Builder, val.bits()),
-            Struct(data) => {
-                let builder = builder_as!(array::StructBuilder);
-                require!(
-                    builder.num_fields() == data.fields().len(),
-                    Error::generic("Struct builder has wrong number of fields")
-                );
-                for _ in 0..num_rows {
-                    // TODO: Get rid of this alternate code path when we drop arrow-54 support.
-                    #[cfg(not(feature = "arrow-55"))]
-                    for (field_index, value) in data.values().iter().enumerate() {
-                        let builder = &mut StructFieldBuilder {
-                            builder,
-                            field_index,
-                        };
-                        value.append_to(builder, 1)?;
-                    }
-
-                    #[cfg(feature = "arrow-55")]
-                    let field_builders = builder.field_builders_mut().iter_mut();
-                    #[cfg(feature = "arrow-55")]
-                    for (builder, value) in field_builders.zip(data.values()) {
-                        value.append_to(builder, 1)?;
-                    }
-                    builder.append(true);
-                }
-            }
-            Array(data) => {
-                let builder = builder_as!(array::ListBuilder<Box<dyn ArrayBuilder>>);
-                for _ in 0..num_rows {
-                    #[allow(deprecated)]
-                    for value in data.array_elements() {
-                        value.append_to(builder.values(), 1)?;
-                    }
-                    builder.append(true);
-                }
-            }
-            Map(data) => {
-                let builder =
-                    builder_as!(array::MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>);
-                for _ in 0..num_rows {
-                    for (key, val) in data.pairs() {
-                        key.append_to(builder.keys(), 1)?;
-                        val.append_to(builder.values(), 1)?;
-                    }
-                    builder.append(true)?;
-                }
-            }
-            Null(data_type) => Self::append_null(builder, data_type, num_rows)?,
-        }
-
-        Ok(())
+        }};
     }
 
-    fn append_null(
-        builder: &mut impl ArrayBuilderAs,
-        data_type: &DataType,
-        num_rows: usize,
-    ) -> DeltaResult<()> {
-        // Almost the same as above -- differs only in the data type parameter
-        macro_rules! builder_as {
-            ($t:ty) => {{
-                builder.array_builder_as::<$t>().ok_or_else(|| {
-                    Error::invalid_expression(format!("Invalid builder for {data_type}"))
-                })?
-            }};
+    match scalar {
+        Integer(val) => append_val_as!(array::Int32Builder, *val),
+        Long(val) => append_val_as!(array::Int64Builder, *val),
+        Short(val) => append_val_as!(array::Int16Builder, *val),
+        Byte(val) => append_val_as!(array::Int8Builder, *val),
+        Float(val) => append_val_as!(array::Float32Builder, *val),
+        Double(val) => append_val_as!(array::Float64Builder, *val),
+        String(val) => append_val_as!(array::StringBuilder, val),
+        Boolean(val) => append_val_as!(array::BooleanBuilder, *val),
+        Timestamp(val) | TimestampNtz(val) => {
+            // timezone was already set at builder construction time
+            append_val_as!(array::TimestampMicrosecondBuilder, *val)
         }
-
-        macro_rules! append_null_as {
-            ($t:ty) => {{
-                let builder = builder_as!($t);
-                for _ in 0..num_rows {
-                    builder.append_null()
+        Date(val) => append_val_as!(array::Date32Builder, *val),
+        Binary(val) => append_val_as!(array::BinaryBuilder, val),
+        // precision and scale were already set at builder construction time
+        Decimal(val) => append_val_as!(array::Decimal128Builder, val.bits()),
+        Struct(data) => {
+            let builder = builder_as!(array::StructBuilder);
+            require!(
+                builder.num_fields() == data.fields().len(),
+                Error::generic("Struct builder has wrong number of fields")
+            );
+            for _ in 0..num_rows {
+                // TODO: Get rid of this alternate code path when we drop arrow-54 support.
+                #[cfg(not(feature = "arrow-55"))]
+                for (field_index, value) in data.values().iter().enumerate() {
+                    let builder = &mut StructFieldBuilder {
+                        builder,
+                        field_index,
+                    };
+                    scalar_append_to(value, builder, 1)?;
                 }
-            }};
-        }
 
-        match *data_type {
-            DataType::INTEGER => append_null_as!(array::Int32Builder),
-            DataType::LONG => append_null_as!(array::Int64Builder),
-            DataType::SHORT => append_null_as!(array::Int16Builder),
-            DataType::BYTE => append_null_as!(array::Int8Builder),
-            DataType::FLOAT => append_null_as!(array::Float32Builder),
-            DataType::DOUBLE => append_null_as!(array::Float64Builder),
-            DataType::STRING => append_null_as!(array::StringBuilder),
-            DataType::BOOLEAN => append_null_as!(array::BooleanBuilder),
-            DataType::TIMESTAMP | DataType::TIMESTAMP_NTZ => {
-                append_null_as!(array::TimestampMicrosecondBuilder)
-            }
-            DataType::DATE => append_null_as!(array::Date32Builder),
-            DataType::BINARY => append_null_as!(array::BinaryBuilder),
-            DataType::Primitive(PrimitiveType::Decimal(_)) => {
-                append_null_as!(array::Decimal128Builder)
-            }
-            DataType::Struct(ref stype) => {
-                // WARNING: Unlike ArrayBuilder and MapBuilder, StructBuilder always requires us to
-                // insert an entry for each child builder, even when we're inserting NULL.
-                let builder = builder_as!(array::StructBuilder);
-                require!(
-                    builder.num_fields() == stype.fields_len(),
-                    Error::generic("Struct builder has wrong number of fields")
-                );
-                for _ in 0..num_rows {
-                    // TODO: Get rid of this alternate code path when we drop arrow-54 support.
-                    #[cfg(not(feature = "arrow-55"))]
-                    for (field_index, field) in stype.fields().enumerate() {
-                        let builder = &mut StructFieldBuilder {
-                            builder,
-                            field_index,
-                        };
-                        Self::append_null(builder, &field.data_type, 1)?;
-                    }
-
-                    #[cfg(feature = "arrow-55")]
-                    let field_builders = builder.field_builders_mut().iter_mut();
-                    #[cfg(feature = "arrow-55")]
-                    for (builder, field) in field_builders.zip(stype.fields()) {
-                        Self::append_null(builder, &field.data_type, 1)?;
-                    }
-                    builder.append(false);
+                #[cfg(feature = "arrow-55")]
+                let field_builders = builder.field_builders_mut().iter_mut();
+                #[cfg(feature = "arrow-55")]
+                for (builder, value) in field_builders.zip(data.values()) {
+                    scalar_append_to(value, builder, 1)?;
                 }
-            }
-            DataType::Array(_) => append_null_as!(array::ListBuilder<Box<dyn ArrayBuilder>>),
-            DataType::Map(_) => {
-                // For some reason, there is no `MapBuilder::append_null` method -- even tho
-                // StructBuilder and ListBuilder both provide it.
-                let builder =
-                    builder_as!(array::MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>);
-                for _ in 0..num_rows {
-                    builder.append(false)?;
-                }
+                builder.append(true);
             }
         }
-        Ok(())
+        Array(data) => {
+            let builder = builder_as!(array::ListBuilder<Box<dyn ArrayBuilder>>);
+            for _ in 0..num_rows {
+                #[allow(deprecated)]
+                for value in data.array_elements() {
+                    scalar_append_to(value, builder.values(), 1)?;
+                }
+                builder.append(true);
+            }
+        }
+        Map(data) => {
+            let builder =
+                builder_as!(array::MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>);
+            for _ in 0..num_rows {
+                for (key, val) in data.pairs() {
+                    scalar_append_to(key, builder.keys(), 1)?;
+                    scalar_append_to(val, builder.values(), 1)?;
+                }
+                builder.append(true)?;
+            }
+        }
+        Null(data_type) => scalar_append_null(builder, data_type, num_rows)?,
     }
+
+    Ok(())
+}
+
+fn scalar_append_null(
+    builder: &mut impl ArrayBuilderAs,
+    data_type: &DataType,
+    num_rows: usize,
+) -> DeltaResult<()> {
+    // Almost the same as above -- differs only in the data type parameter
+    macro_rules! builder_as {
+        ($t:ty) => {{
+            builder.array_builder_as::<$t>().ok_or_else(|| {
+                Error::invalid_expression(format!("Invalid builder for {data_type}"))
+            })?
+        }};
+    }
+
+    macro_rules! append_null_as {
+        ($t:ty) => {{
+            let builder = builder_as!($t);
+            for _ in 0..num_rows {
+                builder.append_null()
+            }
+        }};
+    }
+
+    match *data_type {
+        DataType::INTEGER => append_null_as!(array::Int32Builder),
+        DataType::LONG => append_null_as!(array::Int64Builder),
+        DataType::SHORT => append_null_as!(array::Int16Builder),
+        DataType::BYTE => append_null_as!(array::Int8Builder),
+        DataType::FLOAT => append_null_as!(array::Float32Builder),
+        DataType::DOUBLE => append_null_as!(array::Float64Builder),
+        DataType::STRING => append_null_as!(array::StringBuilder),
+        DataType::BOOLEAN => append_null_as!(array::BooleanBuilder),
+        DataType::TIMESTAMP | DataType::TIMESTAMP_NTZ => {
+            append_null_as!(array::TimestampMicrosecondBuilder)
+        }
+        DataType::DATE => append_null_as!(array::Date32Builder),
+        DataType::BINARY => append_null_as!(array::BinaryBuilder),
+        DataType::Primitive(PrimitiveType::Decimal(_)) => {
+            append_null_as!(array::Decimal128Builder)
+        }
+        DataType::Struct(ref stype) => {
+            // WARNING: Unlike ArrayBuilder and MapBuilder, StructBuilder always requires us to
+            // insert an entry for each child builder, even when we're inserting NULL.
+            let builder = builder_as!(array::StructBuilder);
+            require!(
+                builder.num_fields() == stype.fields_len(),
+                Error::generic("Struct builder has wrong number of fields")
+            );
+            for _ in 0..num_rows {
+                // TODO: Get rid of this alternate code path when we drop arrow-54 support.
+                #[cfg(not(feature = "arrow-55"))]
+                for (field_index, field) in stype.fields().enumerate() {
+                    let builder = &mut StructFieldBuilder {
+                        builder,
+                        field_index,
+                    };
+                    Self::append_null(builder, &field.data_type, 1)?;
+                }
+
+                #[cfg(feature = "arrow-55")]
+                let field_builders = builder.field_builders_mut().iter_mut();
+                #[cfg(feature = "arrow-55")]
+                for (builder, field) in field_builders.zip(stype.fields()) {
+                    Self::append_null(builder, &field.data_type, 1)?;
+                }
+                builder.append(false);
+            }
+        }
+        DataType::Array(_) => append_null_as!(array::ListBuilder<Box<dyn ArrayBuilder>>),
+        DataType::Map(_) => {
+            // For some reason, there is no `MapBuilder::append_null` method -- even tho
+            // StructBuilder and ListBuilder both provide it.
+            let builder =
+                builder_as!(array::MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>);
+            for _ in 0..num_rows {
+                builder.append(false)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -298,7 +300,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
     fn null_row(&self, output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>> {
         let fields = output_schema.fields();
         let arrays = fields
-            .map(|field| Scalar::Null(field.data_type().clone()).to_array(1))
+            .map(|field| scalar_to_array(&Scalar::Null(field.data_type().clone()), 1))
             .try_collect()?;
         let record_batch =
             RecordBatch::try_new(Arc::new(output_schema.as_ref().try_into()?), arrays)?;
