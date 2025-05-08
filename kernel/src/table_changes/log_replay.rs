@@ -25,7 +25,7 @@ use crate::schema::{
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef, RowVisitor};
+use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
 
 use itertools::Itertools;
 
