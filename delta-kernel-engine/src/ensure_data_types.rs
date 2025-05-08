@@ -8,12 +8,14 @@ use std::{
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use itertools::Itertools;
 
-use crate::arrow_utils::make_arrow_error;
-use crate::require;
 use delta_kernel::{
     schema::{DataType, MetadataValue, StructField},
     DeltaResult, Error,
 };
+
+use crate::arrow_utils::make_arrow_error;
+use crate::require;
+use crate::EngineResult;
 
 /// Ensure a kernel data type matches an arrow data type. This only ensures that the actual "type"
 /// is the same, but does so recursively into structs, and ensures lists and maps have the correct
@@ -31,7 +33,7 @@ pub(crate) fn ensure_data_types(
     kernel_type: &DataType,
     arrow_type: &ArrowDataType,
     check_nullability_and_metadata: bool,
-) -> DeltaResult<DataTypeCompat> {
+) -> EngineResult<DataTypeCompat> {
     let check = EnsureDataTypes {
         check_nullability_and_metadata,
     };
@@ -59,7 +61,7 @@ impl EnsureDataTypes {
         &self,
         kernel_type: &DataType,
         arrow_type: &ArrowDataType,
-    ) -> DeltaResult<DataTypeCompat> {
+    ) -> EngineResult<DataTypeCompat> {
         match (kernel_type, arrow_type) {
             (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
                 check_cast_compat(kernel_type.try_into()?, arrow_type)
@@ -180,7 +182,7 @@ impl EnsureDataTypes {
 fn check_cast_compat(
     target_type: ArrowDataType,
     source_type: &ArrowDataType,
-) -> DeltaResult<DataTypeCompat> {
+) -> EngineResult<DataTypeCompat> {
     use ArrowDataType::*;
 
     match (source_type, &target_type) {

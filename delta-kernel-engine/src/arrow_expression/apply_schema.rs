@@ -10,34 +10,35 @@ use crate::arrow::array::{
 use crate::arrow::datatypes::Schema as ArrowSchema;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 
-use delta_kernel::error::{DeltaResult, Error};
+use delta_kernel::error::Error;
 use delta_kernel::schema::{ArrayType, DataType, MapType, Schema, StructField};
 
 use super::super::arrow_utils::make_arrow_error;
 use crate::ensure_data_types::ensure_data_types;
+use crate::{EngineError, EngineResult};
 
 // Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch where the
 // names of fields, nullable, and metadata in the struct have been transformed to match those in
 // schema specified by `schema`
-pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<RecordBatch> {
+pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> EngineResult<RecordBatch> {
     let DataType::Struct(struct_schema) = schema else {
-        return Err(Error::generic(
-            "apply_schema at top-level must be passed a struct schema",
-        ));
+        return Err(
+            Error::generic("apply_schema at top-level must be passed a struct schema").into(),
+        );
     };
     let applied = apply_schema_to_struct(array, struct_schema)?;
     let (fields, columns, nulls) = applied.into_parts();
     if let Some(nulls) = nulls {
         if nulls.null_count() != 0 {
-            return Err(Error::invalid_struct_data(
-                "Top-level nulls in struct are not supported",
-            ));
+            return Err(
+                Error::invalid_struct_data("Top-level nulls in struct are not supported").into(),
+            );
         }
     }
-    Ok(RecordBatch::try_new(
-        Arc::new(ArrowSchema::new(fields)),
-        columns,
-    )?)
+    Ok(
+        RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)
+            .map_err(|e| EngineError::from(e))?,
+    )
 }
 
 // helper to transform an arrow field+col into the specified target type. If `rename` is specified
@@ -64,31 +65,30 @@ fn new_field_with_metadata(
 fn transform_struct(
     struct_array: &StructArray,
     target_fields: impl Iterator<Item = impl Borrow<StructField>>,
-) -> DeltaResult<StructArray> {
+) -> EngineResult<StructArray> {
     let (_, arrow_cols, nulls) = struct_array.clone().into_parts();
     let input_col_count = arrow_cols.len();
-    let result_iter =
-        arrow_cols
-            .into_iter()
-            .zip(target_fields)
-            .map(|(sa_col, target_field)| -> DeltaResult<_> {
-                let target_field = target_field.borrow();
-                let transformed_col = apply_schema_to(&sa_col, target_field.data_type())?;
-                let transformed_field = new_field_with_metadata(
-                    &target_field.name,
-                    transformed_col.data_type(),
-                    target_field.nullable,
-                    Some(target_field.metadata_with_string_values()),
-                );
-                Ok((transformed_field, transformed_col))
-            });
+    let result_iter = arrow_cols.into_iter().zip(target_fields).map(
+        |(sa_col, target_field)| -> EngineResult<_> {
+            let target_field = target_field.borrow();
+            let transformed_col = apply_schema_to(&sa_col, target_field.data_type())?;
+            let transformed_field = new_field_with_metadata(
+                &target_field.name,
+                transformed_col.data_type(),
+                target_field.nullable,
+                Some(target_field.metadata_with_string_values()),
+            );
+            Ok((transformed_field, transformed_col))
+        },
+    );
     let (transformed_fields, transformed_cols): (Vec<ArrowField>, Vec<ArrayRef>) =
         result_iter.process_results(|iter| iter.unzip())?;
     if transformed_cols.len() != input_col_count {
         return Err(Error::InternalError(format!(
             "Passed struct had {input_col_count} columns, but transformed column has {}",
             transformed_cols.len()
-        )));
+        ))
+        .into());
     }
     Ok(StructArray::try_new(
         transformed_fields.into(),
@@ -98,7 +98,7 @@ fn transform_struct(
 }
 
 // Transform a struct array. The data is in `array`, and the target fields are in `kernel_fields`.
-fn apply_schema_to_struct(array: &dyn Array, kernel_fields: &Schema) -> DeltaResult<StructArray> {
+fn apply_schema_to_struct(array: &dyn Array, kernel_fields: &Schema) -> EngineResult<StructArray> {
     let Some(sa) = array.as_struct_opt() else {
         return Err(make_arrow_error(
             "Arrow claimed to be a struct but isn't a StructArray",
@@ -111,7 +111,7 @@ fn apply_schema_to_struct(array: &dyn Array, kernel_fields: &Schema) -> DeltaRes
 fn apply_schema_to_list(
     array: &dyn Array,
     target_inner_type: &ArrayType,
-) -> DeltaResult<ListArray> {
+) -> EngineResult<ListArray> {
     let Some(la) = array.as_list_opt() else {
         return Err(make_arrow_error(
             "Arrow claimed to be a list but isn't a ListArray",
@@ -134,7 +134,7 @@ fn apply_schema_to_list(
 }
 
 // deconstruct a map, and rebuild it with the specified target kernel type
-fn apply_schema_to_map(array: &dyn Array, kernel_map_type: &MapType) -> DeltaResult<MapArray> {
+fn apply_schema_to_map(array: &dyn Array, kernel_map_type: &MapType) -> EngineResult<MapArray> {
     let Some(ma) = array.as_map_opt() else {
         return Err(make_arrow_error(
             "Arrow claimed to be a map but isn't a MapArray",
@@ -171,7 +171,7 @@ fn apply_schema_to_map(array: &dyn Array, kernel_map_type: &MapType) -> DeltaRes
 
 // apply `schema` to `array`. This handles renaming, and adjusting nullability and metadata. if the
 // actual data types don't match, this will return an error
-pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> DeltaResult<ArrayRef> {
+pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> EngineResult<ArrayRef> {
     use DataType::*;
     let array: ArrayRef = match schema {
         Struct(stype) => Arc::new(apply_schema_to_struct(array, stype)?),

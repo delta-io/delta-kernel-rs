@@ -16,6 +16,7 @@ use tracing::debug;
 
 use crate::arrow_data::ArrowEngineData;
 use crate::require;
+use crate::{EngineError, EngineResult};
 use apply_schema::{apply_schema, apply_schema_to};
 use evaluate_expression::{evaluate_expression, evaluate_predicate};
 
@@ -62,10 +63,10 @@ impl ArrayBuilderAs for StructFieldBuilder<'_> {
 }
 
 /// Convert scalar to arrow array.
-pub fn scalar_to_array(scalar: &Scalar, num_rows: usize) -> DeltaResult<ArrayRef> {
+pub fn scalar_to_array(scalar: &Scalar, num_rows: usize) -> EngineResult<ArrayRef> {
     let data_type = ArrowDataType::try_from(&scalar.data_type())?;
     let mut builder = array::make_builder(&data_type, num_rows);
-    scalar.append_to(&mut builder, num_rows)?;
+    scalar_append_to(scalar, &mut builder, num_rows)?;
     Ok(builder.finish())
 }
 
@@ -95,7 +96,7 @@ fn scalar_append_to(
     scalar: &Scalar,
     builder: &mut impl ArrayBuilderAs,
     num_rows: usize,
-) -> DeltaResult<()> {
+) -> EngineResult<()> {
     use Scalar::*;
     macro_rules! builder_as {
         ($t:ty) => {{
@@ -135,7 +136,7 @@ fn scalar_append_to(
             let builder = builder_as!(array::StructBuilder);
             require!(
                 builder.num_fields() == data.fields().len(),
-                Error::generic("Struct builder has wrong number of fields")
+                Error::generic("Struct builder has wrong number of fields").into()
             );
             for _ in 0..num_rows {
                 // TODO: Get rid of this alternate code path when we drop arrow-54 support.
@@ -188,7 +189,7 @@ fn scalar_append_null(
     builder: &mut impl ArrayBuilderAs,
     data_type: &DataType,
     num_rows: usize,
-) -> DeltaResult<()> {
+) -> EngineResult<()> {
     // Almost the same as above -- differs only in the data type parameter
     macro_rules! builder_as {
         ($t:ty) => {{
@@ -230,7 +231,7 @@ fn scalar_append_null(
             let builder = builder_as!(array::StructBuilder);
             require!(
                 builder.num_fields() == stype.fields_len(),
-                Error::generic("Struct builder has wrong number of fields")
+                Error::generic("Struct builder has wrong number of fields").into()
             );
             for _ in 0..num_rows {
                 // TODO: Get rid of this alternate code path when we drop arrow-54 support.
@@ -247,7 +248,7 @@ fn scalar_append_null(
                 let field_builders = builder.field_builders_mut().iter_mut();
                 #[cfg(feature = "arrow-55")]
                 for (builder, field) in field_builders.zip(stype.fields()) {
-                    Self::append_null(builder, &field.data_type, 1)?;
+                    scalar_append_null(builder, &field.data_type, 1)?;
                 }
                 builder.append(false);
             }
@@ -302,8 +303,16 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         let arrays = fields
             .map(|field| scalar_to_array(&Scalar::Null(field.data_type().clone()), 1))
             .try_collect()?;
-        let record_batch =
-            RecordBatch::try_new(Arc::new(output_schema.as_ref().try_into()?), arrays)?;
+        let record_batch = RecordBatch::try_new(
+            Arc::new(
+                output_schema
+                    .as_ref()
+                    .try_into()
+                    .map_err(EngineError::from)?,
+            ),
+            arrays,
+        )
+        .map_err(EngineError::from)?;
         Ok(Box::new(ArrowEngineData::new(record_batch)))
     }
 }
@@ -323,7 +332,11 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
             .downcast_ref::<ArrowEngineData>()
             .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))?
             .record_batch();
-        let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into()?;
+        let _input_schema: ArrowSchema = self
+            .input_schema
+            .as_ref()
+            .try_into()
+            .map_err(EngineError::from)?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {
         //     return Err(Error::Generic(format!(
@@ -337,9 +350,10 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
             apply_schema(&array_ref, &self.output_type)?
         } else {
             let array_ref = apply_schema_to(&array_ref, &self.output_type)?;
-            let arrow_type: ArrowDataType = ArrowDataType::try_from(&self.output_type)?;
+            let arrow_type: ArrowDataType =
+                ArrowDataType::try_from(&self.output_type).map_err(EngineError::from)?;
             let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
-            RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
+            RecordBatch::try_new(Arc::new(schema), vec![array_ref]).map_err(EngineError::from)?
         };
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
@@ -359,7 +373,11 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
             .downcast_ref::<ArrowEngineData>()
             .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))?
             .record_batch();
-        let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into()?;
+        let _input_schema: ArrowSchema = self
+            .input_schema
+            .as_ref()
+            .try_into()
+            .map_err(EngineError::from)?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {
         //     return Err(Error::Generic(format!(
@@ -374,7 +392,8 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
             ArrowDataType::Boolean,
             true,
         )]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])?;
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])
+            .map_err(EngineError::from)?;
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
 }

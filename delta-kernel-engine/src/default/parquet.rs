@@ -29,6 +29,7 @@ use crate::arrow_data::ArrowEngineData;
 use crate::arrow_utils::{fixup_parquet_read, generate_mask, get_requested_indices};
 use crate::default::executor::TaskExecutor;
 use crate::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use crate::{EngineError, EngineResult};
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -54,7 +55,7 @@ impl DataFileMetadata {
         &self,
         partition_values: &HashMap<String, String>,
         data_change: bool,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    ) -> EngineResult<Box<dyn EngineData>> {
         let DataFileMetadata {
             file_meta:
                 FileMeta {
@@ -121,7 +122,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         &self,
         path: &url::Url,
         data: Box<dyn EngineData>,
-    ) -> DeltaResult<DataFileMetadata> {
+    ) -> EngineResult<DataFileMetadata> {
         let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
 
@@ -139,10 +140,9 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let name: String = format!("{}.parquet", Uuid::new_v4());
         // fail if path does not end with a trailing slash
         if !path.path().ends_with('/') {
-            return Err(Error::generic(format!(
-                "Path must end with a trailing slash: {}",
-                path
-            )));
+            return Err(
+                Error::generic(format!("Path must end with a trailing slash: {}", path)).into(),
+            );
         }
         let path = path.join(&name)?;
 
@@ -162,7 +162,8 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
             return Err(Error::generic(format!(
                 "Size mismatch after writing parquet file: expected {}, got {}",
                 size, metadata.size
-            )));
+            ))
+            .into());
         }
 
         let file_meta = FileMeta::new(path, modification_time, size);
@@ -180,7 +181,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         data: Box<dyn EngineData>,
         partition_values: HashMap<String, String>,
         data_change: bool,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    ) -> EngineResult<Box<dyn EngineData>> {
         let parquet_metadata = self.write_parquet(path, data).await?;
         parquet_metadata.as_record_batch(&partition_values, data_change)
     }
@@ -221,11 +222,17 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         };
         FileStream::new_async_read_iterator(
             self.task_executor.clone(),
-            Arc::new(physical_schema.as_ref().try_into()?),
+            Arc::new(
+                physical_schema
+                    .as_ref()
+                    .try_into()
+                    .map_err(EngineError::from)?,
+            ),
             file_opener,
             files,
             self.readahead,
         )
+        .map_err(Error::from)
     }
 }
 
@@ -257,7 +264,11 @@ impl ParquetOpener {
 }
 
 impl FileOpener for ParquetOpener {
-    fn open(&self, file_meta: FileMeta, _range: Option<Range<i64>>) -> DeltaResult<FileOpenFuture> {
+    fn open(
+        &self,
+        file_meta: FileMeta,
+        _range: Option<Range<i64>>,
+    ) -> EngineResult<FileOpenFuture> {
         let path = Path::from_url_path(file_meta.location.path())?;
         let store = self.store.clone();
 
@@ -334,7 +345,11 @@ impl PresignedUrlOpener {
 }
 
 impl FileOpener for PresignedUrlOpener {
-    fn open(&self, file_meta: FileMeta, _range: Option<Range<i64>>) -> DeltaResult<FileOpenFuture> {
+    fn open(
+        &self,
+        file_meta: FileMeta,
+        _range: Option<Range<i64>>,
+    ) -> EngineResult<FileOpenFuture> {
         let batch_size = self.batch_size;
         let table_schema = self.table_schema.clone();
         let predicate = self.predicate.clone();

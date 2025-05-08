@@ -8,9 +8,11 @@ use url::Url;
 use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStore};
 
+use delta_kernel::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+
 use super::UrlExt;
 use crate::default::executor::TaskExecutor;
-use delta_kernel::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use crate::EngineError;
 
 #[derive(Debug)]
 pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
@@ -43,7 +45,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         // The offset is used for list-after; the prefix is used to restrict the listing to a specific directory.
         // Unfortunately, `Path` provides no easy way to check whether a name is directory-like,
         // because it strips trailing /, so we're reduced to manually checking the original URL.
-        let offset = Path::from_url_path(path.path())?;
+        let offset = Path::from_url_path(path.path()).map_err(EngineError::from)?;
         let prefix = if path.path().ends_with('/') {
             offset.clone()
         } else {
@@ -101,7 +103,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
                             .ok();
                     }
                     Err(e) => {
-                        sender.send(Err(e.into())).ok();
+                        sender.send(Err(EngineError::from(e).into())).ok();
                     }
                 }
             }
@@ -151,7 +153,14 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
                     async move {
                         if url.is_presigned() {
                             // have to annotate type here or rustc can't figure it out
-                            Ok::<bytes::Bytes, Error>(reqwest::get(url).await?.bytes().await?)
+                            Ok::<bytes::Bytes, Error>(
+                                reqwest::get(url)
+                                    .await
+                                    .map_err(EngineError::from)?
+                                    .bytes()
+                                    .await
+                                    .map_err(EngineError::from)?,
+                            )
                         } else if let Some(rng) = range {
                             // TODO: remove after arrow 54 is dropped
                             #[cfg(feature = "arrow-54")]
@@ -163,10 +172,13 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
                                 ..(rng.end.try_into().map_err(|_| {
                                     Error::generic("unable to convert usize to u64")
                                 })?);
-                            Ok(store.get_range(&path, rng).await?)
+                            Ok(store
+                                .get_range(&path, rng)
+                                .await
+                                .map_err(EngineError::from)?)
                         } else {
-                            let result = store.get(&path).await?;
-                            Ok(result.bytes().await?)
+                            let result = store.get(&path).await.map_err(EngineError::from)?;
+                            Ok(result.bytes().await.map_err(EngineError::from)?)
                         }
                     }
                 })

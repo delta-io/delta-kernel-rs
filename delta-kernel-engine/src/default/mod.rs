@@ -26,6 +26,7 @@ use self::parquet::DefaultParquetHandler;
 use self::storage::parse_url_opts;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
+use crate::{EngineError, EngineResult};
 
 pub mod executor;
 pub mod file_stream;
@@ -55,7 +56,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         table_root: &Url,
         options: impl IntoIterator<Item = (K, V)>,
         task_executor: Arc<E>,
-    ) -> DeltaResult<Self>
+    ) -> EngineResult<Self>
     where
         K: AsRef<str>,
         V: Into<String>,
@@ -102,7 +103,11 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         data_change: bool,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
-        let input_schema: Schema = data.record_batch().schema().try_into()?;
+        let input_schema: Schema = data
+            .record_batch()
+            .schema()
+            .try_into()
+            .map_err(EngineError::from)?;
         let output_schema = write_context.schema();
         let logical_to_physical_expr = self.evaluation_handler().new_expression_evaluator(
             input_schema.into(),

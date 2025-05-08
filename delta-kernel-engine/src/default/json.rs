@@ -20,6 +20,8 @@ use super::executor::TaskExecutor;
 use crate::arrow_data::ArrowEngineData;
 use crate::arrow_utils::parse_json as arrow_parse_json;
 use crate::arrow_utils::to_json_bytes;
+use crate::{EngineError, EngineResult};
+
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
@@ -88,7 +90,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         json_strings: Box<dyn EngineData>,
         output_schema: SchemaRef,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        arrow_parse_json(json_strings, output_schema)
+        arrow_parse_json(json_strings, output_schema).map_err(Error::from)
     }
 
     fn read_json_files(
@@ -101,7 +103,12 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             return Ok(Box::new(std::iter::empty()));
         }
 
-        let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
+        let schema: ArrowSchemaRef = Arc::new(
+            physical_schema
+                .as_ref()
+                .try_into()
+                .map_err(EngineError::from)?,
+        );
         let file_opener = JsonOpener::new(self.batch_size, schema.clone(), self.store.clone());
 
         let (tx, rx) = mpsc::sync_channel(self.buffer_size);
@@ -128,7 +135,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             }
         });
 
-        Ok(Box::new(rx.into_iter()))
+        Ok(Box::new(rx.into_iter().map(|i| i.map_err(Error::from))))
     }
 
     // note: for now we just buffer all the data and write it out all at once
@@ -146,13 +153,13 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         };
 
         let store = self.store.clone(); // cheap Arc
-        let path = Path::from_url_path(path.path())?;
+        let path = Path::from_url_path(path.path()).map_err(EngineError::from)?;
         let path_str = path.to_string();
         self.task_executor
             .block_on(async move { store.put_opts(&path, buffer.into(), put_mode.into()).await })
             .map_err(|e| match e {
                 object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path_str),
-                e => e.into(),
+                e => EngineError::from(e).into(),
             })?;
         Ok(())
     }
@@ -186,7 +193,7 @@ impl JsonOpener {
         &self,
         file_meta: FileMeta,
         _: Option<Range<i64>>,
-    ) -> DeltaResult<BoxStream<'static, DeltaResult<RecordBatch>>> {
+    ) -> EngineResult<BoxStream<'static, EngineResult<RecordBatch>>> {
         let store = self.object_store.clone();
         let schema = self.projected_schema.clone();
         let batch_size = self.batch_size;
@@ -197,14 +204,16 @@ impl JsonOpener {
                 let reader = ReaderBuilder::new(schema)
                     .with_batch_size(batch_size)
                     .build(BufReader::new(file))?;
-                Ok(futures::stream::iter(reader).map_err(Error::from).boxed())
+                Ok(futures::stream::iter(reader)
+                    .map_err(EngineError::from)
+                    .boxed())
             }
             GetResultPayload::Stream(s) => {
                 let mut decoder = ReaderBuilder::new(schema)
                     .with_batch_size(batch_size)
                     .build_decoder()?;
 
-                let mut input = s.map_err(Error::from);
+                let mut input = s.map_err(EngineError::from);
                 let mut buffered = Bytes::new();
 
                 let s = futures::stream::poll_fn(move |cx| {
@@ -235,9 +244,9 @@ impl JsonOpener {
                         }
                     }
 
-                    Poll::Ready(decoder.flush().map_err(Error::from).transpose())
+                    Poll::Ready(decoder.flush().map_err(EngineError::from).transpose())
                 });
-                Ok(s.map_err(Error::from).boxed())
+                Ok(s.map_err(EngineError::from).boxed())
             }
         }
     }
