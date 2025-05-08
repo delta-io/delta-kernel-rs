@@ -1,5 +1,5 @@
 use super::*;
-use crate::expressions::{column_expr, Expression as Expr};
+use crate::expressions::{column_expr, Expression as Expr, Predicate as Pred};
 use crate::kernel_predicates::KernelPredicateEvaluator as _;
 use crate::DataType;
 
@@ -43,7 +43,7 @@ impl ParquetStatsProvider for UnimplementedTestFilter {
 /// Tests apply_junction and apply_scalar
 #[test]
 fn test_junctions() {
-    use JunctionOperator::*;
+    use JunctionPredicateOp::*;
 
     let test_cases = &[
         // Every combo of 0, 1 and 2 inputs
@@ -93,28 +93,28 @@ fn test_junctions() {
         let inputs: Vec<_> = inputs
             .iter()
             .map(|val| match val {
-                Some(v) => Expr::literal(v),
-                None => Expr::null_literal(DataType::BOOLEAN),
+                Some(v) => Pred::literal(*v),
+                None => Pred::null_literal(),
             })
             .collect();
 
         expect_eq!(
-            filter.eval_junction(And, &inputs, false),
+            filter.eval_pred_junction(And, &inputs, false),
             *expect_and,
             "AND({inputs:?})"
         );
         expect_eq!(
-            filter.eval_junction(Or, &inputs, false),
+            filter.eval_pred_junction(Or, &inputs, false),
             *expect_or,
             "OR({inputs:?})"
         );
         expect_eq!(
-            filter.eval_junction(And, &inputs, true),
+            filter.eval_pred_junction(And, &inputs, true),
             expect_and.map(|val| !val),
             "NOT(AND({inputs:?}))"
         );
         expect_eq!(
-            filter.eval_junction(Or, &inputs, true),
+            filter.eval_pred_junction(Or, &inputs, true),
             expect_or.map(|val| !val),
             "NOT(OR({inputs:?}))"
         );
@@ -160,19 +160,19 @@ fn test_eval_binary_comparisons() {
     const FIFTEEN: Scalar = Scalar::Integer(15);
     const NULL_VAL: Scalar = Scalar::Null(DataType::INTEGER);
 
-    let expressions = [
-        Expr::lt(column_expr!("x"), Expr::literal(10)),
-        Expr::le(column_expr!("x"), Expr::literal(10)),
-        Expr::eq(column_expr!("x"), Expr::literal(10)),
-        Expr::ne(column_expr!("x"), Expr::literal(10)),
-        Expr::gt(column_expr!("x"), Expr::literal(10)),
-        Expr::ge(column_expr!("x"), Expr::literal(10)),
+    let predicates = [
+        Pred::lt(column_expr!("x"), Expr::literal(10)),
+        Pred::le(column_expr!("x"), Expr::literal(10)),
+        Pred::eq(column_expr!("x"), Expr::literal(10)),
+        Pred::ne(column_expr!("x"), Expr::literal(10)),
+        Pred::gt(column_expr!("x"), Expr::literal(10)),
+        Pred::ge(column_expr!("x"), Expr::literal(10)),
     ];
 
     let do_test = |min: Scalar, max: Scalar, expected: &[Option<bool>]| {
         let filter = MinMaxTestFilter::new(Some(min.clone()), Some(max.clone()));
-        for (expr, expect) in expressions.iter().zip(expected.iter()) {
-            expect_eq!(filter.eval(expr), *expect, "{expr:#?} with [{min}..{max}]");
+        for (pred, expect) in predicates.iter().zip(expected.iter()) {
+            expect_eq!(filter.eval(pred), *expect, "{pred:#?} with [{min}..{max}]");
         }
     };
 
@@ -229,8 +229,8 @@ impl ParquetStatsProvider for NullCountTestFilter {
 #[test]
 fn test_eval_is_null() {
     let expressions = [
-        Expr::is_null(column_expr!("x")),
-        Expr::is_not_null(column_expr!("x")),
+        Pred::is_null(column_expr!("x")),
+        Pred::is_not_null(column_expr!("x")),
     ];
 
     let do_test = |nullcount: i64, expected: &[Option<bool>]| {
