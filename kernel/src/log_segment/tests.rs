@@ -45,7 +45,6 @@ impl ListedLogFiles {
     }
 }
 
-
 // NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
 // that the parquet reader properly infers nullcount = rowcount for missing columns. The two
 // checkpoint part files that contain transaction app ids have truncated schemas that would
@@ -1041,11 +1040,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
     let v2_checkpoint_read_schema = get_log_schema().project(&[METADATA_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(
-            vec![],
-            vec![],
-            vec![create_log_path(&checkpoint_one_file)],
-        ),
+        ListedLogFiles::new(vec![], vec![], vec![create_log_path(&checkpoint_one_file)]),
         log_root,
         None,
     )?;
@@ -1146,11 +1141,7 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(
-            vec![],
-            vec![],
-            vec![create_log_path(&checkpoint_one_file)],
-        ),
+        ListedLogFiles::new(vec![], vec![], vec![create_log_path(&checkpoint_one_file)]),
         log_root,
         None,
     )?;
@@ -1188,11 +1179,7 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(
-            vec![],
-            vec![],
-            vec![create_log_path(&checkpoint_one_file)],
-        ),
+        ListedLogFiles::new(vec![], vec![], vec![create_log_path(&checkpoint_one_file)]),
         log_root,
         None,
     )?;
@@ -1251,11 +1238,7 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(
-            vec![],
-            vec![],
-            vec![create_log_path(&checkpoint_file_path)],
-        ),
+        ListedLogFiles::new(vec![], vec![], vec![create_log_path(&checkpoint_file_path)]),
         log_root,
         None,
     )?;
@@ -1299,35 +1282,60 @@ fn test_compaction_listing(
     checkpoint_version: Option<u64>,
     version_to_load: Option<u64>,
 ) {
-    let mut paths: Vec<Path> = commit_versions.iter().map(|version| delta_path_for_version(*version, "json")).chain(
-        compaction_versions.iter().map(|(start, end)| compacted_log_path_for_versions(*start, *end, "json"))).collect();
+    let mut paths: Vec<Path> = commit_versions
+        .iter()
+        .map(|version| delta_path_for_version(*version, "json"))
+        .chain(
+            compaction_versions
+                .iter()
+                .map(|(start, end)| compacted_log_path_for_versions(*start, *end, "json")),
+        )
+        .collect();
     if let Some(version) = checkpoint_version {
-        paths.push(delta_path_for_version(version, "checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json"));
+        paths.push(delta_path_for_version(
+            version,
+            "checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+        ));
     }
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &paths,
-        None,
-    );
-    let log_segment = LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), None, version_to_load).unwrap();
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None);
+    let log_segment =
+        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), None, version_to_load)
+            .unwrap();
 
     let version_to_load = version_to_load.unwrap_or(u64::MAX);
     let checkpoint_cuttoff = checkpoint_version.map(|v| v as i64).unwrap_or(-1);
-    let expected_commit_versions: Vec<&u64> = commit_versions.iter().filter(|v| {
-        **v as i64 > checkpoint_cuttoff && **v <= version_to_load
-    }).collect();
-    let expected_compaction_versions: Vec<&(u64, u64)> = compaction_versions.iter().filter(|(start, end)| {
-        *start as i64 > checkpoint_cuttoff && *end <= version_to_load
-    }).collect();
+    let expected_commit_versions: Vec<&u64> = commit_versions
+        .iter()
+        .filter(|v| **v as i64 > checkpoint_cuttoff && **v <= version_to_load)
+        .collect();
+    let expected_compaction_versions: Vec<&(u64, u64)> = compaction_versions
+        .iter()
+        .filter(|(start, end)| *start as i64 > checkpoint_cuttoff && *end <= version_to_load)
+        .collect();
 
-    assert_eq!(log_segment.ascending_commit_files.len(), expected_commit_versions.len());
-    assert_eq!(log_segment.ascending_compaction_files.len(), expected_compaction_versions.len());
+    assert_eq!(
+        log_segment.ascending_commit_files.len(),
+        expected_commit_versions.len()
+    );
+    assert_eq!(
+        log_segment.ascending_compaction_files.len(),
+        expected_compaction_versions.len()
+    );
 
-    for (commit_file, expected_version) in log_segment.ascending_commit_files.iter().zip(expected_commit_versions.iter()) {
+    for (commit_file, expected_version) in log_segment
+        .ascending_commit_files
+        .iter()
+        .zip(expected_commit_versions.iter())
+    {
         assert!(commit_file.is_commit());
         assert_eq!(commit_file.version, **expected_version);
     }
 
-    for (compaction_file, (expected_start, expected_end)) in log_segment.ascending_compaction_files.iter().zip(expected_compaction_versions.iter()) {
+    for (compaction_file, (expected_start, expected_end)) in log_segment
+        .ascending_compaction_files
+        .iter()
+        .zip(expected_compaction_versions.iter())
+    {
         assert!(compaction_file.is_compaction());
         assert_eq!(compaction_file.version, *expected_start);
         if let LogPathFileType::CompactedCommit { hi } = compaction_file.file_type {
@@ -1353,8 +1361,8 @@ fn test_compaction_in_version_range() {
     test_compaction_listing(
         &[0, 1, 2, 3],
         &[(1, 2)],
-        None, // checkpoint version
-        Some(2) // version to load
+        None,    // checkpoint version
+        Some(2), // version to load
     );
 }
 
@@ -1363,7 +1371,7 @@ fn test_compaction_out_of_version_range() {
     test_compaction_listing(
         &[0, 1, 2, 3, 4],
         &[(1, 3)],
-        None, // checkpoint version
+        None,    // checkpoint version
         Some(2), // version to load
     );
 }
@@ -1378,17 +1386,15 @@ fn test_multi_compaction() {
     );
 }
 
-
 #[test]
 fn test_multi_compaction_one_out_of_range() {
     test_compaction_listing(
         &[0, 1, 2, 3, 4, 5],
         &[(1, 2), (3, 5)],
-        None, // checkpoint version
+        None,    // checkpoint version
         Some(4), // version to load
     );
 }
-
 
 #[test]
 fn test_compaction_with_checkpoint() {
@@ -1396,11 +1402,9 @@ fn test_compaction_with_checkpoint() {
         &[0, 1, 2, 4, 5],
         &[(1, 2), (4, 5)],
         Some(3), // checkpoint version
-        None, // version to load
+        None,    // version to load
     );
 }
-
-
 
 #[test]
 fn test_compaction_to_early_with_checkpoint() {
@@ -1408,7 +1412,7 @@ fn test_compaction_to_early_with_checkpoint() {
         &[0, 1, 2, 4, 5],
         &[(1, 2)],
         Some(3), // checkpoint version
-        None, // version to load
+        None,    // version to load
     );
 }
 
@@ -1418,6 +1422,6 @@ fn test_compaction_starts_at_checkpoint() {
         &[0, 1, 2, 4, 5],
         &[(3, 5)],
         Some(3), // checkpoint version
-        None, // version to load
+        None,    // version to load
     );
 }
