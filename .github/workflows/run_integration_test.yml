@@ -23,6 +23,10 @@ jobs:
       - name: Setup rust toolchain
         if: ${{ !matrix.skip }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Run HDFS integration tests
+        if: ${{ !matrix.skip }}
+        shell: bash
+        run: pushd hdfs-integration-test && cargo test --features integration-test
       - name: Run integration tests
         if: ${{ !matrix.skip }}
         shell: bash
