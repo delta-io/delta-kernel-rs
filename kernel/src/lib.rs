@@ -95,6 +95,7 @@ pub use arrow_compat::*;
 pub(crate) mod kernel_predicates;
 pub(crate) mod utils;
 
+internal_mod!(pub(crate) mod history_manager);
 internal_mod!(pub(crate) mod path);
 internal_mod!(pub(crate) mod log_replay);
 internal_mod!(pub(crate) mod log_segment);
