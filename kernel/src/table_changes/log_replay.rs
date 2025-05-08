@@ -54,7 +54,7 @@ pub(crate) fn table_changes_action_iter(
     engine: Arc<dyn Engine>,
     commit_files: impl IntoIterator<Item = ParsedLogPath>,
     table_schema: SchemaRef,
-    physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+    physical_predicate: Option<(PredicateRef, SchemaRef)>,
     mut table_configuration: TableConfiguration,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
     let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
