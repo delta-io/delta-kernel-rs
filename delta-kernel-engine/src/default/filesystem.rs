@@ -9,8 +9,8 @@ use crate::object_store::path::Path;
 use crate::object_store::{DynObjectStore, ObjectStore};
 
 use super::UrlExt;
-use crate::engine::default::executor::TaskExecutor;
-use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use crate::default::executor::TaskExecutor;
+use delta_kernel::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 #[derive(Debug)]
 pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
@@ -194,8 +194,8 @@ mod tests {
 
     use test_utils::delta_path_for_version;
 
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::DefaultEngine;
+    use crate::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::default::DefaultEngine;
     use crate::Engine as _;
 
     use itertools::Itertools;

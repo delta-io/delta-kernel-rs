@@ -17,11 +17,11 @@ use tracing::warn;
 use url::Url;
 
 use super::executor::TaskExecutor;
-use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::parse_json as arrow_parse_json;
-use crate::engine::arrow_utils::to_json_bytes;
-use crate::schema::SchemaRef;
-use crate::{
+use crate::arrow_data::ArrowEngineData;
+use crate::arrow_utils::parse_json as arrow_parse_json;
+use crate::arrow_utils::to_json_bytes;
+use delta_kernel::schema::SchemaRef;
+use delta_kernel::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
 };
 
@@ -253,10 +253,8 @@ mod tests {
     use crate::actions::get_log_schema;
     use crate::arrow::array::{AsArray, Int32Array, RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-    use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::executor::tokio::{
-        TokioBackgroundExecutor, TokioMultiThreadExecutor,
-    };
+    use crate::arrow_data::ArrowEngineData;
+    use crate::default::executor::tokio::{TokioBackgroundExecutor, TokioMultiThreadExecutor};
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
     use crate::object_store::{

@@ -1,4 +1,7 @@
 //! Expression handling based on arrow-rs compute kernels.
+
+use std::sync::Arc;
+
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Datum, RecordBatch, StructArray,
@@ -11,15 +14,16 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, IntervalUnit, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
-use crate::engine::arrow_utils::prim_array_cmp;
-use crate::error::{DeltaResult, Error};
-use crate::expressions::{
+use crate::arrow_utils::prim_array_cmp;
+
+use delta_kernel::error::{DeltaResult, Error};
+use delta_kernel::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
     JunctionPredicate, JunctionPredicateOp, Predicate, Scalar, UnaryPredicate, UnaryPredicateOp,
 };
-use crate::schema::DataType;
+use delta_kernel::schema::DataType;
+
 use itertools::Itertools;
-use std::sync::Arc;
 
 trait ProvidesColumnByName {
     fn column_by_name(&self, name: &str) -> Option<&ArrayRef>;

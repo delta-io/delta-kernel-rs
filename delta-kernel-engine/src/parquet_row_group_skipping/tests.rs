@@ -1,9 +1,12 @@
-use super::*;
-use crate::expressions::{column_name, column_pred};
-use crate::kernel_predicates::DataSkippingPredicateEvaluator as _;
-use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
-use crate::Predicate;
 use std::fs::File;
+
+use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
+
+use delta_kernel::expressions::{column_name, column_pred};
+use delta_kernel::kernel_predicates::DataSkippingPredicateEvaluator as _;
+use delta_kernel::Predicate;
+
+use super::*;
 
 /// Performs an exhaustive set of reads against a specially crafted parquet file.
 ///

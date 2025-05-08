@@ -9,9 +9,9 @@ use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
 
 use super::*;
 use crate::expressions::*;
-use crate::schema::{ArrayType, MapType, StructField, StructType};
-use crate::DataType as DeltaDataTypes;
-use crate::EvaluationHandlerExtension as _;
+use delta_kernel::schema::{ArrayType, MapType, StructField, StructType};
+use delta_kernel::DataType as DeltaDataTypes;
+use delta_kernel::EvaluationHandlerExtension as _;
 
 use Expression as Expr;
 use Predicate as Pred;

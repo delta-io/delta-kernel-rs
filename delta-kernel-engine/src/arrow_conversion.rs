@@ -9,8 +9,8 @@ use crate::arrow::datatypes::{
 use crate::arrow::error::ArrowError;
 use itertools::Itertools;
 
-use crate::error::Error;
-use crate::schema::{
+use delta_kernel::error::Error;
+use delta_kernel::schema::{
     ArrayType, DataType, MapType, MetadataValue, PrimitiveType, StructField, StructType,
 };
 
@@ -252,7 +252,7 @@ impl TryFrom<&ArrowDataType> for DataType {
 
 #[cfg(test)]
 mod tests {
-    use crate::engine::arrow_conversion::ArrowField;
+    use crate::arrow_conversion::ArrowField;
     use crate::{
         schema::{DataType, StructField},
         DeltaResult,

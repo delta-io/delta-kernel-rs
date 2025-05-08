@@ -8,8 +8,8 @@ use std::{
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use itertools::Itertools;
 
-use crate::{
-    engine::arrow_utils::make_arrow_error,
+use crate::arrow_utils::make_arrow_error;
+use delta_kernel::{
     schema::{DataType, MetadataValue, StructField},
     utils::require,
     DeltaResult, Error,

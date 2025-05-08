@@ -7,7 +7,7 @@
 //! and multi-threaded executor based on Tokio.
 use futures::{future::BoxFuture, Future};
 
-use crate::DeltaResult;
+use delta_kernel::DeltaResult;
 
 /// An executor that can be used to run async tasks. This is used by IO functions
 /// within the `DefaultEngine`.

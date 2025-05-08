@@ -6,16 +6,16 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 
-use crate::engine::arrow_data::ArrowEngineData;
-use crate::error::{DeltaResult, Error};
-use crate::expressions::{Expression, Predicate, Scalar};
-use crate::schema::{DataType, PrimitiveType, SchemaRef};
-use crate::utils::require;
-use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
+use delta_kernel::error::{DeltaResult, Error};
+use delta_kernel::expressions::{Expression, Predicate, Scalar};
+use delta_kernel::schema::{DataType, PrimitiveType, SchemaRef};
+use delta_kernel::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
 
 use itertools::Itertools;
 use tracing::debug;
 
+use crate::arrow_data::ArrowEngineData;
+use crate::utils::require;
 use apply_schema::{apply_schema, apply_schema_to};
 use evaluate_expression::{evaluate_expression, evaluate_predicate};
 

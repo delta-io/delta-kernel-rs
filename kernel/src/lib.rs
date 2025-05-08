@@ -105,6 +105,7 @@ use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
 use schema::{SchemaTransform, StructField, StructType};
 
+#[cfg(test)]
 pub(crate) mod engine;
 
 // Macro for `internal-api` modules. Note this can't be implemented alongside the `#[internal_api]`

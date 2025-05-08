@@ -4,10 +4,8 @@ use crate::arrow::array::{
     PrimitiveArray,
 };
 
-use crate::{
-    engine_data::{GetData, ListItem, MapItem},
-    DeltaResult,
-};
+use delta_kernel::engine_data::{GetData, ListItem, MapItem};
+use delta_kernel::DeltaResult;
 
 // actual impls (todo: could macro these)
 

@@ -3,7 +3,12 @@
 pub mod arrow_data;
 pub mod arrow_expression;
 pub mod default;
+pub mod error;
+pub use error::*;
 pub mod parquet_row_group_skipping;
+// we re-export the arrow/parquet/object_store
+mod arrow_compat;
+pub use arrow_compat::*;
 
 pub(crate) mod arrow_conversion;
 pub(crate) mod arrow_get_data;
@@ -19,7 +24,7 @@ mod tests {
 
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::arrow_data::ArrowEngineData;
     use crate::{Engine, EngineData};
 
     use test_utils::delta_path_for_version;

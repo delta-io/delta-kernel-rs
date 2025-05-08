@@ -1,13 +1,16 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer stats.
-use crate::expressions::{ColumnName, DecimalData, Predicate, Scalar};
-use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
+use std::collections::HashMap;
+
 use crate::parquet::arrow::arrow_reader::ArrowReaderBuilder;
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::file::statistics::Statistics;
 use crate::parquet::schema::types::ColumnDescPtr;
-use crate::schema::{DataType, DecimalType, PrimitiveType};
+
+use delta_kernel::expressions::{ColumnName, DecimalData, Predicate, Scalar};
+use delta_kernel::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
+use delta_kernel::schema::{DataType, DecimalType, PrimitiveType};
+
 use chrono::{DateTime, Days};
-use std::collections::HashMap;
 use tracing::debug;
 
 #[cfg(test)]
@@ -55,7 +58,7 @@ impl<'a> RowGroupFilter<'a> {
 
     /// Applies a filtering predicate to a row group. Return value false means to skip it.
     fn apply(row_group: &'a RowGroupMetaData, predicate: &Predicate) -> bool {
-        use crate::kernel_predicates::KernelPredicateEvaluator as _;
+        use delta_kernel::kernel_predicates::KernelPredicateEvaluator as _;
         RowGroupFilter::new(row_group, predicate).eval_sql_where(predicate) != Some(false)
     }
 

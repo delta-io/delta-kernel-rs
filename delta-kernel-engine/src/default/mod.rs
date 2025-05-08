@@ -9,21 +9,23 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use self::storage::parse_url_opts;
+use delta_kernel::schema::Schema;
+use delta_kernel::transaction::WriteContext;
+use delta_kernel::{
+    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+};
+
 use crate::object_store::DynObjectStore;
+
 use url::Url;
 
 use self::executor::TaskExecutor;
 use self::filesystem::ObjectStoreStorageHandler;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
+use self::storage::parse_url_opts;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
-use crate::schema::Schema;
-use crate::transaction::WriteContext;
-use crate::{
-    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
-};
 
 pub mod executor;
 pub mod file_stream;
@@ -170,8 +172,8 @@ impl UrlExt for Url {
 mod tests {
     use super::executor::tokio::TokioBackgroundExecutor;
     use super::*;
-    use crate::engine::tests::test_arrow_engine;
     use crate::object_store::local::LocalFileSystem;
+    use crate::tests::test_arrow_engine;
 
     #[test]
     fn test_default_engine() {
