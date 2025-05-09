@@ -4,14 +4,6 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
-use crate::engine::ensure_data_types::DataTypeCompat;
-use crate::{
-    engine::arrow_data::ArrowEngineData,
-    schema::{DataType, Schema, SchemaRef, StructField, StructType},
-    utils::require,
-    DeltaResult, EngineData, Error,
-};
-
 use crate::arrow::array::{
     cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray,
     OffsetSizeTrait, RecordBatch, StringArray, StructArray,
@@ -24,8 +16,19 @@ use crate::arrow::datatypes::{
 };
 use crate::arrow::json::{LineDelimitedWriter, ReaderBuilder};
 use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
+
+use delta_kernel::{
+    schema::{DataType, Schema, SchemaRef, StructField, StructType},
+    DeltaResult, EngineData, Error,
+};
+
 use itertools::Itertools;
 use tracing::debug;
+
+use crate::arrow_data::ArrowEngineData;
+use crate::ensure_data_types::DataTypeCompat;
+use crate::require;
+use crate::{EngineError, EngineResult};
 
 macro_rules! prim_array_cmp {
     ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
@@ -50,7 +53,7 @@ macro_rules! prim_array_cmp {
                             $right_arr.data_type())
                         )
                 )
-        }.map_err(Error::generic_err);
+        }.map_err(crate::EngineError::from);
     };
 }
 
@@ -59,11 +62,11 @@ pub(crate) use prim_array_cmp;
 /// Get the indices in `parquet_schema` of the specified columns in `requested_schema`. This
 /// returns a tuples of (mask_indices: Vec<parquet_schema_index>, reorder_indices:
 /// Vec<requested_index>). `mask_indices` is used for generating the mask for reading from the
-pub(crate) fn make_arrow_error(s: impl Into<String>) -> Error {
-    Error::Arrow(crate::arrow::error::ArrowError::InvalidArgumentError(
+pub(crate) fn make_arrow_error(s: impl Into<String>) -> EngineError {
+    EngineError::Arrow(crate::arrow::error::ArrowError::InvalidArgumentError(
         s.into(),
     ))
-    .with_backtrace()
+    // .with_backtrace() FIXME
 }
 
 /// Applies post-processing to data read from parquet files. This includes `reorder_struct_array` to
@@ -72,7 +75,7 @@ pub(crate) fn make_arrow_error(s: impl Into<String>) -> Error {
 pub(crate) fn fixup_parquet_read<T>(
     batch: RecordBatch,
     requested_ordering: &[ReorderIndex],
-) -> DeltaResult<T>
+) -> EngineResult<T>
 where
     StructArray: Into<T>,
 {
@@ -265,7 +268,7 @@ fn get_indices(
     requested_schema: &Schema,
     fields: &Fields,
     mask_indices: &mut Vec<usize>,
-) -> DeltaResult<(usize, Vec<ReorderIndex>)> {
+) -> EngineResult<(usize, Vec<ReorderIndex>)> {
     let mut found_fields = HashSet::with_capacity(requested_schema.fields.len());
     let mut reorder_indices = Vec::with_capacity(requested_schema.fields.len());
     let mut parquet_offset = start_parquet_offset;
@@ -300,7 +303,7 @@ fn get_indices(
                         // push the child reorder on
                         reorder_indices.push(ReorderIndex::nested(index, children));
                     } else {
-                        return Err(Error::unexpected_column_type(field.name()));
+                        return Err(Error::unexpected_column_type(field.name()).into());
                     }
                 }
                 ArrowDataType::List(list_field)
@@ -326,7 +329,8 @@ fn get_indices(
                         if children.len() != 1 {
                             return Err(Error::generic(
                                 "List call should not have generated more than one reorder index",
-                            ));
+                            )
+                            .into());
                         }
                         // safety, checked that we have 1 element
                         let mut children = children.swap_remove(0);
@@ -335,7 +339,7 @@ fn get_indices(
                         children.index = index;
                         reorder_indices.push(children);
                     } else {
-                        return Err(Error::unexpected_column_type(list_field.name()));
+                        return Err(Error::unexpected_column_type(list_field.name()).into());
                     }
                 }
                 ArrowDataType::Map(key_val_field, _) => {
@@ -350,7 +354,9 @@ fn get_indices(
                                 Error::generic("map fields didn't include a val col")
                             })?;
                             if key_val_names.next().is_some() {
-                                return Err(Error::generic("map fields had more than 2 members"));
+                                return Err(
+                                    Error::generic("map fields had more than 2 members").into()
+                                );
                             }
                             let inner_schema = map_type.as_struct_schema(key_name, val_name);
                             let (parquet_advance, _children) = get_indices(
@@ -369,7 +375,7 @@ fn get_indices(
                             reorder_indices.push(ReorderIndex::identity(index));
                         }
                         _ => {
-                            return Err(Error::unexpected_column_type(field.name()));
+                            return Err(Error::unexpected_column_type(field.name()).into());
                         }
                     }
                 }
@@ -392,7 +398,8 @@ fn get_indices(
                         DataTypeCompat::Nested => {
                             return Err(Error::internal_error(
                                 "Comparing nested types in get_indices",
-                            ))
+                            )
+                            .into())
                         }
                     }
                     found_fields.insert(requested_field.name());
@@ -415,15 +422,16 @@ fn get_indices(
             if !found_fields.contains(field.name()) {
                 if field.nullable {
                     debug!("Inserting missing and nullable field: {}", field.name());
+                    let arrow_field = crate::arrow_conversion::arrow_field_from_struct_field(field)?;
                     reorder_indices.push(ReorderIndex::missing(
                         requested_position,
-                        Arc::new(field.try_into()?),
+                        Arc::new(arrow_field),
                     ));
                 } else {
                     return Err(Error::Generic(format!(
                         "Requested field not found in parquet schema, and field is not nullable: {}",
                         field.name()
-                    )));
+                    )).into());
                 }
             }
         }
@@ -444,7 +452,7 @@ fn get_indices(
 pub(crate) fn get_requested_indices(
     requested_schema: &SchemaRef,
     parquet_schema: &ArrowSchemaRef,
-) -> DeltaResult<(Vec<usize>, Vec<ReorderIndex>)> {
+) -> EngineResult<(Vec<usize>, Vec<ReorderIndex>)> {
     let mut mask_indices = vec![];
     let (_, reorder_indexes) = get_indices(
         0,
@@ -500,7 +508,7 @@ type FieldArrayOpt = Option<(Arc<ArrowField>, Arc<dyn ArrowArray>)>;
 pub(crate) fn reorder_struct_array(
     input_data: StructArray,
     requested_ordering: &[ReorderIndex],
-) -> DeltaResult<StructArray> {
+) -> EngineResult<StructArray> {
     debug!("Reordering {input_data:?} with ordering: {requested_ordering:?}");
     if !ordering_needs_transform(requested_ordering) {
         // indices is already sorted, meaning we requested in the order that the columns were
@@ -563,7 +571,8 @@ pub(crate) fn reorder_struct_array(
                         _ => {
                             return Err(Error::internal_error(
                                 "Nested reorder can only apply to struct/list/map.",
-                            ));
+                            )
+                            .into());
                         }
                     }
                 }
@@ -584,7 +593,7 @@ pub(crate) fn reorder_struct_array(
         let (field_vec, reordered_columns): (Vec<Arc<ArrowField>>, _) =
             final_fields_cols.into_iter().flatten().unzip();
         if field_vec.len() != num_cols {
-            Err(Error::internal_error("Found a None in final_fields_cols."))
+            Err(Error::internal_error("Found a None in final_fields_cols.").into())
         } else {
             Ok(StructArray::try_new(
                 field_vec.into(),
@@ -599,7 +608,7 @@ fn reorder_list<O: OffsetSizeTrait>(
     list_array: GenericListArray<O>,
     input_field_name: &str,
     children: &[ReorderIndex],
-) -> DeltaResult<FieldArrayOpt> {
+) -> EngineResult<FieldArrayOpt> {
     let (list_field, offset_buffer, maybe_sa, null_buf) = list_array.into_parts();
     if let Some(struct_array) = maybe_sa.as_struct_opt() {
         let struct_array = struct_array.clone();
@@ -622,9 +631,7 @@ fn reorder_list<O: OffsetSizeTrait>(
         )?);
         Ok(Some((new_field, list)))
     } else {
-        Err(Error::internal_error(
-            "Nested reorder of list should have had struct child.",
-        ))
+        Err(Error::internal_error("Nested reorder of list should have had struct child.").into())
     }
 }
 
@@ -680,7 +687,7 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
 pub(crate) fn parse_json(
     json_strings: Box<dyn EngineData>,
     schema: SchemaRef,
-) -> DeltaResult<Box<dyn EngineData>> {
+) -> EngineResult<Box<dyn EngineData>> {
     let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
     let json_strings = json_strings
         .column(0)
@@ -689,7 +696,8 @@ pub(crate) fn parse_json(
         .ok_or_else(|| {
             Error::generic("Expected json_strings to be a StringArray, found something else")
         })?;
-    let schema: ArrowSchemaRef = Arc::new(schema.as_ref().try_into()?);
+    let arrow_schema = crate::arrow_conversion::arrow_schema_from_struct_type(schema.as_ref())?;
+    let schema: ArrowSchemaRef = Arc::new(arrow_schema);
     let result = parse_json_impl(json_strings, schema)?;
     Ok(Box::new(ArrowEngineData::new(result)))
 }
@@ -699,7 +707,10 @@ pub(crate) fn parse_json(
 // NOTE: This code is really inefficient because arrow lacks the native capability to perform robust
 // StringArray -> StructArray JSON parsing. See https://github.com/apache/arrow-rs/issues/6522. If
 // that shortcoming gets fixed upstream, this method can simplify or hopefully even disappear.
-fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaResult<RecordBatch> {
+fn parse_json_impl(
+    json_strings: &StringArray,
+    schema: ArrowSchemaRef,
+) -> EngineResult<RecordBatch> {
     if json_strings.is_empty() {
         return Ok(RecordBatch::new_empty(schema));
     }
@@ -708,18 +719,21 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
     let mut decoder = ReaderBuilder::new(schema.clone())
         .with_batch_size(1)
         .build_decoder()?;
-    let parse_one = |json_string: Option<&str>| -> DeltaResult<RecordBatch> {
+    let parse_one = |json_string: Option<&str>| -> EngineResult<RecordBatch> {
         let mut reader = BufReader::new(json_string.unwrap_or("{}").as_bytes());
         let buf = reader.fill_buf()?;
         let read = buf.len();
         require!(
             decoder.decode(buf)? == read,
-            Error::missing_data("Incomplete JSON string")
+            Error::missing_data("Incomplete JSON string").into()
         );
         let Some(batch) = decoder.flush()? else {
-            return Err(Error::missing_data("Expected data"));
+            return Err(Error::missing_data("Expected data").into());
         };
-        require!(batch.num_rows() == 1, Error::generic("Expected one row"));
+        require!(
+            batch.num_rows() == 1,
+            Error::generic("Expected one row").into()
+        );
         Ok(batch)
     };
     let output: Vec<_> = json_strings.iter().map(parse_one).try_collect()?;
@@ -730,7 +744,7 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
 // TODO (zach): this should stream data to the JSON writer and output an iterator.
 pub(crate) fn to_json_bytes(
     data: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send,
-) -> DeltaResult<Vec<u8>> {
+) -> EngineResult<Vec<u8>> {
     let mut writer = LineDelimitedWriter::new(Vec::new());
     for chunk in data.into_iter() {
         let arrow_data = ArrowEngineData::try_from_engine_data(chunk?)?;
@@ -1502,7 +1516,7 @@ mod tests {
     #[test]
     fn test_arrow_broken_nested_null_masks() {
         use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
-        use crate::engine::arrow_utils::fix_nested_null_masks;
+        use crate::arrow_utils::fix_nested_null_masks;
         use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
         // Parse some JSON into a nested schema

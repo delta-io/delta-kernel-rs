@@ -1,0 +1,75 @@
+[package]
+name = "delta-kernel-engine"
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+delta_kernel = { path = "../kernel" }
+bytes = "1.10"
+chrono = "0.4.40"
+itertools = "0.14"
+futures = "0.3"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+# Used for fetching direct urls (like pre-signed urls)
+reqwest = { version = "0.12.15", default-features = false }
+# optionally used with default engine (though not required)
+# TODO for now we just make this required
+tokio = { version = "1.44", features = ["rt-multi-thread"] }
+url = "2.5"
+uuid = { version = "1.16.0", features = ["v4", "fast-rng"] }
+
+# arrow 54
+[dependencies.arrow_54]
+package = "arrow"
+version = "54.3"
+features = [ "chrono-tz", "ffi", "json", "prettyprint" ]
+optional = true
+[dependencies.parquet_54]
+package = "parquet"
+version = "54.3"
+features = [ "async", "object_store" ]
+optional = true
+[dependencies.object_store_54]
+package = "object_store"
+version = "0.11"
+features = [ "aws", "azure", "gcp", "http" ]
+optional = true
+
+# arrow 55
+[dependencies.arrow_55]
+package = "arrow"
+version = "55"
+features = [ "chrono-tz", "ffi", "json", "prettyprint" ]
+optional = true
+[dependencies.parquet_55]
+package = "parquet"
+version = "55"
+features = [ "async", "object_store" ]
+optional = true
+[dependencies.object_store_55]
+package = "object_store"
+version = "0.12"
+features = [ "aws", "azure", "gcp", "http" ]
+optional = true
+
+[features]
+# default to arrow 54
+default = [ "arrow-54", "reqwest/default" ]
+# arrow 54 version
+arrow-54 = [ "dep:arrow_54", "dep:parquet_54", "dep:object_store_54" ]
+# arrow 55 version
+arrow-55 = [ "dep:arrow_55", "dep:parquet_55", "dep:object_store_55" ]
+# turn on 'rustls' to use rustls instead of native-tls
+rustls = [ "reqwest/rustls-tls-native-roots", "reqwest/http2" ]
+
+[dev-dependencies]
+async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implementation

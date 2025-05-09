@@ -12,5 +12,6 @@ version.workspace = true
 release = false
 
 [dependencies]
-delta_kernel = { path = "../kernel", features = [ "default-engine", "arrow" ] }
+delta_kernel = { path = "../kernel" }
+delta-kernel-engine = { path = "../delta-kernel-engine", features = [ "arrow-55" ] }
 itertools = "0.14.0"

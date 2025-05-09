@@ -16,11 +16,7 @@ mod arrow_compat_shims {
 
 // if nothing is enabled but we need arrow because of some other feature flag, throw compile-time
 // error
-#[cfg(all(
-    feature = "need-arrow",
-    not(feature = "arrow-54"),
-    not(feature = "arrow-55")
-))]
+#[cfg(all(not(feature = "arrow-54"), not(feature = "arrow-55")))]
 compile_error!("Requested a feature that needs arrow without enabling arrow. Please enable the `arrow-54` or `arrow-55` feature");
 
 #[cfg(any(feature = "arrow-54", feature = "arrow-55"))]

@@ -78,6 +78,7 @@ pub mod checkpoint;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
+pub mod kernel_predicates;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -88,11 +89,6 @@ pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
 
-mod arrow_compat;
-#[cfg(any(feature = "arrow-54", feature = "arrow-55"))]
-pub use arrow_compat::*;
-
-pub(crate) mod kernel_predicates;
 pub(crate) mod utils;
 
 // for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
@@ -124,12 +120,8 @@ use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
 use schema::{SchemaTransform, StructField, StructType};
 
-#[cfg(any(
-    feature = "default-engine",
-    feature = "sync-engine",
-    feature = "arrow-conversion"
-))]
-pub mod engine;
+#[cfg(test)]
+pub(crate) mod engine;
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
@@ -568,15 +560,3 @@ pub trait Engine: AsAny {
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
 }
-
-// we have an 'internal' feature flag: default-engine-base, which is actually just the shared
-// pieces of default-engine and default-engine-rustls. the crate can't compile with _only_
-// default-engine-base, so we give a friendly error here.
-#[cfg(all(
-    feature = "default-engine-base",
-    not(any(feature = "default-engine", feature = "default-engine-rustls",))
-))]
-compile_error!(
-    "The default-engine-base feature flag is not meant to be used directly. \
-    Please use either default-engine or default-engine-rustls."
-);
