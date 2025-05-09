@@ -54,16 +54,9 @@ fn scalar_to_df(scalar: &Scalar) -> DFResult<ScalarValue> {
             ScalarValue::Decimal128(Some(data.bits()), data.precision(), data.scale() as i8)
         }
         Scalar::Struct(data) => {
-            let fields = data
-                .fields()
-                .iter()
-                .map(ArrowField::try_from)
-                .try_collect::<_, Vec<_>, _>()?;
-            let values = data
-                .values()
-                .iter()
-                .map(scalar_to_df)
-                .try_collect::<_, Vec<_>, _>()?;
+            let fields: Vec<ArrowField> =
+                data.fields().iter().map(TryInto::try_into).try_collect()?;
+            let values: Vec<_> = data.values().iter().map(scalar_to_df).try_collect()?;
             fields
                 .into_iter()
                 .zip(values.into_iter())
@@ -74,12 +67,12 @@ fn scalar_to_df(scalar: &Scalar) -> DFResult<ScalarValue> {
         }
         Scalar::Array(_) => {
             return Err(DataFusionError::NotImplemented(
-                "Array scalar values not supported".into(),
+                "Array scalar values not implemented".into(),
             ))
         }
         Scalar::Map(_) => {
             return Err(DataFusionError::NotImplemented(
-                "Map scalar values not supported".into(),
+                "Map scalar values not implemented".into(),
             ))
         }
         Scalar::Null(data_type) => ScalarValue::try_from(&ArrowDataType::try_from(data_type)?)?,
@@ -157,9 +150,157 @@ mod tests {
     use datafusion_expr::{col, lit};
     use delta_kernel::expressions::ColumnName;
     use delta_kernel::expressions::{
-        BinaryExpression, BinaryOperator, JunctionOperator, Scalar, UnaryExpression, UnaryOperator,
+        ArrayData, BinaryExpression, BinaryOperator, JunctionOperator, MapData, Scalar, StructData,
+        UnaryExpression, UnaryOperator,
     };
-    use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
+
+    /// Test conversion of primitive scalar types to DataFusion scalar values
+    #[test]
+    fn test_scalar_to_df_primitives() {
+        let test_cases = vec![
+            (Scalar::Boolean(true), ScalarValue::Boolean(Some(true))),
+            (
+                Scalar::String("test".to_string()),
+                ScalarValue::Utf8(Some("test".to_string())),
+            ),
+            (Scalar::Integer(42), ScalarValue::Int32(Some(42))),
+            (Scalar::Long(42), ScalarValue::Int64(Some(42))),
+            (Scalar::Float(42.0), ScalarValue::Float32(Some(42.0))),
+            (Scalar::Double(42.0), ScalarValue::Float64(Some(42.0))),
+            (Scalar::Byte(42), ScalarValue::Int8(Some(42))),
+            (Scalar::Short(42), ScalarValue::Int16(Some(42))),
+        ];
+
+        for (input, expected) in test_cases {
+            let result = scalar_to_df(&input).unwrap();
+            assert_eq!(result, expected);
+        }
+    }
+
+    /// Test conversion of temporal scalar types to DataFusion scalar values
+    #[test]
+    fn test_scalar_to_df_temporal() {
+        let test_cases = vec![
+            (
+                Scalar::Timestamp(1234567890),
+                ScalarValue::TimestampMicrosecond(Some(1234567890), Some("UTC".into())),
+            ),
+            (
+                Scalar::TimestampNtz(1234567890),
+                ScalarValue::TimestampMicrosecond(Some(1234567890), None),
+            ),
+            (Scalar::Date(18262), ScalarValue::Date32(Some(18262))),
+        ];
+
+        for (input, expected) in test_cases {
+            let result = scalar_to_df(&input).unwrap();
+            assert_eq!(result, expected);
+        }
+    }
+
+    /// Test conversion of binary and decimal scalar types to DataFusion scalar values
+    #[test]
+    fn test_scalar_to_df_binary_decimal() {
+        let binary_data = vec![1, 2, 3];
+        let decimal_data = Scalar::decimal(123456789, 10, 2).unwrap();
+
+        let test_cases = vec![
+            (
+                Scalar::Binary(binary_data.clone()),
+                ScalarValue::Binary(Some(binary_data)),
+            ),
+            (
+                decimal_data,
+                ScalarValue::Decimal128(Some(123456789), 10, 2),
+            ),
+        ];
+
+        for (input, expected) in test_cases {
+            let result = scalar_to_df(&input).unwrap();
+            assert_eq!(result, expected);
+        }
+    }
+
+    /// Test conversion of struct scalar type to DataFusion scalar value
+    #[test]
+    fn test_scalar_to_df_struct() {
+        let result = scalar_to_df(&Scalar::Struct(
+            StructData::try_new(
+                vec![
+                    StructField::nullable("a", DataType::INTEGER),
+                    StructField::nullable("b", DataType::STRING),
+                ],
+                vec![Scalar::Integer(42), Scalar::String("test".to_string())],
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+
+        // Create the expected struct value
+        let expected = ScalarStructBuilder::new()
+            .with_scalar(
+                ArrowField::new("a", ArrowDataType::Int32, true),
+                ScalarValue::Int32(Some(42)),
+            )
+            .with_scalar(
+                ArrowField::new("b", ArrowDataType::Utf8, true),
+                ScalarValue::Utf8(Some("test".to_string())),
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(result, expected);
+    }
+
+    /// Test conversion of null scalar types to DataFusion scalar values
+    #[test]
+    fn test_scalar_to_df_null() {
+        let test_cases = vec![
+            (Scalar::Null(DataType::INTEGER), ScalarValue::Int32(None)),
+            (Scalar::Null(DataType::STRING), ScalarValue::Utf8(None)),
+            (Scalar::Null(DataType::BOOLEAN), ScalarValue::Boolean(None)),
+            (Scalar::Null(DataType::DOUBLE), ScalarValue::Float64(None)),
+        ];
+
+        for (input, expected) in test_cases {
+            let result = scalar_to_df(&input).unwrap();
+            assert_eq!(result, expected);
+        }
+    }
+
+    /// Test error cases for unsupported scalar types (Array and Map)
+    #[test]
+    fn test_scalar_to_df_errors() {
+        let array_data = ArrayData::try_new(
+            ArrayType::new(DataType::INTEGER, true),
+            vec![Scalar::Integer(1), Scalar::Integer(2)],
+        )
+        .unwrap();
+
+        let map_data = MapData::try_new(
+            MapType::new(DataType::STRING, DataType::INTEGER, true),
+            vec![
+                (Scalar::String("key1".to_string()), Scalar::Integer(1)),
+                (Scalar::String("key2".to_string()), Scalar::Integer(2)),
+            ],
+        )
+        .unwrap();
+
+        let test_cases = vec![
+            (
+                Scalar::Array(array_data),
+                "Array scalar values not supported",
+            ),
+            (Scalar::Map(map_data), "Map scalar values not supported"),
+        ];
+
+        for (input, expected_error) in test_cases {
+            let result = scalar_to_df(&input);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains(expected_error));
+        }
+    }
 
     /// Test basic column reference: `test_col`
     #[test]
@@ -373,6 +514,308 @@ mod tests {
             op: BinaryOperator::Distinct,
             right: Box::new(Expression::Column(ColumnName::new(["b"]))),
         });
+        assert!(to_datafusion_expr(&expr, &DataType::BOOLEAN).is_err());
+
+        // Test error case: empty column name
+        let expr = Expression::Column(ColumnName::new::<&str>([]));
+        assert!(to_datafusion_expr(&expr, &DataType::BOOLEAN).is_err());
+    }
+
+    /// Test binary expression conversions:
+    /// - Equality: a = b
+    /// - Inequality: a != b
+    /// - Less than: a < b
+    /// - Less than or equal: a <= b
+    /// - Greater than: a > b
+    /// - Greater than or equal: a >= b
+    /// - Addition: a + b
+    /// - Subtraction: a - b
+    /// - Multiplication: a * b
+    /// - Division: a / b
+    #[test]
+    fn test_binary_to_df() {
+        let test_cases = vec![
+            (
+                BinaryExpression {
+                    left: Box::new(Expression::Column(ColumnName::new(["a"]))),
+                    op: BinaryOperator::Equal,
+                    right: Box::new(Expression::Column(ColumnName::new(["b"]))),
+                },
+                col("a").eq(col("b")),
+            ),
+            (
+                BinaryExpression {
+                    left: Box::new(Expression::Column(ColumnName::new(["a"]))),
+                    op: BinaryOperator::NotEqual,
+                    right: Box::new(Expression::Column(ColumnName::new(["b"]))),
+                },
+                col("a").not_eq(col("b")),
+            ),
+            (
+                BinaryExpression {
+                    left: Box::new(Expression::Column(ColumnName::new(["a"]))),
+                    op: BinaryOperator::LessThan,
+                    right: Box::new(Expression::Column(ColumnName::new(["b"]))),
+                },
+                col("a").lt(col("b")),
+            ),
+            (
+                BinaryExpression {
+                    left: Box::new(Expression::Column(ColumnName::new(["a"]))),
+                    op: BinaryOperator::LessThanOrEqual,
+                    right: Box::new(Expression::Column(ColumnName::new(["b"]))),
+                },
+                col("a").lt_eq(col("b")),
+            ),
+            (
+                BinaryExpression {
+                    left: Box::new(Expression::Column(ColumnName::new(["a"]))),
+                    op: BinaryOperator::GreaterThan,
+                    right: Box::new(Expression::Column(ColumnName::new(["b"]))),
+                },
+                col("a").gt(col("b")),
+            ),
+            (
+                BinaryExpression {
+                    left: Box::new(Expression::Column(ColumnName::new(["a"]))),
+                    op: BinaryOperator::GreaterThanOrEqual,
+                    right: Box::new(Expression::Column(ColumnName::new(["b"]))),
+                },
+                col("a").gt_eq(col("b")),
+            ),
+            (
+                BinaryExpression {
+                    left: Box::new(Expression::Column(ColumnName::new(["a"]))),
+                    op: BinaryOperator::Plus,
+                    right: Box::new(Expression::Column(ColumnName::new(["b"]))),
+                },
+                col("a") + col("b"),
+            ),
+            (
+                BinaryExpression {
+                    left: Box::new(Expression::Column(ColumnName::new(["a"]))),
+                    op: BinaryOperator::Minus,
+                    right: Box::new(Expression::Column(ColumnName::new(["b"]))),
+                },
+                col("a") - col("b"),
+            ),
+            (
+                BinaryExpression {
+                    left: Box::new(Expression::Column(ColumnName::new(["a"]))),
+                    op: BinaryOperator::Multiply,
+                    right: Box::new(Expression::Column(ColumnName::new(["b"]))),
+                },
+                col("a") * col("b"),
+            ),
+            (
+                BinaryExpression {
+                    left: Box::new(Expression::Column(ColumnName::new(["a"]))),
+                    op: BinaryOperator::Divide,
+                    right: Box::new(Expression::Column(ColumnName::new(["b"]))),
+                },
+                col("a") / col("b"),
+            ),
+        ];
+
+        for (input, expected) in test_cases {
+            let result = binary_to_df(&input, &DataType::BOOLEAN).unwrap();
+            assert_eq!(result, expected);
+        }
+    }
+
+    /// Test junction expression conversions:
+    /// - Simple AND: a AND b
+    /// - Simple OR: a OR b
+    /// - Multiple AND: a AND b AND c
+    /// - Multiple OR: a OR b OR c
+    /// - Empty AND (should return true)
+    /// - Empty OR (should return false)
+    #[test]
+    fn test_junction_to_df() {
+        let test_cases = vec![
+            // Simple AND
+            (
+                JunctionExpression {
+                    op: JunctionOperator::And,
+                    exprs: vec![
+                        Expression::Column(ColumnName::new(["a"])),
+                        Expression::Column(ColumnName::new(["b"])),
+                    ],
+                },
+                col("a").and(col("b")),
+            ),
+            // Simple OR
+            (
+                JunctionExpression {
+                    op: JunctionOperator::Or,
+                    exprs: vec![
+                        Expression::Column(ColumnName::new(["a"])),
+                        Expression::Column(ColumnName::new(["b"])),
+                    ],
+                },
+                col("a").or(col("b")),
+            ),
+            // Multiple AND
+            (
+                JunctionExpression {
+                    op: JunctionOperator::And,
+                    exprs: vec![
+                        Expression::Column(ColumnName::new(["a"])),
+                        Expression::Column(ColumnName::new(["b"])),
+                        Expression::Column(ColumnName::new(["c"])),
+                    ],
+                },
+                col("a").and(col("b")).and(col("c")),
+            ),
+            // Multiple OR
+            (
+                JunctionExpression {
+                    op: JunctionOperator::Or,
+                    exprs: vec![
+                        Expression::Column(ColumnName::new(["a"])),
+                        Expression::Column(ColumnName::new(["b"])),
+                        Expression::Column(ColumnName::new(["c"])),
+                    ],
+                },
+                col("a").or(col("b")).or(col("c")),
+            ),
+            // Empty AND (should return true)
+            (
+                JunctionExpression {
+                    op: JunctionOperator::And,
+                    exprs: vec![],
+                },
+                lit(true),
+            ),
+            // Empty OR (should return false)
+            (
+                JunctionExpression {
+                    op: JunctionOperator::Or,
+                    exprs: vec![],
+                },
+                lit(false),
+            ),
+        ];
+
+        for (input, expected) in test_cases {
+            let result = junction_to_df(&input, &DataType::BOOLEAN).unwrap();
+            assert_eq!(result, expected);
+        }
+    }
+
+    /// Test to_datafusion_expr with various expression types and combinations:
+    /// - Column expressions with nested fields
+    /// - Complex unary expressions
+    /// - Nested binary expressions
+    /// - Mixed junction expressions
+    /// - Struct expressions with nested fields
+    /// - Complex combinations of all expression types
+    #[test]
+    fn test_to_datafusion_expr_comprehensive() {
+        // Test column expressions with nested fields
+        let expr = Expression::Column(ColumnName::new(["struct", "field", "nested"]));
+        let result = to_datafusion_expr(&expr, &DataType::BOOLEAN).unwrap();
+        assert_eq!(result, col("struct").field("field").field("nested"));
+
+        // Test complex unary expressions
+        let expr = Expression::Unary(UnaryExpression {
+            op: UnaryOperator::Not,
+            expr: Box::new(Expression::Unary(UnaryExpression {
+                op: UnaryOperator::IsNull,
+                expr: Box::new(Expression::Column(ColumnName::new(["a"]))),
+            })),
+        });
+        let result = to_datafusion_expr(&expr, &DataType::BOOLEAN).unwrap();
+        assert_eq!(result, !col("a").is_null());
+
+        // Test nested binary expressions
+        let expr = Expression::Binary(BinaryExpression {
+            left: Box::new(Expression::Binary(BinaryExpression {
+                left: Box::new(Expression::Column(ColumnName::new(["a"]))),
+                op: BinaryOperator::Plus,
+                right: Box::new(Expression::Column(ColumnName::new(["b"]))),
+            })),
+            op: BinaryOperator::Multiply,
+            right: Box::new(Expression::Column(ColumnName::new(["c"]))),
+        });
+        let result = to_datafusion_expr(&expr, &DataType::BOOLEAN).unwrap();
+        assert_eq!(result, (col("a") + col("b")) * col("c"));
+
+        // Test mixed junction expressions
+        let expr = Expression::Junction(JunctionExpression {
+            op: JunctionOperator::And,
+            exprs: vec![
+                Expression::Binary(BinaryExpression {
+                    left: Box::new(Expression::Column(ColumnName::new(["a"]))),
+                    op: BinaryOperator::GreaterThan,
+                    right: Box::new(Expression::Literal(Scalar::Integer(0))),
+                }),
+                Expression::Junction(JunctionExpression {
+                    op: JunctionOperator::Or,
+                    exprs: vec![
+                        Expression::Column(ColumnName::new(["b"])),
+                        Expression::Column(ColumnName::new(["c"])),
+                    ],
+                }),
+            ],
+        });
+        let result = to_datafusion_expr(&expr, &DataType::BOOLEAN).unwrap();
+        assert_eq!(result, col("a").gt(lit(0)).and(col("b").or(col("c"))));
+
+        // Test struct expressions with nested fields
+        let expr = Expression::Struct(vec![
+            Expression::Column(ColumnName::new(["a"])),
+            Expression::Binary(BinaryExpression {
+                left: Box::new(Expression::Column(ColumnName::new(["b"]))),
+                op: BinaryOperator::Plus,
+                right: Box::new(Expression::Column(ColumnName::new(["c"]))),
+            }),
+        ]);
+        let result = to_datafusion_expr(
+            &expr,
+            &DataType::Struct(Box::new(StructType::new(vec![
+                StructField::nullable("a", DataType::INTEGER),
+                StructField::nullable("sum", DataType::INTEGER),
+            ]))),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            named_struct(vec![lit("a"), col("a"), lit("sum"), col("b") + col("c")])
+        );
+
+        // Test complex combination of all expression types
+        let expr = Expression::Junction(JunctionExpression {
+            op: JunctionOperator::And,
+            exprs: vec![
+                Expression::Unary(UnaryExpression {
+                    op: UnaryOperator::Not,
+                    expr: Box::new(Expression::Column(ColumnName::new(["a"]))),
+                }),
+                Expression::Binary(BinaryExpression {
+                    left: Box::new(Expression::Column(ColumnName::new(["b"]))),
+                    op: BinaryOperator::Equal,
+                    right: Box::new(Expression::Literal(Scalar::Integer(42))),
+                }),
+                Expression::Junction(JunctionExpression {
+                    op: JunctionOperator::Or,
+                    exprs: vec![
+                        Expression::Column(ColumnName::new(["c"])),
+                        Expression::Column(ColumnName::new(["d"])),
+                    ],
+                }),
+            ],
+        });
+        let result = to_datafusion_expr(&expr, &DataType::BOOLEAN).unwrap();
+        assert_eq!(
+            result,
+            (!col("a"))
+                .and(col("b").eq(lit(42)))
+                .and(col("c").or(col("d")))
+        );
+
+        // Test error case: empty column name
+        let expr = Expression::Column(ColumnName::new::<&str>([]));
         assert!(to_datafusion_expr(&expr, &DataType::BOOLEAN).is_err());
     }
 }

@@ -173,7 +173,7 @@ fn to_junction_op(op: Operator) -> JunctionOperator {
 mod tests {
     use super::*;
     use datafusion_expr::{col, lit};
-    use delta_kernel::expressions::JunctionOperator;
+    use delta_kernel::expressions::{BinaryOperator, JunctionOperator, Scalar};
 
     fn assert_junction_expr(expr: &Expr, expected_op: JunctionOperator, expected_children: usize) {
         let delta_expr = to_delta_expression(expr).unwrap();
@@ -292,6 +292,163 @@ mod tests {
                 }
             }
             _ => panic!("Expected Junction expression"),
+        }
+    }
+
+    #[test]
+    fn test_column_expression() {
+        let expr = col("test_column");
+        let delta_expr = to_delta_expression(&expr).unwrap();
+        match delta_expr {
+            Expression::Column(name) => assert_eq!(&name.to_string(), "test_column"),
+            _ => panic!("Expected Column expression, got {:?}", delta_expr),
+        }
+    }
+
+    #[test]
+    fn test_literal_expressions() {
+        // Test boolean literal
+        let expr = lit(true);
+        let delta_expr = to_delta_expression(&expr).unwrap();
+        match delta_expr {
+            Expression::Literal(Scalar::Boolean(value)) => assert!(value),
+            _ => panic!("Expected Boolean literal, got {:?}", delta_expr),
+        }
+
+        // Test string literal
+        let expr = lit("test");
+        let delta_expr = to_delta_expression(&expr).unwrap();
+        match delta_expr {
+            Expression::Literal(Scalar::String(value)) => assert_eq!(value, "test"),
+            _ => panic!("Expected String literal, got {:?}", delta_expr),
+        }
+
+        // Test integer literal
+        let expr = lit(42i32);
+        let delta_expr = to_delta_expression(&expr).unwrap();
+        match delta_expr {
+            Expression::Literal(Scalar::Integer(value)) => assert_eq!(value, 42),
+            _ => panic!("Expected Integer literal, got {:?}", delta_expr),
+        }
+
+        // Test decimal literal
+        let expr = lit(ScalarValue::Decimal128(Some(12345), 10, 2));
+        let delta_expr = to_delta_expression(&expr).unwrap();
+        match delta_expr {
+            Expression::Literal(Scalar::Decimal(data)) => {
+                assert_eq!(data.bits(), 12345);
+                assert_eq!(data.precision(), 10);
+                assert_eq!(data.scale(), 2);
+            }
+            _ => panic!("Expected Decimal literal, got {:?}", delta_expr),
+        }
+    }
+
+    #[test]
+    fn test_binary_expressions() {
+        // Test comparison operators
+        let test_cases = vec![
+            (col("a").eq(lit(1)), BinaryOperator::Equal),
+            (col("a").not_eq(lit(1)), BinaryOperator::NotEqual),
+            (col("a").lt(lit(1)), BinaryOperator::LessThan),
+            (col("a").lt_eq(lit(1)), BinaryOperator::LessThanOrEqual),
+            (col("a").gt(lit(1)), BinaryOperator::GreaterThan),
+            (col("a").gt_eq(lit(1)), BinaryOperator::GreaterThanOrEqual),
+        ];
+
+        for (expr, expected_op) in test_cases {
+            let delta_expr = to_delta_expression(&expr).unwrap();
+            match delta_expr {
+                Expression::Binary(binary) => {
+                    assert_eq!(binary.op, expected_op);
+                    match *binary.left {
+                        Expression::Column(name) => assert_eq!(name.to_string(), "a"),
+                        _ => panic!("Expected Column expression in left operand"),
+                    }
+                    match *binary.right {
+                        Expression::Literal(Scalar::Integer(value)) => assert_eq!(value, 1),
+                        _ => panic!("Expected Integer literal in right operand"),
+                    }
+                }
+                _ => panic!("Expected Binary expression, got {:?}", delta_expr),
+            }
+        }
+
+        // Test arithmetic operators
+        let test_cases = vec![
+            (col("a") + lit(1), BinaryOperator::Plus),
+            (col("a") - lit(1), BinaryOperator::Minus),
+            (col("a") * lit(1), BinaryOperator::Multiply),
+            (col("a") / lit(1), BinaryOperator::Divide),
+        ];
+
+        for (expr, expected_op) in test_cases {
+            let delta_expr = to_delta_expression(&expr).unwrap();
+            match delta_expr {
+                Expression::Binary(binary) => {
+                    assert_eq!(binary.op, expected_op);
+                    match *binary.left {
+                        Expression::Column(name) => assert_eq!(name.to_string(), "a"),
+                        _ => panic!("Expected Column expression in left operand"),
+                    }
+                    match *binary.right {
+                        Expression::Literal(Scalar::Integer(value)) => assert_eq!(value, 1),
+                        _ => panic!("Expected Integer literal in right operand"),
+                    }
+                }
+                _ => panic!("Expected Binary expression, got {:?}", delta_expr),
+            }
+        }
+    }
+
+    #[test]
+    fn test_unary_expressions() {
+        // Test IS NULL
+        let expr = col("a").is_null();
+        let delta_expr = to_delta_expression(&expr).unwrap();
+        match delta_expr {
+            Expression::Unary(unary) => {
+                assert_eq!(unary.op, UnaryOperator::IsNull);
+                match *unary.expr {
+                    Expression::Column(name) => assert_eq!(name.to_string(), "a"),
+                    _ => panic!("Expected Column expression in operand"),
+                }
+            }
+            _ => panic!("Expected Unary expression, got {:?}", delta_expr),
+        }
+
+        // Test NOT
+        let expr = !col("a");
+        let delta_expr = to_delta_expression(&expr).unwrap();
+        match delta_expr {
+            Expression::Unary(unary) => {
+                assert_eq!(unary.op, UnaryOperator::Not);
+                match *unary.expr {
+                    Expression::Column(name) => assert_eq!(name.to_string(), "a"),
+                    _ => panic!("Expected Column expression in operand"),
+                }
+            }
+            _ => panic!("Expected Unary expression, got {:?}", delta_expr),
+        }
+    }
+
+    #[test]
+    fn test_null_literals() {
+        let test_cases = vec![
+            (lit(ScalarValue::Boolean(None)), DataType::BOOLEAN),
+            (lit(ScalarValue::Utf8(None)), DataType::STRING),
+            (lit(ScalarValue::Int32(None)), DataType::INTEGER),
+            (lit(ScalarValue::Float64(None)), DataType::DOUBLE),
+        ];
+
+        for (expr, expected_type) in test_cases {
+            let delta_expr = to_delta_expression(&expr).unwrap();
+            match delta_expr {
+                Expression::Literal(Scalar::Null(data_type)) => {
+                    assert_eq!(data_type, expected_type);
+                }
+                _ => panic!("Expected Null literal, got {:?}", delta_expr),
+            }
         }
     }
 }
