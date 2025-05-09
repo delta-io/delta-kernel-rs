@@ -1,32 +1,15 @@
 //! Defines [`EngineExpressionVisitor`]. This is a visitor that can be used to convert the kernel's
-//! [`Expression`] to an engine's expression format.
-use crate::expressions::{SharedExpression, SharedPredicate};
+//! [`Expression`] or [`Predicate`] to an engine's native expression format.
 use std::ffi::c_void;
 
-use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
     Expression, JunctionPredicate, JunctionPredicateOp, MapData, Predicate, Scalar, StructData,
     UnaryPredicate, UnaryPredicateOp,
 };
 
-/// Free the memory the passed SharedExpression
-///
-/// # Safety
-/// Engine is responsible for passing a valid SharedExpression
-#[no_mangle]
-pub unsafe extern "C" fn free_kernel_expression(data: Handle<SharedExpression>) {
-    data.drop_handle();
-}
-
-/// Free the memory the passed SharedPredicate
-///
-/// # Safety
-/// Engine is responsible for passing a valid SharedPredicate
-#[no_mangle]
-pub unsafe extern "C" fn free_kernel_predicate(data: Handle<SharedPredicate>) {
-    data.drop_handle();
-}
+use crate::expressions::{SharedExpression, SharedPredicate};
+use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
 
 type VisitLiteralFn<T> = extern "C" fn(data: *mut c_void, sibling_list_id: usize, value: T);
 type VisitUnaryFn = extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
