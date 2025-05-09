@@ -1,7 +1,6 @@
 //! This module defines the [`LogHistoryManager`], which can be used to perform timestamp queries
 //! over the Delta Log, translating from timestamps to Delta versions.
 
-use crate::internal_mod;
 use error::{LogHistoryError, TimestampOutOfRangeError};
 use search::{binary_search_by_key_with_bounds, Bound, SearchError};
 use std::cell::RefCell;
@@ -18,7 +17,11 @@ use crate::utils::require;
 use crate::{DeltaResult, Engine, Error as DeltaError, RowVisitor, Version};
 use timestamp_visitor::InCommitTimestampVisitor;
 
-internal_mod!(pub(crate) mod search);
+#[cfg(feature = "internal-api")]
+pub mod search;
+#[cfg(not(feature = "internal-api"))]
+mod search;
+
 pub mod error;
 mod timestamp_visitor;
 
