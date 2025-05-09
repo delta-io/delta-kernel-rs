@@ -492,20 +492,55 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
     ) -> Option<Cow<'a, JunctionPredicate>> {
         self.depth_limited(Self::recurse_into_pred_junction, pred)
     }
+
+    fn transform_pred_opaque(
+        &mut self,
+        pred: &'a OpaquePredicate,
+    ) -> Option<Cow<'a, OpaquePredicate>> {
+        self.depth_limited(Self::recurse_into_pred_opaque, pred)
+    }
+
+    fn transform_expr_opaque(
+        &mut self,
+        expr: &'a OpaqueExpression,
+    ) -> Option<Cow<'a, OpaqueExpression>> {
+        self.depth_limited(Self::recurse_into_expr_opaque, expr)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::ExpressionDepthChecker;
-    use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
+    use crate::expressions::{
+        column_expr, column_pred, Expression as Expr, OpaqueExpressionOp, OpaquePredicateOp,
+        Predicate as Pred,
+    };
+
+    #[derive(Debug, PartialEq)]
+    struct OpaqueTestOp(String);
+
+    impl OpaqueExpressionOp for OpaqueTestOp {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl OpaquePredicateOp for OpaqueTestOp {
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
 
     #[test]
     fn test_depth_checker() {
         let pred = Pred::or_from([
             Pred::and_from([
-                Pred::or(
-                    Pred::lt(Expr::literal(10), column_expr!("x")),
-                    Pred::gt(Expr::literal(20), column_expr!("b")),
+                Pred::opaque(
+                    OpaqueTestOp("opaque".to_string()),
+                    vec![
+                        Expr::literal(10) + column_expr!("x"),
+                        Expr::unknown("unknown") - column_expr!("b"),
+                    ],
                 ),
                 Pred::literal(true),
                 Pred::not(Pred::literal(true)),
@@ -514,10 +549,17 @@ mod tests {
                 Pred::is_null(column_expr!("b")),
                 Pred::gt(Expr::literal(10), column_expr!("x")),
                 Pred::or(
-                    Pred::gt(Expr::literal(5) + Expr::literal(10), Expr::literal(20)),
+                    Pred::gt(
+                        Expr::literal(5)
+                            + Expr::opaque(
+                                OpaqueTestOp("inscrutable".to_string()),
+                                vec![Expr::literal(10)],
+                            ),
+                        Expr::literal(20),
+                    ),
                     column_pred!("y"),
                 ),
-                Pred::literal(true),
+                Pred::unknown("mystery"),
             ]),
             Pred::ne(
                 Expr::literal(42),
@@ -533,7 +575,7 @@ mod tests {
 
         // OR
         //  * AND
-        //    * OR     >LIMIT<
+        //    * OPAQUE   >LIMIT<
         //    * NOT
         //  * AND
         //  * NE
@@ -541,9 +583,9 @@ mod tests {
 
         // OR
         //  * AND
-        //    * OR
-        //      * LT     >LIMIT<
-        //      * GT
+        //    * OPAQUE
+        //      * PLUS      >LIMIT<
+        //      * MINUS
         //    * NOT
         //  * AND
         //  * NE
@@ -551,9 +593,9 @@ mod tests {
 
         // OR
         //  * AND
-        //    * OR
-        //      * LT
-        //      * GT
+        //    * OPAQUE
+        //      * PLUS
+        //      * MINUS
         //    * NOT
         //  * AND
         //    * IS NULL
@@ -564,13 +606,11 @@ mod tests {
         //  * NE
         assert_eq!(check_with_call_count(3), (4, 13));
 
-        // Depth limit not hit (full traversal required)
-        //
         // OR
         //  * AND
-        //    * OR
-        //      * LT
-        //      * GT
+        //    * OPAQUE
+        //      * PLUS
+        //      * MINUS
         //    * NOT
         //  * AND
         //    * IS_NULL
@@ -578,10 +618,29 @@ mod tests {
         //    * OR
         //      * GT
         //        * PLUS
+        //          * OPAQUE    >LIMIT<
+        //  * NE
+        assert_eq!(check_with_call_count(4), (5, 14));
+
+        // Depth limit not hit (full traversal required)
+        //
+        // OR
+        //  * AND
+        //    * OPAQUE
+        //      * PLUS
+        //      * MINUS
+        //    * NOT
+        //  * AND
+        //    * IS_NULL
+        //    * GT
+        //    * OR
+        //      * GT
+        //        * PLUS
+        //          * OPAQUE
         //  * NE
         //    * STRUCT
-        assert_eq!(check_with_call_count(4), (4, 14));
-        assert_eq!(check_with_call_count(5), (4, 14));
+        assert_eq!(check_with_call_count(5), (5, 15));
+        assert_eq!(check_with_call_count(6), (5, 15));
 
         // Check expressions as well
         let expr = Expr::from(pred);
@@ -593,24 +652,26 @@ mod tests {
         //
         // PRED
         //  * OR
-        //    * AND            > LIMIT 1 <
-        //      * OR           > LIMIT 2 <
-        //        * LT         > LIMIT 3 <
-        //        * GT
+        //    * AND              > LIMIT 1 <
+        //      * OPAQUE         > LIMIT 2 <
+        //        * PLUS         > LIMIT 3 <
+        //        * MINUS
         //      * NOT
         //    * AND
         //      * IS_NULL
         //      * GT
         //      * OR
         //        * GT
-        //          * PLUS     > LIMIT 4 <
+        //          * PLUS       > LIMIT 4 <
+        //            * OPAQUE   > LIMIT 5 <
         //    * NE
         //      * STRUCT
         assert_eq!(check_with_call_count(1), (2, 5));
         assert_eq!(check_with_call_count(2), (3, 7));
         assert_eq!(check_with_call_count(3), (4, 9));
         assert_eq!(check_with_call_count(4), (5, 14));
-        assert_eq!(check_with_call_count(5), (5, 15));
-        assert_eq!(check_with_call_count(6), (5, 15));
+        assert_eq!(check_with_call_count(5), (6, 15));
+        assert_eq!(check_with_call_count(6), (6, 16));
+        assert_eq!(check_with_call_count(7), (6, 16));
     }
 }
