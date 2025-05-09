@@ -204,7 +204,7 @@ impl<T: ExternEngine + ?Sized> AllocateError for &T {
 /// # Safety
 ///
 /// The allocator must be valid.
-pub(crate) trait IntoExternResult<T> {
+pub trait IntoExternResult<T> {
     unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T>;
 }
 
