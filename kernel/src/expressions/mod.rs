@@ -12,7 +12,7 @@ pub use self::column_names::{
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use self::transforms::{ExpressionTransform as _, GetColumnReferences};
 use crate::kernel_predicates::DataSkippingPredicateEvaluator;
-use crate::{DataType, DeltaResult, DynPartialEq};
+use crate::{DataType, DeltaResult, DynPartialEq, Error};
 
 mod column_names;
 pub(crate) mod literal_expression_transform;
@@ -93,7 +93,11 @@ pub trait OpaqueExpressionOp: DynPartialEq + std::fmt::Debug {
     /// An output of `Err` indicates an incorrect invocation (e.g. wrong number and/or types of
     /// arguments, None input, etc), and `Ok(Scalar::Null)` means the operation actually produced a
     /// legitimately NULL output.
-    fn eval_expr_scalar(&self, values: &[Option<Scalar>]) -> DeltaResult<Scalar>;
+    fn eval_expr_scalar(&self, _values: &[Option<Scalar>]) -> DeltaResult<Scalar> {
+        Err(Error::Unsupported(format!(
+            "{self:?} does not implement scalar evaluation"
+        )))
+    }
 }
 
 /// An opaque predicate operation (ie defined and implemented by the engine).
@@ -115,35 +119,43 @@ pub trait OpaquePredicateOp: DynPartialEq + std::fmt::Debug {
     /// produced a legitimately NULL output.
     fn eval_pred_scalar(
         &self,
-        values: &[Option<Scalar>],
-        inverted: bool,
-    ) -> DeltaResult<Option<bool>>;
+        _values: &[Option<Scalar>],
+        _inverted: bool,
+    ) -> DeltaResult<Option<bool>> {
+        Err(Error::Unsupported(format!(
+            "{self:?} does not implement scalar evaluation"
+        )))
+    }
 
     /// Attempts to use this (possibly inverted) opaque predicate for stats-based pruning.
     ///
     /// Kernel attempts to implement parquet row group skipping by calling this method.
     fn eval_as_data_skipping_predicate(
         &self,
-        predicate_evaluator: &dyn DataSkippingPredicateEvaluator<
+        _predicate_evaluator: &dyn DataSkippingPredicateEvaluator<
             Output = bool,
             ColumnStat = Scalar,
         >,
-        exprs: &[Expression],
-        inverted: bool,
-    ) -> Option<bool>;
+        _exprs: &[Expression],
+        _inverted: bool,
+    ) -> Option<bool> {
+        None
+    }
 
     /// Attempts to convert this (possibly inverted) opaque predicate to a data skipping predicate.
     ///
     /// Kernel attempts to implement file pruning by calling this method.
     fn as_data_skipping_predicate(
         &self,
-        predicate_evaluator: &dyn DataSkippingPredicateEvaluator<
+        _predicate_evaluator: &dyn DataSkippingPredicateEvaluator<
             Output = Predicate,
             ColumnStat = Expression,
         >,
-        exprs: &[Expression],
-        inverted: bool,
-    ) -> Option<Predicate>;
+        _exprs: &[Expression],
+        _inverted: bool,
+    ) -> Option<Predicate> {
+        None
+    }
 }
 
 /// A shared reference to an [`OpaqueExpressionOp`] instance.
@@ -449,6 +461,22 @@ impl Expression {
             right: Box::new(rhs.into()),
         })
     }
+
+    /// Creates a new opaque expression
+    pub fn opaque<T: OpaqueExpressionOp>(
+        op: impl Into<Arc<T>>,
+        exprs: impl IntoIterator<Item = Expression>,
+    ) -> Self {
+        Self::Opaque(OpaqueExpression {
+            op: op.into(),
+            exprs: exprs.into_iter().collect(),
+        })
+    }
+
+    /// Creates a new unknown expression
+    pub fn unknown(name: impl Into<String>) -> Self {
+        Self::Unknown(name.into())
+    }
 }
 
 impl Predicate {
@@ -578,6 +606,22 @@ impl Predicate {
     pub fn junction(op: JunctionPredicateOp, preds: impl IntoIterator<Item = Self>) -> Self {
         let preds = preds.into_iter().collect();
         Self::Junction(JunctionPredicate { op, preds })
+    }
+
+    /// Creates a new opaque predicate
+    pub fn opaque<T: OpaquePredicateOp>(
+        op: impl Into<Arc<T>>,
+        exprs: impl IntoIterator<Item = Expression>,
+    ) -> Self {
+        Self::Opaque(OpaquePredicate {
+            op: op.into(),
+            exprs: exprs.into_iter().collect(),
+        })
+    }
+
+    /// Creates a new unknown predicate
+    pub fn unknown(name: impl Into<String>) -> Self {
+        Self::Unknown(name.into())
     }
 }
 

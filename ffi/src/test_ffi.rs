@@ -4,12 +4,10 @@ use std::sync::Arc;
 
 use crate::expressions::{SharedExpression, SharedPredicate};
 use crate::handle::Handle;
-use delta_kernel::DeltaResult;
 use delta_kernel::expressions::{
     column_expr, column_pred, ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr,
-    MapData, Predicate as Pred, Scalar, StructData, OpaqueExpressionOp, OpaqueExpression, OpaquePredicateOp, OpaquePredicate,
+    MapData, OpaqueExpressionOp, OpaquePredicateOp, Predicate as Pred, Scalar, StructData,
 };
-use delta_kernel::kernel_predicates::DataSkippingPredicateEvaluator;
 use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
 #[derive(Debug, PartialEq)]
@@ -19,39 +17,11 @@ impl OpaqueExpressionOp for OpaqueTestOp {
     fn name(&self) -> &str {
         &self.0
     }
-    fn eval_expr_scalar(&self, _values: &[Option<Scalar>]) -> DeltaResult<Scalar> {
-        unimplemented!()
-    }
 }
 
 impl OpaquePredicateOp for OpaqueTestOp {
     fn name(&self) -> &str {
         &self.0
-    }
-    fn eval_pred_scalar(&self, _values: &[Option<Scalar>], _inverted: bool) -> DeltaResult<Option<bool>> {
-        unimplemented!()
-    }
-    fn eval_as_data_skipping_predicate(
-        &self,
-        _predicate_evaluator: &dyn DataSkippingPredicateEvaluator<
-            Output = bool,
-            ColumnStat = Scalar,
-        >,
-        _exprs: &[Expr],
-        _inverted: bool,
-    ) -> Option<bool> {
-        unimplemented!()
-    }
-    fn as_data_skipping_predicate(
-        &self,
-        _predicate_evaluator: &dyn DataSkippingPredicateEvaluator<
-            Output = Pred,
-            ColumnStat = Expr,
-        >,
-        _exprs: &[Expr],
-        _inverted: bool,
-    ) -> Option<Pred> {
-        unimplemented!()
     }
 }
 
@@ -97,10 +67,6 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
     )
     .unwrap();
 
-    let opaque = Expr::Opaque(OpaqueExpression {
-        op: Arc::new(OpaqueTestOp("foo".to_string())),
-        exprs: vec![Expr::literal(42), Expr::literal(3.14159)],
-    });
     let mut sub_exprs = vec![
         column_expr!("col"),
         Expr::literal(i8::MAX),
@@ -127,8 +93,11 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         Scalar::Array(array_data).into(),
         Scalar::Map(map_data).into(),
         Expr::struct_from([Expr::literal(5_i32), Expr::literal(20_i64)]),
-        opaque,
-        Expr::Unknown("mystery".to_string()),
+        Expr::opaque(
+            OpaqueTestOp("foo".to_string()),
+            vec![Expr::literal(42), Expr::literal(1.111)],
+        ),
+        Expr::unknown("mystery"),
     ];
     sub_exprs.extend(
         [
@@ -159,10 +128,6 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
     let array_data =
         ArrayData::try_new(array_type.clone(), vec![Scalar::Short(5), Scalar::Short(0)]).unwrap();
 
-    let opaque = Pred::Opaque(OpaquePredicate {
-        op: Arc::new(OpaqueTestOp("bar".to_string())),
-        exprs: vec![Expr::literal(42), Expr::literal(3.14159)],
-    });
     let mut sub_exprs = vec![
         column_pred!("col"),
         Pred::literal(true),
@@ -182,8 +147,11 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
             Pred::ne(Expr::literal(20), Expr::literal(10)),
         ]),
         Pred::is_not_null(column_expr!("col")),
-        opaque,
-        Pred::Unknown("intrigue".to_string()),
+        Pred::opaque(
+            OpaqueTestOp("bar".to_string()),
+            vec![Expr::literal(42), Expr::literal(1.111)],
+        ),
+        Pred::unknown("intrigue"),
     ];
     sub_exprs.extend(
         [
