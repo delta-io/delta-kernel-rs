@@ -19,6 +19,22 @@ pub(crate) mod parquet_stats_skipping;
 #[cfg(test)]
 mod tests;
 
+/// A data skipping predicate evaluator that directly applies data skipping, resolving column
+/// references to scalar stats values such as those provided by parquet footer stats.
+//
+// NOTE: We need a generic lifetime here to inform the compiler that this typedef only needs to live
+// as long as whatever is using it. Otherwise the compiler infers the static lifetime, which is too
+// long for any concrete implementation that has a lifetime parameter of its own (such as the
+// `RowGroupFilter` used by parquet data skipping). Downside is a `<'_>` at every use site.
+pub type DirectDataSkippingPredicateEvaluator<'a> =
+    dyn DataSkippingPredicateEvaluator<Output = bool, ColumnStat = Scalar> + 'a;
+
+/// A data skipping predicate evaluator that rewrites the input to a predicate that performs data
+/// skipping over column stats for all referenced columns. The resulting predicate can be evaluated
+/// against batches of column stats at some future point.
+pub type IndirectDataSkippingPredicateEvaluator<'a> =
+    dyn DataSkippingPredicateEvaluator<Output = Pred, ColumnStat = Expr> + 'a;
+
 /// Uses kernel (not engine) logic to evaluate a predicate tree against column names that resolve as
 /// scalars. Useful for testing/debugging but also serves as a reference implementation that
 /// documents the expression semantics that kernel relies on for data skipping.
@@ -966,17 +982,7 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
 }
 
 #[cfg(test)]
-#[allow(unused)] // The test just needs to compile
-fn ensure_dyn_compatible1(
-    eval: &dyn DataSkippingPredicateEvaluator<Output = Pred, ColumnStat = Expr>,
-) {
-    let _ = eval.eval_sql_where(&Pred::literal(true));
-}
+const _: Option<&DirectDataSkippingPredicateEvaluator<'_>> = None;
 
 #[cfg(test)]
-#[allow(unused)] // The test just needs to compile
-fn ensure_dyn_compatible2(
-    eval: &dyn DataSkippingPredicateEvaluator<Output = bool, ColumnStat = Scalar>,
-) {
-    let _ = eval.eval_sql_where(&Pred::literal(true));
-}
+const _: Option<&IndirectDataSkippingPredicateEvaluator<'_>> = None;

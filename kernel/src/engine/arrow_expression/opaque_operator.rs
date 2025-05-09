@@ -6,7 +6,10 @@ use crate::expressions::{
     ArrayData as KernelArrayData, BinaryPredicateOp, Expression, JunctionPredicateOp,
     OpaqueExpression, OpaquePredicate, OpaquePredicateOp, Predicate, Scalar,
 };
-use crate::kernel_predicates::{DataSkippingPredicateEvaluator, KernelPredicateEvaluator as _};
+use crate::kernel_predicates::{
+    DataSkippingPredicateEvaluator, DirectDataSkippingPredicateEvaluator,
+    IndirectDataSkippingPredicateEvaluator, KernelPredicateEvaluator as _,
+};
 use crate::{DeltaResult, Error};
 use itertools::Itertools;
 
@@ -77,10 +80,7 @@ impl OpaquePredicateOp for ArrowOpaquePredicateOp {
 
     fn as_data_skipping_predicate(
         &self,
-        predicate_evaluator: &dyn DataSkippingPredicateEvaluator<
-            Output = Predicate,
-            ColumnStat = Expression,
-        >,
+        predicate_evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
         exprs: &[Expression],
         inverted: bool,
     ) -> Option<Predicate> {
@@ -97,10 +97,7 @@ impl OpaquePredicateOp for ArrowOpaquePredicateOp {
 
     fn eval_as_data_skipping_predicate(
         &self,
-        predicate_evaluator: &dyn DataSkippingPredicateEvaluator<
-            Output = bool,
-            ColumnStat = Scalar,
-        >,
+        predicate_evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
         exprs: &[Expression],
         inverted: bool,
     ) -> Option<bool> {

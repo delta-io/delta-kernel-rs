@@ -11,7 +11,9 @@ pub use self::column_names::{
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use self::transforms::{ExpressionTransform as _, GetColumnReferences};
-use crate::kernel_predicates::DataSkippingPredicateEvaluator;
+use crate::kernel_predicates::{
+    DirectDataSkippingPredicateEvaluator, IndirectDataSkippingPredicateEvaluator,
+};
 use crate::{DataType, DeltaResult, DynPartialEq, Error};
 
 mod column_names;
@@ -132,10 +134,7 @@ pub trait OpaquePredicateOp: DynPartialEq + std::fmt::Debug {
     /// Kernel attempts to implement parquet row group skipping by calling this method.
     fn eval_as_data_skipping_predicate(
         &self,
-        _predicate_evaluator: &dyn DataSkippingPredicateEvaluator<
-            Output = bool,
-            ColumnStat = Scalar,
-        >,
+        _predicate_evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
         _exprs: &[Expression],
         _inverted: bool,
     ) -> Option<bool> {
@@ -147,10 +146,7 @@ pub trait OpaquePredicateOp: DynPartialEq + std::fmt::Debug {
     /// Kernel attempts to implement file pruning by calling this method.
     fn as_data_skipping_predicate(
         &self,
-        _predicate_evaluator: &dyn DataSkippingPredicateEvaluator<
-            Output = Predicate,
-            ColumnStat = Expression,
-        >,
+        _predicate_evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
         _exprs: &[Expression],
         _inverted: bool,
     ) -> Option<Predicate> {
