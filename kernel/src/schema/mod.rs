@@ -45,6 +45,12 @@ impl Display for MetadataValue {
     }
 }
 
+impl PartialEq<String> for MetadataValue {
+    fn eq(&self, other: &String) -> bool {
+        self.to_string().eq(other)
+    }
+}
+
 impl From<String> for MetadataValue {
     fn from(value: String) -> Self {
         Self::String(value)

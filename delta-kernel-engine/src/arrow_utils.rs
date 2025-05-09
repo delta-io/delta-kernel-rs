@@ -422,9 +422,10 @@ fn get_indices(
             if !found_fields.contains(field.name()) {
                 if field.nullable {
                     debug!("Inserting missing and nullable field: {}", field.name());
+                    let arrow_field = crate::arrow_conversion::arrow_field_from_struct_field(field)?;
                     reorder_indices.push(ReorderIndex::missing(
                         requested_position,
-                        Arc::new(field.try_into()?),
+                        Arc::new(arrow_field),
                     ));
                 } else {
                     return Err(Error::Generic(format!(
@@ -695,7 +696,8 @@ pub(crate) fn parse_json(
         .ok_or_else(|| {
             Error::generic("Expected json_strings to be a StringArray, found something else")
         })?;
-    let schema: ArrowSchemaRef = Arc::new(schema.as_ref().try_into()?);
+    let arrow_schema = crate::arrow_conversion::arrow_schema_from_struct_type(schema.as_ref())?;
+    let schema: ArrowSchemaRef = Arc::new(arrow_schema);
     let result = parse_json_impl(json_strings, schema)?;
     Ok(Box::new(ArrowEngineData::new(result)))
 }

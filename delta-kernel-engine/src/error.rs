@@ -22,9 +22,8 @@ pub enum EngineError {
     /// An error interacting with the object_store crate
     // We don't use [#from] object_store::Error here as our From impl transforms
     // object_store::Error::NotFound into Self::FileNotFound
-    // FIXME
     #[error("Error interacting with object store: {0}")]
-    ObjectStore(#[from] object_store::Error),
+    ObjectStore(object_store::Error),
 
     /// An error working with paths from the object_store crate
     #[error("Object store path error: {0}")]
@@ -42,6 +41,20 @@ pub enum EngineError {
 
 impl From<EngineError> for delta_kernel::Error {
     fn from(e: EngineError) -> Self {
-        Self::Generic(format!("Engine error: {e}"))
+        match e {
+            EngineError::KernelError(e) => e,
+            _ => Self::Generic(format!("Engine error: {e}")),
+        }
+    }
+}
+
+impl From<object_store::Error> for EngineError {
+    fn from(value: object_store::Error) -> Self {
+        match value {
+            object_store::Error::NotFound { path, .. } => {
+                delta_kernel::Error::file_not_found(path).into()
+            }
+            err => Self::ObjectStore(err),
+        }
     }
 }

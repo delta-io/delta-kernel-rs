@@ -13,6 +13,7 @@ use delta_kernel::{
     DeltaResult, Error,
 };
 
+use crate::arrow_conversion::arrow_data_type_from_data_type;
 use crate::arrow_utils::make_arrow_error;
 use crate::require;
 use crate::EngineResult;
@@ -64,7 +65,8 @@ impl EnsureDataTypes {
     ) -> EngineResult<DataTypeCompat> {
         match (kernel_type, arrow_type) {
             (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
-                check_cast_compat(kernel_type.try_into()?, arrow_type)
+                let arrow_data_type = arrow_data_type_from_data_type(kernel_type)?;
+                check_cast_compat(arrow_data_type, arrow_type)
             }
             // strings, bools, and binary  aren't primitive in arrow
             (&DataType::BOOLEAN, ArrowDataType::Boolean)
@@ -229,12 +231,6 @@ fn can_upcast_to_decimal(
     target_precision >= source_precision
         && target_scale >= source_scale
         && target_precision - source_precision >= (target_scale - source_scale) as u8
-}
-
-impl PartialEq<String> for MetadataValue {
-    fn eq(&self, other: &String) -> bool {
-        self.to_string().eq(other)
-    }
 }
 
 // allow for comparing our metadata maps to arrow ones. We can't implement PartialEq because both

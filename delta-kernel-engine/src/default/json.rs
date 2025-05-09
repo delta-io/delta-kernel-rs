@@ -104,10 +104,8 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         }
 
         let schema: ArrowSchemaRef = Arc::new(
-            physical_schema
-                .as_ref()
-                .try_into()
-                .map_err(EngineError::from)?,
+            crate::arrow_conversion::arrow_schema_from_struct_type(physical_schema.as_ref())
+                .map_err(|e| EngineError::from(e))?,
         );
         let file_opener = JsonOpener::new(self.batch_size, schema.clone(), self.store.clone());
 
