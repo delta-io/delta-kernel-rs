@@ -100,8 +100,6 @@ optional = true
 default = []
 # internal-api will make everything marked #[internal_api] public
 internal-api = []
-# integration-test turns on a particularly heavy test for hdfs-object-store
-integration-test = ["hdfs-native-object-store/integration-test"]
 
 # The default versions for arrow/parquet/object_store
 arrow = ["arrow-55"] # latest arrow version
@@ -139,10 +137,6 @@ rustc_version = "0.4.1"
 [dev-dependencies]
 delta_kernel = { path = ".", features = ["arrow", "default-engine", "sync-engine"] }
 test_utils = { path = "../test-utils" }
-# Used for testing parse_url_opts extensibility
-hdfs-native-object-store = { version = "0.14.0" }
-hdfs-native = "0.11.1"
-walkdir = { version = "2.5.0" }
 async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implementation
 paste = "1.0"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
