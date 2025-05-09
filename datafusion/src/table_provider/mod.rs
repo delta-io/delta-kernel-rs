@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{TimeZone, Utc};
 use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::datasource::physical_plan::parquet::{
     DefaultParquetFileReaderFactory, ParquetAccessPlan, RowGroupAccess,
@@ -22,7 +21,7 @@ use datafusion_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::PhysicalExpr;
 use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use delta_kernel::object_store::{path::Path as ObjectStorePath, ObjectMeta};
+use delta_kernel::object_store::path::Path as ObjectStorePath;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{Engine, ExpressionRef};
 use futures::stream::{StreamExt, TryStreamExt};
@@ -31,7 +30,7 @@ use itertools::Itertools;
 use self::scan_metadata::{DeltaTableSnapshot, ScanFileContext, TableSnapshot};
 use crate::exec::{DeltaScanExec, FILE_ID_COLUMN};
 use crate::expressions::{to_datafusion_expr, to_delta_predicate};
-
+use crate::utils::get_store_url;
 mod scan_metadata;
 
 pub struct DeltaTableProvider {
@@ -108,14 +107,8 @@ impl TableProvider for DeltaTableProvider {
         // To correlate the data with the original file, we add the file url as a partition value
         // This is required to apply the correct transform to the data in downstream processing.
         let to_partitioned_file = |f: ScanFileContext| {
-            let object_meta = ObjectMeta {
-                location: ObjectStorePath::from_url_path(f.file_url.path())?,
-                last_modified: Utc.timestamp_nanos(0),
-                e_tag: None,
-                version: None,
-                size: f.size,
-            };
-            let mut partitioned_file = PartitionedFile::from(object_meta);
+            let file_path = ObjectStorePath::from_url_path(f.file_url.path())?.to_string();
+            let mut partitioned_file = PartitionedFile::new(file_path, f.size);
             partitioned_file.partition_values =
                 vec![ScalarValue::Utf8(Some(f.file_url.to_string()))];
             Ok::<_, DataFusionError>((
@@ -174,14 +167,6 @@ async fn get_read_plan(
         1 => plans.remove(0),
         _ => Arc::new(UnionExec::new(plans)),
     })
-}
-
-fn get_store_url(url: &url::Url) -> Result<ObjectStoreUrl> {
-    ObjectStoreUrl::parse(format!(
-        "{}://{}",
-        url.scheme(),
-        &url[url::Position::BeforeHost..url::Position::AfterPort],
-    ))
 }
 
 // convert a delta expression to a datafusion physical expression

@@ -24,6 +24,7 @@ use crate::arrow::datatypes::{
 };
 use crate::arrow::json::{LineDelimitedWriter, ReaderBuilder};
 use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
+use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 use tracing::debug;
 
@@ -677,6 +678,7 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
 
 /// Arrow lacks the functionality to json-parse a string column into a struct column -- even tho the
 /// JSON file reader does exactly the same thing. This function is a hack to work around that gap.
+#[internal_api]
 pub(crate) fn parse_json(
     json_strings: Box<dyn EngineData>,
     schema: SchemaRef,
@@ -728,6 +730,7 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
 
 /// serialize an arrow RecordBatch to a JSON string by appending to a buffer.
 // TODO (zach): this should stream data to the JSON writer and output an iterator.
+#[internal_api]
 pub(crate) fn to_json_bytes(
     data: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send,
 ) -> DeltaResult<Vec<u8>> {
