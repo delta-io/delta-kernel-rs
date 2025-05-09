@@ -284,7 +284,6 @@ impl TableConfiguration {
     /// To support this feature the table must:
     /// - Have a min_writer_version of 7
     /// - Have the [`WriterFeature::InCommitTimestamp`] writer feature.
-    #[allow(unused)]
     pub(crate) fn is_in_commit_timestamps_supported(&self) -> bool {
         self.protocol().min_writer_version() == 7
             && self
@@ -294,7 +293,6 @@ impl TableConfiguration {
 
     /// Returns `true` if in-commit timestamps is supported and it is enabled. In-commit timestamps
     /// is enabled when the `delta.enableInCommitTimestamps` configuration is set to `true`.
-    #[allow(unused)]
     pub(crate) fn is_in_commit_timestamps_enabled(&self) -> bool {
         self.is_in_commit_timestamps_supported()
             && self
@@ -309,7 +307,6 @@ impl TableConfiguration {
     /// If in-commit timestamps is not supported, or not enabled, this returns `None`.
     /// If in-commit timestams is enabled, but the enablement version or timestamp is not present,
     /// this returns an error.
-    #[allow(unused)]
     pub(crate) fn in_commit_timestamp_enablement(&self) -> DeltaResult<Option<(Version, i64)>> {
         if !self.is_in_commit_timestamps_enabled() {
             return Ok(None);

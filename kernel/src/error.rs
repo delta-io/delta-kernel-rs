@@ -211,6 +211,9 @@ pub enum Error {
         #[from] crate::expressions::literal_expression_transform::Error,
     ),
 
+    #[error(transparent)]
+    LogHistoryError(#[from] crate::history_manager::error::LogHistoryError),
+
     /// Schema mismatch has occurred or invalid schema used somewhere
     #[error("Schema error: {0}")]
     Schema(String),
