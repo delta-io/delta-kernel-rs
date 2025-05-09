@@ -4,7 +4,9 @@ use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::datasource::physical_plan::{FileScanConfigBuilder, JsonSource};
 use datafusion::execution::SessionState;
 use datafusion_catalog::memory::DataSourceExec;
+use datafusion_common::HashMap;
 use datafusion_datasource::PartitionedFile;
+use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_physical_plan::execute_stream;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::ExecutionPlan;
@@ -25,7 +27,7 @@ use parking_lot::RwLock;
 use tracing::warn;
 use url::Url;
 
-use crate::utils::get_store_url;
+use crate::utils::{group_by_store, AsObjectStoreUrl};
 
 const DEFAULT_BUFFER_SIZE: usize = 1024;
 
@@ -68,17 +70,21 @@ impl<E: TaskExecutor> JsonHandler for DataFusionJsonHandler<E> {
             return Ok(Box::new(std::iter::empty()));
         }
 
-        let files_by_store = files
+        let to_partitioned_files = |arg: (ObjectStoreUrl, Vec<&FileMeta>)| {
+            let (url, files) = arg;
+            let part_files = files
+                .into_iter()
+                .map(|f| {
+                    let path = Path::from_url_path(f.location.path())?.to_string();
+                    Ok::<_, DeltaError>(PartitionedFile::new(path, f.size))
+                })
+                .try_collect::<_, Vec<_>, _>()?;
+            Ok::<_, DeltaError>((url, part_files))
+        };
+        let files_by_store = group_by_store(files)
             .into_iter()
-            .map(|file| {
-                let store_url = get_store_url(&file.location).map_err(DeltaError::generic_err)?;
-                let file_path = Path::from_url_path(file.location.path())?.to_string();
-                let partitioned_file = PartitionedFile::new(file_path, file.size);
-                Ok::<_, DeltaError>((store_url, partitioned_file))
-            })
-            .try_collect::<_, Vec<_>, _>()?
-            .into_iter()
-            .into_group_map();
+            .map(to_partitioned_files)
+            .try_collect::<_, HashMap<_, _>, _>()?;
 
         let source = Arc::new(JsonSource::default());
         let arrow_schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
@@ -142,7 +148,7 @@ impl<E: TaskExecutor> JsonHandler for DataFusionJsonHandler<E> {
             PutMode::Create
         };
 
-        let store_url = get_store_url(path).map_err(DeltaError::generic_err)?;
+        let store_url = path.as_object_store_url();
         let store = self
             .state
             .read()

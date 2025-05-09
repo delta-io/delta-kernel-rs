@@ -30,7 +30,7 @@ use itertools::Itertools;
 use self::scan_metadata::{DeltaTableSnapshot, ScanFileContext, TableSnapshot};
 use crate::exec::{DeltaScanExec, FILE_ID_COLUMN};
 use crate::expressions::{to_datafusion_expr, to_delta_predicate};
-use crate::utils::get_store_url;
+use crate::utils::AsObjectStoreUrl;
 mod scan_metadata;
 
 pub struct DeltaTableProvider {
@@ -112,7 +112,7 @@ impl TableProvider for DeltaTableProvider {
             partitioned_file.partition_values =
                 vec![ScalarValue::Utf8(Some(f.file_url.to_string()))];
             Ok::<_, DataFusionError>((
-                get_store_url(&f.file_url)?,
+                f.file_url.as_object_store_url(),
                 (partitioned_file, f.selection_vector),
             ))
         };

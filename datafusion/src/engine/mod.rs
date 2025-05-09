@@ -7,13 +7,14 @@ use parking_lot::RwLock;
 
 use self::evaluation::DataFusionEvaluationHandler;
 use self::json::DataFusionJsonHandler;
-
+use self::storage::DataFusionStorageHandler;
 mod evaluation;
 mod json;
+mod storage;
 
 pub struct DataFusionEngine<E: TaskExecutor> {
     evaluation_handler: Arc<DataFusionEvaluationHandler>,
-
+    storage_handler: Arc<DataFusionStorageHandler<E>>,
     json_handler: Arc<DataFusionJsonHandler<E>>,
 }
 
@@ -27,9 +28,14 @@ impl<E: TaskExecutor> DataFusionEngine<E> {
             state.clone(),
             task_executor.clone(),
         ));
+        let storage_handler = Arc::new(DataFusionStorageHandler::new(
+            state.read().runtime_env().object_store_registry.clone(),
+            task_executor.clone(),
+        ));
         Self {
             evaluation_handler,
             json_handler,
+            storage_handler,
         }
     }
 }
@@ -40,7 +46,7 @@ impl<E: TaskExecutor> Engine for DataFusionEngine<E> {
     }
 
     fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-        todo!()
+        self.storage_handler.clone()
     }
 
     fn json_handler(&self) -> Arc<dyn JsonHandler> {

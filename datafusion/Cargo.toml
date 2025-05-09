@@ -26,7 +26,9 @@ datafusion-expr-common = { version = "47" }
 datafusion-physical-plan = { version = "47" }
 
 async-trait = "0.1"
+bytes = "1.6.0"
 chrono = "0.4.40"
+dashmap = "6.0.1"
 futures = "0.3"
 itertools = "0.14"
 parking_lot = "0.12"
