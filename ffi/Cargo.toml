@@ -29,6 +29,8 @@ cbindgen = "0.28"
 libc = "0.2.171"
 
 [dev-dependencies]
+delta-kernel-engine = { path = "../delta-kernel-engine" }
+delta-kernel-engine-ffi = { path = "../delta-kernel-engine-ffi" }
 rand = "0.8.5"
 test_utils = { path = "../test-utils" }
 tokio = { version = "1.44" }

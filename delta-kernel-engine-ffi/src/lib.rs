@@ -1,9 +1,18 @@
 use std::collections::HashMap;
 use std::default::Default;
+use std::sync::Arc;
+
 use url::Url;
 
 use delta_kernel::DeltaResult;
-use delta_kernel_ffi_macros::handle_descriptor;
+use delta_kernel_engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel_engine::default::DefaultEngine;
+use delta_kernel_ffi::error::{AllocateErrorFn, ExternResult};
+use delta_kernel_ffi::handle::Handle;
+use delta_kernel_ffi::{
+    engine_to_handle, error::IntoExternResult, unwrap_and_parse_path_as_url, KernelStringSlice,
+    SharedExternEngine, TryFromStringSlice,
+};
 
 /// A builder that allows setting options on the `Engine` before actually building it
 pub struct EngineBuilder {
@@ -101,4 +110,17 @@ fn get_default_default_engine_impl(
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     get_default_engine_impl(url?, Default::default(), allocate_error)
+}
+
+fn get_default_engine_impl(
+    url: Url,
+    options: HashMap<String, String>,
+    allocate_error: AllocateErrorFn,
+) -> DeltaResult<Handle<SharedExternEngine>> {
+    let engine = DefaultEngine::<TokioBackgroundExecutor>::try_new(
+        &url,
+        options,
+        Arc::new(TokioBackgroundExecutor::new()),
+    );
+    Ok(engine_to_handle(Arc::new(engine?), allocate_error))
 }
