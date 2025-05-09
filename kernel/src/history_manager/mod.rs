@@ -71,11 +71,11 @@ impl LogHistoryManager {
     /// # Parameters
     /// - `engine`: Implementation of [`Engine`] apis.
     /// - `snapshot`: A [`Snapshot`] of the table. The latest version in the snapshot will be the
-    ///               greatest time that this [`LogHistoryManager`] will be able to resolve
-    ///               timestamps for.
+    ///   greatest time that this [`LogHistoryManager`] will be able to resolve
+    ///   timestamps for.
     /// - `limit`: Optional maximum number of versions to track in the history manager's state.
-    ///            When specified, the earliest queryable version is `snapshot.version - limit`.
-    ///            This parameter allows trading memory usage for historical reach.
+    ///   When specified, the earliest queryable version is `snapshot.version - limit`.
+    ///   This parameter allows trading memory usage for historical reach.
     /// ```
     #[allow(unused)]
     pub(crate) fn try_new(

@@ -86,8 +86,8 @@ impl Table {
     /// - `engine`: The [`Engine`] implementation to use for data access
     /// - `snapshot`: An existing snapshot to initialize the history manager with
     /// - `limit`: Optional maximum number of versions to track. When specified, the earliest
-    ///            queryable version will be `snapshot.version() - limit`. This allows trading
-    ///            memory usage for historical reach.
+    ///   queryable version will be `snapshot.version() - limit`. This allows trading
+    ///   memory usage for historical reach.
     pub fn history_manager_from_snapshot(
         &self,
         engine: &dyn Engine,
@@ -106,8 +106,8 @@ impl Table {
     /// # Parameters
     /// - `engine`: The [`Engine`] implementation to use for data access
     /// - `limit`: Optional maximum number of versions to track. When specified, the earliest
-    ///            queryable version will be `latest_version - limit`. This allows trading
-    ///            memory usage for historical reach.
+    ///   queryable version will be `latest_version - limit`. This allows trading
+    ///   memory usage for historical reach.
     pub fn history_manager(
         &self,
         engine: &dyn Engine,
