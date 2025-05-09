@@ -7,7 +7,7 @@
 //! and multi-threaded executor based on Tokio.
 use futures::{future::BoxFuture, Future};
 
-use delta_kernel::DeltaResult;
+use crate::EngineResult;
 
 /// An executor that can be used to run async tasks. This is used by IO functions
 /// within the `DefaultEngine`.
@@ -30,13 +30,12 @@ pub trait TaskExecutor: Send + Sync + 'static {
     where
         F: Future<Output = ()> + Send + 'static;
 
-    fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, DeltaResult<R>>
+    fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, EngineResult<R>>
     where
         T: FnOnce() -> R + Send + 'static,
         R: Send + 'static;
 }
 
-#[cfg(any(feature = "tokio", test))]
 pub mod tokio {
     use super::TaskExecutor;
     use futures::TryFutureExt;
@@ -44,7 +43,7 @@ pub mod tokio {
     use std::sync::mpsc::channel;
     use tokio::runtime::RuntimeFlavor;
 
-    use crate::DeltaResult;
+    use crate::{EngineError, EngineResult};
 
     /// A [`TaskExecutor`] that uses the tokio single-threaded runtime in a
     /// background thread to service tasks.
@@ -135,12 +134,12 @@ pub mod tokio {
             self.send_future(Box::pin(task));
         }
 
-        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, DeltaResult<R>>
+        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, EngineResult<R>>
         where
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
         {
-            Box::pin(tokio::task::spawn_blocking(task).map_err(crate::Error::join_failure))
+            Box::pin(tokio::task::spawn_blocking(task).map_err(EngineError::from))
         }
     }
 
@@ -198,12 +197,12 @@ pub mod tokio {
             self.handle.spawn(task);
         }
 
-        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, DeltaResult<R>>
+        fn spawn_blocking<T, R>(&self, task: T) -> BoxFuture<'_, EngineResult<R>>
         where
             T: FnOnce() -> R + Send + 'static,
             R: Send + 'static,
         {
-            Box::pin(tokio::task::spawn_blocking(task).map_err(crate::Error::join_failure))
+            Box::pin(tokio::task::spawn_blocking(task).map_err(EngineError::from))
         }
     }
 

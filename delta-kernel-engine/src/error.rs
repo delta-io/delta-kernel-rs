@@ -37,6 +37,9 @@ pub enum EngineError {
 
     #[error("URL ParseError: {0}")]
     Url(#[from] url::ParseError),
+
+    #[error("Tokio JoinError: {0}")]
+    TokioJoinError(#[from] tokio::task::JoinError),
 }
 
 impl From<EngineError> for delta_kernel::Error {
