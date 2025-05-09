@@ -36,30 +36,20 @@ impl MetadataVisitor {
                 getters.len()
             ))
         );
-        let name: Option<String> = getters[1].get_opt(row_index, "metadata.name")?;
-        let description: Option<String> = getters[2].get_opt(row_index, "metadata.description")?;
         // get format out of primitives
-        let format_provider: String = getters[3].get(row_index, "metadata.format.provider")?;
-        // options for format is always empty, so skip getters[4]
-        let schema_string: String = getters[5].get(row_index, "metadata.schema_string")?;
-        let partition_columns: Vec<_> = getters[6].get(row_index, "metadata.partition_list")?;
-        let created_time: Option<i64> = getters[7].get_opt(row_index, "metadata.created_time")?;
-        let configuration_map_opt: Option<HashMap<_, _>> =
-            getters[8].get_opt(row_index, "metadata.configuration")?;
-        let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
-
+        let configuration_map_opt = getters[8].get_opt(row_index, "metaData.configuration")?;
         Ok(Metadata {
             id,
-            name,
-            description,
+            name: getters[1].get_opt(row_index, "metaData.name")?,
+            description: getters[2].get_opt(row_index, "metaData.description")?,
             format: Format {
-                provider: format_provider,
-                options: HashMap::new(),
+                provider: getters[3].get(row_index, "metaData.format.provider")?,
+                options: HashMap::new(), // options for format is always empty, so skip getters[4]
             },
-            schema_string,
-            partition_columns,
-            created_time,
-            configuration,
+            schema_string: getters[5].get(row_index, "metaData.schemaString")?,
+            partition_columns: getters[6].get(row_index, "metaData.partitionColumns")?,
+            created_time: getters[7].get_opt(row_index, "metaData.created_time")?,
+            configuration: configuration_map_opt.unwrap_or_else(HashMap::new),
         })
     }
 }
@@ -74,9 +64,9 @@ impl RowVisitor for MetadataVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
             // Since id column is required, use it to detect presence of a metadata action
-            if let Some(id) = getters[0].get_opt(i, "metadata.id")? {
+            if let Some(id) = getters[0].get_opt(i, "metaData.id")? {
                 self.metadata = Some(Self::visit_metadata(i, id, getters)?);
-                break;
+                break; // A commit has at most one metaData action
             }
         }
         Ok(())
@@ -157,7 +147,7 @@ impl RowVisitor for ProtocolVisitor {
             // Since minReaderVersion column is required, use it to detect presence of a Protocol action
             if let Some(mrv) = getters[0].get_opt(i, "protocol.min_reader_version")? {
                 self.protocol = Some(Self::visit_protocol(i, mrv, getters)?);
-                break;
+                break; // A commit has at most one Protocol action
             }
         }
         Ok(())
