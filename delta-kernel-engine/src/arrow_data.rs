@@ -2,9 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::types::{Int32Type, Int64Type};
-use crate::arrow::array::{
-    Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray,
-};
+use crate::arrow::array::{Array, ArrayRef, OffsetSizeTrait, RecordBatch, StructArray};
 use crate::arrow::datatypes::{DataType as ArrowDataType, FieldRef};
 use delta_kernel::engine_data::{EngineData, EngineList, EngineMap, GetData, RowVisitor};
 use delta_kernel::schema::{ColumnName, DataType};

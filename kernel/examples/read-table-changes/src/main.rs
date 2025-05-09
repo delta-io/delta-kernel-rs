@@ -3,10 +3,11 @@ use std::{collections::HashMap, sync::Arc};
 use delta_kernel_engine::arrow::array::RecordBatch;
 use delta_kernel_engine::arrow::{compute::filter_record_batch, util::pretty::print_batches};
 
-use delta_kernel::{DeltaResult, Table};
+use delta_kernel::Table;
 use delta_kernel_engine::arrow_data::ArrowEngineData;
 use delta_kernel_engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_engine::default::DefaultEngine;
+use delta_kernel_engine::EngineResult;
 
 use clap::Parser;
 use itertools::Itertools;
@@ -25,7 +26,7 @@ struct Cli {
     end_version: Option<u64>,
 }
 
-fn main() -> DeltaResult<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let table = Table::try_from_uri(cli.path)?;
     let options = HashMap::from([("skip_signature", "true".to_string())]);
@@ -39,7 +40,7 @@ fn main() -> DeltaResult<()> {
     let table_changes_scan = table_changes.into_scan_builder().build()?;
     let batches: Vec<RecordBatch> = table_changes_scan
         .execute(engine.clone())?
-        .map(|scan_result| -> DeltaResult<_> {
+        .map(|scan_result| -> EngineResult<_> {
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();
             let data = scan_result.raw_data?;
