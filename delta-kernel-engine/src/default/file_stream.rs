@@ -7,14 +7,14 @@ use std::task::{ready, Context, Poll};
 
 use crate::arrow::array::RecordBatch;
 use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use delta_kernel::{DeltaResult, FileDataReadResultIterator, FileMeta};
+use delta_kernel::{FileDataReadResultIterator, FileMeta};
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use futures::FutureExt;
 
 use super::executor::TaskExecutor;
 use crate::arrow_data::ArrowEngineData;
-use crate::{EngineError, EngineResult};
+use crate::EngineResult;
 
 /// A fallible future that resolves to a stream of [`RecordBatch`]
 /// cbindgen:ignore
