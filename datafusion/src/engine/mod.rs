@@ -6,16 +6,17 @@ use delta_kernel::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, Stora
 use parking_lot::RwLock;
 
 use self::evaluation::DataFusionEvaluationHandler;
-use self::json::DataFusionJsonHandler;
+use self::file_format::DataFusionFileFormatHandler;
 use self::storage::DataFusionStorageHandler;
+
 mod evaluation;
-mod json;
+mod file_format;
 mod storage;
 
 pub struct DataFusionEngine<E: TaskExecutor> {
     evaluation_handler: Arc<DataFusionEvaluationHandler>,
     storage_handler: Arc<DataFusionStorageHandler<E>>,
-    json_handler: Arc<DataFusionJsonHandler<E>>,
+    file_format_handler: Arc<DataFusionFileFormatHandler<E>>,
 }
 
 impl<E: TaskExecutor> DataFusionEngine<E> {
@@ -24,7 +25,7 @@ impl<E: TaskExecutor> DataFusionEngine<E> {
         let evaluation_handler = Arc::new(DataFusionEvaluationHandler {
             state: state.clone(),
         });
-        let json_handler = Arc::new(DataFusionJsonHandler::new(
+        let file_format_handler = Arc::new(DataFusionFileFormatHandler::new(
             state.clone(),
             task_executor.clone(),
         ));
@@ -34,7 +35,7 @@ impl<E: TaskExecutor> DataFusionEngine<E> {
         ));
         Self {
             evaluation_handler,
-            json_handler,
+            file_format_handler,
             storage_handler,
         }
     }
@@ -50,10 +51,10 @@ impl<E: TaskExecutor> Engine for DataFusionEngine<E> {
     }
 
     fn json_handler(&self) -> Arc<dyn JsonHandler> {
-        self.json_handler.clone()
+        self.file_format_handler.clone()
     }
 
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-        todo!()
+        self.file_format_handler.clone()
     }
 }

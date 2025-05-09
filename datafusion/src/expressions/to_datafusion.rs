@@ -1,36 +1,39 @@
 use datafusion_common::{DataFusionError, Result as DFResult, ScalarValue};
 use datafusion_expr::{col, lit, Expr};
+use datafusion_functions::core::expr_ext::FieldAccessor;
+use datafusion_functions::expr_fn::named_struct;
 use delta_kernel::expressions::{
     BinaryExpression, BinaryOperator, Expression, JunctionExpression, JunctionOperator, Scalar,
     UnaryExpression, UnaryOperator,
 };
 use delta_kernel::schema::{DataType, PrimitiveType};
+use itertools::Itertools;
 
-pub(crate) fn to_datafusion_expr(expr: &Expression) -> DFResult<Vec<Expr>> {
-    match expr {
-        Expression::Column(name) => Ok(vec![col(name.to_string())]),
-        Expression::Literal(scalar) => Ok(vec![scalar_to_df_scalar(scalar)?]),
-        Expression::Binary(BinaryExpression { left, op, right }) => {
-            let mut left_expr = to_datafusion_expr(left)?;
-            let mut right_expr = to_datafusion_expr(right)?;
-            if left_expr.len() != 1 || right_expr.len() != 1 {
-                return Err(DataFusionError::Execution(
-                    "Binary expressions must have exactly one child".into(),
-                ));
-            }
-            let left_expr = left_expr.remove(0);
-            let right_expr = right_expr.remove(0);
+pub(crate) fn to_datafusion_expr(expr: &Expression, output_type: &DataType) -> DFResult<Expr> {
+    match (expr, output_type) {
+        (Expression::Column(name), _) => {
+            let mut name_iter = name.iter();
+            let base_name = name_iter.next().ok_or_else(|| {
+                DataFusionError::Internal("Expected at least one column name".into())
+            })?;
+            let base = col(base_name);
+            Ok(name_iter.fold(base, |acc, n| acc.field(n)))
+        }
+        (Expression::Literal(scalar), _) => Ok(scalar_to_df_scalar(scalar)?),
+        (Expression::Binary(BinaryExpression { left, op, right }), _) => {
+            let left_expr = to_datafusion_expr(left, output_type)?;
+            let right_expr = to_datafusion_expr(right, output_type)?;
             Ok(match op {
-                BinaryOperator::Equal => vec![left_expr.eq(right_expr)],
-                BinaryOperator::NotEqual => vec![left_expr.not_eq(right_expr)],
-                BinaryOperator::LessThan => vec![left_expr.lt(right_expr)],
-                BinaryOperator::LessThanOrEqual => vec![left_expr.lt_eq(right_expr)],
-                BinaryOperator::GreaterThan => vec![left_expr.gt(right_expr)],
-                BinaryOperator::GreaterThanOrEqual => vec![left_expr.gt_eq(right_expr)],
-                BinaryOperator::Plus => vec![left_expr + right_expr],
-                BinaryOperator::Minus => vec![left_expr - right_expr],
-                BinaryOperator::Multiply => vec![left_expr * right_expr],
-                BinaryOperator::Divide => vec![left_expr / right_expr],
+                BinaryOperator::Equal => left_expr.eq(right_expr),
+                BinaryOperator::NotEqual => left_expr.not_eq(right_expr),
+                BinaryOperator::LessThan => left_expr.lt(right_expr),
+                BinaryOperator::LessThanOrEqual => left_expr.lt_eq(right_expr),
+                BinaryOperator::GreaterThan => left_expr.gt(right_expr),
+                BinaryOperator::GreaterThanOrEqual => left_expr.gt_eq(right_expr),
+                BinaryOperator::Plus => left_expr + right_expr,
+                BinaryOperator::Minus => left_expr - right_expr,
+                BinaryOperator::Multiply => left_expr * right_expr,
+                BinaryOperator::Divide => left_expr / right_expr,
                 BinaryOperator::Distinct => Err(DataFusionError::NotImplemented(
                     "DISTINCT operator not supported".into(),
                 ))?,
@@ -42,38 +45,47 @@ pub(crate) fn to_datafusion_expr(expr: &Expression) -> DFResult<Vec<Expr>> {
                 ))?,
             })
         }
-        Expression::Unary(UnaryExpression { op, expr }) => {
-            let mut inner_expr = to_datafusion_expr(expr)?;
-            if inner_expr.len() != 1 {
-                return Err(DataFusionError::Execution(
-                    "Unary expressions must have exactly one child".into(),
-                ));
-            }
-            let inner_expr = inner_expr.remove(0);
+        (Expression::Unary(UnaryExpression { op, expr }), _) => {
+            let inner_expr = to_datafusion_expr(expr, output_type)?;
             Ok(match op {
-                UnaryOperator::IsNull => vec![inner_expr.is_null()],
-                UnaryOperator::Not => vec![!inner_expr],
+                UnaryOperator::IsNull => inner_expr.is_null(),
+                UnaryOperator::Not => !inner_expr,
             })
         }
-        Expression::Junction(JunctionExpression { op, exprs }) => {
-            let df_exprs: DFResult<Vec<_>> = exprs.iter().map(to_datafusion_expr).collect();
-            let df_exprs: Vec<_> = df_exprs?.into_iter().flatten().collect();
+        (Expression::Junction(JunctionExpression { op, exprs }), _) => {
+            let df_exprs: Vec<_> = exprs
+                .iter()
+                .map(|e| to_datafusion_expr(e, output_type))
+                .try_collect()?;
 
             match op {
-                JunctionOperator::And => Ok(vec![df_exprs
+                JunctionOperator::And => Ok(df_exprs
                     .into_iter()
                     .reduce(|a, b| a.and(b))
-                    .unwrap_or(lit(true))]),
-                JunctionOperator::Or => Ok(vec![df_exprs
+                    .unwrap_or(lit(true))),
+                JunctionOperator::Or => Ok(df_exprs
                     .into_iter()
                     .reduce(|a, b| a.or(b))
-                    .unwrap_or(lit(false))]),
+                    .unwrap_or(lit(false))),
             }
         }
-        Expression::Struct(fields) => {
-            let df_exprs: DFResult<Vec<_>> = fields.iter().map(to_datafusion_expr).collect();
-            Ok(df_exprs?.into_iter().flatten().collect())
+        (Expression::Struct(fields), DataType::Struct(struct_type)) => {
+            let df_exprs: Vec<_> = fields
+                .iter()
+                .zip(struct_type.fields())
+                .map(|(expr, field)| {
+                    Ok(vec![
+                        lit(field.name().to_string()),
+                        to_datafusion_expr(expr, field.data_type())?,
+                    ])
+                })
+                .flatten_ok()
+                .try_collect::<_, _, DataFusionError>()?;
+            Ok(named_struct(df_exprs))
         }
+        (Expression::Struct(_), _) => Err(DataFusionError::NotImplemented(
+            "expected struct output type".into(),
+        )),
     }
 }
 
@@ -148,18 +160,20 @@ mod tests {
     use datafusion_expr::{col, lit};
     use delta_kernel::expressions::ColumnName;
     use delta_kernel::expressions::{
-        BinaryExpression, BinaryOperator, JunctionOperator, Scalar, StructData, UnaryExpression,
-        UnaryOperator,
+        BinaryExpression, BinaryOperator, JunctionOperator, Scalar, UnaryExpression, UnaryOperator,
     };
-    use delta_kernel::schema::{DataType, StructField};
+    use delta_kernel::schema::{DataType, StructField, StructType};
 
     /// Test basic column reference: `test_col`
     #[test]
     fn test_column_expression() {
         let expr = Expression::Column(ColumnName::new(["test_col"]));
-        let result = to_datafusion_expr(&expr).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], col("test_col"));
+        let result = to_datafusion_expr(&expr, &DataType::BOOLEAN).unwrap();
+        assert_eq!(result, col("test_col"));
+
+        let expr = Expression::Column(ColumnName::new(["test_col", "field_1", "field_2"]));
+        let result = to_datafusion_expr(&expr, &DataType::BOOLEAN).unwrap();
+        assert_eq!(result, col("test_col").field("field_1").field("field_2"));
     }
 
     /// Test various literal values:
@@ -190,9 +204,8 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let result = to_datafusion_expr(&input).unwrap();
-            assert_eq!(result.len(), 1);
-            assert_eq!(result[0], expected);
+            let result = to_datafusion_expr(&input, &DataType::BOOLEAN).unwrap();
+            assert_eq!(result, expected);
         }
     }
 
@@ -230,9 +243,8 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let result = to_datafusion_expr(&input).unwrap();
-            assert_eq!(result.len(), 1);
-            assert_eq!(result[0], expected);
+            let result = to_datafusion_expr(&input, &DataType::BOOLEAN).unwrap();
+            assert_eq!(result, expected);
         }
     }
 
@@ -259,9 +271,8 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let result = to_datafusion_expr(&input).unwrap();
-            assert_eq!(result.len(), 1);
-            assert_eq!(result[0], expected);
+            let result = to_datafusion_expr(&input, &DataType::BOOLEAN).unwrap();
+            assert_eq!(result, expected);
         }
     }
 
@@ -294,9 +305,8 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let result = to_datafusion_expr(&input).unwrap();
-            assert_eq!(result.len(), 1);
-            assert_eq!(result[0], expected);
+            let result = to_datafusion_expr(&input, &DataType::BOOLEAN).unwrap();
+            assert_eq!(result, expected);
         }
     }
 
@@ -331,15 +341,33 @@ mod tests {
             ],
         });
 
-        let result = to_datafusion_expr(&expr).unwrap();
-        assert_eq!(result.len(), 1);
+        let result = to_datafusion_expr(&expr, &DataType::BOOLEAN).unwrap();
         let expected = (col("a").gt(lit(1)).and(col("b").lt(lit(2)))).or(col("c").eq(lit(3)));
-        assert_eq!(result[0], expected);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_struct_expression() {
+        let expr = Expression::Struct(vec![
+            Expression::Column(ColumnName::new(["a"])),
+            Expression::Column(ColumnName::new(["b"])),
+        ]);
+        let result = to_datafusion_expr(
+            &expr,
+            &DataType::Struct(Box::new(StructType::new(vec![
+                StructField::nullable("a", DataType::INTEGER),
+                StructField::nullable("b", DataType::INTEGER),
+            ]))),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            named_struct(vec![lit("a"), col("a"), lit("b"), col("b")])
+        );
     }
 
     /// Test error cases:
     /// - `a DISTINCT b` (unsupported operator)
-    /// - `STRUCT()` (unsupported scalar type)
     #[test]
     fn test_error_cases() {
         // Test unsupported binary operators
@@ -348,16 +376,6 @@ mod tests {
             op: BinaryOperator::Distinct,
             right: Box::new(Expression::Column(ColumnName::new(["b"]))),
         });
-        assert!(to_datafusion_expr(&expr).is_err());
-
-        // Test unsupported scalar types
-        let expr = Expression::Literal(Scalar::Struct(
-            StructData::try_new(
-                vec![StructField::nullable("field", DataType::INTEGER)],
-                vec![Scalar::Integer(42)],
-            )
-            .unwrap(),
-        ));
-        assert!(to_datafusion_expr(&expr).is_err());
+        assert!(to_datafusion_expr(&expr, &DataType::BOOLEAN).is_err());
     }
 }

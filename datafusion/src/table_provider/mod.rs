@@ -13,7 +13,7 @@ use datafusion::parquet::file::metadata::RowGroupMetaData;
 use datafusion::physical_plan::{union::UnionExec, ExecutionPlan};
 use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::error::Result;
-use datafusion_common::{DFSchema, DataFusionError, ScalarValue};
+use datafusion_common::{DFSchema, DataFusionError, HashMap, ScalarValue};
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource::PartitionedFile;
 use datafusion_execution::object_store::ObjectStoreUrl;
@@ -22,6 +22,7 @@ use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::PhysicalExpr;
 use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use delta_kernel::object_store::path::Path as ObjectStorePath;
+use delta_kernel::schema::DataType as DeltaDataType;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{Engine, ExpressionRef};
 use futures::stream::{StreamExt, TryStreamExt};
@@ -87,12 +88,14 @@ impl TableProvider for DeltaTableProvider {
             .scan_metadata(state, projection, to_delta_predicate(filters)?)
             .await?;
 
+        let delta_schema = self.snapshot.table_schema_delta().into();
+
         // Convert the delta expressions from the scan into a map of file id to datafusion physical expression
         // these will be applied to convert the raw data read from disk into the logical table schema
         let physical_schema_df = table_scan.physical_schema.clone().try_into()?;
         let file_transform = |file_ctx: &ScanFileContext| {
             file_ctx.transform.as_ref().map(|t| {
-                to_physical(state, &physical_schema_df, t)
+                to_physical(state, &physical_schema_df, t, &delta_schema)
                     .map(|expr| (file_ctx.file_url.to_string(), expr))
             })
         };
@@ -100,7 +103,8 @@ impl TableProvider for DeltaTableProvider {
             .files
             .iter()
             .filter_map(file_transform)
-            .try_collect::<_, _, DataFusionError>()?;
+            .try_collect::<_, HashMap<_, _>, _>()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         // Convert the files into datafusions `PartitionedFile`s grouped by the object store they are stored in
         // this is used to create a DataSourceExec plan for each store
@@ -176,11 +180,12 @@ fn to_physical(
     state: &dyn Session,
     physical_schema_df: &DFSchema,
     transform: &ExpressionRef,
-) -> Result<Vec<Arc<dyn PhysicalExpr>>> {
-    to_datafusion_expr(transform)?
-        .into_iter()
-        .map(|expr: Expr| state.create_physical_expr(expr, physical_schema_df))
-        .collect::<Result<Vec<_>>>()
+    output_type: &DeltaDataType,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    state.create_physical_expr(
+        to_datafusion_expr(transform, output_type)?,
+        physical_schema_df,
+    )
 }
 
 async fn compute_parquet_access_plans(

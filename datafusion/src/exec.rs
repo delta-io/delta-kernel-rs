@@ -26,7 +26,7 @@ pub struct DeltaScanExec {
     /// Execution plan yielding the raw data read from data files.
     input: Arc<dyn ExecutionPlan>,
     /// Transforms to be applied to data eminating from individual files
-    transforms: Arc<HashMap<String, Vec<PhysicalExprRef>>>,
+    transforms: Arc<HashMap<String, PhysicalExprRef>>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
 }
@@ -48,7 +48,7 @@ impl DeltaScanExec {
     pub(crate) fn new(
         logical_schema: SchemaRef,
         input: Arc<dyn ExecutionPlan>,
-        transforms: Arc<HashMap<String, Vec<PhysicalExprRef>>>,
+        transforms: Arc<HashMap<String, PhysicalExprRef>>,
     ) -> Self {
         Self {
             logical_schema,
@@ -167,7 +167,7 @@ struct DeltaScanStream {
     input: SendableRecordBatchStream,
     baseline_metrics: BaselineMetrics,
     /// Transforms to be applied to data eminating from individual files
-    transforms: Arc<HashMap<String, Vec<PhysicalExprRef>>>,
+    transforms: Arc<HashMap<String, PhysicalExprRef>>,
 }
 
 impl DeltaScanStream {
@@ -198,17 +198,17 @@ impl DeltaScanStream {
             return Ok(batch);
         };
 
-        let arrays = transform
-            .iter()
-            .map(|t| {
-                t.evaluate(&batch).and_then(|value| match value {
-                    ColumnarValue::Array(array) => Ok(array),
-                    ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(batch.num_rows()),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let array = transform.evaluate(&batch).and_then(|value| match value {
+            ColumnarValue::Array(array) => Ok(array),
+            ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(batch.num_rows()),
+        })?;
 
-        Ok(RecordBatch::try_new(self.schema.clone(), arrays)?)
+        Ok(array
+            .as_struct_opt()
+            .ok_or_else(|| {
+                DataFusionError::Internal("Expected struct output from transform".to_string())
+            })?
+            .into())
     }
 }
 

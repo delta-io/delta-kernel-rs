@@ -8,14 +8,17 @@ mod to_delta;
 mod tests {
     use super::*;
     use datafusion_expr::{col, lit};
-    use delta_kernel::expressions::{BinaryExpression, BinaryOperator, Expression};
+    use delta_kernel::{
+        expressions::{BinaryExpression, BinaryOperator, Expression},
+        schema::DataType,
+    };
 
     #[test]
     fn test_roundtrip_simple_and() {
         let df_expr = col("a").eq(lit(1)).and(col("b").eq(lit(2)));
         let delta_expr = to_delta_expression(&df_expr).unwrap();
-        let df_expr_roundtrip = to_datafusion_expr(&delta_expr).unwrap();
-        assert_eq!(df_expr, df_expr_roundtrip[0]);
+        let df_expr_roundtrip = to_datafusion_expr(&delta_expr, &DataType::BOOLEAN).unwrap();
+        assert_eq!(df_expr, df_expr_roundtrip);
     }
 
     #[test]
@@ -26,8 +29,8 @@ mod tests {
             .and(col("c").eq(lit(3)))
             .and(col("d").eq(lit(4)));
         let delta_expr = to_delta_expression(&df_expr).unwrap();
-        let df_expr_roundtrip = to_datafusion_expr(&delta_expr).unwrap();
-        assert_eq!(df_expr, df_expr_roundtrip[0]);
+        let df_expr_roundtrip = to_datafusion_expr(&delta_expr, &DataType::BOOLEAN).unwrap();
+        assert_eq!(df_expr, df_expr_roundtrip);
     }
 
     #[test]
@@ -37,40 +40,40 @@ mod tests {
             .and(col("b").eq(lit(2)))
             .or(col("c").eq(lit(3)).and(col("d").eq(lit(4))));
         let delta_expr = to_delta_expression(&df_expr).unwrap();
-        let df_expr_roundtrip = to_datafusion_expr(&delta_expr).unwrap();
-        assert_eq!(df_expr, df_expr_roundtrip[0]);
+        let df_expr_roundtrip = to_datafusion_expr(&delta_expr, &DataType::BOOLEAN).unwrap();
+        assert_eq!(df_expr, df_expr_roundtrip);
     }
 
     #[test]
     fn test_roundtrip_unary() {
         let df_expr = !col("a").eq(lit(1));
         let delta_expr = to_delta_expression(&df_expr).unwrap();
-        let df_expr_roundtrip = to_datafusion_expr(&delta_expr).unwrap();
-        assert_eq!(df_expr, df_expr_roundtrip[0]);
+        let df_expr_roundtrip = to_datafusion_expr(&delta_expr, &DataType::BOOLEAN).unwrap();
+        assert_eq!(df_expr, df_expr_roundtrip);
     }
 
     #[test]
     fn test_roundtrip_is_null() {
         let df_expr = col("a").is_null();
         let delta_expr = to_delta_expression(&df_expr).unwrap();
-        let df_expr_roundtrip = to_datafusion_expr(&delta_expr).unwrap();
-        assert_eq!(df_expr, df_expr_roundtrip[0]);
+        let df_expr_roundtrip = to_datafusion_expr(&delta_expr, &DataType::BOOLEAN).unwrap();
+        assert_eq!(df_expr, df_expr_roundtrip);
     }
 
     #[test]
     fn test_roundtrip_binary_ops() {
         let df_expr = col("a") + col("b") * col("c");
         let delta_expr = to_delta_expression(&df_expr).unwrap();
-        let df_expr_roundtrip = to_datafusion_expr(&delta_expr).unwrap();
-        assert_eq!(df_expr, df_expr_roundtrip[0]);
+        let df_expr_roundtrip = to_datafusion_expr(&delta_expr, &DataType::BOOLEAN).unwrap();
+        assert_eq!(df_expr, df_expr_roundtrip);
     }
 
     #[test]
     fn test_roundtrip_comparison_ops() {
         let df_expr = col("a").gt(col("b")).and(col("c").lt_eq(col("d")));
         let delta_expr = to_delta_expression(&df_expr).unwrap();
-        let df_expr_roundtrip = to_datafusion_expr(&delta_expr).unwrap();
-        assert_eq!(df_expr, df_expr_roundtrip[0]);
+        let df_expr_roundtrip = to_datafusion_expr(&delta_expr, &DataType::BOOLEAN).unwrap();
+        assert_eq!(df_expr, df_expr_roundtrip);
     }
 
     #[test]
@@ -81,20 +84,20 @@ mod tests {
             left: Box::new(Expression::Column("a".parse().unwrap())),
             right: Box::new(Expression::Column("b".parse().unwrap())),
         });
-        assert!(to_datafusion_expr(&delta_expr).is_err());
+        assert!(to_datafusion_expr(&delta_expr, &DataType::BOOLEAN).is_err());
 
         let delta_expr = Expression::Binary(BinaryExpression {
             op: BinaryOperator::In,
             left: Box::new(Expression::Column("a".parse().unwrap())),
             right: Box::new(Expression::Column("b".parse().unwrap())),
         });
-        assert!(to_datafusion_expr(&delta_expr).is_err());
+        assert!(to_datafusion_expr(&delta_expr, &DataType::BOOLEAN).is_err());
 
         let delta_expr = Expression::Binary(BinaryExpression {
             op: BinaryOperator::NotIn,
             left: Box::new(Expression::Column("a".parse().unwrap())),
             right: Box::new(Expression::Column("b".parse().unwrap())),
         });
-        assert!(to_datafusion_expr(&delta_expr).is_err());
+        assert!(to_datafusion_expr(&delta_expr, &DataType::BOOLEAN).is_err());
     }
 }

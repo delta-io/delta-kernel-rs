@@ -52,6 +52,8 @@ pub trait TableSnapshot: std::fmt::Debug + Send + Sync {
     /// This includes any geneated or implicit columns, mapped names, etc.
     fn table_schema(&self) -> &ArrowSchemaRef;
 
+    fn table_schema_delta(&self) -> DeltaSchemaRef;
+
     /// Produce the metadata required to plan a table scan.
     async fn scan_metadata(
         &self,
@@ -91,6 +93,10 @@ impl DeltaTableSnapshot {
 impl TableSnapshot for DeltaTableSnapshot {
     fn table_schema(&self) -> &ArrowSchemaRef {
         &self.table_schema
+    }
+
+    fn table_schema_delta(&self) -> DeltaSchemaRef {
+        self.snapshot.schema()
     }
 
     async fn scan_metadata(
@@ -180,13 +186,10 @@ impl ScanContext {
     fn parse_path(&self, path: &str) -> Result<Url> {
         Ok(match Url::parse(path) {
             Ok(url) => url,
-            Err(_) => {
-                
-                self
-                    .table_root
-                    .join(path)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?
-            }
+            Err(_) => self
+                .table_root
+                .join(path)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?,
         })
     }
 }

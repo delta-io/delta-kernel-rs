@@ -1,5 +1,8 @@
+use datafusion_common::HashMap;
+use datafusion_datasource::PartitionedFile;
 use datafusion_execution::object_store::ObjectStoreUrl;
-use delta_kernel::{FileMeta, FileSlice};
+use delta_kernel::object_store::path::Path;
+use delta_kernel::{DeltaResult, Error as DeltaError, FileMeta, FileSlice};
 use itertools::Itertools;
 use url::Url;
 
@@ -38,6 +41,29 @@ pub(crate) fn group_by_store<T: IntoIterator<Item = impl AsObjectStoreUrl>>(
         .into_iter()
         .map(|item| (item.as_object_store_url(), item))
         .into_group_map()
+}
+
+pub(crate) fn grouped_partitioned_files(
+    files: &[FileMeta],
+) -> DeltaResult<HashMap<ObjectStoreUrl, Vec<PartitionedFile>>> {
+    group_by_store(files)
+        .into_iter()
+        .map(to_partitioned_files)
+        .try_collect::<_, HashMap<_, _>, _>()
+}
+
+fn to_partitioned_files(
+    arg: (ObjectStoreUrl, Vec<&FileMeta>),
+) -> DeltaResult<(ObjectStoreUrl, Vec<PartitionedFile>)> {
+    let (url, files) = arg;
+    let part_files = files
+        .into_iter()
+        .map(|f| {
+            let path = Path::from_url_path(f.location.path())?.to_string();
+            Ok::<_, DeltaError>(PartitionedFile::new(path, f.size))
+        })
+        .try_collect::<_, Vec<_>, _>()?;
+    Ok::<_, DeltaError>((url, part_files))
 }
 
 fn get_store_url(url: &url::Url) -> ObjectStoreUrl {

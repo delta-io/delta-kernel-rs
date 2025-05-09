@@ -1,10 +1,9 @@
 use std::sync::{mpsc, Arc};
 
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use datafusion::datasource::physical_plan::{FileScanConfigBuilder, JsonSource};
+use datafusion::datasource::physical_plan::{FileScanConfigBuilder, JsonSource, ParquetSource};
 use datafusion::execution::SessionState;
 use datafusion_catalog::memory::DataSourceExec;
-use datafusion_common::HashMap;
 use datafusion_datasource::PartitionedFile;
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_physical_plan::execute_stream;
@@ -18,94 +17,103 @@ use delta_kernel::object_store::{path::Path, PutMode};
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{
     DeltaResult, EngineData, Error as DeltaError, ExpressionRef, FileDataReadResultIterator,
-    FileMeta, JsonHandler,
+    FileMeta, JsonHandler, ParquetHandler,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::TryStreamExt;
-use itertools::Itertools;
 use parking_lot::RwLock;
 use tracing::warn;
 use url::Url;
 
-use crate::utils::{group_by_store, AsObjectStoreUrl};
+use crate::utils::{grouped_partitioned_files, AsObjectStoreUrl};
 
 const DEFAULT_BUFFER_SIZE: usize = 1024;
 
-#[derive(Debug)]
-pub struct DataFusionJsonHandler<E: TaskExecutor> {
+pub struct DataFusionFileFormatHandler<E: TaskExecutor> {
     /// Shared session state for the session
     state: Arc<RwLock<SessionState>>,
     /// The executor to run async tasks on
     task_executor: Arc<E>,
     /// size of the buffer (via our `sync_channel`).
     buffer_size: usize,
+
+    json_source: Arc<JsonSource>,
+    parquet_source: Arc<ParquetSource>,
 }
 
-impl<E: TaskExecutor> DataFusionJsonHandler<E> {
+impl<E: TaskExecutor> std::fmt::Debug for DataFusionFileFormatHandler<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DataFusionFileFormatHandler")
+            .field("state", &self.state)
+            .field("buffer_size", &self.buffer_size)
+            .finish()
+    }
+}
+
+impl<E: TaskExecutor> DataFusionFileFormatHandler<E> {
     pub fn new(state: Arc<RwLock<SessionState>>, task_executor: Arc<E>) -> Self {
         Self {
             state,
             task_executor,
             buffer_size: DEFAULT_BUFFER_SIZE,
+            json_source: Arc::new(JsonSource::default()),
+            parquet_source: Arc::new(ParquetSource::default()),
         }
     }
-}
 
-impl<E: TaskExecutor> JsonHandler for DataFusionJsonHandler<E> {
-    fn parse_json(
+    fn parquet_exec(
         &self,
-        json_strings: Box<dyn EngineData>,
-        output_schema: SchemaRef,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        arrow_parse_json(json_strings, output_schema)
+        store_url: ObjectStoreUrl,
+        files: Vec<PartitionedFile>,
+        arrow_schema: ArrowSchemaRef,
+    ) -> Arc<dyn ExecutionPlan> {
+        let config =
+            FileScanConfigBuilder::new(store_url, arrow_schema, self.parquet_source.clone())
+                .with_file_group(files.into_iter().collect())
+                .build();
+        // TODO: repartitition plan to read/parse from multiple threads
+        DataSourceExec::from_data_source(config)
     }
 
-    fn read_json_files(
+    fn json_exec(
+        &self,
+        store_url: ObjectStoreUrl,
+        files: Vec<PartitionedFile>,
+        arrow_schema: ArrowSchemaRef,
+    ) -> Arc<dyn ExecutionPlan> {
+        let config = FileScanConfigBuilder::new(store_url, arrow_schema, self.json_source.clone())
+            .with_file_group(files.into_iter().collect())
+            .build();
+        // TODO: repartitition plan to read/parse from multiple threads
+        DataSourceExec::from_data_source(config)
+    }
+
+    fn get_plan(
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        _predicate: Option<ExpressionRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
-        if files.is_empty() {
-            return Ok(Box::new(std::iter::empty()));
-        }
-
-        let to_partitioned_files = |arg: (ObjectStoreUrl, Vec<&FileMeta>)| {
-            let (url, files) = arg;
-            let part_files = files
-                .into_iter()
-                .map(|f| {
-                    let path = Path::from_url_path(f.location.path())?.to_string();
-                    Ok::<_, DeltaError>(PartitionedFile::new(path, f.size))
-                })
-                .try_collect::<_, Vec<_>, _>()?;
-            Ok::<_, DeltaError>((url, part_files))
-        };
-        let files_by_store = group_by_store(files)
-            .into_iter()
-            .map(to_partitioned_files)
-            .try_collect::<_, HashMap<_, _>, _>()?;
-
-        let source = Arc::new(JsonSource::default());
+        get_exec: impl Fn(
+            ObjectStoreUrl,
+            Vec<PartitionedFile>,
+            ArrowSchemaRef,
+        ) -> Arc<dyn ExecutionPlan>,
+    ) -> DeltaResult<Arc<dyn ExecutionPlan>> {
+        let files_by_store = grouped_partitioned_files(files)?;
         let arrow_schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
 
         let mut plans = Vec::new();
 
         for (store_url, files) in files_by_store.into_iter() {
-            let config =
-                FileScanConfigBuilder::new(store_url, arrow_schema.clone(), source.clone())
-                    .with_file_group(files.into_iter().collect())
-                    .build();
-            // TODO: repartitition plan to read/parse from multiple threads
-            let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
-            plans.push(plan);
+            plans.push(get_exec(store_url, files, arrow_schema.clone()));
         }
 
-        let plan = match plans.len() {
+        Ok(match plans.len() {
             1 => plans.remove(0),
             _ => Arc::new(UnionExec::new(plans)),
-        };
+        })
+    }
 
+    fn execute_plan(&self, plan: Arc<dyn ExecutionPlan>) -> FileDataReadResultIterator {
         let task_ctx = self.state.read().task_ctx();
         let (tx, rx) = mpsc::sync_channel(self.buffer_size);
 
@@ -131,7 +139,32 @@ impl<E: TaskExecutor> JsonHandler for DataFusionJsonHandler<E> {
             }
         });
 
-        Ok(Box::new(rx.into_iter()))
+        Box::new(rx.into_iter())
+    }
+}
+
+impl<E: TaskExecutor> JsonHandler for DataFusionFileFormatHandler<E> {
+    fn parse_json(
+        &self,
+        json_strings: Box<dyn EngineData>,
+        output_schema: SchemaRef,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        arrow_parse_json(json_strings, output_schema)
+    }
+
+    fn read_json_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        _predicate: Option<ExpressionRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        if files.is_empty() {
+            return Ok(Box::new(std::iter::empty()));
+        }
+        let get_exec =
+            |store_url, files, arrow_schema| self.json_exec(store_url, files, arrow_schema);
+        let plan = self.get_plan(files, physical_schema, get_exec)?;
+        Ok(self.execute_plan(plan))
     }
 
     // note: for now we just buffer all the data and write it out all at once
@@ -167,5 +200,19 @@ impl<E: TaskExecutor> JsonHandler for DataFusionJsonHandler<E> {
                 e => e.into(),
             })?;
         Ok(())
+    }
+}
+
+impl<E: TaskExecutor> ParquetHandler for DataFusionFileFormatHandler<E> {
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        _predicate: Option<ExpressionRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        let get_exec =
+            |store_url, files, arrow_schema| self.parquet_exec(store_url, files, arrow_schema);
+        let plan = self.get_plan(files, physical_schema, get_exec)?;
+        Ok(self.execute_plan(plan))
     }
 }
