@@ -80,7 +80,12 @@ pub enum JunctionPredicateOp {
 
 /// An opaque expression operation (ie defined and implemented by the engine).
 pub trait OpaqueExpressionOp: DynPartialEq + std::fmt::Debug {
+    /// Succinctly identifies this op
+    fn name(&self) -> &str;
+
     /// Attempts to apply this expression operation to a set of scalar values.
+    ///
+    /// Kernel uses this method to implement partition pruning.
     ///
     /// An input of None means kernel was unable to evaluate that particular input arg. Otherwise,
     /// Some(Scalar) is the result of that evaluation (possibly `Scalar::Null` if NULL).
@@ -93,6 +98,9 @@ pub trait OpaqueExpressionOp: DynPartialEq + std::fmt::Debug {
 
 /// An opaque predicate operation (ie defined and implemented by the engine).
 pub trait OpaquePredicateOp: DynPartialEq + std::fmt::Debug {
+    /// Succinctly identifies this op
+    fn name(&self) -> &str;
+
     /// Attempts to apply this (possibly inverted) opaque predicate to a set of scalar values.
     ///
     /// Kernel uses this method to implement partition pruning and to evaluate any opaque data

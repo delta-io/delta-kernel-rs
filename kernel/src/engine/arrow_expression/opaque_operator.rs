@@ -55,6 +55,14 @@ impl ArrowOpaquePredicateOp {
 }
 
 impl OpaquePredicateOp for ArrowOpaquePredicateOp {
+    fn name(&self) -> &str {
+        use ArrowOpaquePredicateOp::*;
+        match self {
+            InList(_) => "IN",
+            NotInList(_) => "NOT IN",
+        }
+    }
+
     fn eval_pred_scalar(
         &self,
         values: &[Option<Scalar>],

@@ -92,7 +92,7 @@ mod arrow_compat;
 #[cfg(any(feature = "arrow-54", feature = "arrow-55"))]
 pub use arrow_compat::*;
 
-pub(crate) mod kernel_predicates;
+pub mod kernel_predicates;
 pub(crate) mod utils;
 
 internal_mod!(pub(crate) mod path);

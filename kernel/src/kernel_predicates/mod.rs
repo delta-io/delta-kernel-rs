@@ -61,7 +61,7 @@ mod tests;
 /// NOTE: The error-handling semantics of this trait's scalar-based predicate evaluation may differ
 /// from those of the engine's predicate evaluation, because kernel predicates don't include the
 /// necessary type information to reliably detect all type errors.
-pub(crate) trait KernelPredicateEvaluator {
+pub trait KernelPredicateEvaluator {
     type Output;
 
     /// A (possibly inverted) boolean scalar value, e.g. `[NOT] <value>`.
