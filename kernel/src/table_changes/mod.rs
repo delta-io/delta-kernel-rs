@@ -5,7 +5,7 @@
 //! # use std::sync::Arc;
 //! # use delta_kernel::engine::sync::SyncEngine;
 //! # use delta_kernel::expressions::{column_expr, Scalar};
-//! # use delta_kernel::{Expression, Table, Error};
+//! # use delta_kernel::{Predicate, Table, Error};
 //! # let path = "./tests/data/table-with-cdf";
 //! # let engine = Arc::new(SyncEngine::new());
 //! // Construct a table from a path oaeuhoanut
@@ -18,7 +18,7 @@
 //! let schema = table_changes
 //!     .schema()
 //!     .project(&["id", "_commit_version"])?;
-//! let predicate = Arc::new(Expression::gt(column_expr!("id"), Scalar::from(10)));
+//! let predicate = Arc::new(Predicate::gt(column_expr!("id"), Scalar::from(10)));
 //!
 //! // Construct the table changes scan
 //! let table_changes_scan = table_changes

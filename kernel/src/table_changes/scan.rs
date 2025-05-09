@@ -10,7 +10,7 @@ use crate::actions::deletion_vector::split_vector;
 use crate::scan::state::GlobalScanState;
 use crate::scan::{ColumnType, PhysicalPredicate, ScanResult};
 use crate::schema::{SchemaRef, StructType};
-use crate::{DeltaResult, Engine, ExpressionRef, FileMeta};
+use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::{physical_to_logical_expr, scan_file_physical_schema};
@@ -53,7 +53,7 @@ pub struct TableChangesScan {
 /// # use std::sync::Arc;
 /// # use delta_kernel::engine::sync::SyncEngine;
 /// # use delta_kernel::expressions::{column_expr, Scalar};
-/// # use delta_kernel::{Expression, Table};
+/// # use delta_kernel::{Predicate, Table};
 /// # let path = "./tests/data/table-with-cdf";
 /// # let engine = Box::new(SyncEngine::new());
 /// # let table = Table::try_from_uri(path).unwrap();
@@ -62,7 +62,7 @@ pub struct TableChangesScan {
 ///     .schema()
 ///     .project(&["id", "_commit_version"])
 ///     .unwrap();
-/// let predicate = Arc::new(Expression::gt(column_expr!("id"), Scalar::from(10)));
+/// let predicate = Arc::new(Predicate::gt(column_expr!("id"), Scalar::from(10)));
 /// let scan = table_changes
 ///     .into_scan_builder()
 ///     .with_schema(schema)
@@ -73,7 +73,7 @@ pub struct TableChangesScan {
 pub struct TableChangesScanBuilder {
     table_changes: Arc<TableChanges>,
     schema: Option<SchemaRef>,
-    predicate: Option<ExpressionRef>,
+    predicate: Option<PredicateRef>,
 }
 
 impl TableChangesScanBuilder {
@@ -103,7 +103,7 @@ impl TableChangesScanBuilder {
     ///
     /// NOTE: The filtering is best-effort and can produce false positives (rows that should should
     /// have been filtered out but were kept).
-    pub fn with_predicate(mut self, predicate: impl Into<Option<ExpressionRef>>) -> Self {
+    pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();
         self
     }
@@ -222,8 +222,8 @@ impl TableChangesScan {
         &self.logical_schema
     }
 
-    /// Get the predicate [`ExpressionRef`] of the scan.
-    fn physical_predicate(&self) -> Option<ExpressionRef> {
+    /// Get the predicate [`PredicateRef`] of the scan.
+    fn physical_predicate(&self) -> Option<PredicateRef> {
         if let PhysicalPredicate::Some(ref predicate, _) = self.physical_predicate {
             Some(predicate.clone())
         } else {
@@ -276,7 +276,7 @@ fn read_scan_file(
     resolved_scan_file: ResolvedCdfScanFile,
     global_state: &GlobalScanState,
     all_fields: &[ColumnType],
-    _physical_predicate: Option<ExpressionRef>,
+    _physical_predicate: Option<PredicateRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
     let ResolvedCdfScanFile {
         scan_file,
@@ -362,7 +362,7 @@ mod tests {
     use crate::scan::{ColumnType, PhysicalPredicate};
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::COMMIT_VERSION_COL_NAME;
-    use crate::{Expression, Table};
+    use crate::{Predicate, Table};
 
     #[test]
     fn simple_table_changes_scan_builder() {
@@ -402,7 +402,7 @@ mod tests {
             .schema()
             .project(&["id", COMMIT_VERSION_COL_NAME])
             .unwrap();
-        let predicate = Arc::new(Expression::gt(column_expr!("id"), Scalar::from(10)));
+        let predicate = Arc::new(Predicate::gt(column_expr!("id"), Scalar::from(10)));
         let scan = table_changes
             .into_scan_builder()
             .with_schema(schema)

@@ -156,7 +156,7 @@ impl Table {
         version: impl Into<Option<Version>>,
     ) -> DeltaResult<CheckpointWriter> {
         let snapshot = Arc::new(self.snapshot(engine, version.into())?);
-        Ok(CheckpointWriter { snapshot })
+        CheckpointWriter::try_new(snapshot)
     }
 
     /// Create a new write transaction for this table.

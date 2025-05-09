@@ -105,9 +105,10 @@ async fn create_table(
     .concat();
 
     // put 0.json with protocol + metadata
-    let path = table_path.path();
-    let path = format!("{path}_delta_log/00000000000000000000.json");
-    store.put(&Path::from(path), data.into()).await?;
+    let path = table_path.join("_delta_log/00000000000000000000.json")?;
+    store
+        .put(&Path::from_url_path(path.path())?, data.into())
+        .await?;
     Ok(Table::new(table_path))
 }
 
