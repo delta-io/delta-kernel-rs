@@ -10,6 +10,7 @@ use url::Url;
 
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{Engine, Error, Table, Version};
+use delta_kernel_engine::EngineError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssertionError {
@@ -18,6 +19,9 @@ pub enum AssertionError {
 
     #[error("Kernel error: {0}")]
     KernelError(#[from] Error),
+
+    #[error("Engine error: {0}")]
+    EngineError(#[from] EngineError),
 }
 
 pub type TestResult<T, E = AssertionError> = std::result::Result<T, E>;
