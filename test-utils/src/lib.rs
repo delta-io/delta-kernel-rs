@@ -2,13 +2,15 @@
 
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
-use delta_kernel::arrow::error::ArrowError;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::object_store::{path::Path, ObjectStore};
-use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
-use delta_kernel::parquet::file::properties::WriterProperties;
+use delta_kernel_engine::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use delta_kernel_engine::arrow::error::ArrowError;
+use delta_kernel_engine::object_store::{path::Path, ObjectStore};
+use delta_kernel_engine::parquet::arrow::arrow_writer::ArrowWriter;
+use delta_kernel_engine::parquet::file::properties::WriterProperties;
+
 use delta_kernel::EngineData;
+use delta_kernel_engine::arrow_data::ArrowEngineData;
+
 use itertools::Itertools;
 
 /// A common useful initial metadata and protocol. Also includes a single commitInfo

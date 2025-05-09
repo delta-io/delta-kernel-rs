@@ -1,12 +1,14 @@
 use std::{collections::HashMap, sync::Arc};
 
-use clap::Parser;
-use delta_kernel::arrow::array::RecordBatch;
-use delta_kernel::arrow::{compute::filter_record_batch, util::pretty::print_batches};
-use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel_engine::arrow::array::RecordBatch;
+use delta_kernel_engine::arrow::{compute::filter_record_batch, util::pretty::print_batches};
+
 use delta_kernel::{DeltaResult, Table};
+use delta_kernel_engine::arrow_data::ArrowEngineData;
+use delta_kernel_engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel_engine::default::DefaultEngine;
+
+use clap::Parser;
 use itertools::Itertools;
 
 #[derive(Parser)]
