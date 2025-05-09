@@ -9,7 +9,7 @@ use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
 use crate::expressions::{
     column_expr, joined_column_expr, BinaryPredicateOp, ColumnName, Expression as Expr,
-    JunctionPredicateOp, Predicate as Pred, PredicateRef, Scalar,
+    JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -39,7 +39,7 @@ mod tests;
 /// - `OR` is rewritten only if all operands are eligible for data skipping. Otherwise, the whole OR
 ///   predicate is dropped.
 #[cfg(test)]
-fn as_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
+pub(crate) fn as_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
     DataSkippingPredicateCreator.eval(pred)
 }
 
@@ -194,8 +194,7 @@ struct DataSkippingPredicateCreator;
 
 impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
     type Output = Pred;
-    type TypedStat = Expr;
-    type IntStat = Expr;
+    type ColumnStat = Expr;
 
     /// Retrieves the minimum value of a column, if it exists and has the requested type.
     fn get_min_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
@@ -243,6 +242,8 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted).map(Pred::literal)
     }
 
+    // NOTE: This is nearly identical to the impl for ParquetStatsProvider in
+    // parquet_stats_skipping.rs, except it uses `Expression` and `Predicate` instead of `Scalar`.
     fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
         let safe_to_skip = match inverted {
             true => self.get_rowcount_stat()?, // all-null
@@ -262,10 +263,19 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
             .map(Pred::literal)
     }
 
+    fn eval_pred_opaque(
+        &self,
+        op: &OpaquePredicateOpRef,
+        exprs: &[Expr],
+        inverted: bool,
+    ) -> Option<Pred> {
+        op.as_data_skipping_predicate(self, exprs, inverted)
+    }
+
     fn finish_eval_pred_junction(
         &self,
         mut op: JunctionPredicateOp,
-        preds: impl IntoIterator<Item = Option<Pred>>,
+        preds: &mut dyn Iterator<Item = Option<Pred>>,
         inverted: bool,
     ) -> Option<Pred> {
         if inverted {
@@ -279,7 +289,6 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         // observing that one NULL is enough to produce the correct behavior during predicate eval.
         let mut keep_null = true;
         let preds: Vec<_> = preds
-            .into_iter()
             .flat_map(|p| match p {
                 Some(pred) => Some(pred),
                 None => keep_null.then(|| {

@@ -11,6 +11,7 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, IntervalUnit, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
+use crate::engine::arrow_expression::opaque_operator::{eval_expr_opaque, eval_pred_opaque};
 use crate::engine::arrow_utils::prim_array_cmp;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
@@ -126,6 +127,8 @@ pub(crate) fn evaluate_expression(
 
             Ok(eval(&left_arr, &right_arr)?)
         }
+        (Opaque(o), _) => eval_expr_opaque(o, batch),
+        (Unknown(name), _) => Err(Error::generic(format!("Unknown expression: {name:?}"))),
     }
 }
 
@@ -251,5 +254,7 @@ pub(crate) fn evaluate_predicate(
                 .reduce(|l, r| Ok(reducer(&l?, &r?)?))
                 .unwrap_or_else(|| Ok(BooleanArray::from(vec![default; batch.num_rows()])))
         }
+        Opaque(o) => eval_pred_opaque(o, false, batch),
+        Unknown(name) => Err(Error::generic(format!("Unknown expression: {name:?}"))),
     }
 }

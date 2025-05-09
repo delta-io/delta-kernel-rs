@@ -92,7 +92,7 @@ mod arrow_compat;
 #[cfg(any(feature = "arrow-54", feature = "arrow-55"))]
 pub use arrow_compat::*;
 
-pub(crate) mod kernel_predicates;
+pub mod kernel_predicates;
 pub(crate) mod utils;
 
 // for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
@@ -325,6 +325,21 @@ impl<T: Any + Send + Sync> AsAny for T {
     }
     fn type_name(&self) -> &'static str {
         std::any::type_name::<Self>()
+    }
+}
+
+/// Extension trait that facilitates object-safe implementations of `PartialEq`.
+pub trait DynPartialEq: AsAny {
+    fn dyn_eq(&self, other: &dyn Any) -> bool;
+}
+
+// Blanket implementation for all eligible types
+impl<T: PartialEq + AsAny> DynPartialEq for T {
+    fn dyn_eq(&self, other: &dyn Any) -> bool {
+        match other.downcast_ref::<T>() {
+            Some(other) => self == other,
+            None => false,
+        }
     }
 }
 

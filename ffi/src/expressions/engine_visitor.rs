@@ -1,32 +1,18 @@
 //! Defines [`EngineExpressionVisitor`]. This is a visitor that can be used to convert the kernel's
-//! [`Expression`] to an engine's expression format.
-use crate::expressions::{SharedExpression, SharedPredicate};
+//! [`Expression`] or [`Predicate`] to an engine's native expression format.
 use std::ffi::c_void;
 
-use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
-    Expression, JunctionPredicate, JunctionPredicateOp, MapData, Predicate, Scalar, StructData,
+    Expression, JunctionPredicate, JunctionPredicateOp, MapData, OpaqueExpression,
+    OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef, Predicate, Scalar, StructData,
     UnaryPredicate, UnaryPredicateOp,
 };
 
-/// Free the memory the passed SharedExpression
-///
-/// # Safety
-/// Engine is responsible for passing a valid SharedExpression
-#[no_mangle]
-pub unsafe extern "C" fn free_kernel_expression(data: Handle<SharedExpression>) {
-    data.drop_handle();
-}
-
-/// Free the memory the passed SharedPredicate
-///
-/// # Safety
-/// Engine is responsible for passing a valid SharedPredicate
-#[no_mangle]
-pub unsafe extern "C" fn free_kernel_predicate(data: Handle<SharedPredicate>) {
-    data.drop_handle();
-}
+use crate::expressions::{
+    SharedExpression, SharedOpaqueExpressionOp, SharedOpaquePredicateOp, SharedPredicate,
+};
+use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
 
 type VisitLiteralFn<T> = extern "C" fn(data: *mut c_void, sibling_list_id: usize, value: T);
 type VisitUnaryFn = extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
@@ -192,6 +178,26 @@ pub struct EngineExpressionVisitor {
     /// The sub-expressions of the `StructExpression` are in a list identified by `child_list_id`
     pub visit_struct_expr:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize),
+    /// Visits the operator (`op`) and children (`child_list_id`) of an opaque expression belonging
+    /// to the list identified by `sibling_list_id`.
+    pub visit_opaque_expr: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        op: Handle<SharedOpaqueExpressionOp>,
+        child_list_id: usize,
+    ),
+    /// Visits the operator (`op`) and children (`child_list_id`) of an opaque predicate belonging
+    /// to the list identified by `sibling_list_id`.
+    pub visit_opaque_pred: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        op: Handle<SharedOpaquePredicateOp>,
+        child_list_id: usize,
+    ),
+    /// Visits the name of an `Expression::Unknown` or `Predicate::Unknown` belonging to the
+    /// list identified by `sibling_list_id`.
+    pub visit_unknown:
+        extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
 }
 
 /// Visit the expression of the passed [`SharedExpression`] Handle using the provided `visitor`.
@@ -339,6 +345,26 @@ fn visit_expression_struct(
     call!(visitor, visit_struct_expr, sibling_list_id, child_list_id)
 }
 
+fn visit_expression_opaque(
+    visitor: &mut EngineExpressionVisitor,
+    op: &OpaqueExpressionOpRef,
+    exprs: &[Expression],
+    sibling_list_id: usize,
+) {
+    let child_list_id = call!(visitor, make_field_list, exprs.len());
+    for expr in exprs {
+        visit_expression_impl(visitor, expr, child_list_id);
+    }
+    let op = Handle::from(op.clone());
+    call!(
+        visitor,
+        visit_opaque_expr,
+        sibling_list_id,
+        op,
+        child_list_id
+    );
+}
+
 fn visit_predicate_junction(
     visitor: &mut EngineExpressionVisitor,
     op: &JunctionPredicateOp,
@@ -355,6 +381,35 @@ fn visit_predicate_junction(
         JunctionPredicateOp::Or => &visitor.visit_or,
     };
     visit_fn(visitor.data, sibling_list_id, child_list_id);
+}
+
+fn visit_predicate_opaque(
+    visitor: &mut EngineExpressionVisitor,
+    op: &OpaquePredicateOpRef,
+    exprs: &[Expression],
+    sibling_list_id: usize,
+) {
+    let child_list_id = call!(visitor, make_field_list, exprs.len());
+    for expr in exprs {
+        visit_expression_impl(visitor, expr, child_list_id);
+    }
+    let op = Handle::from(op.clone());
+    call!(
+        visitor,
+        visit_opaque_pred,
+        sibling_list_id,
+        op,
+        child_list_id
+    );
+}
+
+fn visit_unknown(visitor: &mut EngineExpressionVisitor, sibling_list_id: usize, name: &str) {
+    call!(
+        visitor,
+        visit_unknown,
+        sibling_list_id,
+        kernel_string_slice!(name)
+    );
 }
 
 fn visit_expression_scalar(
@@ -436,6 +491,10 @@ fn visit_expression_impl(
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
+        Expression::Opaque(OpaqueExpression { op, exprs }) => {
+            visit_expression_opaque(visitor, op, exprs, sibling_list_id)
+        }
+        Expression::Unknown(name) => visit_unknown(visitor, sibling_list_id, name),
     }
 }
 
@@ -479,6 +538,10 @@ fn visit_predicate_impl(
         Predicate::Junction(JunctionPredicate { op, preds }) => {
             visit_predicate_junction(visitor, op, preds, sibling_list_id)
         }
+        Predicate::Opaque(OpaquePredicate { op, exprs }) => {
+            visit_predicate_opaque(visitor, op, exprs, sibling_list_id)
+        }
+        Predicate::Unknown(name) => visit_unknown(visitor, sibling_list_id, name),
     }
 }
 
