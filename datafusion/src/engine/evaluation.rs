@@ -1,10 +1,11 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use datafusion::arrow::array::{AsArray, RecordBatch};
 use datafusion::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 use datafusion::execution::SessionState;
+use datafusion_common::scalar::ScalarStructBuilder;
 use datafusion_common::{DFSchema, DataFusionError};
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_plan::expressions::col;
@@ -19,6 +20,15 @@ use parking_lot::RwLock;
 
 use crate::expressions::to_datafusion_expr;
 
+static ERROR_EXPR: LazyLock<Arc<dyn PhysicalExpr>> = LazyLock::new(|| {
+    let err_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "error",
+        ArrowDataType::Utf8,
+        true,
+    )]));
+    col("error", err_schema.as_ref()).unwrap()
+});
+
 pub struct DataFusionEvaluationHandler {
     pub(super) state: Arc<RwLock<SessionState>>,
 }
@@ -30,79 +40,69 @@ impl EvaluationHandler for DataFusionEvaluationHandler {
         expression: Expression,
         output_type: DataType,
     ) -> Arc<dyn ExpressionEvaluator> {
-        let mut errors = Vec::new();
-        let err_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "error",
-            ArrowDataType::Utf8,
-            true,
-        )]));
-
-        let with_error = |e: DataFusionError| {
-            errors.push(e);
-            Arc::new(DataFusionExpressionEvaluator::new(
-                col("error", err_schema.as_ref()).unwrap(),
-                errors,
-                output_type.clone(),
-            ))
-        };
-
         let df_schema = match ArrowSchema::try_from(schema.as_ref())
             .map_err(DataFusionError::from)
             .and_then(DFSchema::try_from)
         {
             Ok(v) => v,
-            Err(e) => return with_error(e),
+            Err(e) => return DataFusionExpressionEvaluator::new_err(output_type, e),
         };
-
         let physical_expressions = match to_datafusion_expr(&expression, &output_type)
             .and_then(|df_expr| self.state.read().create_physical_expr(df_expr, &df_schema))
         {
             Ok(v) => v,
-            Err(e) => return with_error(e),
+            Err(e) => return DataFusionExpressionEvaluator::new_err(output_type, e),
         };
-
-        Arc::new(DataFusionExpressionEvaluator::new(
-            physical_expressions,
-            vec![],
-            output_type,
-        ))
+        DataFusionExpressionEvaluator::new(physical_expressions, output_type)
     }
 
     fn null_row(&self, output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>> {
-        todo!()
+        let schema =
+            ArrowSchema::try_from(output_schema.as_ref()).map_err(DeltaError::generic_err)?;
+        let value = ScalarStructBuilder::new_null(schema.fields())
+            .to_array_of_size(1)
+            .map_err(DeltaError::generic_err)?;
+        Ok(Box::new(ArrowEngineData::new(value.as_struct().into())))
     }
 }
 
 pub struct DataFusionExpressionEvaluator {
-    physical_expressions: Arc<dyn PhysicalExpr>,
-    init_errors: Vec<DataFusionError>,
+    /// The physical expression to evaluate
+    expr: Arc<dyn PhysicalExpr>,
+    /// The type of the output of the expression
     output_type: DataType,
+    /// Error that occurred during initialization
+    ///
+    /// Raising this error is deferred until `evaluate` is called since
+    /// creating the evaluator is an infallible operation.
+    init_error: Option<DataFusionError>,
 }
 
 impl DataFusionExpressionEvaluator {
-    pub fn new(
-        physical_expressions: Arc<dyn PhysicalExpr>,
-        init_errors: Vec<DataFusionError>,
-        output_type: DataType,
-    ) -> Self {
-        Self {
-            physical_expressions,
-            init_errors,
+    pub fn new(expr: Arc<dyn PhysicalExpr>, output_type: DataType) -> Arc<Self> {
+        Arc::new(Self {
+            expr,
+            init_error: None,
             output_type,
-        }
+        })
+    }
+
+    fn new_err(output_type: DataType, error: DataFusionError) -> Arc<Self> {
+        Arc::new(Self {
+            expr: ERROR_EXPR.clone(),
+            init_error: Some(error),
+            output_type,
+        })
     }
 
     fn raise_errors(&self) -> DeltaResult<()> {
-        match self.init_errors.len() {
-            0 => Ok(()),
-            _ => Err(self
-                .init_errors
-                .first()
-                .map(|e| DeltaError::generic(e.to_string()))
-                .expect("length matched 1")),
+        match &self.init_error {
+            Some(e) => Err(DeltaError::generic(e.to_string())),
+            None => Ok(()),
         }
     }
 }
+
 impl ExpressionEvaluator for DataFusionExpressionEvaluator {
     fn evaluate(&self, data: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         self.raise_errors()?;
@@ -114,7 +114,7 @@ impl ExpressionEvaluator for DataFusionExpressionEvaluator {
             .record_batch();
 
         let results = self
-            .physical_expressions
+            .expr
             .evaluate(batch)
             .and_then(|value| match value {
                 ColumnarValue::Array(array) => Ok(array),
@@ -122,7 +122,7 @@ impl ExpressionEvaluator for DataFusionExpressionEvaluator {
             })
             .map_err(DeltaError::generic_err)?;
 
-        let batch: RecordBatch = match &self.output_type {
+        let batch = match &self.output_type {
             DataType::Struct(_data) => {
                 let arr = results
                     .as_struct_opt()
@@ -130,10 +130,10 @@ impl ExpressionEvaluator for DataFusionExpressionEvaluator {
                 arr.into()
             }
             _ => {
-                let arrow_type: ArrowDataType = ArrowDataType::try_from(&self.output_type)?;
+                let arrow_type = ArrowDataType::try_from(&self.output_type)?;
                 let output_schema =
                     ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
-                RecordBatch::try_new(Arc::new(output_schema), vec![results])?
+                RecordBatch::try_new(Arc::new(output_schema), vec![results.clone()])?
             }
         };
 
@@ -176,7 +176,6 @@ mod tests {
 
         let evaluator = DataFusionExpressionEvaluator::new(
             physical_expr,
-            vec![],
             DataType::Primitive(PrimitiveType::Integer),
         );
 

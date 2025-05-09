@@ -1,96 +1,41 @@
+use datafusion_common::scalar::ScalarStructBuilder;
 use datafusion_common::{DataFusionError, Result as DFResult, ScalarValue};
 use datafusion_expr::{col, lit, Expr};
 use datafusion_functions::core::expr_ext::FieldAccessor;
 use datafusion_functions::expr_fn::named_struct;
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use delta_kernel::expressions::{
     BinaryExpression, BinaryOperator, Expression, JunctionExpression, JunctionOperator, Scalar,
     UnaryExpression, UnaryOperator,
 };
-use delta_kernel::schema::{DataType, PrimitiveType};
+use delta_kernel::schema::DataType;
 use itertools::Itertools;
 
 pub(crate) fn to_datafusion_expr(expr: &Expression, output_type: &DataType) -> DFResult<Expr> {
-    match (expr, output_type) {
-        (Expression::Column(name), _) => {
+    match expr {
+        Expression::Column(name) => {
             let mut name_iter = name.iter();
             let base_name = name_iter.next().ok_or_else(|| {
                 DataFusionError::Internal("Expected at least one column name".into())
             })?;
-            let base = col(base_name);
-            Ok(name_iter.fold(base, |acc, n| acc.field(n)))
+            Ok(name_iter.fold(col(base_name), |acc, n| acc.field(n)))
         }
-        (Expression::Literal(scalar), _) => Ok(scalar_to_df_scalar(scalar)?),
-        (Expression::Binary(BinaryExpression { left, op, right }), _) => {
-            let left_expr = to_datafusion_expr(left, output_type)?;
-            let right_expr = to_datafusion_expr(right, output_type)?;
-            Ok(match op {
-                BinaryOperator::Equal => left_expr.eq(right_expr),
-                BinaryOperator::NotEqual => left_expr.not_eq(right_expr),
-                BinaryOperator::LessThan => left_expr.lt(right_expr),
-                BinaryOperator::LessThanOrEqual => left_expr.lt_eq(right_expr),
-                BinaryOperator::GreaterThan => left_expr.gt(right_expr),
-                BinaryOperator::GreaterThanOrEqual => left_expr.gt_eq(right_expr),
-                BinaryOperator::Plus => left_expr + right_expr,
-                BinaryOperator::Minus => left_expr - right_expr,
-                BinaryOperator::Multiply => left_expr * right_expr,
-                BinaryOperator::Divide => left_expr / right_expr,
-                BinaryOperator::Distinct => Err(DataFusionError::NotImplemented(
-                    "DISTINCT operator not supported".into(),
-                ))?,
-                BinaryOperator::In => Err(DataFusionError::NotImplemented(
-                    "IN operator not supported".into(),
-                ))?,
-                BinaryOperator::NotIn => Err(DataFusionError::NotImplemented(
-                    "NOT IN operator not supported".into(),
-                ))?,
-            })
-        }
-        (Expression::Unary(UnaryExpression { op, expr }), _) => {
+        Expression::Unary(UnaryExpression { op, expr }) => {
             let inner_expr = to_datafusion_expr(expr, output_type)?;
             Ok(match op {
                 UnaryOperator::IsNull => inner_expr.is_null(),
                 UnaryOperator::Not => !inner_expr,
             })
         }
-        (Expression::Junction(JunctionExpression { op, exprs }), _) => {
-            let df_exprs: Vec<_> = exprs
-                .iter()
-                .map(|e| to_datafusion_expr(e, output_type))
-                .try_collect()?;
-
-            match op {
-                JunctionOperator::And => Ok(df_exprs
-                    .into_iter()
-                    .reduce(|a, b| a.and(b))
-                    .unwrap_or(lit(true))),
-                JunctionOperator::Or => Ok(df_exprs
-                    .into_iter()
-                    .reduce(|a, b| a.or(b))
-                    .unwrap_or(lit(false))),
-            }
-        }
-        (Expression::Struct(fields), DataType::Struct(struct_type)) => {
-            let df_exprs: Vec<_> = fields
-                .iter()
-                .zip(struct_type.fields())
-                .map(|(expr, field)| {
-                    Ok(vec![
-                        lit(field.name().to_string()),
-                        to_datafusion_expr(expr, field.data_type())?,
-                    ])
-                })
-                .flatten_ok()
-                .try_collect::<_, _, DataFusionError>()?;
-            Ok(named_struct(df_exprs))
-        }
-        (Expression::Struct(_), _) => Err(DataFusionError::NotImplemented(
-            "expected struct output type".into(),
-        )),
+        Expression::Literal(scalar) => scalar_to_df(scalar).map(lit),
+        Expression::Binary(expr) => binary_to_df(expr, output_type),
+        Expression::Junction(expr) => junction_to_df(expr, output_type),
+        Expression::Struct(fields) => struct_to_df(fields, output_type),
     }
 }
 
-fn scalar_to_df_scalar(scalar: &Scalar) -> DFResult<Expr> {
-    Ok(lit(match scalar {
+fn scalar_to_df(scalar: &Scalar) -> DFResult<ScalarValue> {
+    Ok(match scalar {
         Scalar::Boolean(value) => ScalarValue::Boolean(Some(*value)),
         Scalar::String(value) => ScalarValue::Utf8(Some(value.clone())),
         Scalar::Byte(value) => ScalarValue::Int8(Some(*value)),
@@ -106,40 +51,26 @@ fn scalar_to_df_scalar(scalar: &Scalar) -> DFResult<Expr> {
         Scalar::Date(value) => ScalarValue::Date32(Some(*value)),
         Scalar::Binary(value) => ScalarValue::Binary(Some(value.clone())),
         Scalar::Decimal(data) => {
-            let value = data.bits();
-            let precision = data.precision();
-            let scale = data.scale();
-            ScalarValue::Decimal128(Some(value), precision, scale as i8)
+            ScalarValue::Decimal128(Some(data.bits()), data.precision(), data.scale() as i8)
         }
-        Scalar::Null(data_type) => match data_type {
-            &DataType::BOOLEAN => ScalarValue::Boolean(None),
-            &DataType::STRING => ScalarValue::Utf8(None),
-            &DataType::BYTE => ScalarValue::Int8(None),
-            &DataType::SHORT => ScalarValue::Int16(None),
-            &DataType::INTEGER => ScalarValue::Int32(None),
-            &DataType::LONG => ScalarValue::Int64(None),
-            &DataType::FLOAT => ScalarValue::Float32(None),
-            &DataType::DOUBLE => ScalarValue::Float64(None),
-            &DataType::TIMESTAMP => ScalarValue::TimestampMicrosecond(None, Some("UTC".into())),
-            &DataType::TIMESTAMP_NTZ => ScalarValue::TimestampMicrosecond(None, None),
-            &DataType::DATE => ScalarValue::Date32(None),
-            &DataType::BINARY => ScalarValue::Binary(None),
-            DataType::Primitive(PrimitiveType::Decimal(decimal_type)) => {
-                let precision = decimal_type.precision();
-                let scale = decimal_type.scale();
-                ScalarValue::Decimal128(None, precision, scale as i8)
-            }
-            _ => {
-                return Err(DataFusionError::NotImplemented(format!(
-                    "Null value with type {:?} not supported",
-                    data_type
-                )))
-            }
-        },
-        Scalar::Struct(_) => {
-            return Err(DataFusionError::NotImplemented(
-                "Struct scalar values not supported".into(),
-            ))
+        Scalar::Struct(data) => {
+            let fields = data
+                .fields()
+                .iter()
+                .map(ArrowField::try_from)
+                .try_collect::<_, Vec<_>, _>()?;
+            let values = data
+                .values()
+                .iter()
+                .map(scalar_to_df)
+                .try_collect::<_, Vec<_>, _>()?;
+            fields
+                .into_iter()
+                .zip(values.into_iter())
+                .fold(ScalarStructBuilder::new(), |builder, (field, value)| {
+                    builder.with_scalar(field, value)
+                })
+                .build()?
         }
         Scalar::Array(_) => {
             return Err(DataFusionError::NotImplemented(
@@ -151,7 +82,73 @@ fn scalar_to_df_scalar(scalar: &Scalar) -> DFResult<Expr> {
                 "Map scalar values not supported".into(),
             ))
         }
-    }))
+        Scalar::Null(data_type) => ScalarValue::try_from(&ArrowDataType::try_from(data_type)?)?,
+    })
+}
+
+fn binary_to_df(bin: &BinaryExpression, output_type: &DataType) -> DFResult<Expr> {
+    let BinaryExpression { left, op, right } = bin;
+    let left_expr = to_datafusion_expr(left, output_type)?;
+    let right_expr = to_datafusion_expr(right, output_type)?;
+    Ok(match op {
+        BinaryOperator::Equal => left_expr.eq(right_expr),
+        BinaryOperator::NotEqual => left_expr.not_eq(right_expr),
+        BinaryOperator::LessThan => left_expr.lt(right_expr),
+        BinaryOperator::LessThanOrEqual => left_expr.lt_eq(right_expr),
+        BinaryOperator::GreaterThan => left_expr.gt(right_expr),
+        BinaryOperator::GreaterThanOrEqual => left_expr.gt_eq(right_expr),
+        BinaryOperator::Plus => left_expr + right_expr,
+        BinaryOperator::Minus => left_expr - right_expr,
+        BinaryOperator::Multiply => left_expr * right_expr,
+        BinaryOperator::Divide => left_expr / right_expr,
+        BinaryOperator::Distinct => Err(DataFusionError::NotImplemented(
+            "DISTINCT operator not supported".into(),
+        ))?,
+        BinaryOperator::In => Err(DataFusionError::NotImplemented(
+            "IN operator not supported".into(),
+        ))?,
+        BinaryOperator::NotIn => Err(DataFusionError::NotImplemented(
+            "NOT IN operator not supported".into(),
+        ))?,
+    })
+}
+
+fn junction_to_df(junction: &JunctionExpression, output_type: &DataType) -> DFResult<Expr> {
+    let JunctionExpression { op, exprs } = junction;
+    let df_exprs: Vec<_> = exprs
+        .iter()
+        .map(|e| to_datafusion_expr(e, output_type))
+        .try_collect()?;
+    match op {
+        JunctionOperator::And => Ok(df_exprs
+            .into_iter()
+            .reduce(|a, b| a.and(b))
+            .unwrap_or(lit(true))),
+        JunctionOperator::Or => Ok(df_exprs
+            .into_iter()
+            .reduce(|a, b| a.or(b))
+            .unwrap_or(lit(false))),
+    }
+}
+
+fn struct_to_df(fields: &[Expression], output_type: &DataType) -> DFResult<Expr> {
+    let DataType::Struct(struct_type) = output_type else {
+        return Err(DataFusionError::Execution(
+            "expected struct output type".into(),
+        ));
+    };
+    let df_exprs: Vec<_> = fields
+        .iter()
+        .zip(struct_type.fields())
+        .map(|(expr, field)| {
+            Ok(vec![
+                lit(field.name().to_string()),
+                to_datafusion_expr(expr, field.data_type())?,
+            ])
+        })
+        .flatten_ok()
+        .try_collect::<_, _, DataFusionError>()?;
+    Ok(named_struct(df_exprs))
 }
 
 #[cfg(test)]

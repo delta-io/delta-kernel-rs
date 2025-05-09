@@ -22,6 +22,7 @@ pub struct DataFusionStorageHandler<E: TaskExecutor> {
 }
 
 impl<E: TaskExecutor> DataFusionStorageHandler<E> {
+    /// Create a new [`DataFusionStorageHandler`] instance.
     pub fn new(stores: Arc<dyn ObjectStoreRegistry>, task_executor: Arc<E>) -> Self {
         Self {
             stores,
