@@ -31,6 +31,7 @@ use itertools::Itertools;
 use self::snapshot::{DeltaTableSnapshot, ScanFileContext, TableSnapshot};
 use crate::exec::{DeltaScanExec, FILE_ID_COLUMN};
 use crate::expressions::{to_datafusion_expr, to_delta_predicate};
+use crate::session::KernelSessionExt as _;
 use crate::utils::AsObjectStoreUrl;
 
 mod snapshot;
@@ -155,6 +156,8 @@ async fn get_read_plan(
     let mut plans = Vec::new();
     let file_id_field = Field::new(FILE_ID_COLUMN, DataType::Utf8, true);
     for (store_url, files) in files_by_store.into_iter() {
+        state.ensure_object_store(store_url.as_ref()).await?;
+
         let store = state.runtime_env().object_store(&store_url)?;
         let reader_factory: Arc<dyn ParquetFileReaderFactory> =
             Arc::new(DefaultParquetFileReaderFactory::new(store));

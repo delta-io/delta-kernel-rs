@@ -9,7 +9,7 @@ mod utils;
 
 pub use engine::DataFusionEngine;
 pub use log_table_provider::DeltaLogTableProvider;
-pub use session::KernelSessionExt;
+pub use session::{KernelContextExt, KernelSessionExt, ObjectStoreFactory};
 pub use table_provider::DeltaTableProvider;
 
 #[cfg(test)]
