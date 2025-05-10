@@ -12,7 +12,7 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{Engine, Expression, ExpressionRef};
 use url::Url;
 
-use crate::error::to_df_err;
+use crate::{error::to_df_err, session::EngineExtension};
 
 pub struct ScanFileContext {
     pub selection_vector: Option<Vec<bool>>,
@@ -65,7 +65,6 @@ pub trait TableSnapshot: std::fmt::Debug + Send + Sync {
 
 pub struct DeltaTableSnapshot {
     snapshot: Arc<Snapshot>,
-    engine: Arc<dyn Engine>,
     table_schema: ArrowSchemaRef,
 }
 
@@ -79,11 +78,10 @@ impl std::fmt::Debug for DeltaTableSnapshot {
 }
 
 impl DeltaTableSnapshot {
-    pub fn try_new(snapshot: Arc<Snapshot>, engine: Arc<dyn Engine>) -> Result<Self> {
+    pub fn try_new(snapshot: Arc<Snapshot>) -> Result<Self> {
         let table_schema = Arc::new(snapshot.schema().as_ref().try_into()?);
         Ok(Self {
             snapshot,
-            engine,
             table_schema,
         })
     }
@@ -101,12 +99,19 @@ impl TableSnapshot for DeltaTableSnapshot {
 
     async fn scan_metadata(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         predicate: Arc<Expression>,
     ) -> Result<TableScan> {
+        let engine = state
+            .config()
+            .get_extension::<EngineExtension>()
+            .map(|e| e.engine.clone())
+            .ok_or_else(|| {
+                DataFusionError::External(Box::new(exec_err!("no engine extension found")))
+            })?;
         scan_metadata(
-            &self.engine,
+            &engine,
             &self.snapshot,
             projection,
             predicate,

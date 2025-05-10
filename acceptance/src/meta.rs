@@ -138,6 +138,17 @@ pub fn read_dat_case(case_root: impl AsRef<Path>) -> TestResult<TestCaseInfo> {
     })
 }
 
+pub fn read_dat_case_info(case_info: impl AsRef<Path>) -> TestResult<TestCaseInfo> {
+    let file = File::open(case_info.as_ref()).map_err(|_| AssertionError::InvalidTestCase)?;
+    let info: TestCaseInfoJson =
+        serde_json::from_reader(file).map_err(|_| AssertionError::InvalidTestCase)?;
+    Ok(TestCaseInfo {
+        root_dir: case_info.as_ref().parent().unwrap().into(),
+        name: info.name,
+        description: info.description,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

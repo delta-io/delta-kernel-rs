@@ -24,15 +24,16 @@ use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use delta_kernel::object_store::path::Path as ObjectStorePath;
 use delta_kernel::schema::DataType as DeltaDataType;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{Engine, ExpressionRef};
+use delta_kernel::ExpressionRef;
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 
-use self::scan_metadata::{DeltaTableSnapshot, ScanFileContext, TableSnapshot};
+use self::snapshot::{DeltaTableSnapshot, ScanFileContext, TableSnapshot};
 use crate::exec::{DeltaScanExec, FILE_ID_COLUMN};
 use crate::expressions::{to_datafusion_expr, to_delta_predicate};
 use crate::utils::AsObjectStoreUrl;
-mod scan_metadata;
+
+mod snapshot;
 
 pub struct DeltaTableProvider {
     snapshot: Arc<dyn TableSnapshot>,
@@ -47,8 +48,8 @@ impl std::fmt::Debug for DeltaTableProvider {
 }
 
 impl DeltaTableProvider {
-    pub fn try_new(snapshot: Arc<Snapshot>, engine: Arc<dyn Engine>) -> Result<Self> {
-        let snapshot = DeltaTableSnapshot::try_new(snapshot, engine)?;
+    pub fn try_new(snapshot: Arc<Snapshot>) -> Result<Self> {
+        let snapshot = DeltaTableSnapshot::try_new(snapshot)?;
         Ok(Self {
             snapshot: Arc::new(snapshot),
         })
@@ -111,10 +112,13 @@ impl TableProvider for DeltaTableProvider {
         // To correlate the data with the original file, we add the file url as a partition value
         // This is required to apply the correct transform to the data in downstream processing.
         let to_partitioned_file = |f: ScanFileContext| {
-            let file_path = ObjectStorePath::from_url_path(f.file_url.path())?.to_string();
-            let mut partitioned_file = PartitionedFile::new(file_path, f.size);
+            let file_path = ObjectStorePath::from_url_path(f.file_url.path())?;
+            let mut partitioned_file = PartitionedFile::new(file_path.to_string(), f.size);
             partitioned_file.partition_values =
                 vec![ScalarValue::Utf8(Some(f.file_url.to_string()))];
+            // NB: we need to reassign the location since the 'new' method does
+            // incorrect or inconsistent encoding internally.
+            partitioned_file.object_meta.location = file_path;
             Ok::<_, DataFusionError>((
                 f.file_url.as_object_store_url(),
                 (partitioned_file, f.selection_vector),

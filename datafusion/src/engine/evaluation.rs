@@ -4,12 +4,12 @@ use datafusion::arrow::array::{AsArray, RecordBatch};
 use datafusion::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
-use datafusion::execution::SessionState;
 use datafusion_common::scalar::ScalarStructBuilder;
-use datafusion_common::{DFSchema, DataFusionError};
+use datafusion_common::{DFSchema, DataFusionError, Result as DFResult};
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_plan::expressions::col;
 use datafusion_physical_plan::PhysicalExpr;
+use datafusion_session::{Session, SessionStore};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::schema::{DataType, SchemaRef};
 use delta_kernel::{
@@ -30,7 +30,25 @@ static ERROR_EXPR: LazyLock<Arc<dyn PhysicalExpr>> = LazyLock::new(|| {
 });
 
 pub struct DataFusionEvaluationHandler {
-    pub(super) state: Arc<RwLock<SessionState>>,
+    /// The session store that contains the current session.
+    pub(super) state: SessionStore,
+}
+
+impl DataFusionEvaluationHandler {
+    pub fn new(state: SessionStore) -> Self {
+        Self { state }
+    }
+
+    pub fn session_store(&self) -> &SessionStore {
+        &self.state
+    }
+
+    fn session(&self) -> DFResult<Arc<RwLock<dyn Session>>> {
+        self.state
+            .get_session()
+            .upgrade()
+            .ok_or_else(|| DataFusionError::Execution("no active session".into()))
+    }
 }
 
 impl EvaluationHandler for DataFusionEvaluationHandler {
@@ -47,12 +65,14 @@ impl EvaluationHandler for DataFusionEvaluationHandler {
             Ok(v) => v,
             Err(e) => return DataFusionExpressionEvaluator::new_err(output_type, e),
         };
-        let physical_expressions = match to_datafusion_expr(&expression, &output_type)
-            .and_then(|df_expr| self.state.read().create_physical_expr(df_expr, &df_schema))
-        {
-            Ok(v) => v,
-            Err(e) => return DataFusionExpressionEvaluator::new_err(output_type, e),
-        };
+        let physical_expressions =
+            match to_datafusion_expr(&expression, &output_type).and_then(|df_expr| {
+                self.session()
+                    .and_then(|session| session.read().create_physical_expr(df_expr, &df_schema))
+            }) {
+                Ok(v) => v,
+                Err(e) => return DataFusionExpressionEvaluator::new_err(output_type, e),
+            };
         DataFusionExpressionEvaluator::new(physical_expressions, output_type)
     }
 
@@ -95,7 +115,7 @@ impl DataFusionExpressionEvaluator {
         })
     }
 
-    fn raise_errors(&self) -> DeltaResult<()> {
+    fn raise_error(&self) -> DeltaResult<()> {
         match &self.init_error {
             Some(e) => Err(DeltaError::generic(e.to_string())),
             None => Ok(()),
@@ -105,7 +125,7 @@ impl DataFusionExpressionEvaluator {
 
 impl ExpressionEvaluator for DataFusionExpressionEvaluator {
     fn evaluate(&self, data: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
-        self.raise_errors()?;
+        self.raise_error()?;
 
         let batch = data
             .any_ref()
@@ -116,6 +136,7 @@ impl ExpressionEvaluator for DataFusionExpressionEvaluator {
         let results = self
             .expr
             .evaluate(batch)
+            // TODO(roeap): we should consider implementing EngineData for ColumnarValue directly
             .and_then(|value| match value {
                 ColumnarValue::Array(array) => Ok(array),
                 ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(batch.num_rows()),
@@ -143,14 +164,18 @@ impl ExpressionEvaluator for DataFusionExpressionEvaluator {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::ops::Add;
+
     use datafusion::arrow::array::{Int32Array, StringArray};
     use datafusion::arrow::datatypes::{Field, Schema};
-    use datafusion_expr::Operator;
-    use datafusion_physical_plan::expressions::{BinaryExpr, Column, Literal};
-    use datafusion_physical_plan::PhysicalExpr;
+    use datafusion::prelude::SessionContext;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
-    use delta_kernel::schema::{DataType, PrimitiveType};
+    use delta_kernel::schema::{DataType, PrimitiveType, StructField, StructType};
+    use delta_kernel::Engine;
+    use rstest::*;
+
+    use super::*;
+    use crate::tests::df_engine;
 
     fn create_test_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -162,96 +187,131 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(a), Arc::new(b)]).unwrap()
     }
 
-    #[test]
-    fn test_evaluate_success() {
+    #[rstest]
+    #[tokio::test]
+    async fn test_evaluate_success(df_engine: (Arc<dyn Engine>, SessionContext)) {
+        let (engine, _ctx) = df_engine;
+        let handler = engine.evaluation_handler();
+
         let batch = create_test_batch();
         let data = ArrowEngineData::new(batch);
 
         // Create a simple physical expression that adds 1 to column "a"
-        let physical_expr = Arc::new(BinaryExpr::new(
-            Arc::new(Column::new("a", 0)),
-            Operator::Plus,
-            Arc::new(Literal::new(datafusion_common::ScalarValue::Int32(Some(1)))),
-        )) as Arc<dyn PhysicalExpr>;
+        let expr = Expression::column(["a"]).add(Expression::literal(1));
+        let input_schema = Arc::new(StructType::new(vec![StructField::new(
+            "a",
+            DataType::Primitive(PrimitiveType::Integer),
+            true,
+        )]));
 
-        let evaluator = DataFusionExpressionEvaluator::new(
-            physical_expr,
+        let evaluator = handler.new_expression_evaluator(
+            input_schema,
+            expr,
             DataType::Primitive(PrimitiveType::Integer),
         );
 
         let result = evaluator.evaluate(&data).unwrap();
-        let result_batch = result
-            .any_ref()
-            .downcast_ref::<ArrowEngineData>()
-            .unwrap()
-            .record_batch();
+        let engine_data = ArrowEngineData::try_from_engine_data(result).unwrap();
 
         let expected = Int32Array::from(vec![Some(2), Some(3), None]);
         assert_eq!(
-            result_batch.column(0).as_ref(),
+            engine_data.record_batch().column(0).as_ref(),
             &expected,
             "Expected a + 1 to be [2, 3, null]"
         );
     }
 
-    // #[test]
-    // fn test_evaluate_with_errors() {
-    //     let batch = create_test_batch();
-    //     let data = ArrowEngineData::new(batch);
-    //
-    //     // Create a physical expression for a non-existent column
-    //     let physical_expr = Arc::new(Column::new("non_existent", 0)) as Arc<dyn PhysicalExpr>;
-    //
-    //     let evaluator = DataFusionExpressionEvaluator::new(
-    //         vec![physical_expr],
-    //         vec![],
-    //         DataType::Primitive(PrimitiveType::Integer),
-    //     );
-    //
-    //     let result = evaluator.evaluate(&data);
-    //     assert!(result.is_err(), "Expected error for non-existent column");
-    // }
+    #[rstest]
+    #[tokio::test]
+    async fn test_evaluate_struct_output(df_engine: (Arc<dyn Engine>, SessionContext)) {
+        let (engine, _ctx) = df_engine;
+        let handler = engine.evaluation_handler();
 
-    // #[test]
-    // fn test_evaluate_struct_output() {
-    //     let batch = create_test_batch();
-    //     let data = ArrowEngineData::new(batch);
-    //
-    //     // Create physical expressions for columns "a" and "b"
-    //     Expression::struct_from([Expression::column(["a"])]);
-    //
-    //     let evaluator = DataFusionExpressionEvaluator::new(
-    //         physical_exprs,
-    //         vec![],
-    //         DataType::Struct(Box::new(StructType::new(vec![
-    //             StructField::new("a", DataType::Primitive(PrimitiveType::Integer), true),
-    //             StructField::new("b", DataType::Primitive(PrimitiveType::String), true),
-    //         ]))),
-    //     );
-    //
-    //     let result = evaluator.evaluate(&data).unwrap();
-    //     let result_batch = result
-    //         .any_ref()
-    //         .downcast_ref::<ArrowEngineData>()
-    //         .unwrap()
-    //         .record_batch();
-    //
-    //     assert_eq!(result_batch.num_columns(), 2);
-    //     assert_eq!(result_batch.num_rows(), 3);
-    // }
+        let batch = create_test_batch();
+        let data = ArrowEngineData::new(batch);
 
-    // #[test]
-    // fn test_evaluate_with_init_errors() {
-    //     let evaluator = DataFusionExpressionEvaluator::new(
-    //         vec![],
-    //         vec![DataFusionError::Internal("Test error".to_string())],
-    //         DataType::Primitive(PrimitiveType::Integer),
-    //     );
-    //
-    //     let batch = create_test_batch();
-    //     let data = ArrowEngineData::new(batch);
-    //
-    //     let result = evaluator.evaluate(&data);
-    //     assert!(result.is_err(), "Expected error due to init errors");
-    // }
+        // Create expression that returns a struct with two fields
+        let expr =
+            Expression::struct_from(vec![Expression::column(["a"]), Expression::column(["b"])]);
+        let input_schema = Arc::new(StructType::new(vec![
+            StructField::new("a", DataType::Primitive(PrimitiveType::Integer), true),
+            StructField::new("b", DataType::Primitive(PrimitiveType::String), true),
+        ]));
+
+        let output_type = DataType::Struct(Box::new(StructType::new(vec![
+            StructField::new("x", DataType::Primitive(PrimitiveType::Integer), true),
+            StructField::new("y", DataType::Primitive(PrimitiveType::String), true),
+        ])));
+
+        let evaluator = handler.new_expression_evaluator(input_schema, expr, output_type);
+        let result = evaluator.evaluate(&data).unwrap();
+        let engine_data = ArrowEngineData::try_from_engine_data(result).unwrap();
+
+        assert_eq!(
+            engine_data.record_batch().num_columns(),
+            2,
+            "Expected struct with 2 fields"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_evaluate_init_error(df_engine: (Arc<dyn Engine>, SessionContext)) {
+        let (engine, _ctx) = df_engine;
+        let handler = engine.evaluation_handler();
+
+        // Create an invalid expression that will fail during initialization
+        let expr = Expression::column(["non_existent"]);
+        let input_schema = Arc::new(StructType::new(vec![StructField::new(
+            "a",
+            DataType::Primitive(PrimitiveType::Integer),
+            true,
+        )]));
+
+        let evaluator = handler.new_expression_evaluator(
+            input_schema,
+            expr,
+            DataType::Primitive(PrimitiveType::Integer),
+        );
+
+        let batch = create_test_batch();
+        let data = ArrowEngineData::new(batch);
+
+        // Evaluation should fail with the initialization error
+        assert!(evaluator.evaluate(&data).is_err());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_evaluate_scalar(df_engine: (Arc<dyn Engine>, SessionContext)) {
+        let (engine, _ctx) = df_engine;
+        let handler = engine.evaluation_handler();
+
+        let batch = create_test_batch();
+        let data = ArrowEngineData::new(batch);
+
+        // Create expression that returns a constant scalar value
+        let expr = Expression::literal(42);
+        let input_schema = Arc::new(StructType::new(vec![StructField::new(
+            "a",
+            DataType::Primitive(PrimitiveType::Integer),
+            true,
+        )]));
+
+        let evaluator = handler.new_expression_evaluator(
+            input_schema,
+            expr,
+            DataType::Primitive(PrimitiveType::Integer),
+        );
+
+        let result = evaluator.evaluate(&data).unwrap();
+        let engine_data = ArrowEngineData::try_from_engine_data(result).unwrap();
+
+        let expected = Int32Array::from(vec![Some(42), Some(42), Some(42)]);
+        assert_eq!(
+            engine_data.record_batch().column(0).as_ref(),
+            &expected,
+            "Expected constant value 42 repeated for all rows"
+        );
+    }
 }

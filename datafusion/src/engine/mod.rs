@@ -1,36 +1,41 @@
 use std::sync::Arc;
 
-use datafusion::execution::SessionState;
+use datafusion::prelude::SessionContext;
+use datafusion_session::SessionStore;
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
-use parking_lot::RwLock;
 
-use self::evaluation::DataFusionEvaluationHandler;
-use self::file_format::DataFusionFileFormatHandler;
-use self::storage::DataFusionStorageHandler;
+pub use self::evaluation::DataFusionEvaluationHandler;
+pub use self::file_format::DataFusionFileFormatHandler;
+pub use self::storage::DataFusionStorageHandler;
 
 mod evaluation;
 mod file_format;
 mod storage;
 
 pub struct DataFusionEngine<E: TaskExecutor> {
-    evaluation_handler: Arc<DataFusionEvaluationHandler>,
-    storage_handler: Arc<DataFusionStorageHandler<E>>,
-    file_format_handler: Arc<DataFusionFileFormatHandler<E>>,
+    pub(crate) evaluation_handler: Arc<DataFusionEvaluationHandler>,
+    pub(crate) storage_handler: Arc<DataFusionStorageHandler<E>>,
+    pub(crate) file_format_handler: Arc<DataFusionFileFormatHandler<E>>,
 }
 
 impl<E: TaskExecutor> DataFusionEngine<E> {
     /// Create a new [`DataFusionEngine`].
-    pub fn new(task_executor: Arc<E>, state: Arc<RwLock<SessionState>>) -> Self {
-        let evaluation_handler = Arc::new(DataFusionEvaluationHandler {
-            state: state.clone(),
-        });
+    pub fn new(task_executor: Arc<E>, ctx: &SessionContext) -> Self {
+        let evaluation_handler = Arc::new(DataFusionEvaluationHandler::new(SessionStore::new()));
+        evaluation_handler
+            .session_store()
+            .with_state(ctx.state_weak_ref());
         let file_format_handler = Arc::new(DataFusionFileFormatHandler::new(
-            state.clone(),
             task_executor.clone(),
+            SessionStore::new(),
         ));
+        file_format_handler
+            .session_store()
+            .with_state(ctx.state_weak_ref());
         let storage_handler = Arc::new(DataFusionStorageHandler::new(
-            state.read().runtime_env().object_store_registry.clone(),
+            ctx.runtime_env().object_store_registry.clone(),
             task_executor.clone(),
         ));
         Self {
@@ -38,6 +43,12 @@ impl<E: TaskExecutor> DataFusionEngine<E> {
             file_format_handler,
             storage_handler,
         }
+    }
+
+    /// Create a new [`DataFusionEngine`] with a background executor.
+    pub fn new_background(ctx: &SessionContext) -> Arc<dyn Engine> {
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        Arc::new(DataFusionEngine::new(executor, ctx))
     }
 }
 

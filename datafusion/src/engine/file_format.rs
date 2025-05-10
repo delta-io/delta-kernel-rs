@@ -2,13 +2,14 @@ use std::sync::{mpsc, Arc};
 
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::datasource::physical_plan::{FileScanConfigBuilder, JsonSource, ParquetSource};
-use datafusion::execution::SessionState;
 use datafusion_catalog::memory::DataSourceExec;
+use datafusion_common::{DataFusionError, Result as DFResult};
 use datafusion_datasource::PartitionedFile;
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_physical_plan::execute_stream;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_session::{Session, SessionStore};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::arrow_utils::{parse_json as arrow_parse_json, to_json_bytes};
 use delta_kernel::engine::default::executor::TaskExecutor;
@@ -31,7 +32,7 @@ const DEFAULT_BUFFER_SIZE: usize = 1024;
 
 pub struct DataFusionFileFormatHandler<E: TaskExecutor> {
     /// Shared session state for the session
-    state: Arc<RwLock<SessionState>>,
+    state: SessionStore,
     /// The executor to run async tasks on
     task_executor: Arc<E>,
     /// size of the buffer (via our `sync_channel`).
@@ -51,7 +52,7 @@ impl<E: TaskExecutor> std::fmt::Debug for DataFusionFileFormatHandler<E> {
 }
 
 impl<E: TaskExecutor> DataFusionFileFormatHandler<E> {
-    pub fn new(state: Arc<RwLock<SessionState>>, task_executor: Arc<E>) -> Self {
+    pub fn new(task_executor: Arc<E>, state: SessionStore) -> Self {
         Self {
             state,
             task_executor,
@@ -59,6 +60,17 @@ impl<E: TaskExecutor> DataFusionFileFormatHandler<E> {
             json_source: Arc::new(JsonSource::default()),
             parquet_source: Arc::new(ParquetSource::default()),
         }
+    }
+
+    pub fn session_store(&self) -> &SessionStore {
+        &self.state
+    }
+
+    fn session(&self) -> DFResult<Arc<RwLock<dyn Session>>> {
+        self.state
+            .get_session()
+            .upgrade()
+            .ok_or_else(|| DataFusionError::Execution("no active session".into()))
     }
 
     fn parquet_exec(
@@ -114,7 +126,12 @@ impl<E: TaskExecutor> DataFusionFileFormatHandler<E> {
     }
 
     fn execute_plan(&self, plan: Arc<dyn ExecutionPlan>) -> FileDataReadResultIterator {
-        let task_ctx = self.state.read().task_ctx();
+        let Ok(task_ctx) = self.session().map(|session| session.read().task_ctx()) else {
+            return Box::new(std::iter::once(Err(DeltaError::Generic(
+                "no active session".into(),
+            ))));
+        };
+
         let (tx, rx) = mpsc::sync_channel(self.buffer_size);
 
         self.task_executor.spawn(async move {
@@ -183,7 +200,8 @@ impl<E: TaskExecutor> JsonHandler for DataFusionFileFormatHandler<E> {
 
         let store_url = path.as_object_store_url();
         let store = self
-            .state
+            .session()
+            .map_err(DeltaError::generic_err)?
             .read()
             .runtime_env()
             .object_store(store_url)

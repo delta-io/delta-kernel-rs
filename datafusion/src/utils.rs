@@ -59,8 +59,12 @@ fn to_partitioned_files(
     let part_files = files
         .into_iter()
         .map(|f| {
-            let path = Path::from_url_path(f.location.path())?.to_string();
-            Ok::<_, DeltaError>(PartitionedFile::new(path, f.size))
+            let path = Path::from_url_path(f.location.path())?;
+            let mut partitioned_file = PartitionedFile::new(path.to_string(), f.size);
+            // NB: we need to reassign the location since the 'new' method does
+            // incorrect or inconsistent encoding internally.
+            partitioned_file.object_meta.location = path;
+            Ok::<_, DeltaError>(partitioned_file)
         })
         .try_collect::<_, Vec<_>, _>()?;
     Ok::<_, DeltaError>((url, part_files))
