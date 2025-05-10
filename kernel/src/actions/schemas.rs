@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
+// TODO(zach): should this instead return something const? or Arc<StructType>?
 pub(crate) trait ToSchema {
     fn to_schema() -> StructType;
 }
