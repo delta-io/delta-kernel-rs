@@ -2,11 +2,13 @@ mod engine;
 mod error;
 mod exec;
 mod expressions;
+mod log_table_provider;
 mod session;
 mod table_provider;
 mod utils;
 
 pub use engine::DataFusionEngine;
+pub use log_table_provider::DeltaLogTableProvider;
 pub use session::KernelSession;
 pub use table_provider::DeltaTableProvider;
 

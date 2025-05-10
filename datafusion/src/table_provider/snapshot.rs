@@ -12,7 +12,8 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{Engine, Expression, ExpressionRef};
 use url::Url;
 
-use crate::{error::to_df_err, session::EngineExtension};
+use crate::error::to_df_err;
+use crate::session::get_engine;
 
 pub struct ScanFileContext {
     pub selection_vector: Option<Vec<bool>>,
@@ -103,15 +104,8 @@ impl TableSnapshot for DeltaTableSnapshot {
         projection: Option<&Vec<usize>>,
         predicate: Arc<Expression>,
     ) -> Result<TableScan> {
-        let engine = state
-            .config()
-            .get_extension::<EngineExtension>()
-            .map(|e| e.engine.clone())
-            .ok_or_else(|| {
-                DataFusionError::External(Box::new(exec_err!("no engine extension found")))
-            })?;
         scan_metadata(
-            &engine,
+            get_engine(state.config())?,
             &self.snapshot,
             projection,
             predicate,
@@ -122,7 +116,7 @@ impl TableSnapshot for DeltaTableSnapshot {
 }
 
 async fn scan_metadata(
-    engine: &Arc<dyn Engine>,
+    engine: Arc<dyn Engine>,
     snapshot: &Arc<Snapshot>,
     projection: Option<&Vec<usize>>,
     predicate: Arc<Expression>,
@@ -142,8 +136,6 @@ async fn scan_metadata(
     let table_root =
         Url::parse(&scan_state.table_root).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let physical_schema: ArrowSchemaRef = Arc::new(scan_state.physical_schema.as_ref().try_into()?);
-
-    let engine = engine.clone();
 
     let scan_inner = move || {
         let mut context = ScanContext::new(engine.clone(), table_root);

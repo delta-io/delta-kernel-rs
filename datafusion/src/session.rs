@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_common::{DataFusionError, Result as DFResult};
 use datafusion_session::SessionStore;
 use delta_kernel::engine::default::executor::tokio::{
@@ -75,6 +75,14 @@ impl KernelSession for SessionContext {
             _ => panic!("unsupported runtime flavor"),
         }
     }
+}
+
+pub fn get_engine(config: &SessionConfig) -> Result<Arc<dyn Engine>, DataFusionError> {
+    config
+        .get_extension::<EngineExtension>()
+        .as_ref()
+        .map(|ext| ext.engine.clone())
+        .ok_or_else(|| DataFusionError::Execution("no engine extension found".into()))
 }
 
 fn enable_kernel_engine_multi_thread(

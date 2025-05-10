@@ -3,7 +3,7 @@ use std::sync::Arc;
 use datafusion::arrow::util::pretty::print_batches;
 use datafusion::execution::context::SessionContext;
 use delta_kernel::table::Table;
-use delta_kernel_datafusion::{DeltaTableProvider, KernelSession};
+use delta_kernel_datafusion::{DeltaLogTableProvider, DeltaTableProvider, KernelSession};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -17,10 +17,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let snapshot = table.snapshot(engine.as_ref(), None)?;
     let provider = DeltaTableProvider::try_new(snapshot.into())?;
-
     ctx.register_table("delta_table", Arc::new(provider))?;
 
-    let df = ctx.sql("SELECT * FROM delta_table").await?;
+    let log_provider = DeltaLogTableProvider::try_new(table.into())?;
+    ctx.register_table("delta_log", Arc::new(log_provider))?;
+
+    let df = ctx
+        .sql("SELECT add['path'] as path FROM delta_log WHERE add['path'] IS NOT NULL")
+        .await?;
     let df = df.collect().await?;
 
     print_batches(&df)?;
