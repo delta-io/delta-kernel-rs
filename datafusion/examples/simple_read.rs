@@ -3,14 +3,16 @@ use std::sync::Arc;
 use datafusion::arrow::util::pretty::print_batches;
 use datafusion::execution::context::SessionContext;
 use delta_kernel::table::Table;
-use delta_kernel_datafusion::{DeltaLogTableProvider, DeltaTableProvider, KernelSession};
+use delta_kernel_datafusion::{DeltaLogTableProvider, DeltaTableProvider, KernelSessionExt as _};
+
+static PATH: &str = "file:///Users/robert.pack/code/delta-kernel-rs/acceptance/tests/dat/out/reader_tests/generated/";
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = SessionContext::new().enable_kernel_engine()?;
-    let engine = ctx.kernel_engine();
+    let ctx = SessionContext::new().enable_kernel_engine();
+    let engine = ctx.kernel_engine()?;
 
-    let path = "file:///Users/robert.pack/code/delta-kernel-rs/acceptance/tests/dat/out/reader_tests/generated/column_mapping/delta";
+    let path = format!("{}column_mapping/delta", PATH);
 
     // build a table and get the latest snapshot from it
     let table = Table::try_from_uri(path)?;
@@ -19,6 +21,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider = DeltaTableProvider::try_new(snapshot.into())?;
     ctx.register_table("delta_table", Arc::new(provider))?;
 
+    let df = ctx.sql("SELECT * FROM delta_table").await?;
+    let df = df.collect().await?;
+    print_batches(&df)?;
+
     let log_provider = DeltaLogTableProvider::try_new(table.into())?;
     ctx.register_table("delta_log", Arc::new(log_provider))?;
 
@@ -26,7 +32,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .sql("SELECT add['path'] as path FROM delta_log WHERE add['path'] IS NOT NULL")
         .await?;
     let df = df.collect().await?;
-
     print_batches(&df)?;
 
     Ok(())

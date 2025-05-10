@@ -31,16 +31,14 @@ static ERROR_EXPR: LazyLock<Arc<dyn PhysicalExpr>> = LazyLock::new(|| {
 
 pub struct DataFusionEvaluationHandler {
     /// The session store that contains the current session.
-    pub(super) state: SessionStore,
+    pub(super) state: Arc<SessionStore>,
 }
 
 impl DataFusionEvaluationHandler {
-    pub fn new(state: SessionStore) -> Self {
-        Self { state }
-    }
-
-    pub fn session_store(&self) -> &SessionStore {
-        &self.state
+    pub fn new(state: impl Into<Arc<SessionStore>>) -> Self {
+        Self {
+            state: state.into(),
+        }
     }
 
     fn session(&self) -> DFResult<Arc<RwLock<dyn Session>>> {

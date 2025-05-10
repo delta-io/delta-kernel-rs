@@ -23,19 +23,36 @@ pub struct DataFusionEngine<E: TaskExecutor> {
 impl<E: TaskExecutor> DataFusionEngine<E> {
     /// Create a new [`DataFusionEngine`].
     pub fn new(task_executor: Arc<E>, ctx: &SessionContext) -> Self {
-        let evaluation_handler = Arc::new(DataFusionEvaluationHandler::new(SessionStore::new()));
-        evaluation_handler
-            .session_store()
-            .with_state(ctx.state_weak_ref());
+        let session_store = Arc::new(SessionStore::new());
+        let evaluation_handler = Arc::new(DataFusionEvaluationHandler::new(session_store.clone()));
         let file_format_handler = Arc::new(DataFusionFileFormatHandler::new(
             task_executor.clone(),
-            SessionStore::new(),
+            session_store.clone(),
         ));
-        file_format_handler
-            .session_store()
-            .with_state(ctx.state_weak_ref());
         let storage_handler = Arc::new(DataFusionStorageHandler::new(
-            ctx.runtime_env().object_store_registry.clone(),
+            session_store.clone(),
+            task_executor.clone(),
+        ));
+        session_store.with_state(ctx.state_weak_ref());
+        Self {
+            evaluation_handler,
+            file_format_handler,
+            storage_handler,
+        }
+    }
+
+    /// Create a new [`DataFusionEngine`] with a session store.
+    ///
+    /// The caller is responsible to update the session reference in the session store
+    /// and assure it is not dropped prematurely.
+    pub fn new_with_session_store(task_executor: Arc<E>, session_store: Arc<SessionStore>) -> Self {
+        let evaluation_handler = Arc::new(DataFusionEvaluationHandler::new(session_store.clone()));
+        let file_format_handler = Arc::new(DataFusionFileFormatHandler::new(
+            task_executor.clone(),
+            session_store.clone(),
+        ));
+        let storage_handler = Arc::new(DataFusionStorageHandler::new(
+            session_store.clone(),
             task_executor.clone(),
         ));
         Self {

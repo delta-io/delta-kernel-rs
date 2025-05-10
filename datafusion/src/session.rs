@@ -9,16 +9,13 @@ use delta_kernel::engine::default::executor::tokio::{
 use delta_kernel::Engine;
 use tokio::runtime::RuntimeFlavor;
 
-use crate::engine::{
-    DataFusionEngine, DataFusionEvaluationHandler, DataFusionFileFormatHandler,
-    DataFusionStorageHandler,
-};
+use crate::engine::DataFusionEngine;
 
 pub(crate) struct EngineExtension {
     pub(crate) engine: Arc<dyn Engine>,
 }
 
-pub trait KernelSession {
+pub trait KernelSessionExt {
     /// Create a new delta kernel engine for this session.
     ///
     /// The created engine shares the session state with the session
@@ -36,44 +33,35 @@ pub trait KernelSession {
     ///
     /// * `CurrentThread` - A dedciated background runtime is used.
     /// * `MultiThread` - A shared haldle is used to create a multi-threaded executor.
-    fn kernel_engine(&self) -> Arc<dyn Engine>;
+    fn kernel_engine(&self) -> DFResult<Arc<dyn Engine>>;
 
-    fn enable_kernel_engine(self) -> DFResult<SessionContext>;
+    fn enable_kernel_engine(self) -> SessionContext;
 }
 
-impl KernelSession for SessionContext {
-    fn kernel_engine(&self) -> Arc<dyn Engine> {
-        self.state()
-            .config()
-            .get_extension::<EngineExtension>()
-            .as_ref()
-            .map(|ext| ext.engine.clone())
-            .unwrap_or_else(|| {
-                tracing::warn!(
-                    "No engine extension found, creating a new one. This is not recommended."
-                );
-                let handle = tokio::runtime::Handle::current();
-                match handle.runtime_flavor() {
-                    RuntimeFlavor::CurrentThread => {
-                        let executor = Arc::new(TokioBackgroundExecutor::new());
-                        Arc::new(DataFusionEngine::new(executor, self))
-                    }
-                    RuntimeFlavor::MultiThread => {
-                        let executor = Arc::new(TokioMultiThreadExecutor::new(handle));
-                        Arc::new(DataFusionEngine::new(executor, self))
-                    }
-                    _ => panic!("unsupported runtime flavor"),
-                }
-            })
+impl KernelSessionExt for SessionContext {
+    fn kernel_engine(&self) -> DFResult<Arc<dyn Engine>> {
+        get_engine(self.state().config())
     }
 
-    fn enable_kernel_engine(self) -> DFResult<SessionContext> {
+    fn enable_kernel_engine(self) -> SessionContext {
         let handle = tokio::runtime::Handle::current();
-        match handle.runtime_flavor() {
-            RuntimeFlavor::MultiThread => enable_kernel_engine_multi_thread(self, handle),
-            RuntimeFlavor::CurrentThread => enable_kernel_engine_background(self),
+        let session_store = Arc::new(SessionStore::new());
+
+        let engine: Arc<dyn Engine> = match handle.runtime_flavor() {
+            RuntimeFlavor::MultiThread => Arc::new(DataFusionEngine::new_with_session_store(
+                Arc::new(TokioMultiThreadExecutor::new(handle)),
+                session_store.clone(),
+            )),
+            RuntimeFlavor::CurrentThread => Arc::new(DataFusionEngine::new_with_session_store(
+                Arc::new(TokioBackgroundExecutor::new()),
+                session_store.clone(),
+            )),
             _ => panic!("unsupported runtime flavor"),
-        }
+        };
+
+        let ctx = with_engine(self, engine);
+        session_store.with_state(ctx.state_weak_ref());
+        ctx
     }
 }
 
@@ -83,78 +71,6 @@ pub fn get_engine(config: &SessionConfig) -> Result<Arc<dyn Engine>, DataFusionE
         .as_ref()
         .map(|ext| ext.engine.clone())
         .ok_or_else(|| DataFusionError::Execution("no engine extension found".into()))
-}
-
-fn enable_kernel_engine_multi_thread(
-    ctx: SessionContext,
-    handle: tokio::runtime::Handle,
-) -> DFResult<SessionContext> {
-    let executor = match handle.runtime_flavor() {
-        RuntimeFlavor::MultiThread => Arc::new(TokioMultiThreadExecutor::new(handle)),
-        _ => {
-            return Err(DataFusionError::Execution(
-                "unsuppoerted runtime flavor".into(),
-            ))
-        }
-    };
-
-    let runtime_env = ctx.runtime_env().object_store_registry.clone();
-    let evaluation_handler = Arc::new(DataFusionEvaluationHandler::new(SessionStore::new()));
-    let storage_handler = Arc::new(DataFusionStorageHandler::new(
-        runtime_env.clone(),
-        executor.clone(),
-    ));
-    let file_format_handler = Arc::new(DataFusionFileFormatHandler::new(
-        executor.clone(),
-        SessionStore::new(),
-    ));
-    let engine = Arc::new(DataFusionEngine {
-        evaluation_handler: evaluation_handler.clone(),
-        storage_handler,
-        file_format_handler: file_format_handler.clone(),
-    });
-
-    let ctx = with_engine(ctx, engine);
-
-    evaluation_handler
-        .session_store()
-        .with_state(ctx.state_weak_ref());
-    file_format_handler
-        .session_store()
-        .with_state(ctx.state_weak_ref());
-
-    Ok(ctx)
-}
-
-fn enable_kernel_engine_background(ctx: SessionContext) -> DFResult<SessionContext> {
-    let executor = Arc::new(TokioBackgroundExecutor::new());
-
-    let runtime_env = ctx.runtime_env().object_store_registry.clone();
-    let evaluation_handler = Arc::new(DataFusionEvaluationHandler::new(SessionStore::new()));
-    let storage_handler = Arc::new(DataFusionStorageHandler::new(
-        runtime_env.clone(),
-        executor.clone(),
-    ));
-    let file_format_handler = Arc::new(DataFusionFileFormatHandler::new(
-        executor.clone(),
-        SessionStore::new(),
-    ));
-    let engine = Arc::new(DataFusionEngine {
-        evaluation_handler: evaluation_handler.clone(),
-        storage_handler,
-        file_format_handler: file_format_handler.clone(),
-    });
-
-    let ctx = with_engine(ctx, engine);
-
-    evaluation_handler
-        .session_store()
-        .with_state(ctx.state_weak_ref());
-    file_format_handler
-        .session_store()
-        .with_state(ctx.state_weak_ref());
-
-    Ok(ctx)
 }
 
 fn with_engine(ctx: SessionContext, engine: Arc<dyn Engine>) -> SessionContext {

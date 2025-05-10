@@ -4,6 +4,7 @@ use bytes::Bytes;
 use dashmap::mapref::one::Ref;
 use dashmap::DashMap;
 use datafusion_execution::object_store::{ObjectStoreRegistry, ObjectStoreUrl};
+use datafusion_session::SessionStore;
 use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::engine::default::filesystem::ObjectStoreStorageHandler;
 use delta_kernel::{DeltaResult, Error as DeltaError, FileMeta, FileSlice, StorageHandler};
@@ -14,7 +15,7 @@ use crate::utils::{group_by_store, AsObjectStoreUrl};
 
 pub struct DataFusionStorageHandler<E: TaskExecutor> {
     /// Object store registry shared with datafusion session
-    stores: Arc<dyn ObjectStoreRegistry>,
+    session_store: Arc<SessionStore>,
     /// Registry of object store handlers
     registry: Arc<DashMap<ObjectStoreUrl, Arc<ObjectStoreStorageHandler<E>>>>,
     /// The executor to run async tasks on
@@ -23,12 +24,20 @@ pub struct DataFusionStorageHandler<E: TaskExecutor> {
 
 impl<E: TaskExecutor> DataFusionStorageHandler<E> {
     /// Create a new [`DataFusionStorageHandler`] instance.
-    pub fn new(stores: Arc<dyn ObjectStoreRegistry>, task_executor: Arc<E>) -> Self {
+    pub fn new(session_store: Arc<SessionStore>, task_executor: Arc<E>) -> Self {
         Self {
-            stores,
+            session_store,
             registry: DashMap::new().into(),
             task_executor,
         }
+    }
+
+    fn registry(&self) -> DeltaResult<Arc<dyn ObjectStoreRegistry>> {
+        self.session_store
+            .get_session()
+            .upgrade()
+            .ok_or_else(|| DeltaError::generic_err("no session found"))
+            .map(|session| session.read().runtime_env().object_store_registry.clone())
     }
 
     fn get_or_create(
@@ -39,7 +48,7 @@ impl<E: TaskExecutor> DataFusionStorageHandler<E> {
             return Ok(handler);
         }
         let store = self
-            .stores
+            .registry()?
             .get_store(url.as_ref())
             .map_err(DeltaError::generic_err)?;
         self.registry.insert(

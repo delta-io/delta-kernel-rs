@@ -32,7 +32,7 @@ const DEFAULT_BUFFER_SIZE: usize = 1024;
 
 pub struct DataFusionFileFormatHandler<E: TaskExecutor> {
     /// Shared session state for the session
-    state: SessionStore,
+    state: Arc<SessionStore>,
     /// The executor to run async tasks on
     task_executor: Arc<E>,
     /// size of the buffer (via our `sync_channel`).
@@ -52,18 +52,14 @@ impl<E: TaskExecutor> std::fmt::Debug for DataFusionFileFormatHandler<E> {
 }
 
 impl<E: TaskExecutor> DataFusionFileFormatHandler<E> {
-    pub fn new(task_executor: Arc<E>, state: SessionStore) -> Self {
+    pub fn new(task_executor: Arc<E>, state: impl Into<Arc<SessionStore>>) -> Self {
         Self {
-            state,
+            state: state.into(),
             task_executor,
             buffer_size: DEFAULT_BUFFER_SIZE,
             json_source: Arc::new(JsonSource::default()),
             parquet_source: Arc::new(ParquetSource::default()),
         }
-    }
-
-    pub fn session_store(&self) -> &SessionStore {
-        &self.state
     }
 
     fn session(&self) -> DFResult<Arc<RwLock<dyn Session>>> {
