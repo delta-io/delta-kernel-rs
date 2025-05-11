@@ -405,7 +405,7 @@ pub trait EvaluationHandler: AsAny {
 /// EvaluationHandlers.
 // For some reason rustc doesn't detect it's usage so we allow(dead_code) here...
 #[allow(dead_code)]
-trait EvaluationHandlerExtension: EvaluationHandler {
+pub trait EvaluationHandlerExtension: EvaluationHandler {
     /// Create a single-row [`EngineData`] by applying the given schema to the leaf-values given in
     /// `values`.
     // Note: we will stick with a Schema instead of DataType (more constrained can expand in

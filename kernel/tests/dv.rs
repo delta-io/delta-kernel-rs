@@ -4,7 +4,7 @@ use std::ops::Add;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use delta_kernel::engine::sync::SyncEngine;
+use delta_kernel::engine::SyncEngine;
 use delta_kernel::scan::ScanResult;
 use delta_kernel::{DeltaResult, Table};
 

@@ -405,7 +405,8 @@ mod tests {
 
     use crate::arrow_data::ArrowEngineData;
     use crate::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::EngineData;
+
+    use delta_kernel::{transaction, EngineData};
 
     use itertools::Itertools;
 
@@ -472,7 +473,7 @@ mod tests {
         let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
 
         let schema = Arc::new(
-            crate::transaction::get_write_metadata_schema()
+            transaction::get_write_metadata_schema()
                 .as_ref()
                 .try_into()
                 .unwrap(),

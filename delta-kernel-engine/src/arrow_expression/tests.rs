@@ -8,9 +8,9 @@ use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
 
 use super::*;
-use crate::expressions::*;
+use delta_kernel::expressions::*;
+use delta_kernel::schema::DataType as DeltaDataTypes;
 use delta_kernel::schema::{ArrayType, MapType, StructField, StructType};
-use delta_kernel::DataType as DeltaDataTypes;
 use delta_kernel::EvaluationHandlerExtension as _;
 
 use Expression as Expr;
@@ -139,7 +139,7 @@ fn test_literal_complex_type_array() {
     ];
     let struct_type = StructType::new(struct_fields.clone());
     let struct_value = Scalar::Struct(
-        crate::expressions::StructData::try_new(
+        StructData::try_new(
             struct_fields.clone(),
             vec![
                 Scalar::Integer(42),
@@ -457,11 +457,11 @@ fn test_null_row() {
         StructField::nullable(
             "x",
             StructType::new([
-                StructField::nullable("a", crate::schema::DataType::INTEGER),
-                StructField::not_null("b", crate::schema::DataType::STRING),
+                StructField::nullable("a", DeltaDataTypes::INTEGER),
+                StructField::not_null("b", DeltaDataTypes::STRING),
             ]),
         ),
-        StructField::nullable("c", crate::schema::DataType::STRING),
+        StructField::nullable("c", DeltaDataTypes::STRING),
     ]));
     let handler = ArrowEvaluationHandler;
     let result = handler.null_row(schema.clone()).unwrap();
@@ -492,7 +492,7 @@ fn test_null_row() {
 fn test_null_row_err() {
     let not_null_schema = Arc::new(StructType::new(vec![StructField::not_null(
         "a",
-        crate::schema::DataType::STRING,
+        DeltaDataTypes::STRING,
     )]));
     let handler = ArrowEvaluationHandler;
     assert!(handler.null_row(not_null_schema).is_err());

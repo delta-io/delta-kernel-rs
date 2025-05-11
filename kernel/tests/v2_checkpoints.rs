@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::RecordBatch;
-use delta_kernel::engine::sync::SyncEngine;
+use delta_kernel_engine::arrow::array::RecordBatch;
+use delta_kernel_engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel_engine::default::DefaultEngine;
+use delta_kernel_engine::object_store::local::LocalFileSystem;
 
-use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::{DeltaResult, Table};
 
 mod common;
@@ -15,7 +16,11 @@ fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<Recor
     let test_path = test_dir.path().join(test_name.as_ref());
 
     let table = Table::try_from_uri(test_path.to_str().expect("table path to string")).unwrap();
-    let engine = Arc::new(SyncEngine::new());
+    let object_store = Arc::new(LocalFileSystem::new());
+    let engine = Arc::new(DefaultEngine::new(
+        object_store,
+        TokioBackgroundExecutor::new().into(),
+    ));
     let snapshot = table.snapshot(engine.as_ref(), None)?;
     let scan = snapshot.into_scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;

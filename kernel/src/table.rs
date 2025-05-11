@@ -103,7 +103,7 @@ impl Table {
     /// Creates a [`CheckpointWriter`] for generating checkpoints at the specified table version.
     ///
     /// See the [`crate::checkpoint`] module documentation for more details on checkpoint types
-    /// and the overall checkpoint process.    
+    /// and the overall checkpoint process.
     ///
     /// # Parameters
     /// - `engine`: Implementation of [`Engine`] apis.
@@ -165,7 +165,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::engine::sync::SyncEngine;
+    use crate::engine::SyncEngine;
 
     #[test]
     fn test_table() {

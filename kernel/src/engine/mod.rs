@@ -1,13 +1,14 @@
 //! A simple, single threaded, [`Engine`] that can only read from the local filesystem
 
-use super::arrow_expression::ArrowEvaluationHandler;
-use crate::engine::arrow_data::ArrowEngineData;
 use crate::{
     DeltaResult, Engine, Error, EvaluationHandler, FileDataReadResultIterator, FileMeta,
     JsonHandler, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
 };
+use delta_kernel_engine::arrow_conversion::something;
+use delta_kernel_engine::arrow_data::ArrowEngineData;
+use delta_kernel_engine::arrow_expression::ArrowEvaluationHandler;
 
-use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use delta_kernel_engine::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use itertools::Itertools;
 use std::fs::File;
 use std::sync::Arc;
@@ -19,7 +20,7 @@ mod storage;
 
 /// This is a simple implementation of [`Engine`]. It only supports reading data from the local
 /// filesystem, and internally represents data using `Arrow`.
-pub struct SyncEngine {
+pub(crate) struct SyncEngine {
     storage_handler: Arc<storage::SyncStorageHandler>,
     json_handler: Arc<json::SyncJsonHandler>,
     parquet_handler: Arc<parquet::SyncParquetHandler>,
@@ -101,7 +102,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::tests::test_arrow_engine;
+    use delta_kernel_engine::tests::test_arrow_engine;
 
     #[test]
     fn test_sync_engine() {

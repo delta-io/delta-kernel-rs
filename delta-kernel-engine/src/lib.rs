@@ -10,7 +10,8 @@ pub mod parquet_row_group_skipping;
 mod arrow_compat;
 pub use arrow_compat::*;
 
-pub(crate) mod arrow_conversion;
+pub mod arrow_conversion;
+
 pub(crate) mod arrow_get_data;
 pub(crate) mod arrow_utils;
 pub(crate) mod ensure_data_types;
@@ -36,7 +37,7 @@ mod tests {
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use crate::arrow_data::ArrowEngineData;
-    use crate::{Engine, EngineData};
+    use delta_kernel::{Engine, EngineData};
 
     use test_utils::delta_path_for_version;
 

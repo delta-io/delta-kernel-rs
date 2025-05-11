@@ -63,7 +63,7 @@ rustc_version = "0.4.1"
 delta-kernel-engine = { path = "../delta-kernel-engine", features = ["arrow-55"] }
 test_utils = { path = "../test-utils" }
 # Used for testing parse_url_opts extensibility
-hdfs-native-object-store = { version = "0.14.0" }
+hdfs-native-object-store = { version = "0.14.0", features = ["integration-test"] }
 hdfs-native = "0.11.1"
 walkdir = { version = "2.5.0" }
 paste = "1.0"
@@ -75,3 +75,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "fmt",
 ] }
+# TODO: remove these - only used for write.rs example
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"

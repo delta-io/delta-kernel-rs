@@ -72,4 +72,5 @@ arrow-55 = [ "dep:arrow_55", "dep:parquet_55", "dep:object_store_55" ]
 rustls = [ "reqwest/rustls-tls-native-roots", "reqwest/http2" ]
 
 [dev-dependencies]
+test_utils = { path = "../test-utils" }
 async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implementation

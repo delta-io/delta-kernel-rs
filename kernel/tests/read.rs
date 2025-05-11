@@ -2,22 +2,24 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use delta_kernel_engine::arrow::compute::{concat_batches, filter_record_batch};
+use delta_kernel_engine::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use delta_kernel_engine::object_store::{memory::InMemory, path::Path, ObjectStore};
+use delta_kernel_engine::parquet::file::properties::{EnabledStatistics, WriterProperties};
+
 use delta_kernel::actions::deletion_vector::split_vector;
-use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
-use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{
     column_expr, column_pred, BinaryPredicateOp, Expression as Expr, ExpressionRef,
     Predicate as Pred,
 };
-use delta_kernel::object_store::{memory::InMemory, path::Path, ObjectStore};
-use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, Schema};
 use delta_kernel::{Engine, FileMeta, Table};
+use delta_kernel_engine::arrow_conversion::arrow_schema_from_struct_type;
+use delta_kernel_engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel_engine::default::DefaultEngine;
+
 use itertools::Itertools;
 use test_utils::{
     actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
@@ -316,7 +318,8 @@ fn read_with_execute(
     scan: &Scan,
     expected: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let result_schema: ArrowSchemaRef = Arc::new(scan.schema().as_ref().try_into()?);
+    let result_schema: ArrowSchemaRef =
+        Arc::new(arrow_schema_from_struct_type(scan.schema().as_ref())?);
     let batches = read_scan(scan, engine)?;
 
     if expected.is_empty() {
@@ -359,7 +362,8 @@ fn read_with_scan_metadata(
     expected: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let global_state = scan.global_scan_state();
-    let result_schema: ArrowSchemaRef = Arc::new(scan.schema().as_ref().try_into()?);
+    let result_schema: ArrowSchemaRef =
+        Arc::new(arrow_schema_from_struct_type(scan.schema().as_ref())?);
     let scan_metadata = scan.scan_metadata(engine)?;
     let mut scan_files = vec![];
     for res in scan_metadata {
@@ -431,36 +435,32 @@ fn read_table_data(
     let path = std::fs::canonicalize(PathBuf::from(path))?;
     let predicate = predicate.map(Arc::new);
     let url = url::Url::from_directory_path(path).unwrap();
-    let default_engine = DefaultEngine::try_new(
+    let default_engine = Arc::new(DefaultEngine::try_new(
         &url,
         std::iter::empty::<(&str, &str)>(),
         Arc::new(TokioBackgroundExecutor::new()),
-    )?;
-    let sync_engine = delta_kernel::engine::sync::SyncEngine::new();
+    )?);
 
-    let engines: Vec<Arc<dyn Engine>> = vec![Arc::new(sync_engine), Arc::new(default_engine)];
-    for engine in engines {
-        let table = Table::new(url.clone());
-        let snapshot = table.snapshot(engine.as_ref(), None)?;
+    let table = Table::new(url.clone());
+    let snapshot = table.snapshot(default_engine.as_ref(), None)?;
 
-        let read_schema = select_cols.map(|select_cols| {
-            let table_schema = snapshot.schema();
-            let selected_fields = select_cols
-                .iter()
-                .map(|col| table_schema.field(col).cloned().unwrap());
-            Arc::new(Schema::new(selected_fields))
-        });
-        println!("Read {url:?} with schema {read_schema:#?} and predicate {predicate:#?}");
-        let scan = snapshot
-            .into_scan_builder()
-            .with_schema_opt(read_schema)
-            .with_predicate(predicate.clone())
-            .build()?;
+    let read_schema = select_cols.map(|select_cols| {
+        let table_schema = snapshot.schema();
+        let selected_fields = select_cols
+            .iter()
+            .map(|col| table_schema.field(col).cloned().unwrap());
+        Arc::new(Schema::new(selected_fields))
+    });
+    println!("Read {url:?} with schema {read_schema:#?} and predicate {predicate:#?}");
+    let scan = snapshot
+        .into_scan_builder()
+        .with_schema_opt(read_schema)
+        .with_predicate(predicate.clone())
+        .build()?;
 
-        sort_lines!(expected);
-        read_with_scan_metadata(table.location(), engine.as_ref(), &scan, &expected)?;
-        read_with_execute(engine, &scan, &expected)?;
-    }
+    sort_lines!(expected);
+    read_with_scan_metadata(table.location(), default_engine.as_ref(), &scan, &expected)?;
+    read_with_execute(default_engine, &scan, &expected)?;
     Ok(())
 }
 
