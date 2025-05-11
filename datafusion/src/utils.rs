@@ -34,6 +34,16 @@ impl AsObjectStoreUrl for FileSlice {
     }
 }
 
+pub(crate) trait AsObjectStorePath {
+    fn as_object_store_path(&self) -> Path;
+}
+
+impl AsObjectStorePath for Url {
+    fn as_object_store_path(&self) -> Path {
+        Path::from_url_path(self.path()).unwrap()
+    }
+}
+
 pub(crate) fn group_by_store<T: IntoIterator<Item = impl AsObjectStoreUrl>>(
     files: T,
 ) -> std::collections::HashMap<ObjectStoreUrl, Vec<T::Item>> {
@@ -59,7 +69,7 @@ fn to_partitioned_files(
     let part_files = files
         .into_iter()
         .map(|f| {
-            let path = Path::from_url_path(f.location.path())?;
+            let path = f.location.as_object_store_path();
             let mut partitioned_file = PartitionedFile::new(path.to_string(), f.size);
             // NB: we need to reassign the location since the 'new' method does
             // incorrect or inconsistent encoding internally.

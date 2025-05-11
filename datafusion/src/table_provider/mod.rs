@@ -21,7 +21,6 @@ use datafusion_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::PhysicalExpr;
 use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use delta_kernel::object_store::path::Path as ObjectStorePath;
 use delta_kernel::schema::DataType as DeltaDataType;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::ExpressionRef;
@@ -33,7 +32,7 @@ use crate::exec::{DeltaScanExec, FILE_ID_COLUMN};
 use crate::expressions::{to_datafusion_expr, to_delta_predicate};
 use crate::session::KernelSessionExt as _;
 use crate::table_format::{ScanFileContext, TableSnapshot};
-use crate::utils::AsObjectStoreUrl;
+use crate::utils::{AsObjectStorePath, AsObjectStoreUrl};
 
 mod snapshot;
 
@@ -114,7 +113,7 @@ impl TableProvider for DeltaTableProvider {
         // To correlate the data with the original file, we add the file url as a partition value
         // This is required to apply the correct transform to the data in downstream processing.
         let to_partitioned_file = |f: ScanFileContext| {
-            let file_path = ObjectStorePath::from_url_path(f.file_url.path())?;
+            let file_path = f.file_url.as_object_store_path();
             let mut partitioned_file = PartitionedFile::new(file_path.to_string(), f.size);
             partitioned_file.partition_values =
                 vec![ScalarValue::Utf8(Some(f.file_url.to_string()))];
