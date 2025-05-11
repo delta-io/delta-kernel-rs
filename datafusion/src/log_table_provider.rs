@@ -1,6 +1,5 @@
 use std::sync::{Arc, LazyLock};
 
-use crate::session::get_engine;
 use async_trait::async_trait;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_catalog::memory::MemorySourceConfig;
@@ -14,6 +13,8 @@ use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::{snapshot::Snapshot, Table};
 use itertools::Itertools;
+
+use crate::session::KernelSessionExt;
 
 static LOG_SCHEMA: LazyLock<ArrowSchemaRef> =
     LazyLock::new(|| Arc::new(get_log_schema().as_ref().try_into().unwrap()));
@@ -61,7 +62,7 @@ impl TableProvider for DeltaLogTableProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let engine = get_engine(state.config())?;
+        let engine = state.kernel_engine()?;
         let table_root = self.table.location().clone();
 
         let snapshot = tokio::task::spawn_blocking(move || {
@@ -71,7 +72,7 @@ impl TableProvider for DeltaLogTableProvider {
         .await
         .map_err(|e| DataFusionError::Execution(e.to_string()))??;
 
-        let engine = get_engine(state.config())?;
+        let engine = state.kernel_engine()?;
         let actions = tokio::task::spawn_blocking(move || {
             snapshot
                 .log_segment()

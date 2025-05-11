@@ -9,7 +9,7 @@ static PATH: &str = "file:///Users/robert.pack/code/delta-kernel-rs/acceptance/t
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = SessionContext::new().enable_delta_kernel();
+    let ctx = SessionContext::new().enable_delta_kernel(None);
 
     let path = format!("{}column_mapping/delta", PATH);
 

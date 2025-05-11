@@ -1,6 +1,6 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::SessionContext;
 use datafusion_common::TableReference;
 use datafusion_common::{DataFusionError, Result as DFResult};
 use datafusion_execution::object_store::ObjectStoreRegistry;
@@ -12,19 +12,103 @@ use delta_kernel::engine::default::executor::tokio::{
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::{Engine, Table};
 use parking_lot::RwLock;
-use tokio::runtime::RuntimeFlavor;
+use tokio::runtime::{Handle, RuntimeFlavor};
 use url::Url;
 
 use crate::engine::DataFusionEngine;
 use crate::DeltaTableProvider;
 
-pub struct EngineExtension {
+/// Configuration for the kernel extension.
+#[derive(Default)]
+pub struct KernelExtensionConfig {
+    /// The engine to use for the kernel.
+    engine: Option<Arc<dyn Engine>>,
+    /// The object store factory to use for the kernel.
+    object_store_factory: Option<Arc<dyn ObjectStoreFactory>>,
+    /// Runtime handle to execute blocking tasks.
+    handle: Option<Handle>,
+}
+
+impl KernelExtensionConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_engine(mut self, engine: impl Into<Option<Arc<dyn Engine>>>) -> Self {
+        self.engine = engine.into();
+        self
+    }
+
+    pub fn with_object_store_factory(
+        mut self,
+        factory: impl Into<Option<Arc<dyn ObjectStoreFactory>>>,
+    ) -> Self {
+        self.object_store_factory = factory.into();
+        self
+    }
+
+    pub fn with_handle_multi_thread(mut self, handle: impl Into<Option<Handle>>) -> Self {
+        self.handle = handle.into();
+        self
+    }
+
+    pub fn build(self) -> SessionContext {
+        self.build_with_session(SessionContext::new())
+    }
+
+    pub fn build_with_session(self, ctx: SessionContext) -> SessionContext {
+        let session_store = Arc::new(SessionStore::new());
+
+        let engine = self.engine.unwrap_or_else(|| {
+            let handle = self
+                .handle
+                .unwrap_or_else(|| tokio::runtime::Handle::current());
+            match handle.runtime_flavor() {
+                RuntimeFlavor::MultiThread => Arc::new(DataFusionEngine::new_with_session_store(
+                    Arc::new(TokioMultiThreadExecutor::new(handle)),
+                    session_store.clone(),
+                )),
+                RuntimeFlavor::CurrentThread => Arc::new(DataFusionEngine::new_with_session_store(
+                    Arc::new(TokioBackgroundExecutor::new()),
+                    session_store.clone(),
+                )),
+                _ => panic!("unsupported runtime flavor"),
+            }
+        });
+
+        let ctx = with_engine(
+            ctx,
+            engine,
+            session_store.clone(),
+            self.object_store_factory,
+        );
+        session_store.with_state(ctx.state_weak_ref());
+
+        ctx
+    }
+}
+
+impl Into<SessionContext> for KernelExtensionConfig {
+    fn into(self) -> SessionContext {
+        self.build()
+    }
+}
+
+pub struct KernelExtension {
     pub(crate) engine: Arc<dyn Engine>,
     object_store_factory: Option<Arc<dyn ObjectStoreFactory>>,
+    session_store: Arc<SessionStore>,
+}
+
+impl KernelExtension {
+    /// Set the session state for the kernel extension.
+    pub fn with_state(&self, state: Weak<RwLock<dyn Session>>) {
+        self.session_store.with_state(state);
+    }
 }
 
 #[async_trait::async_trait]
-impl ObjectStoreFactory for EngineExtension {
+impl ObjectStoreFactory for KernelExtension {
     async fn create_object_store(&self, url: &Url) -> DFResult<Arc<dyn ObjectStore>> {
         self.object_store_factory
             .as_ref()
@@ -36,9 +120,9 @@ impl ObjectStoreFactory for EngineExtension {
 
 #[async_trait::async_trait]
 impl<S: Session + ?Sized> KernelSessionExt for S {
-    fn kernel_ext(&self) -> DFResult<Arc<EngineExtension>> {
+    fn kernel_ext(&self) -> DFResult<Arc<KernelExtension>> {
         self.config()
-            .get_extension::<EngineExtension>()
+            .get_extension::<KernelExtension>()
             .ok_or_else(|| DataFusionError::Execution("no engine extension found".into()))
     }
 
@@ -58,7 +142,10 @@ pub trait ObjectStoreFactory: Send + Sync + 'static {
 
 #[async_trait::async_trait]
 pub trait KernelContextExt: private::KernelContextExtInner {
-    fn enable_delta_kernel(self) -> SessionContext;
+    fn enable_delta_kernel(
+        self,
+        config: impl Into<Option<KernelExtensionConfig>>,
+    ) -> SessionContext;
 
     async fn register_delta(
         &self,
@@ -69,15 +156,19 @@ pub trait KernelContextExt: private::KernelContextExtInner {
 
 #[async_trait::async_trait]
 impl KernelContextExt for SessionContext {
-    fn enable_delta_kernel(self) -> SessionContext {
+    fn enable_delta_kernel(
+        self,
+        config: impl Into<Option<KernelExtensionConfig>>,
+    ) -> SessionContext {
         if self
             .state_ref()
             .read()
             .config()
-            .get_extension::<EngineExtension>()
+            .get_extension::<KernelExtension>()
             .is_none()
         {
-            return enable_kernel_engine(self, None);
+            let config = config.into().unwrap_or_default();
+            return config.build_with_session(self);
         }
         self
     }
@@ -113,7 +204,7 @@ pub trait KernelSessionExt: Send + Sync {
     ///
     /// Tries to get the kernel extension from the extension registry
     /// on [`SessionConfig`].
-    fn kernel_ext(&self) -> DFResult<Arc<EngineExtension>>;
+    fn kernel_ext(&self) -> DFResult<Arc<KernelExtension>>;
 
     fn kernel_engine(&self) -> DFResult<Arc<dyn Engine>> {
         Ok(self.kernel_ext()?.engine.clone())
@@ -153,19 +244,20 @@ impl private::KernelContextExtInner for SessionContext {
     }
 
     fn kernel_engine(&self) -> DFResult<Arc<dyn Engine>> {
-        Ok(self.kernel().read().kernel_engine()?)
+        self.kernel().read().kernel_engine()
     }
 }
 
 async fn ensure_object_store(
     url: &Url,
     registry: Arc<dyn ObjectStoreRegistry>,
-    kernel: Arc<EngineExtension>,
+    kernel: Arc<KernelExtension>,
 ) -> DFResult<()> {
     let mut root_url = url.clone();
     root_url.set_path("/");
 
     if registry.get_store(&root_url).is_err() {
+        tracing::debug!("creating new object store for '{}'", root_url);
         let store = kernel.create_object_store(&root_url).await?;
         registry.register_store(url, store);
     }
@@ -173,24 +265,18 @@ async fn ensure_object_store(
     Ok(())
 }
 
-pub fn get_engine(config: &SessionConfig) -> Result<Arc<dyn Engine>, DataFusionError> {
-    config
-        .get_extension::<EngineExtension>()
-        .as_ref()
-        .map(|ext| ext.engine.clone())
-        .ok_or_else(|| DataFusionError::Execution("no engine extension found".into()))
-}
-
 fn with_engine(
     ctx: SessionContext,
     engine: Arc<dyn Engine>,
+    session_store: Arc<SessionStore>,
     object_store_factory: Option<Arc<dyn ObjectStoreFactory>>,
 ) -> SessionContext {
     let session_id = ctx.session_id().clone();
     let mut new_config = ctx.copied_config();
-    new_config.set_extension(Arc::new(EngineExtension {
+    new_config.set_extension(Arc::new(KernelExtension {
         engine,
         object_store_factory,
+        session_store,
     }));
 
     let ctx: SessionContext = ctx
@@ -199,30 +285,5 @@ fn with_engine(
         .with_config(new_config)
         .build()
         .into();
-    ctx
-}
-
-fn enable_kernel_engine(
-    ctx: SessionContext,
-    object_store_factory: Option<Arc<dyn ObjectStoreFactory>>,
-) -> SessionContext {
-    let handle = tokio::runtime::Handle::current();
-    let session_store = Arc::new(SessionStore::new());
-
-    let engine: Arc<dyn Engine> = match handle.runtime_flavor() {
-        RuntimeFlavor::MultiThread => Arc::new(DataFusionEngine::new_with_session_store(
-            Arc::new(TokioMultiThreadExecutor::new(handle)),
-            session_store.clone(),
-        )),
-        RuntimeFlavor::CurrentThread => Arc::new(DataFusionEngine::new_with_session_store(
-            Arc::new(TokioBackgroundExecutor::new()),
-            session_store.clone(),
-        )),
-        _ => panic!("unsupported runtime flavor"),
-    };
-
-    let ctx = with_engine(ctx, engine, object_store_factory);
-    session_store.with_state(ctx.state_weak_ref());
-
     ctx
 }

@@ -1,3 +1,20 @@
+//! DataFusion extension for Delta Lake.
+//!
+//! This crate provides a seamless integration of Delta Lake backed tables into the Datafusion ecosystem.
+//! The low level protocol is implemented in the [`delta_kernel`] crate while this crate provides
+//! a DataFusion based [`Engine`](delta_kernel::Engine) to drive the work required by kernel.
+//!
+//! The main API to interact with the extension is provided via two extension traits.
+//!
+//! - [`KernelContextExt`] extends [`SessionContext`] to provide top level APIs for end users
+//!   integrating Datafusion into their application.
+//! - [`KernelSessionExt`] extends the [`Session`] trait to access kernel capabilities when writing custom
+//!   extensions to Datafusion such as [`ExecutionPlan`]s.
+//!
+//! [`SessionContext`]: datafusion::prelude::SessionContext
+//! [`Session`]: datafusion_session::Session
+//! [`ExecutionPlan`]: datafusion_physical_plan::execution_plan::ExecutionPlan
+
 mod engine;
 mod error;
 mod exec;
@@ -9,7 +26,7 @@ mod utils;
 
 pub use engine::DataFusionEngine;
 pub use log_table_provider::DeltaLogTableProvider;
-pub use session::{KernelContextExt, KernelSessionExt, ObjectStoreFactory};
+pub use session::{KernelContextExt, KernelExtensionConfig, KernelSessionExt, ObjectStoreFactory};
 pub use table_provider::DeltaTableProvider;
 
 #[cfg(test)]

@@ -13,7 +13,7 @@ use delta_kernel::{Engine, Expression, ExpressionRef};
 use url::Url;
 
 use crate::error::to_df_err;
-use crate::session::get_engine;
+use crate::session::KernelSessionExt;
 
 pub struct ScanFileContext {
     pub selection_vector: Option<Vec<bool>>,
@@ -105,7 +105,7 @@ impl TableSnapshot for DeltaTableSnapshot {
         predicate: Arc<Expression>,
     ) -> Result<TableScan> {
         scan_metadata(
-            get_engine(state.config())?,
+            state.kernel_engine()?,
             &self.snapshot,
             projection,
             predicate,
