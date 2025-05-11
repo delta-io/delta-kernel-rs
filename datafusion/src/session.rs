@@ -10,17 +10,21 @@ use delta_kernel::engine::default::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
 use delta_kernel::object_store::ObjectStore;
-use delta_kernel::{Engine, Table};
+use delta_kernel::snapshot::Snapshot;
+use delta_kernel::{Engine, Table, Version};
 use parking_lot::RwLock;
 use tokio::runtime::{Handle, RuntimeFlavor};
 use url::Url;
 
 use crate::engine::DataFusionEngine;
-use crate::DeltaTableProvider;
+use crate::table_format::TableSnapshot;
+use crate::table_provider::{DeltaTableProvider, DeltaTableSnapshot};
+use crate::utils::AsObjectStoreUrl;
 
 /// Configuration for the kernel extension.
 #[derive(Default)]
 pub struct KernelExtensionConfig {
+    context: Option<SessionContext>,
     /// The engine to use for the kernel.
     engine: Option<Arc<dyn Engine>>,
     /// The object store factory to use for the kernel.
@@ -32,6 +36,11 @@ pub struct KernelExtensionConfig {
 impl KernelExtensionConfig {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_context(mut self, context: SessionContext) -> Self {
+        self.context = Some(context);
+        self
     }
 
     pub fn with_engine(mut self, engine: impl Into<Option<Arc<dyn Engine>>>) -> Self {
@@ -53,10 +62,7 @@ impl KernelExtensionConfig {
     }
 
     pub fn build(self) -> SessionContext {
-        self.build_with_session(SessionContext::new())
-    }
-
-    pub fn build_with_session(self, ctx: SessionContext) -> SessionContext {
+        let ctx = self.context.unwrap_or(SessionContext::new());
         let session_store = Arc::new(SessionStore::new());
 
         let engine = self.engine.unwrap_or_else(|| {
@@ -105,6 +111,22 @@ impl KernelExtension {
     pub fn with_state(&self, state: Weak<RwLock<dyn Session>>) {
         self.session_store.with_state(state);
     }
+
+    pub async fn read_snapshot(
+        &self,
+        url: &Url,
+        version: Option<Version>,
+    ) -> DFResult<Arc<Snapshot>> {
+        let table =
+            Table::try_from_uri(url).map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        let engine = self.engine.clone();
+        let snapshot =
+            tokio::task::spawn_blocking(move || table.snapshot(engine.as_ref(), version))
+                .await
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        Ok(snapshot.into())
+    }
 }
 
 #[async_trait::async_trait]
@@ -127,8 +149,6 @@ impl<S: Session + ?Sized> KernelSessionExt for S {
     }
 
     async fn ensure_object_store(&self, url: &Url) -> DFResult<()> {
-        let mut root_url = url.clone();
-        root_url.set_path("/");
         let registry = self.runtime_env().object_store_registry.clone();
         let ext = self.kernel_ext()?;
         ensure_object_store(url, registry, ext).await
@@ -147,6 +167,12 @@ pub trait KernelContextExt: private::KernelContextExtInner {
         config: impl Into<Option<KernelExtensionConfig>>,
     ) -> SessionContext;
 
+    async fn read_delta_snapshot(
+        &self,
+        url: &Url,
+        version: Option<Version>,
+    ) -> DFResult<Arc<dyn TableSnapshot>>;
+
     async fn register_delta(
         &self,
         table_ref: impl Into<TableReference> + Send,
@@ -160,17 +186,22 @@ impl KernelContextExt for SessionContext {
         self,
         config: impl Into<Option<KernelExtensionConfig>>,
     ) -> SessionContext {
-        if self
-            .state_ref()
-            .read()
-            .config()
-            .get_extension::<KernelExtension>()
-            .is_none()
-        {
-            let config = config.into().unwrap_or_default();
-            return config.build_with_session(self);
+        if self.state_ref().read().kernel_ext().is_err() {
+            config.into().unwrap_or_default().with_context(self).into()
+        } else {
+            self
         }
-        self
+    }
+
+    async fn read_delta_snapshot(
+        &self,
+        url: &Url,
+        version: Option<Version>,
+    ) -> DFResult<Arc<dyn TableSnapshot>> {
+        self.ensure_object_store(url).await?;
+        let ext = self.kernel().read().kernel_ext()?;
+        let snapshot = ext.read_snapshot(url, version).await?;
+        Ok(Arc::new(DeltaTableSnapshot::try_new(snapshot)?))
     }
 
     async fn register_delta(
@@ -253,13 +284,11 @@ async fn ensure_object_store(
     registry: Arc<dyn ObjectStoreRegistry>,
     kernel: Arc<KernelExtension>,
 ) -> DFResult<()> {
-    let mut root_url = url.clone();
-    root_url.set_path("/");
-
-    if registry.get_store(&root_url).is_err() {
-        tracing::debug!("creating new object store for '{}'", root_url);
-        let store = kernel.create_object_store(&root_url).await?;
-        registry.register_store(url, store);
+    let object_store_url = url.as_object_store_url();
+    if registry.get_store(object_store_url.as_ref()).is_err() {
+        tracing::debug!("creating new object store for '{}'", url);
+        let store = kernel.create_object_store(url).await?;
+        registry.register_store(object_store_url.as_ref(), store);
     }
 
     Ok(())
@@ -278,7 +307,6 @@ fn with_engine(
         object_store_factory,
         session_store,
     }));
-
     let ctx: SessionContext = ctx
         .into_state_builder()
         .with_session_id(session_id)

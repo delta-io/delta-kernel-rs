@@ -21,12 +21,14 @@ mod exec;
 mod expressions;
 mod log_table_provider;
 mod session;
+mod table_format;
 mod table_provider;
 mod utils;
 
 pub use engine::DataFusionEngine;
 pub use log_table_provider::DeltaLogTableProvider;
 pub use session::{KernelContextExt, KernelExtensionConfig, KernelSessionExt, ObjectStoreFactory};
+pub use table_format::{ScanFileContext, TableScan, TableSnapshot};
 pub use table_provider::DeltaTableProvider;
 
 #[cfg(test)]

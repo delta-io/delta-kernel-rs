@@ -28,10 +28,11 @@ use delta_kernel::ExpressionRef;
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 
-use self::snapshot::{DeltaTableSnapshot, ScanFileContext, TableSnapshot};
+pub use self::snapshot::DeltaTableSnapshot;
 use crate::exec::{DeltaScanExec, FILE_ID_COLUMN};
 use crate::expressions::{to_datafusion_expr, to_delta_predicate};
 use crate::session::KernelSessionExt as _;
+use crate::table_format::{ScanFileContext, TableSnapshot};
 use crate::utils::AsObjectStoreUrl;
 
 mod snapshot;
@@ -90,7 +91,7 @@ impl TableProvider for DeltaTableProvider {
             .scan_metadata(state, projection, to_delta_predicate(filters)?)
             .await?;
 
-        let delta_schema = self.snapshot.table_schema_delta().into();
+        let delta_schema = self.snapshot.schema().into();
 
         // Convert the delta expressions from the scan into a map of file id to datafusion physical expression
         // these will be applied to convert the raw data read from disk into the logical table schema
