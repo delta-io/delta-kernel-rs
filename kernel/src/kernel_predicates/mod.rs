@@ -639,7 +639,7 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
 pub(crate) trait DataSkippingPredicateEvaluator {
     /// The output type produced by this predicate evaluator
     type Output;
-    /// The type of min column stats
+    /// The type for column stats consumed by this predicate evaluator
     type ColumnStat;
 
     /// Retrieves the minimum value of a column, if it exists and has the requested type.
@@ -844,10 +844,8 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
     }
 }
 
+// Statically verify that both forms of the trait are dyn compatible
 #[cfg(test)]
-// Statically verify the trait is dyn compatible
 const _: Option<&dyn DataSkippingPredicateEvaluator<Output = Pred, ColumnStat = Expr>> = None;
-
 #[cfg(test)]
-// Statically verify the trait is dyn compatible
 const _: Option<&dyn DataSkippingPredicateEvaluator<Output = bool, ColumnStat = Scalar>> = None;

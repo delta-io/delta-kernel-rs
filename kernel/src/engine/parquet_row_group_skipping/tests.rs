@@ -59,16 +59,16 @@ fn test_get_stat_values() {
     ]);
     let filter = RowGroupFilter::new(metadata.metadata().row_group(0), &columns);
 
-    assert_eq!(filter.get_rowcount_stat(), Some(Scalar::from(5)));
+    assert_eq!(filter.get_rowcount_stat(), Some(5i64.into()));
 
     // Only the BOOL column has any nulls
     assert_eq!(
         filter.get_nullcount_stat(&column_name!("bool")),
-        Some(Scalar::from(3))
+        Some(3i64.into())
     );
     assert_eq!(
         filter.get_nullcount_stat(&column_name!("varlen.utf8")),
-        Some(Scalar::from(0))
+        Some(0i64.into())
     );
 
     assert_eq!(
