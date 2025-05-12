@@ -499,6 +499,11 @@ impl Display for BinaryPredicateOp {
     }
 }
 
+// Helper for displaying the children of variadic expressions and predicates
+fn format_child_list<T: Display>(children: &[T]) -> String {
+    children.iter().map(|c| format!("{c}")).join(", ")
+}
+
 impl Display for Expression {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         use Expression::*;
@@ -506,11 +511,7 @@ impl Display for Expression {
             Literal(l) => write!(f, "{l}"),
             Column(name) => write!(f, "Column({name})"),
             Predicate(p) => write!(f, "{p}"),
-            Struct(exprs) => write!(
-                f,
-                "Struct({})",
-                &exprs.iter().map(|e| format!("{e}")).join(", ")
-            ),
+            Struct(exprs) => write!(f, "Struct({})", format_child_list(exprs)),
             Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
         }
     }
@@ -532,12 +533,11 @@ impl Display for Predicate {
                 UnaryPredicateOp::IsNull => write!(f, "{expr} IS NULL"),
             },
             Junction(JunctionPredicate { op, preds }) => {
-                let preds = &preds.iter().map(|p| format!("{p}")).join(", ");
                 let op = match op {
                     JunctionPredicateOp::And => "AND",
                     JunctionPredicateOp::Or => "OR",
                 };
-                write!(f, "{op}({preds})")
+                write!(f, "{op}({})", format_child_list(preds))
             }
         }
     }
