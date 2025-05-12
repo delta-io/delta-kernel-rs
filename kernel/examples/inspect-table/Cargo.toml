@@ -6,11 +6,8 @@ publish = false
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-delta_kernel = { path = "../../../kernel", features = [
-  "arrow",
-  "default-engine",
-  "internal-api",
-] }
+delta_kernel = { path = "../../../kernel", features = [ "internal-api" ] }
+delta-kernel-engine = { path = "../../../delta-kernel-engine", features = [ "arrow-55" ] }
 env_logger = "0.11.8"
 url = "2"
 

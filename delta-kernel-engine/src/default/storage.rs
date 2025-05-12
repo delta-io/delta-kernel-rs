@@ -1,14 +1,17 @@
 use crate::object_store::parse_url_opts as parse_url_opts_object_store;
 use crate::object_store::path::Path;
-use crate::object_store::{Error, ObjectStore};
+use crate::object_store::ObjectStore;
 use url::Url;
 
-use crate::Error as DeltaError;
+use delta_kernel::Error;
+
+use crate::{EngineError, EngineResult};
+
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
 
 /// Alias for convenience
-type ClosureReturn = Result<(Box<dyn ObjectStore>, Path), Error>;
+type ClosureReturn = Result<(Box<dyn ObjectStore>, Path), EngineError>;
 /// This type alias makes it easier to reference the handler closure(s)
 ///
 /// It uses a HashMap<String, String> which _must_ be converted in our [parse_url_opts] because we
@@ -26,11 +29,9 @@ static URL_REGISTRY: LazyLock<RwLock<Handlers>> = LazyLock::new(|| RwLock::new(H
 pub fn insert_url_handler(
     scheme: impl AsRef<str>,
     handler_closure: HandlerClosure,
-) -> Result<(), DeltaError> {
+) -> EngineResult<()> {
     let Ok(mut registry) = URL_REGISTRY.write() else {
-        return Err(DeltaError::generic(
-            "failed to acquire lock for adding a URL handler!",
-        ));
+        return Err(Error::generic("failed to acquire lock for adding a URL handler!").into());
     };
     registry.insert(scheme.as_ref().into(), handler_closure);
     Ok(())
@@ -40,7 +41,7 @@ pub fn insert_url_handler(
 ///
 /// This function will first attempt to use any schemes registered via [insert_url_handler],
 /// falling back to the default behavior of [crate::object_store::parse_url_opts]
-pub fn parse_url_opts<I, K, V>(url: &Url, options: I) -> Result<(Box<dyn ObjectStore>, Path), Error>
+pub fn parse_url_opts<I, K, V>(url: &Url, options: I) -> EngineResult<(Box<dyn ObjectStore>, Path)>
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<str>,
@@ -57,7 +58,7 @@ where
             return handler(url, options);
         }
     }
-    parse_url_opts_object_store(url, options)
+    Ok(parse_url_opts_object_store(url, options)?)
 }
 
 #[cfg(test)]

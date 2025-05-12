@@ -1,11 +1,12 @@
-use delta_kernel::arrow::compute::filter_record_batch;
-use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::arrow::util::pretty::pretty_format_batches;
+use delta_kernel_engine::arrow::compute::filter_record_batch;
+use delta_kernel_engine::arrow::record_batch::RecordBatch;
+use delta_kernel_engine::arrow::util::pretty::pretty_format_batches;
+
 use itertools::Itertools;
 
-use crate::ArrowEngineData;
 use delta_kernel::scan::Scan;
 use delta_kernel::{DeltaResult, Engine, EngineData, Table};
+use delta_kernel_engine::arrow_data::ArrowEngineData;
 
 use std::sync::Arc;
 
@@ -24,7 +25,7 @@ macro_rules! sort_lines {
 #[macro_export]
 macro_rules! assert_batches_sorted_eq {
     ($expected_lines_sorted: expr, $CHUNKS: expr) => {
-        let formatted = delta_kernel::arrow::util::pretty::pretty_format_batches($CHUNKS)
+        let formatted = delta_kernel_engine::arrow::util::pretty::pretty_format_batches($CHUNKS)
             .unwrap()
             .to_string();
         // fix for windows: \r\n -->
@@ -95,7 +96,11 @@ pub(crate) fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec
             let data = scan_result.raw_data?;
             let record_batch = to_arrow(data)?;
             if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
+                Ok(
+                    filter_record_batch(&record_batch, &mask.into()).map_err(|e| {
+                        delta_kernel::Error::Generic(format!("Failed to filter record batch: {e}"))
+                    })?,
+                )
             } else {
                 Ok(record_batch)
             }

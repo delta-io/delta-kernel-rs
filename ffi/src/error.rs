@@ -8,20 +8,10 @@ use crate::{kernel_string_slice, ExternEngine, KernelStringSlice};
 pub enum KernelError {
     UnknownError, // catch-all for unrecognized kernel Error types
     FFIError,     // errors encountered in the code layer that supports FFI
-    #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
-    ArrowError,
     EngineDataTypeError,
     ExtractError,
     GenericError,
     IOErrorError,
-    #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
-    ParquetError,
-    #[cfg(feature = "default-engine")]
-    ObjectStoreError,
-    #[cfg(feature = "default-engine")]
-    ObjectStorePathError,
-    #[cfg(feature = "default-engine")]
-    ReqwestError,
     FileNotFoundError,
     MissingColumnError,
     UnexpectedColumnTypeError,
@@ -61,23 +51,12 @@ pub enum KernelError {
 impl From<Error> for KernelError {
     fn from(e: Error) -> Self {
         match e {
-            // NOTE: By definition, no kernel Error maps to FFIError
-            #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
-            Error::Arrow(_) => KernelError::ArrowError,
             Error::CheckpointWrite(_) => KernelError::CheckpointWriteError,
             Error::EngineDataType(_) => KernelError::EngineDataTypeError,
             Error::Extract(..) => KernelError::ExtractError,
             Error::Generic(_) => KernelError::GenericError,
             Error::GenericError { .. } => KernelError::GenericError,
             Error::IOError(_) => KernelError::IOErrorError,
-            #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
-            Error::Parquet(_) => KernelError::ParquetError,
-            #[cfg(feature = "default-engine")]
-            Error::ObjectStore(_) => KernelError::ObjectStoreError,
-            #[cfg(feature = "default-engine")]
-            Error::ObjectStorePath(_) => KernelError::ObjectStorePathError,
-            #[cfg(feature = "default-engine")]
-            Error::Reqwest(_) => KernelError::ReqwestError,
             Error::FileNotFound(_) => KernelError::FileNotFoundError,
             Error::MissingColumn(_) => KernelError::MissingColumnError,
             Error::UnexpectedColumnType(_) => KernelError::UnexpectedColumnTypeError,
@@ -204,7 +183,7 @@ impl<T: ExternEngine + ?Sized> AllocateError for &T {
 /// # Safety
 ///
 /// The allocator must be valid.
-pub(crate) trait IntoExternResult<T> {
+pub trait IntoExternResult<T> {
     unsafe fn into_extern_result(self, alloc: &dyn AllocateError) -> ExternResult<T>;
 }
 

@@ -8,15 +8,14 @@ use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
 use delta_kernel::actions::deletion_vector::split_vector;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::engine::sync::SyncEngine;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, GlobalScanState, Stats};
 use delta_kernel::schema::Schema;
 use delta_kernel::{DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Table};
+use delta_kernel_engine::arrow_data::ArrowEngineData;
+use delta_kernel_engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel_engine::default::DefaultEngine;
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use url::Url;
 
 /// An example program that reads a table using multiple threads. This shows the use of the
@@ -32,10 +31,6 @@ struct Cli {
     /// how many threads to read with (1 - 2048)
     #[arg(short, long, default_value_t = 2, value_parser = 1..=2048)]
     thread_count: i64,
-
-    /// Which Engine to use
-    #[arg(short, long, value_enum, default_value_t = EngineType::Default)]
-    engine: EngineType,
 
     /// Comma separated list of columns to select
     #[arg(long, value_delimiter=',', num_args(0..))]
@@ -54,14 +49,6 @@ struct Cli {
     /// Limit to printing only LIMIT rows.
     #[arg(short, long)]
     limit: Option<usize>,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-enum EngineType {
-    /// Use the default, async engine
-    Default,
-    /// Use the sync engine (local files only)
-    Sync,
 }
 
 fn main() -> ExitCode {
@@ -122,7 +109,7 @@ fn send_scan_file(
     scan_tx.send(scan_file).unwrap();
 }
 
-fn try_main() -> DeltaResult<()> {
+fn try_main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     // build a table and get the latest snapshot from it
@@ -130,23 +117,20 @@ fn try_main() -> DeltaResult<()> {
     println!("Reading {}", table.location());
 
     // create the requested engine
-    let engine: Arc<dyn Engine> = match cli.engine {
-        EngineType::Default => {
-            let mut options = if let Some(region) = cli.region {
-                HashMap::from([("region", region)])
-            } else {
-                HashMap::new()
-            };
-            if cli.public {
-                options.insert("skip_signature", "true".to_string());
-            }
-            Arc::new(DefaultEngine::try_new(
-                table.location(),
-                options,
-                Arc::new(TokioBackgroundExecutor::new()),
-            )?)
+    let engine: Arc<dyn Engine> = {
+        let mut options = if let Some(region) = cli.region {
+            HashMap::from([("region", region)])
+        } else {
+            HashMap::new()
+        };
+        if cli.public {
+            options.insert("skip_signature", "true".to_string());
         }
-        EngineType::Sync => Arc::new(SyncEngine::new()),
+        Arc::new(DefaultEngine::try_new(
+            table.location(),
+            options,
+            Arc::new(TokioBackgroundExecutor::new()),
+        )?)
     };
 
     let snapshot = table.snapshot(engine.as_ref(), None)?;

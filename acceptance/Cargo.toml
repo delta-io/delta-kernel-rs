@@ -15,10 +15,9 @@ release = false
 
 [dependencies]
 delta_kernel = { path = "../kernel", features = [
-  "default-engine",
-  "arrow",
   "internal-api",
 ] }
+delta-kernel-engine = { path = "../delta-kernel-engine", features = [ "arrow-55" ] }
 futures = "0.3"
 itertools = "0.14"
 object_store = "0.11" # must 'match' arrow version above

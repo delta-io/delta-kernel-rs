@@ -8,12 +8,15 @@ use std::{
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use itertools::Itertools;
 
-use crate::{
-    engine::arrow_utils::make_arrow_error,
+use delta_kernel::{
     schema::{DataType, MetadataValue, StructField},
-    utils::require,
     DeltaResult, Error,
 };
+
+use crate::arrow_conversion::arrow_data_type_from_data_type;
+use crate::arrow_utils::make_arrow_error;
+use crate::require;
+use crate::EngineResult;
 
 /// Ensure a kernel data type matches an arrow data type. This only ensures that the actual "type"
 /// is the same, but does so recursively into structs, and ensures lists and maps have the correct
@@ -31,7 +34,7 @@ pub(crate) fn ensure_data_types(
     kernel_type: &DataType,
     arrow_type: &ArrowDataType,
     check_nullability_and_metadata: bool,
-) -> DeltaResult<DataTypeCompat> {
+) -> EngineResult<DataTypeCompat> {
     let check = EnsureDataTypes {
         check_nullability_and_metadata,
     };
@@ -59,10 +62,11 @@ impl EnsureDataTypes {
         &self,
         kernel_type: &DataType,
         arrow_type: &ArrowDataType,
-    ) -> DeltaResult<DataTypeCompat> {
+    ) -> EngineResult<DataTypeCompat> {
         match (kernel_type, arrow_type) {
             (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
-                check_cast_compat(kernel_type.try_into()?, arrow_type)
+                let arrow_data_type = arrow_data_type_from_data_type(kernel_type)?;
+                check_cast_compat(arrow_data_type, arrow_type)
             }
             // strings, bools, and binary  aren't primitive in arrow
             (&DataType::BOOLEAN, ArrowDataType::Boolean)
@@ -180,7 +184,7 @@ impl EnsureDataTypes {
 fn check_cast_compat(
     target_type: ArrowDataType,
     source_type: &ArrowDataType,
-) -> DeltaResult<DataTypeCompat> {
+) -> EngineResult<DataTypeCompat> {
     use ArrowDataType::*;
 
     match (source_type, &target_type) {
@@ -227,12 +231,6 @@ fn can_upcast_to_decimal(
     target_precision >= source_precision
         && target_scale >= source_scale
         && target_precision - source_precision >= (target_scale - source_scale) as u8
-}
-
-impl PartialEq<String> for MetadataValue {
-    fn eq(&self, other: &String) -> bool {
-        self.to_string().eq(other)
-    }
 }
 
 // allow for comparing our metadata maps to arrow ones. We can't implement PartialEq because both

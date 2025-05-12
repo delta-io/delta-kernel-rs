@@ -12,7 +12,7 @@ use crate::schema::DataType;
 use std::cmp::Ordering;
 use tracing::debug;
 
-pub(crate) mod parquet_stats_skipping;
+pub mod parquet_stats_skipping;
 
 #[cfg(test)]
 mod tests;
@@ -59,7 +59,7 @@ mod tests;
 /// NOTE: The error-handling semantics of this trait's scalar-based predicate evaluation may differ
 /// from those of the engine's predicate evaluation, because kernel predicates don't include the
 /// necessary type information to reliably detect all type errors.
-pub(crate) trait KernelPredicateEvaluator {
+pub trait KernelPredicateEvaluator {
     type Output;
 
     /// A (possibly inverted) boolean scalar value, e.g. `[NOT] <value>`.
@@ -636,7 +636,7 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
 /// example, comparisons involving a column are converted into comparisons over that column's
 /// min/max stats, and NULL checks are converted into comparisons involving the column's nullcount
 /// and rowcount stats.
-pub(crate) trait DataSkippingPredicateEvaluator {
+pub trait DataSkippingPredicateEvaluator {
     /// The output type produced by this predicate evaluator
     type Output;
     /// The type of min and max column stats

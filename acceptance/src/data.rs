@@ -1,22 +1,25 @@
 use std::{path::Path, sync::Arc};
 
-use delta_kernel::arrow::array::{Array, RecordBatch};
-use delta_kernel::arrow::compute::{
-    concat_batches, filter_record_batch, lexsort_to_indices, take, SortColumn,
+use delta_kernel_engine::arrow::array::{Array, RecordBatch};
+use delta_kernel_engine::arrow::compute::{
+    self, concat_batches, filter_record_batch, lexsort_to_indices, take, SortColumn,
 };
-use delta_kernel::arrow::datatypes::{DataType, Schema};
-
-use delta_kernel::object_store::{local::LocalFileSystem, ObjectStore};
-use delta_kernel::parquet::arrow::async_reader::{
+use delta_kernel_engine::arrow::datatypes::{DataType, Schema};
+use delta_kernel_engine::object_store::{local::LocalFileSystem, ObjectStore};
+use delta_kernel_engine::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
-use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Engine, Error, Table};
+
+use delta_kernel::{Engine, Table};
+use delta_kernel_engine::arrow_data::ArrowEngineData;
+use delta_kernel_engine::{EngineError, EngineResult};
+
 use futures::{stream::TryStreamExt, StreamExt};
 use itertools::Itertools;
 
 use crate::{TestCaseInfo, TestResult};
 
-pub async fn read_golden(path: &Path, _version: Option<&str>) -> DeltaResult<RecordBatch> {
+pub async fn read_golden(path: &Path, _version: Option<&str>) -> EngineResult<RecordBatch> {
     let expected_root = path.join("expected").join("latest").join("table_content");
     let store = Arc::new(LocalFileSystem::new_with_prefix(&expected_root)?);
     let files: Vec<_> = store.list(None).try_collect().await?;
@@ -41,7 +44,7 @@ pub async fn read_golden(path: &Path, _version: Option<&str>) -> DeltaResult<Rec
     Ok(all_data)
 }
 
-pub fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
+pub fn sort_record_batch(batch: RecordBatch) -> EngineResult<RecordBatch> {
     // Sort by all columns
     let mut sort_columns = vec![];
     for col in batch.columns() {
@@ -87,7 +90,7 @@ fn normalize_col(col: Arc<dyn Array>) -> Arc<dyn Array> {
     if let DataType::Timestamp(unit, Some(zone)) = col.data_type() {
         if **zone == *"+00:00" {
             let data_type = DataType::Timestamp(*unit, Some("UTC".into()));
-            delta_kernel::arrow::compute::cast(&col, &data_type).expect("Could not cast to UTC")
+            compute::cast(&col, &data_type).expect("Could not cast to UTC")
         } else {
             col
         }
@@ -120,7 +123,7 @@ pub async fn assert_scan_metadata(
     let mut schema = None;
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
-        .map(|scan_result| -> DeltaResult<_> {
+        .map(|scan_result| -> EngineResult<_> {
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();
             let data = scan_result.raw_data?;
@@ -139,7 +142,7 @@ pub async fn assert_scan_metadata(
             }
         })
         .try_collect()?;
-    let all_data = concat_batches(&schema.unwrap(), batches.iter()).map_err(Error::from)?;
+    let all_data = concat_batches(&schema.unwrap(), batches.iter()).map_err(EngineError::from)?;
     let all_data = sort_record_batch(all_data)?;
     let golden = read_golden(test_case.root_dir(), None).await?;
     let golden = sort_record_batch(golden)?;

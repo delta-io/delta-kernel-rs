@@ -1,0 +1,18 @@
+[package]
+name = "delta-kernel-engine-ffi"
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+delta_kernel = { path = "../kernel" }
+delta_kernel_ffi = { path = "../ffi", features = ["internal-api"] }
+delta_kernel_ffi_macros = { path = "../ffi-proc-macros" }
+delta-kernel-engine = { path = "../delta-kernel-engine" }
+tracing = "0.1"
+url = "2.5"

@@ -10,7 +10,8 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 // re-export because many call sites that use schemas do not necessarily use expressions
-pub(crate) use crate::expressions::{column_name, ColumnName};
+// TODO: should we just export from expressions?
+pub use crate::expressions::{column_name, ColumnName};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
@@ -41,6 +42,12 @@ impl Display for MetadataValue {
             MetadataValue::Boolean(b) => write!(f, "{b}"),
             MetadataValue::Other(v) => write!(f, "{v}"), // just write the json back
         }
+    }
+}
+
+impl PartialEq<String> for MetadataValue {
+    fn eq(&self, other: &String) -> bool {
+        self.to_string().eq(other)
     }
 }
 
@@ -292,7 +299,7 @@ impl StructType {
         self.fields.values()
     }
 
-    pub(crate) fn fields_len(&self) -> usize {
+    pub fn fields_len(&self) -> usize {
         // O(1) for indexmap
         self.fields.len()
     }

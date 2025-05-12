@@ -1,4 +1,7 @@
 //! Expression handling based on arrow-rs compute kernels.
+
+use std::sync::Arc;
+
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Datum, RecordBatch, StructArray,
@@ -11,15 +14,19 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, IntervalUnit, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
-use crate::engine::arrow_utils::prim_array_cmp;
-use crate::error::{DeltaResult, Error};
-use crate::expressions::{
+
+use delta_kernel::error::{DeltaResult, Error};
+use delta_kernel::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
     JunctionPredicate, JunctionPredicateOp, Predicate, Scalar, UnaryPredicate, UnaryPredicateOp,
 };
-use crate::schema::DataType;
+use delta_kernel::schema::DataType;
+
+use crate::arrow_expression::scalar_to_array;
+use crate::arrow_utils::prim_array_cmp;
+use crate::EngineResult;
+
 use itertools::Itertools;
-use std::sync::Arc;
 
 trait ProvidesColumnByName {
     fn column_by_name(&self, name: &str) -> Option<&ArrayRef>;
@@ -52,7 +59,7 @@ impl ProvidesColumnByName for StructArray {
 // }
 // ```
 // The path ["b", "d", "f"] would retrieve the int64 column while ["a", "b"] would produce an error.
-fn extract_column(mut parent: &dyn ProvidesColumnByName, col: &[String]) -> DeltaResult<ArrayRef> {
+fn extract_column(mut parent: &dyn ProvidesColumnByName, col: &[String]) -> EngineResult<ArrayRef> {
     let mut field_names = col.iter();
     let Some(mut field_name) = field_names.next() else {
         return Err(ArrowError::SchemaError("Empty column path".to_string()))?;
@@ -76,11 +83,11 @@ pub(crate) fn evaluate_expression(
     expression: &Expression,
     batch: &RecordBatch,
     result_type: Option<&DataType>,
-) -> DeltaResult<ArrayRef> {
+) -> EngineResult<ArrayRef> {
     use BinaryExpressionOp::*;
     use Expression::*;
     match (expression, result_type) {
-        (Literal(scalar), _) => Ok(scalar.to_array(batch.num_rows())?),
+        (Literal(scalar), _) => Ok(scalar_to_array(scalar, batch.num_rows())?),
         (Column(name), _) => extract_column(batch, name),
         (Struct(fields), Some(DataType::Struct(output_schema))) => {
             let columns = fields
@@ -102,16 +109,17 @@ pub(crate) fn evaluate_expression(
             let result = StructArray::try_new(output_fields.into(), output_cols, None)?;
             Ok(Arc::new(result))
         }
-        (Struct(_), _) => Err(Error::generic(
-            "Data type is required to evaluate struct expressions",
-        )),
+        (Struct(_), _) => {
+            Err(Error::generic("Data type is required to evaluate struct expressions").into())
+        }
         (Predicate(pred), None | Some(&DataType::BOOLEAN)) => {
             let result = evaluate_predicate(pred, batch)?;
             Ok(Arc::new(result))
         }
         (Predicate(_), Some(data_type)) => Err(Error::generic(format!(
             "Predicate evaluation produces boolean output, but caller expects {data_type:?}"
-        ))),
+        ))
+        .into()),
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
@@ -132,7 +140,7 @@ pub(crate) fn evaluate_expression(
 pub(crate) fn evaluate_predicate(
     predicate: &Predicate,
     batch: &RecordBatch,
-) -> DeltaResult<BooleanArray> {
+) -> EngineResult<BooleanArray> {
     use BinaryPredicateOp::*;
     use Predicate::*;
     match predicate {
@@ -143,7 +151,7 @@ pub(crate) fn evaluate_predicate(
             let arr = evaluate_expression(expr, batch, Some(&DataType::BOOLEAN))?;
             match arr.as_any().downcast_ref::<BooleanArray>() {
                 Some(arr) => Ok(arr.clone()),
-                None => Err(Error::generic("expected boolean array")),
+                None => Err(Error::generic("expected boolean array").into()),
             }
         }
         Not(pred) => Ok(not(&evaluate_predicate(pred, batch)?)?),
@@ -209,7 +217,8 @@ pub(crate) fn evaluate_predicate(
             }
             (l, r) => Err(Error::invalid_expression(format!(
                 "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
-            ))),
+            ))
+            .into()),
         },
         Binary(BinaryPredicate {
             op: NotIn,
@@ -234,7 +243,7 @@ pub(crate) fn evaluate_predicate(
                 NotEqual => |l, r| neq(l, r),
                 Distinct => |l, r| distinct(l, r),
                 // NOTE: [Not]In was already covered above
-                In | NotIn => return Err(Error::generic("Invalid expression given")),
+                In | NotIn => return Err(Error::generic("Invalid expression given").into()),
             };
 
             Ok(eval(&left_arr, &right_arr)?)
