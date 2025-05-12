@@ -9,7 +9,6 @@ use std::sync::LazyLock;
 
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::schemas::GetStructField;
-use crate::internal_mod;
 use crate::schema::{SchemaRef, StructType};
 use crate::table_features::{
     ReaderFeature, WriterFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
@@ -31,7 +30,12 @@ pub mod set_transaction;
 
 pub(crate) mod domain_metadata;
 pub(crate) mod schemas;
-internal_mod!(pub(crate) mod visitors);
+
+// see comment in ../lib.rs for the path module for why we include this way
+#[cfg(feature = "internal-api")]
+pub mod visitors;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod visitors;
 
 #[internal_api]
 pub(crate) const ADD_NAME: &str = "add";
