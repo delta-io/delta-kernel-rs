@@ -441,7 +441,7 @@ fn list_log_files(
         // TODO this filters out .crc files etc which start with "." - how do we want to use these kind of files?
         .filter_map_ok(identity)
         .take_while(move |path_res| match path_res {
-            Ok(path) => !end_version.is_some_and(|end_version| end_version < path.version),
+            Ok(path) => end_version.is_none_or(|end_version| end_version >= path.version),
             Err(_) => true,
         }))
 }
