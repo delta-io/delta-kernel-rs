@@ -150,7 +150,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let modification_time = metadata.last_modified.timestamp_millis();
         let metadata_size = metadata.size;
         #[cfg(not(feature = "arrow-55"))]
-        let metadata_size = metadata_size
+        let metadata_size: u64 = metadata_size
             .try_into()
             .map_err(|_| Error::generic("Failed to convert parquet metadata 'size' to u64"))?;
         if size != metadata_size {
