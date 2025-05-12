@@ -421,10 +421,10 @@ impl RowVisitor for SetTransactionVisitor {
         for i in 0..row_count {
             if let Some(app_id) = getters[0].get_opt(i, "txn.appId")? {
                 // if caller requested a specific id then only visit matches
-                if !self
+                if self
                     .application_id
                     .as_ref()
-                    .is_some_and(|requested| !requested.eq(&app_id))
+                    .is_none_or(|requested| requested.eq(&app_id))
                 {
                     let txn = SetTransactionVisitor::visit_txn(i, app_id, getters)?;
                     if !self.set_transactions.contains_key(&txn.app_id) {
@@ -552,7 +552,7 @@ impl RowVisitor for DomainMetadataVisitor {
             if let Some(domain) = domain {
                 // if caller requested a specific domain then only visit matches
                 let filter = self.domain_filter.as_ref();
-                if filter.map_or(true, |requested| requested == &domain) {
+                if filter.is_none_or(|requested| requested == &domain) {
                     let domain_metadata =
                         DomainMetadataVisitor::visit_domain_metadata(i, domain.clone(), getters)?;
                     self.domain_metadatas
