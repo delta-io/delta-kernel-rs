@@ -69,6 +69,7 @@ pub(crate) fn make_arrow_error(s: impl Into<String>) -> Error {
     .with_backtrace()
 }
 
+/// Prepares to enumerate row indexes of rows in a parquet file, accounting for row group skipping.
 pub(crate) struct RowIndexBuilder {
     row_group_starting_row_offsets: Vec<Range<i64>>,
     row_group_ordinals: Option<Vec<usize>>,

@@ -468,7 +468,7 @@ mod tests {
             metas.push(FileMeta {
                 location: url.clone(),
                 last_modified: meta.last_modified.timestamp(),
-                size: meta.size.try_into().unwrap(),
+                size: meta.size,
             });
         }
 
