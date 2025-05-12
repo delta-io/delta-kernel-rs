@@ -639,22 +639,20 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
 pub(crate) trait DataSkippingPredicateEvaluator {
     /// The output type produced by this predicate evaluator
     type Output;
-    /// The type of min and max column stats
-    type TypedStat;
-    /// The type of nullcount and rowcount column stats
-    type IntStat;
+    /// The type for column stats consumed by this predicate evaluator
+    type ColumnStat;
 
     /// Retrieves the minimum value of a column, if it exists and has the requested type.
-    fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Self::TypedStat>;
+    fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Self::ColumnStat>;
 
     /// Retrieves the maximum value of a column, if it exists and has the requested type.
-    fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Self::TypedStat>;
+    fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Self::ColumnStat>;
 
     /// Retrieves the null count of a column, if it exists.
-    fn get_nullcount_stat(&self, col: &ColumnName) -> Option<Self::IntStat>;
+    fn get_nullcount_stat(&self, col: &ColumnName) -> Option<Self::ColumnStat>;
 
     /// Retrieves the row count of a column (parquet footers always include this stat).
-    fn get_rowcount_stat(&self) -> Option<Self::IntStat>;
+    fn get_rowcount_stat(&self) -> Option<Self::ColumnStat>;
 
     /// See [`KernelPredicateEvaluator::eval_pred_scalar`]
     fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Self::Output>;
@@ -684,7 +682,7 @@ pub(crate) trait DataSkippingPredicateEvaluator {
     fn finish_eval_pred_junction(
         &self,
         op: JunctionPredicateOp,
-        preds: impl IntoIterator<Item = Option<Self::Output>>,
+        preds: &mut dyn Iterator<Item = Option<Self::Output>>,
         inverted: bool,
     ) -> Option<Self::Output>;
 
@@ -693,7 +691,7 @@ pub(crate) trait DataSkippingPredicateEvaluator {
     fn eval_partial_cmp(
         &self,
         ord: Ordering,
-        col: Self::TypedStat,
+        col: Self::ColumnStat,
         val: &Scalar,
         inverted: bool,
     ) -> Option<Self::Output>;
@@ -785,11 +783,11 @@ pub(crate) trait DataSkippingPredicateEvaluator {
             ];
             (JunctionPredicateOp::And, preds)
         };
-        self.finish_eval_pred_junction(op, preds, false)
+        self.finish_eval_pred_junction(op, &mut preds.into_iter(), false)
     }
 }
 
-impl<T: DataSkippingPredicateEvaluator> KernelPredicateEvaluator for T {
+impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T {
     type Output = T::Output;
 
     fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Self::Output> {
@@ -842,6 +840,12 @@ impl<T: DataSkippingPredicateEvaluator> KernelPredicateEvaluator for T {
         preds: impl IntoIterator<Item = Option<Self::Output>>,
         inverted: bool,
     ) -> Option<Self::Output> {
-        self.finish_eval_pred_junction(op, preds, inverted)
+        self.finish_eval_pred_junction(op, &mut preds.into_iter(), inverted)
     }
 }
+
+// Statically verify that both forms of the trait are dyn compatible
+#[cfg(test)]
+const _: Option<&dyn DataSkippingPredicateEvaluator<Output = Pred, ColumnStat = Expr>> = None;
+#[cfg(test)]
+const _: Option<&dyn DataSkippingPredicateEvaluator<Output = bool, ColumnStat = Scalar>> = None;
