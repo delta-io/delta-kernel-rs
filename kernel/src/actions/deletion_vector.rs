@@ -270,7 +270,10 @@ pub fn split_vector(
     match vector {
         Some(vector) if split_index < vector.len() => Some(vector.split_off(split_index)),
         Some(vector) if extend.is_some() => {
-            vector.extend(std::iter::repeat(extend.unwrap()).take(split_index - vector.len()));
+            vector.extend(std::iter::repeat_n(
+                extend.unwrap(),
+                split_index - vector.len(),
+            ));
             None
         }
         _ => None,
