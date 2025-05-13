@@ -7,6 +7,11 @@ use crate::Error as DeltaError;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
 
+// NB: tests for this module (testing registering a custom URL handler) are in the
+// hdfs-integration-test crate. Otherwise (if they were included here) we would need to support
+// multiple versions of hdfs crates since they are compatible with specific versions of
+// object_store (of which we support multiple versions).
+
 /// Alias for convenience
 type ClosureReturn = Result<(Box<dyn ObjectStore>, Path), Error>;
 /// This type alias makes it easier to reference the handler closure(s)
@@ -58,65 +63,4 @@ where
         }
     }
     parse_url_opts_object_store(url, options)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use crate::object_store::{self, path::Path};
-    use hdfs_native_object_store::HdfsObjectStore;
-
-    /// Example funciton of doing testing of a custom [HdfsObjectStore] construction
-    fn parse_url_opts_hdfs_native<I, K, V>(
-        url: &Url,
-        options: I,
-    ) -> Result<(Box<dyn ObjectStore>, Path), Error>
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: Into<String>,
-    {
-        let options_map = options
-            .into_iter()
-            .map(|(k, v)| (k.as_ref().to_string(), v.into()))
-            .collect();
-        let store = HdfsObjectStore::with_config(url.as_str(), options_map)?;
-        let path = Path::parse(url.path())?;
-        Ok((Box::new(store), path))
-    }
-
-    #[test]
-    fn test_add_hdfs_scheme() {
-        let scheme = "hdfs";
-        if let Ok(handlers) = URL_REGISTRY.read() {
-            assert!(handlers.get(scheme).is_none());
-        } else {
-            panic!("Failed to read the RwLock for the registry");
-        }
-        insert_url_handler(scheme, Arc::new(parse_url_opts_hdfs_native))
-            .expect("Failed to add new URL scheme handler");
-
-        if let Ok(handlers) = URL_REGISTRY.read() {
-            assert!(handlers.get(scheme).is_some());
-        } else {
-            panic!("Failed to read the RwLock for the registry");
-        }
-
-        let url: Url = Url::parse("hdfs://example").expect("Failed to parse URL");
-        let options: HashMap<String, String> = HashMap::default();
-        // Currently constructing an [HdfsObjectStore] won't work if there isn't an actual HDFS
-        // to connect to, so the only way to really verify that we got the object store we
-        // expected is to inspect the `store` on the error v_v
-        if let Err(store_error) = parse_url_opts(&url, options) {
-            match store_error {
-                object_store::Error::Generic { store, source: _ } => {
-                    assert_eq!(store, "HdfsObjectStore");
-                }
-                unexpected => panic!("Unexpected error happened: {unexpected:?}"),
-            }
-        } else {
-            panic!("Expected to get an error when constructing an HdfsObjectStore, but something didn't work as expected! Either the parse_url_opts_hdfs_native function didn't get called, or the hdfs-native-object-store no longer errors when it cannot connect to HDFS");
-        }
-    }
 }

@@ -7,6 +7,7 @@ members = [
     "kernel/examples/*",
     "test-utils",
     "feature-tests",
+    "hdfs-integration-test",
 ]
 # note that in addition to the members above, the workspace includes examples:
 # - inspect-table
