@@ -299,6 +299,66 @@ impl Scalar {
         };
         Ok(Self::TimestampNtz(timestamp.timestamp_micros()))
     }
+
+    /// Attempts to add two scalars, returning None if they were incompatible.
+    pub fn try_add(&self, other: &Scalar) -> Option<Scalar> {
+        use Scalar::*;
+        let result = match (self, other) {
+            (Integer(a), Integer(b)) => Integer(a + b),
+            (Long(a), Long(b)) => Long(a + b),
+            (Short(a), Short(b)) => Short(a + b),
+            (Byte(a), Byte(b)) => Byte(a + b),
+            (Float(a), Float(b)) => Float(a + b),
+            (Double(a), Double(b)) => Double(a + b),
+            _ => return None,
+        };
+        Some(result)
+    }
+
+    /// Attempts to subtract two scalars, returning None if they were incompatible.
+    pub fn try_sub(&self, other: &Scalar) -> Option<Scalar> {
+        use Scalar::*;
+        let result = match (self, other) {
+            (Integer(a), Integer(b)) => Integer(a - b),
+            (Long(a), Long(b)) => Long(a - b),
+            (Short(a), Short(b)) => Short(a - b),
+            (Byte(a), Byte(b)) => Byte(a - b),
+            (Float(a), Float(b)) => Float(a - b),
+            (Double(a), Double(b)) => Double(a - b),
+            _ => return None,
+        };
+        Some(result)
+    }
+
+    /// Attempts to multiply two scalars, returning None if they were incompatible.
+    pub fn try_mul(&self, other: &Scalar) -> Option<Scalar> {
+        use Scalar::*;
+        let result = match (self, other) {
+            (Integer(a), Integer(b)) => Integer(a * b),
+            (Long(a), Long(b)) => Long(a * b),
+            (Short(a), Short(b)) => Short(a * b),
+            (Byte(a), Byte(b)) => Byte(a * b),
+            (Float(a), Float(b)) => Float(a * b),
+            (Double(a), Double(b)) => Double(a * b),
+            _ => return None,
+        };
+        Some(result)
+    }
+
+    /// Attempts to divide two scalars, returning None if they were incompatible.
+    pub fn try_div(&self, other: &Scalar) -> Option<Scalar> {
+        use Scalar::*;
+        let result = match (self, other) {
+            (Integer(a), Integer(b)) => Integer(a / b),
+            (Long(a), Long(b)) => Long(a / b),
+            (Short(a), Short(b)) => Short(a / b),
+            (Byte(a), Byte(b)) => Byte(a / b),
+            (Float(a), Float(b)) => Float(a / b),
+            (Double(a), Double(b)) => Double(a / b),
+            _ => return None,
+        };
+        Some(result)
+    }
 }
 
 impl Display for Scalar {
