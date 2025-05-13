@@ -186,15 +186,15 @@ impl TryFrom<DirEntry> for FileMeta {
                 last_modified.as_millis()
             ))
         })?;
-        // TODO: remove after arrow 54 is dropped
-        #[allow(clippy::useless_conversion)]
+        let metadata_len = metadata.len();
+        #[cfg(all(feature = "arrow-54", not(feature = "arrow-55")))]
+        let metadata_len = metadata_len
+            .try_into()
+            .map_err(|_| Error::generic("unable to convert DirEntry metadata to file size"))?;
         Ok(FileMeta {
             location,
             last_modified,
-            size: metadata
-                .len()
-                .try_into()
-                .map_err(|_| Error::generic("unable to convert DirEntry metadata to file size"))?,
+            size: metadata_len,
         })
     }
 }

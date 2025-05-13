@@ -128,8 +128,6 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         writer.write(record_batch)?;
         writer.close()?; // writer must be closed to write footer
 
-        // TODO: remove after dropping arrow 54 support
-        #[allow(clippy::useless_conversion)]
         let size: u64 = buffer
             .len()
             .try_into()
@@ -150,10 +148,9 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
 
         let metadata = self.store.head(&Path::from_url_path(path.path())?).await?;
         let modification_time = metadata.last_modified.timestamp_millis();
-        // TODO: remove after dropping arrow 54 support
-        #[allow(clippy::useless_conversion)]
-        let metadata_size: u64 = metadata
-            .size
+        let metadata_size = metadata.size;
+        #[cfg(not(feature = "arrow-55"))]
+        let metadata_size: u64 = metadata_size
             .try_into()
             .map_err(|_| Error::generic("Failed to convert parquet metadata 'size' to u64"))?;
         if size != metadata_size {
@@ -418,12 +415,13 @@ mod tests {
             .schema()
             .clone();
 
-        // TODO: remove after dropping arrow 54 support
-        #[allow(clippy::useless_conversion)]
+        let meta_size = meta.size;
+        #[cfg(not(feature = "arrow-55"))]
+        let meta_size = meta_size.try_into().unwrap();
         let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp(),
-            size: meta.size.try_into().unwrap(),
+            size: meta_size,
         }];
 
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
