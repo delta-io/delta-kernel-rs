@@ -14,13 +14,13 @@ use crate::schema::SchemaRef;
 use crate::snapshot::LastCheckpointHint;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, Expression, ParquetHandler, Predicate, PredicateRef,
-    RowVisitor, StorageHandler, Version,
+    DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
+    PredicateRef, RowVisitor, StorageHandler, Version,
 };
 use delta_kernel_derive::internal_api;
 
 use itertools::Itertools;
-use tracing::warn;
+use tracing::{debug, warn};
 use url::Url;
 
 #[cfg(test)]
@@ -219,23 +219,80 @@ impl LogSegment {
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
-        // `replay` expects commit files to be sorted in descending order, so we reverse the sorted
-        // commit files
-        let commit_files: Vec<_> = self
-            .ascending_commit_files
-            .iter()
-            .rev()
-            .map(|f| f.location.clone())
-            .collect();
+        // `replay` expects commit files to be sorted in descending order, so the return value here is correct
+        let cover_locations = self.find_commit_cover();
+
         let commit_stream = engine
             .json_handler()
-            .read_json_files(&commit_files, commit_read_schema, meta_predicate.clone())?
+            .read_json_files(&cover_locations, commit_read_schema, meta_predicate.clone())?
             .map_ok(|batch| (batch, true));
 
         let checkpoint_stream =
             self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate)?;
 
         Ok(commit_stream.chain(checkpoint_stream))
+    }
+
+    /// find a minimal set to cover the range of commits we want. This is greedy so not always
+    /// optimal, but we assume there are rarely overlapping compactions so this is okay. NB: This
+    /// returns files is DESCENDING ORDER, as that's what `replay` expects. This function assumes
+    /// that all files in `self.ascending_commit_files` and `self.ascending_compaction_files` are in
+    /// range for this log segment. This is invariant is maintained by our listing code.
+    fn find_commit_cover(&self) -> Vec<FileMeta> {
+        // Note that for this algorithm, we're iterating through commits/compactions in DESCENDING
+        // order. We track the next low point covered by a compaction. So the steps are:
+        // Loop over all commit files:
+        //   1. If the current commit is at or above the next covered low point, skip it, it's covered
+        //   2. Otherwise, if there is a next compaction, check if its high point is equal to the
+        //      current commit version.
+        //     a. if yes, we're crossing into a compaction, skip the commit, include the compaction
+        //        file, set the new low point
+        //     b. if not, this commit isn't covered so include it
+        //   3. If there's no next compaction, just include the commit
+        let mut cover = vec![];
+        let mut desc_compaction_iter = self.ascending_compaction_files.iter().rev().peekable();
+        let mut next_low = Version::MAX;
+        for commit_file in self.ascending_commit_files.iter().rev() {
+            if commit_file.version >= next_low {
+                // we've covered this one already
+                debug!("Skipping commit file as it's already covered: {commit_file:#?}");
+                continue;
+            }
+            if let Some(next_compaction) = desc_compaction_iter.peek() {
+                let end_version = next_compaction.hi_version().expect("FIX ME");
+                if commit_file.version == end_version {
+                    // the next compaction file covers up to this point, pull it off and use it as
+                    // the next output file
+                    debug!("Using compaction file: {next_compaction:#?}");
+                    cover.push(next_compaction.location.clone());
+                    next_low = next_compaction.version;
+
+                    desc_compaction_iter.next();
+
+                    // to deal with overlaps, advance the compaction files iter until the hi version is
+                    // below where the last one ended
+                    while let Some(next) = desc_compaction_iter.peek() {
+                        if next.hi_version().expect("FIX ME") < next_low {
+                            break;
+                        } else {
+                            debug!("Skipping compaction file as it's already covered: {next:#?}");
+                            desc_compaction_iter.next();
+                        }
+                    }
+                } else {
+                    // not covered, include
+                    debug!("Including uncovered commit file {commit_file:#?}");
+                    cover.push(commit_file.location.clone());
+                }
+            } else {
+                // no more compactions, so include if we're below the low the final compaction set
+                debug!(
+                    "Including commit file as no more compactions {commit_file:#?}, low {next_low}"
+                );
+                cover.push(commit_file.location.clone());
+            }
+        }
+        cover
     }
 
     /// Returns an iterator over checkpoint data, processing sidecar files when necessary.
