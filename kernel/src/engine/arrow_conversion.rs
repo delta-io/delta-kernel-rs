@@ -1,4 +1,4 @@
-//! Conversions from kernel types to arrow types
+//! Conversions from kernel schema types to arrow schema types.
 
 use std::sync::Arc;
 
@@ -19,19 +19,61 @@ pub(crate) const MAP_ROOT_DEFAULT: &str = "key_value";
 pub(crate) const MAP_KEY_DEFAULT: &str = "key";
 pub(crate) const MAP_VALUE_DEFAULT: &str = "value";
 
-impl TryFrom<&StructType> for ArrowSchema {
-    type Error = ArrowError;
+/// Convert a kernel type into an arrow type (automatically implemented for all types that
+/// implement [`TryFromKernel`])
+pub trait TryIntoArrow<ArrowType> {
+    fn into_arrow(self) -> Result<ArrowType, ArrowError>;
+}
 
-    fn try_from(s: &StructType) -> Result<Self, ArrowError> {
-        let fields: Vec<ArrowField> = s.fields().map(TryInto::try_into).try_collect()?;
+/// Convert an arrow type into a kernel type (a similar [`TryIntoKernel`] trait is automatically
+/// implemented for all types that implement [`TryFromArrow`])
+pub trait TryFromArrow<ArrowType> {
+    fn from_arrow(t: ArrowType) -> Result<Self, ArrowError>
+    where
+        Self: Sized;
+}
+
+/// Convert an arrow type into a kernel type (automatically implemented for all types that
+/// implement [`TryFromArrow`])
+pub trait TryIntoKernel<KernelType> {
+    fn into_kernel(self) -> Result<KernelType, ArrowError>;
+}
+
+/// Convert a kernel type into an arrow type (a similar [`TryIntoArrow`] trait is automatically
+/// implemented for all types that implement [`TryFromKernel`])
+pub trait TryFromKernel<KernelType> {
+    fn from_kernel(t: KernelType) -> Result<Self, ArrowError>
+    where
+        Self: Sized;
+}
+
+impl<KernelType, ArrowType> TryIntoArrow<ArrowType> for KernelType
+where
+    ArrowType: TryFromKernel<KernelType>,
+{
+    fn into_arrow(self) -> Result<ArrowType, ArrowError> {
+        ArrowType::from_kernel(self)
+    }
+}
+
+impl<KernelType, ArrowType> TryIntoKernel<KernelType> for ArrowType
+where
+    KernelType: TryFromArrow<ArrowType>,
+{
+    fn into_kernel(self) -> Result<KernelType, ArrowError> {
+        KernelType::from_arrow(self)
+    }
+}
+
+impl TryFromKernel<&StructType> for ArrowSchema {
+    fn from_kernel(s: &StructType) -> Result<Self, ArrowError> {
+        let fields: Vec<ArrowField> = s.fields().map(TryFromKernel::from_kernel).try_collect()?;
         Ok(ArrowSchema::new(fields))
     }
 }
 
-impl TryFrom<&StructField> for ArrowField {
-    type Error = ArrowError;
-
-    fn try_from(f: &StructField) -> Result<Self, ArrowError> {
+impl TryFromKernel<&StructField> for ArrowField {
+    fn from_kernel(f: &StructField) -> Result<Self, ArrowError> {
         let metadata = f
             .metadata()
             .iter()
@@ -44,7 +86,7 @@ impl TryFrom<&StructField> for ArrowField {
 
         let field = ArrowField::new(
             f.name(),
-            ArrowDataType::try_from(f.data_type())?,
+            ArrowDataType::from_kernel(f.data_type())?,
             f.is_nullable(),
         )
         .with_metadata(metadata);
@@ -53,34 +95,30 @@ impl TryFrom<&StructField> for ArrowField {
     }
 }
 
-impl TryFrom<&ArrayType> for ArrowField {
-    type Error = ArrowError;
-
-    fn try_from(a: &ArrayType) -> Result<Self, ArrowError> {
+impl TryFromKernel<&ArrayType> for ArrowField {
+    fn from_kernel(a: &ArrayType) -> Result<Self, ArrowError> {
         Ok(ArrowField::new(
             LIST_ARRAY_ROOT,
-            ArrowDataType::try_from(a.element_type())?,
+            ArrowDataType::from_kernel(a.element_type())?,
             a.contains_null(),
         ))
     }
 }
 
-impl TryFrom<&MapType> for ArrowField {
-    type Error = ArrowError;
-
-    fn try_from(a: &MapType) -> Result<Self, ArrowError> {
+impl TryFromKernel<&MapType> for ArrowField {
+    fn from_kernel(a: &MapType) -> Result<Self, ArrowError> {
         Ok(ArrowField::new(
             MAP_ROOT_DEFAULT,
             ArrowDataType::Struct(
                 vec![
                     ArrowField::new(
                         MAP_KEY_DEFAULT,
-                        ArrowDataType::try_from(a.key_type())?,
+                        ArrowDataType::from_kernel(a.key_type())?,
                         false,
                     ),
                     ArrowField::new(
                         MAP_VALUE_DEFAULT,
-                        ArrowDataType::try_from(a.value_type())?,
+                        ArrowDataType::from_kernel(a.value_type())?,
                         a.value_contains_null(),
                     ),
                 ]
@@ -91,10 +129,8 @@ impl TryFrom<&MapType> for ArrowField {
     }
 }
 
-impl TryFrom<&DataType> for ArrowDataType {
-    type Error = ArrowError;
-
-    fn try_from(t: &DataType) -> Result<Self, ArrowError> {
+impl TryFromKernel<&DataType> for ArrowDataType {
+    fn from_kernel(t: &DataType) -> Result<Self, ArrowError> {
         match t {
             DataType::Primitive(p) => {
                 match p {
@@ -128,54 +164,49 @@ impl TryFrom<&DataType> for ArrowDataType {
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(
                 s.fields()
-                    .map(TryInto::try_into)
+                    .map(TryIntoArrow::into_arrow)
                     .collect::<Result<Vec<ArrowField>, ArrowError>>()?
                     .into(),
             )),
-            DataType::Array(a) => Ok(ArrowDataType::List(Arc::new(a.as_ref().try_into()?))),
-            DataType::Map(m) => Ok(ArrowDataType::Map(Arc::new(m.as_ref().try_into()?), false)),
+            DataType::Array(a) => Ok(ArrowDataType::List(Arc::new(a.as_ref().into_arrow()?))),
+            DataType::Map(m) => Ok(ArrowDataType::Map(
+                Arc::new(m.as_ref().into_arrow()?),
+                false,
+            )),
         }
     }
 }
 
-impl TryFrom<&ArrowSchema> for StructType {
-    type Error = ArrowError;
-
-    fn try_from(arrow_schema: &ArrowSchema) -> Result<Self, ArrowError> {
+impl TryFromArrow<&ArrowSchema> for StructType {
+    fn from_arrow(arrow_schema: &ArrowSchema) -> Result<Self, ArrowError> {
         StructType::try_new(
             arrow_schema
                 .fields()
                 .iter()
-                .map(|field| field.as_ref().try_into()),
+                .map(|field| field.as_ref().into_kernel()),
         )
     }
 }
 
-impl TryFrom<ArrowSchemaRef> for StructType {
-    type Error = ArrowError;
-
-    fn try_from(arrow_schema: ArrowSchemaRef) -> Result<Self, ArrowError> {
-        arrow_schema.as_ref().try_into()
+impl TryFromArrow<ArrowSchemaRef> for StructType {
+    fn from_arrow(arrow_schema: ArrowSchemaRef) -> Result<Self, ArrowError> {
+        arrow_schema.as_ref().into_kernel()
     }
 }
 
-impl TryFrom<&ArrowField> for StructField {
-    type Error = ArrowError;
-
-    fn try_from(arrow_field: &ArrowField) -> Result<Self, ArrowError> {
+impl TryFromArrow<&ArrowField> for StructField {
+    fn from_arrow(arrow_field: &ArrowField) -> Result<Self, ArrowError> {
         Ok(StructField::new(
             arrow_field.name().clone(),
-            DataType::try_from(arrow_field.data_type())?,
+            DataType::from_arrow(arrow_field.data_type())?,
             arrow_field.is_nullable(),
         )
         .with_metadata(arrow_field.metadata().iter().map(|(k, v)| (k.clone(), v))))
     }
 }
 
-impl TryFrom<&ArrowDataType> for DataType {
-    type Error = ArrowError;
-
-    fn try_from(arrow_datatype: &ArrowDataType) -> Result<Self, ArrowError> {
+impl TryFromArrow<&ArrowDataType> for DataType {
+    fn from_arrow(arrow_datatype: &ArrowDataType) -> Result<Self, ArrowError> {
         match arrow_datatype {
             ArrowDataType::Utf8 => Ok(DataType::STRING),
             ArrowDataType::LargeUtf8 => Ok(DataType::STRING),
@@ -213,27 +244,37 @@ impl TryFrom<&ArrowDataType> for DataType {
                 Ok(DataType::TIMESTAMP)
             }
             ArrowDataType::Struct(fields) => {
-                DataType::try_struct_type(fields.iter().map(|field| field.as_ref().try_into()))
+                DataType::try_struct_type(fields.iter().map(|field| field.as_ref().into_kernel()))
             }
-            ArrowDataType::List(field) => {
-                Ok(ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()).into())
-            }
-            ArrowDataType::ListView(field) => {
-                Ok(ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()).into())
-            }
-            ArrowDataType::LargeList(field) => {
-                Ok(ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()).into())
-            }
-            ArrowDataType::LargeListView(field) => {
-                Ok(ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()).into())
-            }
-            ArrowDataType::FixedSizeList(field, _) => {
-                Ok(ArrayType::new((*field).data_type().try_into()?, (*field).is_nullable()).into())
-            }
+            ArrowDataType::List(field) => Ok(ArrayType::new(
+                (*field).data_type().into_kernel()?,
+                (*field).is_nullable(),
+            )
+            .into()),
+            ArrowDataType::ListView(field) => Ok(ArrayType::new(
+                (*field).data_type().into_kernel()?,
+                (*field).is_nullable(),
+            )
+            .into()),
+            ArrowDataType::LargeList(field) => Ok(ArrayType::new(
+                (*field).data_type().into_kernel()?,
+                (*field).is_nullable(),
+            )
+            .into()),
+            ArrowDataType::LargeListView(field) => Ok(ArrayType::new(
+                (*field).data_type().into_kernel()?,
+                (*field).is_nullable(),
+            )
+            .into()),
+            ArrowDataType::FixedSizeList(field, _) => Ok(ArrayType::new(
+                (*field).data_type().into_kernel()?,
+                (*field).is_nullable(),
+            )
+            .into()),
             ArrowDataType::Map(field, _) => {
                 if let ArrowDataType::Struct(struct_fields) = field.data_type() {
-                    let key_type = DataType::try_from(struct_fields[0].data_type())?;
-                    let value_type = DataType::try_from(struct_fields[1].data_type())?;
+                    let key_type = DataType::from_arrow(struct_fields[0].data_type())?;
+                    let value_type = DataType::from_arrow(struct_fields[1].data_type())?;
                     let value_type_nullable = struct_fields[1].is_nullable();
                     Ok(MapType::new(key_type, value_type, value_type_nullable).into())
                 } else {
@@ -242,7 +283,7 @@ impl TryFrom<&ArrowDataType> for DataType {
             }
             // Dictionary types are just an optimized in-memory representation of an array.
             // Schema-wise, they are the same as the value type.
-            ArrowDataType::Dictionary(_, value_type) => Ok(value_type.as_ref().try_into()?),
+            ArrowDataType::Dictionary(_, value_type) => Ok(value_type.as_ref().into_kernel()?),
             s => Err(ArrowError::SchemaError(format!(
                 "Invalid data type for Delta Lake: {s}"
             ))),
@@ -252,6 +293,7 @@ impl TryFrom<&ArrowDataType> for DataType {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::engine::arrow_conversion::ArrowField;
     use crate::{
         schema::{DataType, StructField},
@@ -265,7 +307,7 @@ mod tests {
         metadata.insert("description", "hello world".to_owned());
         let struct_field = StructField::not_null("name", DataType::STRING).with_metadata(metadata);
 
-        let arrow_field = ArrowField::try_from(&struct_field)?;
+        let arrow_field = ArrowField::from_kernel(&struct_field)?;
         let new_metadata = arrow_field.metadata();
 
         assert_eq!(
