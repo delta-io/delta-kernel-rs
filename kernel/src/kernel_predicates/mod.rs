@@ -215,21 +215,15 @@ pub(crate) trait KernelPredicateEvaluator {
             (Literal(a), Literal(b)) => self.eval_pred_binary_scalars(op, a, b, inverted),
             (Column(col), Literal(val)) => match op {
                 LessThan => self.eval_pred_lt(col, val, inverted),
-                GreaterThanOrEqual => self.eval_pred_lt(col, val, !inverted),
-                LessThanOrEqual => self.eval_pred_gt(col, val, !inverted),
                 GreaterThan => self.eval_pred_gt(col, val, inverted),
                 Equal => self.eval_pred_eq(col, val, inverted),
-                NotEqual => self.eval_pred_eq(col, val, !inverted),
                 Distinct => self.eval_pred_distinct(col, val, inverted),
                 In => self.eval_pred_in(col, val, inverted),
             },
             (Literal(val), Column(col)) => match op {
                 LessThan => self.eval_pred_gt(col, val, inverted),
-                GreaterThanOrEqual => self.eval_pred_gt(col, val, !inverted),
-                LessThanOrEqual => self.eval_pred_lt(col, val, !inverted),
                 GreaterThan => self.eval_pred_lt(col, val, inverted),
                 Equal => self.eval_pred_eq(col, val, inverted),
-                NotEqual => self.eval_pred_eq(col, val, !inverted),
                 Distinct => self.eval_pred_distinct(col, val, inverted),
                 In => None, // arg order is semantically important
             },
@@ -479,11 +473,8 @@ impl KernelPredicateEvaluatorDefaults {
         use BinaryPredicateOp::*;
         match op {
             Equal => Self::partial_cmp_scalars(Ordering::Equal, left, right, inverted),
-            NotEqual => Self::partial_cmp_scalars(Ordering::Equal, left, right, !inverted),
             LessThan => Self::partial_cmp_scalars(Ordering::Less, left, right, inverted),
-            LessThanOrEqual => Self::partial_cmp_scalars(Ordering::Greater, left, right, !inverted),
             GreaterThan => Self::partial_cmp_scalars(Ordering::Greater, left, right, inverted),
-            GreaterThanOrEqual => Self::partial_cmp_scalars(Ordering::Less, left, right, !inverted),
             Distinct | In => {
                 debug!("Unsupported binary operator: {left:?} {op:?} {right:?}");
                 None

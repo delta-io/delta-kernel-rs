@@ -149,7 +149,8 @@ pub extern "C" fn visit_predicate_le(
     a: usize,
     b: usize,
 ) -> usize {
-    visit_predicate_binary(state, BinaryPredicateOp::LessThanOrEqual, a, b)
+    let p = visit_predicate_binary(state, BinaryPredicateOp::GreaterThan, a, b);
+    visit_predicate_not(state, p)
 }
 
 #[no_mangle]
@@ -167,7 +168,8 @@ pub extern "C" fn visit_predicate_ge(
     a: usize,
     b: usize,
 ) -> usize {
-    visit_predicate_binary(state, BinaryPredicateOp::GreaterThanOrEqual, a, b)
+    let p = visit_predicate_binary(state, BinaryPredicateOp::LessThan, a, b);
+    visit_predicate_not(state, p)
 }
 
 #[no_mangle]
@@ -185,7 +187,8 @@ pub extern "C" fn visit_predicate_ne(
     a: usize,
     b: usize,
 ) -> usize {
-    visit_predicate_binary(state, BinaryPredicateOp::NotEqual, a, b)
+    let p = visit_predicate_binary(state, BinaryPredicateOp::Equal, a, b);
+    visit_predicate_not(state, p)
 }
 
 /// # Safety

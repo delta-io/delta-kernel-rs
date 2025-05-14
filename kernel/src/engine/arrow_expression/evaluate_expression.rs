@@ -3,7 +3,7 @@ use crate::arrow::array::types::*;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Datum, RecordBatch, StructArray,
 };
-use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq};
+use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, lt};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
 use crate::arrow::compute::{and_kleene, is_null, not, or_kleene};
@@ -218,11 +218,8 @@ pub(crate) fn evaluate_predicate(
 
             let eval_fn = match op {
                 LessThan => lt,
-                LessThanOrEqual => lt_eq,
                 GreaterThan => gt,
-                GreaterThanOrEqual => gt_eq,
                 Equal => eq,
-                NotEqual => neq,
                 Distinct => distinct,
                 In => return eval_in(),
             };
