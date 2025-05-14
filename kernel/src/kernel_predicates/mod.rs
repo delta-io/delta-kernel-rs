@@ -210,28 +210,34 @@ pub(crate) trait KernelPredicateEvaluator {
         use BinaryPredicateOp::*;
         use Expr::{Column, Literal};
 
-        // NOTE: We rely on the literal values to provide logical type hints. That means we cannot
-        // perform column-column comparisons, because we cannot infer the logical type to use.
-        let (op, col, val) = match (left, right) {
-            (Column(a), Column(b)) => return self.eval_pred_binary_columns(op, a, b, inverted),
-            (Literal(a), Literal(b)) => return self.eval_pred_binary_scalars(op, a, b, inverted),
-            (Literal(val), Column(col)) => (op.commute()?, col, val),
-            (Column(col), Literal(val)) => (op, col, val),
+        match (left, right) {
+            (Column(a), Column(b)) => self.eval_pred_binary_columns(op, a, b, inverted),
+            (Literal(a), Literal(b)) => self.eval_pred_binary_scalars(op, a, b, inverted),
+            (Column(col), Literal(val)) => match op {
+                LessThan => self.eval_pred_lt(col, val, inverted),
+                GreaterThanOrEqual => self.eval_pred_lt(col, val, !inverted),
+                LessThanOrEqual => self.eval_pred_le(col, val, inverted),
+                GreaterThan => self.eval_pred_le(col, val, !inverted),
+                Equal => self.eval_pred_eq(col, val, inverted),
+                NotEqual => self.eval_pred_eq(col, val, !inverted),
+                Distinct => self.eval_pred_distinct(col, val, inverted),
+                In => self.eval_pred_in(col, val, inverted),
+                NotIn => self.eval_pred_in(col, val, !inverted),
+            },
+            (Literal(val), Column(col)) => match op {
+                LessThan => self.eval_pred_le(col, val, !inverted),
+                GreaterThanOrEqual => self.eval_pred_le(col, val, inverted),
+                LessThanOrEqual => self.eval_pred_lt(col, val, !inverted),
+                GreaterThan => self.eval_pred_lt(col, val, inverted),
+                Equal => self.eval_pred_eq(col, val, inverted),
+                NotEqual => self.eval_pred_eq(col, val, !inverted),
+                Distinct => self.eval_pred_distinct(col, val, inverted),
+                In | NotIn => None, // arg order is semantically important
+            },
             _ => {
                 debug!("Unsupported binary operand(s): {left:?} {op:?} {right:?}");
-                return None;
+                None
             }
-        };
-        match op {
-            LessThan => self.eval_pred_lt(col, val, inverted),
-            GreaterThanOrEqual => self.eval_pred_lt(col, val, !inverted),
-            LessThanOrEqual => self.eval_pred_le(col, val, inverted),
-            GreaterThan => self.eval_pred_le(col, val, !inverted),
-            Equal => self.eval_pred_eq(col, val, inverted),
-            NotEqual => self.eval_pred_eq(col, val, !inverted),
-            Distinct => self.eval_pred_distinct(col, val, inverted),
-            In => self.eval_pred_in(col, val, inverted),
-            NotIn => self.eval_pred_in(col, val, !inverted),
         }
     }
 
@@ -824,6 +830,8 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
         self.eval_pred_binary_scalars(op, left, right, inverted)
     }
 
+    // NOTE: We rely on the literal values to provide logical type hints. That means we cannot
+    // perform column-column comparisons, because we cannot infer the logical type to use.
     fn eval_pred_binary_columns(
         &self,
         _op: BinaryPredicateOp,
@@ -831,7 +839,7 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
         _b: &ColumnName,
         _inverted: bool,
     ) -> Option<Self::Output> {
-        None // Unsupported
+        None
     }
 
     fn finish_eval_pred_junction(

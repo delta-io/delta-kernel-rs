@@ -179,6 +179,15 @@ pub extern "C" fn visit_predicate_eq(
     visit_predicate_binary(state, BinaryPredicateOp::Equal, a, b)
 }
 
+#[no_mangle]
+pub extern "C" fn visit_predicate_ne(
+    state: &mut KernelExpressionVisitorState,
+    a: usize,
+    b: usize,
+) -> usize {
+    visit_predicate_binary(state, BinaryPredicateOp::NotEqual, a, b)
+}
+
 /// # Safety
 /// The string slice must be valid
 #[no_mangle]

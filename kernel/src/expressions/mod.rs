@@ -173,19 +173,6 @@ impl BinaryPredicateOp {
             Distinct | In | NotIn => false, // tolerates NULL input
         }
     }
-
-    /// Returns `<op2>` (if any) such that `B <op2> A` is equivalent to `A <op> B`.
-    pub(crate) fn commute(&self) -> Option<BinaryPredicateOp> {
-        use BinaryPredicateOp::*;
-        match self {
-            GreaterThan => Some(LessThan),
-            GreaterThanOrEqual => Some(LessThanOrEqual),
-            LessThan => Some(GreaterThan),
-            LessThanOrEqual => Some(GreaterThanOrEqual),
-            Equal | NotEqual | Distinct => Some(*self),
-            In | NotIn => None, // not commutative
-        }
-    }
 }
 
 impl JunctionPredicateOp {
