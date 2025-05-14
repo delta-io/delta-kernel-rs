@@ -7,7 +7,6 @@ members = [
     "kernel/examples/*",
     "test-utils",
     "feature-tests",
-    "datafusion",
 ]
 # note that in addition to the members above, the workspace includes examples:
 # - inspect-table
