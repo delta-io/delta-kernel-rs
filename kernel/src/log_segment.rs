@@ -14,8 +14,8 @@ use crate::schema::SchemaRef;
 use crate::snapshot::LastCheckpointHint;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, ParquetHandler, RowVisitor,
-    StorageHandler, Version,
+    DeltaResult, Engine, EngineData, Error, Expression, ParquetHandler, Predicate, PredicateRef,
+    RowVisitor, StorageHandler, Version,
 };
 use delta_kernel_derive::internal_api;
 
@@ -209,7 +209,7 @@ impl LogSegment {
         engine: &dyn Engine,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
-        meta_predicate: Option<ExpressionRef>,
+        meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
         // `replay` expects commit files to be sorted in descending order, so we reverse the sorted
         // commit files
@@ -245,7 +245,7 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
         checkpoint_read_schema: SchemaRef,
-        meta_predicate: Option<ExpressionRef>,
+        meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
         let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
             || checkpoint_read_schema.contains(REMOVE_NAME);
@@ -341,7 +341,7 @@ impl LogSegment {
         log_root: Url,
         batch: &dyn EngineData,
         checkpoint_read_schema: SchemaRef,
-        meta_predicate: Option<ExpressionRef>,
+        meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<Option<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>> {
         // Visit the rows of the checkpoint batch to extract sidecar file references
         let mut visitor = SidecarVisitor::default();
@@ -407,8 +407,8 @@ impl LogSegment {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
         let schema = get_log_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
         // filter out log files that do not contain metadata or protocol information
-        static META_PREDICATE: LazyLock<Option<ExpressionRef>> = LazyLock::new(|| {
-            Some(Arc::new(Expression::or(
+        static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
+            Some(Arc::new(Predicate::or(
                 Expression::column([METADATA_NAME, "id"]).is_not_null(),
                 Expression::column([PROTOCOL_NAME, "minReaderVersion"]).is_not_null(),
             )))
@@ -441,7 +441,7 @@ fn list_log_files(
         // TODO this filters out .crc files etc which start with "." - how do we want to use these kind of files?
         .filter_map_ok(identity)
         .take_while(move |path_res| match path_res {
-            Ok(path) => !end_version.is_some_and(|end_version| end_version < path.version),
+            Ok(path) => end_version.is_none_or(|end_version| end_version >= path.version),
             Err(_) => true,
         }))
 }

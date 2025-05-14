@@ -24,8 +24,8 @@ use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, ExpressionRef, FileDataReadResultIterator, FileMeta,
-    ParquetHandler,
+    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetHandler,
+    PredicateRef,
 };
 
 #[derive(Debug)]
@@ -128,8 +128,6 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         writer.write(record_batch)?;
         writer.close()?; // writer must be closed to write footer
 
-        // TODO: remove after dropping arrow 54 support
-        #[allow(clippy::useless_conversion)]
         let size: u64 = buffer
             .len()
             .try_into()
@@ -145,15 +143,14 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let path = path.join(&name)?;
 
         self.store
-            .put(&Path::from(path.path()), buffer.into())
+            .put(&Path::from_url_path(path.path())?, buffer.into())
             .await?;
 
-        let metadata = self.store.head(&Path::from(path.path())).await?;
+        let metadata = self.store.head(&Path::from_url_path(path.path())?).await?;
         let modification_time = metadata.last_modified.timestamp_millis();
-        // TODO: remove after dropping arrow 54 support
-        #[allow(clippy::useless_conversion)]
-        let metadata_size: u64 = metadata
-            .size
+        let metadata_size = metadata.size;
+        #[cfg(not(feature = "arrow-55"))]
+        let metadata_size: u64 = metadata_size
             .try_into()
             .map_err(|_| Error::generic("Failed to convert parquet metadata 'size' to u64"))?;
         if size != metadata_size {
@@ -189,7 +186,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        predicate: Option<ExpressionRef>,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         if files.is_empty() {
             return Ok(Box::new(std::iter::empty()));
@@ -232,7 +229,7 @@ struct ParquetOpener {
     // projection: Arc<[usize]>,
     batch_size: usize,
     table_schema: SchemaRef,
-    predicate: Option<ExpressionRef>,
+    predicate: Option<PredicateRef>,
     limit: Option<usize>,
     store: Arc<DynObjectStore>,
 }
@@ -241,7 +238,7 @@ impl ParquetOpener {
     pub(crate) fn new(
         batch_size: usize,
         table_schema: SchemaRef,
-        predicate: Option<ExpressionRef>,
+        predicate: Option<PredicateRef>,
         store: Arc<DynObjectStore>,
     ) -> Self {
         Self {
@@ -309,7 +306,7 @@ impl FileOpener for ParquetOpener {
 /// Implements [`FileOpener`] for a opening a parquet file from a presigned URL
 struct PresignedUrlOpener {
     batch_size: usize,
-    predicate: Option<ExpressionRef>,
+    predicate: Option<PredicateRef>,
     limit: Option<usize>,
     table_schema: SchemaRef,
     client: reqwest::Client,
@@ -319,7 +316,7 @@ impl PresignedUrlOpener {
     pub(crate) fn new(
         batch_size: usize,
         schema: SchemaRef,
-        predicate: Option<ExpressionRef>,
+        predicate: Option<PredicateRef>,
     ) -> Self {
         Self {
             batch_size,
@@ -408,7 +405,7 @@ mod tests {
             "./tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
         )).unwrap();
         let url = url::Url::from_file_path(path).unwrap();
-        let location = Path::from(url.path());
+        let location = Path::from_url_path(url.path()).unwrap();
         let meta = store.head(&location).await.unwrap();
 
         let reader = ParquetObjectReader::new(store.clone(), location);
@@ -418,12 +415,13 @@ mod tests {
             .schema()
             .clone();
 
-        // TODO: remove after dropping arrow 54 support
-        #[allow(clippy::useless_conversion)]
+        let meta_size = meta.size;
+        #[cfg(not(feature = "arrow-55"))]
+        let meta_size = meta_size.try_into().unwrap();
         let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp(),
-            size: meta.size.try_into().unwrap(),
+            size: meta_size,
         }];
 
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
@@ -518,7 +516,10 @@ mod tests {
         let expected_location = Url::parse("memory:///data/").unwrap();
 
         // head the object to get metadata
-        let meta = store.head(&Path::from(location.path())).await.unwrap();
+        let meta = store
+            .head(&Path::from_url_path(location.path()).unwrap())
+            .await
+            .unwrap();
         let expected_size = meta.size;
 
         // check that last_modified is within 10s of now
@@ -535,7 +536,7 @@ mod tests {
         assert!(now - last_modified < 10_000);
 
         // check we can read back
-        let path = Path::from(location.path());
+        let path = Path::from_url_path(location.path()).unwrap();
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
