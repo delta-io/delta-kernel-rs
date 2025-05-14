@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
-use delta_kernel::scan::state::{DvInfo, GlobalScanState};
+use delta_kernel::scan::state::DvInfo;
 use delta_kernel::scan::{Scan, ScanMetadata};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Error, Expression, ExpressionRef};
@@ -117,54 +117,39 @@ fn scan_impl(
     Ok(Arc::new(scan_builder.build()?).into())
 }
 
-#[handle_descriptor(target=GlobalScanState, mutable=false, sized=true)]
-pub struct SharedGlobalScanState;
-
-/// Get the global state for a scan. See the docs for [`delta_kernel::scan::state::GlobalScanState`]
-/// for more information.
+/// Get the table root of a scan.
 ///
 /// # Safety
 /// Engine is responsible for providing a valid scan pointer
 #[no_mangle]
-pub unsafe extern "C" fn get_global_scan_state(
+pub unsafe extern "C" fn get_scan_table_root(
     scan: Handle<SharedScan>,
-) -> Handle<SharedGlobalScanState> {
+) -> Handle<KernelStringSlice> {
     let scan = unsafe { scan.as_ref() };
-    Arc::new(scan.global_scan_state()).into()
+    scan.table_root().to_string().into()
+}
+
+/// Get the logical schema of a scan.
+///
+/// # Safety
+/// Engine is responsible for providing a valid scan pointer
+#[no_mangle]
+pub unsafe extern "C" fn get_scan_logical_schema(scan: Handle<SharedScan>) -> Handle<SharedSchema> {
+    let scan = unsafe { scan.as_ref() };
+    scan.logical_schema().clone().into()
 }
 
 /// Get the kernel view of the physical read schema that an engine should read from parquet file in
 /// a scan
 ///
 /// # Safety
-/// Engine is responsible for providing a valid GlobalScanState pointer
+/// Engine is responsible for providing a valid scan pointer
 #[no_mangle]
-pub unsafe extern "C" fn get_global_read_schema(
-    state: Handle<SharedGlobalScanState>,
+pub unsafe extern "C" fn get_scan_physical_schema(
+    scan: Handle<SharedScan>,
 ) -> Handle<SharedSchema> {
-    let state = unsafe { state.as_ref() };
-    state.physical_schema.clone().into()
-}
-
-/// Get the kernel view of the physical read schema that an engine should read from parquet file in
-/// a scan
-///
-/// # Safety
-/// Engine is responsible for providing a valid GlobalScanState pointer
-#[no_mangle]
-pub unsafe extern "C" fn get_global_logical_schema(
-    state: Handle<SharedGlobalScanState>,
-) -> Handle<SharedSchema> {
-    let state = unsafe { state.as_ref() };
-    state.logical_schema.clone().into()
-}
-
-/// # Safety
-///
-/// Caller is responsible for passing a valid global scan state pointer.
-#[no_mangle]
-pub unsafe extern "C" fn free_global_scan_state(state: Handle<SharedGlobalScanState>) {
-    state.drop_handle();
+    let scan = unsafe { scan.as_ref() };
+    scan.physical_schema().clone().into()
 }
 
 // Intentionally opaque to the engine.
@@ -382,20 +367,18 @@ pub unsafe extern "C" fn get_transform_for_row(
 pub unsafe extern "C" fn selection_vector_from_dv(
     dv_info: &DvInfo,
     engine: Handle<SharedExternEngine>,
-    state: Handle<SharedGlobalScanState>,
+    root_url: &Url,
 ) -> ExternResult<KernelBoolSlice> {
-    let state = unsafe { state.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    selection_vector_from_dv_impl(dv_info, engine, state).into_extern_result(&engine)
+    selection_vector_from_dv_impl(dv_info, engine, root_url).into_extern_result(&engine)
 }
 
 fn selection_vector_from_dv_impl(
     dv_info: &DvInfo,
     extern_engine: &dyn ExternEngine,
-    state: &GlobalScanState,
+    root_url: &Url,
 ) -> DeltaResult<KernelBoolSlice> {
-    let root_url = Url::parse(&state.table_root)?;
-    match dv_info.get_selection_vector(extern_engine.engine().as_ref(), &root_url)? {
+    match dv_info.get_selection_vector(extern_engine.engine().as_ref(), root_url)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelBoolSlice::empty()),
     }
@@ -409,20 +392,18 @@ fn selection_vector_from_dv_impl(
 pub unsafe extern "C" fn row_indexes_from_dv(
     dv_info: &DvInfo,
     engine: Handle<SharedExternEngine>,
-    state: Handle<SharedGlobalScanState>,
+    root_url: &Url,
 ) -> ExternResult<KernelRowIndexArray> {
-    let state = unsafe { state.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    row_indexes_from_dv_impl(dv_info, engine, state).into_extern_result(&engine)
+    row_indexes_from_dv_impl(dv_info, engine, root_url).into_extern_result(&engine)
 }
 
 fn row_indexes_from_dv_impl(
     dv_info: &DvInfo,
     extern_engine: &dyn ExternEngine,
-    state: &GlobalScanState,
+    root_url: &Url,
 ) -> DeltaResult<KernelRowIndexArray> {
-    let root_url = Url::parse(&state.table_root)?;
-    match dv_info.get_row_indexes(extern_engine.engine().as_ref(), &root_url)? {
+    match dv_info.get_row_indexes(extern_engine.engine().as_ref(), root_url)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelRowIndexArray::empty()),
     }

@@ -335,7 +335,6 @@ int main(int argc, char* argv[])
   free_scan(scan);
   free_schema(logical_schema);
   free_schema(read_schema);
-  free_global_scan_state(global_state);
   free_snapshot(snapshot);
   free_engine(engine);
   free(context.table_root);
