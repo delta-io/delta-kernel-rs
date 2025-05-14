@@ -15,9 +15,9 @@ use url::Url;
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::expressions::SharedExpression;
 use crate::{
-    kernel_string_slice, AllocateStringFn, ExternEngine, ExternResult, IntoExternResult,
-    KernelBoolSlice, KernelRowIndexArray, KernelStringSlice, NullableCvoid, SharedExternEngine,
-    SharedSchema, SharedSnapshot, TryFromStringSlice,
+    kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
+    ExternResult, IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice,
+    NullableCvoid, SharedExternEngine, SharedSchema, SharedSnapshot, TryFromStringSlice,
 };
 
 use super::handle::Handle;
@@ -120,13 +120,16 @@ fn scan_impl(
 /// Get the table root of a scan.
 ///
 /// # Safety
-/// Engine is responsible for providing a valid scan pointer
+/// Engine is responsible for providing a valid scan pointer and allocate_fn (for allocating the
+/// string)
 #[no_mangle]
-pub unsafe extern "C" fn get_scan_table_root(
+pub unsafe extern "C" fn scan_table_root(
     scan: Handle<SharedScan>,
-) -> Handle<KernelStringSlice> {
+    allocate_fn: AllocateStringFn,
+) -> NullableCvoid {
     let scan = unsafe { scan.as_ref() };
-    scan.table_root().to_string().into()
+    let table_root = scan.table_root().to_string();
+    allocate_fn(kernel_string_slice!(table_root))
 }
 
 /// Get the logical schema of a scan.
@@ -134,7 +137,7 @@ pub unsafe extern "C" fn get_scan_table_root(
 /// # Safety
 /// Engine is responsible for providing a valid scan pointer
 #[no_mangle]
-pub unsafe extern "C" fn get_scan_logical_schema(scan: Handle<SharedScan>) -> Handle<SharedSchema> {
+pub unsafe extern "C" fn scan_logical_schema(scan: Handle<SharedScan>) -> Handle<SharedSchema> {
     let scan = unsafe { scan.as_ref() };
     scan.logical_schema().clone().into()
 }
@@ -145,9 +148,7 @@ pub unsafe extern "C" fn get_scan_logical_schema(scan: Handle<SharedScan>) -> Ha
 /// # Safety
 /// Engine is responsible for providing a valid scan pointer
 #[no_mangle]
-pub unsafe extern "C" fn get_scan_physical_schema(
-    scan: Handle<SharedScan>,
-) -> Handle<SharedSchema> {
+pub unsafe extern "C" fn scan_physical_schema(scan: Handle<SharedScan>) -> Handle<SharedSchema> {
     let scan = unsafe { scan.as_ref() };
     scan.physical_schema().clone().into()
 }
@@ -367,18 +368,19 @@ pub unsafe extern "C" fn get_transform_for_row(
 pub unsafe extern "C" fn selection_vector_from_dv(
     dv_info: &DvInfo,
     engine: Handle<SharedExternEngine>,
-    root_url: &Url,
+    root_url: KernelStringSlice,
 ) -> ExternResult<KernelBoolSlice> {
     let engine = unsafe { engine.as_ref() };
+    let root_url = unsafe { unwrap_and_parse_path_as_url(root_url) };
     selection_vector_from_dv_impl(dv_info, engine, root_url).into_extern_result(&engine)
 }
 
 fn selection_vector_from_dv_impl(
     dv_info: &DvInfo,
     extern_engine: &dyn ExternEngine,
-    root_url: &Url,
+    root_url: DeltaResult<Url>,
 ) -> DeltaResult<KernelBoolSlice> {
-    match dv_info.get_selection_vector(extern_engine.engine().as_ref(), root_url)? {
+    match dv_info.get_selection_vector(extern_engine.engine().as_ref(), &root_url?)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelBoolSlice::empty()),
     }
@@ -392,18 +394,19 @@ fn selection_vector_from_dv_impl(
 pub unsafe extern "C" fn row_indexes_from_dv(
     dv_info: &DvInfo,
     engine: Handle<SharedExternEngine>,
-    root_url: &Url,
+    root_url: KernelStringSlice,
 ) -> ExternResult<KernelRowIndexArray> {
     let engine = unsafe { engine.as_ref() };
+    let root_url = unsafe { unwrap_and_parse_path_as_url(root_url) };
     row_indexes_from_dv_impl(dv_info, engine, root_url).into_extern_result(&engine)
 }
 
 fn row_indexes_from_dv_impl(
     dv_info: &DvInfo,
     extern_engine: &dyn ExternEngine,
-    root_url: &Url,
+    root_url: DeltaResult<Url>,
 ) -> DeltaResult<KernelRowIndexArray> {
-    match dv_info.get_row_indexes(extern_engine.engine().as_ref(), root_url)? {
+    match dv_info.get_row_indexes(extern_engine.engine().as_ref(), &root_url?)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelRowIndexArray::empty()),
     }
