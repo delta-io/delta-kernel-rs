@@ -50,8 +50,6 @@ pub enum BinaryPredicateOp {
     Distinct,
     /// IN
     In,
-    /// NOT IN
-    NotIn,
 }
 
 /// A binary expression operator.
@@ -170,7 +168,7 @@ impl BinaryPredicateOp {
         match self {
             LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual => true,
             Equal | NotEqual => true,
-            Distinct | In | NotIn => false, // tolerates NULL input
+            Distinct | In => false, // tolerates NULL input
         }
     }
 }
@@ -481,7 +479,6 @@ impl Display for BinaryPredicateOp {
             // in our code we take care of this, but theirs might not ...
             Distinct => write!(f, "DISTINCT"),
             In => write!(f, "IN"),
-            NotIn => write!(f, "NOT IN"),
         }
     }
 }

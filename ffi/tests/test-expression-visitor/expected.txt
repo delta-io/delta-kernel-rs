@@ -58,11 +58,12 @@ And
     Array
       Short(5)
       Short(0)
-  NotIn
-    Integer(10)
-    Array
-      Short(5)
-      Short(0)
+  Not
+    In
+      Integer(10)
+      Array
+        Short(5)
+        Short(0)
   Or
     Equal
       Integer(5)

@@ -117,11 +117,11 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
             Expr::literal(10),
             Scalar::Array(array_data.clone()),
         ),
-        Pred::binary(
-            BinaryPredicateOp::NotIn,
+        Pred::not(Pred::binary(
+            BinaryPredicateOp::In,
             Expr::literal(10),
             Scalar::Array(array_data),
-        ),
+        )),
         Pred::or_from(vec![
             Pred::eq(Expr::literal(5), Expr::literal(10)),
             Pred::ne(Expr::literal(20), Expr::literal(10)),

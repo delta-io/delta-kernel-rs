@@ -35,7 +35,6 @@ enum OpType {
   NotEqual,
   Distinct,
   In,
-  NotIn,
 };
 enum LitType {
   Integer,
@@ -174,7 +173,6 @@ DEFINE_BINOP(visit_expr_eq, Equal)
 DEFINE_BINOP(visit_expr_ne, NotEqual)
 DEFINE_BINOP(visit_expr_distinct, Distinct)
 DEFINE_BINOP(visit_expr_in, In)
-DEFINE_BINOP(visit_expr_not_in, NotIn)
 #undef DEFINE_BINOP
 
 /*************************************************************
@@ -370,7 +368,6 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_ne = visit_expr_ne,
     .visit_distinct = visit_expr_distinct,
     .visit_in = visit_expr_in,
-    .visit_not_in = visit_expr_not_in,
     .visit_add = visit_expr_add,
     .visit_minus = visit_expr_minus,
     .visit_multiply = visit_expr_multiply,
@@ -417,7 +414,6 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_ne = visit_expr_ne,
     .visit_distinct = visit_expr_distinct,
     .visit_in = visit_expr_in,
-    .visit_not_in = visit_expr_not_in,
     .visit_add = visit_expr_add,
     .visit_minus = visit_expr_minus,
     .visit_multiply = visit_expr_multiply,

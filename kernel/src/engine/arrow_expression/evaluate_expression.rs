@@ -225,7 +225,6 @@ pub(crate) fn evaluate_predicate(
                 NotEqual => neq,
                 Distinct => distinct,
                 In => return eval_in(),
-                NotIn => return Ok(not(&eval_in()?)?),
             };
 
             let left = evaluate_expression(left, batch, None)?;

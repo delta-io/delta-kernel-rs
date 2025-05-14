@@ -68,10 +68,6 @@ void print_tree_helper(ExpressionItem ref, int depth) {
           printf("In\n");
           break;
         };
-        case NotIn: {
-          printf("NotIn\n");
-          break;
-        }; break;
         case Distinct:
           printf("Distinct\n");
           break;

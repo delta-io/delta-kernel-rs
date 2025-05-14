@@ -153,9 +153,6 @@ pub struct EngineExpressionVisitor {
     /// Visits the `In` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_in: VisitBinaryFn,
-    /// Visits the `NotIn` binary operator belonging to the list identified by `sibling_list_id`.
-    /// The operands will be in a _two_ item list identified by `child_list_id`
-    pub visit_not_in: VisitBinaryFn,
     /// Visits the `Add` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_add: VisitBinaryFn,
@@ -455,7 +452,6 @@ fn visit_predicate_impl(
                 BinaryPredicateOp::NotEqual => visitor.visit_ne,
                 BinaryPredicateOp::Distinct => visitor.visit_distinct,
                 BinaryPredicateOp::In => visitor.visit_in,
-                BinaryPredicateOp::NotIn => visitor.visit_not_in,
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }

@@ -222,7 +222,6 @@ pub(crate) trait KernelPredicateEvaluator {
                 NotEqual => self.eval_pred_eq(col, val, !inverted),
                 Distinct => self.eval_pred_distinct(col, val, inverted),
                 In => self.eval_pred_in(col, val, inverted),
-                NotIn => self.eval_pred_in(col, val, !inverted),
             },
             (Literal(val), Column(col)) => match op {
                 LessThan => self.eval_pred_le(col, val, !inverted),
@@ -232,7 +231,7 @@ pub(crate) trait KernelPredicateEvaluator {
                 Equal => self.eval_pred_eq(col, val, inverted),
                 NotEqual => self.eval_pred_eq(col, val, !inverted),
                 Distinct => self.eval_pred_distinct(col, val, inverted),
-                In | NotIn => None, // arg order is semantically important
+                In => None, // arg order is semantically important
             },
             _ => {
                 debug!("Unsupported binary operand(s): {left:?} {op:?} {right:?}");
@@ -485,7 +484,7 @@ impl KernelPredicateEvaluatorDefaults {
             LessThanOrEqual => Self::partial_cmp_scalars(Ordering::Greater, left, right, !inverted),
             GreaterThan => Self::partial_cmp_scalars(Ordering::Greater, left, right, inverted),
             GreaterThanOrEqual => Self::partial_cmp_scalars(Ordering::Less, left, right, !inverted),
-            Distinct | In | NotIn => {
+            Distinct | In => {
                 debug!("Unsupported binary operator: {left:?} {op:?} {right:?}");
                 None
             }
