@@ -74,8 +74,8 @@ pub(crate) trait KernelPredicateEvaluator {
     /// A (possibly inverted) less-than comparison, e.g. `<col> < <value>`.
     fn eval_pred_lt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output>;
 
-    /// A (possibly inverted) less-than-or-equal comparison, e.g. `<col> <= <value>`
-    fn eval_pred_le(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output>;
+    /// A (possibly inverted) greater-than comparison, e.g. `<col> > <value>`
+    fn eval_pred_gt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output>;
 
     /// A (possibly inverted) equality comparison, e.g. `<col> = <value>` or `<col> != <value>`.
     ///
@@ -216,16 +216,16 @@ pub(crate) trait KernelPredicateEvaluator {
             (Column(col), Literal(val)) => match op {
                 LessThan => self.eval_pred_lt(col, val, inverted),
                 GreaterThanOrEqual => self.eval_pred_lt(col, val, !inverted),
-                LessThanOrEqual => self.eval_pred_le(col, val, inverted),
-                GreaterThan => self.eval_pred_le(col, val, !inverted),
+                LessThanOrEqual => self.eval_pred_gt(col, val, !inverted),
+                GreaterThan => self.eval_pred_gt(col, val, inverted),
                 Equal => self.eval_pred_eq(col, val, inverted),
                 NotEqual => self.eval_pred_eq(col, val, !inverted),
                 Distinct => self.eval_pred_distinct(col, val, inverted),
                 In => self.eval_pred_in(col, val, inverted),
             },
             (Literal(val), Column(col)) => match op {
-                LessThan => self.eval_pred_le(col, val, !inverted),
-                GreaterThanOrEqual => self.eval_pred_le(col, val, inverted),
+                LessThan => self.eval_pred_gt(col, val, inverted),
+                GreaterThanOrEqual => self.eval_pred_gt(col, val, !inverted),
                 LessThanOrEqual => self.eval_pred_lt(col, val, !inverted),
                 GreaterThan => self.eval_pred_lt(col, val, inverted),
                 Equal => self.eval_pred_eq(col, val, inverted),
@@ -595,9 +595,9 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
         self.eval_pred_binary_scalars(BinaryPredicateOp::LessThan, &col, val, inverted)
     }
 
-    fn eval_pred_le(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<bool> {
+    fn eval_pred_gt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<bool> {
         let col = self.resolve_column(col)?;
-        self.eval_pred_binary_scalars(BinaryPredicateOp::LessThanOrEqual, &col, val, inverted)
+        self.eval_pred_binary_scalars(BinaryPredicateOp::GreaterThan, &col, val, inverted)
     }
 
     fn eval_pred_eq(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<bool> {
@@ -749,9 +749,17 @@ pub(crate) trait DataSkippingPredicateEvaluator {
         }
     }
 
-    /// See [`KernelPredicateEvaluator::eval_pred_le`]
-    fn eval_pred_le(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
+    /// See [`KernelPredicateEvaluator::eval_pred_gt`]
+    fn eval_pred_gt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
         if inverted {
+            // Given `col <= val`:
+            // Skip if `val` is less than _all_ values in [min, max], implies
+            // Skip if `val < min AND val < max` implies
+            // Skip if `val < min` implies
+            // Keep if `NOT(val < min)` implies
+            // Keep if `NOT(min > val)`
+            self.partial_cmp_min_stat(col, val, Ordering::Greater, true)
+        } else {
             // Given `col > val`:
             // Skip if `val` is not less than _all_ values in [min, max], implies
             // Skip if `val >= min AND val >= max` implies
@@ -760,14 +768,6 @@ pub(crate) trait DataSkippingPredicateEvaluator {
             // Keep if `NOT(max <= val)` implies
             // Keep if `max > val`
             self.partial_cmp_max_stat(col, val, Ordering::Greater, false)
-        } else {
-            // Given `col <= val`:
-            // Skip if `val` is less than _all_ values in [min, max], implies
-            // Skip if `val < min AND val < max` implies
-            // Skip if `val < min` implies
-            // Keep if `NOT(val < min)` implies
-            // Keep if `NOT(min > val)`
-            self.partial_cmp_min_stat(col, val, Ordering::Greater, true)
         }
     }
 
@@ -811,8 +811,8 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
         self.eval_pred_lt(col, val, inverted)
     }
 
-    fn eval_pred_le(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
-        self.eval_pred_le(col, val, inverted)
+    fn eval_pred_gt(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
+        self.eval_pred_gt(col, val, inverted)
     }
 
     fn eval_pred_eq(&self, col: &ColumnName, val: &Scalar, inverted: bool) -> Option<Self::Output> {
