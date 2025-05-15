@@ -1336,7 +1336,10 @@ fn test_compaction_listing(
         .iter()
         .zip(expected_compaction_versions.iter())
     {
-        assert!(compaction_file.is_compaction());
+        assert!(matches!(
+            compaction_file.file_type,
+            LogPathFileType::CompactedCommit { .. }
+        ));
         assert_eq!(compaction_file.version, *expected_start);
         if let LogPathFileType::CompactedCommit { hi } = compaction_file.file_type {
             assert_eq!(hi, *expected_end);

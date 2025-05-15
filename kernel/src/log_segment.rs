@@ -492,33 +492,25 @@ pub(crate) fn list_log_files_with_version(
         for (version, files) in &log_files_per_version {
             let mut new_checkpoint_parts = vec![];
             for file in files {
-                if file.is_commit() {
-                    ascending_commit_files.push(file);
-                } else if file.is_compaction() {
-                    let include = if let Some(end_version) = end_version {
-                        // validate this compaction doesn't extend too far
-                        if let LogPathFileType::CompactedCommit { hi } = file.file_type {
-                            hi <= end_version
-                        } else {
-                            warn!("Found compaction file with type != CompactedCommit");
-                            false // don't include wonky file
-                        }
-                    } else {
-                        true
-                    };
-                    if include {
+                use LogPathFileType::*;
+                match file.file_type {
+                    Commit => ascending_commit_files.push(file),
+                    CompactedCommit { hi } if end_version.is_none_or(|end| hi <= end) => {
                         ascending_compaction_files.push(file);
                     }
-                } else if file.is_checkpoint() {
-                    new_checkpoint_parts.push(file);
-                } else {
-                    warn!(
-                        "Found file {} with unknown file type {:?} at version {}",
-                        file.filename, file.file_type, version
-                    );
+                    CompactedCommit { .. } => (), // Failed the bounds check above
+                    SinglePartCheckpoint | UuidCheckpoint(_) | MultiPartCheckpoint { .. } => {
+                        new_checkpoint_parts.push(file)
+                    }
+                    Crc => (), // TODO: Keep only the latest one
+                    Unknown => {
+                        warn!(
+                            "Found file {} with unknown file type {:?} at version {}",
+                            file.filename, file.file_type, version
+                        );
+                    }
                 }
             }
-
             // Group and find the first complete checkpoint for this version.
             // All checkpoints for the same version are equivalent, so we only take one.
             if let Some((_, complete_checkpoint)) = group_checkpoint_parts(new_checkpoint_parts)

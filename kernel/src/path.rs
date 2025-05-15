@@ -161,11 +161,6 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     }
 
     #[internal_api]
-    pub(crate) fn is_compaction(&self) -> bool {
-        matches!(self.file_type, LogPathFileType::CompactedCommit { .. })
-    }
-
-    #[internal_api]
     pub(crate) fn is_checkpoint(&self) -> bool {
         matches!(
             self.file_type,
