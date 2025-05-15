@@ -9,8 +9,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{
-    column_expr, column_pred, BinaryPredicateOp, Expression as Expr, ExpressionRef,
-    Predicate as Pred,
+    column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred,
 };
 use delta_kernel::object_store::{memory::InMemory, path::Path, ObjectStore};
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -254,43 +253,41 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     //
     // NOTE: For cases that match both batch1 and batch2, we list batch2 first because log replay
     // returns most recently added files first.
-    use BinaryPredicateOp::{
-        Equal, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual, NotEqual,
-    };
-    let test_cases: Vec<(_, i32, _)> = vec![
-        (Equal, 0, vec![]),
-        (Equal, 1, vec![&batch1]),
-        (Equal, 3, vec![&batch1]),
-        (Equal, 4, vec![]),
-        (Equal, 5, vec![&batch2]),
-        (Equal, 7, vec![&batch2]),
-        (Equal, 8, vec![]),
-        (LessThan, 1, vec![]),
-        (LessThan, 2, vec![&batch1]),
-        (LessThan, 5, vec![&batch1]),
-        (LessThan, 6, vec![&batch2, &batch1]),
-        (LessThanOrEqual, 0, vec![]),
-        (LessThanOrEqual, 1, vec![&batch1]),
-        (LessThanOrEqual, 4, vec![&batch1]),
-        (LessThanOrEqual, 5, vec![&batch2, &batch1]),
-        (GreaterThan, 2, vec![&batch2, &batch1]),
-        (GreaterThan, 3, vec![&batch2]),
-        (GreaterThan, 6, vec![&batch2]),
-        (GreaterThan, 7, vec![]),
-        (GreaterThanOrEqual, 3, vec![&batch2, &batch1]),
-        (GreaterThanOrEqual, 4, vec![&batch2]),
-        (GreaterThanOrEqual, 7, vec![&batch2]),
-        (GreaterThanOrEqual, 8, vec![]),
-        (NotEqual, 0, vec![&batch2, &batch1]),
-        (NotEqual, 1, vec![&batch2, &batch1]),
-        (NotEqual, 3, vec![&batch2, &batch1]),
-        (NotEqual, 4, vec![&batch2, &batch1]),
-        (NotEqual, 5, vec![&batch2, &batch1]),
-        (NotEqual, 7, vec![&batch2, &batch1]),
-        (NotEqual, 8, vec![&batch2, &batch1]),
+    #[allow(clippy::type_complexity)] // otherwise it's even more complex because no `_`
+    let test_cases: Vec<(fn(Expr, Expr) -> _, _, _)> = vec![
+        (Pred::eq, 0i32, vec![]),
+        (Pred::eq, 1, vec![&batch1]),
+        (Pred::eq, 3, vec![&batch1]),
+        (Pred::eq, 4, vec![]),
+        (Pred::eq, 5, vec![&batch2]),
+        (Pred::eq, 7, vec![&batch2]),
+        (Pred::eq, 8, vec![]),
+        (Pred::lt, 1, vec![]),
+        (Pred::lt, 2, vec![&batch1]),
+        (Pred::lt, 5, vec![&batch1]),
+        (Pred::lt, 6, vec![&batch2, &batch1]),
+        (Pred::le, 0, vec![]),
+        (Pred::le, 1, vec![&batch1]),
+        (Pred::le, 4, vec![&batch1]),
+        (Pred::le, 5, vec![&batch2, &batch1]),
+        (Pred::gt, 2, vec![&batch2, &batch1]),
+        (Pred::gt, 3, vec![&batch2]),
+        (Pred::gt, 6, vec![&batch2]),
+        (Pred::gt, 7, vec![]),
+        (Pred::ge, 3, vec![&batch2, &batch1]),
+        (Pred::ge, 4, vec![&batch2]),
+        (Pred::ge, 7, vec![&batch2]),
+        (Pred::ge, 8, vec![]),
+        (Pred::ne, 0, vec![&batch2, &batch1]),
+        (Pred::ne, 1, vec![&batch2, &batch1]),
+        (Pred::ne, 3, vec![&batch2, &batch1]),
+        (Pred::ne, 4, vec![&batch2, &batch1]),
+        (Pred::ne, 5, vec![&batch2, &batch1]),
+        (Pred::ne, 7, vec![&batch2, &batch1]),
+        (Pred::ne, 8, vec![&batch2, &batch1]),
     ];
-    for (op, value, expected_batches) in test_cases {
-        let predicate = Pred::binary(op, column_expr!("id"), Expr::literal(value));
+    for (pred_fn, value, expected_batches) in test_cases {
+        let predicate = pred_fn(column_expr!("id"), Expr::literal(value));
         let scan = snapshot
             .clone()
             .scan_builder()

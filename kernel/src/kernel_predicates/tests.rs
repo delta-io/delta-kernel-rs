@@ -201,17 +201,6 @@ fn test_eval_binary_scalars() {
         );
 
         expect_eq!(
-            compare(NotEqual, &smaller_value, &smaller_value, inverted),
-            Some(inverted),
-            "{smaller_value} != {smaller_value} (inverted: {inverted})"
-        );
-        expect_eq!(
-            compare(NotEqual, &smaller_value, &larger_value, inverted),
-            Some(!inverted),
-            "{smaller_value} != {larger_value} (inverted: {inverted})"
-        );
-
-        expect_eq!(
             compare(LessThan, &smaller_value, &smaller_value, inverted),
             Some(inverted),
             "{smaller_value} < {smaller_value} (inverted: {inverted})"
@@ -231,28 +220,6 @@ fn test_eval_binary_scalars() {
             compare(GreaterThan, &smaller_value, &larger_value, inverted),
             Some(inverted),
             "{smaller_value} > {larger_value} (inverted: {inverted})"
-        );
-
-        expect_eq!(
-            compare(LessThanOrEqual, &smaller_value, &smaller_value, inverted),
-            Some(!inverted),
-            "{smaller_value} <= {smaller_value} (inverted: {inverted})"
-        );
-        expect_eq!(
-            compare(LessThanOrEqual, &smaller_value, &larger_value, inverted),
-            Some(!inverted),
-            "{smaller_value} <= {larger_value} (inverted: {inverted})"
-        );
-
-        expect_eq!(
-            compare(GreaterThanOrEqual, &smaller_value, &smaller_value, inverted),
-            Some(!inverted),
-            "{smaller_value} >= {smaller_value} (inverted: {inverted})"
-        );
-        expect_eq!(
-            compare(GreaterThanOrEqual, &smaller_value, &larger_value, inverted),
-            Some(inverted),
-            "{smaller_value} >= {larger_value} (inverted: {inverted})"
         );
     }
 }
@@ -477,24 +444,9 @@ fn eval_binary() {
             "x < 10 (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_pred_binary(BinaryPredicateOp::LessThanOrEqual, &col, &val, inverted),
-            Some(!inverted),
-            "x <= 10 (inverted: {inverted})"
-        );
-        expect_eq!(
             filter.eval_pred_binary(BinaryPredicateOp::Equal, &col, &val, inverted),
             Some(inverted),
             "x = 10 (inverted: {inverted})"
-        );
-        expect_eq!(
-            filter.eval_pred_binary(BinaryPredicateOp::NotEqual, &col, &val, inverted),
-            Some(!inverted),
-            "x != 10 (inverted: {inverted})"
-        );
-        expect_eq!(
-            filter.eval_pred_binary(BinaryPredicateOp::GreaterThanOrEqual, &col, &val, inverted),
-            Some(inverted),
-            "x >= 10 (inverted: {inverted})"
         );
         expect_eq!(
             filter.eval_pred_binary(BinaryPredicateOp::GreaterThan, &col, &val, inverted),
@@ -513,24 +465,9 @@ fn eval_binary() {
             "10 < x (inverted: {inverted})"
         );
         expect_eq!(
-            filter.eval_pred_binary(BinaryPredicateOp::LessThanOrEqual, &val, &col, inverted),
-            Some(inverted),
-            "10 <= x (inverted: {inverted})"
-        );
-        expect_eq!(
             filter.eval_pred_binary(BinaryPredicateOp::Equal, &val, &col, inverted),
             Some(inverted),
             "10 = x (inverted: {inverted})"
-        );
-        expect_eq!(
-            filter.eval_pred_binary(BinaryPredicateOp::NotEqual, &val, &col, inverted),
-            Some(!inverted),
-            "10 != x (inverted: {inverted})"
-        );
-        expect_eq!(
-            filter.eval_pred_binary(BinaryPredicateOp::GreaterThanOrEqual, &val, &col, inverted),
-            Some(!inverted),
-            "10 >= x (inverted: {inverted})"
         );
         expect_eq!(
             filter.eval_pred_binary(BinaryPredicateOp::GreaterThan, &val, &col, inverted),
