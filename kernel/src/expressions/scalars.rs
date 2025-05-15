@@ -290,7 +290,7 @@ impl Scalar {
         Ok(Self::Decimal(dval))
     }
 
-    /// Constructs a Scalar timestamp from an `i64` millisecond since unix epoch
+    /// Constructs a Scalar timestamp (in UTC) from an `i64` millisecond since unix epoch
     pub(crate) fn timestamp_from_millis(millis: i64) -> DeltaResult<Self> {
         let Some(timestamp) = DateTime::from_timestamp_millis(millis) else {
             return Err(Error::generic(format!(
