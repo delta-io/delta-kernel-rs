@@ -19,7 +19,7 @@ mod storage;
 
 /// This is a simple implementation of [`Engine`]. It only supports reading data from the local
 /// filesystem, and internally represents data using `Arrow`.
-pub struct SyncEngine {
+pub(crate) struct SyncEngine {
     storage_handler: Arc<storage::SyncStorageHandler>,
     json_handler: Arc<json::SyncJsonHandler>,
     parquet_handler: Arc<parquet::SyncParquetHandler>,
@@ -27,8 +27,7 @@ pub struct SyncEngine {
 }
 
 impl SyncEngine {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         SyncEngine {
             storage_handler: Arc::new(storage::SyncStorageHandler {}),
             json_handler: Arc::new(json::SyncJsonHandler {}),

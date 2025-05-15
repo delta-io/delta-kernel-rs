@@ -5,10 +5,14 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::{path::Path, ObjectStore};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::EngineData;
+
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::DefaultEngine;
 use itertools::Itertools;
 
 /// A common useful initial metadata and protocol. Also includes a single commitInfo
@@ -135,4 +139,18 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
     ArrowEngineData::try_from_engine_data(engine_data)
         .unwrap()
         .into()
+}
+
+pub trait NewLocalDefaultEngine {
+    fn new_local() -> Arc<DefaultEngine<TokioBackgroundExecutor>>;
+}
+
+impl NewLocalDefaultEngine for DefaultEngine<TokioBackgroundExecutor> {
+    fn new_local() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
+        let object_store = Arc::new(LocalFileSystem::new());
+        Arc::new(DefaultEngine::new(
+            object_store,
+            TokioBackgroundExecutor::new().into(),
+        ))
+    }
 }
