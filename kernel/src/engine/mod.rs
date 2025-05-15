@@ -5,7 +5,7 @@
 #[cfg(feature = "arrow-conversion")]
 pub(crate) mod arrow_conversion;
 
-#[cfg(all(feature = "arrow-expression", any(feature = "default-engine-base")))]
+#[cfg(all(feature = "arrow-expression", feature = "default-engine-base"))]
 pub mod arrow_expression;
 #[cfg(feature = "arrow-expression")]
 pub(crate) mod arrow_utils;
