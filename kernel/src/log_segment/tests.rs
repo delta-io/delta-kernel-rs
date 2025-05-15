@@ -4,6 +4,7 @@ use std::{path::PathBuf, sync::Arc};
 use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
 use futures::executor::block_on;
 use itertools::Itertools;
+use test_log::test;
 use url::Url;
 
 use crate::actions::visitors::AddVisitor;
@@ -16,9 +17,9 @@ use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreStorageHandler;
 use crate::engine::default::DefaultEngine;
 use crate::engine::sync::SyncEngine;
-use crate::log_segment::LogSegment;
+use crate::log_segment::{ListedLogFiles, LogSegment};
 use crate::parquet::arrow::ArrowWriter;
-use crate::path::ParsedLogPath;
+use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::scan::test_utils::{
     add_batch_simple, add_batch_with_remove, sidecar_batch_with_given_paths,
 };
@@ -26,9 +27,24 @@ use crate::snapshot::LastCheckpointHint;
 use crate::utils::test_utils::{assert_batch_matches, Action};
 use crate::{
     DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor,
-    StorageHandler, Table,
+    StorageHandler, Table, Version,
 };
-use test_utils::delta_path_for_version;
+use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
+
+// utility to easily create ListedLogFiles
+impl ListedLogFiles {
+    fn new(
+        ascending_commit_files: Vec<ParsedLogPath>,
+        ascending_compaction_files: Vec<ParsedLogPath>,
+        checkpoint_parts: Vec<ParsedLogPath>,
+    ) -> Self {
+        ListedLogFiles {
+            ascending_commit_files,
+            ascending_compaction_files,
+            checkpoint_parts,
+        }
+    }
+}
 
 // NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
 // that the parquet reader properly infers nullcount = rowcount for missing columns. The two
@@ -962,8 +978,11 @@ fn test_create_checkpoint_stream_errors_when_schema_has_remove_but_no_sidecar_ac
 
     // Create the stream over checkpoint batches.
     let log_segment = LogSegment::try_new(
-        vec![],
-        vec![create_log_path("file:///00000000000000000001.parquet")],
+        ListedLogFiles::new(
+            vec![],
+            vec![],
+            vec![create_log_path("file:///00000000000000000001.parquet")],
+        ),
         log_root,
         None,
     )?;
@@ -987,8 +1006,11 @@ fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_actio
 
     // Create the stream over checkpoint batches.
     let log_segment = LogSegment::try_new(
-        vec![],
-        vec![create_log_path("file:///00000000000000000001.parquet")],
+        ListedLogFiles::new(
+            vec![],
+            vec![],
+            vec![create_log_path("file:///00000000000000000001.parquet")],
+        ),
         log_root,
         None,
     )?;
@@ -1019,8 +1041,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
     let v2_checkpoint_read_schema = get_log_schema().project(&[METADATA_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        vec![],
-        vec![create_log_path(&checkpoint_one_file)],
+        ListedLogFiles::new(vec![], vec![], vec![create_log_path(&checkpoint_one_file)]),
         log_root,
         None,
     )?;
@@ -1071,11 +1092,14 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        vec![],
-        vec![
-            create_log_path(&checkpoint_one_file),
-            create_log_path(&checkpoint_two_file),
-        ],
+        ListedLogFiles::new(
+            vec![],
+            vec![],
+            vec![
+                create_log_path(&checkpoint_one_file),
+                create_log_path(&checkpoint_two_file),
+            ],
+        ),
         log_root,
         None,
     )?;
@@ -1118,8 +1142,7 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        vec![],
-        vec![create_log_path(&checkpoint_one_file)],
+        ListedLogFiles::new(vec![], vec![], vec![create_log_path(&checkpoint_one_file)]),
         log_root,
         None,
     )?;
@@ -1157,8 +1180,7 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        vec![],
-        vec![create_log_path(&checkpoint_one_file)],
+        ListedLogFiles::new(vec![], vec![], vec![create_log_path(&checkpoint_one_file)]),
         log_root,
         None,
     )?;
@@ -1217,8 +1239,7 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        vec![],
-        vec![create_log_path(&checkpoint_file_path)],
+        ListedLogFiles::new(vec![], vec![], vec![create_log_path(&checkpoint_file_path)]),
         log_root,
         None,
     )?;
@@ -1254,4 +1275,306 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
     assert!(iter.next().is_none());
 
     Ok(())
+}
+
+fn create_segment_for(
+    commit_versions: &[u64],
+    compaction_versions: &[(u64, u64)],
+    checkpoint_version: Option<u64>,
+    version_to_load: Option<u64>,
+) -> LogSegment {
+    let mut paths: Vec<Path> = commit_versions
+        .iter()
+        .map(|version| delta_path_for_version(*version, "json"))
+        .chain(
+            compaction_versions
+                .iter()
+                .map(|(start, end)| compacted_log_path_for_versions(*start, *end, "json")),
+        )
+        .collect();
+    if let Some(version) = checkpoint_version {
+        paths.push(delta_path_for_version(
+            version,
+            "checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+        ));
+    }
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None);
+    LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), None, version_to_load).unwrap()
+}
+
+fn test_compaction_listing(
+    commit_versions: &[u64],
+    compaction_versions: &[(u64, u64)],
+    checkpoint_version: Option<u64>,
+    version_to_load: Option<u64>,
+) {
+    let log_segment = create_segment_for(
+        commit_versions,
+        compaction_versions,
+        checkpoint_version,
+        version_to_load,
+    );
+    let version_to_load = version_to_load.unwrap_or(u64::MAX);
+    let checkpoint_cuttoff = checkpoint_version.map(|v| v as i64).unwrap_or(-1);
+    let expected_commit_versions: Vec<&u64> = commit_versions
+        .iter()
+        .filter(|v| **v as i64 > checkpoint_cuttoff && **v <= version_to_load)
+        .collect();
+    let expected_compaction_versions: Vec<&(u64, u64)> = compaction_versions
+        .iter()
+        .filter(|(start, end)| *start as i64 > checkpoint_cuttoff && *end <= version_to_load)
+        .collect();
+
+    assert_eq!(
+        log_segment.ascending_commit_files.len(),
+        expected_commit_versions.len()
+    );
+    assert_eq!(
+        log_segment.ascending_compaction_files.len(),
+        expected_compaction_versions.len()
+    );
+
+    for (commit_file, expected_version) in log_segment
+        .ascending_commit_files
+        .iter()
+        .zip(expected_commit_versions.iter())
+    {
+        assert!(commit_file.is_commit());
+        assert_eq!(commit_file.version, **expected_version);
+    }
+
+    for (compaction_file, (expected_start, expected_end)) in log_segment
+        .ascending_compaction_files
+        .iter()
+        .zip(expected_compaction_versions.iter())
+    {
+        assert!(matches!(
+            compaction_file.file_type,
+            LogPathFileType::CompactedCommit { .. }
+        ));
+        assert_eq!(compaction_file.version, *expected_start);
+        if let LogPathFileType::CompactedCommit { hi } = compaction_file.file_type {
+            assert_eq!(hi, *expected_end);
+        } else {
+            panic!("File was compaction but type was not CompactedCommit");
+        }
+    }
+}
+
+#[test]
+fn test_compaction_simple() {
+    test_compaction_listing(
+        &[0, 1, 2],
+        &[(1, 2)],
+        None, // checkpoint version
+        None, // version to load
+    );
+}
+
+#[test]
+fn test_compaction_in_version_range() {
+    test_compaction_listing(
+        &[0, 1, 2, 3],
+        &[(1, 2)],
+        None,    // checkpoint version
+        Some(2), // version to load
+    );
+}
+
+#[test]
+fn test_compaction_out_of_version_range() {
+    test_compaction_listing(
+        &[0, 1, 2, 3, 4],
+        &[(1, 3)],
+        None,    // checkpoint version
+        Some(2), // version to load
+    );
+}
+
+#[test]
+fn test_multi_compaction() {
+    test_compaction_listing(
+        &[0, 1, 2, 3, 4, 5],
+        &[(1, 2), (3, 5)],
+        None, // checkpoint version
+        None, //version to load
+    );
+}
+
+#[test]
+fn test_multi_compaction_one_out_of_range() {
+    test_compaction_listing(
+        &[0, 1, 2, 3, 4, 5],
+        &[(1, 2), (3, 5)],
+        None,    // checkpoint version
+        Some(4), // version to load
+    );
+}
+
+#[test]
+fn test_compaction_with_checkpoint() {
+    test_compaction_listing(
+        &[0, 1, 2, 4, 5],
+        &[(1, 2), (4, 5)],
+        Some(3), // checkpoint version
+        None,    // version to load
+    );
+}
+
+#[test]
+fn test_compaction_to_early_with_checkpoint() {
+    test_compaction_listing(
+        &[0, 1, 2, 4, 5],
+        &[(1, 2)],
+        Some(3), // checkpoint version
+        None,    // version to load
+    );
+}
+
+#[test]
+fn test_compaction_starts_at_checkpoint() {
+    test_compaction_listing(
+        &[0, 1, 2, 4, 5],
+        &[(3, 5)],
+        Some(3), // checkpoint version
+        None,    // version to load
+    );
+}
+
+enum ExpectedFile {
+    Commit(Version),
+    Compaction(Version, Version),
+}
+
+fn test_commit_cover(
+    commit_versions: &[u64],
+    compaction_versions: &[(u64, u64)],
+    checkpoint_version: Option<u64>,
+    version_to_load: Option<u64>,
+    expected_files: &[ExpectedFile],
+) {
+    let log_segment = create_segment_for(
+        commit_versions,
+        compaction_versions,
+        checkpoint_version,
+        version_to_load,
+    );
+    let cover = log_segment.find_commit_cover();
+    // our test-utils include "_delta_log" in the path, which is already in log_segment.log_root, so
+    // we don't use them. TODO: Unify this
+    let expected_locations = expected_files.iter().map(|ef| match ef {
+        ExpectedFile::Commit(version) => log_segment
+            .log_root
+            .join(&format!("{version:020}.json"))
+            .expect("Couldn't join"),
+        ExpectedFile::Compaction(lo, hi) => log_segment
+            .log_root
+            .join(&format!("{lo:020}.{hi:020}.compacted.json"))
+            .expect("Couldn't join"),
+    });
+    assert_eq!(cover.len(), expected_locations.len());
+    for (location, expected_location) in cover.iter().zip(expected_locations) {
+        assert_eq!(location.location, expected_location);
+    }
+}
+
+#[test]
+fn test_commit_cover_one_compaction() {
+    test_commit_cover(
+        &[0, 1, 2],
+        &[(1, 2)],
+        None, // checkpoint version
+        None, // version to load
+        &[ExpectedFile::Compaction(1, 2), ExpectedFile::Commit(0)],
+    );
+}
+
+#[test]
+fn test_commit_cover_in_version_range() {
+    test_commit_cover(
+        &[0, 1, 2, 3],
+        &[(1, 2)],
+        None,    // checkpoint version
+        Some(2), // version to load
+        &[ExpectedFile::Compaction(1, 2), ExpectedFile::Commit(0)],
+    );
+}
+
+#[test]
+fn test_commit_cover_out_of_version_range() {
+    test_commit_cover(
+        &[0, 1, 2, 3, 4],
+        &[(1, 3)],
+        None,    // checkpoint version
+        Some(2), // version to load
+        &[
+            ExpectedFile::Commit(2),
+            ExpectedFile::Commit(1),
+            ExpectedFile::Commit(0),
+        ],
+    );
+}
+
+#[test]
+fn test_commit_cover_multi_compaction() {
+    test_commit_cover(
+        &[0, 1, 2, 3, 4, 5],
+        &[(1, 2), (3, 5)],
+        None, // checkpoint version
+        None, //version to load
+        &[
+            ExpectedFile::Compaction(3, 5),
+            ExpectedFile::Compaction(1, 2),
+            ExpectedFile::Commit(0),
+        ],
+    );
+}
+
+#[test]
+fn test_commit_cover_multi_compaction_one_out_of_range() {
+    test_commit_cover(
+        &[0, 1, 2, 3, 4, 5],
+        &[(1, 2), (3, 5)],
+        None,    // checkpoint version
+        Some(4), // version to load
+        &[
+            ExpectedFile::Commit(4),
+            ExpectedFile::Commit(3),
+            ExpectedFile::Compaction(1, 2),
+            ExpectedFile::Commit(0),
+        ],
+    );
+}
+
+#[test]
+fn test_commit_cover_compaction_with_checkpoint() {
+    test_commit_cover(
+        &[0, 1, 2, 4, 5],
+        &[(1, 2), (4, 5)],
+        Some(3), // checkpoint version
+        None,    // version to load
+        &[ExpectedFile::Compaction(4, 5)],
+    );
+}
+
+#[test]
+fn test_commit_cover_too_early_with_checkpoint() {
+    test_commit_cover(
+        &[0, 1, 2, 4, 5],
+        &[(1, 2)],
+        Some(3), // checkpoint version
+        None,    // version to load
+        &[ExpectedFile::Commit(5), ExpectedFile::Commit(4)],
+    );
+}
+
+#[test]
+fn test_commit_cover_starts_at_checkpoint() {
+    test_commit_cover(
+        &[0, 1, 2, 4, 5],
+        &[(3, 5)],
+        Some(3), // checkpoint version
+        None,    // version to load
+        &[ExpectedFile::Commit(5), ExpectedFile::Commit(4)],
+    );
 }

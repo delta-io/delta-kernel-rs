@@ -175,6 +175,17 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     pub(crate) fn is_unknown(&self) -> bool {
         matches!(self.file_type, LogPathFileType::Unknown)
     }
+
+    /// Return the "hi" version of a parsed path that spans versions. (Currently only compaction
+    /// files)
+    #[internal_api]
+    pub(crate) fn hi_version(&self) -> Option<Version> {
+        if let LogPathFileType::CompactedCommit { hi } = self.file_type {
+            Some(hi)
+        } else {
+            None
+        }
+    }
 }
 
 impl ParsedLogPath<Url> {

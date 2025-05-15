@@ -112,6 +112,12 @@ pub fn delta_path_for_version(version: u64, suffix: &str) -> Path {
     Path::from(path.as_str())
 }
 
+/// get an ObjectStore path for a compressed log file, based on the start/end versions
+pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suffix: &str) -> Path {
+    let path = format!("_delta_log/{start_version:020}.{end_version:020}.compacted.{suffix}");
+    Path::from(path.as_str())
+}
+
 /// put a commit file into the specified object store.
 pub async fn add_commit(
     store: &dyn ObjectStore,
