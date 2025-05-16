@@ -58,39 +58,44 @@ And
     Array
       Short(5)
       Short(0)
-  NotIn
-    Integer(10)
-    Array
-      Short(5)
-      Short(0)
+  Not
+    In
+      Integer(10)
+      Array
+        Short(5)
+        Short(0)
   Or
     Equal
       Integer(5)
       Integer(10)
-    NotEqual
-      Integer(20)
-      Integer(10)
+    Not
+      Equal
+        Integer(20)
+        Integer(10)
   Not
     IsNull
       Column(col)
   Equal
     Integer(0)
     Integer(0)
-  NotEqual
-    Integer(0)
-    Integer(0)
+  Not
+    Equal
+      Integer(0)
+      Integer(0)
   LessThan
     Integer(0)
     Integer(0)
-  LessThanOrEqual
-    Integer(0)
-    Integer(0)
+  Not
+    GreaterThan
+      Integer(0)
+      Integer(0)
   GreaterThan
     Integer(0)
     Integer(0)
-  GreaterThanOrEqual
-    Integer(0)
-    Integer(0)
+  Not
+    LessThan
+      Integer(0)
+      Integer(0)
   Distinct
     Integer(0)
     Integer(0)

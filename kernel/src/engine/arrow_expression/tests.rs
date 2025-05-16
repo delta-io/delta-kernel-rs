@@ -28,11 +28,11 @@ fn test_array_column() {
     let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
-    let not_op = Pred::binary(
-        BinaryPredicateOp::NotIn,
+    let not_op = Pred::not(Pred::binary(
+        BinaryPredicateOp::In,
         Expr::literal(5),
         column_expr!("item"),
-    );
+    ));
 
     let in_op = Pred::binary(
         BinaryPredicateOp::In,
@@ -56,11 +56,11 @@ fn test_bad_right_type_array() {
     let schema = Schema::new([field.clone()]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
 
-    let in_op = Pred::binary(
-        BinaryPredicateOp::NotIn,
+    let in_op = Pred::not(Pred::binary(
+        BinaryPredicateOp::In,
         Expr::literal(5),
         column_expr!("item"),
-    );
+    ));
 
     let in_result = evaluate_predicate(&in_op, &batch);
 
@@ -77,8 +77,8 @@ fn test_literal_type_array() {
     let schema = Schema::new([field.clone()]);
     let batch = RecordBatch::new_empty(Arc::new(schema));
 
-    let in_op = Pred::binary(
-        BinaryPredicateOp::NotIn,
+    let in_op = Pred::not(Pred::binary(
+        BinaryPredicateOp::In,
         Expr::literal(5),
         Scalar::Array(
             ArrayData::try_new(
@@ -87,7 +87,7 @@ fn test_literal_type_array() {
             )
             .unwrap(),
         ),
-    );
+    ));
 
     let in_result = evaluate_predicate(&in_op, &batch).unwrap();
     let in_expected = BooleanArray::from(vec![true]);
@@ -232,11 +232,11 @@ fn test_invalid_array_sides() {
     let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
-    let in_op = Pred::binary(
-        BinaryPredicateOp::NotIn,
+    let in_op = Pred::not(Pred::binary(
+        BinaryPredicateOp::In,
         column_expr!("item"),
         column_expr!("item"),
-    );
+    ));
 
     let in_result = evaluate_predicate(&in_op, &batch);
 
@@ -259,11 +259,11 @@ fn test_str_arrays() {
     let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
-    let str_not_op = Pred::binary(
-        BinaryPredicateOp::NotIn,
+    let str_not_op = Pred::not(Pred::binary(
+        BinaryPredicateOp::In,
         Expr::literal("bye"),
         column_expr!("item"),
-    );
+    ));
 
     let str_in_op = Pred::binary(
         BinaryPredicateOp::In,
