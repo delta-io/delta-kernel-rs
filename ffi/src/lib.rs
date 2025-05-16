@@ -355,14 +355,14 @@ pub trait ExternEngine: Send + Sync {
 #[handle_descriptor(target=dyn ExternEngine, mutable=false)]
 pub struct SharedExternEngine;
 
-#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+#[cfg(feature = "default-engine")]
 struct ExternEngineVtable {
     // Actual engine instance to use
     engine: Arc<dyn Engine>,
     allocate_error: AllocateErrorFn,
 }
 
-#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+#[cfg(feature = "default-engine")]
 impl Drop for ExternEngineVtable {
     fn drop(&mut self) {
         debug!("dropping engine interface");
@@ -373,7 +373,7 @@ impl Drop for ExternEngineVtable {
 ///
 /// Kernel doesn't use any threading or concurrency. If engine chooses to do so, engine is
 /// responsible for handling  any races that could result.
-#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+#[cfg(feature = "default-engine")]
 unsafe impl Send for ExternEngineVtable {}
 
 /// # Safety
@@ -385,10 +385,10 @@ unsafe impl Send for ExternEngineVtable {}
 /// Basically, by failing to implement these traits, we forbid the engine from being able to declare
 /// its thread-safety (because rust assumes it is not threadsafe). By implementing them, we leave it
 /// up to the engine to enforce thread safety if engine chooses to use threads at all.
-#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+#[cfg(feature = "default-engine")]
 unsafe impl Sync for ExternEngineVtable {}
 
-#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+#[cfg(feature = "default-engine")]
 impl ExternEngine for ExternEngineVtable {
     fn engine(&self) -> Arc<dyn Engine> {
         self.engine.clone()
@@ -513,18 +513,7 @@ fn get_default_default_engine_impl(
     get_default_engine_impl(url?, Default::default(), allocate_error)
 }
 
-/// # Safety
-///
-/// Caller is responsible for passing a valid path pointer.
-#[cfg(feature = "sync-engine")]
-#[no_mangle]
-pub unsafe extern "C" fn get_sync_engine(
-    allocate_error: AllocateErrorFn,
-) -> ExternResult<Handle<SharedExternEngine>> {
-    get_sync_engine_impl(allocate_error).into_extern_result(&allocate_error)
-}
-
-#[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+#[cfg(feature = "default-engine")]
 fn engine_to_handle(
     engine: Arc<dyn Engine>,
     allocate_error: AllocateErrorFn,
@@ -550,14 +539,6 @@ fn get_default_engine_impl(
         Arc::new(TokioBackgroundExecutor::new()),
     );
     Ok(engine_to_handle(Arc::new(engine?), allocate_error))
-}
-
-#[cfg(feature = "sync-engine")]
-fn get_sync_engine_impl(
-    allocate_error: AllocateErrorFn,
-) -> DeltaResult<Handle<SharedExternEngine>> {
-    let engine = delta_kernel::engine::sync::SyncEngine::new();
-    Ok(engine_to_handle(Arc::new(engine), allocate_error))
 }
 
 /// # Safety
@@ -903,15 +884,5 @@ mod tests {
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
         Ok(())
-    }
-
-    #[test]
-    #[cfg(feature = "sync-engine")]
-    fn sync_engine() {
-        let engine = unsafe { get_sync_engine(allocate_err) };
-        let engine = ok_or_panic(engine);
-        unsafe {
-            free_engine(engine);
-        }
     }
 }

@@ -6,4 +6,4 @@ edition = "2021"
 [workspace]
 
 [dependencies]
-delta_kernel = { path = "../kernel", features = ["default-engine", "sync-engine"] }
+delta_kernel = { path = "../kernel", features = ["default-engine"] }
