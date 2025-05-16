@@ -61,8 +61,9 @@ void scan_row_callback(
   } else {
     print_diag(" [no stats])\n");
   }
+  KernelStringSlice table_root_slice = { context->table_root, strlen(context->table_root) };
   ExternResultKernelBoolSlice selection_vector_res =
-    selection_vector_from_dv(dv_info, context->engine, context->global_state);
+    selection_vector_from_dv(dv_info, context->engine, table_root_slice);
   if (selection_vector_res.tag != OkKernelBoolSlice) {
     printf("Could not get selection vector from kernel\n");
     exit(-1);
@@ -281,13 +282,15 @@ int main(int argc, char* argv[])
   }
 
   SharedScan* scan = scan_res.ok;
-  SharedGlobalScanState* global_state = get_global_scan_state(scan);
-  SharedSchema* logical_schema = get_global_logical_schema(global_state);
-  SharedSchema* read_schema = get_global_read_schema(global_state);
+
+  char* scan_table_path = scan_table_root(scan, allocate_string);
+  print_diag("Scan table root: %s\n", scan_table_path);
+
+  SharedSchema* logical_schema = scan_logical_schema(scan);
+  SharedSchema* physical_schema = scan_physical_schema(scan);
   struct EngineContext context = {
-    global_state,
     logical_schema,
-    read_schema,
+    physical_schema,
     table_root,
     engine,
     partition_cols,
@@ -334,11 +337,11 @@ int main(int argc, char* argv[])
   free_scan_metadata_iter(data_iter);
   free_scan(scan);
   free_schema(logical_schema);
-  free_schema(read_schema);
-  free_global_scan_state(global_state);
+  free_schema(physical_schema);
   free_snapshot(snapshot);
   free_engine(engine);
   free(context.table_root);
+  free(scan_table_path);
   free_partition_list(context.partition_cols);
 
   return 0;

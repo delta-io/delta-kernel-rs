@@ -12,15 +12,15 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::sync::SyncEngine;
-use delta_kernel::scan::state::{transform_to_logical, DvInfo, GlobalScanState, Stats};
-use delta_kernel::schema::Schema;
+use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
+use delta_kernel::schema::{Schema, SchemaRef};
 use delta_kernel::{DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Table};
 
 use clap::{Parser, ValueEnum};
 use url::Url;
 
 /// An example program that reads a table using multiple threads. This shows the use of the
-/// scan_metadata and global_scan_state methods on a Scan, that can be used to partition work to either
+/// scan_metadata method on a Scan, that can be used to partition work to either
 /// multiple threads, or workers (in the case of a distributed engine).
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -181,9 +181,6 @@ fn try_main() -> DeltaResult<()> {
     // the kernel.
     let scan_metadata = scan.scan_metadata(engine.as_ref())?;
 
-    // get any global state associated with this scan
-    let global_state = Arc::new(scan.global_scan_state());
-
     // create the channels we'll use. record_batch_[t/r]x are used for the threads to send back the
     // processed RecordBatches to themain thread
     let (record_batch_tx, record_batch_rx) = mpsc::channel();
@@ -195,7 +192,11 @@ fn try_main() -> DeltaResult<()> {
     let _handles: Vec<_> = (0..cli.thread_count)
         .map(|_| {
             // items that we need to send to the other thread
-            let scan_state = global_state.clone();
+            let scan_state = Arc::new(ScanState {
+                table_root: scan.table_root().clone(),
+                physical_schema: scan.physical_schema().clone(),
+                logical_schema: scan.logical_schema().clone(),
+            });
             let rb_tx = record_batch_tx.clone();
             let scan_file_rx = scan_file_rx.clone();
             let engine = engine.clone();
@@ -242,10 +243,16 @@ fn try_main() -> DeltaResult<()> {
     Ok(())
 }
 
+struct ScanState {
+    table_root: Url,
+    physical_schema: SchemaRef,
+    logical_schema: SchemaRef,
+}
+
 // this is the work each thread does
 fn do_work(
     engine: Arc<dyn Engine>,
-    scan_state: Arc<GlobalScanState>,
+    scan_state: Arc<ScanState>,
     record_batch_tx: Sender<RecordBatch>,
     scan_file_rx: spmc::Receiver<ScanFile>,
 ) {
@@ -255,7 +262,7 @@ fn do_work(
     // hangs up, which indicates there's no more data to process.
     while let Ok(scan_file) = scan_file_rx.recv() {
         // we got a scan file, let's process it
-        let root_url = Url::parse(&scan_state.table_root).unwrap();
+        let root_url = &scan_state.table_root;
 
         // get the selection vector (i.e. deletion vector)
         let mut selection_vector = scan_file
