@@ -69,7 +69,6 @@ jobs:
       - name: build docs
         run: cargo doc
 
-
   # When we run cargo { build, clippy } --no-default-features, we want to build/lint the kernel to
   # ensure that we can build the kernel without any features enabled. Unfortunately, due to how
   # cargo resolves features, if we have a workspace member that depends on the kernel with features
@@ -142,7 +141,7 @@ jobs:
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
         with:
-          cmake-version: '3.30.x'
+          cmake-version: "3.30.x"
       - name: Install arrow-glib
         run: |
           if [ "$RUNNER_OS" == "Linux" ]; then
@@ -231,3 +230,10 @@ jobs:
           fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+  typos:
+    name: Spell Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check spelling
+        uses: crate-ci/typos@v1
