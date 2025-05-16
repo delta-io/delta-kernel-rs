@@ -12,6 +12,7 @@ use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::EngineData;
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use itertools::Itertools;
 
@@ -141,11 +142,21 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
         .into()
 }
 
-pub trait NewLocalDefaultEngine {
-    fn new_local() -> Arc<DefaultEngine<TokioBackgroundExecutor>>;
+/// Simple extension trait with helpful methods (just constuctor for now) for creating/using
+/// DefaultEngine in our tests.
+///
+/// Note: we implment this extension trait here so that we can import this trait (from test-utils
+/// crate) and get to use all these test-only helper methods from places where we don't have access
+/// to #[cfg(test)] (i.e. in examples/integration tests).
+pub trait DefaultEngineExtension {
+    type Executor: TaskExecutor;
+
+    fn new_local() -> Arc<DefaultEngine<Self::Executor>>;
 }
 
-impl NewLocalDefaultEngine for DefaultEngine<TokioBackgroundExecutor> {
+impl DefaultEngineExtension for DefaultEngine<TokioBackgroundExecutor> {
+    type Executor = TokioBackgroundExecutor;
+
     fn new_local() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
         let object_store = Arc::new(LocalFileSystem::new());
         Arc::new(DefaultEngine::new(

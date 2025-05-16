@@ -7,7 +7,7 @@ use delta_kernel::{DeltaResult, Table};
 mod common;
 use common::{load_test_data, read_scan};
 
-use test_utils::NewLocalDefaultEngine;
+use test_utils::DefaultEngineExtension;
 
 use itertools::Itertools;
 

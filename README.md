@@ -78,9 +78,9 @@ If you enable the `default-engine` feature, you get an implementation of the `En
 uses [Arrow] as its data format.
 
 The [`arrow crate`](https://docs.rs/arrow/latest/arrow/) tends to release new major versions rather
-quickly. To enable engines that already integrate arrow to also integrate kernel and not force them
-to track a specific version of arrow that kernel depends on, we take as broad dependency on arrow
-versions as we can.
+frequently. To enable engines that already integrate arrow to also integrate kernel and not force
+them to track a specific version of arrow that kernel depends on, we take as broad dependency on
+arrow versions as we can.
 
 We allow selecting the version of arrow to use via feature flags. Currently we support the following
 flags:
@@ -95,9 +95,6 @@ flags:
 Note that if more than one `arrow-x` feature is enabled, kernel will use the _highest_ (latest)
 specified flag. This also means that if you use `--all-features` you will get the latest version of
 arrow that kernel supports.
-
-If you enable at least one of `default-engine`, `arrow-conversion`, or `arrow-expression`, you must
-enable either `arrow` (latest arrow version) or `arrow-54` or `arrow-55`.
 
 ### Object Store
 You may also need to patch the `object_store` version used if the version of `parquet` you depend on

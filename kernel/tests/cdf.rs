@@ -8,7 +8,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::{DeltaResult, Error, PredicateRef, Table, Version};
 
-use test_utils::NewLocalDefaultEngine;
+use test_utils::DefaultEngineExtension;
 
 mod common;
 use common::{load_test_data, to_arrow};

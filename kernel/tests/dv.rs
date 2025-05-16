@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::scan::ScanResult;
 use delta_kernel::{DeltaResult, Table};
-use test_utils::NewLocalDefaultEngine;
+use test_utils::DefaultEngineExtension;
 
 use itertools::Itertools;
 use test_log::test;
