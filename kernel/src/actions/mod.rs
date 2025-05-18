@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 pub mod deletion_vector;
 pub mod set_transaction;
 
+pub(crate) mod crc;
 pub(crate) mod domain_metadata;
 pub(crate) mod schemas;
 
