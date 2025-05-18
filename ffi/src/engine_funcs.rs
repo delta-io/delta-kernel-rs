@@ -122,8 +122,6 @@ fn read_parquet_file_impl(
     let engine = extern_engine.engine();
     let parquet_handler = engine.parquet_handler();
     let location = Url::parse(path?)?;
-    // TODO: remove after arrow 54 is dropped
-    #[allow(clippy::useless_conversion)]
     let delta_fm = delta_kernel::FileMeta {
         location,
         last_modified: file.last_modified,
