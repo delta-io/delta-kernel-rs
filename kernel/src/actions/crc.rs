@@ -89,8 +89,7 @@ pub(crate) struct DeletedRecordCountsHistogram {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actions::schemas::ToDataType as _;
-    use crate::actions::schemas::ToSchema as _;
+    use crate::actions::schemas::{ToDataType as _, ToSchema as _};
     use crate::schema::{ArrayType, DataType, StructField, StructType};
 
     #[test]
