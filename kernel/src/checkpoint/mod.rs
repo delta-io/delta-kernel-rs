@@ -163,7 +163,7 @@ static CHECKPOINT_METADATA_ACTION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(||
 /// [`CheckpointWriter::finalize`]. Failing to do so may result in data loss or corruption.
 pub struct CheckpointDataIterator {
     /// The nested iterator that yields checkpoint batches with action counts
-    checkpoint_batch_iterator: Box<dyn Iterator<Item = DeltaResult<CheckpointBatch>>>,
+    checkpoint_batch_iterator: Box<dyn Iterator<Item = DeltaResult<CheckpointBatch>> + Send>,
     /// Running total of actions included in the checkpoint
     actions_count: i64,
     /// Running total of add actions included in the checkpoint
