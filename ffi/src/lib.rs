@@ -13,6 +13,7 @@ use url::Url;
 
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
+use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel::{DeltaResult, Engine, EngineData, Table};
 use delta_kernel_ffi_macros::handle_descriptor;
 
@@ -721,6 +722,141 @@ pub unsafe extern "C" fn free_string_slice_data(data: Handle<StringSliceIterator
     data.drop_handle();
 }
 
+#[handle_descriptor(target=Transaction, mutable=true, sized=true)]
+pub struct ExclusiveTransaction;
+
+/// Start a transaction on the latest snapshot of the table.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles and path pointer.
+#[no_mangle]
+pub unsafe extern "C" fn transaction(
+    path: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let url = unsafe { unwrap_and_parse_path_as_url(path) };
+    let engine = unsafe { engine.as_ref() };
+    transaction_impl(url, engine).into_extern_result(&engine)
+}
+
+fn transaction_impl(
+    url: DeltaResult<Url>,
+    extern_engine: &dyn ExternEngine,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    let table = Table::try_from_uri(url?)?;
+    let transaction = table.new_transaction(extern_engine.engine().as_ref())?;
+    Ok(Box::new(transaction).into())
+}
+
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn free_transaction(txn: Handle<ExclusiveTransaction>) {
+    txn.drop_handle();
+}
+
+/// TODO
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle. CONSUMES TRANSACTION and commit info
+#[no_mangle]
+pub unsafe extern "C" fn with_commit_info(
+    txn: Handle<ExclusiveTransaction>,
+    commit_info: Handle<ExclusiveEngineData>,
+) -> Handle<ExclusiveTransaction> {
+    let txn = unsafe { txn.into_inner() };
+    let commit_info = unsafe { commit_info.into_inner() };
+    Box::new(txn.with_commit_info(commit_info)).into()
+}
+
+use delta_kernel::transaction::WriteContext;
+
+#[handle_descriptor(target=WriteContext, mutable=false, sized=true)]
+pub struct SharedWriteContext;
+
+#[no_mangle]
+pub unsafe extern "C" fn get_write_context(
+    txn: Handle<ExclusiveTransaction>,
+) -> Handle<SharedWriteContext> {
+    let txn = unsafe { txn.as_ref() };
+    Arc::new(txn.get_write_context()).into()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn free_write_context(write_context: Handle<SharedWriteContext>) {
+    write_context.drop_handle();
+}
+
+/// TODO
+///
+/// # Safety
+/// Engine is responsible for providing a valid WriteContext pointer
+#[no_mangle]
+pub unsafe extern "C" fn get_write_schema(
+    write_context: Handle<SharedWriteContext>,
+) -> Handle<SharedSchema> {
+    let write_context = unsafe { write_context.as_ref() };
+    write_context.schema().clone().into()
+}
+
+/// TODO
+///
+/// # Safety
+/// Engine is responsible for providing a valid WriteContext pointer
+#[no_mangle]
+pub unsafe extern "C" fn get_write_path(
+    write_context: Handle<SharedWriteContext>,
+    allocate_fn: AllocateStringFn,
+) -> NullableCvoid {
+    let write_context = unsafe { write_context.as_ref() };
+    let write_path = write_context.target_dir().to_string();
+    allocate_fn(kernel_string_slice!(write_path))
+}
+
+/// TODO
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle. Assumes no concurrent txn usage. Consumes
+/// write_metadata.
+#[no_mangle]
+pub unsafe extern "C" fn add_write_metadata(
+    mut txn: Handle<ExclusiveTransaction>,
+    write_metadata: Handle<ExclusiveEngineData>,
+) {
+    let txn = unsafe { txn.as_mut() };
+    let write_metadata = unsafe { write_metadata.into_inner() };
+    txn.add_write_metadata(write_metadata);
+}
+
+/// TODO
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle. And MUST NOT USE transaction after this
+/// method is called.
+#[no_mangle]
+pub unsafe extern "C" fn commit(
+    txn: Handle<ExclusiveTransaction>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<u64> {
+    let txn = unsafe { txn.into_inner() };
+    let extern_engine = unsafe { engine.as_ref() };
+    let engine = extern_engine.engine();
+    // FIXME for now just erasing the enum
+    match txn.commit(engine.as_ref()) {
+        Ok(CommitResult::Committed(v)) => Ok(v),
+        Ok(CommitResult::Conflict(_, v)) => Err(delta_kernel::Error::Generic(format!(
+            "commit conflict at version {v}"
+        ))),
+        Err(e) => Err(e),
+    }
+    .into_extern_result(&extern_engine)
+}
+
 /// A set that can identify its contents by address
 pub struct ReferenceSet<T> {
     map: std::collections::HashMap<usize, T>,
@@ -776,10 +912,26 @@ impl<T> Default for ReferenceSet<T> {
 mod tests {
     use delta_kernel::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
     use delta_kernel::object_store::memory::InMemory;
+    use delta_kernel::schema::{DataType, StructField, StructType};
     use test_utils::{actions_to_string, actions_to_string_partitioned, add_commit, TestAction};
+
+    use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use delta_kernel::arrow::record_batch::RecordBatch;
+
+    use delta_kernel::arrow::array::{Array, ArrayRef, Int32Array, StringArray, StructArray};
+    use delta_kernel::arrow::ffi::to_ffi;
+    use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
+    use delta_kernel::parquet::file::properties::WriterProperties;
+    use delta_kernel_ffi::engine_data::ArrowFFIData;
+
+    use delta_kernel_ffi::engine_data::get_engine_data;
+
+    use test_utils::{setup_tables, test_read};
 
     use super::*;
     use crate::error::{EngineError, KernelError};
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use tempfile::tempdir;
 
     #[no_mangle]
     extern "C" fn allocate_err(etype: KernelError, _: KernelStringSlice) -> *mut EngineError {
@@ -825,8 +977,7 @@ mod tests {
         }
     }
 
-    pub(crate) fn get_default_engine() -> Handle<SharedExternEngine> {
-        let path = "memory:///doesntmatter/foo";
+    pub(crate) fn get_default_engine(path: &str) -> Handle<SharedExternEngine> {
         let path = kernel_string_slice!(path);
         let builder = unsafe { ok_or_panic(get_engine_builder(path, allocate_err)) };
         unsafe { ok_or_panic(builder_build(builder)) }
@@ -834,10 +985,223 @@ mod tests {
 
     #[test]
     fn engine_builder() {
-        let engine = get_default_engine();
+        let engine = get_default_engine("memory:///doesntmatter/foo");
         unsafe {
             free_engine(engine);
         }
+    }
+
+    fn create_arrow_ffi_from_json(
+        schema: ArrowSchema,
+        json_string: &str,
+    ) -> Result<Box<ArrowFFIData>, Box<dyn std::error::Error>> {
+        let cursor = std::io::Cursor::new(json_string.as_bytes());
+        let mut reader = arrow_json::reader::ReaderBuilder::new(schema.into())
+            .build(cursor)
+            .unwrap();
+        let batch = reader.next().unwrap().unwrap();
+
+        let commit_info_struct_array: StructArray = batch.try_into().unwrap();
+        let array_data = commit_info_struct_array.into_data();
+        let (out_array, out_schema) = to_ffi(&array_data)?;
+
+        Ok(Box::new(ArrowFFIData {
+            array: out_array,
+            schema: out_schema,
+        }))
+    }
+
+    // TODO: deduplicate with the new_commit_info used in Kernel tests
+    fn new_commit_info() -> Result<Box<ArrowFFIData>, Box<dyn std::error::Error>> {
+        // create commit info of the form {engineCommitInfo: Map { "engineInfo": "default engine" } }
+        let schema = ArrowSchema::new(vec![Field::new(
+            "engineCommitInfo",
+            ArrowDataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    ArrowDataType::Struct(
+                        vec![
+                            Field::new("key", ArrowDataType::Utf8, false),
+                            Field::new("value", ArrowDataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            false,
+        )]);
+
+        create_arrow_ffi_from_json(
+            schema,
+            r#"{"engineCommitInfo":{"engineInfo" :"default engine"}}"#,
+        )
+    }
+
+    fn create_file_metadata(
+        path: &str,
+        num_rows: i64,
+    ) -> Result<Box<ArrowFFIData>, Box<dyn std::error::Error>> {
+        let schema = ArrowSchema::new(vec![
+            Field::new("path", ArrowDataType::Utf8, false),
+            Field::new(
+                "partitionValues",
+                ArrowDataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        ArrowDataType::Struct(
+                            vec![
+                                Field::new("key", ArrowDataType::Utf8, false),
+                                Field::new("value", ArrowDataType::Utf8, true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                false,
+            ),
+            Field::new("size", ArrowDataType::Int64, false),
+            Field::new("modificationTime", ArrowDataType::Int64, false),
+            Field::new("dataChange", ArrowDataType::Boolean, false),
+        ]);
+
+        let current_time: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let file_metadata = format!(
+            r#"{{"path":"{}", "partitionValues": {{}}, "size": {}, "modificationTime": {}, "dataChange": true}}"#,
+            path, num_rows, current_time
+        );
+
+        create_arrow_ffi_from_json(schema, file_metadata.as_str())
+    }
+
+    fn write_parquet_file(
+        delta_path: &str,
+        file_path: &str,
+        batch: &RecordBatch,
+    ) -> Result<Box<ArrowFFIData>, Box<dyn std::error::Error>> {
+        // WriterProperties can be used to set Parquet file options
+        let props = WriterProperties::builder().build();
+
+        let full_path = format!("{}{}", delta_path, file_path);
+        let file = std::fs::File::create(&full_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+
+        writer.write(&batch).expect("Writing batch");
+
+        // writer must be closed to write footer
+        let res = writer.close().unwrap();
+
+        create_file_metadata(file_path, res.num_rows)
+    }
+
+    unsafe fn add_commit_info_to_transaction(
+        txn: Handle<ExclusiveTransaction>,
+        engine: &Handle<SharedExternEngine>,
+        commit_info: Box<ArrowFFIData>,
+    ) -> Handle<ExclusiveTransaction> {
+        // Construct the commit info by going through the ffi format
+        let commit_info_ptr = Box::into_raw(commit_info); // TODO: free?
+        let commit_info_engine_data =
+            ok_or_panic(get_engine_data(commit_info_ptr, engine.shallow_copy()));
+        with_commit_info(txn, commit_info_engine_data)
+    }
+
+    #[tokio::test]
+    async fn test_basic_append() -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(StructType::new(vec![
+            StructField::nullable("number", DataType::INTEGER),
+            StructField::nullable("string", DataType::STRING),
+        ]));
+
+        // Create a temporary local directory for use during this test
+        let tmp_test_dir = tempdir()?;
+
+        // TODO: test with partitions
+        let partition_columns = vec![];
+
+        for (table, _engine, _store, _table_name) in setup_tables(
+            schema,
+            &partition_columns,
+            tmp_test_dir.path().to_str(),
+            "test_table",
+        )
+        .await?
+        {
+            let table_path = table.location().as_str();
+            let engine = get_default_engine(table_path);
+
+            // Start the transaction
+            let txn = ok_or_panic(unsafe {
+                transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+            });
+
+            // Add some empty commit info
+            let txn_with_commit_info =
+                unsafe { add_commit_info_to_transaction(txn, &engine, new_commit_info()?) };
+
+            let write_context = unsafe { get_write_context(txn_with_commit_info.shallow_copy()) };
+
+            // TODO: write separate test for properly testing the write schema
+            let write_schema = unsafe { get_write_schema(write_context.shallow_copy()) };
+
+            // Ensure the ffi returns the correct table path TODO: can the write path be different from the table path?
+            let write_path = unsafe { get_write_path(write_context.shallow_copy(), allocate_str) };
+            assert!(write_path.is_some());
+            let canonical_write_path = std::fs::canonicalize(
+                recover_string(write_path.unwrap()).trim_start_matches("file://"),
+            )
+            .unwrap();
+            let canonical_table_path =
+                std::fs::canonicalize(table_path.trim_start_matches("file://")).unwrap();
+            assert_eq!(canonical_write_path, canonical_table_path);
+
+            // Create some test data
+            let batch = RecordBatch::try_from_iter(vec![
+                (
+                    "number",
+                    Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])) as ArrayRef,
+                ),
+                (
+                    "string",
+                    Arc::new(StringArray::from(vec![
+                        "value-1", "value-2", "value-3", "value-4", "value-5",
+                    ])) as ArrayRef,
+                ),
+            ])
+            .unwrap();
+
+            let table_path_without_file_prefix = table_path.trim_start_matches("file://");
+            let file_info =
+                write_parquet_file(table_path_without_file_prefix, "my_file.parquet", &batch)?;
+
+            // TODO: I feel this leaks the struct itself? get_engine_data does take ownership of the ArrowFFIData.array and ArrowFFIData.schema, but the struct seems to be leaked?
+            let file_info_ptr = Box::into_raw(file_info);
+            let file_info_engine_data =
+                ok_or_panic(unsafe { get_engine_data(file_info_ptr, engine.shallow_copy()) });
+
+            unsafe {
+                add_write_metadata(txn_with_commit_info.shallow_copy(), file_info_engine_data)
+            };
+
+            ok_or_panic(unsafe { commit(txn_with_commit_info, engine.shallow_copy()) });
+
+            // Confirm that the data matches what we appended
+            let test_batch = ArrowEngineData::from(batch);
+            test_read(&test_batch, &table, unsafe { engine.as_ref().engine() })?;
+
+            unsafe { free_schema(write_schema) };
+            unsafe { free_write_context(write_context) };
+            unsafe { free_engine(engine) };
+        }
+
+        Ok(())
     }
 
     #[tokio::test]

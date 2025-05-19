@@ -2,13 +2,16 @@
 
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use delta_kernel::arrow::array::{
+    ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
+};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::{path::Path, ObjectStore};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
-use delta_kernel::EngineData;
+use delta_kernel::schema::SchemaRef;
+use delta_kernel::{DeltaResult, Engine, EngineData, Table};
 use itertools::Itertools;
 
 /// A common useful initial metadata and protocol. Also includes a single commitInfo
@@ -81,6 +84,18 @@ impl IntoArray for Vec<i32> {
     }
 }
 
+impl IntoArray for Vec<i64> {
+    fn into_array(self) -> ArrayRef {
+        Arc::new(Int64Array::from(self))
+    }
+}
+
+impl IntoArray for Vec<bool> {
+    fn into_array(self) -> ArrayRef {
+        Arc::new(BooleanArray::from(self))
+    }
+}
+
 impl IntoArray for Vec<&'static str> {
     fn into_array(self) -> ArrayRef {
         Arc::new(StringArray::from(self))
@@ -129,4 +144,199 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
     ArrowEngineData::try_from_engine_data(engine_data)
         .unwrap()
         .into()
+}
+
+// we provide this table creation function since we only do appends to existing tables for now.
+// this will just create an empty table with the given schema. (just protocol + metadata actions)
+use delta_kernel::arrow::compute::filter_record_batch;
+use delta_kernel::arrow::util::pretty::pretty_format_batches;
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::scan::Scan;
+use serde_json::{json, to_vec};
+use url::Url;
+
+// setup default engine with in-memory (local_directory is none) or local fs (in local_directory) object store.
+fn setup(
+    table_name: &str,
+    local_directory: Option<&str>,
+) -> (
+    Arc<dyn ObjectStore>,
+    DefaultEngine<TokioBackgroundExecutor>,
+    Url,
+) {
+    let (storage, base_path, base_url): (Arc<dyn ObjectStore>, String, &str) = match local_directory
+    {
+        None => (Arc::new(InMemory::new()), format!("/"), "memory:///"),
+        Some(dir) => (
+            Arc::new(LocalFileSystem::new()),
+            format!("{dir}/kernel_write_tests/"),
+            "file:///",
+        ),
+    };
+
+    let table_root_path = Path::from(format!("{base_path}{table_name}"));
+    let url = Url::parse(&format!("{base_url}{table_root_path}/")).unwrap();
+    let executor = Arc::new(TokioBackgroundExecutor::new());
+    let engine = DefaultEngine::new(Arc::clone(&storage), executor);
+
+    (storage, engine, url)
+}
+
+pub async fn create_table(
+    store: Arc<dyn ObjectStore>,
+    table_path: Url,
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    use_37_protocol: bool,
+) -> Result<Table, Box<dyn std::error::Error>> {
+    let table_id = "test_id";
+    let schema = serde_json::to_string(&schema)?;
+
+    let protocol = if use_37_protocol {
+        json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": [],
+                "writerFeatures": []
+            }
+        })
+    } else {
+        json!({
+            "protocol": {
+                "minReaderVersion": 1,
+                "minWriterVersion": 1,
+            }
+        })
+    };
+    let metadata = json!({
+        "metaData": {
+            "id": table_id,
+            "format": {
+                "provider": "parquet",
+                "options": {}
+            },
+            "schemaString": schema,
+            "partitionColumns": partition_columns,
+            "configuration": {},
+            "createdTime": 1677811175819u64
+        }
+    });
+
+    let data = [
+        to_vec(&protocol).unwrap(),
+        b"\n".to_vec(),
+        to_vec(&metadata).unwrap(),
+    ]
+    .concat();
+
+    // put 0.json with protocol + metadata
+    let path = table_path.join("_delta_log/00000000000000000000.json")?;
+    store
+        .put(&Path::from_url_path(path.path())?, data.into())
+        .await?;
+    Ok(Table::new(table_path))
+}
+
+/// Creates two empty test tables, one with 37 protocol and one with 11 protocol.
+/// the tables will be named {table_base_name}_11 and table_base_name}_37. The local_directory param
+/// can be set to write out the tables to the local filesystem, passing in None will create in-memory tables
+pub async fn setup_tables(
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    local_directory: Option<&str>,
+    table_base_name: &str,
+) -> Result<
+    Vec<(
+        Table,
+        DefaultEngine<TokioBackgroundExecutor>,
+        Arc<dyn ObjectStore>,
+        &'static str,
+    )>,
+    Box<dyn std::error::Error>,
+> {
+    let table_name_11 = format!("{table_base_name}_11");
+    let table_name_37 = format!("{table_base_name}_37");
+    let (store_11, engine_11, table_location_11) = setup(table_name_11.as_str(), local_directory);
+    let (store_37, engine_37, table_location_37) = setup(table_name_37.as_str(), local_directory);
+    Ok(vec![
+        (
+            create_table(
+                store_37.clone(),
+                table_location_37,
+                schema.clone(),
+                partition_columns,
+                true,
+            )
+            .await?,
+            engine_37,
+            store_37,
+            "test_table_37",
+        ),
+        (
+            create_table(
+                store_11.clone(),
+                table_location_11,
+                schema,
+                partition_columns,
+                false,
+            )
+            .await?,
+            engine_11,
+            store_11,
+            "test_table_11",
+        ),
+    ])
+}
+
+// we know we're using arrow under the hood, so cast an EngineData into something we can work with
+pub fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
+    Ok(data
+        .into_any()
+        .downcast::<ArrowEngineData>()
+        .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
+        .into())
+}
+
+pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<RecordBatch>> {
+    let scan_results = scan.execute(engine)?;
+    scan_results
+        .map(|scan_result| -> DeltaResult<_> {
+            let scan_result = scan_result?;
+            let mask = scan_result.full_mask();
+            let data = scan_result.raw_data?;
+            let record_batch = to_arrow(data)?;
+            if let Some(mask) = mask {
+                Ok(filter_record_batch(&record_batch, &mask.into())?)
+            } else {
+                Ok(record_batch)
+            }
+        })
+        .try_collect()
+}
+
+pub fn test_read(
+    expected: &ArrowEngineData,
+    table: &Table,
+    engine: Arc<dyn Engine>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let snapshot = table.snapshot(engine.as_ref(), None)?;
+    let scan = snapshot.into_scan_builder().build()?;
+    let batches = read_scan(&scan, engine)?;
+    let formatted = pretty_format_batches(&batches).unwrap().to_string();
+
+    let expected = pretty_format_batches(&[expected.record_batch().clone()])
+        .unwrap()
+        .to_string();
+
+    assert_eq!(
+        formatted, expected,
+        "actual:\n{}\nexpected:\n{}",
+        formatted, expected
+    );
+
+    Ok(())
 }
