@@ -290,14 +290,14 @@ impl Scalar {
         Ok(Self::Decimal(dval))
     }
 
-    /// Constructs a Scalar timestamp with no timezone from an `i64` millisecond since unix epoch
-    pub(crate) fn timestamp_ntz_from_millis(millis: i64) -> DeltaResult<Self> {
+    /// Constructs a Scalar timestamp (in UTC) from an `i64` millisecond since unix epoch
+    pub(crate) fn timestamp_from_millis(millis: i64) -> DeltaResult<Self> {
         let Some(timestamp) = DateTime::from_timestamp_millis(millis) else {
             return Err(Error::generic(format!(
                 "Failed to create millisecond timestamp from {millis}"
             )));
         };
-        Ok(Self::TimestampNtz(timestamp.timestamp_micros()))
+        Ok(Self::Timestamp(timestamp.timestamp_micros()))
     }
 }
 
