@@ -4,21 +4,23 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
+use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
-use self::log_replay::{get_scan_metadata_transform_expr, DV_SCHEMA};
+use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
+use crate::actions::schemas::ToSchema;
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
 use crate::log_replay::HasSelectionVector;
-use crate::log_segment::LogSegment;
+use crate::log_segment::{ListedLogFiles, LogSegment};
 use crate::scan::state::{DvInfo, Stats};
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
@@ -458,27 +460,51 @@ impl Scan {
     /// Engines may decide to cache the results of `scan_metadata` to avoid additional IO operations
     /// required to replay the log.
     ///
-    /// NOTE: During replay, the predicates associated with the scan are applied, also to the existing metadata.
-    /// As such the previous scan should have predicates that are compatible with the current scan.
-    /// Compatible in this case means, that they need to be strictly more permissive than the current scan.
-    pub fn scan_metadata_from_existing(
+    /// As such the new scan's predicate must "contain" the previous scan's predicate. That is, the new
+    /// scan's predicate MUST skip all files the previous scan's predicate skipped, The new scan's
+    /// predicate is also allowed to skip files the previous predicate kept. For example, if the previous
+    /// scan predicate was
+    /// ```text
+    /// WHERE a < 42 AND b = 10
+    /// ```
+    /// then it is legal for the new scan to use predicates such as the following:
+    /// ```text
+    /// WHERE a = 30 AND b = 10
+    /// WHERE a < 10 AND b = 10
+    /// WHERE a < 42 AND b = 10 AND c = 20
+    /// ```
+    /// but it is NOT legal for the new scan to use predicates like these:
+    /// ```text
+    /// WHERE a < 42
+    /// WHERE a = 50 AND b = 10
+    /// WHERE a < 42 AND b <= 10
+    /// WHERE a < 42 OR b = 10
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    /// * `hint_version` - Table version the provided hint data was read from.
+    /// * `hint_data` - Exisiting scan metadata to use as a hint.
+    /// * `hint_predicate` - The predicate used by the previous scan.
+    #[internal_api]
+    pub(crate) fn scan_metadata_from(
         &self,
         engine: &dyn Engine,
         hint_version: Version,
         hint_data: impl IntoIterator<Item = Box<dyn EngineData>> + 'static,
+        _hint_predicate: Option<PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
         static RESTORED_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
-            // Note that fields projected out of a nullable struct must be nullable
             let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
             DataType::struct_type(vec![StructField::nullable(
                 "add",
                 DataType::struct_type(vec![
-                    StructField::nullable("path", DataType::STRING),
-                    StructField::nullable("partitionValues", partition_values),
-                    StructField::nullable("size", DataType::LONG),
+                    StructField::not_null("path", DataType::STRING),
+                    StructField::not_null("partitionValues", partition_values),
+                    StructField::not_null("size", DataType::LONG),
                     StructField::nullable("modificationTime", DataType::LONG),
                     StructField::nullable("stats", DataType::STRING),
-                    StructField::nullable("deletionVector", DV_SCHEMA.clone()),
+                    StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
                 ]),
             )])
         });
@@ -505,10 +531,8 @@ impl Scan {
         // If the snapshot version corresponds to the hint version, we process the existing data
         // to apply file skipping and provide the required transformations.
         if hint_version == self.snapshot.version() {
-            return Ok(Box::new(self.scan_metadata_inner(
-                engine,
-                hint_data.into_iter().map(apply_transform),
-            )?));
+            let scan = hint_data.into_iter().map(apply_transform);
+            return Ok(Box::new(self.scan_metadata_inner(engine, scan)?));
         }
 
         let log_segment = self.snapshot.log_segment();
@@ -516,19 +540,20 @@ impl Scan {
         // If the current log segment contains a checkpoint newer than the hint version
         // we disregard the existing data hint, and perform a full scan. The current log segment
         // only has deltas after the checkpoint, so we cannot update from prior versions.
-        if let Some(version) = log_segment.checkpoint_version {
-            if version > hint_version {
-                let scan_iter = self.scan_metadata(engine)?;
-                return Ok(Box::new(scan_iter));
-            }
+        if matches!(log_segment.checkpoint_version, Some(v) if v > hint_version) {
+            return Ok(Box::new(self.scan_metadata(engine)?));
         }
 
         // create a new log segment containing only the commits added after the version hint.
         let mut ascending_commit_files = log_segment.ascending_commit_files.clone();
         ascending_commit_files.retain(|f| f.version > hint_version);
-        let new_log_segment = LogSegment::try_new(
+        let listed_log_files = ListedLogFiles {
             ascending_commit_files,
-            vec![],
+            ascending_compaction_files: vec![],
+            checkpoint_parts: vec![],
+        };
+        let new_log_segment = LogSegment::try_new(
+            listed_log_files,
             log_segment.log_root.clone(),
             Some(log_segment.end_version),
         )?;
@@ -1204,7 +1229,7 @@ mod tests {
             .try_collect()
             .unwrap();
         let new_files: Vec<_> = scan
-            .scan_metadata_from_existing(engine.as_ref(), version, files)
+            .scan_metadata_from(engine.as_ref(), version, files, None)
             .unwrap()
             .try_collect()
             .unwrap();
@@ -1243,7 +1268,7 @@ mod tests {
         let snapshot = table.snapshot(engine.as_ref(), Some(1)).unwrap();
         let scan = snapshot.into_scan_builder().build().unwrap();
         let new_files: Vec<_> = scan
-            .scan_metadata_from_existing(engine.as_ref(), 0, files)
+            .scan_metadata_from(engine.as_ref(), 0, files, None)
             .unwrap()
             .map_ok(|ScanMetadata { scan_files, .. }| {
                 let batch: RecordBatch = ArrowEngineData::try_from_engine_data(scan_files.data)
