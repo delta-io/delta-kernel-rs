@@ -139,7 +139,7 @@ pub(crate) fn evaluate_predicate(
     use BinaryPredicateOp::*;
     use Predicate::*;
 
-    // Helper to conditionally invert results of arrow operations we couldn't push NOT down into.
+    // Helper to conditionally invert results of arrow operations if we couldn't push down the NOT.
     let maybe_inverted = |result: Cow<'_, BooleanArray>| match inverted {
         true => not(&result),
         false => Ok(result.into_owned()),
