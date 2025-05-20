@@ -12,11 +12,14 @@ use crate::Version;
 
 #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
 use crate::arrow::error::ArrowError;
+#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
+use crate::object_store;
 
 /// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
 
 /// All the types of errors that the kernel can run into
+#[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     /// This is an error that includes a backtrace. To have a particular type of error include such
@@ -33,6 +36,9 @@ pub enum Error {
     #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
     #[error(transparent)]
     Arrow(ArrowError),
+
+    #[error("Error writing checkpoint: {0}")]
+    CheckpointWrite(String),
 
     /// User tried to convert engine data to the wrong type
     #[error("Invalid engine data type. Could not convert to {0}")]
@@ -69,12 +75,12 @@ pub enum Error {
     /// An error interacting with the object_store crate
     // We don't use [#from] object_store::Error here as our From impl transforms
     // object_store::Error::NotFound into Self::FileNotFound
-    #[cfg(feature = "object_store")]
+    #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
     #[error("Error interacting with object store: {0}")]
     ObjectStore(object_store::Error),
 
     /// An error working with paths from the object_store crate
-    #[cfg(feature = "object_store")]
+    #[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
     #[error("Object store path error: {0}")]
     ObjectStorePath(#[from] object_store::path::Error),
 
@@ -204,10 +210,18 @@ pub enum Error {
     LiteralExpressionTransformError(
         #[from] crate::expressions::literal_expression_transform::Error,
     ),
+
+    /// Schema mismatch has occurred or invalid schema used somewhere
+    #[error("Schema error: {0}")]
+    Schema(String),
 }
 
 // Convenience constructors for Error types that take a String argument
 impl Error {
+    pub(crate) fn checkpoint_write(msg: impl ToString) -> Self {
+        Self::CheckpointWrite(msg.to_string())
+    }
+
     pub fn generic_err(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self::GenericError {
             source: source.into(),
@@ -281,6 +295,10 @@ impl Error {
         Self::InvalidCheckpoint(msg.to_string())
     }
 
+    pub(crate) fn schema(msg: impl ToString) -> Self {
+        Self::Schema(msg.to_string())
+    }
+
     // Capture a backtrace when the error is constructed.
     #[must_use]
     pub fn with_backtrace(self) -> Self {
@@ -319,7 +337,7 @@ impl From<ArrowError> for Error {
     }
 }
 
-#[cfg(feature = "object_store")]
+#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
 impl From<object_store::Error> for Error {
     fn from(value: object_store::Error) -> Self {
         match value {

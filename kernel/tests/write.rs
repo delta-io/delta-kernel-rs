@@ -8,11 +8,11 @@ use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
 
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::path::Path;
+use delta_kernel::object_store::ObjectStore;
 use itertools::Itertools;
-use object_store::local::LocalFileSystem;
-use object_store::memory::InMemory;
-use object_store::path::Path;
-use object_store::ObjectStore;
 use serde_json::Deserializer;
 use serde_json::{json, to_vec};
 use url::Url;
@@ -105,9 +105,10 @@ async fn create_table(
     .concat();
 
     // put 0.json with protocol + metadata
-    let path = table_path.path();
-    let path = format!("{path}_delta_log/00000000000000000000.json");
-    store.put(&Path::from(path), data.into()).await?;
+    let path = table_path.join("_delta_log/00000000000000000000.json")?;
+    store
+        .put(&Path::from_url_path(path.path())?, data.into())
+        .await?;
     Ok(Table::new(table_path))
 }
 
@@ -372,7 +373,7 @@ async fn get_and_check_all_parquet_sizes(store: Arc<dyn ObjectStore>, path: &str
     assert!(parquet_files
         .iter()
         .all(|f| f.as_ref().unwrap().size == size));
-    size.try_into().unwrap()
+    size
 }
 
 #[tokio::test]

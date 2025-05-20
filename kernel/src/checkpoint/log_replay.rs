@@ -25,42 +25,31 @@
 //!   the overall process. For each batch of log actions, it:
 //!   1. Creates a visitor with the current deduplication state
 //!   2. Applies the visitor to filter actions in the batch
-//!   3. Updates counters and state for cross-batch deduplication
-//!   4. Produces a [`FilteredEngineData`] result which includes a selection vector indicating which
-//!      actions should be included in the checkpoint file
+//!   3. Tracks state for deduplication across batches
+//!   4. Produces a [`CheckpointBatch`] result which includes both the filtered data and counts of
+//!      actions selected for the checkpoint file
 //!
 //! [`CheckpointMetadata`]: crate::actions::CheckpointMetadata
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
-use crate::log_replay::{FileActionDeduplicator, FileActionKey, LogReplayProcessor};
+use crate::log_replay::{
+    FileActionDeduplicator, FileActionKey, HasSelectionVector, LogReplayProcessor,
+};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, EngineData, Error};
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 /// The [`CheckpointLogReplayProcessor`] is an implementation of the [`LogReplayProcessor`]
 /// trait that filters log segment actions for inclusion in a V1 spec checkpoint file. This
 /// processor is leveraged when creating a single-file V2 checkpoint as the V2 spec schema is
 /// a superset of the V1 spec schema, with the addition of a [`CheckpointMetadata`] action.
-///
-/// It processes each action batch via the `process_actions_batch` method, using the
-/// [`CheckpointVisitor`] to build an accompanying selection vector indicating which actions
-/// should be included in the checkpoint.
-#[allow(unused)] // TODO(seb): Remove once checkpoint api is implemented
 pub(crate) struct CheckpointLogReplayProcessor {
     /// Tracks file actions that have been seen during log replay to avoid duplicates.
     /// Contains (data file path, dv_unique_id) pairs as `FileActionKey` instances.
     seen_file_keys: HashSet<FileActionKey>,
-    // Arc<AtomicI64> provides shared mutability for our counters, allowing both the
-    // iterator to update the values during processing and the caller to observe the final
-    // counts afterward. The counters are i64 to match the `_last_checkpoint` file schema.
-    // Tracks the total number of actions included in the checkpoint file.
-    actions_count: Arc<AtomicI64>,
-    // Tracks the total number of add actions included in the checkpoint file.
-    add_actions_count: Arc<AtomicI64>,
     /// Indicates whether a protocol action has been seen in the log.
     seen_protocol: bool,
     /// Indicates whether a metadata action has been seen in the log.
@@ -71,11 +60,31 @@ pub(crate) struct CheckpointLogReplayProcessor {
     minimum_file_retention_timestamp: i64,
 }
 
+/// This struct is the output of the [`CheckpointLogReplayProcessor`].
+///
+/// It contains the filtered batch of actions to be included in the checkpoint,
+/// along with statistics about the number of actions filtered for inclusion.
+pub(crate) struct CheckpointBatch {
+    /// The filtered batch of actions to be included in the checkpoint.
+    pub(crate) filtered_data: FilteredEngineData,
+    /// The number of actions in the batch filtered for inclusion in the checkpoint.
+    pub(crate) actions_count: i64,
+    /// The number of add actions in the batch filtered for inclusion in the checkpoint.
+    pub(crate) add_actions_count: i64,
+}
+
+impl HasSelectionVector for CheckpointBatch {
+    fn has_selected_rows(&self) -> bool {
+        self.filtered_data.has_selected_rows()
+    }
+}
+
 impl LogReplayProcessor for CheckpointLogReplayProcessor {
-    type Output = FilteredEngineData;
+    type Output = CheckpointBatch;
 
     /// Processes a batch of actions read from the log during reverse chronological replay
-    /// and returns a filtered batch ([`FilteredEngineData`]) to be included in the checkpoint.
+    /// and returns a [`CheckpointBatch`], which contains the filtered actions to be
+    /// included in the checkpoint file, along with statistics about the included actions.
     ///
     /// This method delegates the filtering logic to the [`CheckpointVisitor`], which implements
     /// the deduplication rules described in the module documentation. The method tracks
@@ -100,23 +109,19 @@ impl LogReplayProcessor for CheckpointLogReplayProcessor {
         );
         visitor.visit_rows_of(batch.as_ref())?;
 
-        // Update the total actions and add actions counters. Relaxed ordering is sufficient
-        // here as we only care about the total count when writing the _last_checkpoint file.
-        // (the ordering is not important for correctness)
-        self.actions_count.fetch_add(
-            visitor.file_actions_count + visitor.non_file_actions_count,
-            Ordering::Relaxed,
-        );
-        self.add_actions_count
-            .fetch_add(visitor.add_actions_count, Ordering::Relaxed);
-
         // Update protocol and metadata seen flags
         self.seen_protocol = visitor.seen_protocol;
         self.seen_metadata = visitor.seen_metadata;
 
-        Ok(FilteredEngineData {
+        let filtered_data = FilteredEngineData {
             data: batch,
             selection_vector: visitor.selection_vector,
+        };
+
+        Ok(CheckpointBatch {
+            filtered_data,
+            actions_count: visitor.actions_count,
+            add_actions_count: visitor.add_actions_count,
         })
     }
 
@@ -127,16 +132,9 @@ impl LogReplayProcessor for CheckpointLogReplayProcessor {
 }
 
 impl CheckpointLogReplayProcessor {
-    #[allow(unused)] // TODO(seb): Remove once checkpoint api is implemented
-    pub(crate) fn new(
-        actions_count: Arc<AtomicI64>,
-        add_actions_count: Arc<AtomicI64>,
-        minimum_file_retention_timestamp: i64,
-    ) -> Self {
+    pub(crate) fn new(minimum_file_retention_timestamp: i64) -> Self {
         Self {
             seen_file_keys: Default::default(),
-            actions_count,
-            add_actions_count,
             seen_protocol: false,
             seen_metadata: false,
             seen_txns: Default::default(),
@@ -195,9 +193,7 @@ pub(crate) struct CheckpointVisitor<'seen> {
     // TODO: _last_checkpoint schema should be updated to use u64 instead of i64
     // for fields that are not expected to be negative. (Issue #786)
     // i64 to match the `_last_checkpoint` file schema
-    non_file_actions_count: i64,
-    // i64 to match the `_last_checkpoint` file schema
-    file_actions_count: i64,
+    actions_count: i64,
     // i64 to match the `_last_checkpoint` file schema
     add_actions_count: i64,
     // i64 for comparison with remove.deletionTimestamp
@@ -245,8 +241,7 @@ impl CheckpointVisitor<'_> {
                 Self::REMOVE_DV_START_INDEX,
             ),
             selection_vector,
-            non_file_actions_count: 0,
-            file_actions_count: 0,
+            actions_count: 0,
             add_actions_count: 0,
             minimum_file_retention_timestamp,
             seen_protocol,
@@ -306,7 +301,6 @@ impl CheckpointVisitor<'_> {
         } else if self.is_expired_tombstone(i, getters[Self::REMOVE_DELETION_TIMESTAMP_INDEX])? {
             return Ok(false); // Skip expired remove tombstones
         }
-        self.file_actions_count += 1;
         Ok(true) // Include this action
     }
 
@@ -334,7 +328,6 @@ impl CheckpointVisitor<'_> {
         }
         // Valid, non-duplicate protocol action to be included
         self.seen_protocol = true;
-        self.non_file_actions_count += 1;
         Ok(true)
     }
 
@@ -360,7 +353,6 @@ impl CheckpointVisitor<'_> {
 
         // Valid, non-duplicate metadata action to be included
         self.seen_metadata = true;
-        self.non_file_actions_count += 1;
         Ok(true)
     }
 
@@ -382,7 +374,6 @@ impl CheckpointVisitor<'_> {
         }
 
         // Valid, non-duplicate txn action to be included
-        self.non_file_actions_count += 1;
         Ok(true)
     }
 
@@ -404,10 +395,16 @@ impl CheckpointVisitor<'_> {
     ) -> DeltaResult<bool> {
         // The `||` operator short-circuits the evaluation, so if any of the checks return true,
         // the rest will not be evaluated.
-        Ok(self.check_file_action(i, getters)?
+        let is_valid = self.check_file_action(i, getters)?
             || self.check_txn_action(i, getters[11])?
             || self.check_protocol_action(i, getters[10])?
-            || self.check_metadata_action(i, getters[9])?)
+            || self.check_metadata_action(i, getters[9])?;
+
+        if is_valid {
+            self.actions_count += 1;
+        }
+
+        Ok(is_valid)
     }
 }
 
@@ -463,10 +460,13 @@ impl RowVisitor for CheckpointVisitor<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::arrow::array::StringArray;
     use crate::utils::test_utils::{action_batch, parse_json_batch};
-    use std::collections::HashSet;
+
+    use itertools::Itertools;
 
     /// Helper function to create test batches from JSON strings
     fn create_batch(json_strings: Vec<&str>) -> DeltaResult<(Box<dyn EngineData>, bool)> {
@@ -478,23 +478,18 @@ mod tests {
     fn run_checkpoint_test(
         input_batches: Vec<(Box<dyn EngineData>, bool)>,
     ) -> DeltaResult<(Vec<FilteredEngineData>, i64, i64)> {
-        let actions_count = Arc::new(AtomicI64::new(0));
-        let add_actions_count = Arc::new(AtomicI64::new(0));
-        let results: Vec<_> = CheckpointLogReplayProcessor::new(
-            actions_count.clone(),
-            add_actions_count.clone(),
-            0, // minimum_file_retention_timestamp
-        )
-        .process_actions_iter(input_batches.into_iter().map(Ok))
-        .collect::<DeltaResult<Vec<_>>>()?;
+        let processed_batches: Vec<_> = CheckpointLogReplayProcessor::new(0)
+            .process_actions_iter(input_batches.into_iter().map(Ok))
+            .try_collect()?;
+        let total_count: i64 = processed_batches.iter().map(|b| b.actions_count).sum();
+        let add_count: i64 = processed_batches.iter().map(|b| b.add_actions_count).sum();
+        let filtered_data = processed_batches
+            .into_iter()
+            .map(|b| b.filtered_data)
+            .collect();
 
-        Ok((
-            results,
-            actions_count.load(Ordering::Relaxed),
-            add_actions_count.load(Ordering::Relaxed),
-        ))
+        Ok((filtered_data, total_count, add_count))
     }
-
     #[test]
     fn test_checkpoint_visitor() -> DeltaResult<()> {
         let data = action_batch();
@@ -524,12 +519,11 @@ mod tests {
             false, // Row 8 is a checkpointMetadata action (excluded)
         ];
 
-        assert_eq!(visitor.file_actions_count, 2);
+        assert_eq!(visitor.actions_count, 5);
         assert_eq!(visitor.add_actions_count, 1);
         assert!(visitor.seen_protocol);
         assert!(visitor.seen_metadata);
         assert_eq!(visitor.seen_txns.len(), 1);
-        assert_eq!(visitor.non_file_actions_count, 3);
 
         assert_eq!(visitor.selection_vector, expected);
         Ok(())
@@ -548,7 +542,7 @@ mod tests {
             r#"{"remove":{"path":"one_below_threshold","deletionTimestamp":99,"dataChange":true,"partitionValues":{}}}"#,
             r#"{"remove":{"path":"one_above_threshold","deletionTimestamp":101,"dataChange":true,"partitionValues":{}}}"#,
             // Missing timestamp defaults to 0
-            r#"{"remove":{"path":"missing_timestamp","dataChange":true,"partitionValues":{}}}"#, 
+            r#"{"remove":{"path":"missing_timestamp","dataChange":true,"partitionValues":{}}}"#,
         ]
         .into();
         let batch = parse_json_batch(json_strings);
@@ -570,9 +564,8 @@ mod tests {
         // Only "one_above_threshold" should be kept
         let expected = vec![false, false, true, false];
         assert_eq!(visitor.selection_vector, expected);
-        assert_eq!(visitor.file_actions_count, 1);
+        assert_eq!(visitor.actions_count, 1);
         assert_eq!(visitor.add_actions_count, 0);
-        assert_eq!(visitor.non_file_actions_count, 0);
         Ok(())
     }
 
@@ -600,9 +593,8 @@ mod tests {
 
         let expected = vec![true];
         assert_eq!(visitor.selection_vector, expected);
-        assert_eq!(visitor.file_actions_count, 1);
+        assert_eq!(visitor.actions_count, 1);
         assert_eq!(visitor.add_actions_count, 1);
-        assert_eq!(visitor.non_file_actions_count, 0);
         // The action should NOT be added to the seen_file_keys set as it's a checkpoint batch
         // and actions in checkpoint batches do not conflict with each other.
         // This is a key difference from log batches, where actions can conflict.
@@ -614,7 +606,7 @@ mod tests {
     fn test_checkpoint_visitor_file_actions_with_deletion_vectors() -> DeltaResult<()> {
         let json_strings: StringArray = vec![
             // Add action for file1 with deletion vector
-            r#"{"add":{"path":"file1","partitionValues":{},"size":635,"modificationTime":100,"dataChange":true,"deletionVector":{"storageType":"ONE","pathOrInlineDv":"dv1","offset":1,"sizeInBytes":36,"cardinality":2}}}"#, 
+            r#"{"add":{"path":"file1","partitionValues":{},"size":635,"modificationTime":100,"dataChange":true,"deletionVector":{"storageType":"ONE","pathOrInlineDv":"dv1","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
             // Remove action for file1 with a different deletion vector
             r#"{"remove":{"path":"file1","deletionTimestamp":100,"dataChange":true,"deletionVector":{"storageType":"TWO","pathOrInlineDv":"dv2","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
             // Remove action for file1 with another different deletion vector
@@ -639,9 +631,8 @@ mod tests {
 
         let expected = vec![true, true, true];
         assert_eq!(visitor.selection_vector, expected);
-        assert_eq!(visitor.file_actions_count, 3);
+        assert_eq!(visitor.actions_count, 3);
         assert_eq!(visitor.add_actions_count, 1);
-        assert_eq!(visitor.non_file_actions_count, 0);
 
         Ok(())
     }
@@ -675,8 +666,7 @@ mod tests {
         // All actions should be skipped as they have already been seen
         let expected = vec![false, false, false];
         assert_eq!(visitor.selection_vector, expected);
-        assert_eq!(visitor.non_file_actions_count, 0);
-        assert_eq!(visitor.file_actions_count, 0);
+        assert_eq!(visitor.actions_count, 0);
 
         Ok(())
     }
@@ -691,7 +681,7 @@ mod tests {
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7}}"#, // Duplicate protocol
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1677811175819}}"#,
             // Duplicate metadata
-            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1677811175819}}"#, 
+            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1677811175819}}"#,
         ]
         .into();
         let batch = parse_json_batch(json_strings);
@@ -714,8 +704,7 @@ mod tests {
         let expected = vec![true, false, true, true, false, true, false];
         assert_eq!(visitor.selection_vector, expected);
         assert_eq!(visitor.seen_txns.len(), 2); // Two different app IDs
-        assert_eq!(visitor.non_file_actions_count, 4); // 2 txns + 1 protocol + 1 metadata
-        assert_eq!(visitor.file_actions_count, 0);
+        assert_eq!(visitor.actions_count, 4); // 2 txns + 1 protocol + 1 metadata
 
         Ok(())
     }

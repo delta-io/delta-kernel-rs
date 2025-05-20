@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use delta_kernel::schema::{DataType, Schema, SchemaRef};
 use delta_kernel::{
-    DeltaResult, EngineData, Expression, ExpressionEvaluator, FileDataReadResultIterator,
+    DeltaResult, EngineData, Error, Expression, ExpressionEvaluator, FileDataReadResultIterator,
 };
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
@@ -125,7 +125,10 @@ fn read_parquet_file_impl(
     let delta_fm = delta_kernel::FileMeta {
         location,
         last_modified: file.last_modified,
-        size: file.size,
+        size: file
+            .size
+            .try_into()
+            .map_err(|_| Error::generic_err("unable to convert to FileSize"))?,
     };
     // TODO: Plumb the predicate through the FFI?
     let data = parquet_handler.read_parquet_files(&[delta_fm], physical_schema, None)?;
@@ -180,7 +183,7 @@ fn new_expression_evaluator_impl(
 /// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn free_expression_evaluator(evaluator: Handle<SharedExpressionEvaluator>) {
-    debug!("engine released evaluator");
+    debug!("engine released expression evaluator");
     evaluator.drop_handle();
 }
 
@@ -189,7 +192,7 @@ pub unsafe extern "C" fn free_expression_evaluator(evaluator: Handle<SharedExpre
 /// # Safety
 /// Caller is responsible for calling with a valid `Engine`, `ExclusiveEngineData`, and `Evaluator`
 #[no_mangle]
-pub unsafe extern "C" fn evaluate(
+pub unsafe extern "C" fn evaluate_expression(
     engine: Handle<SharedExternEngine>,
     batch: &mut Handle<ExclusiveEngineData>,
     evaluator: Handle<SharedExpressionEvaluator>,
@@ -197,11 +200,11 @@ pub unsafe extern "C" fn evaluate(
     let engine = unsafe { engine.clone_as_arc() };
     let batch = unsafe { batch.as_mut() };
     let evaluator = unsafe { evaluator.clone_as_arc() };
-    let res = evaluate_impl(batch, evaluator.as_ref());
+    let res = evaluate_expression_impl(batch, evaluator.as_ref());
     res.into_extern_result(&engine.as_ref())
 }
 
-fn evaluate_impl(
+fn evaluate_expression_impl(
     batch: &dyn EngineData,
     evaluator: &dyn ExpressionEvaluator,
 ) -> DeltaResult<Handle<ExclusiveEngineData>> {
@@ -219,7 +222,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn test_new_evaluator() {
+    fn test_new_expression_evaluator() {
         let engine = get_default_engine();
         let in_schema = Arc::new(StructType::new(vec![StructField::new(
             "a",

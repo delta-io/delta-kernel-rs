@@ -267,7 +267,7 @@ fn do_work(
         let location = root_url.join(&scan_file.path).unwrap();
         let meta = FileMeta {
             last_modified: 0,
-            size: scan_file.size as usize,
+            size: scan_file.size.try_into().unwrap(),
             location,
         };
 
