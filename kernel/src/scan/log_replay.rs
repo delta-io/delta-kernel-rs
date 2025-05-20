@@ -336,6 +336,8 @@ fn get_add_transform_expr() -> Expression {
     ])
 }
 
+// TODO: remove once `scan_metadata_from` is pub.
+#[allow(unused)]
 pub(crate) fn get_scan_metadata_transform_expr() -> Expression {
     Expression::Struct(vec![Expression::Struct(vec![
         column_expr!("path"),

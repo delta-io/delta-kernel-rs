@@ -486,6 +486,7 @@ impl Scan {
     /// * `hint_version` - Table version the provided hint data was read from.
     /// * `hint_data` - Exisiting scan metadata to use as a hint.
     /// * `hint_predicate` - The predicate used by the previous scan.
+    #[allow(unused)]
     #[internal_api]
     pub(crate) fn scan_metadata_from(
         &self,
