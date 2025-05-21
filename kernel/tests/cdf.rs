@@ -2,6 +2,7 @@ use std::error;
 
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::compute::filter_record_batch;
+use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use itertools::Itertools;
 
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -39,6 +40,7 @@ fn read_cdf_for_table(
         .with_schema(schema)
         .with_predicate(predicate)
         .build()?;
+    let scan_schema_as_arrow: ArrowSchema = scan.schema().as_ref().try_into().unwrap();
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
         .map(|scan_result| -> DeltaResult<_> {
@@ -46,6 +48,8 @@ fn read_cdf_for_table(
             let mask = scan_result.full_mask();
             let data = scan_result.raw_data?;
             let record_batch = to_arrow(data)?;
+            // Verify that the arrow record batches match the expected schema
+            assert!(record_batch.schema().as_ref() == &scan_schema_as_arrow);
             match mask {
                 Some(mask) => Ok(filter_record_batch(&record_batch, &mask.into())?),
                 None => Ok(record_batch),
