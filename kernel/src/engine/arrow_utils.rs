@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
+use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow};
 use crate::engine::ensure_data_types::DataTypeCompat;
 use crate::{
     engine::arrow_data::ArrowEngineData,
@@ -20,7 +21,7 @@ use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::concat_batches;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef, Fields,
-    SchemaRef as ArrowSchemaRef,
+    Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
 use crate::arrow::json::{LineDelimitedWriter, ReaderBuilder};
 use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
@@ -54,7 +55,6 @@ macro_rules! prim_array_cmp {
     };
 }
 
-use crate::engine::arrow_conversion::TryIntoArrow;
 pub(crate) use prim_array_cmp;
 
 /// Get the indices in `parquet_schema` of the specified columns in `requested_schema`. This
@@ -418,7 +418,7 @@ fn get_indices(
                     debug!("Inserting missing and nullable field: {}", field.name());
                     reorder_indices.push(ReorderIndex::missing(
                         requested_position,
-                        Arc::new(field.into_arrow()?),
+                        Arc::new(field.try_into_arrow()?),
                     ));
                 } else {
                     return Err(Error::Generic(format!(
@@ -690,7 +690,7 @@ pub(crate) fn parse_json(
         .ok_or_else(|| {
             Error::generic("Expected json_strings to be a StringArray, found something else")
         })?;
-    let schema: ArrowSchemaRef = Arc::new(schema.as_ref().into_arrow()?);
+    let schema = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
     let result = parse_json_impl(json_strings, schema)?;
     Ok(Box::new(ArrowEngineData::new(result)))
 }

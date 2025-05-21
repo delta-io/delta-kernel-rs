@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::sync::{mpsc, Arc};
 use std::task::Poll;
 
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use crate::arrow::json::ReaderBuilder;
 use crate::arrow::record_batch::RecordBatch;
 use crate::object_store::path::Path;
@@ -17,7 +17,7 @@ use tracing::warn;
 use url::Url;
 
 use super::executor::TaskExecutor;
-use crate::engine::arrow_conversion::TryIntoArrow;
+use crate::engine::arrow_conversion::TryFromKernel;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::parse_json as arrow_parse_json;
 use crate::engine::arrow_utils::to_json_bytes;
@@ -102,7 +102,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             return Ok(Box::new(std::iter::empty()));
         }
 
-        let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().into_arrow()?);
+        let schema = Arc::new(ArrowSchema::try_from_kernel(physical_schema.as_ref())?);
         let file_opener = JsonOpener::new(self.batch_size, schema.clone(), self.store.clone());
 
         let (tx, rx) = mpsc::sync_channel(self.buffer_size);

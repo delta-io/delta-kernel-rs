@@ -88,7 +88,7 @@ impl DataFileMetadata {
         let data_change = Arc::new(BooleanArray::from(vec![data_change]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(write_metadata_schema.as_ref().into_arrow()?),
+            Arc::new(write_metadata_schema.as_ref().try_into_arrow()?),
             vec![path, partitions, size, modification_time, data_change],
         )?)))
     }
@@ -217,7 +217,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         };
         FileStream::new_async_read_iterator(
             self.task_executor.clone(),
-            Arc::new(physical_schema.as_ref().into_arrow()?),
+            Arc::new(physical_schema.as_ref().try_into_arrow()?),
             file_opener,
             files,
             self.readahead,
@@ -430,7 +430,7 @@ mod tests {
         let data: Vec<RecordBatch> = handler
             .read_parquet_files(
                 files,
-                Arc::new(physical_schema.into_kernel().unwrap()),
+                Arc::new(physical_schema.try_into_kernel().unwrap()),
                 None,
             )
             .unwrap()
@@ -459,7 +459,7 @@ mod tests {
         let schema = Arc::new(
             crate::transaction::get_write_metadata_schema()
                 .as_ref()
-                .into_arrow()
+                .try_into_arrow()
                 .unwrap(),
         );
         let key_builder = StringBuilder::new();
@@ -553,7 +553,7 @@ mod tests {
         let data: Vec<RecordBatch> = parquet_handler
             .read_parquet_files(
                 &[parquet_file.clone()],
-                Arc::new(physical_schema.into_kernel().unwrap()),
+                Arc::new(physical_schema.try_into_kernel().unwrap()),
                 None,
             )
             .unwrap()
