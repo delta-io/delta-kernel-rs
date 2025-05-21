@@ -38,8 +38,8 @@ pub fn parse_column_name(input: proc_macro::TokenStream) -> proc_macro::TokenStr
 /// the values of the container (i.e. a `key` -> `null` in a `HashMap`). Therefore the schema should
 /// mark the value field as nullable, but those mappings will be dropped when converting to an
 /// actual rust `HashMap`. Currently this can _only_ be set on `HashMap` fields.
-#[proc_macro_derive(Schema, attributes(drop_null_container_values))]
-pub fn derive_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+#[proc_macro_derive(ToSchema, attributes(drop_null_container_values))]
+pub fn derive_to_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let struct_ident = input.ident;
 
