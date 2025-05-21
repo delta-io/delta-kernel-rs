@@ -510,6 +510,8 @@ impl Scan {
             )])
         });
 
+        // TODO(#966): validate that the current predicate is compatible with the hint predicate.
+
         if hint_version > self.snapshot.version() {
             return Err(Error::Generic(format!(
                 "hint_version {} is greater than current version {}",
@@ -541,7 +543,7 @@ impl Scan {
         // If the current log segment contains a checkpoint newer than the hint version
         // we disregard the existing data hint, and perform a full scan. The current log segment
         // only has deltas after the checkpoint, so we cannot update from prior versions.
-        if log_segment.checkpoint_version.is_some_and(|v| v > hint_version) {
+        if matches!(log_segment.checkpoint_version, Some(v) if v > hint_version) {
             return Ok(Box::new(self.scan_metadata(engine)?));
         }
 
