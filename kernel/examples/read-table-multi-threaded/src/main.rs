@@ -267,7 +267,7 @@ fn do_work(
         // get the selection vector (i.e. deletion vector)
         let mut selection_vector = scan_file
             .dv_info
-            .get_selection_vector(engine, &root_url)
+            .get_selection_vector(engine, root_url)
             .unwrap();
 
         // build the required metadata for our parquet handler to read this file
