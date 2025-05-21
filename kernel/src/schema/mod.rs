@@ -16,6 +16,7 @@ use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
 pub(crate) mod compare;
+pub(crate) mod derive_macro_support;
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;

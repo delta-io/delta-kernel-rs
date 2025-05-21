@@ -29,7 +29,6 @@ pub mod set_transaction;
 
 pub(crate) mod crc;
 pub(crate) mod domain_metadata;
-pub(crate) mod schemas;
 
 // see comment in ../lib.rs for the path module for why we include this way
 #[cfg(feature = "internal-api")]
