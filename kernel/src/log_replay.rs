@@ -13,10 +13,6 @@
 //! This module provides structures for efficient batch processing, focusing on file action
 //! deduplication with `FileActionDeduplicator` which tracks unique files across log batches
 //! to minimize memory usage for tables with extensive history.
-//!
-//! [`CheckpointLogReplayProcessor`]: crate::checkpoint::log_replay::CheckpointLogReplayProcessor
-//! [`ScanLogReplayProcessor`]: crate::scan::log_replay::ScanLogReplayProcessor
-//! [`ScanMetadata`]: crate::scan::ScanMetadata
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::scan::data_skipping::DataSkippingFilter;

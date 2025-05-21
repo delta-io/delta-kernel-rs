@@ -9,7 +9,6 @@ use std::sync::LazyLock;
 
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::schemas::GetStructField;
-use crate::internal_mod;
 use crate::schema::{SchemaRef, StructType};
 use crate::table_features::{
     ReaderFeature, WriterFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
@@ -28,8 +27,15 @@ use serde::{Deserialize, Serialize};
 pub mod deletion_vector;
 pub mod set_transaction;
 
+pub(crate) mod crc;
+pub(crate) mod domain_metadata;
 pub(crate) mod schemas;
-internal_mod!(pub(crate) mod visitors);
+
+// see comment in ../lib.rs for the path module for why we include this way
+#[cfg(feature = "internal-api")]
+pub mod visitors;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod visitors;
 
 #[internal_api]
 pub(crate) const ADD_NAME: &str = "add";
@@ -49,6 +55,10 @@ pub(crate) const CDC_NAME: &str = "cdc";
 pub(crate) const SIDECAR_NAME: &str = "sidecar";
 #[internal_api]
 pub(crate) const CHECKPOINT_METADATA_NAME: &str = "checkpointMetadata";
+#[internal_api]
+pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
+
+pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
 static LOG_ADD_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| StructType::new([Option::<Add>::get_struct_field(ADD_NAME)]).into());
@@ -64,8 +74,7 @@ static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         Option::<Cdc>::get_struct_field(CDC_NAME),
         Option::<Sidecar>::get_struct_field(SIDECAR_NAME),
         Option::<CheckpointMetadata>::get_struct_field(CHECKPOINT_METADATA_NAME),
-        // We don't support the following actions yet
-        //Option::<DomainMetadata>::get_struct_field(DOMAIN_METADATA_NAME),
+        Option::<DomainMetadata>::get_struct_field(DOMAIN_METADATA_NAME),
     ])
     .into()
 });
@@ -77,6 +86,13 @@ static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 static LOG_TXN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     StructType::new([Option::<SetTransaction>::get_struct_field(
         SET_TRANSACTION_NAME,
+    )])
+    .into()
+});
+
+static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    StructType::new([Option::<DomainMetadata>::get_struct_field(
+        DOMAIN_METADATA_NAME,
     )])
     .into()
 });
@@ -97,6 +113,10 @@ pub(crate) fn get_log_commit_info_schema() -> &'static SchemaRef {
 
 pub(crate) fn get_log_txn_schema() -> &'static SchemaRef {
     &LOG_TXN_SCHEMA
+}
+
+pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
+    &LOG_DOMAIN_METADATA_SCHEMA
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Schema)]
@@ -424,9 +444,12 @@ pub(crate) struct Add {
 
     /// A map from partition column to value for this logical file. This map can contain null in the
     /// values meaning a partition is null. We drop those values from this map, due to the
-    /// `drop_null_container_values` annotation. This means an engine can assume that if a partition
-    /// is found in [`Metadata`] `partition_columns`, but not in this map, its value is null.
-    #[drop_null_container_values]
+    /// `allow_null_container_values` annotation allowing them and because [`materialize`] drops
+    /// null values. This means an engine can assume that if a partition is found in
+    /// [`Metadata::partition_columns`] but not in this map, its value is null.
+    ///
+    /// [`materialize`]: crate::engine_data::EngineMap::materialize
+    #[allow_null_container_values]
     pub(crate) partition_values: HashMap<String, String>,
 
     /// The size of this data file in bytes
@@ -539,9 +562,12 @@ pub(crate) struct Cdc {
 
     /// A map from partition column to value for this logical file. This map can contain null in the
     /// values meaning a partition is null. We drop those values from this map, due to the
-    /// `drop_null_container_values` annotation. This means an engine can assume that if a partition
-    /// is found in [`Metadata`] `partition_columns`, but not in this map, its value is null.
-    #[drop_null_container_values]
+    /// `allow_null_container_values` annotation allowing them and because [`materialize`] drops
+    /// null values. This means an engine can assume that if a partition is found in
+    /// [`Metadata::partition_columns`] but not in this map, its value is null.
+    ///
+    /// [`materialize`]: crate::engine_data::EngineMap::materialize
+    #[allow_null_container_values]
     pub partition_values: HashMap<String, String>,
 
     /// The size of this cdc file in bytes
@@ -642,6 +668,30 @@ pub(crate) struct CheckpointMetadata {
 
     /// Map containing any additional metadata about the V2 spec checkpoint.
     pub(crate) tags: Option<HashMap<String, String>>,
+}
+
+/// The [DomainMetadata] action contains a configuration (string) for a named metadata domain. Two
+/// overlapping transactions conflict if they both contain a domain metadata action for the same
+/// metadata domain.
+///
+/// Note that the `delta.*` domain is reserved for internal use.
+///
+/// [DomainMetadata]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#domain-metadata
+#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[internal_api]
+pub(crate) struct DomainMetadata {
+    domain: String,
+    configuration: String,
+    removed: bool,
+}
+
+impl DomainMetadata {
+    // returns true if the domain metadata is an system-controlled domain (all domains that start
+    // with "delta.")
+    #[allow(unused)]
+    fn is_internal(&self) -> bool {
+        self.domain.starts_with(INTERNAL_DOMAIN_PREFIX)
+    }
 }
 
 #[cfg(test)]
@@ -858,6 +908,22 @@ mod tests {
                     "engineCommitInfo",
                     MapType::new(DataType::STRING, DataType::STRING, false),
                 ),
+            ]),
+        )]));
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn test_domain_metadata_schema() {
+        let schema = get_log_schema()
+            .project(&[DOMAIN_METADATA_NAME])
+            .expect("Couldn't get domainMetadata field");
+        let expected = Arc::new(StructType::new([StructField::nullable(
+            "domainMetadata",
+            StructType::new([
+                StructField::not_null("domain", DataType::STRING),
+                StructField::not_null("configuration", DataType::STRING),
+                StructField::not_null("removed", DataType::BOOLEAN),
             ]),
         )]));
         assert_eq!(schema, expected);

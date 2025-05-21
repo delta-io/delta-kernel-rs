@@ -8,16 +8,16 @@ use crate::arrow::datatypes::{
 
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::error::{DeltaResult, Error};
-use crate::expressions::{Expression, Scalar};
+use crate::expressions::{Expression, Predicate, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
-use crate::{EngineData, EvaluationHandler, ExpressionEvaluator};
+use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
 
 use itertools::Itertools;
 use tracing::debug;
 
 use apply_schema::{apply_schema, apply_schema_to};
-use evaluate_expression::evaluate_expression;
+use evaluate_expression::{evaluate_expression, evaluate_predicate};
 
 mod apply_schema;
 mod evaluate_expression;
@@ -66,7 +66,7 @@ impl Scalar {
     pub fn to_array(&self, num_rows: usize) -> DeltaResult<ArrayRef> {
         let data_type = ArrowDataType::try_from(&self.data_type())?;
         let mut builder = array::make_builder(&data_type, num_rows);
-        self.append(&mut builder, num_rows)?;
+        self.append_to(&mut builder, num_rows)?;
         Ok(builder.finish())
     }
 
@@ -92,7 +92,7 @@ impl Scalar {
     // rows, because empty list/map is a valid state. But struct builders _DO_ require appending
     // (possibly NULL) entries in order to preserve consistent row counts between the struct and its
     // fields.
-    fn append(&self, builder: &mut impl ArrayBuilderAs, num_rows: usize) -> DeltaResult<()> {
+    fn append_to(&self, builder: &mut impl ArrayBuilderAs, num_rows: usize) -> DeltaResult<()> {
         use Scalar::*;
         macro_rules! builder_as {
             ($t:ty) => {{
@@ -142,14 +142,14 @@ impl Scalar {
                             builder,
                             field_index,
                         };
-                        value.append(builder, 1)?;
+                        value.append_to(builder, 1)?;
                     }
 
                     #[cfg(feature = "arrow-55")]
                     let field_builders = builder.field_builders_mut().iter_mut();
                     #[cfg(feature = "arrow-55")]
                     for (builder, value) in field_builders.zip(data.values()) {
-                        value.append(builder, 1)?;
+                        value.append_to(builder, 1)?;
                     }
                     builder.append(true);
                 }
@@ -159,9 +159,20 @@ impl Scalar {
                 for _ in 0..num_rows {
                     #[allow(deprecated)]
                     for value in data.array_elements() {
-                        value.append(builder.values(), 1)?;
+                        value.append_to(builder.values(), 1)?;
                     }
                     builder.append(true);
+                }
+            }
+            Map(data) => {
+                let builder =
+                    builder_as!(array::MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>);
+                for _ in 0..num_rows {
+                    for (key, val) in data.pairs() {
+                        key.append_to(builder.keys(), 1)?;
+                        val.append_to(builder.values(), 1)?;
+                    }
+                    builder.append(true)?;
                 }
             }
             Null(data_type) => Self::append_null(builder, data_type, num_rows)?,
@@ -270,6 +281,17 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         })
     }
 
+    fn new_predicate_evaluator(
+        &self,
+        schema: SchemaRef,
+        predicate: Predicate,
+    ) -> Arc<dyn PredicateEvaluator> {
+        Arc::new(DefaultPredicateEvaluator {
+            input_schema: schema,
+            predicate,
+        })
+    }
+
     /// Create a single-row array with all-null leaf values. Note that if a nested struct is
     /// included in the `output_type`, the entire struct will be NULL (instead of a not-null struct
     /// with NULL fields).
@@ -317,6 +339,40 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
             let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
             RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
         };
+        Ok(Box::new(ArrowEngineData::new(batch)))
+    }
+}
+
+#[derive(Debug)]
+pub struct DefaultPredicateEvaluator {
+    input_schema: SchemaRef,
+    predicate: Predicate,
+}
+
+impl PredicateEvaluator for DefaultPredicateEvaluator {
+    fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
+        debug!("Arrow evaluator evaluating: {:#?}", self.predicate);
+        let batch = batch
+            .any_ref()
+            .downcast_ref::<ArrowEngineData>()
+            .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))?
+            .record_batch();
+        let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into()?;
+        // TODO: make sure we have matching schemas for validation
+        // if batch.schema().as_ref() != &input_schema {
+        //     return Err(Error::Generic(format!(
+        //         "input schema does not match batch schema: {:?} != {:?}",
+        //         input_schema,
+        //         batch.schema()
+        //     )));
+        // };
+        let array = evaluate_predicate(&self.predicate, batch)?;
+        let schema = ArrowSchema::new(vec![ArrowField::new(
+            "output",
+            ArrowDataType::Boolean,
+            true,
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])?;
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
 }

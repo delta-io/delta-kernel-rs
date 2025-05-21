@@ -95,14 +95,29 @@ pub use arrow_compat::*;
 pub(crate) mod kernel_predicates;
 pub(crate) mod utils;
 
-internal_mod!(pub(crate) mod path);
-internal_mod!(pub(crate) mod log_replay);
-internal_mod!(pub(crate) mod log_segment);
+// for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
+// macros, and so will not format the files associated with these modules if we get too clever. see:
+// https://github.com/rust-lang/rustfmt/issues/3253
+
+#[cfg(feature = "internal-api")]
+pub mod path;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod path;
+
+#[cfg(feature = "internal-api")]
+pub mod log_replay;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod log_replay;
+
+#[cfg(feature = "internal-api")]
+pub mod log_segment;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod log_segment;
 
 pub use delta_kernel_derive;
 pub use engine_data::{EngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
-pub use expressions::{Expression, ExpressionRef};
+pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use table::Table;
 
 use expressions::literal_expression_transform::LiteralExpressionTransform;
@@ -115,24 +130,6 @@ use schema::{SchemaTransform, StructField, StructType};
     feature = "arrow-conversion"
 ))]
 pub mod engine;
-
-// Macro for `internal-api` modules. Note this can't be implemented alongside the `#[internal_api]`
-// macro because proc macro crates can't export macro_rules! macros.
-#[macro_export]
-macro_rules! internal_mod {
-    // error if item is already pub
-    (pub mod $name:ident) => {
-        compile_error!("internal_mod!: module is already public");
-    };
-
-    ($vis:vis mod $name:ident) => {
-        #[cfg(feature = "internal-api")]
-        pub mod $name;
-
-        #[cfg(not(feature = "internal-api"))]
-        $vis mod $name;
-    };
-}
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
@@ -189,15 +186,15 @@ impl TryFrom<DirEntry> for FileMeta {
                 last_modified.as_millis()
             ))
         })?;
-        // TODO: remove after arrow 54 is dropped
-        #[allow(clippy::useless_conversion)]
+        let metadata_len = metadata.len();
+        #[cfg(all(feature = "arrow-54", not(feature = "arrow-55")))]
+        let metadata_len = metadata_len
+            .try_into()
+            .map_err(|_| Error::generic("unable to convert DirEntry metadata to file size"))?;
         Ok(FileMeta {
             location,
             last_modified,
-            size: metadata
-                .len()
-                .try_into()
-                .map_err(|_| Error::generic("unable to convert DirEntry metadata to file size"))?,
+            size: metadata_len,
         })
     }
 }
@@ -339,8 +336,20 @@ impl<T: Any + Send + Sync> AsAny for T {
 pub trait ExpressionEvaluator: AsAny {
     /// Evaluate the expression on a given EngineData.
     ///
-    /// Contains one value for each row of the input.
+    /// Produces one value for each row of the input.
     /// The data type of the output is same as the type output of the expression this evaluator is using.
+    fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>>;
+}
+
+/// Trait for implementing a Predicate evaluator.
+///
+/// It contains one Predicate which can be evaluated on multiple ColumnarBatches.
+/// Connectors can implement this trait to optimize the evaluation using the
+/// connector specific capabilities.
+pub trait PredicateEvaluator: AsAny {
+    /// Evaluate the predicate on a given EngineData.
+    ///
+    /// Produces one boolean value for each row of the input.
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>>;
 }
 
@@ -352,9 +361,15 @@ pub trait EvaluationHandler: AsAny {
     /// Create an [`ExpressionEvaluator`] that can evaluate the given [`Expression`]
     /// on columnar batches with the given [`Schema`] to produce data of [`DataType`].
     ///
+    /// If the provided output type is a struct, its fields describe the columns of output produced
+    /// by the evaluator. Otherwise, the output schema is a single column named "output" of the
+    /// specified `output_type`. In all cases, the output schema is only used for its names (all
+    /// field names will be updated to match) and nullability (non-nullable columns can be converted
+    /// to nullable). Any mismatch in types (including number of columns) will produce an error.
+    ///
     /// # Parameters
     ///
-    /// - `schema`: Schema of the input data.
+    /// - `input_schema`: Schema of the input data.
     /// - `expression`: Expression to evaluate.
     /// - `output_type`: Expected result data type.
     ///
@@ -362,10 +377,27 @@ pub trait EvaluationHandler: AsAny {
     /// [`DataType`]: crate::schema::DataType
     fn new_expression_evaluator(
         &self,
-        schema: SchemaRef,
+        input_schema: SchemaRef,
         expression: Expression,
         output_type: DataType,
     ) -> Arc<dyn ExpressionEvaluator>;
+
+    /// Create a [`PredicateEvaluator`] that can evaluate the given [`Predicate`] on columnar
+    /// batches with the given [`Schema`] to produce a column of boolean results.
+    ///
+    /// The output schema is a single nullable boolean column named "output".
+    ///
+    /// # Parameters
+    ///
+    /// - `input_schema`: Schema of the input data.
+    /// - `predicate`: Predicate to evaluate.
+    ///
+    /// [`Schema`]: crate::schema::StructType
+    fn new_predicate_evaluator(
+        &self,
+        input_schema: SchemaRef,
+        predicate: Predicate,
+    ) -> Arc<dyn PredicateEvaluator>;
 
     /// Create a single-row all-null-value [`EngineData`] with the schema specified by
     /// `output_schema`.
@@ -477,7 +509,7 @@ pub trait JsonHandler: AsAny {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        predicate: Option<ExpressionRef>,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
     /// Atomically (!) write a single JSON file. Each row of the input data should be written as a
@@ -528,7 +560,7 @@ pub trait ParquetHandler: AsAny {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        predicate: Option<ExpressionRef>,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 }
 

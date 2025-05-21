@@ -2,11 +2,12 @@ use std::{error, sync::Arc};
 
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::compute::filter_record_batch;
+use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::engine::sync::SyncEngine;
 use itertools::Itertools;
 
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::{DeltaResult, Error, ExpressionRef, Table, Version};
+use delta_kernel::{DeltaResult, Error, PredicateRef, Table, Version};
 
 mod common;
 use common::{load_test_data, to_arrow};
@@ -15,7 +16,7 @@ fn read_cdf_for_table(
     test_name: impl AsRef<str>,
     start_version: Version,
     end_version: impl Into<Option<Version>>,
-    predicate: impl Into<Option<ExpressionRef>>,
+    predicate: impl Into<Option<PredicateRef>>,
 ) -> DeltaResult<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
     let test_path = test_dir.path().join(test_name.as_ref());
@@ -37,6 +38,7 @@ fn read_cdf_for_table(
         .with_schema(schema)
         .with_predicate(predicate)
         .build()?;
+    let scan_schema_as_arrow: ArrowSchema = scan.schema().as_ref().try_into().unwrap();
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
         .map(|scan_result| -> DeltaResult<_> {
@@ -44,6 +46,8 @@ fn read_cdf_for_table(
             let mask = scan_result.full_mask();
             let data = scan_result.raw_data?;
             let record_batch = to_arrow(data)?;
+            // Verify that the arrow record batches match the expected schema
+            assert!(record_batch.schema().as_ref() == &scan_schema_as_arrow);
             match mask {
                 Some(mask) => Ok(filter_record_batch(&record_batch, &mask.into())?),
                 None => Ok(record_batch),

@@ -3,10 +3,11 @@
 
 use std::sync::Arc;
 
+use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::set_transaction::SetTransactionScanner;
-use crate::actions::{Metadata, Protocol};
+use crate::actions::{Metadata, Protocol, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
-use crate::log_segment::{self, LogSegment};
+use crate::log_segment::{self, ListedLogFiles, LogSegment};
 use crate::scan::ScanBuilder;
 use crate::schema::{Schema, SchemaRef};
 use crate::table_configuration::TableConfiguration;
@@ -133,18 +134,19 @@ impl Snapshot {
         let listing_start = old_log_segment.checkpoint_version.unwrap_or(0) + 1;
 
         // Check for new commits
-        let (new_ascending_commit_files, checkpoint_parts) =
-            log_segment::list_log_files_with_version(
-                storage.as_ref(),
-                &log_root,
-                Some(listing_start),
-                new_version,
-            )?;
+        let new_listed_files = log_segment::list_log_files_with_version(
+            storage.as_ref(),
+            &log_root,
+            Some(listing_start),
+            new_version,
+        )?;
 
         // NB: we need to check both checkpoints and commits since we filter commits at and below
         // the checkpoint version. Example: if we have a checkpoint + commit at version 1, the log
         // listing above will only return the checkpoint and not the commit.
-        if new_ascending_commit_files.is_empty() && checkpoint_parts.is_empty() {
+        if new_listed_files.ascending_commit_files.is_empty()
+            && new_listed_files.checkpoint_parts.is_empty()
+        {
             match new_version {
                 Some(new_version) if new_version != old_version => {
                     // No new commits, but we are looking for a new version
@@ -162,12 +164,8 @@ impl Snapshot {
 
         // create a log segment just from existing_checkpoint.version -> new_version
         // OR could be from 1 -> new_version
-        let mut new_log_segment = LogSegment::try_new(
-            new_ascending_commit_files,
-            checkpoint_parts,
-            log_root.clone(),
-            new_version,
-        )?;
+        let mut new_log_segment =
+            LogSegment::try_new(new_listed_files, log_root.clone(), new_version)?;
 
         let new_end_version = new_log_segment.end_version;
         if new_end_version < old_version {
@@ -220,11 +218,16 @@ impl Snapshot {
         // NB: we must add the new log segment to the existing snapshot's log segment
         let mut ascending_commit_files = old_log_segment.ascending_commit_files.clone();
         ascending_commit_files.extend(new_log_segment.ascending_commit_files);
+        let mut ascending_compaction_files = old_log_segment.ascending_compaction_files.clone();
+        ascending_compaction_files.extend(new_log_segment.ascending_compaction_files);
         // we can pass in just the old checkpoint parts since by the time we reach this line, we
         // know there are no checkpoints in the new log segment.
         let combined_log_segment = LogSegment::try_new(
-            ascending_commit_files,
-            old_log_segment.checkpoint_parts.clone(),
+            ListedLogFiles {
+                ascending_commit_files,
+                ascending_compaction_files,
+                checkpoint_parts: old_log_segment.checkpoint_parts.clone(),
+            },
             log_root,
             new_version,
         )?;
@@ -252,9 +255,9 @@ impl Snapshot {
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.
     ///
     /// See the [`crate::checkpoint`] module documentation for more details on checkpoint types
-    /// and the overall checkpoint process.    
+    /// and the overall checkpoint process.
     pub fn checkpoint(self: Arc<Self>) -> DeltaResult<CheckpointWriter> {
-        Ok(CheckpointWriter { snapshot: self })
+        CheckpointWriter::try_new(self)
     }
 
     /// Log segment this snapshot uses
@@ -329,6 +332,24 @@ impl Snapshot {
     ) -> DeltaResult<Option<i64>> {
         let txn = SetTransactionScanner::get_one(self.log_segment(), application_id, engine)?;
         Ok(txn.map(|t| t.version))
+    }
+
+    /// Fetch the domainMetadata for a specific domain in this snapshot. This returns the latest
+    /// configuration for the domain, or None if the domain does not exist.
+    ///
+    /// Note that this method performs log replay (fetches and processes metadata from storage).
+    pub fn get_domain_metadata(
+        &self,
+        domain: &str,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Option<String>> {
+        if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
+            return Err(Error::generic(
+                "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain",
+            ));
+        }
+
+        domain_metadata_configuration(self.log_segment(), domain, engine)
     }
 }
 
@@ -729,5 +750,107 @@ mod tests {
             .version,
             3,
         );
+    }
+
+    #[tokio::test]
+    async fn test_domain_metadata() -> DeltaResult<()> {
+        let url = Url::parse("memory:///")?;
+        let store = Arc::new(InMemory::new());
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+        // commit0
+        // - domain1: not removed
+        // - domain2: not removed
+        let commit = [
+            json!({
+                "protocol": {
+                    "minReaderVersion": 1,
+                    "minWriterVersion": 1
+                }
+            }),
+            json!({
+                "metaData": {
+                    "id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+                    "format": { "provider": "parquet", "options": {} },
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
+                    "partitionColumns": [],
+                    "configuration": {},
+                    "createdTime": 1587968585495i64
+                }
+            }),
+            json!({
+                "domainMetadata": {
+                    "domain": "domain1",
+                    "configuration": "domain1_commit0",
+                    "removed": false
+                }
+            }),
+            json!({
+                "domainMetadata": {
+                    "domain": "domain2",
+                    "configuration": "domain2_commit0",
+                    "removed": false
+                }
+            }),
+            json!({
+                "domainMetadata": {
+                    "domain": "domain3",
+                    "configuration": "domain3_commit0",
+                    "removed": false
+                }
+            }),
+        ]
+        .map(|json| json.to_string())
+        .join("\n");
+        add_commit(store.clone().as_ref(), 0, commit).await.unwrap();
+
+        // commit1
+        // - domain1: removed
+        // - domain2: not-removed
+        // - internal domain
+        let commit = [
+            json!({
+                "domainMetadata": {
+                    "domain": "domain1",
+                    "configuration": "domain1_commit1",
+                    "removed": true
+                }
+            }),
+            json!({
+                "domainMetadata": {
+                    "domain": "domain2",
+                    "configuration": "domain2_commit1",
+                    "removed": false
+                }
+            }),
+            json!({
+                "domainMetadata": {
+                    "domain": "delta.domain3",
+                    "configuration": "domain3_commit1",
+                    "removed": false
+                }
+            }),
+        ]
+        .map(|json| json.to_string())
+        .join("\n");
+        add_commit(store.as_ref(), 1, commit).await.unwrap();
+
+        let snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, None)?);
+
+        assert_eq!(snapshot.get_domain_metadata("domain1", &engine)?, None);
+        assert_eq!(
+            snapshot.get_domain_metadata("domain2", &engine)?,
+            Some("domain2_commit1".to_string())
+        );
+        assert_eq!(
+            snapshot.get_domain_metadata("domain3", &engine)?,
+            Some("domain3_commit0".to_string())
+        );
+        let err = snapshot
+            .get_domain_metadata("delta.domain3", &engine)
+            .unwrap_err();
+        assert!(matches!(err, Error::Generic(msg) if
+                msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
+        Ok(())
     }
 }
