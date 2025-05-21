@@ -1,16 +1,15 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::iter;
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::actions::schemas::{GetNullableContainerStructField, GetStructField};
 use crate::actions::SetTransaction;
 use crate::actions::COMMIT_INFO_NAME;
 use crate::actions::{get_log_add_schema, get_log_commit_info_schema};
 use crate::error::Error;
 use crate::expressions::{column_expr, Scalar, StructData};
 use crate::path::ParsedLogPath;
-use crate::schema::{SchemaRef, StructField, StructType};
+use crate::schema::{MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::{DataType, DeltaResult, Engine, EngineData, Expression, Version};
 
@@ -21,11 +20,14 @@ const UNKNOWN_OPERATION: &str = "UNKNOWN";
 
 pub(crate) static WRITE_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new(vec![
-        <String>::get_struct_field("path"),
-        <HashMap<String, String>>::get_nullable_container_struct_field("partitionValues"),
-        <i64>::get_struct_field("size"),
-        <i64>::get_struct_field("modificationTime"),
-        <bool>::get_struct_field("dataChange"),
+        StructField::not_null("path", DataType::STRING),
+        StructField::not_null(
+            "partitionValues",
+            MapType::new(DataType::STRING, DataType::STRING, true),
+        ),
+        StructField::not_null("size", DataType::LONG),
+        StructField::not_null("modificationTime", DataType::LONG),
+        StructField::not_null("dataChange", DataType::BOOLEAN),
     ]))
 });
 
