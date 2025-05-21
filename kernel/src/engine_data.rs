@@ -71,7 +71,11 @@ impl<'a> ListItem<'a> {
 pub trait EngineMap {
     /// Get the item with the specified key from the map at `row_index` in the raw data, and return it as an `Option<&'a str>`
     fn get<'a>(&'a self, row_index: usize, key: &str) -> Option<&'a str>;
-    /// Materialize the entire map at `row_index` in the raw data into a `HashMap`
+    /// Materialize the entire map at `row_index` in the raw data into a `HashMap`. Note that in
+    /// conjunction with the `allow_null_container_values` attribute, `materialize` _drops_ any
+    /// (key, value) pairs where the underlying value was `null`. If preserving `null` values is
+    /// important, use the `allow_null_container_values` attribute, and manually materialize the map
+    /// using [`Self::get`].
     fn materialize(&self, row_index: usize) -> HashMap<String, String>;
 }
 
