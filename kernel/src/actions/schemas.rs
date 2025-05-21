@@ -2,11 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
-
-pub(crate) trait ToSchema {
-    fn to_schema() -> StructType;
-}
+use crate::schema::{ArrayType, DataType, MapType, StructField, ToSchema};
 
 pub(crate) trait ToDataType {
     fn to_data_type() -> DataType;
@@ -16,10 +12,6 @@ impl<T: ToSchema> ToDataType for T {
     fn to_data_type() -> DataType {
         T::to_schema().into()
     }
-}
-
-pub(crate) trait ToNullableContainerType {
-    fn to_nullable_container_type() -> DataType;
 }
 
 macro_rules! impl_to_data_type {
@@ -65,27 +57,8 @@ impl<K: ToDataType, V: ToDataType> ToDataType for HashMap<K, V> {
     }
 }
 
-// ToDataType impl for nullable map types
-impl<K: ToDataType, V: ToDataType> ToNullableContainerType for HashMap<K, V> {
-    fn to_nullable_container_type() -> DataType {
-        MapType::new(K::to_data_type(), V::to_data_type(), true).into()
-    }
-}
-
 pub(crate) trait GetStructField {
     fn get_struct_field(name: impl Into<String>) -> StructField;
-}
-
-pub(crate) trait GetNullableContainerStructField {
-    fn get_nullable_container_struct_field(name: impl Into<String>) -> StructField;
-}
-
-// Normal types produce non-nullable fields, but in this case the container they reference has
-// nullable values
-impl<T: ToNullableContainerType> GetNullableContainerStructField for T {
-    fn get_nullable_container_struct_field(name: impl Into<String>) -> StructField {
-        StructField::not_null(name, T::to_nullable_container_type())
-    }
 }
 
 // Normal types produce non-nullable fields
@@ -99,5 +72,28 @@ impl<T: ToDataType> GetStructField for T {
 impl<T: ToDataType> GetStructField for Option<T> {
     fn get_struct_field(name: impl Into<String>) -> StructField {
         StructField::nullable(name, T::to_data_type())
+    }
+}
+
+pub(crate) trait ToNullableContainerType {
+    fn to_nullable_container_type() -> DataType;
+}
+
+// ToDataType impl for nullable map types
+impl<K: ToDataType, V: ToDataType> ToNullableContainerType for HashMap<K, V> {
+    fn to_nullable_container_type() -> DataType {
+        MapType::new(K::to_data_type(), V::to_data_type(), true).into()
+    }
+}
+
+pub(crate) trait GetNullableContainerStructField {
+    fn get_nullable_container_struct_field(name: impl Into<String>) -> StructField;
+}
+
+// Normal types produce non-nullable fields, but in this case the container they reference has
+// nullable values
+impl<T: ToNullableContainerType> GetNullableContainerStructField for T {
+    fn get_nullable_container_struct_field(name: impl Into<String>) -> StructField {
+        StructField::not_null(name, T::to_nullable_container_type())
     }
 }

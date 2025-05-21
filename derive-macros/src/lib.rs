@@ -46,7 +46,7 @@ pub fn derive_to_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStre
     let schema_fields = gen_schema_fields(&input.data);
     let output = quote! {
         #[automatically_derived]
-        impl crate::actions::schemas::ToSchema for #struct_ident {
+        impl crate::schema::ToSchema for #struct_ident {
             fn to_schema() -> crate::schema::StructType {
                 use crate::actions::schemas::{ToDataType, GetStructField, GetNullableContainerStructField};
                 crate::schema::StructType::new([

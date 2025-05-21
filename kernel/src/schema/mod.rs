@@ -20,6 +20,12 @@ pub(crate) mod compare;
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
 
+/// Converts a type to a [`Schema`] that represents that type. Derivable for struct types using the
+/// [`delta_kernel_derive::ToSchema`] derive macro.
+pub(crate) trait ToSchema {
+    fn to_schema() -> StructType;
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 #[serde(untagged)]
 pub enum MetadataValue {
