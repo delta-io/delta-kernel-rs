@@ -493,6 +493,7 @@ impl From<&[u8]> for Scalar {
     }
 }
 
+// NOTE: We "cheat" and use the macro support trait `ToDataType`
 impl<T: Into<Scalar> + ToDataType> From<Option<T>> for Scalar {
     fn from(t: Option<T>) -> Self {
         match t {
