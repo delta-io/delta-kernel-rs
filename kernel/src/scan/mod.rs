@@ -336,7 +336,8 @@ pub struct ScanMetadata {
     /// optional expression that must be applied to convert the file's data into the logical schema
     /// expected by the scan:
     ///
-    /// - `Some(expr)`: Apply this expression to transform the data to match [`Scan::schema()`].
+    /// - `Some(expr)`: Apply this expression to transform the data to match
+    ///   [`Scan::logical_schema()`].
     /// - `None`: No transformation is needed; the data is already in the correct logical form.
     ///
     /// Note: This vector can be indexed by row number, as rows masked by the selection vector will
@@ -391,7 +392,7 @@ impl Scan {
     /// reside.
     // NOTE: this is obviously included in the snapshot, just re-exposed here for convenience.
     pub fn table_root(&self) -> &Url {
-        &self.snapshot.table_root()
+        self.snapshot.table_root()
     }
 
     /// Get a shared reference to the [`Snapshot`] of this scan.

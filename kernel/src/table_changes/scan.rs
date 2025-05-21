@@ -217,7 +217,7 @@ impl TableChangesScan {
     }
 
     pub fn table_root(&self) -> &Url {
-        &self.table_changes.table_root()
+        self.table_changes.table_root()
     }
 
     /// Get the predicate [`PredicateRef`] of the scan.
