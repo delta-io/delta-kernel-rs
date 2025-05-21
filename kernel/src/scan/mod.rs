@@ -464,17 +464,17 @@ impl Scan {
     /// scan's predicate MUST skip all files the previous scan's predicate skipped, The new scan's
     /// predicate is also allowed to skip files the previous predicate kept. For example, if the previous
     /// scan predicate was
-    /// ```text
+    /// ```sql
     /// WHERE a < 42 AND b = 10
     /// ```
     /// then it is legal for the new scan to use predicates such as the following:
-    /// ```text
+    /// ```sql
     /// WHERE a = 30 AND b = 10
     /// WHERE a < 10 AND b = 10
     /// WHERE a < 42 AND b = 10 AND c = 20
     /// ```
     /// but it is NOT legal for the new scan to use predicates like these:
-    /// ```text
+    /// ```sql
     /// WHERE a < 42
     /// WHERE a = 50 AND b = 10
     /// WHERE a < 42 AND b <= 10
