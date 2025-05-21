@@ -85,7 +85,7 @@ impl<T: ToDataType> GetStructField for Option<T> {
 }
 
 /// The [`delta_kernel_derive::ToSchema`] macro uses this trait to implement the
-/// `drop_null_container_values` attribute. It is similar to [`ToDataType`], except the containers
+/// `allow_null_container_values` attribute. It is similar to [`ToDataType`], except the containers
 /// it produces have nullable elements, e.g. [`MapType::value_contains_null`] is true.
 pub(crate) trait ToNullableContainerType {
     fn to_nullable_container_type() -> DataType;
@@ -100,7 +100,7 @@ impl<K: ToDataType, V: ToDataType> ToNullableContainerType for HashMap<K, V> {
 
 // The [`delta_kernel_derive::ToSchema`] macro uses this to convert a struct field's name + type
 // into a `StructField` definition for a container with nullable values, when the struct field was
-// annotated with the `drop_null_container_values` attribute.
+// annotated with the `allow_null_container_values` attribute.
 pub(crate) trait GetNullableContainerStructField {
     fn get_nullable_container_struct_field(name: impl Into<String>) -> StructField;
 }
