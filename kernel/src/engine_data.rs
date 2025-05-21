@@ -75,7 +75,7 @@ pub trait EngineMap {
     /// conjunction with the `allow_null_container_values` attribute, `materialize` _drops_ any
     /// (key, value) pairs where the underlying value was `null`. If preserving `null` values is
     /// important, use the `allow_null_container_values` attribute, and manually materialize the map
-    /// using [`get`].
+    /// using [`Self::get`].
     fn materialize(&self, row_index: usize) -> HashMap<String, String>;
 }
 

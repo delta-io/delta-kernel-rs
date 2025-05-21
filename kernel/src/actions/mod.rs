@@ -445,9 +445,11 @@ pub(crate) struct Add {
 
     /// A map from partition column to value for this logical file. This map can contain null in the
     /// values meaning a partition is null. We drop those values from this map, due to the
-    /// `allow_null_container_values` annotation allowing them and because `materialize` drops null
-    /// values. This means an engine can assume that if a partition is found in [`Metadata`]
-    /// `partition_columns`, but not in this map, its value is null.
+    /// `allow_null_container_values` annotation allowing them and because [`materialize`] drops
+    /// null values. This means an engine can assume that if a partition is found in
+    /// [`Metadata::partition_columns`] but not in this map, its value is null.
+    ///
+    /// [`materialize`]: crate::engine_data::EngineMap::materialize
     #[allow_null_container_values]
     pub(crate) partition_values: HashMap<String, String>,
 
@@ -561,9 +563,11 @@ pub(crate) struct Cdc {
 
     /// A map from partition column to value for this logical file. This map can contain null in the
     /// values meaning a partition is null. We drop those values from this map, due to the
-    /// `allow_null_container_values` annotation allowing them and because `materialize` drops null
-    /// values. This means an engine can assume that if a partition is found in [`Metadata`]
-    /// `partition_columns`, but not in this map, its value is null.
+    /// `allow_null_container_values` annotation allowing them and because [`materialize`] drops
+    /// null values. This means an engine can assume that if a partition is found in
+    /// [`Metadata::partition_columns`] but not in this map, its value is null.
+    ///
+    /// [`materialize`]: crate::engine_data::EngineMap::materialize
     #[allow_null_container_values]
     pub partition_values: HashMap<String, String>,
 
