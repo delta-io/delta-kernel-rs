@@ -541,7 +541,7 @@ impl Scan {
         // If the current log segment contains a checkpoint newer than the hint version
         // we disregard the existing data hint, and perform a full scan. The current log segment
         // only has deltas after the checkpoint, so we cannot update from prior versions.
-        if matches!(log_segment.checkpoint_version, Some(v) if v > hint_version) {
+        if log_segment.checkpoint_version.is_some_and(|v| v > hint_version) {
             return Ok(Box::new(self.scan_metadata(engine)?));
         }
 
@@ -1262,10 +1262,10 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].num_rows(), 3);
 
-        let files = files
+        let files: Vec<_> = files
             .into_iter()
             .map(|b| Box::new(ArrowEngineData::from(b)) as Box<dyn EngineData>)
-            .collect::<Vec<_>>();
+            .collect();
         let snapshot = table.snapshot(engine.as_ref(), Some(1)).unwrap();
         let scan = snapshot.into_scan_builder().build().unwrap();
         let new_files: Vec<_> = scan
