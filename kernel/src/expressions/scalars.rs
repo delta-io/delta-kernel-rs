@@ -4,7 +4,7 @@ use std::fmt::{Display, Formatter};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use itertools::Itertools;
 
-use crate::actions::schemas::ToDataType;
+use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::{ArrayType, DataType, DecimalType, MapType, PrimitiveType, StructField};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
@@ -493,6 +493,7 @@ impl From<&[u8]> for Scalar {
     }
 }
 
+// NOTE: We "cheat" and use the macro support trait `ToDataType`
 impl<T: Into<Scalar> + ToDataType> From<Option<T>> for Scalar {
     fn from(t: Option<T>) -> Self {
         match t {

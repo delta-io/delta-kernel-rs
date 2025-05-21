@@ -7,13 +7,12 @@ use std::sync::LazyLock;
 use delta_kernel_derive::internal_api;
 
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
+use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType, ToSchema as _};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 use super::deletion_vector::DeletionVectorDescriptor;
 use super::domain_metadata::DomainMetadataMap;
-use super::schemas::ToSchema as _;
 use super::*;
 
 #[derive(Default)]

@@ -5,11 +5,10 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::str::FromStr;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::schemas::GetStructField;
-use crate::schema::{SchemaRef, StructType};
+use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
 use crate::table_features::{
     ReaderFeature, WriterFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
 };
@@ -21,7 +20,7 @@ use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, RowVisitor as _};
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
-use delta_kernel_derive::{internal_api, Schema};
+use delta_kernel_derive::{internal_api, ToSchema};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
@@ -30,7 +29,6 @@ pub mod set_transaction;
 
 pub(crate) mod crc;
 pub(crate) mod domain_metadata;
-pub(crate) mod schemas;
 
 // see comment in ../lib.rs for the path module for why we include this way
 #[cfg(feature = "internal-api")]
@@ -61,41 +59,47 @@ pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 
 pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
-static LOG_ADD_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| StructType::new([Option::<Add>::get_struct_field(ADD_NAME)]).into());
+static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new([StructField::nullable(
+        ADD_NAME,
+        Add::to_schema(),
+    )]))
+});
 
 static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    StructType::new([
-        Option::<Add>::get_struct_field(ADD_NAME),
-        Option::<Remove>::get_struct_field(REMOVE_NAME),
-        Option::<Metadata>::get_struct_field(METADATA_NAME),
-        Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
-        Option::<SetTransaction>::get_struct_field(SET_TRANSACTION_NAME),
-        Option::<CommitInfo>::get_struct_field(COMMIT_INFO_NAME),
-        Option::<Cdc>::get_struct_field(CDC_NAME),
-        Option::<Sidecar>::get_struct_field(SIDECAR_NAME),
-        Option::<CheckpointMetadata>::get_struct_field(CHECKPOINT_METADATA_NAME),
-        Option::<DomainMetadata>::get_struct_field(DOMAIN_METADATA_NAME),
-    ])
-    .into()
+    Arc::new(StructType::new([
+        StructField::nullable(ADD_NAME, Add::to_schema()),
+        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
+        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
+        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
+        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
+        StructField::nullable(COMMIT_INFO_NAME, CommitInfo::to_schema()),
+        StructField::nullable(CDC_NAME, Cdc::to_schema()),
+        StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
+        StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema()),
+        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
+    ]))
 });
 
 static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    StructType::new([Option::<CommitInfo>::get_struct_field(COMMIT_INFO_NAME)]).into()
+    Arc::new(StructType::new([StructField::nullable(
+        COMMIT_INFO_NAME,
+        CommitInfo::to_schema(),
+    )]))
 });
 
 static LOG_TXN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    StructType::new([Option::<SetTransaction>::get_struct_field(
+    Arc::new(StructType::new([StructField::nullable(
         SET_TRANSACTION_NAME,
-    )])
-    .into()
+        SetTransaction::to_schema(),
+    )]))
 });
 
 static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    StructType::new([Option::<DomainMetadata>::get_struct_field(
+    Arc::new(StructType::new([StructField::nullable(
         DOMAIN_METADATA_NAME,
-    )])
-    .into()
+        DomainMetadata::to_schema(),
+    )]))
 });
 
 #[internal_api]
@@ -120,7 +124,7 @@ pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
     &LOG_DOMAIN_METADATA_SCHEMA
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
 pub(crate) struct Format {
@@ -139,7 +143,7 @@ impl Default for Format {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, ToSchema)]
 #[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
 #[internal_api]
 pub(crate) struct Metadata {
@@ -192,7 +196,7 @@ impl Metadata {
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, Schema, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
@@ -404,7 +408,7 @@ where
     )))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct CommitInfo {
@@ -432,7 +436,7 @@ pub(crate) struct CommitInfo {
     pub(crate) engine_commit_info: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 #[internal_api]
 pub(crate) struct Add {
@@ -500,7 +504,7 @@ impl Add {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct Remove {
@@ -550,7 +554,7 @@ pub(crate) struct Remove {
     pub(crate) default_row_commit_version: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct Cdc {
@@ -585,7 +589,7 @@ pub(crate) struct Cdc {
     pub tags: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[internal_api]
 pub(crate) struct SetTransaction {
     /// A unique identifier for the application performing the transaction.
@@ -622,7 +626,7 @@ impl SetTransaction {
 /// file actions. This action is only allowed in checkpoints following the V2 spec.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-file-information
-#[derive(Schema, Debug, PartialEq)]
+#[derive(ToSchema, Debug, PartialEq)]
 #[internal_api]
 pub(crate) struct Sidecar {
     /// A path to a sidecar file that can be either:
@@ -666,7 +670,7 @@ impl Sidecar {
 /// The CheckpointMetadata action describes details about a checkpoint following the V2 specification.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-metadata
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[internal_api]
 pub(crate) struct CheckpointMetadata {
     /// The version of the V2 spec checkpoint.
@@ -688,7 +692,7 @@ pub(crate) struct CheckpointMetadata {
 /// Note that the `delta.*` domain is reserved for internal use.
 ///
 /// [DomainMetadata]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#domain-metadata
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[internal_api]
 pub(crate) struct DomainMetadata {
     domain: String,

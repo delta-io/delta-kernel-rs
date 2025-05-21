@@ -7,12 +7,12 @@ use bytes::Bytes;
 use roaring::RoaringTreemap;
 use url::Url;
 
-use delta_kernel_derive::Schema;
+use delta_kernel_derive::ToSchema;
 
 use crate::utils::require;
 use crate::{DeltaResult, Error, StorageHandler};
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[cfg_attr(test, derive(serde::Serialize), serde(rename_all = "camelCase"))]
 pub struct DeletionVectorDescriptor {
     /// A single character to indicate how to access the DV. Legal options are: ['u', 'i', 'p'].

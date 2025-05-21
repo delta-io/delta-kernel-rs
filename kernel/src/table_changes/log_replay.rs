@@ -4,7 +4,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
-use crate::actions::schemas::GetStructField;
 use crate::actions::visitors::{visit_deletion_vector_at, ProtocolVisitor};
 use crate::actions::{
     get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, METADATA_NAME,
@@ -15,7 +14,10 @@ use crate::expressions::{column_name, ColumnName};
 use crate::path::ParsedLogPath;
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
-use crate::schema::{ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructType};
+use crate::schema::{
+    ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType,
+    ToSchema as _,
+};
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_changes::{check_cdf_table_properties, ensure_cdf_read_supported};
 use crate::table_properties::TableProperties;
@@ -278,11 +280,11 @@ struct PreparePhaseVisitor<'a> {
 impl PreparePhaseVisitor<'_> {
     fn schema() -> Arc<StructType> {
         Arc::new(StructType::new(vec![
-            Option::<Add>::get_struct_field(ADD_NAME),
-            Option::<Remove>::get_struct_field(REMOVE_NAME),
-            Option::<Cdc>::get_struct_field(CDC_NAME),
-            Option::<Metadata>::get_struct_field(METADATA_NAME),
-            Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
+            StructField::nullable(ADD_NAME, Add::to_schema()),
+            StructField::nullable(REMOVE_NAME, Remove::to_schema()),
+            StructField::nullable(CDC_NAME, Cdc::to_schema()),
+            StructField::nullable(METADATA_NAME, Metadata::to_schema()),
+            StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
         ]))
     }
 }
@@ -382,9 +384,9 @@ impl<'a> FileActionSelectionVisitor<'a> {
     }
     fn schema() -> Arc<StructType> {
         Arc::new(StructType::new(vec![
-            Option::<Cdc>::get_struct_field(CDC_NAME),
-            Option::<Add>::get_struct_field(ADD_NAME),
-            Option::<Remove>::get_struct_field(REMOVE_NAME),
+            StructField::nullable(CDC_NAME, Cdc::to_schema()),
+            StructField::nullable(ADD_NAME, Add::to_schema()),
+            StructField::nullable(REMOVE_NAME, Remove::to_schema()),
         ]))
     }
 }
