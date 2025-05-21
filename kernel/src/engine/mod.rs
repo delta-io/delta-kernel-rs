@@ -2,6 +2,8 @@
 //! be built into the kernel by setting the `default-engine` or `sync-engine` feature flags. See the
 //! related modules for more information.
 
+use crate::internal_mod;
+
 #[cfg(feature = "arrow-conversion")]
 pub(crate) mod arrow_conversion;
 
@@ -11,7 +13,7 @@ pub(crate) mod arrow_conversion;
 ))]
 pub mod arrow_expression;
 #[cfg(feature = "arrow-expression")]
-pub(crate) mod arrow_utils;
+internal_mod!(pub(crate) mod arrow_utils);
 
 #[cfg(feature = "default-engine-base")]
 pub mod default;
