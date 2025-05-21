@@ -90,7 +90,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::actions::{
-    schemas::GetStructField, Add, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME,
+    schemas::ToSchema as _, Add, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME,
     CHECKPOINT_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
     SIDECAR_NAME,
 };
@@ -133,12 +133,12 @@ static LAST_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// Schema for extracting relevant actions from log files for checkpoint creation
 static CHECKPOINT_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new([
-        Option::<Add>::get_struct_field(ADD_NAME),
-        Option::<Remove>::get_struct_field(REMOVE_NAME),
-        Option::<Metadata>::get_struct_field(METADATA_NAME),
-        Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
-        Option::<SetTransaction>::get_struct_field(SET_TRANSACTION_NAME),
-        Option::<Sidecar>::get_struct_field(SIDECAR_NAME),
+        StructField::nullable(ADD_NAME, Add::to_schema()),
+        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
+        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
+        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
+        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
+        StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
     ]))
 });
 

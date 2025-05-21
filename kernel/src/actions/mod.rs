@@ -5,11 +5,11 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::str::FromStr;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::schemas::GetStructField;
-use crate::schema::{SchemaRef, StructType};
+use crate::actions::schemas::ToSchema as _;
+use crate::schema::{SchemaRef, StructField, StructType};
 use crate::table_features::{
     ReaderFeature, WriterFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
 };
@@ -61,41 +61,47 @@ pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 
 pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
-static LOG_ADD_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| StructType::new([Option::<Add>::get_struct_field(ADD_NAME)]).into());
+static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new([StructField::nullable(
+        ADD_NAME,
+        Add::to_schema(),
+    )]))
+});
 
 static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    StructType::new([
-        Option::<Add>::get_struct_field(ADD_NAME),
-        Option::<Remove>::get_struct_field(REMOVE_NAME),
-        Option::<Metadata>::get_struct_field(METADATA_NAME),
-        Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
-        Option::<SetTransaction>::get_struct_field(SET_TRANSACTION_NAME),
-        Option::<CommitInfo>::get_struct_field(COMMIT_INFO_NAME),
-        Option::<Cdc>::get_struct_field(CDC_NAME),
-        Option::<Sidecar>::get_struct_field(SIDECAR_NAME),
-        Option::<CheckpointMetadata>::get_struct_field(CHECKPOINT_METADATA_NAME),
-        Option::<DomainMetadata>::get_struct_field(DOMAIN_METADATA_NAME),
-    ])
-    .into()
+    Arc::new(StructType::new([
+        StructField::nullable(ADD_NAME, Add::to_schema()),
+        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
+        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
+        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
+        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
+        StructField::nullable(COMMIT_INFO_NAME, CommitInfo::to_schema()),
+        StructField::nullable(CDC_NAME, Cdc::to_schema()),
+        StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
+        StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema()),
+        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
+    ]))
 });
 
 static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    StructType::new([Option::<CommitInfo>::get_struct_field(COMMIT_INFO_NAME)]).into()
+    Arc::new(StructType::new([StructField::nullable(
+        COMMIT_INFO_NAME,
+        CommitInfo::to_schema(),
+    )]))
 });
 
 static LOG_TXN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    StructType::new([Option::<SetTransaction>::get_struct_field(
+    Arc::new(StructType::new([StructField::nullable(
         SET_TRANSACTION_NAME,
-    )])
-    .into()
+        SetTransaction::to_schema(),
+    )]))
 });
 
 static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    StructType::new([Option::<DomainMetadata>::get_struct_field(
+    Arc::new(StructType::new([StructField::nullable(
         DOMAIN_METADATA_NAME,
-    )])
-    .into()
+        DomainMetadata::to_schema(),
+    )]))
 });
 
 #[internal_api]
