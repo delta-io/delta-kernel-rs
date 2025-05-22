@@ -5,7 +5,9 @@ use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatc
 
 use super::read_files;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::{fixup_parquet_read, generate_mask, get_requested_indices};
+use crate::engine::arrow_utils::{
+    fixup_parquet_read, generate_mask, get_requested_indices, RowIndexBuilder,
+};
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, FileDataReadResultIterator, FileMeta, ParquetHandler, PredicateRef};
@@ -25,11 +27,13 @@ fn try_create_from_parquet(
     if let Some(mask) = generate_mask(&schema, parquet_schema, builder.parquet_schema(), &indices) {
         builder = builder.with_projection(mask);
     }
+    let mut row_indexes = RowIndexBuilder::new(builder.metadata().row_groups());
     if let Some(predicate) = predicate {
-        builder = builder.with_row_group_filter(predicate.as_ref());
+        builder = builder.with_row_group_filter(predicate.as_ref(), &mut row_indexes);
     }
+    let mut row_indexes = row_indexes.into_iter();
     let stream = builder.build()?;
-    Ok(stream.map(move |rbr| fixup_parquet_read(rbr?, &requested_ordering)))
+    Ok(stream.map(move |rbr| fixup_parquet_read(rbr?, &requested_ordering, &mut row_indexes)))
 }
 
 impl ParquetHandler for SyncParquetHandler {
