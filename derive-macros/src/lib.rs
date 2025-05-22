@@ -139,23 +139,8 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
 /// Derive an IntoEngineData trait for a struct that has all fields implement `Into<Scalar>`.
 ///
 /// This is a relatively simple macro to produce the boilerplate for converting a struct into
-/// EngineData using the `create_one` method.
-///
-/// # Example
-/// ```ignore
-/// #[derive(Schema, IntoEngineData)]
-/// struct MyStruct {
-///    a: i32,
-///    b: String,
-/// }
-///
-/// let my_struct = MyStruct { a: 42, b: "Hello".to_string() };
-/// // typically used with ToSchema
-/// let schema = Arc::new(MyStruct::to_schema());
-/// // single-row EngineData
-/// let engine = todo!(); // create an engine
-/// let engine_data = my_struct.into_engine_data(schema, engine);
-/// ```
+/// EngineData using the `create_one` method. TODO: (doc)tests included in the delta_kernel crate:
+/// `IntoEngineData` trait.
 #[proc_macro_derive(IntoEngineData)]
 pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
