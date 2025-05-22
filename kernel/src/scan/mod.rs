@@ -37,9 +37,9 @@ pub(crate) mod data_skipping;
 pub mod log_replay;
 pub mod state;
 
-static COMMIT_META_READ_SCHEMA: LazyLock<SchemaRef> =
+static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| get_log_schema().project(&[ADD_NAME, REMOVE_NAME]).unwrap());
-static CHECKPOINT_META_READ_SCHEMA: LazyLock<SchemaRef> =
+static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| get_log_schema().project(&[ADD_NAME, SIDECAR_NAME]).unwrap());
 
 /// Builder to scan a snapshot of a table.
@@ -454,9 +454,9 @@ impl Scan {
         self.scan_metadata_inner(engine, self.replay_for_scan_metadata(engine)?)
     }
 
-    /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`ScanMetadata`]s.
+    /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
     ///
-    /// The existing iterator is assumed to have originated from a previous call to  `scan_metadata`.
+    /// The existing iterator is assumed contain data from a previous call to  `scan_metadata`,
     /// Engines may decide to cache the results of `scan_metadata` to avoid additional IO operations
     /// required to replay the log.
     ///
@@ -481,19 +481,28 @@ impl Scan {
     /// WHERE a < 42 OR b = 10
     /// ```
     ///
+    /// <div class="warning">
+    ///
+    /// The current implementation does not yet validate the existing
+    /// predicate against the current predicate. Until this is implemented,
+    /// the caller must ensure that the existing predicate is compatible with
+    /// the current predicate.
+    ///
+    /// </div>
+    ///
     /// # Parameters
     ///
-    /// * `hint_version` - Table version the provided hint data was read from.
-    /// * `hint_data` - Exisiting scan metadata to use as a hint.
-    /// * `hint_predicate` - The predicate used by the previous scan.
+    /// * `existing_version` - Table version the provided data was read from.
+    /// * `existing_data` - Existing processed scan metadata with all selection vectors applied.
+    /// * `existing_predicate` - The predicate used by the previous scan.
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn scan_metadata_from(
         &self,
         engine: &dyn Engine,
-        hint_version: Version,
-        hint_data: impl IntoIterator<Item = Box<dyn EngineData>> + 'static,
-        _hint_predicate: Option<PredicateRef>,
+        existing_version: Version,
+        existing_data: impl IntoIterator<Item = Box<dyn EngineData>> + 'static,
+        _existing_predicate: Option<PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
         static RESTORED_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
             let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
@@ -512,10 +521,10 @@ impl Scan {
 
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
 
-        if hint_version > self.snapshot.version() {
+        if existing_version > self.snapshot.version() {
             return Err(Error::Generic(format!(
-                "hint_version {} is greater than current version {}",
-                hint_version,
+                "existing_version {} is greater than current version {}",
+                existing_version,
                 self.snapshot.version()
             )));
         }
@@ -533,8 +542,8 @@ impl Scan {
 
         // If the snapshot version corresponds to the hint version, we process the existing data
         // to apply file skipping and provide the required transformations.
-        if hint_version == self.snapshot.version() {
-            let scan = hint_data.into_iter().map(apply_transform);
+        if existing_version == self.snapshot.version() {
+            let scan = existing_data.into_iter().map(apply_transform);
             return Ok(Box::new(self.scan_metadata_inner(engine, scan)?));
         }
 
@@ -543,13 +552,15 @@ impl Scan {
         // If the current log segment contains a checkpoint newer than the hint version
         // we disregard the existing data hint, and perform a full scan. The current log segment
         // only has deltas after the checkpoint, so we cannot update from prior versions.
-        if matches!(log_segment.checkpoint_version, Some(v) if v > hint_version) {
+        // TODO: we may be able to apply heuristics or other logic to try and fetch missing deltas
+        // from the log.
+        if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
             return Ok(Box::new(self.scan_metadata(engine)?));
         }
 
         // create a new log segment containing only the commits added after the version hint.
         let mut ascending_commit_files = log_segment.ascending_commit_files.clone();
-        ascending_commit_files.retain(|f| f.version > hint_version);
+        ascending_commit_files.retain(|f| f.version > existing_version);
         let listed_log_files = ListedLogFiles {
             ascending_commit_files,
             ascending_compaction_files: vec![],
@@ -564,11 +575,11 @@ impl Scan {
         let it = new_log_segment
             .read_actions(
                 engine,
-                COMMIT_META_READ_SCHEMA.clone(),
-                CHECKPOINT_META_READ_SCHEMA.clone(),
+                COMMIT_READ_SCHEMA.clone(),
+                CHECKPOINT_READ_SCHEMA.clone(),
                 None,
             )?
-            .chain(hint_data.into_iter().map(apply_transform));
+            .chain(existing_data.into_iter().map(apply_transform));
 
         Ok(Box::new(self.scan_metadata_inner(engine, it)?))
     }
@@ -608,8 +619,8 @@ impl Scan {
         // when ~every checkpoint file will contain the adds and removes we are looking for.
         self.snapshot.log_segment().read_actions(
             engine,
-            COMMIT_META_READ_SCHEMA.clone(),
-            CHECKPOINT_META_READ_SCHEMA.clone(),
+            COMMIT_READ_SCHEMA.clone(),
+            CHECKPOINT_READ_SCHEMA.clone(),
             None,
         )
     }
@@ -1207,7 +1218,7 @@ mod tests {
     }
 
     #[test_log::test]
-    fn test_scan_metadata_from_existing() {
+    fn test_scan_metadata_from_same_version() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -1240,8 +1251,10 @@ mod tests {
         assert_eq!(new_files.len(), 1);
     }
 
+    // reading v0 with 3 files.
+    // updating to v1 with 3 more files added.
     #[test_log::test]
-    fn test_scan_metadata_from_existing_part() {
+    fn test_scan_metadata_from_with_update() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = Arc::new(SyncEngine::new());
