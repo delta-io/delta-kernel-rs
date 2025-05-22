@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
-use delta_kernel::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
