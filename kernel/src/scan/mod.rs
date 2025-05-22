@@ -2,12 +2,14 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
+use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
+use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
@@ -17,14 +19,16 @@ use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
 use crate::log_replay::HasSelectionVector;
+use crate::log_segment::{ListedLogFiles, LogSegment};
 use crate::scan::state::{DvInfo, Stats};
+use crate::schema::ToSchema as _;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
     StructType,
 };
 use crate::snapshot::Snapshot;
 use crate::table_features::ColumnMappingMode;
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta};
+use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
 
 use self::log_replay::scan_action_iter;
 use self::state::GlobalScanState;
@@ -32,6 +36,11 @@ use self::state::GlobalScanState;
 pub(crate) mod data_skipping;
 pub mod log_replay;
 pub mod state;
+
+static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| get_log_schema().project(&[ADD_NAME, REMOVE_NAME]).unwrap());
+static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| get_log_schema().project(&[ADD_NAME, SIDECAR_NAME]).unwrap());
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
@@ -442,6 +451,144 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
+        self.scan_metadata_inner(engine, self.replay_for_scan_metadata(engine)?)
+    }
+
+    /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
+    ///
+    /// The existing iterator is assumed contain data from a previous call to  `scan_metadata`,
+    /// Engines may decide to cache the results of `scan_metadata` to avoid additional IO operations
+    /// required to replay the log.
+    ///
+    /// As such the new scan's predicate must "contain" the previous scan's predicate. That is, the new
+    /// scan's predicate MUST skip all files the previous scan's predicate skipped, The new scan's
+    /// predicate is also allowed to skip files the previous predicate kept. For example, if the previous
+    /// scan predicate was
+    /// ```sql
+    /// WHERE a < 42 AND b = 10
+    /// ```
+    /// then it is legal for the new scan to use predicates such as the following:
+    /// ```sql
+    /// WHERE a = 30 AND b = 10
+    /// WHERE a < 10 AND b = 10
+    /// WHERE a < 42 AND b = 10 AND c = 20
+    /// ```
+    /// but it is NOT legal for the new scan to use predicates like these:
+    /// ```sql
+    /// WHERE a < 42
+    /// WHERE a = 50 AND b = 10
+    /// WHERE a < 42 AND b <= 10
+    /// WHERE a < 42 OR b = 10
+    /// ```
+    ///
+    /// <div class="warning">
+    ///
+    /// The current implementation does not yet validate the existing
+    /// predicate against the current predicate. Until this is implemented,
+    /// the caller must ensure that the existing predicate is compatible with
+    /// the current predicate.
+    ///
+    /// </div>
+    ///
+    /// # Parameters
+    ///
+    /// * `existing_version` - Table version the provided data was read from.
+    /// * `existing_data` - Existing processed scan metadata with all selection vectors applied.
+    /// * `existing_predicate` - The predicate used by the previous scan.
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn scan_metadata_from(
+        &self,
+        engine: &dyn Engine,
+        existing_version: Version,
+        existing_data: impl IntoIterator<Item = Box<dyn EngineData>> + 'static,
+        _existing_predicate: Option<PredicateRef>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
+        static RESTORED_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
+            let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
+            DataType::struct_type(vec![StructField::nullable(
+                "add",
+                DataType::struct_type(vec![
+                    StructField::not_null("path", DataType::STRING),
+                    StructField::not_null("partitionValues", partition_values),
+                    StructField::not_null("size", DataType::LONG),
+                    StructField::nullable("modificationTime", DataType::LONG),
+                    StructField::nullable("stats", DataType::STRING),
+                    StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
+                ]),
+            )])
+        });
+
+        // TODO(#966): validate that the current predicate is compatible with the hint predicate.
+
+        if existing_version > self.snapshot.version() {
+            return Err(Error::Generic(format!(
+                "existing_version {} is greater than current version {}",
+                existing_version,
+                self.snapshot.version()
+            )));
+        }
+
+        // in order to be processed by our log replay, we must re-shape the existing scan metadata
+        // back into shape as we read it from the log. Since it is already reconciled data,
+        // we treat it as if it originated from a checkpoint.
+        let transform = engine.evaluation_handler().new_expression_evaluator(
+            scan_row_schema(),
+            get_scan_metadata_transform_expr(),
+            RESTORED_ADD_SCHEMA.clone(),
+        );
+        let apply_transform =
+            move |data: Box<dyn EngineData>| Ok((transform.evaluate(data.as_ref())?, false));
+
+        // If the snapshot version corresponds to the hint version, we process the existing data
+        // to apply file skipping and provide the required transformations.
+        if existing_version == self.snapshot.version() {
+            let scan = existing_data.into_iter().map(apply_transform);
+            return Ok(Box::new(self.scan_metadata_inner(engine, scan)?));
+        }
+
+        let log_segment = self.snapshot.log_segment();
+
+        // If the current log segment contains a checkpoint newer than the hint version
+        // we disregard the existing data hint, and perform a full scan. The current log segment
+        // only has deltas after the checkpoint, so we cannot update from prior versions.
+        // TODO: we may be able to apply heuristics or other logic to try and fetch missing deltas
+        // from the log.
+        if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
+            return Ok(Box::new(self.scan_metadata(engine)?));
+        }
+
+        // create a new log segment containing only the commits added after the version hint.
+        let mut ascending_commit_files = log_segment.ascending_commit_files.clone();
+        ascending_commit_files.retain(|f| f.version > existing_version);
+        let listed_log_files = ListedLogFiles {
+            ascending_commit_files,
+            ascending_compaction_files: vec![],
+            checkpoint_parts: vec![],
+        };
+        let new_log_segment = LogSegment::try_new(
+            listed_log_files,
+            log_segment.log_root.clone(),
+            Some(log_segment.end_version),
+        )?;
+
+        let it = new_log_segment
+            .read_actions(
+                engine,
+                COMMIT_READ_SCHEMA.clone(),
+                CHECKPOINT_READ_SCHEMA.clone(),
+                None,
+            )?
+            .chain(existing_data.into_iter().map(apply_transform));
+
+        Ok(Box::new(self.scan_metadata_inner(engine, it)?))
+    }
+
+    fn scan_metadata_inner(
+        &self,
+        engine: &dyn Engine,
+        action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         // Compute the static part of the transformation. This is `None` if no transformation is
         // needed (currently just means no partition cols AND no column mapping but will be extended
         // for other transforms as we support them)
@@ -455,7 +602,7 @@ impl Scan {
         };
         let it = scan_action_iter(
             engine,
-            self.replay_for_scan_metadata(engine)?,
+            action_iter,
             self.logical_schema.clone(),
             static_transform,
             physical_predicate,
@@ -468,15 +615,12 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
-        let commit_read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?;
-        let checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
-
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
         self.snapshot.log_segment().read_actions(
             engine,
-            commit_read_schema,
-            checkpoint_read_schema,
+            COMMIT_READ_SCHEMA.clone(),
+            CHECKPOINT_READ_SCHEMA.clone(),
             None,
         )
     }
@@ -629,8 +773,8 @@ impl Scan {
 ///    }
 /// }
 /// ```
-pub fn scan_row_schema() -> Schema {
-    log_replay::SCAN_ROW_SCHEMA.as_ref().clone()
+pub fn scan_row_schema() -> SchemaRef {
+    log_replay::SCAN_ROW_SCHEMA.clone()
 }
 
 pub(crate) fn parse_partition_value(
@@ -838,6 +982,10 @@ pub(crate) mod test_utils {
 mod tests {
     use std::path::PathBuf;
 
+    use crate::arrow::array::BooleanArray;
+    use crate::arrow::compute::filter_record_batch;
+    use crate::arrow::record_batch::RecordBatch;
+    use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
     use crate::schema::{ColumnMetadataKey, PrimitiveType};
@@ -1067,6 +1215,89 @@ mod tests {
         assert_eq!(files.len(), 1);
         let num_rows = files[0].raw_data.as_ref().unwrap().len();
         assert_eq!(num_rows, 10)
+    }
+
+    #[test_log::test]
+    fn test_scan_metadata_from_same_version() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine = Arc::new(SyncEngine::new());
+
+        let table = Table::new(url);
+        let snapshot = table.snapshot(engine.as_ref(), None).unwrap();
+        let version = snapshot.version();
+        let scan = snapshot.into_scan_builder().build().unwrap();
+        let files: Vec<_> = scan
+            .scan_metadata(engine.as_ref())
+            .unwrap()
+            .map_ok(|ScanMetadata { scan_files, .. }| {
+                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(scan_files.data)
+                    .unwrap()
+                    .into();
+                let filtered_batch =
+                    filter_record_batch(&batch, &BooleanArray::from(scan_files.selection_vector))
+                        .unwrap();
+                Box::new(ArrowEngineData::from(filtered_batch)) as Box<dyn EngineData>
+            })
+            .try_collect()
+            .unwrap();
+        let new_files: Vec<_> = scan
+            .scan_metadata_from(engine.as_ref(), version, files, None)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+
+        assert_eq!(new_files.len(), 1);
+    }
+
+    // reading v0 with 3 files.
+    // updating to v1 with 3 more files added.
+    #[test_log::test]
+    fn test_scan_metadata_from_with_update() {
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine = Arc::new(SyncEngine::new());
+
+        let table = Table::new(url);
+        let snapshot = table.snapshot(engine.as_ref(), Some(0)).unwrap();
+        let scan = snapshot.into_scan_builder().build().unwrap();
+        let files: Vec<_> = scan
+            .scan_metadata(engine.as_ref())
+            .unwrap()
+            .map_ok(|ScanMetadata { scan_files, .. }| {
+                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(scan_files.data)
+                    .unwrap()
+                    .into();
+                filter_record_batch(&batch, &BooleanArray::from(scan_files.selection_vector))
+                    .unwrap()
+            })
+            .try_collect()
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].num_rows(), 3);
+
+        let files: Vec<_> = files
+            .into_iter()
+            .map(|b| Box::new(ArrowEngineData::from(b)) as Box<dyn EngineData>)
+            .collect();
+        let snapshot = table.snapshot(engine.as_ref(), Some(1)).unwrap();
+        let scan = snapshot.into_scan_builder().build().unwrap();
+        let new_files: Vec<_> = scan
+            .scan_metadata_from(engine.as_ref(), 0, files, None)
+            .unwrap()
+            .map_ok(|ScanMetadata { scan_files, .. }| {
+                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(scan_files.data)
+                    .unwrap()
+                    .into();
+                filter_record_batch(&batch, &BooleanArray::from(scan_files.selection_vector))
+                    .unwrap()
+            })
+            .try_collect()
+            .unwrap();
+        assert_eq!(new_files.len(), 2);
+        assert_eq!(new_files[0].num_rows(), 3);
+        assert_eq!(new_files[1].num_rows(), 3);
     }
 
     #[test]
