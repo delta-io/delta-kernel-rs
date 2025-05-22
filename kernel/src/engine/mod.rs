@@ -11,7 +11,7 @@ pub(crate) mod arrow_conversion;
 ))]
 pub mod arrow_expression;
 #[cfg(feature = "arrow-expression")]
-pub(crate) mod arrow_utils;
+pub mod arrow_utils;
 
 #[cfg(feature = "default-engine-base")]
 pub mod default;

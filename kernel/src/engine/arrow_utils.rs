@@ -4,14 +4,6 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
-use crate::engine::ensure_data_types::DataTypeCompat;
-use crate::{
-    engine::arrow_data::ArrowEngineData,
-    schema::{DataType, Schema, SchemaRef, StructField, StructType},
-    utils::require,
-    DeltaResult, EngineData, Error,
-};
-
 use crate::arrow::array::{
     cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray,
     OffsetSizeTrait, RecordBatch, StringArray, StructArray,
@@ -24,8 +16,17 @@ use crate::arrow::datatypes::{
 };
 use crate::arrow::json::{LineDelimitedWriter, ReaderBuilder};
 use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
+use delta_kernel_derive::internal_api;
 use itertools::Itertools;
 use tracing::debug;
+
+use crate::engine::ensure_data_types::DataTypeCompat;
+use crate::{
+    engine::arrow_data::ArrowEngineData,
+    schema::{DataType, Schema, SchemaRef, StructField, StructType},
+    utils::require,
+    DeltaResult, EngineData, Error,
+};
 
 macro_rules! prim_array_cmp {
     ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
@@ -69,6 +70,7 @@ pub(crate) fn make_arrow_error(s: impl Into<String>) -> Error {
 /// Applies post-processing to data read from parquet files. This includes `reorder_struct_array` to
 /// ensure schema compatibility, as well as `fix_nested_null_masks` to ensure that leaf columns have
 /// accurate null masks that row visitors rely on for correctness.
+#[internal_api]
 pub(crate) fn fixup_parquet_read<T>(
     batch: RecordBatch,
     requested_ordering: &[ReorderIndex],
@@ -677,6 +679,7 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
 
 /// Arrow lacks the functionality to json-parse a string column into a struct column -- even tho the
 /// JSON file reader does exactly the same thing. This function is a hack to work around that gap.
+#[internal_api]
 pub(crate) fn parse_json(
     json_strings: Box<dyn EngineData>,
     schema: SchemaRef,
@@ -728,11 +731,12 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
 
 /// serialize an arrow RecordBatch to a JSON string by appending to a buffer.
 // TODO (zach): this should stream data to the JSON writer and output an iterator.
+#[internal_api]
 pub(crate) fn to_json_bytes(
     data: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send,
 ) -> DeltaResult<Vec<u8>> {
     let mut writer = LineDelimitedWriter::new(Vec::new());
-    for chunk in data.into_iter() {
+    for chunk in data {
         let arrow_data = ArrowEngineData::try_from_engine_data(chunk?)?;
         let record_batch = arrow_data.record_batch();
         writer.write(record_batch)?;
