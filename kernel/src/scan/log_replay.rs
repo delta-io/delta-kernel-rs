@@ -8,7 +8,6 @@ use super::data_skipping::DataSkippingFilter;
 use super::{ScanMetadata, Transform};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::get_log_add_schema;
-use crate::actions::schemas::ToSchema as _;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
     column_expr, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
@@ -16,6 +15,7 @@ use crate::expressions::{
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::{FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::scan::{Scalar, TransformExpr};
+use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator};
