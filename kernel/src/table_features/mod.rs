@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumString};
 
-use crate::actions::schemas::ToDataType;
+use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::DataType;
 
 pub(crate) use column_mapping::column_mapping_mode;
