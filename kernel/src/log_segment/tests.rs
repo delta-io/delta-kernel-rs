@@ -1578,3 +1578,19 @@ fn test_commit_cover_starts_at_checkpoint() {
         &[ExpectedFile::Commit(5), ExpectedFile::Commit(4)],
     );
 }
+
+#[test]
+fn test_commit_cover_wider_range() {
+    test_commit_cover(
+        &Vec::from_iter(0..20),
+        &[(0, 5), (0, 10), (5, 10), (13, 19)],
+        None, // checkpoint version
+        None, // version to load
+        &[
+            ExpectedFile::Compaction(13, 19),
+            ExpectedFile::Commit(12),
+            ExpectedFile::Commit(11),
+            ExpectedFile::Compaction(0, 10),
+        ],
+    );
+}

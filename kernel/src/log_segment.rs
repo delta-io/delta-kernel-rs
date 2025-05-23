@@ -239,60 +239,43 @@ impl LogSegment {
     /// that all files in `self.ascending_commit_files` and `self.ascending_compaction_files` are in
     /// range for this log segment. This is invariant is maintained by our listing code.
     fn find_commit_cover(&self) -> Vec<FileMeta> {
-        // Note that for this algorithm, we're iterating through commits/compactions in DESCENDING
-        // order. We track the next low point covered by a compaction. So the steps are:
-        // Loop over all commit files:
-        //   1. If the current commit is at or above the next covered low point, skip it, it's covered
-        //   2. Otherwise, if there is a next compaction, check if its high point is equal to the
-        //      current commit version.
-        //     a. if yes, we're crossing into a compaction, skip the commit, include the compaction
-        //        file, set the new low point
-        //     b. if not, this commit isn't covered so include it
-        //   3. If there's no next compaction, just include the commit
-        let mut cover = vec![];
-        let mut desc_compaction_iter = self.ascending_compaction_files.iter().rev().peekable();
-        let mut next_low = Version::MAX;
-        for commit_file in self.ascending_commit_files.iter().rev() {
-            if commit_file.version >= next_low {
-                // we've covered this one already
-                debug!("Skipping commit file as it's already covered: {commit_file:#?}");
-                continue;
-            }
-            if let Some(next_compaction) = desc_compaction_iter.peek() {
-                let end_version = next_compaction.hi_version().expect("FIX ME");
-                if commit_file.version == end_version {
-                    // the next compaction file covers up to this point, pull it off and use it as
-                    // the next output file
-                    debug!("Using compaction file: {next_compaction:#?}");
-                    cover.push(next_compaction.location.clone());
-                    next_low = next_compaction.version;
+        // Create an iterator sorted in ascending order by (initial version, end version), e.g.
+        // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
+        //  10.19.compacted.json, 11.json, ...]
+        let all_files = itertools::Itertools::merge_by(
+            self.ascending_commit_files.iter(),
+            self.ascending_compaction_files.iter(),
+            |d, c| d.version <= c.version,
+        );
 
-                    desc_compaction_iter.next();
+        let mut last_pushed: Option<&ParsedLogPath> = None;
 
-                    // to deal with overlaps, advance the compaction files iter until the hi version is
-                    // below where the last one ended
-                    while let Some(next) = desc_compaction_iter.peek() {
-                        if next.hi_version().expect("FIX ME") < next_low {
-                            break;
-                        } else {
-                            debug!("Skipping compaction file as it's already covered: {next:#?}");
-                            desc_compaction_iter.next();
-                        }
-                    }
-                } else {
-                    // not covered, include
-                    debug!("Including uncovered commit file {commit_file:#?}");
-                    cover.push(commit_file.location.clone());
+        let mut selected_files = vec![];
+        for next in all_files {
+            match last_pushed {
+                // Resolve version number ties in favor of the later file (it covers a wider range)
+                Some(prev) if prev.version == next.version => {
+                    let removed = selected_files.pop();
+                    debug!("Selecting {next:?} rather than {removed:?}, it covers a wider range");
+                    last_pushed = Some(next);
+                    selected_files.push(next.location.clone());
                 }
-            } else {
-                // no more compactions, so include if we're below the low the final compaction set
-                debug!(
-                    "Including commit file as no more compactions {commit_file:#?}, low {next_low}"
-                );
-                cover.push(commit_file.location.clone());
+                // Skip later files whose start overlaps with the previous end
+                Some(&ParsedLogPath {
+                    file_type: LogPathFileType::CompactedCommit { hi },
+                    ..
+                }) if next.version <= hi => {
+                    debug!("Skipping log file {next:?}, it's already covered.")
+                }
+                _ => {
+                    debug!("Provisionally selecting {next:?}");
+                    last_pushed = Some(next);
+                    selected_files.push(next.location.clone())
+                }
             }
         }
-        cover
+        selected_files.reverse();
+        selected_files
     }
 
     /// Returns an iterator over checkpoint data, processing sidecar files when necessary.
