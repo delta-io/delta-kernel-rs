@@ -70,7 +70,6 @@ pub(crate) fn make_arrow_error(s: impl Into<String>) -> Error {
 /// Applies post-processing to data read from parquet files. This includes `reorder_struct_array` to
 /// ensure schema compatibility, as well as `fix_nested_null_masks` to ensure that leaf columns have
 /// accurate null masks that row visitors rely on for correctness.
-#[internal_api]
 pub(crate) fn fixup_parquet_read<T>(
     batch: RecordBatch,
     requested_ordering: &[ReorderIndex],
