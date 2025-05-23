@@ -219,6 +219,7 @@ impl ActionsBatch {
 
     /// HACK: a duplication of the pub(crate) field `actions` to allow us to export as
     /// 'internal-api' and let inspect-table example use it.
+    #[allow(unused)]
     #[internal_api]
     pub(crate) fn actions(&self) -> &dyn EngineData {
         self.actions.as_ref()
