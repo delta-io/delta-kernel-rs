@@ -525,7 +525,7 @@ pub(crate) fn visit_metadata_at<'a>(
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<Option<Metadata>> {
     require!(
-        getters.len() >= 10,
+        getters.len() == 9,
         Error::InternalError(format!(
             "Wrong number of MetadataVisitor getters: {}",
             getters.len()
@@ -570,7 +570,7 @@ pub(crate) fn visit_protocol_at<'a>(
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<Option<Protocol>> {
     require!(
-        getters.len() >= 5,
+        getters.len() == 4,
         Error::InternalError(format!(
             "Wrong number of ProtocolVisitor getters: {}",
             getters.len()
