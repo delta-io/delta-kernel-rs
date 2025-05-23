@@ -18,9 +18,12 @@ use crate::engine_data::{GetData, TypedGetData};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::{DeltaResult, EngineData};
 
+use delta_kernel_derive::internal_api;
+
 use std::collections::HashSet;
 
 use tracing::debug;
+
 /// The subset of file action fields that uniquely identifies it in the log, used for deduplication
 /// of adds and removes during log replay.
 #[derive(Debug, Hash, Eq, PartialEq)]
@@ -28,6 +31,7 @@ pub(crate) struct FileActionKey {
     pub(crate) path: String,
     pub(crate) dv_unique_id: Option<String>,
 }
+
 impl FileActionKey {
     pub(crate) fn new(path: impl Into<String>, dv_unique_id: Option<String>) -> Self {
         let path = path.into();
@@ -191,6 +195,36 @@ impl<'seen> FileActionDeduplicator<'seen> {
     }
 }
 
+#[internal_api]
+pub(crate) struct ActionsBatch {
+    /// The batch of actions to be processed: each row is an action from the log.
+    pub(crate) actions: Box<dyn EngineData>,
+    /// Whether the batch is from a commit log (=true) or a checkpoint/CRC/elsewhere (=false).
+    pub(crate) is_log_batch: bool,
+}
+
+impl ActionsBatch {
+    /// Creates a new `ActionsBatch` instance.
+    ///
+    /// # Parameters
+    /// - `actions`: A boxed [`EngineData`] instance representing the actions batch.
+    /// - `is_log_batch`: A boolean indicating whether the batch is from a commit log (`true`) or
+    ///   a checkpoint/CRC/elsewhere (`false`).
+    pub(crate) fn new(actions: Box<dyn EngineData>, is_log_batch: bool) -> Self {
+        Self {
+            actions,
+            is_log_batch,
+        }
+    }
+
+    /// HACK: a duplication of the pub(crate) field `actions` to allow us to export as
+    /// 'internal-api' and let inspect-table example use it.
+    #[internal_api]
+    pub(crate) fn actions(&self) -> &dyn EngineData {
+        self.actions.as_ref()
+    }
+}
+
 /// A trait for processing batches of actions from Delta transaction logs during log replay.
 ///
 /// Log replay processors scan transaction logs in **reverse chronological order** (newest to oldest),
@@ -247,7 +281,7 @@ pub(crate) trait LogReplayProcessor: Sized {
     type Output: HasSelectionVector;
 
     /// Processes a batch of actions and returns the filtered results.
-    ///
+    /// FIXME
     /// # Parameters
     /// - `actions_batch` - A boxed [`EngineData`] instance representing a batch of actions.
     /// - `is_log_batch` - `true` if the batch originates from a commit log, `false` if from a checkpoint.
@@ -255,11 +289,7 @@ pub(crate) trait LogReplayProcessor: Sized {
     /// Returns a [`DeltaResult`] containing the processor’s output, which includes only selected actions.
     ///
     /// Note: Since log replay is stateful, processing may update internal processor state (e.g., deduplication sets).
-    fn process_actions_batch(
-        &mut self,
-        actions_batch: Box<dyn EngineData>,
-        is_log_batch: bool,
-    ) -> DeltaResult<Self::Output>;
+    fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output>;
 
     /// Applies the processor to an actions iterator and filters out empty results.
     ///
@@ -278,13 +308,10 @@ pub(crate) trait LogReplayProcessor: Sized {
     /// (batches where at least one row was selected).
     fn process_actions_iter(
         mut self,
-        action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
+        action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     ) -> impl Iterator<Item = DeltaResult<Self::Output>> {
         action_iter
-            .map(move |action_res| {
-                let (batch, is_log_batch) = action_res?;
-                self.process_actions_batch(batch, is_log_batch)
-            })
+            .map(move |actions_batch| self.process_actions_batch(actions_batch?))
             .filter(|res| {
                 // TODO: Leverage .is_none_or() when msrv = 1.82
                 res.as_ref()

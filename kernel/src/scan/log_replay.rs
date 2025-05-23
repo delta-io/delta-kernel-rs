@@ -13,12 +13,12 @@ use crate::expressions::{
     column_expr, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
 };
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
-use crate::log_replay::{FileActionDeduplicator, FileActionKey, LogReplayProcessor};
+use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::scan::{Scalar, TransformExpr};
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator};
+use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 
 /// [`ScanLogReplayProcessor`] performs log replay (processes actions) specifically for doing a table scan.
 ///
@@ -352,16 +352,16 @@ pub(crate) fn get_scan_metadata_transform_expr() -> Expression {
 impl LogReplayProcessor for ScanLogReplayProcessor {
     type Output = ScanMetadata;
 
-    fn process_actions_batch(
-        &mut self,
-        actions_batch: Box<dyn EngineData>,
-        is_log_batch: bool,
-    ) -> DeltaResult<Self::Output> {
+    fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
+        let ActionsBatch {
+            actions,
+            is_log_batch,
+        } = actions_batch;
         // Build an initial selection vector for the batch which has had the data skipping filter
         // applied. The selection vector is further updated by the deduplication visitor to remove
         // rows that are not valid adds.
-        let selection_vector = self.build_selection_vector(actions_batch.as_ref())?;
-        assert_eq!(selection_vector.len(), actions_batch.len());
+        let selection_vector = self.build_selection_vector(actions.as_ref())?;
+        assert_eq!(selection_vector.len(), actions.len());
 
         let mut visitor = AddRemoveDedupVisitor::new(
             &mut self.seen_file_keys,
@@ -371,10 +371,10 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             self.partition_filter.clone(),
             is_log_batch,
         );
-        visitor.visit_rows_of(actions_batch.as_ref())?;
+        visitor.visit_rows_of(actions.as_ref())?;
 
         // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
-        let result = self.add_transform.evaluate(actions_batch.as_ref())?;
+        let result = self.add_transform.evaluate(actions.as_ref())?;
         Ok(ScanMetadata::new(
             result,
             visitor.selection_vector,
@@ -396,7 +396,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 /// order of the actions in the log from most recent to least recent.
 pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
-    action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
+    action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     logical_schema: SchemaRef,
     transform: Option<Arc<Transform>>,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
@@ -411,6 +411,7 @@ mod tests {
 
     use crate::actions::get_log_schema;
     use crate::expressions::{column_name, Scalar};
+    use crate::log_replay::ActionsBatch;
     use crate::scan::state::{DvInfo, Stats};
     use crate::scan::test_utils::{
         add_batch_simple, add_batch_with_partition_col, add_batch_with_remove,
@@ -478,7 +479,9 @@ mod tests {
         let logical_schema = Arc::new(crate::schema::StructType::new(vec![]));
         let iter = scan_action_iter(
             &SyncEngine::new(),
-            batch.into_iter().map(|batch| Ok((batch as _, true))),
+            batch
+                .into_iter()
+                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             logical_schema,
             None,
             None,
@@ -504,7 +507,9 @@ mod tests {
         let batch = vec![add_batch_with_partition_col()];
         let iter = scan_action_iter(
             &SyncEngine::new(),
-            batch.into_iter().map(|batch| Ok((batch as _, true))),
+            batch
+                .into_iter()
+                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             schema,
             static_transform,
             None,
