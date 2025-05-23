@@ -10,10 +10,10 @@ pub(crate) mod arrow_conversion;
     any(feature = "default-engine-base", feature = "sync-engine")
 ))]
 pub mod arrow_expression;
-#[cfg(all(feature = "arrow-expression", not(feature = "internal-api")))]
+#[cfg(feature = "arrow-expression")]
 pub(crate) mod arrow_utils;
-#[cfg(all(feature = "arrow-expression", feature = "internal-api"))]
-pub mod arrow_utils;
+#[cfg(feature = "internal-api")]
+pub use self::arrow_utils::{fix_nested_null_masks, parse_json, to_json_bytes};
 
 #[cfg(feature = "default-engine-base")]
 pub mod default;

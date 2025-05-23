@@ -12,8 +12,6 @@ use tracing::debug;
 
 use std::collections::{HashMap, HashSet};
 
-pub use crate::engine::arrow_utils::fix_nested_null_masks;
-
 /// ArrowEngineData holds an Arrow `RecordBatch`, implements `EngineData` so the kernel can extract from it.
 ///
 /// WARNING: Row visitors require that all leaf columns of the record batch have correctly computed
