@@ -204,12 +204,8 @@ impl Metadata {
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(
-    any(test, feature = "internal-api"),
-    derive(Serialize, Deserialize),
-    serde(rename_all = "camelCase")
-)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
 // try_new function.
