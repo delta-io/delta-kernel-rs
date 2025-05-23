@@ -520,6 +520,7 @@ pub(crate) fn visit_deletion_vector_at<'a>(
 
 /// Get a Metadata out of some engine data. The caller is responsible for slicing the `getters` slice
 /// such that the first element contains the `id` element of the metadata.
+#[internal_api]
 pub(crate) fn visit_metadata_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
@@ -565,6 +566,7 @@ pub(crate) fn visit_metadata_at<'a>(
 
 /// Get a Protocol out of some engine data. The caller is responsible for slicing the `getters` slice
 /// such that the first element contains the `min_reader_version` element of the protocol.
+#[internal_api]
 pub(crate) fn visit_protocol_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
