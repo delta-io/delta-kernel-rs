@@ -124,8 +124,12 @@ pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
     &LOG_DOMAIN_METADATA_SCHEMA
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[cfg_attr(
+    any(test, feature = "internal-api"),
+    derive(Serialize, Deserialize),
+    serde(rename_all = "camelCase")
+)]
 #[internal_api]
 pub(crate) struct Format {
     /// Name of the encoding for files in this table
@@ -143,8 +147,12 @@ impl Default for Format {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Default, Clone, PartialEq, Eq, ToSchema)]
+#[cfg_attr(
+    any(test, feature = "internal-api"),
+    derive(Serialize, Deserialize),
+    serde(rename_all = "camelCase")
+)]
 #[internal_api]
 pub(crate) struct Metadata {
     /// Unique identifier for this table
@@ -196,8 +204,12 @@ impl Metadata {
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Default, Debug, Clone, PartialEq, Eq, ToSchema)]
+#[cfg_attr(
+    any(test, feature = "internal-api"),
+    derive(Serialize, Deserialize),
+    serde(rename_all = "camelCase")
+)]
 #[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
 // try_new function.

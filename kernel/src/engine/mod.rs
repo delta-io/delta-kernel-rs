@@ -10,7 +10,9 @@ pub(crate) mod arrow_conversion;
     any(feature = "default-engine-base", feature = "sync-engine")
 ))]
 pub mod arrow_expression;
-#[cfg(feature = "arrow-expression")]
+#[cfg(all(feature = "arrow-expression", not(feature = "internal-api")))]
+pub(crate) mod arrow_utils;
+#[cfg(all(feature = "arrow-expression", feature = "internal-api"))]
 pub mod arrow_utils;
 
 #[cfg(feature = "default-engine-base")]
