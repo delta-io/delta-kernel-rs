@@ -13,7 +13,7 @@ pub mod arrow_expression;
 #[cfg(feature = "arrow-expression")]
 pub(crate) mod arrow_utils;
 #[cfg(feature = "internal-api")]
-pub use self::arrow_utils::{fix_nested_null_masks, parse_json, to_json_bytes};
+pub use self::arrow_utils::{parse_json, to_json_bytes};
 
 #[cfg(feature = "default-engine-base")]
 pub mod default;
