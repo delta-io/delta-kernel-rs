@@ -523,7 +523,7 @@ fn test_null_row() {
     let handler = ArrowEvaluationHandler;
     let result = handler.null_row(schema.clone()).unwrap();
     let expected = RecordBatch::try_new(
-        Arc::new(schema.as_ref().try_into().unwrap()),
+        Arc::new(schema.as_ref().try_into_arrow().unwrap()),
         vec![
             Arc::new(StructArray::new_null(
                 [

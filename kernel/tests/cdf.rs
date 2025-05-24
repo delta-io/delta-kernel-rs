@@ -6,6 +6,7 @@ use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::engine::sync::SyncEngine;
 use itertools::Itertools;
 
+use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::{DeltaResult, Error, PredicateRef, Table, Version};
 
@@ -38,7 +39,7 @@ fn read_cdf_for_table(
         .with_schema(schema)
         .with_predicate(predicate)
         .build()?;
-    let scan_schema_as_arrow: ArrowSchema = scan.schema().as_ref().try_into().unwrap();
+    let scan_schema_as_arrow = ArrowSchema::try_from_kernel(scan.schema().as_ref()).unwrap();
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
         .map(|scan_result| -> DeltaResult<_> {

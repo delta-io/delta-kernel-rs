@@ -3,7 +3,7 @@
 //! related modules for more information.
 
 #[cfg(feature = "arrow-conversion")]
-pub(crate) mod arrow_conversion;
+pub mod arrow_conversion;
 
 #[cfg(all(
     feature = "arrow-expression",

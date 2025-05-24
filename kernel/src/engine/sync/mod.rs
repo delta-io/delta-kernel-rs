@@ -8,6 +8,7 @@ use crate::{
 };
 
 use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use crate::engine::arrow_conversion::TryFromKernel as _;
 use itertools::Itertools;
 use std::fs::File;
 use std::sync::Arc;
@@ -73,7 +74,7 @@ where
     if files.is_empty() {
         return Ok(Box::new(std::iter::empty()));
     }
-    let arrow_schema = Arc::new(ArrowSchema::try_from(&*schema)?);
+    let arrow_schema = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
     let files = files.to_vec();
     let result = files
         .into_iter()

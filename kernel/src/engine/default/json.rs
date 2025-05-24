@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::sync::{mpsc, Arc};
 use std::task::Poll;
 
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use crate::arrow::json::ReaderBuilder;
 use crate::arrow::record_batch::RecordBatch;
 use crate::object_store::path::Path;
@@ -17,6 +17,7 @@ use tracing::warn;
 use url::Url;
 
 use super::executor::TaskExecutor;
+use crate::engine::arrow_conversion::TryFromKernel as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::parse_json as arrow_parse_json;
 use crate::engine::arrow_utils::to_json_bytes;
@@ -101,7 +102,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             return Ok(Box::new(std::iter::empty()));
         }
 
-        let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
+        let schema = Arc::new(ArrowSchema::try_from_kernel(physical_schema.as_ref())?);
         let file_opener = JsonOpener::new(self.batch_size, schema.clone(), self.store.clone());
 
         let (tx, rx) = mpsc::sync_channel(self.buffer_size);
@@ -263,6 +264,7 @@ mod tests {
         GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
         PutMultipartOpts, PutOptions, PutPayload, PutResult, Result,
     };
+    use crate::schema::{DataType as DeltaDataType, Schema, StructField};
     use crate::utils::test_utils::string_array_to_engine_data;
     use futures::future;
     use itertools::Itertools;
@@ -540,7 +542,6 @@ mod tests {
         }];
 
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
-        let physical_schema = Arc::new(ArrowSchema::try_from(get_log_schema().as_ref()).unwrap());
         let data: Vec<RecordBatch> = handler
             .read_json_files(files, get_log_schema().clone(), None)
             .unwrap()
@@ -554,7 +555,7 @@ mod tests {
         // limit batch size
         let handler = handler.with_batch_size(2);
         let data: Vec<RecordBatch> = handler
-            .read_json_files(files, Arc::new(physical_schema.try_into().unwrap()), None)
+            .read_json_files(files, get_log_schema().clone(), None)
             .unwrap()
             .map_ok(into_record_batch)
             .try_collect()
@@ -705,12 +706,10 @@ mod tests {
                 )),
             );
             let handler = handler.with_buffer_size(*buffer_size);
-            let schema = Arc::new(ArrowSchema::new(vec![Arc::new(Field::new(
+            let physical_schema = Arc::new(Schema::new(vec![StructField::nullable(
                 "val",
-                DataType::Int32,
-                true,
-            ))]));
-            let physical_schema = Arc::new(schema.try_into().unwrap());
+                DeltaDataType::INTEGER,
+            )]));
             let data: Vec<RecordBatch> = handler
                 .read_json_files(&files, physical_schema, None)
                 .unwrap()

@@ -6,6 +6,7 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 
+use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{Expression, Predicate, Scalar};
@@ -64,7 +65,7 @@ impl ArrayBuilderAs for StructFieldBuilder<'_> {
 impl Scalar {
     /// Convert scalar to arrow array.
     pub fn to_array(&self, num_rows: usize) -> DeltaResult<ArrayRef> {
-        let data_type = ArrowDataType::try_from(&self.data_type())?;
+        let data_type = ArrowDataType::try_from_kernel(&self.data_type())?;
         let mut builder = array::make_builder(&data_type, num_rows);
         self.append_to(&mut builder, num_rows)?;
         Ok(builder.finish())
@@ -301,7 +302,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
             .map(|field| Scalar::Null(field.data_type().clone()).to_array(1))
             .try_collect()?;
         let record_batch =
-            RecordBatch::try_new(Arc::new(output_schema.as_ref().try_into()?), arrays)?;
+            RecordBatch::try_new(Arc::new(output_schema.as_ref().try_into_arrow()?), arrays)?;
         Ok(Box::new(ArrowEngineData::new(record_batch)))
     }
 }
@@ -321,7 +322,7 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
             .downcast_ref::<ArrowEngineData>()
             .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))?
             .record_batch();
-        let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into()?;
+        let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into_arrow()?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {
         //     return Err(Error::Generic(format!(
@@ -335,7 +336,7 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
             apply_schema(&array_ref, &self.output_type)?
         } else {
             let array_ref = apply_schema_to(&array_ref, &self.output_type)?;
-            let arrow_type: ArrowDataType = ArrowDataType::try_from(&self.output_type)?;
+            let arrow_type = ArrowDataType::try_from_kernel(&self.output_type)?;
             let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
             RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
         };
@@ -357,7 +358,7 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
             .downcast_ref::<ArrowEngineData>()
             .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))?
             .record_batch();
-        let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into()?;
+        let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into_arrow()?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {
         //     return Err(Error::Generic(format!(
