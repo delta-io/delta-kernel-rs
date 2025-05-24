@@ -366,7 +366,7 @@ impl PredicateEvaluator for DefaultPredicateEvaluator {
         //         batch.schema()
         //     )));
         // };
-        let array = evaluate_predicate(&self.predicate, batch)?;
+        let array = evaluate_predicate(&self.predicate, batch, false)?;
         let schema = ArrowSchema::new(vec![ArrowField::new(
             "output",
             ArrowDataType::Boolean,

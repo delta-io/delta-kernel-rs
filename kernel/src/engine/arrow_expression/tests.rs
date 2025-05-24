@@ -40,13 +40,20 @@ fn test_array_column() {
         column_expr!("item"),
     );
 
-    let result = evaluate_predicate(&not_op, &batch).unwrap();
-    let expected = BooleanArray::from(vec![true, false, true]);
-    assert_eq!(result, expected);
+    let result = evaluate_predicate(&not_op, &batch, false).unwrap();
+    let expected_not_in = BooleanArray::from(vec![true, false, true]);
+    assert_eq!(result, expected_not_in);
 
-    let result = evaluate_predicate(&in_op, &batch).unwrap();
-    let expected = BooleanArray::from(vec![false, true, false]);
-    assert_eq!(result, expected);
+    let result = evaluate_predicate(&in_op, &batch, false).unwrap();
+    let expected_in = BooleanArray::from(vec![false, true, false]);
+    assert_eq!(result, expected_in);
+
+    // Test inversion as well
+    let result = evaluate_predicate(&not_op, &batch, true).unwrap();
+    assert_eq!(result, expected_in);
+
+    let result = evaluate_predicate(&in_op, &batch, true).unwrap();
+    assert_eq!(result, expected_not_in);
 }
 
 #[test]
@@ -62,7 +69,7 @@ fn test_bad_right_type_array() {
         column_expr!("item"),
     ));
 
-    let in_result = evaluate_predicate(&in_op, &batch);
+    let in_result = evaluate_predicate(&in_op, &batch, false);
 
     assert!(in_result.is_err());
     assert_eq!(
@@ -77,7 +84,7 @@ fn test_literal_type_array() {
     let schema = Schema::new([field.clone()]);
     let batch = RecordBatch::new_empty(Arc::new(schema));
 
-    let in_op = Pred::not(Pred::binary(
+    let not_in_op = Pred::not(Pred::binary(
         BinaryPredicateOp::In,
         Expr::literal(5),
         Scalar::Array(
@@ -89,9 +96,14 @@ fn test_literal_type_array() {
         ),
     ));
 
-    let in_result = evaluate_predicate(&in_op, &batch).unwrap();
-    let in_expected = BooleanArray::from(vec![true]);
-    assert_eq!(in_result, in_expected);
+    let result = evaluate_predicate(&not_in_op, &batch, false).unwrap();
+    let not_in_expected = BooleanArray::from(vec![true]);
+    assert_eq!(result, not_in_expected);
+
+    // Test inversion
+    let result = evaluate_predicate(&not_in_op, &batch, true).unwrap();
+    let in_expected = BooleanArray::from(vec![false]);
+    assert_eq!(result, in_expected);
 }
 
 #[test]
@@ -238,7 +250,7 @@ fn test_invalid_array_sides() {
         column_expr!("item"),
     ));
 
-    let in_result = evaluate_predicate(&in_op, &batch);
+    let in_result = evaluate_predicate(&in_op, &batch, false);
 
     assert!(in_result.is_err());
     assert_eq!(
@@ -271,13 +283,20 @@ fn test_str_arrays() {
         column_expr!("item"),
     );
 
-    let result = evaluate_predicate(&str_in_op, &batch).unwrap();
-    let expected = BooleanArray::from(vec![true, true, true]);
-    assert_eq!(result, expected);
+    let result = evaluate_predicate(&str_in_op, &batch, false).unwrap();
+    let in_expected = BooleanArray::from(vec![true, true, true]);
+    assert_eq!(result, in_expected);
 
-    let result = evaluate_predicate(&str_not_op, &batch).unwrap();
-    let expected = BooleanArray::from(vec![false, false, false]);
-    assert_eq!(result, expected);
+    let result = evaluate_predicate(&str_not_op, &batch, false).unwrap();
+    let not_in_expected = BooleanArray::from(vec![false, false, false]);
+    assert_eq!(result, not_in_expected);
+
+    // Test inversion
+    let result = evaluate_predicate(&str_in_op, &batch, true).unwrap();
+    assert_eq!(result, not_in_expected);
+
+    let result = evaluate_predicate(&str_not_op, &batch, true).unwrap();
+    assert_eq!(result, in_expected);
 }
 
 #[test]
@@ -379,72 +398,112 @@ fn test_binary_cmp() {
     let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
     let column = column_expr!("a");
 
-    let predicate = column.clone().lt(Expr::literal(2));
-    let results = evaluate_predicate(&predicate, &batch).unwrap();
-    let expected = BooleanArray::from(vec![true, false, false]);
-    assert_eq!(results, expected);
+    let predicate_lt = column.clone().lt(Expr::literal(2));
+    let results = evaluate_predicate(&predicate_lt, &batch, false).unwrap();
+    let expected_lt = BooleanArray::from(vec![true, false, false]);
+    assert_eq!(results, expected_lt);
 
-    let predicate = column.clone().le(Expr::literal(2));
-    let results = evaluate_predicate(&predicate, &batch).unwrap();
-    let expected = BooleanArray::from(vec![true, true, false]);
-    assert_eq!(results, expected);
+    let predicate_le = column.clone().le(Expr::literal(2));
+    let results = evaluate_predicate(&predicate_le, &batch, false).unwrap();
+    let expected_le = BooleanArray::from(vec![true, true, false]);
+    assert_eq!(results, expected_le);
 
-    let predicate = column.clone().gt(Expr::literal(2));
-    let results = evaluate_predicate(&predicate, &batch).unwrap();
-    let expected = BooleanArray::from(vec![false, false, true]);
-    assert_eq!(results, expected);
+    let predicate_gt = column.clone().gt(Expr::literal(2));
+    let results = evaluate_predicate(&predicate_gt, &batch, false).unwrap();
+    let expected_gt = BooleanArray::from(vec![false, false, true]);
+    assert_eq!(results, expected_gt);
 
-    let predicate = column.clone().ge(Expr::literal(2));
-    let results = evaluate_predicate(&predicate, &batch).unwrap();
-    let expected = BooleanArray::from(vec![false, true, true]);
-    assert_eq!(results, expected);
+    let predicate_ge = column.clone().ge(Expr::literal(2));
+    let results = evaluate_predicate(&predicate_ge, &batch, false).unwrap();
+    let expected_ge = BooleanArray::from(vec![false, true, true]);
+    assert_eq!(results, expected_ge);
 
-    let predicate = column.clone().eq(Expr::literal(2));
-    let results = evaluate_predicate(&predicate, &batch).unwrap();
-    let expected = BooleanArray::from(vec![false, true, false]);
-    assert_eq!(results, expected);
+    let predicate_eq = column.clone().eq(Expr::literal(2));
+    let results = evaluate_predicate(&predicate_eq, &batch, false).unwrap();
+    let expected_eq = BooleanArray::from(vec![false, true, false]);
+    assert_eq!(results, expected_eq);
 
-    let predicate = column.clone().ne(Expr::literal(2));
-    let results = evaluate_predicate(&predicate, &batch).unwrap();
-    let expected = BooleanArray::from(vec![true, false, true]);
-    assert_eq!(results, expected);
+    let predicate_ne = column.clone().ne(Expr::literal(2));
+    let results = evaluate_predicate(&predicate_ne, &batch, false).unwrap();
+    let expected_ne = BooleanArray::from(vec![true, false, true]);
+    assert_eq!(results, expected_ne);
+
+    // Test inversion
+    let results = evaluate_predicate(&predicate_lt, &batch, true).unwrap();
+    assert_eq!(results, expected_ge);
+
+    let results = evaluate_predicate(&predicate_le, &batch, true).unwrap();
+    assert_eq!(results, expected_gt);
+
+    let results = evaluate_predicate(&predicate_gt, &batch, true).unwrap();
+    assert_eq!(results, expected_le);
+
+    let results = evaluate_predicate(&predicate_ge, &batch, true).unwrap();
+    assert_eq!(results, expected_lt);
+
+    let results = evaluate_predicate(&predicate_eq, &batch, true).unwrap();
+    assert_eq!(results, expected_ne);
+
+    let results = evaluate_predicate(&predicate_ne, &batch, true).unwrap();
+    assert_eq!(results, expected_eq);
 }
 
 #[test]
 fn test_logical() {
+    let t = Some(true);
+    let f = Some(false);
+    let n = None;
+
     let schema = Schema::new(vec![
         Field::new("a", DataType::Boolean, false),
-        Field::new("b", DataType::Boolean, false),
+        Field::new("b", DataType::Boolean, true),
     ]);
     let batch = RecordBatch::try_new(
         Arc::new(schema.clone()),
         vec![
-            Arc::new(BooleanArray::from(vec![true, false])),
-            Arc::new(BooleanArray::from(vec![false, true])),
+            Arc::new(BooleanArray::from(vec![t, t, f, f, t, f])),
+            Arc::new(BooleanArray::from(vec![t, f, t, f, n, n])),
         ],
     )
     .unwrap();
     let column_a = column_pred!("a");
     let column_b = column_pred!("b");
 
-    let pred = Pred::and(column_a.clone(), column_b.clone());
-    let results = evaluate_predicate(&pred, &batch).unwrap();
-    let expected = BooleanArray::from(vec![false, false]);
+    let pred_and_col = Pred::and(column_a.clone(), column_b.clone());
+    let results = evaluate_predicate(&pred_and_col, &batch, false).unwrap();
+    let expected = BooleanArray::from(vec![t, f, f, f, n, f]);
     assert_eq!(results, expected);
 
-    let pred = Pred::and(column_a.clone(), Pred::literal(true));
-    let results = evaluate_predicate(&pred, &batch).unwrap();
-    let expected = BooleanArray::from(vec![true, false]);
+    let pred_and_lit = Pred::and(column_a.clone(), Pred::literal(true));
+    let results = evaluate_predicate(&pred_and_lit, &batch, false).unwrap();
+    let expected = BooleanArray::from(vec![t, t, f, f, t, f]);
     assert_eq!(results, expected);
 
-    let pred = Pred::or(column_a.clone(), column_b);
-    let results = evaluate_predicate(&pred, &batch).unwrap();
-    let expected = BooleanArray::from(vec![true, true]);
+    let pred_or_col = Pred::or(column_a.clone(), column_b);
+    let results = evaluate_predicate(&pred_or_col, &batch, false).unwrap();
+    let expected = BooleanArray::from(vec![t, t, t, f, t, n]);
     assert_eq!(results, expected);
 
-    let pred = Pred::or(column_a.clone(), Pred::literal(false));
-    let results = evaluate_predicate(&pred, &batch).unwrap();
-    let expected = BooleanArray::from(vec![true, false]);
+    let pred_or_lit = Pred::or(column_a.clone(), Pred::literal(false));
+    let results = evaluate_predicate(&pred_or_lit, &batch, false).unwrap();
+    let expected = BooleanArray::from(vec![t, t, f, f, t, f]);
+    assert_eq!(results, expected);
+
+    // Test inversion
+    let results = evaluate_predicate(&pred_and_col, &batch, true).unwrap();
+    let expected = BooleanArray::from(vec![f, t, t, t, n, t]);
+    assert_eq!(results, expected);
+
+    let results = evaluate_predicate(&pred_and_lit, &batch, true).unwrap();
+    let expected = BooleanArray::from(vec![f, f, t, t, f, t]);
+    assert_eq!(results, expected);
+
+    let results = evaluate_predicate(&pred_or_col, &batch, true).unwrap();
+    let expected = BooleanArray::from(vec![f, f, f, t, f, n]);
+    assert_eq!(results, expected);
+
+    let results = evaluate_predicate(&pred_or_lit, &batch, true).unwrap();
+    let expected = BooleanArray::from(vec![f, f, t, t, f, t]);
     assert_eq!(results, expected);
 }
 

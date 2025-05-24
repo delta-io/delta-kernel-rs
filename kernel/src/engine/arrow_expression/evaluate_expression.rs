@@ -3,10 +3,10 @@ use crate::arrow::array::types::*;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Datum, RecordBatch, StructArray,
 };
-use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, lt};
+use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
-use crate::arrow::compute::{and_kleene, is_null, not, or_kleene};
+use crate::arrow::compute::{and_kleene, is_not_null, is_null, not, or_kleene};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, IntervalUnit, TimeUnit,
 };
@@ -19,6 +19,7 @@ use crate::expressions::{
 };
 use crate::schema::DataType;
 use itertools::Itertools;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 trait ProvidesColumnByName {
@@ -106,7 +107,7 @@ pub(crate) fn evaluate_expression(
             "Data type is required to evaluate struct expressions",
         )),
         (Predicate(pred), None | Some(&DataType::BOOLEAN)) => {
-            let result = evaluate_predicate(pred, batch)?;
+            let result = evaluate_predicate(pred, batch, false)?;
             Ok(Arc::new(result))
         }
         (Predicate(_), Some(data_type)) => Err(Error::generic(format!(
@@ -129,12 +130,21 @@ pub(crate) fn evaluate_expression(
     }
 }
 
+/// Evaluates a (possibly inverted) kernel predicate over a record batch
 pub(crate) fn evaluate_predicate(
     predicate: &Predicate,
     batch: &RecordBatch,
+    inverted: bool,
 ) -> DeltaResult<BooleanArray> {
     use BinaryPredicateOp::*;
     use Predicate::*;
+
+    // Helper to conditionally invert results of arrow operations if we couldn't push down the NOT.
+    let maybe_inverted = |result: Cow<'_, BooleanArray>| match inverted {
+        true => not(&result),
+        false => Ok(result.into_owned()),
+    };
+
     match predicate {
         BooleanExpression(expr) => {
             // Grr -- there's no way to cast an `Arc<dyn Array>` back to its native type, so we
@@ -142,17 +152,18 @@ pub(crate) fn evaluate_predicate(
             // instances are still cheaply clonable.
             let arr = evaluate_expression(expr, batch, Some(&DataType::BOOLEAN))?;
             match arr.as_any().downcast_ref::<BooleanArray>() {
-                Some(arr) => Ok(arr.clone()),
+                Some(arr) => Ok(maybe_inverted(Cow::Borrowed(arr))?),
                 None => Err(Error::generic("expected boolean array")),
             }
         }
-        Not(pred) => Ok(not(&evaluate_predicate(pred, batch)?)?),
+        Not(pred) => evaluate_predicate(pred, batch, !inverted),
         Unary(UnaryPredicate { op, expr }) => {
             let arr = evaluate_expression(expr.as_ref(), batch, None)?;
-            let result = match op {
-                UnaryPredicateOp::IsNull => is_null(&arr)?,
+            let eval_op_fn = match (op, inverted) {
+                (UnaryPredicateOp::IsNull, false) => is_null,
+                (UnaryPredicateOp::IsNull, true) => is_not_null,
             };
-            Ok(result)
+            Ok(eval_op_fn(&arr)?)
         }
         Binary(BinaryPredicate { op, left, right }) => {
             let (left, right) = (left.as_ref(), right.as_ref());
@@ -216,12 +227,16 @@ pub(crate) fn evaluate_predicate(
                 ))),
             };
 
-            let eval_fn = match op {
-                LessThan => lt,
-                GreaterThan => gt,
-                Equal => eq,
-                Distinct => distinct,
-                In => return eval_in(),
+            let eval_fn = match (op, inverted) {
+                (LessThan, false) => lt,
+                (LessThan, true) => gt_eq,
+                (GreaterThan, false) => gt,
+                (GreaterThan, true) => lt_eq,
+                (Equal, false) => eq,
+                (Equal, true) => neq,
+                (Distinct, false) => distinct,
+                (Distinct, true) => not_distinct,
+                (In, _) => return Ok(maybe_inverted(Cow::Owned(eval_in()?))?),
             };
 
             let left = evaluate_expression(left, batch, None)?;
@@ -229,14 +244,21 @@ pub(crate) fn evaluate_predicate(
             Ok(eval_fn(&left, &right)?)
         }
         Junction(JunctionPredicate { op, preds }) => {
+            // Leverage de Morgan's laws (invert the children and swap the operator):
+            // NOT(AND(A, B)) = OR(NOT(A), NOT(B))
+            // NOT(OR(A, B)) = AND(NOT(A), NOT(B))
+            //
+            // In case of an empty junction, we return a default value of TRUE (FALSE) for AND (OR),
+            // as a "hidden" extra child: AND(TRUE, ...) = AND(...) and OR(FALSE, ...) = OR(...).
+            use JunctionPredicateOp::*;
             type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
-            let (reducer, default): (Operation, _) = match op {
-                JunctionPredicateOp::And => (and_kleene, true),
-                JunctionPredicateOp::Or => (or_kleene, false),
+            let (reducer, default): (Operation, _) = match (op, inverted) {
+                (And, false) | (Or, true) => (and_kleene, true),
+                (Or, false) | (And, true) => (or_kleene, false),
             };
             preds
                 .iter()
-                .map(|pred| evaluate_predicate(pred, batch))
+                .map(|pred| evaluate_predicate(pred, batch, inverted))
                 .reduce(|l, r| Ok(reducer(&l?, &r?)?))
                 .unwrap_or_else(|| Ok(BooleanArray::from(vec![default; batch.num_rows()])))
         }
