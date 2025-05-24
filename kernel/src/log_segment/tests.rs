@@ -30,17 +30,21 @@ use crate::{
 };
 use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
 
+use super::*;
+
 // utility to easily create ListedLogFiles
 impl ListedLogFiles {
     fn new(
         ascending_commit_files: Vec<ParsedLogPath>,
         ascending_compaction_files: Vec<ParsedLogPath>,
         checkpoint_parts: Vec<ParsedLogPath>,
+        latest_crc_file: Option<ParsedLogPath>,
     ) -> Self {
         ListedLogFiles {
             ascending_commit_files,
             ascending_compaction_files,
             checkpoint_parts,
+            latest_crc_file,
         }
     }
 }
@@ -981,6 +985,7 @@ fn test_create_checkpoint_stream_errors_when_schema_has_remove_but_no_sidecar_ac
             vec![],
             vec![],
             vec![create_log_path("file:///00000000000000000001.parquet")],
+            None,
         ),
         log_root,
         None,
@@ -1009,6 +1014,7 @@ fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_actio
             vec![],
             vec![],
             vec![create_log_path("file:///00000000000000000001.parquet")],
+            None,
         ),
         log_root,
         None,
@@ -1040,7 +1046,12 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
     let v2_checkpoint_read_schema = get_log_schema().project(&[METADATA_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(vec![], vec![], vec![create_log_path(&checkpoint_one_file)]),
+        ListedLogFiles::new(
+            vec![],
+            vec![],
+            vec![create_log_path(&checkpoint_one_file)],
+            None,
+        ),
         log_root,
         None,
     )?;
@@ -1098,6 +1109,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
                 create_log_path(&checkpoint_one_file),
                 create_log_path(&checkpoint_two_file),
             ],
+            None,
         ),
         log_root,
         None,
@@ -1141,7 +1153,12 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(vec![], vec![], vec![create_log_path(&checkpoint_one_file)]),
+        ListedLogFiles::new(
+            vec![],
+            vec![],
+            vec![create_log_path(&checkpoint_one_file)],
+            None,
+        ),
         log_root,
         None,
     )?;
@@ -1179,7 +1196,12 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(vec![], vec![], vec![create_log_path(&checkpoint_one_file)]),
+        ListedLogFiles::new(
+            vec![],
+            vec![],
+            vec![create_log_path(&checkpoint_one_file)],
+            None,
+        ),
         log_root,
         None,
     )?;
@@ -1238,7 +1260,12 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(vec![], vec![], vec![create_log_path(&checkpoint_file_path)]),
+        ListedLogFiles::new(
+            vec![],
+            vec![],
+            vec![create_log_path(&checkpoint_file_path)],
+            None,
+        ),
         log_root,
         None,
     )?;
@@ -1427,4 +1454,29 @@ fn test_compaction_starts_at_checkpoint() {
         Some(3), // checkpoint version
         None,    // version to load
     );
+}
+
+#[test]
+fn test_list_log_files_with_version() -> DeltaResult<()> {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(0, "crc"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(1, "crc"),
+            delta_path_for_version(2, "json"),
+        ],
+        None,
+    );
+    let result = list_log_files_with_version(storage.as_ref(), &log_root, Some(0), None)?;
+    let latest_crc = result.latest_crc_file.unwrap();
+    assert_eq!(
+        latest_crc.location.location.path(),
+        "/_delta_log/00000000000000000001.crc".to_string()
+    );
+    assert_eq!(latest_crc.version, 1);
+    assert_eq!(latest_crc.filename, "00000000000000000001.crc".to_string());
+    assert_eq!(latest_crc.extension, "crc".to_string());
+    assert_eq!(latest_crc.file_type, LogPathFileType::Crc);
+    Ok(())
 }

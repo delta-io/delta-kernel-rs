@@ -133,7 +133,7 @@ impl Snapshot {
         // Start listing just after the previous segment's checkpoint, if any
         let listing_start = old_log_segment.checkpoint_version.unwrap_or(0) + 1;
 
-        // Check for new commits
+        // Check for new commits (and CRC)
         let new_listed_files = log_segment::list_log_files_with_version(
             storage.as_ref(),
             &log_root,
@@ -215,11 +215,22 @@ impl Snapshot {
             new_protocol,
             new_log_segment.end_version,
         )?;
+
         // NB: we must add the new log segment to the existing snapshot's log segment
         let mut ascending_commit_files = old_log_segment.ascending_commit_files.clone();
         ascending_commit_files.extend(new_log_segment.ascending_commit_files);
         let mut ascending_compaction_files = old_log_segment.ascending_compaction_files.clone();
         ascending_compaction_files.extend(new_log_segment.ascending_compaction_files);
+
+        // Note that we _could_ go backwards if someone deletes a CRC:
+        // old listing: 1, 2, 2.crc, 3, 3.crc (latest is 3.crc)
+        // new listing: 1, 2, 2.crc, 3        (latest is 2.crc)
+        // and we would still pick the new listing's (older) CRC file since it ostensibly still
+        // exists
+        let latest_crc_file = new_log_segment
+            .latest_crc_file
+            .or_else(|| old_log_segment.latest_crc_file.clone());
+
         // we can pass in just the old checkpoint parts since by the time we reach this line, we
         // know there are no checkpoints in the new log segment.
         let combined_log_segment = LogSegment::try_new(
@@ -227,6 +238,7 @@ impl Snapshot {
                 ascending_commit_files,
                 ascending_compaction_files,
                 checkpoint_parts: old_log_segment.checkpoint_parts.clone(),
+                latest_crc_file,
             },
             log_root,
             new_version,
@@ -462,6 +474,16 @@ mod tests {
         assert_eq!(snapshot.schema(), expected);
     }
 
+    // TODO: unify this and lots of stuff in LogSegment tests and test_utils
+    async fn commit(store: &InMemory, version: Version, commit: Vec<serde_json::Value>) {
+        let commit_data = commit
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<String>>()
+            .join("\n");
+        add_commit(store, version, commit_data).await.unwrap();
+    }
+
     // interesting cases for testing Snapshot::new_from:
     // 1. new version < existing version
     // 2. new version == existing version
@@ -510,16 +532,6 @@ mod tests {
             let expected = Snapshot::try_new(url.clone(), &engine, Some(1))?;
             assert_eq!(snapshot, expected.into());
             Ok(())
-        }
-
-        // TODO: unify this and lots of stuff in LogSegment tests and test_utils
-        async fn commit(store: &InMemory, version: Version, commit: Vec<serde_json::Value>) {
-            let commit_data = commit
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<String>>()
-                .join("\n");
-            add_commit(store, version, commit_data).await.unwrap();
         }
 
         // for (3) we will just engineer custom log files
@@ -663,6 +675,121 @@ mod tests {
         let commit1 = vec![commit0[0].clone()];
         commit(&store_3c_iv, 1, commit1).await;
         test_new_from(store_3c_iv.into())?;
+
+        Ok(())
+    }
+
+    // test new CRC in new log segment (old log segment has old CRC)
+    #[tokio::test]
+    async fn test_snapshot_new_from_crc() -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemory::new());
+        let url = Url::parse("memory:///")?;
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let protocol = |reader_version, writer_version| {
+            json!({
+                "protocol": {
+                    "minReaderVersion": reader_version,
+                    "minWriterVersion": writer_version
+                }
+            })
+        };
+        let metadata = json!({
+            "metaData": {
+                "id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+                "format": {
+                    "provider": "parquet",
+                    "options": {}
+                },
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1587968585495i64
+            }
+        });
+        let commit0 = vec![
+            json!({
+                "commitInfo": {
+                    "timestamp": 1587968586154i64,
+                    "operation": "WRITE",
+                    "operationParameters": {"mode":"ErrorIfExists","partitionBy":"[]"},
+                    "isBlindAppend":true
+                }
+            }),
+            protocol(1, 1),
+            metadata.clone(),
+        ];
+        let commit1 = vec![
+            json!({
+                "commitInfo": {
+                    "timestamp": 1587968586154i64,
+                    "operation": "WRITE",
+                    "operationParameters": {"mode":"ErrorIfExists","partitionBy":"[]"},
+                    "isBlindAppend":true
+                }
+            }),
+            protocol(1, 2),
+        ];
+
+        // commit 0 and 1 jsons
+        commit(&store, 0, commit0.clone()).await;
+        commit(&store, 1, commit1).await;
+
+        // a) CRC: old one has 0.crc, no new one (expect 0.crc)
+        // b) CRC: old one has 0.crc, new one has 1.crc (expect 1.crc)
+        let crc = json!({
+            "table_size_bytes": 100,
+            "num_files": 1,
+            "num_metadata": 1,
+            "num_protocol": 1,
+            "metadata": metadata,
+            "protocol": protocol(1, 1),
+        });
+
+        // put the old crc
+        let path = delta_path_for_version(0, "crc");
+        store.put(&path, crc.to_string().into()).await?;
+
+        // base snapshot is at version 0
+        let base_snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, Some(0))?);
+
+        // first test: no new crc
+        let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(1))?;
+        let expected = Snapshot::try_new(url.clone(), &engine, Some(1))?;
+        assert_eq!(snapshot, expected.into());
+        assert_eq!(
+            snapshot
+                .log_segment
+                .latest_crc_file
+                .as_ref()
+                .unwrap()
+                .version,
+            0
+        );
+
+        // second test: new crc
+        // put the new crc
+        let path = delta_path_for_version(1, "crc");
+        let crc = json!({
+            "table_size_bytes": 100,
+            "num_files": 1,
+            "num_metadata": 1,
+            "num_protocol": 1,
+            "metadata": metadata,
+            "protocol": protocol(1, 2),
+        });
+        store.put(&path, crc.to_string().into()).await?;
+        let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(1))?;
+        let expected = Snapshot::try_new(url.clone(), &engine, Some(1))?;
+        assert_eq!(snapshot, expected.into());
+        assert_eq!(
+            snapshot
+                .log_segment
+                .latest_crc_file
+                .as_ref()
+                .unwrap()
+                .version,
+            1
+        );
 
         Ok(())
     }
