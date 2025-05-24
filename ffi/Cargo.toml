@@ -40,6 +40,5 @@ trybuild = "1.0"
 default = ["default-engine"]
 default-engine = ["delta_kernel/default-engine", "delta_kernel/arrow"]
 tracing = [ "tracing-core", "tracing-subscriber" ]
-sync-engine = ["delta_kernel/sync-engine", "delta_kernel/arrow"]
 internal-api = []
 test-ffi = []

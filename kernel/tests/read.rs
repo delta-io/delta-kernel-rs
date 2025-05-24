@@ -429,36 +429,32 @@ fn read_table_data(
     let path = std::fs::canonicalize(PathBuf::from(path))?;
     let predicate = predicate.map(Arc::new);
     let url = url::Url::from_directory_path(path).unwrap();
-    let default_engine = DefaultEngine::try_new(
+    let engine = Arc::new(DefaultEngine::try_new(
         &url,
         std::iter::empty::<(&str, &str)>(),
         Arc::new(TokioBackgroundExecutor::new()),
-    )?;
-    let sync_engine = delta_kernel::engine::sync::SyncEngine::new();
+    )?);
 
-    let engines: Vec<Arc<dyn Engine>> = vec![Arc::new(sync_engine), Arc::new(default_engine)];
-    for engine in engines {
-        let table = Table::new(url.clone());
-        let snapshot = table.snapshot(engine.as_ref(), None)?;
+    let table = Table::new(url.clone());
+    let snapshot = table.snapshot(engine.as_ref(), None)?;
 
-        let read_schema = select_cols.map(|select_cols| {
-            let table_schema = snapshot.schema();
-            let selected_fields = select_cols
-                .iter()
-                .map(|col| table_schema.field(col).cloned().unwrap());
-            Arc::new(Schema::new(selected_fields))
-        });
-        println!("Read {url:?} with schema {read_schema:#?} and predicate {predicate:#?}");
-        let scan = snapshot
-            .into_scan_builder()
-            .with_schema_opt(read_schema)
-            .with_predicate(predicate.clone())
-            .build()?;
+    let read_schema = select_cols.map(|select_cols| {
+        let table_schema = snapshot.schema();
+        let selected_fields = select_cols
+            .iter()
+            .map(|col| table_schema.field(col).cloned().unwrap());
+        Arc::new(Schema::new(selected_fields))
+    });
+    println!("Read {url:?} with schema {read_schema:#?} and predicate {predicate:#?}");
+    let scan = snapshot
+        .into_scan_builder()
+        .with_schema_opt(read_schema)
+        .with_predicate(predicate.clone())
+        .build()?;
 
-        sort_lines!(expected);
-        read_with_scan_metadata(table.location(), engine.as_ref(), &scan, &expected)?;
-        read_with_execute(engine, &scan, &expected)?;
-    }
+    sort_lines!(expected);
+    read_with_scan_metadata(table.location(), engine.as_ref(), &scan, &expected)?;
+    read_with_execute(engine, &scan, &expected)?;
     Ok(())
 }
 

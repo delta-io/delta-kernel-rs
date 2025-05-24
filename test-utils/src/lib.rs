@@ -5,10 +5,15 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::{path::Path, ObjectStore};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::EngineData;
+
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::TaskExecutor;
+use delta_kernel::engine::default::DefaultEngine;
 use itertools::Itertools;
 
 /// A common useful initial metadata and protocol. Also includes a single commitInfo
@@ -135,4 +140,28 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
     ArrowEngineData::try_from_engine_data(engine_data)
         .unwrap()
         .into()
+}
+
+/// Simple extension trait with helpful methods (just constuctor for now) for creating/using
+/// DefaultEngine in our tests.
+///
+/// Note: we implment this extension trait here so that we can import this trait (from test-utils
+/// crate) and get to use all these test-only helper methods from places where we don't have access
+/// to #[cfg(test)] (i.e. in examples/integration tests).
+pub trait DefaultEngineExtension {
+    type Executor: TaskExecutor;
+
+    fn new_local() -> Arc<DefaultEngine<Self::Executor>>;
+}
+
+impl DefaultEngineExtension for DefaultEngine<TokioBackgroundExecutor> {
+    type Executor = TokioBackgroundExecutor;
+
+    fn new_local() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
+        let object_store = Arc::new(LocalFileSystem::new());
+        Arc::new(DefaultEngine::new(
+            object_store,
+            TokioBackgroundExecutor::new().into(),
+        ))
+    }
 }

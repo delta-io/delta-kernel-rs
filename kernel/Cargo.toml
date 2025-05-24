@@ -54,7 +54,6 @@ uuid = { version = "1.16.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
 
 # optional deps
-tempfile = { version = "3", optional = true }
 futures = { version = "0.3", optional = true }
 # Used for fetching direct urls (like pre-signed urls)
 reqwest = { version = "0.12.15", default-features = false, optional = true }
@@ -128,16 +127,12 @@ default-engine-rustls = [
   "reqwest/rustls-tls-native-roots",
   "reqwest/http2",
 ]
-sync-engine = [
-  "need-arrow",
-  "tempfile",
-]
 
 [build-dependencies]
 rustc_version = "0.4.1"
 
 [dev-dependencies]
-delta_kernel = { path = ".", features = ["arrow", "default-engine", "sync-engine"] }
+delta_kernel = { path = ".", features = ["arrow", "default-engine"] }
 test_utils = { path = "../test-utils" }
 # Used for testing parse_url_opts extensibility
 hdfs-native-object-store = { version = "0.14.0" }
