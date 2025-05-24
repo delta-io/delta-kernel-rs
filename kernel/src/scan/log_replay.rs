@@ -6,6 +6,7 @@ use itertools::Itertools;
 
 use super::data_skipping::DataSkippingFilter;
 use super::{ScanMetadata, Transform};
+use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
@@ -14,6 +15,7 @@ use crate::expressions::{
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::{FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::scan::{Scalar, TransformExpr};
+use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator};
@@ -310,19 +312,12 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
     let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
     let file_constant_values =
         StructType::new([StructField::nullable("partitionValues", partition_values)]);
-    let deletion_vector = StructType::new([
-        StructField::nullable("storageType", DataType::STRING),
-        StructField::nullable("pathOrInlineDv", DataType::STRING),
-        StructField::nullable("offset", DataType::INTEGER),
-        StructField::nullable("sizeInBytes", DataType::INTEGER),
-        StructField::nullable("cardinality", DataType::LONG),
-    ]);
     Arc::new(StructType::new([
         StructField::nullable("path", DataType::STRING),
         StructField::nullable("size", DataType::LONG),
         StructField::nullable("modificationTime", DataType::LONG),
         StructField::nullable("stats", DataType::STRING),
-        StructField::nullable("deletionVector", deletion_vector),
+        StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
         StructField::nullable("fileConstantValues", file_constant_values),
     ]))
 });
@@ -339,6 +334,19 @@ fn get_add_transform_expr() -> Expression {
         column_expr!("add.deletionVector"),
         Expression::Struct(vec![column_expr!("add.partitionValues")]),
     ])
+}
+
+// TODO: remove once `scan_metadata_from` is pub.
+#[allow(unused)]
+pub(crate) fn get_scan_metadata_transform_expr() -> Expression {
+    Expression::Struct(vec![Expression::Struct(vec![
+        column_expr!("path"),
+        column_expr!("fileConstantValues.partitionValues"),
+        column_expr!("size"),
+        column_expr!("modificationTime"),
+        column_expr!("stats"),
+        column_expr!("deletionVector"),
+    ])])
 }
 
 impl LogReplayProcessor for ScanLogReplayProcessor {
