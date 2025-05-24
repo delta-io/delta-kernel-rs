@@ -36,22 +36,14 @@ pub enum UnaryPredicateOp {
 pub enum BinaryPredicateOp {
     /// Comparison Less Than
     LessThan,
-    /// Comparison Less Than Or Equal
-    LessThanOrEqual,
     /// Comparison Greater Than
     GreaterThan,
-    /// Comparison Greater Than Or Equal
-    GreaterThanOrEqual,
     /// Comparison Equal
     Equal,
-    /// Comparison Not Equal
-    NotEqual,
     /// Distinct
     Distinct,
     /// IN
     In,
-    /// NOT IN
-    NotIn,
 }
 
 /// A binary expression operator.
@@ -168,22 +160,8 @@ impl BinaryPredicateOp {
     pub(crate) fn is_null_intolerant(&self) -> bool {
         use BinaryPredicateOp::*;
         match self {
-            LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual => true,
-            Equal | NotEqual => true,
-            Distinct | In | NotIn => false, // tolerates NULL input
-        }
-    }
-
-    /// Returns `<op2>` (if any) such that `B <op2> A` is equivalent to `A <op> B`.
-    pub(crate) fn commute(&self) -> Option<BinaryPredicateOp> {
-        use BinaryPredicateOp::*;
-        match self {
-            GreaterThan => Some(LessThan),
-            GreaterThanOrEqual => Some(LessThanOrEqual),
-            LessThan => Some(GreaterThan),
-            LessThanOrEqual => Some(GreaterThanOrEqual),
-            Equal | NotEqual | Distinct => Some(*self),
-            In | NotIn => None, // not commutative
+            LessThan | GreaterThan | Equal => true,
+            Distinct | In => false, // tolerates NULL input
         }
     }
 }
@@ -389,12 +367,12 @@ impl Predicate {
 
     /// Create a new predicate `self != other`
     pub fn ne(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
-        Self::binary(BinaryPredicateOp::NotEqual, a, b)
+        Self::not(Self::binary(BinaryPredicateOp::Equal, a, b))
     }
 
     /// Create a new predicate `self <= other`
     pub fn le(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
-        Self::binary(BinaryPredicateOp::LessThanOrEqual, a, b)
+        Self::not(Self::binary(BinaryPredicateOp::GreaterThan, a, b))
     }
 
     /// Create a new predicate `self < other`
@@ -404,7 +382,7 @@ impl Predicate {
 
     /// Create a new predicate `self >= other`
     pub fn ge(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
-        Self::binary(BinaryPredicateOp::GreaterThanOrEqual, a, b)
+        Self::not(Self::binary(BinaryPredicateOp::LessThan, a, b))
     }
 
     /// Create a new predicate `self > other`
@@ -484,17 +462,13 @@ impl Display for BinaryPredicateOp {
         use BinaryPredicateOp::*;
         match self {
             LessThan => write!(f, "<"),
-            LessThanOrEqual => write!(f, "<="),
             GreaterThan => write!(f, ">"),
-            GreaterThanOrEqual => write!(f, ">="),
             Equal => write!(f, "="),
-            NotEqual => write!(f, "!="),
             // TODO(roeap): AFAIK DISTINCT does not have a commonly used operator symbol
             // so ideally this would not be used as we use Display for rendering expressions
             // in our code we take care of this, but theirs might not ...
             Distinct => write!(f, "DISTINCT"),
             In => write!(f, "IN"),
-            NotIn => write!(f, "NOT IN"),
         }
     }
 }
@@ -637,7 +611,7 @@ mod tests {
                     column_expr!("x").ge(Expr::literal(2)),
                     column_expr!("x").le(Expr::literal(10)),
                 ),
-                "AND(Column(x) >= 2, Column(x) <= 10)",
+                "AND(NOT(Column(x) < 2), NOT(Column(x) > 10))",
             ),
             (
                 Pred::and_from([
@@ -645,7 +619,7 @@ mod tests {
                     column_expr!("x").le(Expr::literal(10)),
                     column_expr!("x").le(Expr::literal(100)),
                 ]),
-                "AND(Column(x) >= 2, Column(x) <= 10, Column(x) <= 100)",
+                "AND(NOT(Column(x) < 2), NOT(Column(x) > 10), NOT(Column(x) > 100))",
             ),
             (
                 Pred::or(

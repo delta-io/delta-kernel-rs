@@ -51,6 +51,8 @@ pub(crate) struct LogSegment {
     pub ascending_compaction_files: Vec<ParsedLogPath>,
     /// Checkpoint files in the log segment.
     pub checkpoint_parts: Vec<ParsedLogPath>,
+    /// Latest CRC (checksum) file
+    pub latest_crc_file: Option<ParsedLogPath>,
 }
 
 impl LogSegment {
@@ -63,6 +65,7 @@ impl LogSegment {
             mut ascending_commit_files,
             ascending_compaction_files,
             checkpoint_parts,
+            latest_crc_file,
         } = listed_files;
 
         // Commit file versions must be greater than the most recent checkpoint version if it exists
@@ -119,6 +122,7 @@ impl LogSegment {
             ascending_commit_files,
             ascending_compaction_files,
             checkpoint_parts,
+            latest_crc_file,
         })
     }
 
@@ -195,6 +199,7 @@ impl LogSegment {
             ascending_commit_files,
             ascending_compaction_files: vec![],
             checkpoint_parts: vec![],
+            latest_crc_file: None, // TODO: use CRC files for table changes?
         };
         LogSegment::try_new(listed_files, log_root, end_version)
     }
@@ -426,10 +431,10 @@ impl LogSegment {
     }
 }
 
-/// Returns a fallible iterator of [`ParsedLogPath`] that are between the provided `start_version` (inclusive)
-/// and `end_version` (inclusive). [`ParsedLogPath`] may be a commit or a checkpoint.  If `start_version` is
-/// not specified, the files will begin from version number 0. If `end_version` is not specified, files up to
-/// the most recent version will be included.
+/// Returns a fallible iterator of [`ParsedLogPath`] that are between the provided `start_version`
+/// (inclusive) and `end_version` (inclusive). [`ParsedLogPath`] may be a commit or a checkpoint.
+/// If `start_version` is not specified, the files will begin from version number 0. If
+/// `end_version` is not specified, files up to the most recent version will be included.
 ///
 /// Note: this calls [`StorageHandler::list_from`] to get the list of log files.
 fn list_log_files(
@@ -456,13 +461,15 @@ fn list_log_files(
 
 /// A struct to hold the result of listing log files. The commit and compaction files are guaranteed
 /// to be sorted in ascending order by version. The elements of `checkpoint_parts` are all the parts
-/// of the same checkpoint. Checkpoint parts share the same version.
+/// of the same checkpoint. Checkpoint parts share the same version. The `latest_crc_file` includes
+/// the latest (highest version) CRC file, if any, which may not correspond to the latest commit.
 // TODO: debug asserts in a `new` method to enforce the above?
 #[derive(Debug)]
 pub(crate) struct ListedLogFiles {
     pub ascending_commit_files: Vec<ParsedLogPath>,
     pub ascending_compaction_files: Vec<ParsedLogPath>,
     pub checkpoint_parts: Vec<ParsedLogPath>,
+    pub latest_crc_file: Option<ParsedLogPath>,
 }
 
 /// List all commit and checkpoint files with versions above the provided `start_version` (inclusive).
@@ -485,6 +492,7 @@ pub(crate) fn list_log_files_with_version(
         let mut ascending_commit_files = Vec::with_capacity(10);
         let mut ascending_compaction_files = Vec::with_capacity(2);
         let mut checkpoint_parts = vec![];
+        let mut latest_crc_file: Option<ParsedLogPath> = None;
 
         // Group log files by version
         let log_files_per_version = iter.chunk_by(|x| x.version);
@@ -502,7 +510,12 @@ pub(crate) fn list_log_files_with_version(
                     SinglePartCheckpoint | UuidCheckpoint(_) | MultiPartCheckpoint { .. } => {
                         new_checkpoint_parts.push(file)
                     }
-                    Crc => (), // TODO: Keep only the latest one
+                    Crc => {
+                        let latest_crc_ref = latest_crc_file.as_ref();
+                        if latest_crc_ref.is_none_or(|latest| latest.version < file.version) {
+                            latest_crc_file = Some(file);
+                        }
+                    }
                     Unknown => {
                         warn!(
                             "Found file {} with unknown file type {:?} at version {}",
@@ -529,6 +542,7 @@ pub(crate) fn list_log_files_with_version(
             ascending_commit_files,
             ascending_compaction_files,
             checkpoint_parts,
+            latest_crc_file,
         }
     })
 }

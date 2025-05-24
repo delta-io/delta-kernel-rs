@@ -8,6 +8,7 @@ use std::{
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use itertools::Itertools;
 
+use super::arrow_conversion::TryIntoArrow as _;
 use crate::{
     engine::arrow_utils::make_arrow_error,
     schema::{DataType, MetadataValue, StructField},
@@ -62,7 +63,7 @@ impl EnsureDataTypes {
     ) -> DeltaResult<DataTypeCompat> {
         match (kernel_type, arrow_type) {
             (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
-                check_cast_compat(kernel_type.try_into()?, arrow_type)
+                check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
             }
             // strings, bools, and binary  aren't primitive in arrow
             (&DataType::BOOLEAN, ArrowDataType::Boolean)
@@ -258,10 +259,10 @@ fn metadata_eq(
 mod tests {
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
 
-    use crate::{
-        engine::ensure_data_types::ensure_data_types,
-        schema::{ArrayType, DataType, MapType, StructField},
-    };
+    use crate::engine::arrow_conversion::TryFromKernel as _;
+    use crate::schema::{ArrayType, DataType, MapType, StructField};
+
+    use super::*;
 
     #[test]
     fn accepts_safe_decimal_casts() {
@@ -421,7 +422,7 @@ mod tests {
                 true,
             ),
         )]);
-        let arrow_struct: ArrowDataType = (&schema).try_into().unwrap();
+        let arrow_struct = ArrowDataType::try_from_kernel(&schema).unwrap();
         assert!(ensure_data_types(&schema, &arrow_struct, true).is_ok());
 
         let kernel_simple = DataType::struct_type([

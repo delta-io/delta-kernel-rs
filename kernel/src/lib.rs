@@ -124,11 +124,7 @@ use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
 use schema::{SchemaTransform, StructField, StructType};
 
-#[cfg(any(
-    feature = "default-engine",
-    feature = "sync-engine",
-    feature = "arrow-conversion"
-))]
+#[cfg(any(feature = "default-engine", feature = "arrow-conversion"))]
 pub mod engine;
 
 /// Delta table version is 8 byte unsigned int
