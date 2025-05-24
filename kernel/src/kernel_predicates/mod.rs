@@ -221,6 +221,7 @@ pub(crate) trait KernelPredicateEvaluator {
                 In => self.eval_pred_in(col, val, inverted),
             },
             (Literal(val), Column(col)) => match op {
+                // NOTE: The column has to be on the left, so e.g. `10 < x` becomes `x > 10`
                 LessThan => self.eval_pred_gt(col, val, inverted),
                 GreaterThan => self.eval_pred_lt(col, val, inverted),
                 Equal => self.eval_pred_eq(col, val, inverted),
