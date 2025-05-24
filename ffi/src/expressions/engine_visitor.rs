@@ -132,30 +132,18 @@ pub struct EngineExpressionVisitor {
     /// Visits the `LessThan` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_lt: VisitBinaryFn,
-    /// Visits the `LessThanOrEqual` binary operator belonging to the list identified by `sibling_list_id`.
-    /// The operands will be in a _two_ item list identified by `child_list_id`
-    pub visit_le: VisitBinaryFn,
     /// Visits the `GreaterThan` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_gt: VisitBinaryFn,
-    /// Visits the `GreaterThanOrEqual` binary operator belonging to the list identified by `sibling_list_id`.
-    /// The operands will be in a _two_ item list identified by `child_list_id`
-    pub visit_ge: VisitBinaryFn,
     /// Visits the `Equal` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_eq: VisitBinaryFn,
-    /// Visits the `NotEqual` binary operator belonging to the list identified by `sibling_list_id`.
-    /// The operands will be in a _two_ item list identified by `child_list_id`
-    pub visit_ne: VisitBinaryFn,
     /// Visits the `Distinct` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_distinct: VisitBinaryFn,
     /// Visits the `In` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_in: VisitBinaryFn,
-    /// Visits the `NotIn` binary operator belonging to the list identified by `sibling_list_id`.
-    /// The operands will be in a _two_ item list identified by `child_list_id`
-    pub visit_not_in: VisitBinaryFn,
     /// Visits the `Add` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_add: VisitBinaryFn,
@@ -448,14 +436,10 @@ fn visit_predicate_impl(
             visit_expression_impl(visitor, right, child_list_id);
             let visit_fn = match op {
                 BinaryPredicateOp::LessThan => visitor.visit_lt,
-                BinaryPredicateOp::LessThanOrEqual => visitor.visit_le,
                 BinaryPredicateOp::GreaterThan => visitor.visit_gt,
-                BinaryPredicateOp::GreaterThanOrEqual => visitor.visit_ge,
                 BinaryPredicateOp::Equal => visitor.visit_eq,
-                BinaryPredicateOp::NotEqual => visitor.visit_ne,
                 BinaryPredicateOp::Distinct => visitor.visit_distinct,
                 BinaryPredicateOp::In => visitor.visit_in,
-                BinaryPredicateOp::NotIn => visitor.visit_not_in,
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }

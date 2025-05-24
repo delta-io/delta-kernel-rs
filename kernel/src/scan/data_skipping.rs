@@ -223,15 +223,15 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         val: &Scalar,
         inverted: bool,
     ) -> Option<Pred> {
-        let op = match (ord, inverted) {
-            (Ordering::Less, false) => BinaryPredicateOp::LessThan,
-            (Ordering::Less, true) => BinaryPredicateOp::GreaterThanOrEqual,
-            (Ordering::Equal, false) => BinaryPredicateOp::Equal,
-            (Ordering::Equal, true) => BinaryPredicateOp::NotEqual,
-            (Ordering::Greater, false) => BinaryPredicateOp::GreaterThan,
-            (Ordering::Greater, true) => BinaryPredicateOp::LessThanOrEqual,
+        let pred_fn = match (ord, inverted) {
+            (Ordering::Less, false) => Pred::lt,
+            (Ordering::Less, true) => Pred::ge,
+            (Ordering::Equal, false) => Pred::eq,
+            (Ordering::Equal, true) => Pred::ne,
+            (Ordering::Greater, false) => Pred::gt,
+            (Ordering::Greater, true) => Pred::le,
         };
-        Some(Pred::binary(op, col, val.clone()))
+        Some(pred_fn(col, val.clone()))
     }
 
     fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Pred> {

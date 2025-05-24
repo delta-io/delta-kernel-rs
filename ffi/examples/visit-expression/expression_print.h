@@ -44,34 +44,18 @@ void print_tree_helper(ExpressionItem ref, int depth) {
           printf("LessThan\n");
           break;
         };
-        case LessThanOrEqual: {
-          printf("LessThanOrEqual\n");
-          break;
-        }
         case GreaterThan: {
           printf("GreaterThan\n");
-          break;
-        };
-        case GreaterThaneOrEqual: {
-          printf("GreaterThanOrEqual\n");
           break;
         };
         case Equal: {
           printf("Equal\n");
           break;
         };
-        case NotEqual: {
-          printf("NotEqual\n");
-          break;
-        };
         case In: {
           printf("In\n");
           break;
         };
-        case NotIn: {
-          printf("NotIn\n");
-          break;
-        }; break;
         case Distinct:
           printf("Distinct\n");
           break;

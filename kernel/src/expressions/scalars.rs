@@ -805,13 +805,21 @@ mod tests {
 
         let column = column_expr!("item");
         let array_op = Pred::binary(BinaryPredicateOp::In, Expr::literal(10), array.clone());
-        let array_not_op = Pred::binary(BinaryPredicateOp::NotIn, Expr::literal(10), array);
+        let array_not_op = Pred::not(Pred::binary(
+            BinaryPredicateOp::In,
+            Expr::literal(10),
+            array,
+        ));
         let column_op = Pred::binary(BinaryPredicateOp::In, Expr::literal(PI), column.clone());
-        let column_not_op = Pred::binary(BinaryPredicateOp::NotIn, Expr::literal("Cool"), column);
+        let column_not_op = Pred::not(Pred::binary(
+            BinaryPredicateOp::In,
+            Expr::literal("Cool"),
+            column,
+        ));
         assert_eq!(&format!("{}", array_op), "10 IN (1, 2, 3)");
-        assert_eq!(&format!("{}", array_not_op), "10 NOT IN (1, 2, 3)");
+        assert_eq!(&format!("{}", array_not_op), "NOT(10 IN (1, 2, 3))");
         assert_eq!(&format!("{}", column_op), "3.1415927 IN Column(item)");
-        assert_eq!(&format!("{}", column_not_op), "'Cool' NOT IN Column(item)");
+        assert_eq!(&format!("{}", column_not_op), "NOT('Cool' IN Column(item))");
     }
 
     #[test]

@@ -3,7 +3,7 @@ use crate::arrow::array::types::*;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Datum, RecordBatch, StructArray,
 };
-use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq};
+use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, lt};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
 use crate::arrow::compute::{and_kleene, is_null, not, or_kleene};
@@ -154,90 +154,79 @@ pub(crate) fn evaluate_predicate(
             };
             Ok(result)
         }
-        Binary(BinaryPredicate {
-            op: In,
-            left,
-            right,
-        }) => match (left.as_ref(), right.as_ref()) {
-            (Expression::Literal(_), Expression::Column(_)) => {
-                let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
-                let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
-                if let Some(string_arr) = left_arr.as_string_opt::<i32>() {
-                    if let Some(right_arr) = right_arr.as_list_opt::<i32>() {
-                        let result = in_list_utf8(string_arr, right_arr)?;
-                        return Ok(result);
+        Binary(BinaryPredicate { op, left, right }) => {
+            let (left, right) = (left.as_ref(), right.as_ref());
+
+            // IN is different from all the others, and also quite complex, so factor it out.
+            //
+            // TODO: Factor out as a stand-alone function instead of a closure?
+            let eval_in = || match (left, right) {
+                (Expression::Literal(_), Expression::Column(_)) => {
+                    let left = evaluate_expression(left, batch, None)?;
+                    let right = evaluate_expression(right, batch, None)?;
+                    if let Some(string_arr) = left.as_string_opt::<i32>() {
+                        if let Some(list_arr) = right.as_list_opt::<i32>() {
+                            let result = in_list_utf8(string_arr, list_arr)?;
+                            return Ok(result);
+                        }
+                    }
+
+                    use ArrowDataType::*;
+                    prim_array_cmp! {
+                        left, right,
+                        (Int8, Int8Type),
+                        (Int16, Int16Type),
+                        (Int32, Int32Type),
+                        (Int64, Int64Type),
+                        (UInt8, UInt8Type),
+                        (UInt16, UInt16Type),
+                        (UInt32, UInt32Type),
+                        (UInt64, UInt64Type),
+                        (Float16, Float16Type),
+                        (Float32, Float32Type),
+                        (Float64, Float64Type),
+                        (Timestamp(TimeUnit::Second, _), TimestampSecondType),
+                        (Timestamp(TimeUnit::Millisecond, _), TimestampMillisecondType),
+                        (Timestamp(TimeUnit::Microsecond, _), TimestampMicrosecondType),
+                        (Timestamp(TimeUnit::Nanosecond, _), TimestampNanosecondType),
+                        (Date32, Date32Type),
+                        (Date64, Date64Type),
+                        (Time32(TimeUnit::Second), Time32SecondType),
+                        (Time32(TimeUnit::Millisecond), Time32MillisecondType),
+                        (Time64(TimeUnit::Microsecond), Time64MicrosecondType),
+                        (Time64(TimeUnit::Nanosecond), Time64NanosecondType),
+                        (Duration(TimeUnit::Second), DurationSecondType),
+                        (Duration(TimeUnit::Millisecond), DurationMillisecondType),
+                        (Duration(TimeUnit::Microsecond), DurationMicrosecondType),
+                        (Duration(TimeUnit::Nanosecond), DurationNanosecondType),
+                        (Interval(IntervalUnit::DayTime), IntervalDayTimeType),
+                        (Interval(IntervalUnit::YearMonth), IntervalYearMonthType),
+                        (Interval(IntervalUnit::MonthDayNano), IntervalMonthDayNanoType),
+                        (Decimal128(_, _), Decimal128Type),
+                        (Decimal256(_, _), Decimal256Type)
                     }
                 }
-                prim_array_cmp! {
-                    left_arr, right_arr,
-                    (ArrowDataType::Int8, Int8Type),
-                    (ArrowDataType::Int16, Int16Type),
-                    (ArrowDataType::Int32, Int32Type),
-                    (ArrowDataType::Int64, Int64Type),
-                    (ArrowDataType::UInt8, UInt8Type),
-                    (ArrowDataType::UInt16, UInt16Type),
-                    (ArrowDataType::UInt32, UInt32Type),
-                    (ArrowDataType::UInt64, UInt64Type),
-                    (ArrowDataType::Float16, Float16Type),
-                    (ArrowDataType::Float32, Float32Type),
-                    (ArrowDataType::Float64, Float64Type),
-                    (ArrowDataType::Timestamp(TimeUnit::Second, _), TimestampSecondType),
-                    (ArrowDataType::Timestamp(TimeUnit::Millisecond, _), TimestampMillisecondType),
-                    (ArrowDataType::Timestamp(TimeUnit::Microsecond, _), TimestampMicrosecondType),
-                    (ArrowDataType::Timestamp(TimeUnit::Nanosecond, _), TimestampNanosecondType),
-                    (ArrowDataType::Date32, Date32Type),
-                    (ArrowDataType::Date64, Date64Type),
-                    (ArrowDataType::Time32(TimeUnit::Second), Time32SecondType),
-                    (ArrowDataType::Time32(TimeUnit::Millisecond), Time32MillisecondType),
-                    (ArrowDataType::Time64(TimeUnit::Microsecond), Time64MicrosecondType),
-                    (ArrowDataType::Time64(TimeUnit::Nanosecond), Time64NanosecondType),
-                    (ArrowDataType::Duration(TimeUnit::Second), DurationSecondType),
-                    (ArrowDataType::Duration(TimeUnit::Millisecond), DurationMillisecondType),
-                    (ArrowDataType::Duration(TimeUnit::Microsecond), DurationMicrosecondType),
-                    (ArrowDataType::Duration(TimeUnit::Nanosecond), DurationNanosecondType),
-                    (ArrowDataType::Interval(IntervalUnit::DayTime), IntervalDayTimeType),
-                    (ArrowDataType::Interval(IntervalUnit::YearMonth), IntervalYearMonthType),
-                    (ArrowDataType::Interval(IntervalUnit::MonthDayNano), IntervalMonthDayNanoType),
-                    (ArrowDataType::Decimal128(_, _), Decimal128Type),
-                    (ArrowDataType::Decimal256(_, _), Decimal256Type)
+                (Expression::Literal(lit), Expression::Literal(Scalar::Array(ad))) => {
+                    #[allow(deprecated)]
+                    let exists = ad.array_elements().contains(lit);
+                    Ok(BooleanArray::from(vec![exists]))
                 }
-            }
-            (Expression::Literal(lit), Expression::Literal(Scalar::Array(ad))) => {
-                #[allow(deprecated)]
-                let exists = ad.array_elements().contains(lit);
-                Ok(BooleanArray::from(vec![exists]))
-            }
-            (l, r) => Err(Error::invalid_expression(format!(
-                "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
-            ))),
-        },
-        Binary(BinaryPredicate {
-            op: NotIn,
-            left,
-            right,
-        }) => {
-            let reverse_op = Predicate::binary(In, *left.clone(), *right.clone());
-            let reverse_pred = evaluate_predicate(&reverse_op, batch)?;
-            Ok(not(&reverse_pred)?)
-        }
-        Binary(BinaryPredicate { op, left, right }) => {
-            let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
-            let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
-
-            type Operation = fn(&dyn Datum, &dyn Datum) -> Result<BooleanArray, ArrowError>;
-            let eval: Operation = match op {
-                LessThan => |l, r| lt(l, r),
-                LessThanOrEqual => |l, r| lt_eq(l, r),
-                GreaterThan => |l, r| gt(l, r),
-                GreaterThanOrEqual => |l, r| gt_eq(l, r),
-                Equal => |l, r| eq(l, r),
-                NotEqual => |l, r| neq(l, r),
-                Distinct => |l, r| distinct(l, r),
-                // NOTE: [Not]In was already covered above
-                In | NotIn => return Err(Error::generic("Invalid expression given")),
+                (l, r) => Err(Error::invalid_expression(format!(
+                    "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
+                ))),
             };
 
-            Ok(eval(&left_arr, &right_arr)?)
+            let eval_fn = match op {
+                LessThan => lt,
+                GreaterThan => gt,
+                Equal => eq,
+                Distinct => distinct,
+                In => return eval_in(),
+            };
+
+            let left = evaluate_expression(left, batch, None)?;
+            let right = evaluate_expression(right, batch, None)?;
+            Ok(eval_fn(&left, &right)?)
         }
         Junction(JunctionPredicate { op, preds }) => {
             type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;

@@ -439,7 +439,7 @@ mod tests {
                 ),
                 Pred::literal(true),
             ]),
-            Pred::ne(
+            Pred::eq(
                 Expr::literal(42),
                 Expr::struct_from([Expr::literal(10), column_expr!("b")]),
             ),
@@ -456,7 +456,7 @@ mod tests {
         //    * OR     >LIMIT<
         //    * NOT
         //  * AND
-        //  * NE
+        //  * EQ
         assert_eq!(check_with_call_count(1), (2, 6));
 
         // OR
@@ -466,7 +466,7 @@ mod tests {
         //      * GT
         //    * NOT
         //  * AND
-        //  * NE
+        //  * EQ
         assert_eq!(check_with_call_count(2), (3, 8));
 
         // OR
@@ -481,7 +481,7 @@ mod tests {
         //    * OR
         //      * GT
         //        * PLUS     >LIMIT<
-        //  * NE
+        //  * EQ
         assert_eq!(check_with_call_count(3), (4, 13));
 
         // Depth limit not hit (full traversal required)
@@ -498,7 +498,7 @@ mod tests {
         //    * OR
         //      * GT
         //        * PLUS
-        //  * NE
+        //  * EQ
         //    * STRUCT
         assert_eq!(check_with_call_count(4), (4, 14));
         assert_eq!(check_with_call_count(5), (4, 14));
@@ -524,7 +524,7 @@ mod tests {
         //      * OR
         //        * GT
         //          * PLUS     > LIMIT 4 <
-        //    * NE
+        //    * EQ
         //      * STRUCT
         assert_eq!(check_with_call_count(1), (2, 5));
         assert_eq!(check_with_call_count(2), (3, 7));
