@@ -565,6 +565,7 @@ impl Scan {
             ascending_commit_files,
             ascending_compaction_files: vec![],
             checkpoint_parts: vec![],
+            latest_crc_file: None,
         };
         let new_log_segment = LogSegment::try_new(
             listed_log_files,
