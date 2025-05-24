@@ -16,6 +16,7 @@ use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreStorageHandler;
 use crate::engine::default::DefaultEngine;
 use crate::engine::sync::SyncEngine;
+use crate::log_replay::ActionsBatch;
 use crate::log_segment::{ListedLogFiles, LogSegment};
 use crate::parquet::arrow::ArrowWriter;
 use crate::path::{LogPathFileType, ParsedLogPath};
@@ -1048,7 +1049,10 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
         log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
-    let (first_batch, is_log_batch) = iter.next().unwrap()?;
+    let ActionsBatch {
+        actions: first_batch,
+        is_log_batch,
+    } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(
         first_batch,
@@ -1107,7 +1111,10 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
 
     // Assert the correctness of batches returned
     for expected_sidecar in ["sidecar1.parquet", "sidecar2.parquet"].iter() {
-        let (batch, is_log_batch) = iter.next().unwrap()?;
+        let ActionsBatch {
+            actions: batch,
+            is_log_batch,
+        } = iter.next().unwrap()?;
         assert!(!is_log_batch);
         assert_batch_matches(
             batch,
@@ -1149,7 +1156,10 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
         log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
-    let (first_batch, is_log_batch) = iter.next().unwrap()?;
+    let ActionsBatch {
+        actions: first_batch,
+        is_log_batch,
+    } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(first_batch, add_batch_simple(v2_checkpoint_read_schema));
     assert!(iter.next().is_none());
@@ -1187,7 +1197,10 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
         log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema, None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
-    let (first_batch, is_log_batch) = iter.next().unwrap()?;
+    let ActionsBatch {
+        actions: first_batch,
+        is_log_batch,
+    } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     let mut visitor = AddVisitor::default();
     visitor.visit_rows_of(&*first_batch)?;
@@ -1246,7 +1259,10 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
-    let (first_batch, is_log_batch) = iter.next().unwrap()?;
+    let ActionsBatch {
+        actions: first_batch,
+        is_log_batch,
+    } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(
         first_batch,
@@ -1256,7 +1272,10 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         ),
     );
     // Assert that the second batch returned is from reading sidecarfile1
-    let (second_batch, is_log_batch) = iter.next().unwrap()?;
+    let ActionsBatch {
+        actions: second_batch,
+        is_log_batch,
+    } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(
         second_batch,
@@ -1264,7 +1283,10 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
     );
 
     // Assert that the second batch returned is from reading sidecarfile2
-    let (third_batch, is_log_batch) = iter.next().unwrap()?;
+    let ActionsBatch {
+        actions: third_batch,
+        is_log_batch,
+    } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(
         third_batch,
