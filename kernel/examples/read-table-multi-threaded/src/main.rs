@@ -124,13 +124,13 @@ fn try_main() -> DeltaResult<()> {
     if cli.public {
         options.insert("skip_signature", "true".to_string());
     }
-    let engine = Arc::new(DefaultEngine::try_new(
+    let engine = DefaultEngine::try_new(
         table.location(),
         options,
         Arc::new(TokioBackgroundExecutor::new()),
-    )?);
+    )?;
 
-    let snapshot = table.snapshot(engine.as_ref(), None)?;
+    let snapshot = table.snapshot(&engine, None)?;
 
     // process the columns requested and build a schema from them
     let read_schema_opt = cli
@@ -160,7 +160,7 @@ fn try_main() -> DeltaResult<()> {
     // [`delta_kernel::scan::scan_row_schema`]. Generally engines will not need to interact with
     // this data directly, and can just call [`visit_scan_files`] to get pre-parsed data back from
     // the kernel.
-    let scan_metadata = scan.scan_metadata(engine.as_ref())?;
+    let scan_metadata = scan.scan_metadata(&engine)?;
 
     // get any global state associated with this scan
     let global_state = Arc::new(scan.global_scan_state());
@@ -173,18 +173,17 @@ fn try_main() -> DeltaResult<()> {
 
     // fire up each thread. we don't need the handles as we rely on the channels to indicate when
     // things are done
-    let _handles: Vec<_> = (0..cli.thread_count)
-        .map(|_| {
+    thread::scope(|s| {
+        (0..cli.thread_count).for_each(|_| {
             // items that we need to send to the other thread
             let scan_state = global_state.clone();
             let rb_tx = record_batch_tx.clone();
             let scan_file_rx = scan_file_rx.clone();
-            let engine = engine.clone();
-            thread::spawn(move || {
-                do_work(engine, scan_state, rb_tx, scan_file_rx);
-            })
-        })
-        .collect();
+            s.spawn(|| {
+                do_work(&engine, scan_state, rb_tx, scan_file_rx);
+            });
+        });
+    });
 
     // have handed out all copies needed, drop so record_batch_rx will exit when the last thread is
     // done sending
@@ -225,13 +224,11 @@ fn try_main() -> DeltaResult<()> {
 
 // this is the work each thread does
 fn do_work(
-    engine: Arc<dyn Engine>,
+    engine: &dyn Engine,
     scan_state: Arc<GlobalScanState>,
     record_batch_tx: Sender<RecordBatch>,
     scan_file_rx: spmc::Receiver<ScanFile>,
 ) {
-    // get the type for the function calls
-    let engine: &dyn Engine = engine.as_ref();
     // in a loop, try and get a ScanFile. Note that `recv` will return an `Err` when the other side
     // hangs up, which indicates there's no more data to process.
     while let Ok(scan_file) = scan_file_rx.recv() {
