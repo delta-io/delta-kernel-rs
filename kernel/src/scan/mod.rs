@@ -388,8 +388,11 @@ impl std::fmt::Debug for Scan {
 }
 
 impl Scan {
-    /// The table's root URL. This is the location where data files with relative paths will
-    /// reside.
+    /// The table's root URL. Any relative paths returned from `scan_data` (or in a callback from
+    /// [`ScanMetadata::visit_scan_files`]) must be resolved against this root to get the actual path to
+    /// the file.
+    ///
+    /// [`ScanMetadata::visit_scan_files`]: crate::scan::ScanMetadata::visit_scan_files
     // NOTE: this is obviously included in the snapshot, just re-exposed here for convenience.
     pub fn table_root(&self) -> &Url {
         self.snapshot.table_root()
@@ -400,9 +403,9 @@ impl Scan {
         &self.snapshot
     }
 
-    /// Get a shared reference to the logical [`Schema`] of the scan. Note that the logical schema
-    /// can differ from the physical schema due to e.g. partition columns which are present in the
-    /// logical schema but not in the physical schema.
+    /// Get a shared reference to the logical [`Schema`] of the scan (i.e. the output schema of the
+    /// scan). Note that the logical schema can differ from the physical schema due to e.g.
+    /// partition columns which are present in the logical schema but not in the physical schema.
     ///
     /// [`Schema`]: crate::schema::Schema
     pub fn logical_schema(&self) -> &SchemaRef {

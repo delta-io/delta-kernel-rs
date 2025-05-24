@@ -122,6 +122,12 @@ fn send_scan_file(
     scan_tx.send(scan_file).unwrap();
 }
 
+struct ScanState {
+    table_root: Url,
+    physical_schema: SchemaRef,
+    logical_schema: SchemaRef,
+}
+
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
 
@@ -241,12 +247,6 @@ fn try_main() -> DeltaResult<()> {
     };
     print_batches(&batches)?;
     Ok(())
-}
-
-struct ScanState {
-    table_root: Url,
-    physical_schema: SchemaRef,
-    logical_schema: SchemaRef,
 }
 
 // this is the work each thread does

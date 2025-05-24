@@ -132,10 +132,10 @@ pub unsafe extern "C" fn scan_table_root(
     allocate_fn(kernel_string_slice!(table_root))
 }
 
-/// Get the logical schema of a scan.
+/// Get the logical (i.e. output) schema of a scan.
 ///
 /// # Safety
-/// Engine is responsible for providing a valid scan pointer
+/// Engine is responsible for providing a valid `SharedScan` handle
 #[no_mangle]
 pub unsafe extern "C" fn scan_logical_schema(scan: Handle<SharedScan>) -> Handle<SharedSchema> {
     let scan = unsafe { scan.as_ref() };
@@ -146,7 +146,7 @@ pub unsafe extern "C" fn scan_logical_schema(scan: Handle<SharedScan>) -> Handle
 /// a scan
 ///
 /// # Safety
-/// Engine is responsible for providing a valid scan pointer
+/// Engine is responsible for providing a valid `SharedScan` handle
 #[no_mangle]
 pub unsafe extern "C" fn scan_physical_schema(scan: Handle<SharedScan>) -> Handle<SharedSchema> {
     let scan = unsafe { scan.as_ref() };
