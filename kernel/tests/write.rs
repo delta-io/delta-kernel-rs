@@ -741,7 +741,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         // commit!
         txn.commit(&engine)?;
 
-        let snapshot = Arc::new(table.snapshot(&engine, None)?);
+        let snapshot = Arc::new(table.snapshot(&engine, 1.into())?);
         assert_eq!(
             snapshot.clone().get_app_id_version("app_id1", &engine)?,
             Some(1)

@@ -5,13 +5,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::actions::SetTransaction;
 use crate::actions::COMMIT_INFO_NAME;
-use crate::actions::{get_log_add_schema, get_log_commit_info_schema};
+use crate::actions::{get_log_add_schema, get_log_commit_info_schema, get_log_txn_schema};
 use crate::error::Error;
 use crate::expressions::{column_expr, Scalar, StructData};
 use crate::path::ParsedLogPath;
 use crate::schema::{MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
-use crate::{DataType, DeltaResult, Engine, EngineData, Expression, Version};
+use crate::{DataType, DeltaResult, Engine, EngineData, Expression, IntoEngineData, Version};
 
 use url::Url;
 
@@ -132,7 +132,7 @@ impl Transaction {
             .set_transactions
             .clone()
             .into_iter()
-            .map(|txn| txn.into_engine_data(engine));
+            .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
 
         // step one: construct the iterator of commit info + file actions we want to commit
         let engine_commit_info = self
