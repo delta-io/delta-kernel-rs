@@ -3,12 +3,13 @@
 //! # Example
 //! ```rust
 //! # use std::sync::Arc;
-//! # use delta_kernel::engine::sync::SyncEngine;
+//! # use test_utils::DefaultEngineExtension;
+//! # use delta_kernel::engine::default::DefaultEngine;
 //! # use delta_kernel::expressions::{column_expr, Scalar};
-//! # use delta_kernel::{Predicate, Table, Error};
+//! # use delta_kernel::{Predicate, Table, Error, Engine};
 //! # let path = "./tests/data/table-with-cdf";
-//! # let engine = Arc::new(SyncEngine::new());
-//! // Construct a table from a path oaeuhoanut
+//! # let engine = DefaultEngine::new_local();
+//! // Construct a table from a path
 //! let table = Table::try_from_uri(path)?;
 //!
 //! // Get the table changes (change data feed) between version 0 and 1
@@ -95,9 +96,10 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 ///  # Examples
 ///  Get `TableChanges` for versions 0 to 1 (inclusive)
 ///  ```rust
-///  # use delta_kernel::engine::sync::SyncEngine;
+///  # use delta_kernel::engine::default::DefaultEngine;
+///  # use test_utils::DefaultEngineExtension;
 ///  # use delta_kernel::{Table, Error};
-///  # let engine = Box::new(SyncEngine::new());
+///  # let engine = DefaultEngine::new_local();
 ///  # let path = "./tests/data/table-with-cdf";
 ///  let table = Table::try_from_uri(path).unwrap();
 ///  let table_changes = table.table_changes(engine.as_ref(), 0, 1)?;
