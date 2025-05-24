@@ -17,7 +17,7 @@ use tracing::warn;
 use url::Url;
 
 use super::executor::TaskExecutor;
-use crate::engine::arrow_conversion::TryFromKernel;
+use crate::engine::arrow_conversion::TryFromKernel as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::parse_json as arrow_parse_json;
 use crate::engine::arrow_utils::to_json_bytes;

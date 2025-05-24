@@ -1,5 +1,5 @@
 use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
-use delta_kernel::engine::arrow_conversion::TryFromArrow;
+use delta_kernel::engine::arrow_conversion::TryFromArrow as _;
 
 fn create_arrow_schema() -> Schema {
     let field_a = Field::new("a", DataType::Int64, false);

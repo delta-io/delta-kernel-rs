@@ -63,10 +63,7 @@ where
 
 impl TryFromKernel<&StructType> for ArrowSchema {
     fn try_from_kernel(s: &StructType) -> Result<Self, ArrowError> {
-        let fields: Vec<ArrowField> = s
-            .fields()
-            .map(TryFromKernel::try_from_kernel)
-            .try_collect()?;
+        let fields: Vec<ArrowField> = s.fields().map(|f| f.try_into_arrow()).try_collect()?;
         Ok(ArrowSchema::new(fields))
     }
 }
@@ -83,12 +80,8 @@ impl TryFromKernel<&StructField> for ArrowField {
             .collect::<Result<_, serde_json::Error>>()
             .map_err(|err| ArrowError::JsonError(err.to_string()))?;
 
-        let field = ArrowField::new(
-            f.name(),
-            ArrowDataType::try_from_kernel(f.data_type())?,
-            f.is_nullable(),
-        )
-        .with_metadata(metadata);
+        let field = ArrowField::new(f.name(), f.data_type().try_into_arrow()?, f.is_nullable())
+            .with_metadata(metadata);
 
         Ok(field)
     }
@@ -98,7 +91,7 @@ impl TryFromKernel<&ArrayType> for ArrowField {
     fn try_from_kernel(a: &ArrayType) -> Result<Self, ArrowError> {
         Ok(ArrowField::new(
             LIST_ARRAY_ROOT,
-            ArrowDataType::try_from_kernel(a.element_type())?,
+            a.element_type().try_into_arrow()?,
             a.contains_null(),
         ))
     }
@@ -110,14 +103,10 @@ impl TryFromKernel<&MapType> for ArrowField {
             MAP_ROOT_DEFAULT,
             ArrowDataType::Struct(
                 vec![
-                    ArrowField::new(
-                        MAP_KEY_DEFAULT,
-                        ArrowDataType::try_from_kernel(a.key_type())?,
-                        false,
-                    ),
+                    ArrowField::new(MAP_KEY_DEFAULT, a.key_type().try_into_arrow()?, false),
                     ArrowField::new(
                         MAP_VALUE_DEFAULT,
-                        ArrowDataType::try_from_kernel(a.value_type())?,
+                        a.value_type().try_into_arrow()?,
                         a.value_contains_null(),
                     ),
                 ]

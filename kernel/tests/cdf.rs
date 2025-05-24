@@ -6,7 +6,7 @@ use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::engine::sync::SyncEngine;
 use itertools::Itertools;
 
-use delta_kernel::engine::arrow_conversion::TryFromKernel;
+use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::{DeltaResult, Error, PredicateRef, Table, Version};
 

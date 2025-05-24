@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
-use crate::engine::arrow_conversion::{TryFromKernel, TryIntoArrow};
+use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::ensure_data_types::DataTypeCompat;
 use crate::{
     engine::arrow_data::ArrowEngineData,

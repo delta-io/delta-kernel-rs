@@ -8,7 +8,7 @@ use crate::{
 };
 
 use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
-use crate::engine::arrow_conversion::TryFromKernel;
+use crate::engine::arrow_conversion::TryFromKernel as _;
 use itertools::Itertools;
 use std::fs::File;
 use std::sync::Arc;

@@ -20,7 +20,7 @@ use delta_kernel::parquet::arrow::async_reader::{
 use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Table};
 use futures::{stream::TryStreamExt, StreamExt};
 
-use delta_kernel::engine::arrow_conversion::TryFromKernel;
+use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 

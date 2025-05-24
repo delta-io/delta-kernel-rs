@@ -8,7 +8,7 @@ use std::{
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use itertools::Itertools;
 
-use super::arrow_conversion::TryIntoArrow;
+use super::arrow_conversion::TryIntoArrow as _;
 use crate::{
     engine::arrow_utils::make_arrow_error,
     schema::{DataType, MetadataValue, StructField},
@@ -259,7 +259,7 @@ fn metadata_eq(
 mod tests {
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
 
-    use crate::engine::arrow_conversion::TryFromKernel;
+    use crate::engine::arrow_conversion::TryFromKernel as _;
     use crate::schema::{ArrayType, DataType, MapType, StructField};
 
     use super::*;

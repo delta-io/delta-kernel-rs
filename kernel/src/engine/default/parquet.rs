@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use super::UrlExt;
-use crate::engine::arrow_conversion::TryIntoArrow;
+use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{fixup_parquet_read, generate_mask, get_requested_indices};
 use crate::engine::default::executor::TaskExecutor;
@@ -382,7 +382,7 @@ mod tests {
     use crate::object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
     use url::Url;
 
-    use crate::engine::arrow_conversion::TryIntoKernel;
+    use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::EngineData;
