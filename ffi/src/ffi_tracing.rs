@@ -327,7 +327,7 @@ impl io::Write for BufferedMessageWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.current_buffer
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Could not lock buffer"))?
+            .map_err(|_| io::Error::other("Could not lock buffer"))?
             .extend_from_slice(buf);
         Ok(buf.len())
     }

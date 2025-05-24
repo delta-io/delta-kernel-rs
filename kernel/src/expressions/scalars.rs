@@ -4,7 +4,7 @@ use std::fmt::{Display, Formatter};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use itertools::Itertools;
 
-use crate::actions::schemas::ToDataType;
+use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::{ArrayType, DataType, DecimalType, MapType, PrimitiveType, StructField};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
@@ -290,14 +290,14 @@ impl Scalar {
         Ok(Self::Decimal(dval))
     }
 
-    /// Constructs a Scalar timestamp with no timezone from an `i64` millisecond since unix epoch
-    pub(crate) fn timestamp_ntz_from_millis(millis: i64) -> DeltaResult<Self> {
+    /// Constructs a Scalar timestamp (in UTC) from an `i64` millisecond since unix epoch
+    pub(crate) fn timestamp_from_millis(millis: i64) -> DeltaResult<Self> {
         let Some(timestamp) = DateTime::from_timestamp_millis(millis) else {
             return Err(Error::generic(format!(
                 "Failed to create millisecond timestamp from {millis}"
             )));
         };
-        Ok(Self::TimestampNtz(timestamp.timestamp_micros()))
+        Ok(Self::Timestamp(timestamp.timestamp_micros()))
     }
 }
 
@@ -493,6 +493,7 @@ impl From<&[u8]> for Scalar {
     }
 }
 
+// NOTE: We "cheat" and use the macro support trait `ToDataType`
 impl<T: Into<Scalar> + ToDataType> From<Option<T>> for Scalar {
     fn from(t: Option<T>) -> Self {
         match t {
