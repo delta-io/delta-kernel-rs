@@ -431,10 +431,10 @@ impl LogSegment {
     }
 }
 
-/// Returns a fallible iterator of [`ParsedLogPath`] that are between the provided `start_version` (inclusive)
-/// and `end_version` (inclusive). [`ParsedLogPath`] may be a commit or a checkpoint.  If `start_version` is
-/// not specified, the files will begin from version number 0. If `end_version` is not specified, files up to
-/// the most recent version will be included.
+/// Returns a fallible iterator of [`ParsedLogPath`] that are between the provided `start_version`
+/// (inclusive) and `end_version` (inclusive). [`ParsedLogPath`] may be a commit or a checkpoint.
+/// If `start_version` is not specified, the files will begin from version number 0. If
+/// `end_version` is not specified, files up to the most recent version will be included.
 ///
 /// Note: this calls [`StorageHandler::list_from`] to get the list of log files.
 fn list_log_files(
@@ -462,7 +462,7 @@ fn list_log_files(
 /// A struct to hold the result of listing log files. The commit and compaction files are guaranteed
 /// to be sorted in ascending order by version. The elements of `checkpoint_parts` are all the parts
 /// of the same checkpoint. Checkpoint parts share the same version. The `latest_crc_file` includes
-/// the latest (highest version) CRC file, if any.
+/// the latest (highest version) CRC file, if any, which may not correspond to the latest commit.
 // TODO: debug asserts in a `new` method to enforce the above?
 #[derive(Debug)]
 pub(crate) struct ListedLogFiles {
@@ -511,11 +511,9 @@ pub(crate) fn list_log_files_with_version(
                         new_checkpoint_parts.push(file)
                     }
                     Crc => {
-                        // only keep the latest CRC file
-                        match &mut latest_crc_file {
-                            Some(latest) if file.version > latest.version => *latest = file,
-                            None => latest_crc_file = Some(file),
-                            _ => {} // file.version <= latest.version, do nothing
+                        let latest_crc_ref = latest_crc_file.as_ref();
+                        if latest_crc_ref.is_none_or(|latest| latest.version < file.version) {
+                            latest_crc_file = Some(file);
                         }
                     }
                     Unknown => {

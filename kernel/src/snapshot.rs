@@ -222,6 +222,11 @@ impl Snapshot {
         let mut ascending_compaction_files = old_log_segment.ascending_compaction_files.clone();
         ascending_compaction_files.extend(new_log_segment.ascending_compaction_files);
 
+        // Note that we _could_ go backwards if someone deletes a CRC:
+        // old listing: 1, 2, 2.crc, 3, 3.crc (latest is 3.crc)
+        // new listing: 1, 2, 2.crc, 3        (latest is 2.crc)
+        // and we would still pick the new listing's (older) CRC file since it ostensibly still
+        // exists
         let latest_crc_file = new_log_segment
             .latest_crc_file
             .or_else(|| old_log_segment.latest_crc_file.clone());
