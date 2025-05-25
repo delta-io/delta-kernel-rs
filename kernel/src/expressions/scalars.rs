@@ -4,7 +4,7 @@ use std::fmt::{Display, Formatter};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use itertools::Itertools;
 
-use crate::actions::schemas::ToDataType;
+use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::{ArrayType, DataType, DecimalType, MapType, PrimitiveType, StructField};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
@@ -493,6 +493,7 @@ impl From<&[u8]> for Scalar {
     }
 }
 
+// NOTE: We "cheat" and use the macro support trait `ToDataType`
 impl<T: Into<Scalar> + ToDataType> From<Option<T>> for Scalar {
     fn from(t: Option<T>) -> Self {
         match t {
@@ -804,13 +805,21 @@ mod tests {
 
         let column = column_expr!("item");
         let array_op = Pred::binary(BinaryPredicateOp::In, Expr::literal(10), array.clone());
-        let array_not_op = Pred::binary(BinaryPredicateOp::NotIn, Expr::literal(10), array);
+        let array_not_op = Pred::not(Pred::binary(
+            BinaryPredicateOp::In,
+            Expr::literal(10),
+            array,
+        ));
         let column_op = Pred::binary(BinaryPredicateOp::In, Expr::literal(PI), column.clone());
-        let column_not_op = Pred::binary(BinaryPredicateOp::NotIn, Expr::literal("Cool"), column);
+        let column_not_op = Pred::not(Pred::binary(
+            BinaryPredicateOp::In,
+            Expr::literal("Cool"),
+            column,
+        ));
         assert_eq!(&format!("{}", array_op), "10 IN (1, 2, 3)");
-        assert_eq!(&format!("{}", array_not_op), "10 NOT IN (1, 2, 3)");
+        assert_eq!(&format!("{}", array_not_op), "NOT(10 IN (1, 2, 3))");
         assert_eq!(&format!("{}", column_op), "3.1415927 IN Column(item)");
-        assert_eq!(&format!("{}", column_not_op), "'Cool' NOT IN Column(item)");
+        assert_eq!(&format!("{}", column_not_op), "NOT('Cool' IN Column(item))");
     }
 
     #[test]

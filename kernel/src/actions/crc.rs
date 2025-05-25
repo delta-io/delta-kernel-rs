@@ -9,7 +9,7 @@ use crate::engine_data::GetData;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, Error, RowVisitor};
-use delta_kernel_derive::Schema;
+use delta_kernel_derive::ToSchema;
 
 /// Though technically not an action, we include the CRC (version checksum) file here. A [CRC file]
 /// must:
@@ -19,7 +19,7 @@ use delta_kernel_derive::Schema;
 ///
 /// [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
 #[allow(unused)] // TODO: remove after we complete CRC support
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub(crate) struct Crc {
     /// A unique identifier for the transaction that produced this commit.
     pub(crate) txn_id: Option<String>,
@@ -58,7 +58,7 @@ pub(crate) struct Crc {
 /// across different size ranges.
 ///
 /// [FileSizeHistogram]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#file-size-histogram-schema
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub(crate) struct FileSizeHistogram {
     /// A sorted array of bin boundaries where each element represents the start of a bin
     /// (inclusive) and the next element represents the end of the bin (exclusive). The first
@@ -87,7 +87,7 @@ pub(crate) struct FileSizeHistogram {
 /// Bin 9: [2147483647, ∞) (files with 2,147,483,647 or more deleted records)
 ///
 /// [DeletedRecordCountsHistogram]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deleted-record-counts-histogram-schema
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub(crate) struct DeletedRecordCountsHistogram {
     /// Array of size 10 where each element represents the count of files falling into a specific
     /// deletion count range.
@@ -141,6 +141,7 @@ impl RowVisitor for CrcProtocolMetadataVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::sync::Arc;
 
     use crate::arrow::array::StringArray;
@@ -148,7 +149,9 @@ mod tests {
     use crate::actions::schemas::ToDataType as _;
     use crate::actions::{Format, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
+    use crate::schema::derive_macro_utils::ToDataType as _;
     use crate::schema::{ArrayType, DataType, StructField, StructType};
+    use crate::schema::{ArrayType, DataType, StructField, StructType, ToSchema as _};
     use crate::table_features::{ReaderFeature, WriterFeature};
     use crate::utils::test_utils::string_array_to_engine_data;
     use crate::Engine;
