@@ -120,20 +120,19 @@ impl RowVisitor for CrcProtocolMetadataVisitor {
         require!(
             getters.len() == 13,
             Error::InternalError(format!(
-                "Wrong number of MetadataVisitor getters: {}",
+                "Wrong number of CrcProtocolMetadataVisitor getters: {}",
                 getters.len()
             ))
         );
         if row_count != 1 {
             return Err(Error::InternalError(format!(
-                "Expected 1 row for CRC file, but got {}",
-                row_count
+                "Expected 1 row for CRC file, but got {row_count}",
             )));
         }
 
-        self.metadata = visit_metadata_at(0, &getters[0..9])?
+        self.metadata = visit_metadata_at(0, &getters[..9])?
             .ok_or(Error::generic("Metadata not found in CRC file"))?;
-        self.protocol = visit_protocol_at(0, &getters[9..13])?
+        self.protocol = visit_protocol_at(0, &getters[9..])?
             .ok_or(Error::generic("Protocol not found in CRC file"))?;
         Ok(())
     }

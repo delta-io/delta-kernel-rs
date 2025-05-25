@@ -348,7 +348,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 let configuration_map_opt = getters[11].get_opt(i, "metadata.configuration")?;
                 let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
                 self.metadata_info = Some((schema.to_string(), configuration));
-            } else if let Some(protocol) = visit_protocol_at(i, &getters[12..=15])? {
+            } else if let Some(protocol) = visit_protocol_at(i, &getters[12..])? {
                 self.protocol = Some(protocol);
             }
         }
