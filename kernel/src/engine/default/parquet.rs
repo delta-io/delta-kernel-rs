@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use super::UrlExt;
+use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{fixup_parquet_read, generate_mask, get_requested_indices};
 use crate::engine::default::executor::TaskExecutor;
@@ -87,7 +88,7 @@ impl DataFileMetadata {
         let data_change = Arc::new(BooleanArray::from(vec![data_change]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(write_metadata_schema.as_ref().try_into()?),
+            Arc::new(write_metadata_schema.as_ref().try_into_arrow()?),
             vec![path, partitions, size, modification_time, data_change],
         )?)))
     }
@@ -128,8 +129,6 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         writer.write(record_batch)?;
         writer.close()?; // writer must be closed to write footer
 
-        // TODO: remove after dropping arrow 54 support
-        #[allow(clippy::useless_conversion)]
         let size: u64 = buffer
             .len()
             .try_into()
@@ -150,10 +149,9 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
 
         let metadata = self.store.head(&Path::from_url_path(path.path())?).await?;
         let modification_time = metadata.last_modified.timestamp_millis();
-        // TODO: remove after dropping arrow 54 support
-        #[allow(clippy::useless_conversion)]
-        let metadata_size: u64 = metadata
-            .size
+        let metadata_size = metadata.size;
+        #[cfg(not(feature = "arrow-55"))]
+        let metadata_size: u64 = metadata_size
             .try_into()
             .map_err(|_| Error::generic("Failed to convert parquet metadata 'size' to u64"))?;
         if size != metadata_size {
@@ -219,7 +217,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         };
         FileStream::new_async_read_iterator(
             self.task_executor.clone(),
-            Arc::new(physical_schema.as_ref().try_into()?),
+            Arc::new(physical_schema.as_ref().try_into_arrow()?),
             file_opener,
             files,
             self.readahead,
@@ -384,6 +382,7 @@ mod tests {
     use crate::object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
     use url::Url;
 
+    use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::EngineData;
@@ -418,17 +417,22 @@ mod tests {
             .schema()
             .clone();
 
-        // TODO: remove after dropping arrow 54 support
-        #[allow(clippy::useless_conversion)]
+        let meta_size = meta.size;
+        #[cfg(not(feature = "arrow-55"))]
+        let meta_size = meta_size.try_into().unwrap();
         let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp(),
-            size: meta.size.try_into().unwrap(),
+            size: meta_size,
         }];
 
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
         let data: Vec<RecordBatch> = handler
-            .read_parquet_files(files, Arc::new(physical_schema.try_into().unwrap()), None)
+            .read_parquet_files(
+                files,
+                Arc::new(physical_schema.try_into_kernel().unwrap()),
+                None,
+            )
             .unwrap()
             .map(into_record_batch)
             .try_collect()
@@ -455,7 +459,7 @@ mod tests {
         let schema = Arc::new(
             crate::transaction::get_write_metadata_schema()
                 .as_ref()
-                .try_into()
+                .try_into_arrow()
                 .unwrap(),
         );
         let key_builder = StringBuilder::new();
@@ -549,7 +553,7 @@ mod tests {
         let data: Vec<RecordBatch> = parquet_handler
             .read_parquet_files(
                 &[parquet_file.clone()],
-                Arc::new(physical_schema.try_into().unwrap()),
+                Arc::new(physical_schema.try_into_kernel().unwrap()),
                 None,
             )
             .unwrap()

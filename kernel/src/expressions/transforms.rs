@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::borrow::{Cow, ToOwned};
 use std::collections::HashSet;
 
 use crate::expressions::{
@@ -38,10 +38,7 @@ pub trait ExpressionTransform<'a> {
     /// Called for the expression list of each [`Expression::Struct`] encountered during the
     /// traversal. Implementations can call [`Self::recurse_into_expr_struct`] if they wish to
     /// recursively transform the child expressions.
-    fn transform_expr_struct(
-        &mut self,
-        fields: &'a Vec<Expression>,
-    ) -> Option<Cow<'a, Vec<Expression>>> {
+    fn transform_expr_struct(&mut self, fields: &'a [Expression]) -> Option<Cow<'a, [Expression]>> {
         self.recurse_into_expr_struct(fields)
     }
 
@@ -160,8 +157,8 @@ pub trait ExpressionTransform<'a> {
     /// `Some(Cow::Borrowed)` otherwise.
     fn recurse_into_expr_struct(
         &mut self,
-        fields: &'a Vec<Expression>,
-    ) -> Option<Cow<'a, Vec<Expression>>> {
+        fields: &'a [Expression],
+    ) -> Option<Cow<'a, [Expression]>> {
         recurse_into_children(fields, |f| self.transform_expr(f))
     }
 
@@ -258,9 +255,9 @@ pub trait ExpressionTransform<'a> {
 
 /// Used to recurse into the children of an `Expression::Struct` or `Predicate::Junction`.
 fn recurse_into_children<'a, T: Clone>(
-    children: &'a Vec<T>,
+    children: &'a [T],
     recurse_fn: impl FnMut(&'a T) -> Option<Cow<'a, T>>,
-) -> Option<Cow<'a, Vec<T>>> {
+) -> Option<Cow<'a, [T]>> {
     let mut num_borrowed = 0;
     let new_children: Vec<_> = children
         .iter()
@@ -351,7 +348,7 @@ impl ExpressionDepthChecker {
     }
 
     // Triggers the requested recursion only doing so would not exceed the depth limit.
-    fn depth_limited<'a, T: Clone + std::fmt::Debug>(
+    fn depth_limited<'a, T: std::fmt::Debug + ToOwned + ?Sized>(
         &mut self,
         recurse: impl FnOnce(&mut Self, &'a T) -> Option<Cow<'a, T>>,
         arg: &'a T,
@@ -376,10 +373,7 @@ impl ExpressionDepthChecker {
 }
 
 impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
-    fn transform_expr_struct(
-        &mut self,
-        fields: &'a Vec<Expression>,
-    ) -> Option<Cow<'a, Vec<Expression>>> {
+    fn transform_expr_struct(&mut self, fields: &'a [Expression]) -> Option<Cow<'a, [Expression]>> {
         self.depth_limited(Self::recurse_into_expr_struct, fields)
     }
 
@@ -445,7 +439,7 @@ mod tests {
                 ),
                 Pred::literal(true),
             ]),
-            Pred::ne(
+            Pred::eq(
                 Expr::literal(42),
                 Expr::struct_from([Expr::literal(10), column_expr!("b")]),
             ),
@@ -462,7 +456,7 @@ mod tests {
         //    * OR     >LIMIT<
         //    * NOT
         //  * AND
-        //  * NE
+        //  * EQ
         assert_eq!(check_with_call_count(1), (2, 6));
 
         // OR
@@ -472,7 +466,7 @@ mod tests {
         //      * GT
         //    * NOT
         //  * AND
-        //  * NE
+        //  * EQ
         assert_eq!(check_with_call_count(2), (3, 8));
 
         // OR
@@ -487,7 +481,7 @@ mod tests {
         //    * OR
         //      * GT
         //        * PLUS     >LIMIT<
-        //  * NE
+        //  * EQ
         assert_eq!(check_with_call_count(3), (4, 13));
 
         // Depth limit not hit (full traversal required)
@@ -504,7 +498,7 @@ mod tests {
         //    * OR
         //      * GT
         //        * PLUS
-        //  * NE
+        //  * EQ
         //    * STRUCT
         assert_eq!(check_with_call_count(4), (4, 14));
         assert_eq!(check_with_call_count(5), (4, 14));
@@ -530,7 +524,7 @@ mod tests {
         //      * OR
         //        * GT
         //          * PLUS     > LIMIT 4 <
-        //    * NE
+        //    * EQ
         //      * STRUCT
         assert_eq!(check_with_call_count(1), (2, 5));
         assert_eq!(check_with_call_count(2), (3, 7));

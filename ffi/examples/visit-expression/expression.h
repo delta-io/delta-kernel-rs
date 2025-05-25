@@ -28,14 +28,10 @@ enum OpType {
   Divide,
   Multiply,
   LessThan,
-  LessThanOrEqual,
   GreaterThan,
-  GreaterThaneOrEqual,
   Equal,
-  NotEqual,
   Distinct,
   In,
-  NotIn,
 };
 enum LitType {
   Integer,
@@ -167,14 +163,10 @@ DEFINE_BINOP(visit_expr_minus, Minus)
 DEFINE_BINOP(visit_expr_multiply, Multiply)
 DEFINE_BINOP(visit_expr_divide, Divide)
 DEFINE_BINOP(visit_expr_lt, LessThan)
-DEFINE_BINOP(visit_expr_le, LessThanOrEqual)
 DEFINE_BINOP(visit_expr_gt, GreaterThan)
-DEFINE_BINOP(visit_expr_ge, GreaterThaneOrEqual)
 DEFINE_BINOP(visit_expr_eq, Equal)
-DEFINE_BINOP(visit_expr_ne, NotEqual)
 DEFINE_BINOP(visit_expr_distinct, Distinct)
 DEFINE_BINOP(visit_expr_in, In)
-DEFINE_BINOP(visit_expr_not_in, NotIn)
 #undef DEFINE_BINOP
 
 /*************************************************************
@@ -363,14 +355,10 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_not = visit_expr_not,
     .visit_is_null = visit_expr_is_null,
     .visit_lt = visit_expr_lt,
-    .visit_le = visit_expr_le,
     .visit_gt = visit_expr_gt,
-    .visit_ge = visit_expr_ge,
     .visit_eq = visit_expr_eq,
-    .visit_ne = visit_expr_ne,
     .visit_distinct = visit_expr_distinct,
     .visit_in = visit_expr_in,
-    .visit_not_in = visit_expr_not_in,
     .visit_add = visit_expr_add,
     .visit_minus = visit_expr_minus,
     .visit_multiply = visit_expr_multiply,
@@ -410,14 +398,10 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_not = visit_expr_not,
     .visit_is_null = visit_expr_is_null,
     .visit_lt = visit_expr_lt,
-    .visit_le = visit_expr_le,
     .visit_gt = visit_expr_gt,
-    .visit_ge = visit_expr_ge,
     .visit_eq = visit_expr_eq,
-    .visit_ne = visit_expr_ne,
     .visit_distinct = visit_expr_distinct,
     .visit_in = visit_expr_in,
-    .visit_not_in = visit_expr_not_in,
     .visit_add = visit_expr_add,
     .visit_minus = visit_expr_minus,
     .visit_multiply = visit_expr_multiply,

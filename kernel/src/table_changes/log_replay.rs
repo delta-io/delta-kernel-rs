@@ -8,8 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
-use crate::actions::schemas::GetStructField;
-use crate::actions::visitors::{visit_deletion_vector_at, ProtocolVisitor};
+use crate::actions::visitors::{visit_deletion_vector_at, visit_protocol_at};
 use crate::actions::{
     get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, COMMIT_INFO_NAME,
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
@@ -21,6 +20,7 @@ use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
 use crate::schema::{
     ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType,
+    ToSchema as _,
 };
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_configuration::TableConfiguration;
@@ -296,6 +296,7 @@ struct ProcessedCdfCommitVisitor<'a> {
     commit_timestamp: Option<i64>,
     is_first_batch: bool,
 }
+
 impl ProcessedCdfCommitVisitor<'_> {
     fn schema() -> SchemaRef {
         static PREPARE_PHASE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -427,9 +428,9 @@ impl<'a> FileActionSelectionVisitor<'a> {
     }
     fn schema() -> Arc<StructType> {
         Arc::new(StructType::new(vec![
-            Option::<Cdc>::get_struct_field(CDC_NAME),
-            Option::<Add>::get_struct_field(ADD_NAME),
-            Option::<Remove>::get_struct_field(REMOVE_NAME),
+            StructField::nullable(CDC_NAME, Cdc::to_schema()),
+            StructField::nullable(ADD_NAME, Add::to_schema()),
+            StructField::nullable(REMOVE_NAME, Remove::to_schema()),
         ]))
     }
 }

@@ -95,9 +95,24 @@ pub use arrow_compat::*;
 pub(crate) mod kernel_predicates;
 pub(crate) mod utils;
 
-internal_mod!(pub(crate) mod path);
-internal_mod!(pub(crate) mod log_replay);
-internal_mod!(pub(crate) mod log_segment);
+// for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
+// macros, and so will not format the files associated with these modules if we get too clever. see:
+// https://github.com/rust-lang/rustfmt/issues/3253
+
+#[cfg(feature = "internal-api")]
+pub mod path;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod path;
+
+#[cfg(feature = "internal-api")]
+pub mod log_replay;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod log_replay;
+
+#[cfg(feature = "internal-api")]
+pub mod log_segment;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod log_segment;
 
 pub use delta_kernel_derive;
 pub use engine_data::{EngineData, RowVisitor};
@@ -109,30 +124,8 @@ use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
 use schema::{SchemaTransform, StructField, StructType};
 
-#[cfg(any(
-    feature = "default-engine",
-    feature = "sync-engine",
-    feature = "arrow-conversion"
-))]
+#[cfg(any(feature = "default-engine", feature = "arrow-conversion"))]
 pub mod engine;
-
-// Macro for `internal-api` modules. Note this can't be implemented alongside the `#[internal_api]`
-// macro because proc macro crates can't export macro_rules! macros.
-#[macro_export]
-macro_rules! internal_mod {
-    // error if item is already pub
-    (pub mod $name:ident) => {
-        compile_error!("internal_mod!: module is already public");
-    };
-
-    ($vis:vis mod $name:ident) => {
-        #[cfg(feature = "internal-api")]
-        pub mod $name;
-
-        #[cfg(not(feature = "internal-api"))]
-        $vis mod $name;
-    };
-}
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
@@ -189,15 +182,15 @@ impl TryFrom<DirEntry> for FileMeta {
                 last_modified.as_millis()
             ))
         })?;
-        // TODO: remove after arrow 54 is dropped
-        #[allow(clippy::useless_conversion)]
+        let metadata_len = metadata.len();
+        #[cfg(all(feature = "arrow-54", not(feature = "arrow-55")))]
+        let metadata_len = metadata_len
+            .try_into()
+            .map_err(|_| Error::generic("unable to convert DirEntry metadata to file size"))?;
         Ok(FileMeta {
             location,
             last_modified,
-            size: metadata
-                .len()
-                .try_into()
-                .map_err(|_| Error::generic("unable to convert DirEntry metadata to file size"))?,
+            size: metadata_len,
         })
     }
 }
