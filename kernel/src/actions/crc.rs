@@ -3,9 +3,9 @@ use std::sync::LazyLock;
 
 use super::visitors::{visit_metadata_at, visit_protocol_at};
 use super::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
-use crate::actions::schemas::ToSchema as _;
 use crate::actions::PROTOCOL_NAME;
 use crate::engine_data::GetData;
+use crate::schema::ToSchema as _;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, Error, RowVisitor};
@@ -146,12 +146,10 @@ mod tests {
 
     use crate::arrow::array::StringArray;
 
-    use crate::actions::schemas::ToDataType as _;
     use crate::actions::{Format, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
     use crate::schema::derive_macro_utils::ToDataType as _;
     use crate::schema::{ArrayType, DataType, StructField, StructType};
-    use crate::schema::{ArrayType, DataType, StructField, StructType, ToSchema as _};
     use crate::table_features::{ReaderFeature, WriterFeature};
     use crate::utils::test_utils::string_array_to_engine_data;
     use crate::Engine;
