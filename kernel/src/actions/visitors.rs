@@ -81,8 +81,8 @@ impl RowVisitor for ProtocolVisitor {
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
-            if let protocol @ Some(_) = visit_protocol_at(i, getters)? {
-                self.protocol = protocol;
+            if let Some(protocol) = visit_protocol_at(i, getters)? {
+                self.protocol = Some(protocol);
                 break;
             }
         }
