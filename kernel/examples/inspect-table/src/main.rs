@@ -1,5 +1,6 @@
 use delta_kernel::actions::visitors::{
-    AddVisitor, CdcVisitor, MetadataVisitor, ProtocolVisitor, RemoveVisitor, SetTransactionVisitor,
+    visit_metadata_at, visit_protocol_at, AddVisitor, CdcVisitor, RemoveVisitor,
+    SetTransactionVisitor,
 };
 use delta_kernel::actions::{
     get_log_schema, ADD_NAME, CDC_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
@@ -125,18 +126,13 @@ impl RowVisitor for LogVisitor {
                 let remove =
                     RemoveVisitor::visit_remove(i, path, &getters[remove_start..remove_end])?;
                 Action::Remove(remove)
-            } else if let Some(id) = getters[metadata_start].get_opt(i, "metadata.id")? {
-                let metadata =
-                    MetadataVisitor::visit_metadata(i, id, &getters[metadata_start..metadata_end])?;
-                Action::Metadata(metadata)
-            } else if let Some(min_reader_version) =
-                getters[protocol_start].get_opt(i, "protocol.min_reader_version")?
+            } else if let Some(metadata) =
+                visit_metadata_at(i, &getters[metadata_start..metadata_end])?
             {
-                let protocol = ProtocolVisitor::visit_protocol(
-                    i,
-                    min_reader_version,
-                    &getters[protocol_start..protocol_end],
-                )?;
+                Action::Metadata(metadata)
+            } else if let Some(protocol) =
+                visit_protocol_at(i, &getters[protocol_start..protocol_end])?
+            {
                 Action::Protocol(protocol)
             } else if let Some(app_id) = getters[txn_start].get_opt(i, "txn.appId")? {
                 let txn =
