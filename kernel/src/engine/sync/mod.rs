@@ -1,4 +1,4 @@
-//! A simple, single threaded, [`Engine`] that can only read from the local filesystem
+//! A simple, single threaded, test-only [`Engine`] that can only read from the local filesystem
 
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::arrow_data::ArrowEngineData;
@@ -8,6 +8,7 @@ use crate::{
 };
 
 use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use crate::engine::arrow_conversion::TryFromKernel as _;
 use itertools::Itertools;
 use std::fs::File;
 use std::sync::Arc;
@@ -17,9 +18,9 @@ pub(crate) mod json;
 mod parquet;
 mod storage;
 
-/// This is a simple implementation of [`Engine`]. It only supports reading data from the local
-/// filesystem, and internally represents data using `Arrow`.
-pub struct SyncEngine {
+/// This is a simple (test-only) implementation of [`Engine`]. It only supports reading data from
+/// the local filesystem, and internally represents data using `Arrow`.
+pub(crate) struct SyncEngine {
     storage_handler: Arc<storage::SyncStorageHandler>,
     json_handler: Arc<json::SyncJsonHandler>,
     parquet_handler: Arc<parquet::SyncParquetHandler>,
@@ -27,8 +28,7 @@ pub struct SyncEngine {
 }
 
 impl SyncEngine {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         SyncEngine {
             storage_handler: Arc::new(storage::SyncStorageHandler {}),
             json_handler: Arc::new(json::SyncJsonHandler {}),
@@ -73,7 +73,7 @@ where
     if files.is_empty() {
         return Ok(Box::new(std::iter::empty()));
     }
-    let arrow_schema = Arc::new(ArrowSchema::try_from(&*schema)?);
+    let arrow_schema = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
     let files = files.to_vec();
     let result = files
         .into_iter()

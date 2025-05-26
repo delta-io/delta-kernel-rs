@@ -178,7 +178,7 @@ jobs:
           cargo build
           popd
           pushd ffi
-          cargo b --features default-engine,sync-engine,test-ffi,tracing
+          cargo b --features default-engine,test-ffi,tracing
           popd
       - name: build and run read-table test
         run: |
@@ -210,7 +210,7 @@ jobs:
       - name: Test with Miri
         run: |
           pushd ffi
-          MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --features sync-engine,default-engine
+          MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --features default-engine
 
   coverage:
     runs-on: ubuntu-latest

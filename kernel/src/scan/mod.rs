@@ -566,6 +566,7 @@ impl Scan {
             ascending_commit_files,
             ascending_compaction_files: vec![],
             checkpoint_parts: vec![],
+            latest_crc_file: None,
         };
         let new_log_segment = LogSegment::try_new(
             listed_log_files,
@@ -982,7 +983,7 @@ pub(crate) mod test_utils {
     }
 }
 
-#[cfg(all(test, feature = "sync-engine"))]
+#[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
