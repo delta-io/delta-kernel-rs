@@ -204,7 +204,8 @@ pub(crate) struct ActionsBatch {
 }
 
 impl ActionsBatch {
-    /// Creates a new `ActionsBatch` instance.
+    /// Creates a new `ActionsBatch` instance. See [`LogReplayProcessor::process_actions_batch`] for
+    /// usage.
     ///
     /// # Parameters
     /// - `actions`: A boxed [`EngineData`] instance representing the actions batch.
@@ -282,10 +283,10 @@ pub(crate) trait LogReplayProcessor: Sized {
     type Output: HasSelectionVector;
 
     /// Processes a batch of actions and returns the filtered results.
-    /// FIXME
     /// # Parameters
-    /// - `actions_batch` - A boxed [`EngineData`] instance representing a batch of actions.
-    /// - `is_log_batch` - `true` if the batch originates from a commit log, `false` if from a checkpoint.
+    /// - `actions_batch` - An [`ActionsBatch`] which includes a boxed [`EngineData`] instance
+    ///   representing a batch of actions and a boolean flag indicating whether the batch originates
+    ///   from a commit log, `false` if from a checkpoint.
     ///
     /// Returns a [`DeltaResult`] containing the processor’s output, which includes only selected actions.
     ///
@@ -300,9 +301,9 @@ pub(crate) trait LogReplayProcessor: Sized {
     /// 3. Automatically filters out batches with no selected rows
     ///
     /// # Parameters
-    /// - `action_iter`: Iterator of (batch, is_commit_batch) tuples, where each batch contains actions
-    ///   and the boolean flag indicates whether the batch came from a commit log (`true`) or checkpoint
-    ///   (`false`). Actions must be provided in reverse chronological order.
+    /// - `action_iter`: Iterator of [`ActionsBatch`], where each batch contains actions and the
+    ///   boolean flag indicates whether the batch came from a commit log (`true`) or checkpoint
+    ///   (`false`). Actions _must_ be provided in reverse chronological order.
     ///
     /// # Returns
     /// An iterator that yields the output type of the processor, containing only non-empty results

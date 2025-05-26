@@ -387,13 +387,14 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
     }
 }
 
-/// Given an iterator of (engine_data, bool) tuples and a predicate, returns an iterator of
-/// `(engine_data, selection_vec)`. Each row that is selected in the returned `engine_data` _must_
-/// be processed to complete the scan. Non-selected rows _must_ be ignored. The boolean flag
-/// indicates whether the record batch is a log or checkpoint batch.
+/// Given an iterator of [`ActionsBatch`]s (batches of actions read from the log) and a predicate,
+/// returns an iterator of [`ScanMetadata`]s (which includes the files to be scanned as
+/// [`FilteredEngineData`] and transforms that must be applied to correctly read the data). Each row
+/// that is selected in the returned `engine_data` _must_ be processed to complete the scan.
+/// Non-selected rows _must_ be ignored.
 ///
-/// Note: The iterator of (engine_data, bool) tuples 'action_iter' parameter must be sorted by the
-/// order of the actions in the log from most recent to least recent.
+/// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
+/// the actions in the log from most recent to least recent.
 pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,

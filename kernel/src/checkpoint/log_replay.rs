@@ -470,10 +470,8 @@ mod tests {
 
     /// Helper function to create test batches from JSON strings
     fn create_batch(json_strings: Vec<&str>) -> DeltaResult<ActionsBatch> {
-        Ok(ActionsBatch::new(
-            parse_json_batch(StringArray::from(json_strings)),
-            true,
-        ))
+        let actions = parse_json_batch(StringArray::from(json_strings));
+        Ok(ActionsBatch::new(actions, true))
     }
 
     /// Helper function which applies the [`CheckpointLogReplayProcessor`] to a set of

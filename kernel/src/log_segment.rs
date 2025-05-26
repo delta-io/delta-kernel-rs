@@ -200,9 +200,9 @@ impl LogSegment {
         LogSegment::try_new(listed_files, log_root, end_version)
     }
 
-    /// Read a stream of actions from this log segment. This returns an iterator of (EngineData,
-    /// bool) pairs, where the boolean flag indicates whether the data was read from a commit file
-    /// (true) or a checkpoint file (false).
+    /// Read a stream of actions from this log segment. This returns an iterator of
+    /// [`ActionsBatch`]s which includes EngineData of actions + a boolean flag indicating whether
+    /// the data was read from a commit file (true) or a checkpoint file (false).
     ///
     /// The log files will be read from most recent to oldest.
     ///
