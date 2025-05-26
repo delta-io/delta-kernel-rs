@@ -1,6 +1,7 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of  checkpoint and commit
 //! files.
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{HashMap, VecDeque};
 use std::convert::identity;
 use std::sync::{Arc, LazyLock};
 
@@ -202,6 +203,92 @@ impl LogSegment {
             latest_crc_file: None, // TODO: use CRC files for table changes?
         };
         LogSegment::try_new(listed_files, log_root, end_version)
+    }
+
+    #[allow(unused)]
+    /// Constructs a [`LogSegment`] to be used for timestamp conversion. This [`LogSegment`] will
+    /// consist only of contiguous commit files up to `end_version` (inclusive). If present,
+    /// `limit` specifies the maximum length of the returned log segment. The log segment may be
+    /// shorter than `limit` if there are missing commits.
+    ///
+    // This lists all files starting from `end-limit` if `limit` is defined. For large tables,
+    // listing with a `limit` can be a significant speedup over listing _all_ the files in the log.
+    pub(crate) fn for_timestamp_conversion(
+        storage: &dyn StorageHandler,
+        log_root: Url,
+        end_version: Version,
+        limit: Option<usize>,
+    ) -> DeltaResult<Self> {
+        // Compute the version to start listing from.
+        let start_from = limit
+            .map(|limit| {
+                let Ok(limit) = TryInto::<u64>::try_into(limit) else {
+                    return Err(Error::generic(
+                        "Failed to convert limit into u64
+                         when building log segment in timestamp conversion",
+                    ));
+                };
+                match (limit.cmp(&end_version)) {
+                    Ordering::Less | Ordering::Equal => Ok(end_version - limit),
+                    Ordering::Greater => Ok(0),
+                }
+            })
+            .transpose()?;
+
+        let ascending_commit_files =
+            list_log_files(storage, &log_root, start_from, Some(end_version))?
+                .filter_ok(ParsedLogPath::is_commit);
+
+        let mut contiguous_commits: VecDeque<ParsedLogPath> = match limit {
+            Some(limit) => VecDeque::with_capacity(limit),
+            None => VecDeque::new(),
+        };
+
+        for commit_res in ascending_commit_files {
+            let commit = match commit_res {
+                Ok(commit) => commit,
+                Err(Error::InvalidLogPath(_)) => continue, // Invalid log paths are ignored
+                Err(err) => return Err(err), // All other errors are propagated to the caller
+            };
+
+            if contiguous_commits
+                .back()
+                .is_some_and(|prev_commit| prev_commit.version != commit.version - 1)
+            {
+                // We found a gap, so throw away all earlier versions
+                contiguous_commits.clear();
+            }
+
+            contiguous_commits.push_back(commit);
+
+            // If the number of commits exceeds the limit, remove the earliest one.
+            if limit.is_some_and(|limit| contiguous_commits.len() > limit) {
+                contiguous_commits.pop_front();
+            }
+        }
+
+        // If we have a non-empty commit list and a requested end version, verify they match.
+        //
+        // NOTE: No need to check for an empty commit list, `LogSegment::try_new` fails in that case.
+        if let Some(last_commit) = contiguous_commits
+            .back()
+            .take_if(|last_commit| last_commit.version != end_version)
+        {
+            return Err(Error::generic(format!(
+                "Failed to build LogSegment for timestamp conversion.
+                            Expected end version {end_version}, but found {}",
+                last_commit.version
+            )));
+        }
+
+        let listed_files = ListedLogFiles {
+            ascending_commit_files: contiguous_commits.into(),
+            ascending_compaction_files: vec![],
+            checkpoint_parts: vec![],
+            latest_crc_file: None,
+        };
+
+        LogSegment::try_new(listed_files, log_root, Some(end_version))
     }
 
     /// Read a stream of actions from this log segment. This returns an iterator of (EngineData,
