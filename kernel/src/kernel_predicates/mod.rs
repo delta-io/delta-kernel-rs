@@ -4,8 +4,9 @@
 //! but data skipping "evaluation" actually produces a transformed predicate that replaces column
 //! references with stats column references, which log replay will instruct the engine to evaluate.
 use crate::expressions::{
-    BinaryPredicate, BinaryPredicateOp, ColumnName, Expression as Expr, JunctionPredicate,
-    JunctionPredicateOp, Predicate as Pred, Scalar, UnaryPredicate, UnaryPredicateOp,
+    BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, ColumnName,
+    Expression as Expr, JunctionPredicate, JunctionPredicateOp, Predicate as Pred, Scalar,
+    UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
 
@@ -570,6 +571,25 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
     // Convenient thin wrapper
     fn resolve_column(&self, col: &ColumnName) -> Option<Scalar> {
         self.resolver.resolve_column(col)
+    }
+
+    #[allow(unused)] // TODO: remove this annotation once opaque predicates start using it
+    pub(crate) fn eval_expr(&self, expr: &Expr) -> Option<Scalar> {
+        match expr {
+            Expr::Literal(value) => Some(value.clone()),
+            Expr::Column(name) => self.resolve_column(name),
+            Expr::Predicate(pred) => self.eval_pred(pred, false).map(Scalar::from),
+            Expr::Struct(_) => None, // TODO
+            Expr::Binary(BinaryExpression { op, left, right }) => {
+                let op_fn = match op {
+                    BinaryExpressionOp::Plus => Scalar::try_add,
+                    BinaryExpressionOp::Minus => Scalar::try_sub,
+                    BinaryExpressionOp::Multiply => Scalar::try_mul,
+                    BinaryExpressionOp::Divide => Scalar::try_div,
+                };
+                op_fn(&self.eval_expr(left)?, &self.eval_expr(right)?)
+            }
+        }
     }
 }
 

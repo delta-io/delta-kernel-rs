@@ -299,6 +299,58 @@ impl Scalar {
         };
         Ok(Self::Timestamp(timestamp.timestamp_micros()))
     }
+
+    /// Attempts to add two scalars, returning None if they were incompatible.
+    pub fn try_add(&self, other: &Scalar) -> Option<Scalar> {
+        use Scalar::*;
+        let result = match (self, other) {
+            (Integer(a), Integer(b)) => Integer(a.checked_add(*b)?),
+            (Long(a), Long(b)) => Long(a.checked_add(*b)?),
+            (Short(a), Short(b)) => Short(a.checked_add(*b)?),
+            (Byte(a), Byte(b)) => Byte(a.checked_add(*b)?),
+            _ => return None,
+        };
+        Some(result)
+    }
+
+    /// Attempts to subtract two scalars, returning None if they were incompatible.
+    pub fn try_sub(&self, other: &Scalar) -> Option<Scalar> {
+        use Scalar::*;
+        let result = match (self, other) {
+            (Integer(a), Integer(b)) => Integer(a.checked_sub(*b)?),
+            (Long(a), Long(b)) => Long(a.checked_sub(*b)?),
+            (Short(a), Short(b)) => Short(a.checked_sub(*b)?),
+            (Byte(a), Byte(b)) => Byte(a.checked_sub(*b)?),
+            _ => return None,
+        };
+        Some(result)
+    }
+
+    /// Attempts to multiply two scalars, returning None if they were incompatible.
+    pub fn try_mul(&self, other: &Scalar) -> Option<Scalar> {
+        use Scalar::*;
+        let result = match (self, other) {
+            (Integer(a), Integer(b)) => Integer(a.checked_mul(*b)?),
+            (Long(a), Long(b)) => Long(a.checked_mul(*b)?),
+            (Short(a), Short(b)) => Short(a.checked_mul(*b)?),
+            (Byte(a), Byte(b)) => Byte(a.checked_mul(*b)?),
+            _ => return None,
+        };
+        Some(result)
+    }
+
+    /// Attempts to divide two scalars, returning None if they were incompatible.
+    pub fn try_div(&self, other: &Scalar) -> Option<Scalar> {
+        use Scalar::*;
+        let result = match (self, other) {
+            (Integer(a), Integer(b)) => Integer(a.checked_div(*b)?),
+            (Long(a), Long(b)) => Long(a.checked_div(*b)?),
+            (Short(a), Short(b)) => Short(a.checked_div(*b)?),
+            (Byte(a), Byte(b)) => Byte(a.checked_div(*b)?),
+            _ => return None,
+        };
+        Some(result)
+    }
 }
 
 impl Display for Scalar {
