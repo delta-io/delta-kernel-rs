@@ -18,11 +18,16 @@ void print_expression_item_list(ExpressionItemList list, int depth) {
     print_tree_helper(list.list[i], depth);
   }
 }
+void print_opaque_op_name(void* op_type, KernelStringSlice name) {
+  int len = name.len & 0x7fffffff; // truncate to 31 bits to ensure a positive value
+  printf("%s(%.*s)\n", (char*) op_type, len, name.ptr);
+}
+
 void print_tree_helper(ExpressionItem ref, int depth) {
+  print_n_spaces(depth);
   switch (ref.type) {
     case BinOp: {
       struct BinOp* op = ref.ref;
-      print_n_spaces(depth);
       switch (op->op) {
         case Add: {
           printf("Add\n");
@@ -65,7 +70,6 @@ void print_tree_helper(ExpressionItem ref, int depth) {
     }
     case Variadic: {
       struct Variadic* var = ref.ref;
-      print_n_spaces(depth);
       switch (var->op) {
         case And:
           printf("And\n");
@@ -80,9 +84,25 @@ void print_tree_helper(ExpressionItem ref, int depth) {
       print_expression_item_list(var->exprs, depth + 1);
       break;
     }
+    case OpaqueExpression: {
+      struct OpaqueExpression* opaque = ref.ref;
+      visit_kernel_opaque_expression_op_name(opaque->op, "OpaqueExpression", print_opaque_op_name);
+      print_expression_item_list(opaque->exprs, depth + 1);
+      break;
+    }
+    case OpaquePredicate: {
+      struct OpaquePredicate* opaque = ref.ref;
+      visit_kernel_opaque_predicate_op_name(opaque->op, "OpaquePredicate", print_opaque_op_name);
+      print_expression_item_list(opaque->exprs, depth + 1);
+      break;
+    }
+    case Unknown: {
+      struct Unknown* unknown = ref.ref;
+      printf("Unknown(%s)\n", unknown->name);
+      break;
+    }
     case Literal: {
       struct Literal* lit = ref.ref;
-      print_n_spaces(depth);
       switch (lit->type) {
         case Integer:
           printf("Integer(%d)\n", lit->value.integer_data);
@@ -184,7 +204,6 @@ void print_tree_helper(ExpressionItem ref, int depth) {
       break;
     }
     case Unary: {
-      print_n_spaces(depth);
       struct Unary* unary = ref.ref;
       switch (unary->type) {
         case Not:
@@ -198,11 +217,11 @@ void print_tree_helper(ExpressionItem ref, int depth) {
       print_expression_item_list(unary->sub_expr, depth + 1);
       break;
     }
-    case Column:
-      print_n_spaces(depth);
+    case Column: {
       char* column_name = ref.ref;
       printf("Column(%s)\n", column_name);
       break;
+    }
   }
 }
 
