@@ -21,48 +21,6 @@ pub(crate) struct MetadataVisitor {
     pub(crate) metadata: Option<Metadata>,
 }
 
-impl MetadataVisitor {
-    #[internal_api]
-    fn visit_metadata<'a>(
-        row_index: usize,
-        id: String,
-        getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<Metadata> {
-        require!(
-            getters.len() == 9,
-            Error::InternalError(format!(
-                "Wrong number of MetadataVisitor getters: {}",
-                getters.len()
-            ))
-        );
-        let name: Option<String> = getters[1].get_opt(row_index, "metadata.name")?;
-        let description: Option<String> = getters[2].get_opt(row_index, "metadata.description")?;
-        // get format out of primitives
-        let format_provider: String = getters[3].get(row_index, "metadata.format.provider")?;
-        // options for format is always empty, so skip getters[4]
-        let schema_string: String = getters[5].get(row_index, "metadata.schema_string")?;
-        let partition_columns: Vec<_> = getters[6].get(row_index, "metadata.partition_list")?;
-        let created_time: Option<i64> = getters[7].get_opt(row_index, "metadata.created_time")?;
-        let configuration_map_opt: Option<HashMap<_, _>> =
-            getters[8].get_opt(row_index, "metadata.configuration")?;
-        let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
-
-        Ok(Metadata {
-            id,
-            name,
-            description,
-            format: Format {
-                provider: format_provider,
-                options: HashMap::new(),
-            },
-            schema_string,
-            partition_columns,
-            created_time,
-            configuration,
-        })
-    }
-}
-
 impl RowVisitor for MetadataVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
@@ -72,9 +30,8 @@ impl RowVisitor for MetadataVisitor {
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
-            // Since id column is required, use it to detect presence of a metadata action
-            if let Some(id) = getters[0].get_opt(i, "metadata.id")? {
-                self.metadata = Some(Self::visit_metadata(i, id, getters)?);
+            if let Some(metadata) = visit_metadata_at(i, getters)? {
+                self.metadata = Some(metadata);
                 break;
             }
         }
@@ -116,35 +73,6 @@ pub(crate) struct ProtocolVisitor {
     pub(crate) protocol: Option<Protocol>,
 }
 
-impl ProtocolVisitor {
-    #[internal_api]
-    pub(crate) fn visit_protocol<'a>(
-        row_index: usize,
-        min_reader_version: i32,
-        getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<Protocol> {
-        require!(
-            getters.len() == 4,
-            Error::InternalError(format!(
-                "Wrong number of ProtocolVisitor getters: {}",
-                getters.len()
-            ))
-        );
-        let min_writer_version: i32 = getters[1].get(row_index, "protocol.min_writer_version")?;
-        let reader_features: Option<Vec<_>> =
-            getters[2].get_opt(row_index, "protocol.reader_features")?;
-        let writer_features: Option<Vec<_>> =
-            getters[3].get_opt(row_index, "protocol.writer_features")?;
-
-        Protocol::try_new(
-            min_reader_version,
-            min_writer_version,
-            reader_features,
-            writer_features,
-        )
-    }
-}
-
 impl RowVisitor for ProtocolVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
@@ -153,9 +81,8 @@ impl RowVisitor for ProtocolVisitor {
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
-            // Since minReaderVersion column is required, use it to detect presence of a Protocol action
-            if let Some(mrv) = getters[0].get_opt(i, "protocol.min_reader_version")? {
-                self.protocol = Some(Self::visit_protocol(i, mrv, getters)?);
+            if let Some(protocol) = visit_protocol_at(i, getters)? {
+                self.protocol = Some(protocol);
                 break;
             }
         }
@@ -588,6 +515,89 @@ pub(crate) fn visit_deletion_vector_at<'a>(
     } else {
         Ok(None)
     }
+}
+
+/// Get a Metadata out of some engine data. Note that Ok(None) is returned if there is no Metadata
+/// found. The caller is responsible for slicing the `getters` slice such that the first element
+/// contains the `id` element of the metadata.
+#[internal_api]
+pub(crate) fn visit_metadata_at<'a>(
+    row_index: usize,
+    getters: &[&'a dyn GetData<'a>],
+) -> DeltaResult<Option<Metadata>> {
+    require!(
+        getters.len() == 9,
+        Error::InternalError(format!(
+            "Wrong number of MetadataVisitor getters: {}",
+            getters.len()
+        ))
+    );
+
+    // Since id column is required, use it to detect presence of a metadata action
+    let Some(id) = getters[0].get_opt(row_index, "metadata.id")? else {
+        return Ok(None);
+    };
+
+    let name: Option<String> = getters[1].get_opt(row_index, "metadata.name")?;
+    let description: Option<String> = getters[2].get_opt(row_index, "metadata.description")?;
+    // get format out of primitives
+    let format_provider: String = getters[3].get(row_index, "metadata.format.provider")?;
+    // options for format is always empty, so skip getters[4]
+    let schema_string: String = getters[5].get(row_index, "metadata.schema_string")?;
+    let partition_columns: Vec<_> = getters[6].get(row_index, "metadata.partition_list")?;
+    let created_time: Option<i64> = getters[7].get_opt(row_index, "metadata.created_time")?;
+    let configuration_map_opt: Option<HashMap<_, _>> =
+        getters[8].get_opt(row_index, "metadata.configuration")?;
+    let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
+
+    Ok(Some(Metadata {
+        id,
+        name,
+        description,
+        format: Format {
+            provider: format_provider,
+            options: HashMap::new(),
+        },
+        schema_string,
+        partition_columns,
+        created_time,
+        configuration,
+    }))
+}
+
+/// Get a Protocol out of some engine data. Note that Ok(None) is returned if there is no Protocol
+/// found. The caller is responsible for slicing the `getters` slice such that the first element
+/// contains the `min_reader_version` element of the protocol.
+#[internal_api]
+pub(crate) fn visit_protocol_at<'a>(
+    row_index: usize,
+    getters: &[&'a dyn GetData<'a>],
+) -> DeltaResult<Option<Protocol>> {
+    require!(
+        getters.len() == 4,
+        Error::InternalError(format!(
+            "Wrong number of ProtocolVisitor getters: {}",
+            getters.len()
+        ))
+    );
+    // Since minReaderVersion column is required, use it to detect presence of a Protocol action
+    let Some(min_reader_version) = getters[0].get_opt(row_index, "protocol.min_reader_version")?
+    else {
+        return Ok(None);
+    };
+    let min_writer_version: i32 = getters[1].get(row_index, "protocol.min_writer_version")?;
+    let reader_features: Option<Vec<_>> =
+        getters[2].get_opt(row_index, "protocol.reader_features")?;
+    let writer_features: Option<Vec<_>> =
+        getters[3].get_opt(row_index, "protocol.writer_features")?;
+
+    let protocol = Protocol::try_new(
+        min_reader_version,
+        min_writer_version,
+        reader_features,
+        writer_features,
+    )?;
+    Ok(Some(protocol))
 }
 
 #[cfg(test)]
