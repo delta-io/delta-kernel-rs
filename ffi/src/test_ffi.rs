@@ -15,7 +15,7 @@ use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType
 ///
 /// # Safety
 /// The caller is responsible for freeing the returned memory, either by calling
-/// [`crate::expressions::free_kernel_expression`], or [`crate::handles::Handle::drop_handle`].
+/// [`crate::expressions::free_kernel_expression`], or [`crate::handle::Handle::drop_handle`].
 #[no_mangle]
 pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpression> {
     let array_type = ArrayType::new(
@@ -98,7 +98,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
 ///
 /// # Safety
 /// The caller is responsible for freeing the returned memory, either by calling
-/// [`crate::expressions::free_kernel_predicate`], or [`crate::handles::Handle::drop_handle`].
+/// [`crate::expressions::free_kernel_predicate`], or [`crate::handle::Handle::drop_handle`].
 #[no_mangle]
 pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicate> {
     let array_type = ArrayType::new(
