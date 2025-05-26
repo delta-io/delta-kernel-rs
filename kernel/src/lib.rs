@@ -324,6 +324,21 @@ impl<T: Any + Send + Sync> AsAny for T {
     }
 }
 
+/// Extension trait that facilitates object-safe implementations of `PartialEq`.
+pub trait DynPartialEq: AsAny {
+    fn dyn_eq(&self, other: &dyn Any) -> bool;
+}
+
+// Blanket implementation for all eligible types
+impl<T: PartialEq + AsAny> DynPartialEq for T {
+    fn dyn_eq(&self, other: &dyn Any) -> bool {
+        match other.downcast_ref::<T>() {
+            Some(other) => self == other,
+            None => false,
+        }
+    }
+}
+
 /// Trait for implementing an Expression evaluator.
 ///
 /// It contains one Expression which can be evaluated on multiple ColumnarBatches.
