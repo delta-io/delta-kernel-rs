@@ -407,6 +407,7 @@ fn visit_expression_impl(
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
+        Expression::Opaque(_) | Expression::Unknown(_) => todo!(),
     }
 }
 
@@ -446,6 +447,7 @@ fn visit_predicate_impl(
         Predicate::Junction(JunctionPredicate { op, preds }) => {
             visit_predicate_junction(visitor, op, preds, sibling_list_id)
         }
+        Predicate::Opaque(_) | Predicate::Unknown(_) => todo!(),
     }
 }
 
