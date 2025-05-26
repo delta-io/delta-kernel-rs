@@ -10,7 +10,7 @@ use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
 use super::*;
 use crate::expressions::*;
 use crate::schema::{ArrayType, MapType, StructField, StructType};
-use crate::DataType as DeltaDataTypes;
+use crate::DataType as KernelDataType;
 use crate::EvaluationHandlerExtension as _;
 
 use Expression as Expr;
@@ -89,7 +89,7 @@ fn test_literal_type_array() {
         Expr::literal(5),
         Scalar::Array(
             ArrayData::try_new(
-                ArrayType::new(DeltaDataTypes::INTEGER, false),
+                ArrayType::new(KernelDataType::INTEGER, false),
                 vec![Scalar::Integer(1), Scalar::Integer(2)],
             )
             .unwrap(),
@@ -111,22 +111,22 @@ fn test_literal_complex_type_array() {
     use crate::arrow::array::{Array as _, AsArray as _};
     use crate::arrow::datatypes::Int32Type;
 
-    let array_type = ArrayType::new(DeltaDataTypes::INTEGER, true);
+    let array_type = ArrayType::new(KernelDataType::INTEGER, true);
     let array_value = Scalar::Array(
         ArrayData::try_new(
             array_type.clone(),
             vec![
                 Scalar::from(1),
                 Scalar::from(2),
-                Scalar::Null(DeltaDataTypes::INTEGER),
+                Scalar::Null(KernelDataType::INTEGER),
                 Scalar::from(3),
             ],
         )
         .unwrap(),
     );
     let map_type = MapType::new(
-        DeltaDataTypes::STRING,
-        DeltaDataTypes::Array(Box::new(array_type.clone())),
+        KernelDataType::STRING,
+        KernelDataType::Array(Box::new(array_type.clone())),
         true,
     );
     let map_value = Scalar::Map(
@@ -143,7 +143,7 @@ fn test_literal_complex_type_array() {
         .unwrap(),
     );
     let struct_fields = vec![
-        StructField::nullable("scalar", DeltaDataTypes::INTEGER),
+        StructField::nullable("scalar", KernelDataType::INTEGER),
         StructField::nullable("list", array_type.clone()),
         StructField::nullable("null_list", array_type.clone()),
         StructField::nullable("map", map_type.clone()),
@@ -514,11 +514,11 @@ fn test_null_row() {
         StructField::nullable(
             "x",
             StructType::new([
-                StructField::nullable("a", crate::schema::DataType::INTEGER),
-                StructField::not_null("b", crate::schema::DataType::STRING),
+                StructField::nullable("a", KernelDataType::INTEGER),
+                StructField::not_null("b", KernelDataType::STRING),
             ]),
         ),
-        StructField::nullable("c", crate::schema::DataType::STRING),
+        StructField::nullable("c", KernelDataType::STRING),
     ]));
     let handler = ArrowEvaluationHandler;
     let result = handler.null_row(schema.clone()).unwrap();
@@ -549,7 +549,7 @@ fn test_null_row() {
 fn test_null_row_err() {
     let not_null_schema = Arc::new(StructType::new(vec![StructField::not_null(
         "a",
-        crate::schema::DataType::STRING,
+        KernelDataType::STRING,
     )]));
     let handler = ArrowEvaluationHandler;
     assert!(handler.null_row(not_null_schema).is_err());
@@ -573,13 +573,13 @@ fn test_create_one() {
         1.into(),
         "B".into(),
         3.into(),
-        Scalar::Null(DeltaDataTypes::INTEGER),
+        Scalar::Null(KernelDataType::INTEGER),
     ];
     let schema = Arc::new(StructType::new([
-        StructField::nullable("a", DeltaDataTypes::INTEGER),
-        StructField::nullable("b", DeltaDataTypes::STRING),
-        StructField::not_null("c", DeltaDataTypes::INTEGER),
-        StructField::nullable("d", DeltaDataTypes::INTEGER),
+        StructField::nullable("a", KernelDataType::INTEGER),
+        StructField::nullable("b", KernelDataType::STRING),
+        StructField::not_null("c", KernelDataType::INTEGER),
+        StructField::nullable("d", KernelDataType::INTEGER),
     ]));
 
     let expected_schema = Arc::new(Schema::new(vec![
@@ -606,9 +606,9 @@ fn test_create_one_nested() {
     let values: &[Scalar] = &[1.into(), 2.into()];
     let schema = Arc::new(StructType::new([StructField::not_null(
         "a",
-        DeltaDataTypes::struct_type([
-            StructField::nullable("b", DeltaDataTypes::INTEGER),
-            StructField::not_null("c", DeltaDataTypes::INTEGER),
+        KernelDataType::struct_type([
+            StructField::nullable("b", KernelDataType::INTEGER),
+            StructField::not_null("c", KernelDataType::INTEGER),
         ]),
     )]));
     let expected_schema = Arc::new(Schema::new(vec![Field::new(
@@ -641,12 +641,12 @@ fn test_create_one_nested() {
 
 #[test]
 fn test_create_one_nested_null() {
-    let values: &[Scalar] = &[Scalar::Null(DeltaDataTypes::INTEGER), 1.into()];
+    let values: &[Scalar] = &[Scalar::Null(KernelDataType::INTEGER), 1.into()];
     let schema = Arc::new(StructType::new([StructField::not_null(
         "a",
-        DeltaDataTypes::struct_type([
-            StructField::nullable("b", DeltaDataTypes::INTEGER),
-            StructField::not_null("c", DeltaDataTypes::INTEGER),
+        KernelDataType::struct_type([
+            StructField::nullable("b", KernelDataType::INTEGER),
+            StructField::not_null("c", KernelDataType::INTEGER),
         ]),
     )]));
     let expected_schema = Arc::new(Schema::new(vec![Field::new(
@@ -680,14 +680,14 @@ fn test_create_one_nested_null() {
 #[test]
 fn test_create_one_not_null_struct() {
     let values: &[Scalar] = &[
-        Scalar::Null(DeltaDataTypes::INTEGER),
-        Scalar::Null(DeltaDataTypes::INTEGER),
+        Scalar::Null(KernelDataType::INTEGER),
+        Scalar::Null(KernelDataType::INTEGER),
     ];
     let schema = Arc::new(StructType::new([StructField::not_null(
         "a",
-        DeltaDataTypes::struct_type([
-            StructField::not_null("b", DeltaDataTypes::INTEGER),
-            StructField::nullable("c", DeltaDataTypes::INTEGER),
+        KernelDataType::struct_type([
+            StructField::not_null("b", KernelDataType::INTEGER),
+            StructField::nullable("c", KernelDataType::INTEGER),
         ]),
     )]));
     let handler = ArrowEvaluationHandler;
@@ -696,12 +696,12 @@ fn test_create_one_not_null_struct() {
 
 #[test]
 fn test_create_one_top_level_null() {
-    let values = &[Scalar::Null(DeltaDataTypes::INTEGER)];
+    let values = &[Scalar::Null(KernelDataType::INTEGER)];
     let handler = ArrowEvaluationHandler;
 
     let schema = Arc::new(StructType::new([StructField::not_null(
         "col_1",
-        DeltaDataTypes::INTEGER,
+        KernelDataType::INTEGER,
     )]));
     assert!(matches!(
         handler.create_one(schema, values),
@@ -713,7 +713,7 @@ fn test_create_one_top_level_null() {
 fn test_scalar_map() -> DeltaResult<()> {
     // making an 2-row array each with a map with 2 pairs.
     // result: { key1: 1, key2: null }, { key1: 1, key2: null }
-    let map_type = MapType::new(DeltaDataTypes::STRING, DeltaDataTypes::INTEGER, true);
+    let map_type = MapType::new(KernelDataType::STRING, KernelDataType::INTEGER, true);
     let map_data = MapData::try_new(
         map_type,
         [("key1".to_string(), 1.into()), ("key2".to_string(), None)],
@@ -748,8 +748,8 @@ fn test_scalar_map() -> DeltaResult<()> {
 
 #[test]
 fn test_null_scalar_map() -> DeltaResult<()> {
-    let map_type = MapType::new(DeltaDataTypes::STRING, DeltaDataTypes::STRING, false);
-    let null_scalar_map = Scalar::Null(DeltaDataTypes::Map(Box::new(map_type)));
+    let map_type = MapType::new(KernelDataType::STRING, KernelDataType::STRING, false);
+    let null_scalar_map = Scalar::Null(KernelDataType::Map(Box::new(map_type)));
     let arrow_array = null_scalar_map.to_array(1)?;
     let map_array = arrow_array.as_any().downcast_ref::<MapArray>().unwrap();
 
