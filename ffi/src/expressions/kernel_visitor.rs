@@ -35,7 +35,7 @@ pub(crate) fn unwrap_kernel_expression(
 ) -> Option<Expression> {
     match state.inflight_ids.take(exprid)? {
         ExpressionOrPredicate::Expression(expr) => Some(expr),
-        ExpressionOrPredicate::Predicate(pred) => Some(Expression::predicate(pred)),
+        ExpressionOrPredicate::Predicate(pred) => Some(Expression::from_pred(pred)),
     }
 }
 

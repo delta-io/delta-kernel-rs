@@ -240,7 +240,7 @@ impl Expression {
     }
 
     /// Wraps a predicate as a boolean-valued expression
-    pub fn predicate(value: Predicate) -> Self {
+    pub fn from_pred(value: Predicate) -> Self {
         match value {
             Predicate::BooleanExpression(expr) => expr,
             _ => Self::Predicate(Box::new(value)),
@@ -531,7 +531,7 @@ impl From<ColumnName> for Expression {
 
 impl From<Predicate> for Expression {
     fn from(value: Predicate) -> Self {
-        Self::predicate(value)
+        Self::from_pred(value)
     }
 }
 
