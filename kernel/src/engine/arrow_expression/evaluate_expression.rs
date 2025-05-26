@@ -128,6 +128,7 @@ pub fn evaluate_expression(
 
             Ok(eval(&left_arr, &right_arr)?)
         }
+        (Opaque(_) | Unknown(_), _) => todo!(),
     }
 }
 
@@ -263,5 +264,6 @@ pub fn evaluate_predicate(
                 .reduce(|l, r| Ok(reducer(&l?, &r?)?))
                 .unwrap_or_else(|| Ok(BooleanArray::from(vec![default; batch.num_rows()])))
         }
+        Opaque(_) | Unknown(_) => todo!(),
     }
 }

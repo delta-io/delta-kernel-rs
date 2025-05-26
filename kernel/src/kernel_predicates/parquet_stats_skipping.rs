@@ -1,7 +1,10 @@
 //! An implementation of data skipping that leverages parquet stats from the file footer.
-use crate::expressions::{BinaryPredicateOp, ColumnName, JunctionPredicateOp, Scalar};
+use crate::expressions::{
+    BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
+};
 use crate::kernel_predicates::{DataSkippingPredicateEvaluator, KernelPredicateEvaluatorDefaults};
 use crate::schema::DataType;
+
 use std::cmp::Ordering;
 
 #[cfg(test)]
@@ -84,6 +87,15 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
         inverted: bool,
     ) -> Option<bool> {
         KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, inverted)
+    }
+
+    fn eval_pred_opaque(
+        &self,
+        op: &OpaquePredicateOpRef,
+        exprs: &[Expression],
+        inverted: bool,
+    ) -> Option<bool> {
+        op.eval_as_data_skipping_predicate(self, exprs, inverted)
     }
 
     fn finish_eval_pred_junction(

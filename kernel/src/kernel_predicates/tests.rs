@@ -1,10 +1,13 @@
 use super::*;
 use crate::expressions::{
-    column_expr, column_name, column_pred, ArrayData, Expression as Expr, Predicate as Pred,
-    StructData,
+    column_expr, column_name, column_pred, ArrayData, Expression as Expr, OpaqueExpressionOp,
+    OpaquePredicateOp, Predicate as Pred, StructData,
 };
+use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
+use crate::scan::data_skipping::as_data_skipping_predicate;
 use crate::schema::ArrayType;
 use crate::DataType;
+use crate::DeltaResult;
 
 use std::collections::HashMap;
 
@@ -609,6 +612,189 @@ fn eval_binary() {
             "DISTINCT(10, x) (inverted: {inverted})"
         );
     }
+}
+
+#[derive(Debug, PartialEq)]
+struct OpaqueLessThanOp;
+impl OpaqueLessThanOp {
+    fn name(&self) -> &str {
+        "less_than"
+    }
+
+    fn eval_scalar(&self, values: &[Option<Scalar>], inverted: bool) -> Option<bool> {
+        let [Some(a), Some(b)] = values else {
+            return None;
+        };
+        KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(
+            BinaryPredicateOp::LessThan,
+            a,
+            b,
+            inverted,
+        )
+    }
+}
+
+impl OpaqueExpressionOp for OpaqueLessThanOp {
+    fn name(&self) -> &str {
+        self.name()
+    }
+    fn eval_expr_scalar(&self, values: &[Option<Scalar>]) -> DeltaResult<Scalar> {
+        let result = match self.eval_scalar(values, false) {
+            Some(value) => Scalar::from(value),
+            None => Scalar::Null(DataType::BOOLEAN),
+        };
+        Ok(result)
+    }
+}
+
+impl OpaquePredicateOp for OpaqueLessThanOp {
+    fn name(&self) -> &str {
+        self.name()
+    }
+    fn eval_pred_scalar(
+        &self,
+        values: &[Option<Scalar>],
+        inverted: bool,
+    ) -> DeltaResult<Option<bool>> {
+        Ok(self.eval_scalar(values, inverted))
+    }
+
+    fn eval_as_data_skipping_predicate(
+        &self,
+        predicate_evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
+        exprs: &[Expr],
+        inverted: bool,
+    ) -> Option<bool> {
+        let (col, val, ord) = match exprs {
+            [Expr::Column(col), Expr::Literal(val)] => (col, val, Ordering::Less),
+            [Expr::Literal(val), Expr::Column(col)] => (col, val, Ordering::Greater),
+            _ => return None,
+        };
+        predicate_evaluator.partial_cmp_min_stat(col, val, ord, inverted)
+    }
+
+    fn as_data_skipping_predicate(
+        &self,
+        predicate_evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+        exprs: &[Expr],
+        inverted: bool,
+    ) -> Option<Pred> {
+        let (col, val, ord) = match exprs {
+            [Expr::Column(col), Expr::Literal(val)] => (col, val, Ordering::Less),
+            [Expr::Literal(val), Expr::Column(col)] => (col, val, Ordering::Greater),
+            _ => return None,
+        };
+
+        // NOTE: predicate_evaluator.partial_cmp_min_stat returns `Pred::Binary`. That's fine,
+        // because we have separate testing for the `eval_pred_scalar` path.
+        predicate_evaluator.partial_cmp_min_stat(col, val, ord, inverted)
+    }
+}
+
+struct MinStatsValue(Scalar);
+
+impl ParquetStatsProvider for MinStatsValue {
+    fn get_parquet_min_stat(&self, _col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
+        (self.0.data_type() == *data_type).then(|| self.0.clone())
+    }
+
+    fn get_parquet_max_stat(&self, _col: &ColumnName, _data_type: &DataType) -> Option<Scalar> {
+        unimplemented!()
+    }
+
+    fn get_parquet_nullcount_stat(&self, _col: &ColumnName) -> Option<i64> {
+        Some(0)
+    }
+
+    fn get_parquet_rowcount_stat(&self) -> i64 {
+        1
+    }
+}
+
+#[test]
+fn test_eval_opaque_simple() {
+    let expr = Expr::opaque(OpaqueLessThanOp, vec![column_expr!("x"), Expr::literal(10)]);
+    let pred = Pred::opaque(OpaqueLessThanOp, vec![column_expr!("x"), Expr::literal(10)]);
+    let skipping_pred = as_data_skipping_predicate(&pred).unwrap();
+
+    assert_eq!(expr, expr);
+    assert_eq!(pred, pred);
+
+    // NOTE: Direct data skipping can handle both predicates and expressions
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
+    assert_eq!(filter.eval_expr(&expr), Some(Scalar::from(true)), "x < 10");
+    assert_eq!(filter.eval(&pred), Some(true), "x < 10");
+    assert_eq!(filter.eval(&skipping_pred), Some(true), "x < 10");
+
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(100));
+    assert_eq!(filter.eval_expr(&expr), Some(Scalar::from(false)), "x < 10");
+    assert_eq!(filter.eval(&pred), Some(false), "x < 10");
+    assert_eq!(filter.eval(&skipping_pred), Some(false), "x < 10");
+
+    // NOTE: Indirect data skipping can only rewrite predicates, not expressions
+    let filter = MinStatsValue(Scalar::from(1));
+    assert_eq!(filter.eval(&pred), Some(true), "x < 10");
+
+    let filter = MinStatsValue(Scalar::from(100));
+    assert_eq!(filter.eval(&pred), Some(false), "x < 10");
+
+    // Verify round trip evaluation of pred -> expr -> pred
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
+    let pred = Pred::from_expr(Expr::from(Pred::opaque(
+        OpaqueLessThanOp,
+        vec![column_expr!("x"), Expr::literal(10)],
+    )));
+    assert_eq!(filter.eval(&pred), Some(true), "pred(expr(x < 10))");
+}
+
+#[test]
+fn test_eval_opaque_complex() {
+    // A contrived example that uses an opaque predicate that references an opaque expression
+    let complex_pred = Pred::and(
+        Pred::lt(column_expr!("x"), Scalar::from(true)),
+        Pred::opaque(
+            OpaqueLessThanOp,
+            vec![
+                column_expr!("x"),
+                Expr::opaque(OpaqueLessThanOp, vec![Expr::literal(2), Expr::literal(5)]),
+            ],
+        ),
+    );
+
+    // NOTE: Indirect data skipping cannot rewrite the opaque expression, so we end up with
+    // `AND(NULL, ...)` which evaluates to NULL unless the other leg is FALSE.
+    let complex_skipping_pred = as_data_skipping_predicate(&complex_pred).unwrap();
+
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(false));
+    assert_eq!(
+        filter.eval(&complex_pred),
+        Some(true),
+        "AND(x < TRUE, x < (2 < 5))"
+    );
+    assert_eq!(
+        filter.eval(&complex_skipping_pred),
+        None,
+        "AND(x < TRUE, x < (2 < 5))"
+    );
+
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(true));
+    assert_eq!(
+        filter.eval(&complex_pred),
+        Some(false),
+        "AND(x < TRUE, x < (2 < 5))"
+    );
+    assert_eq!(
+        filter.eval(&complex_skipping_pred),
+        Some(false),
+        "AND(x < TRUE, x < (2 < 5))"
+    );
+}
+
+#[test]
+fn test_eval_unknown() {
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
+    expect_eq!(filter.eval_expr(&Expr::unknown("unknown")), None, "UNKNOWN");
+    expect_eq!(filter.eval(&Pred::unknown("unknown")), None, "UNKNOWN");
 }
 
 // NOTE: `None` is NOT equivalent to `Some(Scalar::Null)`

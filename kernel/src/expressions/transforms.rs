@@ -2,8 +2,8 @@ use std::borrow::{Cow, ToOwned};
 use std::collections::HashSet;
 
 use crate::expressions::{
-    BinaryExpression, BinaryPredicate, ColumnName, Expression, JunctionPredicate, Predicate,
-    Scalar, UnaryPredicate,
+    BinaryExpression, BinaryPredicate, ColumnName, Expression, JunctionPredicate, OpaqueExpression,
+    OpaquePredicate, Predicate, Scalar, UnaryPredicate,
 };
 
 /// Generic framework for recursive bottom-up transforms of expressions and
@@ -40,6 +40,20 @@ pub trait ExpressionTransform<'a> {
     /// recursively transform the child expressions.
     fn transform_expr_struct(&mut self, fields: &'a [Expression]) -> Option<Cow<'a, [Expression]>> {
         self.recurse_into_expr_struct(fields)
+    }
+
+    /// Called for each [`OpaqueExpression`] encountered during the traversal. Implementations can
+    /// call [`Self::recurse_into_expr_opaque`] if they wish to recursively transform the children.
+    fn transform_expr_opaque(
+        &mut self,
+        expr: &'a OpaqueExpression,
+    ) -> Option<Cow<'a, OpaqueExpression>> {
+        self.recurse_into_expr_opaque(expr)
+    }
+
+    /// Called for each [`Expression::Unknown`] encountered during the traversal.
+    fn transform_expr_unknown(&mut self, name: &'a String) -> Option<Cow<'a, String>> {
+        Some(Cow::Borrowed(name))
     }
 
     /// Called for the child predicate of each [`Expression::Predicate`] encountered during the
@@ -92,6 +106,20 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_pred_junction(pred)
     }
 
+    /// Called for each [`OpaquePredicate`] encountered during the traversal. Implementations can
+    /// call [`Self::recurse_into_pred_opaque`] if they wish to recursively transform the children.
+    fn transform_pred_opaque(
+        &mut self,
+        pred: &'a OpaquePredicate,
+    ) -> Option<Cow<'a, OpaquePredicate>> {
+        self.recurse_into_pred_opaque(pred)
+    }
+
+    /// Called for each [`Predicate::Unknown`] encountered during the traversal.
+    fn transform_pred_unknown(&mut self, name: &'a String) -> Option<Cow<'a, String>> {
+        Some(Cow::Borrowed(name))
+    }
+
     /// General entry point for transforming an expression. This method will dispatch to the
     /// specific transform for each expression variant. Also invoked internally in order to recurse
     /// on the child(ren) of non-leaf variants.
@@ -116,6 +144,14 @@ pub trait ExpressionTransform<'a> {
             },
             Expression::Binary(b) => match self.transform_expr_binary(b)? {
                 Owned(b) => Owned(Expression::Binary(b)),
+                Borrowed(_) => Borrowed(expr),
+            },
+            Expression::Opaque(o) => match self.transform_expr_opaque(o)? {
+                Owned(o) => Owned(Expression::Opaque(o)),
+                Borrowed(_) => Borrowed(expr),
+            },
+            Expression::Unknown(u) => match self.transform_expr_unknown(u)? {
+                Owned(u) => Owned(Expression::Unknown(u)),
                 Borrowed(_) => Borrowed(expr),
             },
         };
@@ -148,6 +184,14 @@ pub trait ExpressionTransform<'a> {
                 Owned(j) => Owned(Predicate::Junction(j)),
                 Borrowed(_) => Borrowed(pred),
             },
+            Predicate::Opaque(o) => match self.transform_pred_opaque(o)? {
+                Owned(o) => Owned(Predicate::Opaque(o)),
+                Borrowed(_) => Borrowed(pred),
+            },
+            Predicate::Unknown(u) => match self.transform_pred_unknown(u)? {
+                Owned(u) => Owned(Predicate::Unknown(u)),
+                Borrowed(_) => Borrowed(pred),
+            },
         };
         Some(pred)
     }
@@ -160,6 +204,21 @@ pub trait ExpressionTransform<'a> {
         fields: &'a [Expression],
     ) -> Option<Cow<'a, [Expression]>> {
         recurse_into_children(fields, |f| self.transform_expr(f))
+    }
+
+    /// Recursively transforms the children of an [`OpaqueExpression`]. Returns `None` if all
+    /// children were removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
+    /// `Some(Cow::Borrowed)` otherwise.
+    fn recurse_into_expr_opaque(
+        &mut self,
+        o: &'a OpaqueExpression,
+    ) -> Option<Cow<'a, OpaqueExpression>> {
+        use Cow::*;
+        let o = match recurse_into_children(&o.exprs, |e| self.transform_expr(e))? {
+            Owned(exprs) => Owned(OpaqueExpression::new(o.op.clone(), exprs)),
+            Borrowed(_) => Borrowed(o),
+        };
+        Some(o)
     }
 
     /// Recursively transforms the child of an [`Expression::Predicate`]. Returns `None` if all
@@ -250,6 +309,21 @@ pub trait ExpressionTransform<'a> {
             Borrowed(_) => Borrowed(j),
         };
         Some(j)
+    }
+
+    /// Recursively transforms the children of an [`OpaquePredicate`]. Returns `None` if all
+    /// children were removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
+    /// `Some(Cow::Borrowed)` otherwise.
+    fn recurse_into_pred_opaque(
+        &mut self,
+        o: &'a OpaquePredicate,
+    ) -> Option<Cow<'a, OpaquePredicate>> {
+        use Cow::*;
+        let o = match recurse_into_children(&o.exprs, |e| self.transform_expr(e))? {
+            Owned(exprs) => Owned(OpaquePredicate::new(o.op.clone(), exprs)),
+            Borrowed(_) => Borrowed(o),
+        };
+        Some(o)
     }
 }
 
@@ -412,20 +486,88 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
     ) -> Option<Cow<'a, JunctionPredicate>> {
         self.depth_limited(Self::recurse_into_pred_junction, pred)
     }
+
+    fn transform_pred_opaque(
+        &mut self,
+        pred: &'a OpaquePredicate,
+    ) -> Option<Cow<'a, OpaquePredicate>> {
+        self.depth_limited(Self::recurse_into_pred_opaque, pred)
+    }
+
+    fn transform_expr_opaque(
+        &mut self,
+        expr: &'a OpaqueExpression,
+    ) -> Option<Cow<'a, OpaqueExpression>> {
+        self.depth_limited(Self::recurse_into_expr_opaque, expr)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ExpressionDepthChecker;
-    use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
+    use super::*;
+    use crate::expressions::{
+        column_expr, column_pred, Expression as Expr, OpaqueExpressionOp, OpaquePredicateOp,
+        Predicate as Pred,
+    };
+    use crate::kernel_predicates::{
+        DirectDataSkippingPredicateEvaluator, IndirectDataSkippingPredicateEvaluator,
+    };
+    use crate::DeltaResult;
+
+    #[derive(Debug, PartialEq)]
+    struct OpaqueTestOp(String);
+
+    impl OpaqueExpressionOp for OpaqueTestOp {
+        fn name(&self) -> &str {
+            &self.0
+        }
+        fn eval_expr_scalar(&self, _values: &[Option<Scalar>]) -> DeltaResult<Scalar> {
+            unimplemented!()
+        }
+    }
+
+    impl OpaquePredicateOp for OpaqueTestOp {
+        fn name(&self) -> &str {
+            &self.0
+        }
+
+        fn eval_pred_scalar(
+            &self,
+            _values: &[Option<Scalar>],
+            _inverted: bool,
+        ) -> DeltaResult<Option<bool>> {
+            unimplemented!()
+        }
+
+        fn eval_as_data_skipping_predicate(
+            &self,
+            _predicate_evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
+            _exprs: &[Expr],
+            _inverted: bool,
+        ) -> Option<bool> {
+            unimplemented!()
+        }
+
+        fn as_data_skipping_predicate(
+            &self,
+            _predicate_evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+            _exprs: &[Expr],
+            _inverted: bool,
+        ) -> Option<Pred> {
+            unimplemented!()
+        }
+    }
 
     #[test]
     fn test_depth_checker() {
         let pred = Pred::or_from([
             Pred::and_from([
-                Pred::or(
-                    Pred::lt(Expr::literal(10), column_expr!("x")),
-                    Pred::gt(Expr::literal(20), column_expr!("b")),
+                Pred::opaque(
+                    OpaqueTestOp("opaque".to_string()),
+                    vec![
+                        Expr::literal(10) + column_expr!("x"),
+                        Expr::unknown("unknown") - column_expr!("b"),
+                    ],
                 ),
                 Pred::literal(true),
                 Pred::not(Pred::literal(true)),
@@ -434,16 +576,31 @@ mod tests {
                 Pred::is_null(column_expr!("b")),
                 Pred::gt(Expr::literal(10), column_expr!("x")),
                 Pred::or(
-                    Pred::gt(Expr::literal(5) + Expr::literal(10), Expr::literal(20)),
+                    Pred::gt(
+                        Expr::literal(5)
+                            + Expr::opaque(
+                                OpaqueTestOp("inscrutable".to_string()),
+                                vec![Expr::literal(10)],
+                            ),
+                        Expr::literal(20),
+                    ),
                     column_pred!("y"),
                 ),
-                Pred::literal(true),
+                Pred::unknown("mystery"),
             ]),
             Pred::eq(
                 Expr::literal(42),
                 Expr::struct_from([Expr::literal(10), column_expr!("b")]),
             ),
         ]);
+
+        // Verify the default/no-op transform, since we have this nice complex expression handy.
+        struct Noop;
+        impl super::ExpressionTransform<'_> for Noop {}
+        assert!(matches!(
+            Noop.transform_pred(&pred),
+            Some(std::borrow::Cow::Borrowed(_))
+        ));
 
         // Similar to ExpressionDepthChecker::check_pred, but also returns call count
         let check_with_call_count =
@@ -453,7 +610,7 @@ mod tests {
 
         // OR
         //  * AND
-        //    * OR     >LIMIT<
+        //    * OPAQUE   >LIMIT<
         //    * NOT
         //  * AND
         //  * EQ
@@ -461,9 +618,9 @@ mod tests {
 
         // OR
         //  * AND
-        //    * OR
-        //      * LT     >LIMIT<
-        //      * GT
+        //    * OPAQUE
+        //      * PLUS      >LIMIT<
+        //      * MINUS
         //    * NOT
         //  * AND
         //  * EQ
@@ -471,9 +628,9 @@ mod tests {
 
         // OR
         //  * AND
-        //    * OR
-        //      * LT
-        //      * GT
+        //    * OPAQUE
+        //      * PLUS
+        //      * MINUS
         //    * NOT
         //  * AND
         //    * IS NULL
@@ -484,13 +641,11 @@ mod tests {
         //  * EQ
         assert_eq!(check_with_call_count(3), (4, 13));
 
-        // Depth limit not hit (full traversal required)
-        //
         // OR
         //  * AND
-        //    * OR
-        //      * LT
-        //      * GT
+        //    * OPAQUE
+        //      * PLUS
+        //      * MINUS
         //    * NOT
         //  * AND
         //    * IS_NULL
@@ -498,10 +653,29 @@ mod tests {
         //    * OR
         //      * GT
         //        * PLUS
+        //          * OPAQUE    >LIMIT<
+        //  * EQ
+        assert_eq!(check_with_call_count(4), (5, 14));
+
+        // Depth limit not hit (full traversal required)
+        //
+        // OR
+        //  * AND
+        //    * OPAQUE
+        //      * PLUS
+        //      * MINUS
+        //    * NOT
+        //  * AND
+        //    * IS_NULL
+        //    * GT
+        //    * OR
+        //      * GT
+        //        * PLUS
+        //          * OPAQUE
         //  * EQ
         //    * STRUCT
-        assert_eq!(check_with_call_count(4), (4, 14));
-        assert_eq!(check_with_call_count(5), (4, 14));
+        assert_eq!(check_with_call_count(5), (5, 15));
+        assert_eq!(check_with_call_count(6), (5, 15));
 
         // Check expressions as well
         let expr = Expr::from(pred);
@@ -513,24 +687,26 @@ mod tests {
         //
         // PRED
         //  * OR
-        //    * AND            > LIMIT 1 <
-        //      * OR           > LIMIT 2 <
-        //        * LT         > LIMIT 3 <
-        //        * GT
+        //    * AND              > LIMIT 1 <
+        //      * OPAQUE         > LIMIT 2 <
+        //        * PLUS         > LIMIT 3 <
+        //        * MINUS
         //      * NOT
         //    * AND
         //      * IS_NULL
         //      * GT
         //      * OR
         //        * GT
-        //          * PLUS     > LIMIT 4 <
+        //          * PLUS       > LIMIT 4 <
+        //            * OPAQUE   > LIMIT 5 <
         //    * EQ
         //      * STRUCT
         assert_eq!(check_with_call_count(1), (2, 5));
         assert_eq!(check_with_call_count(2), (3, 7));
         assert_eq!(check_with_call_count(3), (4, 9));
         assert_eq!(check_with_call_count(4), (5, 14));
-        assert_eq!(check_with_call_count(5), (5, 15));
-        assert_eq!(check_with_call_count(6), (5, 15));
+        assert_eq!(check_with_call_count(5), (6, 15));
+        assert_eq!(check_with_call_count(6), (6, 16));
+        assert_eq!(check_with_call_count(7), (6, 16));
     }
 }
