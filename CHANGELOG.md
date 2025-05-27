@@ -43,11 +43,11 @@
 11. Include latest CRC in LogSegment ([#964])
 12. CRC protocol+metadata visitor ([#972])
 13. Make several types/function pub and fix their doc comments ([#977])
-   - `KernelPredicateEvaluator` and `KernelPredicateEvaluatorDefaults` are now pub.
-   - `DataSkippingPredicateEvaluator` is now pub.
-   - add new type aliases `DirectDataSkippingPredicateEvaluator` and `IndirectDataSkippingPredicateEvaluator`
-   - Arrow engine `evaluate_expression` and `evaluate_predicate` are now pub.
-   - `Expression::predicate` renamed to `Expression::from_pred`
+    - `KernelPredicateEvaluator` and `KernelPredicateEvaluatorDefaults` are now pub.
+    - `DataSkippingPredicateEvaluator` is now pub.
+    - add new type aliases `DirectDataSkippingPredicateEvaluator` and `IndirectDataSkippingPredicateEvaluator`
+    - Arrow engine `evaluate_expression` and `evaluate_predicate` are now pub.
+    - `Expression::predicate` renamed to `Expression::from_pred`
 
 ### 🐛 Bug Fixes
 
