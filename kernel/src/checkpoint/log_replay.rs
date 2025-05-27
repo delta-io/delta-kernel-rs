@@ -32,12 +32,12 @@
 //! [`CheckpointMetadata`]: crate::actions::CheckpointMetadata
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::{
-    FileActionDeduplicator, FileActionKey, HasSelectionVector, LogReplayProcessor,
+    ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector, LogReplayProcessor,
 };
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{DeltaResult, EngineData, Error};
+use crate::{DeltaResult, Error};
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -90,12 +90,12 @@ impl LogReplayProcessor for CheckpointLogReplayProcessor {
     /// the deduplication rules described in the module documentation. The method tracks
     /// statistics about processed actions (total count, add actions count) and maintains
     /// state for cross-batch deduplication.
-    fn process_actions_batch(
-        &mut self,
-        batch: Box<dyn EngineData>,
-        is_log_batch: bool,
-    ) -> DeltaResult<Self::Output> {
-        let selection_vector = vec![true; batch.len()];
+    fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
+        let ActionsBatch {
+            actions,
+            is_log_batch,
+        } = actions_batch;
+        let selection_vector = vec![true; actions.len()];
 
         // Create the checkpoint visitor to process actions and update selection vector
         let mut visitor = CheckpointVisitor::new(
@@ -107,14 +107,14 @@ impl LogReplayProcessor for CheckpointLogReplayProcessor {
             self.seen_metadata,
             &mut self.seen_txns,
         );
-        visitor.visit_rows_of(batch.as_ref())?;
+        visitor.visit_rows_of(actions.as_ref())?;
 
         // Update protocol and metadata seen flags
         self.seen_protocol = visitor.seen_protocol;
         self.seen_metadata = visitor.seen_metadata;
 
         let filtered_data = FilteredEngineData {
-            data: batch,
+            data: actions,
             selection_vector: visitor.selection_vector,
         };
 
@@ -469,14 +469,15 @@ mod tests {
     use itertools::Itertools;
 
     /// Helper function to create test batches from JSON strings
-    fn create_batch(json_strings: Vec<&str>) -> DeltaResult<(Box<dyn EngineData>, bool)> {
-        Ok((parse_json_batch(StringArray::from(json_strings)), true))
+    fn create_batch(json_strings: Vec<&str>) -> DeltaResult<ActionsBatch> {
+        let actions = parse_json_batch(StringArray::from(json_strings));
+        Ok(ActionsBatch::new(actions, true))
     }
 
     /// Helper function which applies the [`CheckpointLogReplayProcessor`] to a set of
     /// input batches and returns the results.
     fn run_checkpoint_test(
-        input_batches: Vec<(Box<dyn EngineData>, bool)>,
+        input_batches: Vec<ActionsBatch>,
     ) -> DeltaResult<(Vec<FilteredEngineData>, i64, i64)> {
         let processed_batches: Vec<_> = CheckpointLogReplayProcessor::new(0)
             .process_actions_iter(input_batches.into_iter().map(Ok))

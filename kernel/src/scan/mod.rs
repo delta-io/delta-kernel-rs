@@ -18,7 +18,7 @@ use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
-use crate::log_replay::HasSelectionVector;
+use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ListedLogFiles, LogSegment};
 use crate::scan::state::{DvInfo, Stats};
 use crate::schema::ToSchema as _;
@@ -537,8 +537,9 @@ impl Scan {
             get_scan_metadata_transform_expr(),
             RESTORED_ADD_SCHEMA.clone(),
         );
-        let apply_transform =
-            move |data: Box<dyn EngineData>| Ok((transform.evaluate(data.as_ref())?, false));
+        let apply_transform = move |data: Box<dyn EngineData>| {
+            Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))
+        };
 
         // If the snapshot version corresponds to the hint version, we process the existing data
         // to apply file skipping and provide the required transformations.
@@ -588,7 +589,7 @@ impl Scan {
     fn scan_metadata_inner(
         &self,
         engine: &dyn Engine,
-        action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
+        action_batch_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         // Compute the static part of the transformation. This is `None` if no transformation is
         // needed (currently just means no partition cols AND no column mapping but will be extended
@@ -603,7 +604,7 @@ impl Scan {
         };
         let it = scan_action_iter(
             engine,
-            action_iter,
+            action_batch_iter,
             self.logical_schema.clone(),
             static_transform,
             physical_predicate,
@@ -615,7 +616,7 @@ impl Scan {
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
         self.snapshot.log_segment().read_actions(
@@ -854,6 +855,7 @@ pub(crate) mod test_utils {
     use itertools::Itertools;
     use std::sync::Arc;
 
+    use crate::log_replay::ActionsBatch;
     use crate::{
         actions::get_log_schema,
         engine::{
@@ -961,7 +963,9 @@ pub(crate) mod test_utils {
             logical_schema.unwrap_or_else(|| Arc::new(crate::schema::StructType::new(vec![])));
         let iter = scan_action_iter(
             &SyncEngine::new(),
-            batch.into_iter().map(|batch| Ok((batch as _, true))),
+            batch
+                .into_iter()
+                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             logical_schema,
             transform,
             None,

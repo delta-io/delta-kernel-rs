@@ -3,8 +3,9 @@ use std::sync::{Arc, LazyLock};
 use crate::actions::get_log_txn_schema;
 use crate::actions::visitors::SetTransactionVisitor;
 use crate::actions::{SetTransaction, SET_TRANSACTION_NAME};
+use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
-use crate::{DeltaResult, Engine, EngineData, Expression as Expr, PredicateRef, RowVisitor as _};
+use crate::{DeltaResult, Engine, Expression as Expr, PredicateRef, RowVisitor as _};
 
 pub(crate) use crate::actions::visitors::SetTransactionMap;
 
@@ -50,7 +51,7 @@ fn scan_application_transactions(
     // If a specific id is requested then we can terminate log replay early as soon as it was
     // found. If all ids are requested then we are forced to replay the entire log.
     for maybe_data in replay_for_app_ids(log_segment, engine)? {
-        let (txns, _) = maybe_data?;
+        let txns = maybe_data?.actions;
         visitor.visit_rows_of(txns.as_ref())?;
         // if a specific id is requested and a transaction was found, then return
         if application_id.is_some() && !visitor.set_transactions.is_empty() {
@@ -65,7 +66,7 @@ fn scan_application_transactions(
 fn replay_for_app_ids(
     log_segment: &LogSegment,
     engine: &dyn Engine,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
+) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
     let txn_schema = get_log_txn_schema();
     // This meta-predicate should be effective because all the app ids end up in a single
     // checkpoint part when patitioned by `add.path` like the Delta spec requires. There's no
