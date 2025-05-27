@@ -10,8 +10,9 @@ use std::sync::{Arc, LazyLock};
 use crate::actions::get_log_domain_metadata_schema;
 use crate::actions::visitors::DomainMetadataVisitor;
 use crate::actions::{DomainMetadata, DOMAIN_METADATA_NAME};
+use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
-use crate::{DeltaResult, Engine, EngineData, Expression as Expr, PredicateRef, RowVisitor as _};
+use crate::{DeltaResult, Engine, Expression as Expr, PredicateRef, RowVisitor as _};
 
 const DOMAIN_METADATA_DOMAIN_FIELD: &str = "domain";
 
@@ -47,7 +48,7 @@ fn scan_domain_metadatas(
     // found. If all domains are requested then we are forced to replay the entire log.
     for actions in replay_for_domain_metadatas(log_segment, engine)? {
         // throw away is_log_batch since we don't care
-        let (domain_metadatas, _) = actions?;
+        let domain_metadatas = actions?.actions;
         visitor.visit_rows_of(domain_metadatas.as_ref())?;
         // if a specific domain is requested and it was found, then return. note that we don't need
         // to check if it was the one that was found since the visitor will only keep the requested
@@ -63,7 +64,7 @@ fn scan_domain_metadatas(
 fn replay_for_domain_metadatas(
     log_segment: &LogSegment,
     engine: &dyn Engine,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
+) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
     let schema = get_log_domain_metadata_schema();
     static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
         Some(Arc::new(
