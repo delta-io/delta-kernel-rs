@@ -13,7 +13,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, GlobalScanState, Stats};
 use delta_kernel::schema::Schema;
-use delta_kernel::{DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Table};
+use delta_kernel::{DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Snapshot};
 
 use clap::Parser;
 use url::Url;
@@ -111,10 +111,7 @@ fn send_scan_file(
 
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
-
-    // build a table and get the latest snapshot from it
-    let table = Table::try_from_uri(&cli.path)?;
-    println!("Reading {}", table.location());
+    let url = delta_kernel::try_parse_uri(&cli.path)?;
 
     let mut options = if let Some(region) = cli.region {
         HashMap::from([("region", region)])
@@ -124,13 +121,10 @@ fn try_main() -> DeltaResult<()> {
     if cli.public {
         options.insert("skip_signature", "true".to_string());
     }
-    let engine = DefaultEngine::try_new(
-        table.location(),
-        options,
-        Arc::new(TokioBackgroundExecutor::new()),
-    )?;
+    let engine = DefaultEngine::try_new(&url, options, Arc::new(TokioBackgroundExecutor::new()))?;
 
-    let snapshot = table.snapshot(&engine, None)?;
+    let snapshot = Snapshot::try_new(url, &engine, None)?;
+    println!("Reading {}", snapshot.table_root());
 
     // process the columns requested and build a schema from them
     let read_schema_opt = cli

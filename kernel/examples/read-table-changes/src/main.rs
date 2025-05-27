@@ -6,7 +6,8 @@ use delta_kernel::arrow::{compute::filter_record_batch, util::pretty::print_batc
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::{DeltaResult, Table};
+use delta_kernel::table_changes::TableChanges;
+use delta_kernel::DeltaResult;
 use itertools::Itertools;
 
 #[derive(Parser)]
@@ -25,14 +26,15 @@ struct Cli {
 
 fn main() -> DeltaResult<()> {
     let cli = Cli::parse();
-    let table = Table::try_from_uri(cli.path)?;
+    let url = delta_kernel::try_parse_uri(cli.path)?;
     let options = HashMap::from([("skip_signature", "true".to_string())]);
     let engine = Arc::new(DefaultEngine::try_new(
-        table.location(),
+        &url,
         options,
         Arc::new(TokioBackgroundExecutor::new()),
     )?);
-    let table_changes = table.table_changes(engine.as_ref(), cli.start_version, cli.end_version)?;
+    let table_changes =
+        TableChanges::try_new(url, engine.as_ref(), cli.start_version, cli.end_version)?;
 
     let table_changes_scan = table_changes.into_scan_builder().build()?;
     let batches: Vec<RecordBatch> = table_changes_scan

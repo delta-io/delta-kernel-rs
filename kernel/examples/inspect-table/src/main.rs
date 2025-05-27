@@ -13,7 +13,7 @@ use delta_kernel::expressions::ColumnName;
 use delta_kernel::scan::state::{DvInfo, Stats};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
-use delta_kernel::{DeltaResult, Error, ExpressionRef, Table};
+use delta_kernel::{DeltaResult, Error, ExpressionRef, Snapshot};
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -181,17 +181,16 @@ fn print_scan_file(
 
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
-
-    // build a table and get the latest snapshot from it
-    let table = Table::try_from_uri(&cli.path)?;
+    let url = delta_kernel::try_parse_uri(&cli.path)?;
 
     let engine = DefaultEngine::try_new(
-        table.location(),
+        &url,
         HashMap::<String, String>::new(),
         Arc::new(TokioBackgroundExecutor::new()),
     )?;
 
-    let snapshot = table.snapshot(&engine, None)?;
+    let snapshot = Snapshot::try_new(url, &engine, None)?;
+    println!("Reading {}", snapshot.table_root());
 
     match cli.command {
         Commands::TableVersion => {

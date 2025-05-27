@@ -1,13 +1,14 @@
+use std::sync::Arc;
+
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use itertools::Itertools;
+use url::Url;
 
 use crate::ArrowEngineData;
 use delta_kernel::scan::Scan;
-use delta_kernel::{DeltaResult, Engine, EngineData, Table};
-
-use std::sync::Arc;
+use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
 
 #[macro_export]
 macro_rules! sort_lines {
@@ -65,10 +66,10 @@ pub(crate) fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
 #[allow(unused)]
 pub(crate) fn test_read(
     expected: &ArrowEngineData,
-    table: &Table,
+    url: Url,
     engine: Arc<dyn Engine>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = table.snapshot(engine.as_ref(), None)?;
+    let snapshot = Snapshot::try_new(url, engine.as_ref(), None)?;
     let scan = snapshot.into_scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;
     let formatted = pretty_format_batches(&batches).unwrap().to_string();

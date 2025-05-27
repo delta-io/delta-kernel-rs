@@ -9,7 +9,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::schema::Schema;
-use delta_kernel::{DeltaResult, Table};
+use delta_kernel::{DeltaResult, Snapshot};
 
 use clap::Parser;
 use itertools::Itertools;
@@ -55,10 +55,7 @@ fn main() -> ExitCode {
 
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
-
-    // build a table and get the latest snapshot from it
-    let table = Table::try_from_uri(&cli.path)?;
-    println!("Reading {}", table.location());
+    let url = delta_kernel::try_parse_uri(&cli.path)?;
 
     let mut options = if let Some(region) = cli.region {
         HashMap::from([("region", region)])
@@ -69,12 +66,13 @@ fn try_main() -> DeltaResult<()> {
         options.insert("skip_signature", "true".to_string());
     }
     let engine = Arc::new(DefaultEngine::try_new(
-        table.location(),
+        &url,
         options,
         Arc::new(TokioBackgroundExecutor::new()),
     )?);
 
-    let snapshot = table.snapshot(engine.as_ref(), None)?;
+    let snapshot = Snapshot::try_new(url, engine.as_ref(), None)?;
+    println!("Reading {}", snapshot.table_root());
 
     if cli.schema_only {
         println!("{:#?}", snapshot.schema());
