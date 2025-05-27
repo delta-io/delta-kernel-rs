@@ -1594,3 +1594,35 @@ fn test_commit_cover_wider_range() {
         ],
     );
 }
+
+#[test]
+fn test_commit_cover_no_compactions() {
+    test_commit_cover(
+        &Vec::from_iter(0..4),
+        &[],
+        None, // checkpoint version
+        None, // version to load
+        &[
+            ExpectedFile::Commit(3),
+            ExpectedFile::Commit(2),
+            ExpectedFile::Commit(1),
+            ExpectedFile::Commit(0),
+        ],
+    );
+}
+
+#[test]
+fn test_commit_cover_minimal_overlap() {
+    test_commit_cover(
+        &Vec::from_iter(0..6),
+        &[(0, 2), (2, 5)],
+        None, // checkpoint version
+        None, // version to load
+        &[
+            ExpectedFile::Commit(5),
+            ExpectedFile::Commit(4),
+            ExpectedFile::Commit(3),
+            ExpectedFile::Compaction(0, 2),
+        ],
+    );
+}
