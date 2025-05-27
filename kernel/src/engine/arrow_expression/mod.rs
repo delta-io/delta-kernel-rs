@@ -21,7 +21,8 @@ use apply_schema::{apply_schema, apply_schema_to};
 use evaluate_expression::{evaluate_expression, evaluate_predicate};
 
 mod apply_schema;
-mod evaluate_expression;
+pub mod evaluate_expression;
+pub mod opaque;
 
 #[cfg(test)]
 mod tests;

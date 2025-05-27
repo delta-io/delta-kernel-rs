@@ -35,7 +35,7 @@ pub(crate) fn unwrap_kernel_expression(
 ) -> Option<Expression> {
     match state.inflight_ids.take(exprid)? {
         ExpressionOrPredicate::Expression(expr) => Some(expr),
-        ExpressionOrPredicate::Predicate(pred) => Some(Expression::predicate(pred)),
+        ExpressionOrPredicate::Predicate(pred) => Some(Expression::from_pred(pred)),
     }
 }
 
@@ -189,6 +189,24 @@ pub extern "C" fn visit_predicate_ne(
 ) -> usize {
     let p = visit_predicate_binary(state, BinaryPredicateOp::Equal, a, b);
     visit_predicate_not(state, p)
+}
+
+#[no_mangle]
+pub extern "C" fn visit_predicate_unknown(
+    state: &mut KernelExpressionVisitorState,
+    name: KernelStringSlice,
+) -> usize {
+    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    name.map_or(0, |name| wrap_predicate(state, Predicate::Unknown(name)))
+}
+
+#[no_mangle]
+pub extern "C" fn visit_expression_unknown(
+    state: &mut KernelExpressionVisitorState,
+    name: KernelStringSlice,
+) -> usize {
+    let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    name.map_or(0, |name| wrap_expression(state, Expression::Unknown(name)))
 }
 
 /// # Safety

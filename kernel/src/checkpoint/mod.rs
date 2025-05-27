@@ -298,7 +298,7 @@ impl CheckpointWriter {
     /// - `metadata`: The metadata of the written checkpoint file
     /// - `checkpoint_data`: The exhausted checkpoint data iterator
     ///
-    /// # Returns: [`variant@Ok`] if the checkpoint was successfully finalized
+    /// # Returns: `Ok` if the checkpoint was successfully finalized
     // Internally, this method:
     // 1. Validates that the checkpoint data iterator is fully exhausted
     // 2. Creates the `_last_checkpoint` data with `create_last_checkpoint_data`

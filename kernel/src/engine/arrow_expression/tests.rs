@@ -5,12 +5,19 @@ use crate::arrow::array::{
     ListArray, MapArray, MapBuilder, MapFieldNames, StringBuilder, StructArray,
 };
 use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
 use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
 
 use super::*;
+use crate::engine::arrow_expression::opaque::{
+    ArrowOpaqueExpression as _, ArrowOpaqueExpressionOp, ArrowOpaquePredicate as _,
+    ArrowOpaquePredicateOp,
+};
 use crate::expressions::*;
-use crate::schema::{ArrayType, MapType, StructField, StructType};
-use crate::DataType as DeltaDataTypes;
+use crate::kernel_predicates::{
+    DirectDataSkippingPredicateEvaluator, IndirectDataSkippingPredicateEvaluator,
+};
+use crate::schema::{ArrayType, DataType as KernelDataType, MapType, StructField, StructType};
 use crate::EvaluationHandlerExtension as _;
 
 use Expression as Expr;
@@ -89,7 +96,7 @@ fn test_literal_type_array() {
         Expr::literal(5),
         Scalar::Array(
             ArrayData::try_new(
-                ArrayType::new(DeltaDataTypes::INTEGER, false),
+                ArrayType::new(KernelDataType::INTEGER, false),
                 vec![Scalar::Integer(1), Scalar::Integer(2)],
             )
             .unwrap(),
@@ -111,22 +118,22 @@ fn test_literal_complex_type_array() {
     use crate::arrow::array::{Array as _, AsArray as _};
     use crate::arrow::datatypes::Int32Type;
 
-    let array_type = ArrayType::new(DeltaDataTypes::INTEGER, true);
+    let array_type = ArrayType::new(KernelDataType::INTEGER, true);
     let array_value = Scalar::Array(
         ArrayData::try_new(
             array_type.clone(),
             vec![
                 Scalar::from(1),
                 Scalar::from(2),
-                Scalar::Null(DeltaDataTypes::INTEGER),
+                Scalar::Null(KernelDataType::INTEGER),
                 Scalar::from(3),
             ],
         )
         .unwrap(),
     );
     let map_type = MapType::new(
-        DeltaDataTypes::STRING,
-        DeltaDataTypes::Array(Box::new(array_type.clone())),
+        KernelDataType::STRING,
+        KernelDataType::Array(Box::new(array_type.clone())),
         true,
     );
     let map_value = Scalar::Map(
@@ -143,7 +150,7 @@ fn test_literal_complex_type_array() {
         .unwrap(),
     );
     let struct_fields = vec![
-        StructField::nullable("scalar", DeltaDataTypes::INTEGER),
+        StructField::nullable("scalar", KernelDataType::INTEGER),
         StructField::nullable("list", array_type.clone()),
         StructField::nullable("null_list", array_type.clone()),
         StructField::nullable("map", map_type.clone()),
@@ -507,6 +514,131 @@ fn test_logical() {
     assert_eq!(results, expected);
 }
 
+#[derive(Debug, PartialEq)]
+struct OpaqueLessThanOp;
+
+impl OpaqueLessThanOp {
+    fn name(&self) -> &str {
+        "less_than"
+    }
+
+    fn eval_pred(
+        &self,
+        args: &[Expression],
+        batch: &RecordBatch,
+        inverted: bool,
+    ) -> DeltaResult<BooleanArray> {
+        let op_fn = match inverted {
+            true => gt_eq,
+            false => lt,
+        };
+
+        let [left, right] = args else {
+            panic!("Invalid arg count: {}", args.len());
+        };
+
+        let eval = |arg| evaluate_expression(arg, batch, Some(&KernelDataType::BOOLEAN));
+        Ok(op_fn(&eval(left)?, &eval(right)?)?)
+    }
+}
+
+impl ArrowOpaqueExpressionOp for OpaqueLessThanOp {
+    fn name(&self) -> &str {
+        self.name()
+    }
+
+    fn eval_expr_scalar(&self, _values: &[Option<Scalar>]) -> DeltaResult<Scalar> {
+        unimplemented!() // OpaqueExpressionOp is already tested
+    }
+
+    fn eval_expr(
+        &self,
+        args: &[Expression],
+        batch: &RecordBatch,
+        result_type: Option<&KernelDataType>,
+    ) -> DeltaResult<ArrayRef> {
+        assert!(matches!(result_type, None | Some(&KernelDataType::BOOLEAN)));
+        let result = self.eval_pred(args, batch, false)?;
+        Ok(Arc::new(result))
+    }
+}
+
+impl ArrowOpaquePredicateOp for OpaqueLessThanOp {
+    fn name(&self) -> &str {
+        self.name()
+    }
+
+    fn eval_pred(
+        &self,
+        args: &[Expression],
+        batch: &RecordBatch,
+        inverted: bool,
+    ) -> DeltaResult<BooleanArray> {
+        self.eval_pred(args, batch, inverted)
+    }
+
+    fn eval_pred_scalar(
+        &self,
+        _values: &[Option<Scalar>],
+        _inverted: bool,
+    ) -> DeltaResult<Option<bool>> {
+        unimplemented!() // OpaquePredicateOp is already tested
+    }
+
+    fn eval_as_data_skipping_predicate(
+        &self,
+        _predicate_evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
+        _exprs: &[Expr],
+        _inverted: bool,
+    ) -> Option<bool> {
+        unimplemented!() // OpaquePredicateOp is already tested
+    }
+
+    fn as_data_skipping_predicate(
+        &self,
+        _predicate_evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+        _exprs: &[Expr],
+        _inverted: bool,
+    ) -> Option<Pred> {
+        unimplemented!() // OpaquePredicateOp is already tested
+    }
+}
+
+#[test]
+fn test_opaque() {
+    let expr = Expr::arrow_opaque(OpaqueLessThanOp, [column_expr!("x"), Expr::literal(10)]);
+    let pred = Pred::arrow_opaque(OpaqueLessThanOp, [column_expr!("x"), Expr::literal(10)]);
+
+    assert_eq!(
+        format!("{expr:?}"),
+        "Opaque(OpaqueExpression { op: OpaqueLessThanOp, exprs: [Column(ColumnName { path: [\"x\"] }), Literal(Integer(10))] })"
+    );
+    assert_eq!(
+        format!("{pred:?}"),
+        "Opaque(OpaquePredicate { op: OpaqueLessThanOp, exprs: [Column(ColumnName { path: [\"x\"] }), Literal(Integer(10))] })"
+    );
+
+    assert_eq!(expr, expr);
+    assert_eq!(pred, pred);
+
+    let data = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![1, 10, 100]))],
+    )
+    .unwrap();
+
+    let lt_result = evaluate_predicate(&pred, &data, false).unwrap();
+    let lt_expected = BooleanArray::from(vec![true, false, false]);
+    assert_eq!(lt_result, lt_expected);
+
+    let not_lt_result = evaluate_predicate(&pred, &data, true).unwrap();
+    let not_lt_expected = BooleanArray::from(vec![false, true, true]);
+    assert_eq!(not_lt_result, not_lt_expected);
+
+    let lt_result = evaluate_expression(&expr, &data, Some(&KernelDataType::BOOLEAN)).unwrap();
+    assert_eq!(lt_result.as_ref(), &lt_expected);
+}
+
 #[test]
 fn test_null_row() {
     // note that we _allow_ nested nulls, since the top-level struct can be NULL
@@ -514,11 +646,11 @@ fn test_null_row() {
         StructField::nullable(
             "x",
             StructType::new([
-                StructField::nullable("a", crate::schema::DataType::INTEGER),
-                StructField::not_null("b", crate::schema::DataType::STRING),
+                StructField::nullable("a", KernelDataType::INTEGER),
+                StructField::not_null("b", KernelDataType::STRING),
             ]),
         ),
-        StructField::nullable("c", crate::schema::DataType::STRING),
+        StructField::nullable("c", KernelDataType::STRING),
     ]));
     let handler = ArrowEvaluationHandler;
     let result = handler.null_row(schema.clone()).unwrap();
@@ -549,7 +681,7 @@ fn test_null_row() {
 fn test_null_row_err() {
     let not_null_schema = Arc::new(StructType::new(vec![StructField::not_null(
         "a",
-        crate::schema::DataType::STRING,
+        KernelDataType::STRING,
     )]));
     let handler = ArrowEvaluationHandler;
     assert!(handler.null_row(not_null_schema).is_err());
@@ -573,13 +705,13 @@ fn test_create_one() {
         1.into(),
         "B".into(),
         3.into(),
-        Scalar::Null(DeltaDataTypes::INTEGER),
+        Scalar::Null(KernelDataType::INTEGER),
     ];
     let schema = Arc::new(StructType::new([
-        StructField::nullable("a", DeltaDataTypes::INTEGER),
-        StructField::nullable("b", DeltaDataTypes::STRING),
-        StructField::not_null("c", DeltaDataTypes::INTEGER),
-        StructField::nullable("d", DeltaDataTypes::INTEGER),
+        StructField::nullable("a", KernelDataType::INTEGER),
+        StructField::nullable("b", KernelDataType::STRING),
+        StructField::not_null("c", KernelDataType::INTEGER),
+        StructField::nullable("d", KernelDataType::INTEGER),
     ]));
 
     let expected_schema = Arc::new(Schema::new(vec![
@@ -606,9 +738,9 @@ fn test_create_one_nested() {
     let values: &[Scalar] = &[1.into(), 2.into()];
     let schema = Arc::new(StructType::new([StructField::not_null(
         "a",
-        DeltaDataTypes::struct_type([
-            StructField::nullable("b", DeltaDataTypes::INTEGER),
-            StructField::not_null("c", DeltaDataTypes::INTEGER),
+        KernelDataType::struct_type([
+            StructField::nullable("b", KernelDataType::INTEGER),
+            StructField::not_null("c", KernelDataType::INTEGER),
         ]),
     )]));
     let expected_schema = Arc::new(Schema::new(vec![Field::new(
@@ -641,12 +773,12 @@ fn test_create_one_nested() {
 
 #[test]
 fn test_create_one_nested_null() {
-    let values: &[Scalar] = &[Scalar::Null(DeltaDataTypes::INTEGER), 1.into()];
+    let values: &[Scalar] = &[Scalar::Null(KernelDataType::INTEGER), 1.into()];
     let schema = Arc::new(StructType::new([StructField::not_null(
         "a",
-        DeltaDataTypes::struct_type([
-            StructField::nullable("b", DeltaDataTypes::INTEGER),
-            StructField::not_null("c", DeltaDataTypes::INTEGER),
+        KernelDataType::struct_type([
+            StructField::nullable("b", KernelDataType::INTEGER),
+            StructField::not_null("c", KernelDataType::INTEGER),
         ]),
     )]));
     let expected_schema = Arc::new(Schema::new(vec![Field::new(
@@ -680,14 +812,14 @@ fn test_create_one_nested_null() {
 #[test]
 fn test_create_one_not_null_struct() {
     let values: &[Scalar] = &[
-        Scalar::Null(DeltaDataTypes::INTEGER),
-        Scalar::Null(DeltaDataTypes::INTEGER),
+        Scalar::Null(KernelDataType::INTEGER),
+        Scalar::Null(KernelDataType::INTEGER),
     ];
     let schema = Arc::new(StructType::new([StructField::not_null(
         "a",
-        DeltaDataTypes::struct_type([
-            StructField::not_null("b", DeltaDataTypes::INTEGER),
-            StructField::nullable("c", DeltaDataTypes::INTEGER),
+        KernelDataType::struct_type([
+            StructField::not_null("b", KernelDataType::INTEGER),
+            StructField::nullable("c", KernelDataType::INTEGER),
         ]),
     )]));
     let handler = ArrowEvaluationHandler;
@@ -696,12 +828,12 @@ fn test_create_one_not_null_struct() {
 
 #[test]
 fn test_create_one_top_level_null() {
-    let values = &[Scalar::Null(DeltaDataTypes::INTEGER)];
+    let values = &[Scalar::Null(KernelDataType::INTEGER)];
     let handler = ArrowEvaluationHandler;
 
     let schema = Arc::new(StructType::new([StructField::not_null(
         "col_1",
-        DeltaDataTypes::INTEGER,
+        KernelDataType::INTEGER,
     )]));
     assert!(matches!(
         handler.create_one(schema, values),
@@ -713,7 +845,7 @@ fn test_create_one_top_level_null() {
 fn test_scalar_map() -> DeltaResult<()> {
     // making an 2-row array each with a map with 2 pairs.
     // result: { key1: 1, key2: null }, { key1: 1, key2: null }
-    let map_type = MapType::new(DeltaDataTypes::STRING, DeltaDataTypes::INTEGER, true);
+    let map_type = MapType::new(KernelDataType::STRING, KernelDataType::INTEGER, true);
     let map_data = MapData::try_new(
         map_type,
         [("key1".to_string(), 1.into()), ("key2".to_string(), None)],
@@ -748,8 +880,8 @@ fn test_scalar_map() -> DeltaResult<()> {
 
 #[test]
 fn test_null_scalar_map() -> DeltaResult<()> {
-    let map_type = MapType::new(DeltaDataTypes::STRING, DeltaDataTypes::STRING, false);
-    let null_scalar_map = Scalar::Null(DeltaDataTypes::Map(Box::new(map_type)));
+    let map_type = MapType::new(KernelDataType::STRING, KernelDataType::STRING, false);
+    let null_scalar_map = Scalar::Null(KernelDataType::Map(Box::new(map_type)));
     let arrow_array = null_scalar_map.to_array(1)?;
     let map_array = arrow_array.as_any().downcast_ref::<MapArray>().unwrap();
 
