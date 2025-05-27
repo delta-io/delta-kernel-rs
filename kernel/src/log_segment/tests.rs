@@ -17,6 +17,7 @@ use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreStorageHandler;
 use crate::engine::default::DefaultEngine;
 use crate::engine::sync::SyncEngine;
+use crate::log_replay::ActionsBatch;
 use crate::log_segment::{ListedLogFiles, LogSegment};
 use crate::parquet::arrow::ArrowWriter;
 use crate::path::{LogPathFileType, ParsedLogPath};
@@ -31,17 +32,21 @@ use crate::{
 };
 use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
 
+use super::*;
+
 // utility to easily create ListedLogFiles
 impl ListedLogFiles {
     fn new(
         ascending_commit_files: Vec<ParsedLogPath>,
         ascending_compaction_files: Vec<ParsedLogPath>,
         checkpoint_parts: Vec<ParsedLogPath>,
+        latest_crc_file: Option<ParsedLogPath>,
     ) -> Self {
         ListedLogFiles {
             ascending_commit_files,
             ascending_compaction_files,
             checkpoint_parts,
+            latest_crc_file,
         }
     }
 }
@@ -982,6 +987,7 @@ fn test_create_checkpoint_stream_errors_when_schema_has_remove_but_no_sidecar_ac
             vec![],
             vec![],
             vec![create_log_path("file:///00000000000000000001.parquet")],
+            None,
         ),
         log_root,
         None,
@@ -1010,6 +1016,7 @@ fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_actio
             vec![],
             vec![],
             vec![create_log_path("file:///00000000000000000001.parquet")],
+            None,
         ),
         log_root,
         None,
@@ -1041,7 +1048,12 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
     let v2_checkpoint_read_schema = get_log_schema().project(&[METADATA_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(vec![], vec![], vec![create_log_path(&checkpoint_one_file)]),
+        ListedLogFiles::new(
+            vec![],
+            vec![],
+            vec![create_log_path(&checkpoint_one_file)],
+            None,
+        ),
         log_root,
         None,
     )?;
@@ -1049,7 +1061,10 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
         log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
-    let (first_batch, is_log_batch) = iter.next().unwrap()?;
+    let ActionsBatch {
+        actions: first_batch,
+        is_log_batch,
+    } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(
         first_batch,
@@ -1099,6 +1114,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
                 create_log_path(&checkpoint_one_file),
                 create_log_path(&checkpoint_two_file),
             ],
+            None,
         ),
         log_root,
         None,
@@ -1108,7 +1124,10 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
 
     // Assert the correctness of batches returned
     for expected_sidecar in ["sidecar1.parquet", "sidecar2.parquet"].iter() {
-        let (batch, is_log_batch) = iter.next().unwrap()?;
+        let ActionsBatch {
+            actions: batch,
+            is_log_batch,
+        } = iter.next().unwrap()?;
         assert!(!is_log_batch);
         assert_batch_matches(
             batch,
@@ -1142,7 +1161,12 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(vec![], vec![], vec![create_log_path(&checkpoint_one_file)]),
+        ListedLogFiles::new(
+            vec![],
+            vec![],
+            vec![create_log_path(&checkpoint_one_file)],
+            None,
+        ),
         log_root,
         None,
     )?;
@@ -1150,7 +1174,10 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
         log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
-    let (first_batch, is_log_batch) = iter.next().unwrap()?;
+    let ActionsBatch {
+        actions: first_batch,
+        is_log_batch,
+    } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(first_batch, add_batch_simple(v2_checkpoint_read_schema));
     assert!(iter.next().is_none());
@@ -1180,7 +1207,12 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(vec![], vec![], vec![create_log_path(&checkpoint_one_file)]),
+        ListedLogFiles::new(
+            vec![],
+            vec![],
+            vec![create_log_path(&checkpoint_one_file)],
+            None,
+        ),
         log_root,
         None,
     )?;
@@ -1188,7 +1220,10 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
         log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema, None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
-    let (first_batch, is_log_batch) = iter.next().unwrap()?;
+    let ActionsBatch {
+        actions: first_batch,
+        is_log_batch,
+    } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     let mut visitor = AddVisitor::default();
     visitor.visit_rows_of(&*first_batch)?;
@@ -1239,7 +1274,12 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(vec![], vec![], vec![create_log_path(&checkpoint_file_path)]),
+        ListedLogFiles::new(
+            vec![],
+            vec![],
+            vec![create_log_path(&checkpoint_file_path)],
+            None,
+        ),
         log_root,
         None,
     )?;
@@ -1247,7 +1287,10 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
-    let (first_batch, is_log_batch) = iter.next().unwrap()?;
+    let ActionsBatch {
+        actions: first_batch,
+        is_log_batch,
+    } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(
         first_batch,
@@ -1257,7 +1300,10 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         ),
     );
     // Assert that the second batch returned is from reading sidecarfile1
-    let (second_batch, is_log_batch) = iter.next().unwrap()?;
+    let ActionsBatch {
+        actions: second_batch,
+        is_log_batch,
+    } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(
         second_batch,
@@ -1265,7 +1311,10 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
     );
 
     // Assert that the second batch returned is from reading sidecarfile2
-    let (third_batch, is_log_batch) = iter.next().unwrap()?;
+    let ActionsBatch {
+        actions: third_batch,
+        is_log_batch,
+    } = iter.next().unwrap()?;
     assert!(!is_log_batch);
     assert_batch_matches(
         third_batch,
@@ -1300,6 +1349,32 @@ fn create_segment_for(
     }
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None);
     LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), None, version_to_load).unwrap()
+}
+
+
+#[test]
+fn test_list_log_files_with_version() -> DeltaResult<()> {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(0, "crc"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(1, "crc"),
+            delta_path_for_version(2, "json"),
+        ],
+        None,
+    );
+    let result = list_log_files_with_version(storage.as_ref(), &log_root, Some(0), None)?;
+    let latest_crc = result.latest_crc_file.unwrap();
+    assert_eq!(
+        latest_crc.location.location.path(),
+        "/_delta_log/00000000000000000001.crc".to_string()
+    );
+    assert_eq!(latest_crc.version, 1);
+    assert_eq!(latest_crc.filename, "00000000000000000001.crc".to_string());
+    assert_eq!(latest_crc.extension, "crc".to_string());
+    assert_eq!(latest_crc.file_type, LogPathFileType::Crc);
+    Ok(())
 }
 
 fn test_compaction_listing(
@@ -1626,3 +1701,8 @@ fn test_commit_cover_minimal_overlap() {
         ],
     );
 }
+||||||| 9da2514
+=======
+
+
+>>>>>>> main

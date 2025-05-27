@@ -15,7 +15,7 @@ use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType
 ///
 /// # Safety
 /// The caller is responsible for freeing the returned memory, either by calling
-/// [`crate::expressions::free_kernel_expression`], or [`crate::handles::Handle::drop_handle`].
+/// [`crate::expressions::free_kernel_expression`], or [`crate::handle::Handle::drop_handle`].
 #[no_mangle]
 pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpression> {
     let array_type = ArrayType::new(
@@ -98,7 +98,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
 ///
 /// # Safety
 /// The caller is responsible for freeing the returned memory, either by calling
-/// [`crate::expressions::free_kernel_predicate`], or [`crate::handles::Handle::drop_handle`].
+/// [`crate::expressions::free_kernel_predicate`], or [`crate::handle::Handle::drop_handle`].
 #[no_mangle]
 pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicate> {
     let array_type = ArrayType::new(
@@ -117,11 +117,11 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
             Expr::literal(10),
             Scalar::Array(array_data.clone()),
         ),
-        Pred::binary(
-            BinaryPredicateOp::NotIn,
+        Pred::not(Pred::binary(
+            BinaryPredicateOp::In,
             Expr::literal(10),
             Scalar::Array(array_data),
-        ),
+        )),
         Pred::or_from(vec![
             Pred::eq(Expr::literal(5), Expr::literal(10)),
             Pred::ne(Expr::literal(20), Expr::literal(10)),
@@ -130,16 +130,16 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
     ];
     sub_exprs.extend(
         [
-            BinaryPredicateOp::Equal,
-            BinaryPredicateOp::NotEqual,
-            BinaryPredicateOp::LessThan,
-            BinaryPredicateOp::LessThanOrEqual,
-            BinaryPredicateOp::GreaterThan,
-            BinaryPredicateOp::GreaterThanOrEqual,
-            BinaryPredicateOp::Distinct,
+            Pred::eq,
+            Pred::ne,
+            Pred::lt,
+            Pred::le,
+            Pred::gt,
+            Pred::ge,
+            Pred::distinct,
         ]
         .into_iter()
-        .map(|op| Pred::binary(op, Expr::literal(0), Expr::literal(0))),
+        .map(|op_fn| op_fn(Expr::literal(0), Expr::literal(0))),
     );
 
     Arc::new(Pred::and_from(sub_exprs)).into()

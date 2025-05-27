@@ -35,7 +35,7 @@ pub(crate) fn unwrap_kernel_expression(
 ) -> Option<Expression> {
     match state.inflight_ids.take(exprid)? {
         ExpressionOrPredicate::Expression(expr) => Some(expr),
-        ExpressionOrPredicate::Predicate(pred) => Some(Expression::predicate(pred)),
+        ExpressionOrPredicate::Predicate(pred) => Some(Expression::from_pred(pred)),
     }
 }
 
@@ -149,7 +149,8 @@ pub extern "C" fn visit_predicate_le(
     a: usize,
     b: usize,
 ) -> usize {
-    visit_predicate_binary(state, BinaryPredicateOp::LessThanOrEqual, a, b)
+    let p = visit_predicate_binary(state, BinaryPredicateOp::GreaterThan, a, b);
+    visit_predicate_not(state, p)
 }
 
 #[no_mangle]
@@ -167,7 +168,8 @@ pub extern "C" fn visit_predicate_ge(
     a: usize,
     b: usize,
 ) -> usize {
-    visit_predicate_binary(state, BinaryPredicateOp::GreaterThanOrEqual, a, b)
+    let p = visit_predicate_binary(state, BinaryPredicateOp::LessThan, a, b);
+    visit_predicate_not(state, p)
 }
 
 #[no_mangle]
@@ -177,6 +179,16 @@ pub extern "C" fn visit_predicate_eq(
     b: usize,
 ) -> usize {
     visit_predicate_binary(state, BinaryPredicateOp::Equal, a, b)
+}
+
+#[no_mangle]
+pub extern "C" fn visit_predicate_ne(
+    state: &mut KernelExpressionVisitorState,
+    a: usize,
+    b: usize,
+) -> usize {
+    let p = visit_predicate_binary(state, BinaryPredicateOp::Equal, a, b);
+    visit_predicate_not(state, p)
 }
 
 /// # Safety

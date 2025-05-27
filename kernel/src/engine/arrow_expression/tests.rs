@@ -10,7 +10,7 @@ use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
 use super::*;
 use crate::expressions::*;
 use crate::schema::{ArrayType, MapType, StructField, StructType};
-use crate::DataType as DeltaDataTypes;
+use crate::DataType as KernelDataType;
 use crate::EvaluationHandlerExtension as _;
 
 use Expression as Expr;
@@ -28,11 +28,11 @@ fn test_array_column() {
     let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
-    let not_op = Pred::binary(
-        BinaryPredicateOp::NotIn,
+    let not_op = Pred::not(Pred::binary(
+        BinaryPredicateOp::In,
         Expr::literal(5),
         column_expr!("item"),
-    );
+    ));
 
     let in_op = Pred::binary(
         BinaryPredicateOp::In,
@@ -40,13 +40,20 @@ fn test_array_column() {
         column_expr!("item"),
     );
 
-    let result = evaluate_predicate(&not_op, &batch).unwrap();
-    let expected = BooleanArray::from(vec![true, false, true]);
-    assert_eq!(result, expected);
+    let result = evaluate_predicate(&not_op, &batch, false).unwrap();
+    let expected_not_in = BooleanArray::from(vec![true, false, true]);
+    assert_eq!(result, expected_not_in);
 
-    let result = evaluate_predicate(&in_op, &batch).unwrap();
-    let expected = BooleanArray::from(vec![false, true, false]);
-    assert_eq!(result, expected);
+    let result = evaluate_predicate(&in_op, &batch, false).unwrap();
+    let expected_in = BooleanArray::from(vec![false, true, false]);
+    assert_eq!(result, expected_in);
+
+    // Test inversion as well
+    let result = evaluate_predicate(&not_op, &batch, true).unwrap();
+    assert_eq!(result, expected_in);
+
+    let result = evaluate_predicate(&in_op, &batch, true).unwrap();
+    assert_eq!(result, expected_not_in);
 }
 
 #[test]
@@ -56,13 +63,13 @@ fn test_bad_right_type_array() {
     let schema = Schema::new([field.clone()]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
 
-    let in_op = Pred::binary(
-        BinaryPredicateOp::NotIn,
+    let in_op = Pred::not(Pred::binary(
+        BinaryPredicateOp::In,
         Expr::literal(5),
         column_expr!("item"),
-    );
+    ));
 
-    let in_result = evaluate_predicate(&in_op, &batch);
+    let in_result = evaluate_predicate(&in_op, &batch, false);
 
     assert!(in_result.is_err());
     assert_eq!(
@@ -77,21 +84,26 @@ fn test_literal_type_array() {
     let schema = Schema::new([field.clone()]);
     let batch = RecordBatch::new_empty(Arc::new(schema));
 
-    let in_op = Pred::binary(
-        BinaryPredicateOp::NotIn,
+    let not_in_op = Pred::not(Pred::binary(
+        BinaryPredicateOp::In,
         Expr::literal(5),
         Scalar::Array(
             ArrayData::try_new(
-                ArrayType::new(DeltaDataTypes::INTEGER, false),
+                ArrayType::new(KernelDataType::INTEGER, false),
                 vec![Scalar::Integer(1), Scalar::Integer(2)],
             )
             .unwrap(),
         ),
-    );
+    ));
 
-    let in_result = evaluate_predicate(&in_op, &batch).unwrap();
-    let in_expected = BooleanArray::from(vec![true]);
-    assert_eq!(in_result, in_expected);
+    let result = evaluate_predicate(&not_in_op, &batch, false).unwrap();
+    let not_in_expected = BooleanArray::from(vec![true]);
+    assert_eq!(result, not_in_expected);
+
+    // Test inversion
+    let result = evaluate_predicate(&not_in_op, &batch, true).unwrap();
+    let in_expected = BooleanArray::from(vec![false]);
+    assert_eq!(result, in_expected);
 }
 
 #[test]
@@ -99,22 +111,22 @@ fn test_literal_complex_type_array() {
     use crate::arrow::array::{Array as _, AsArray as _};
     use crate::arrow::datatypes::Int32Type;
 
-    let array_type = ArrayType::new(DeltaDataTypes::INTEGER, true);
+    let array_type = ArrayType::new(KernelDataType::INTEGER, true);
     let array_value = Scalar::Array(
         ArrayData::try_new(
             array_type.clone(),
             vec![
                 Scalar::from(1),
                 Scalar::from(2),
-                Scalar::Null(DeltaDataTypes::INTEGER),
+                Scalar::Null(KernelDataType::INTEGER),
                 Scalar::from(3),
             ],
         )
         .unwrap(),
     );
     let map_type = MapType::new(
-        DeltaDataTypes::STRING,
-        DeltaDataTypes::Array(Box::new(array_type.clone())),
+        KernelDataType::STRING,
+        KernelDataType::Array(Box::new(array_type.clone())),
         true,
     );
     let map_value = Scalar::Map(
@@ -131,7 +143,7 @@ fn test_literal_complex_type_array() {
         .unwrap(),
     );
     let struct_fields = vec![
-        StructField::nullable("scalar", DeltaDataTypes::INTEGER),
+        StructField::nullable("scalar", KernelDataType::INTEGER),
         StructField::nullable("list", array_type.clone()),
         StructField::nullable("null_list", array_type.clone()),
         StructField::nullable("map", map_type.clone()),
@@ -232,13 +244,13 @@ fn test_invalid_array_sides() {
     let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
-    let in_op = Pred::binary(
-        BinaryPredicateOp::NotIn,
+    let in_op = Pred::not(Pred::binary(
+        BinaryPredicateOp::In,
         column_expr!("item"),
         column_expr!("item"),
-    );
+    ));
 
-    let in_result = evaluate_predicate(&in_op, &batch);
+    let in_result = evaluate_predicate(&in_op, &batch, false);
 
     assert!(in_result.is_err());
     assert_eq!(
@@ -259,11 +271,11 @@ fn test_str_arrays() {
     let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
-    let str_not_op = Pred::binary(
-        BinaryPredicateOp::NotIn,
+    let str_not_op = Pred::not(Pred::binary(
+        BinaryPredicateOp::In,
         Expr::literal("bye"),
         column_expr!("item"),
-    );
+    ));
 
     let str_in_op = Pred::binary(
         BinaryPredicateOp::In,
@@ -271,13 +283,20 @@ fn test_str_arrays() {
         column_expr!("item"),
     );
 
-    let result = evaluate_predicate(&str_in_op, &batch).unwrap();
-    let expected = BooleanArray::from(vec![true, true, true]);
-    assert_eq!(result, expected);
+    let result = evaluate_predicate(&str_in_op, &batch, false).unwrap();
+    let in_expected = BooleanArray::from(vec![true, true, true]);
+    assert_eq!(result, in_expected);
 
-    let result = evaluate_predicate(&str_not_op, &batch).unwrap();
-    let expected = BooleanArray::from(vec![false, false, false]);
-    assert_eq!(result, expected);
+    let result = evaluate_predicate(&str_not_op, &batch, false).unwrap();
+    let not_in_expected = BooleanArray::from(vec![false, false, false]);
+    assert_eq!(result, not_in_expected);
+
+    // Test inversion
+    let result = evaluate_predicate(&str_in_op, &batch, true).unwrap();
+    assert_eq!(result, not_in_expected);
+
+    let result = evaluate_predicate(&str_not_op, &batch, true).unwrap();
+    assert_eq!(result, in_expected);
 }
 
 #[test]
@@ -379,72 +398,112 @@ fn test_binary_cmp() {
     let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
     let column = column_expr!("a");
 
-    let predicate = column.clone().lt(Expr::literal(2));
-    let results = evaluate_predicate(&predicate, &batch).unwrap();
-    let expected = BooleanArray::from(vec![true, false, false]);
-    assert_eq!(results, expected);
+    let predicate_lt = column.clone().lt(Expr::literal(2));
+    let results = evaluate_predicate(&predicate_lt, &batch, false).unwrap();
+    let expected_lt = BooleanArray::from(vec![true, false, false]);
+    assert_eq!(results, expected_lt);
 
-    let predicate = column.clone().le(Expr::literal(2));
-    let results = evaluate_predicate(&predicate, &batch).unwrap();
-    let expected = BooleanArray::from(vec![true, true, false]);
-    assert_eq!(results, expected);
+    let predicate_le = column.clone().le(Expr::literal(2));
+    let results = evaluate_predicate(&predicate_le, &batch, false).unwrap();
+    let expected_le = BooleanArray::from(vec![true, true, false]);
+    assert_eq!(results, expected_le);
 
-    let predicate = column.clone().gt(Expr::literal(2));
-    let results = evaluate_predicate(&predicate, &batch).unwrap();
-    let expected = BooleanArray::from(vec![false, false, true]);
-    assert_eq!(results, expected);
+    let predicate_gt = column.clone().gt(Expr::literal(2));
+    let results = evaluate_predicate(&predicate_gt, &batch, false).unwrap();
+    let expected_gt = BooleanArray::from(vec![false, false, true]);
+    assert_eq!(results, expected_gt);
 
-    let predicate = column.clone().ge(Expr::literal(2));
-    let results = evaluate_predicate(&predicate, &batch).unwrap();
-    let expected = BooleanArray::from(vec![false, true, true]);
-    assert_eq!(results, expected);
+    let predicate_ge = column.clone().ge(Expr::literal(2));
+    let results = evaluate_predicate(&predicate_ge, &batch, false).unwrap();
+    let expected_ge = BooleanArray::from(vec![false, true, true]);
+    assert_eq!(results, expected_ge);
 
-    let predicate = column.clone().eq(Expr::literal(2));
-    let results = evaluate_predicate(&predicate, &batch).unwrap();
-    let expected = BooleanArray::from(vec![false, true, false]);
-    assert_eq!(results, expected);
+    let predicate_eq = column.clone().eq(Expr::literal(2));
+    let results = evaluate_predicate(&predicate_eq, &batch, false).unwrap();
+    let expected_eq = BooleanArray::from(vec![false, true, false]);
+    assert_eq!(results, expected_eq);
 
-    let predicate = column.clone().ne(Expr::literal(2));
-    let results = evaluate_predicate(&predicate, &batch).unwrap();
-    let expected = BooleanArray::from(vec![true, false, true]);
-    assert_eq!(results, expected);
+    let predicate_ne = column.clone().ne(Expr::literal(2));
+    let results = evaluate_predicate(&predicate_ne, &batch, false).unwrap();
+    let expected_ne = BooleanArray::from(vec![true, false, true]);
+    assert_eq!(results, expected_ne);
+
+    // Test inversion
+    let results = evaluate_predicate(&predicate_lt, &batch, true).unwrap();
+    assert_eq!(results, expected_ge);
+
+    let results = evaluate_predicate(&predicate_le, &batch, true).unwrap();
+    assert_eq!(results, expected_gt);
+
+    let results = evaluate_predicate(&predicate_gt, &batch, true).unwrap();
+    assert_eq!(results, expected_le);
+
+    let results = evaluate_predicate(&predicate_ge, &batch, true).unwrap();
+    assert_eq!(results, expected_lt);
+
+    let results = evaluate_predicate(&predicate_eq, &batch, true).unwrap();
+    assert_eq!(results, expected_ne);
+
+    let results = evaluate_predicate(&predicate_ne, &batch, true).unwrap();
+    assert_eq!(results, expected_eq);
 }
 
 #[test]
 fn test_logical() {
+    let t = Some(true);
+    let f = Some(false);
+    let n = None;
+
     let schema = Schema::new(vec![
         Field::new("a", DataType::Boolean, false),
-        Field::new("b", DataType::Boolean, false),
+        Field::new("b", DataType::Boolean, true),
     ]);
     let batch = RecordBatch::try_new(
         Arc::new(schema.clone()),
         vec![
-            Arc::new(BooleanArray::from(vec![true, false])),
-            Arc::new(BooleanArray::from(vec![false, true])),
+            Arc::new(BooleanArray::from(vec![t, t, f, f, t, f])),
+            Arc::new(BooleanArray::from(vec![t, f, t, f, n, n])),
         ],
     )
     .unwrap();
     let column_a = column_pred!("a");
     let column_b = column_pred!("b");
 
-    let pred = Pred::and(column_a.clone(), column_b.clone());
-    let results = evaluate_predicate(&pred, &batch).unwrap();
-    let expected = BooleanArray::from(vec![false, false]);
+    let pred_and_col = Pred::and(column_a.clone(), column_b.clone());
+    let results = evaluate_predicate(&pred_and_col, &batch, false).unwrap();
+    let expected = BooleanArray::from(vec![t, f, f, f, n, f]);
     assert_eq!(results, expected);
 
-    let pred = Pred::and(column_a.clone(), Pred::literal(true));
-    let results = evaluate_predicate(&pred, &batch).unwrap();
-    let expected = BooleanArray::from(vec![true, false]);
+    let pred_and_lit = Pred::and(column_a.clone(), Pred::literal(true));
+    let results = evaluate_predicate(&pred_and_lit, &batch, false).unwrap();
+    let expected = BooleanArray::from(vec![t, t, f, f, t, f]);
     assert_eq!(results, expected);
 
-    let pred = Pred::or(column_a.clone(), column_b);
-    let results = evaluate_predicate(&pred, &batch).unwrap();
-    let expected = BooleanArray::from(vec![true, true]);
+    let pred_or_col = Pred::or(column_a.clone(), column_b);
+    let results = evaluate_predicate(&pred_or_col, &batch, false).unwrap();
+    let expected = BooleanArray::from(vec![t, t, t, f, t, n]);
     assert_eq!(results, expected);
 
-    let pred = Pred::or(column_a.clone(), Pred::literal(false));
-    let results = evaluate_predicate(&pred, &batch).unwrap();
-    let expected = BooleanArray::from(vec![true, false]);
+    let pred_or_lit = Pred::or(column_a.clone(), Pred::literal(false));
+    let results = evaluate_predicate(&pred_or_lit, &batch, false).unwrap();
+    let expected = BooleanArray::from(vec![t, t, f, f, t, f]);
+    assert_eq!(results, expected);
+
+    // Test inversion
+    let results = evaluate_predicate(&pred_and_col, &batch, true).unwrap();
+    let expected = BooleanArray::from(vec![f, t, t, t, n, t]);
+    assert_eq!(results, expected);
+
+    let results = evaluate_predicate(&pred_and_lit, &batch, true).unwrap();
+    let expected = BooleanArray::from(vec![f, f, t, t, f, t]);
+    assert_eq!(results, expected);
+
+    let results = evaluate_predicate(&pred_or_col, &batch, true).unwrap();
+    let expected = BooleanArray::from(vec![f, f, f, t, f, n]);
+    assert_eq!(results, expected);
+
+    let results = evaluate_predicate(&pred_or_lit, &batch, true).unwrap();
+    let expected = BooleanArray::from(vec![f, f, t, t, f, t]);
     assert_eq!(results, expected);
 }
 
@@ -455,16 +514,16 @@ fn test_null_row() {
         StructField::nullable(
             "x",
             StructType::new([
-                StructField::nullable("a", crate::schema::DataType::INTEGER),
-                StructField::not_null("b", crate::schema::DataType::STRING),
+                StructField::nullable("a", KernelDataType::INTEGER),
+                StructField::not_null("b", KernelDataType::STRING),
             ]),
         ),
-        StructField::nullable("c", crate::schema::DataType::STRING),
+        StructField::nullable("c", KernelDataType::STRING),
     ]));
     let handler = ArrowEvaluationHandler;
     let result = handler.null_row(schema.clone()).unwrap();
     let expected = RecordBatch::try_new(
-        Arc::new(schema.as_ref().try_into().unwrap()),
+        Arc::new(schema.as_ref().try_into_arrow().unwrap()),
         vec![
             Arc::new(StructArray::new_null(
                 [
@@ -490,7 +549,7 @@ fn test_null_row() {
 fn test_null_row_err() {
     let not_null_schema = Arc::new(StructType::new(vec![StructField::not_null(
         "a",
-        crate::schema::DataType::STRING,
+        KernelDataType::STRING,
     )]));
     let handler = ArrowEvaluationHandler;
     assert!(handler.null_row(not_null_schema).is_err());
@@ -514,13 +573,13 @@ fn test_create_one() {
         1.into(),
         "B".into(),
         3.into(),
-        Scalar::Null(DeltaDataTypes::INTEGER),
+        Scalar::Null(KernelDataType::INTEGER),
     ];
     let schema = Arc::new(StructType::new([
-        StructField::nullable("a", DeltaDataTypes::INTEGER),
-        StructField::nullable("b", DeltaDataTypes::STRING),
-        StructField::not_null("c", DeltaDataTypes::INTEGER),
-        StructField::nullable("d", DeltaDataTypes::INTEGER),
+        StructField::nullable("a", KernelDataType::INTEGER),
+        StructField::nullable("b", KernelDataType::STRING),
+        StructField::not_null("c", KernelDataType::INTEGER),
+        StructField::nullable("d", KernelDataType::INTEGER),
     ]));
 
     let expected_schema = Arc::new(Schema::new(vec![
@@ -547,9 +606,9 @@ fn test_create_one_nested() {
     let values: &[Scalar] = &[1.into(), 2.into()];
     let schema = Arc::new(StructType::new([StructField::not_null(
         "a",
-        DeltaDataTypes::struct_type([
-            StructField::nullable("b", DeltaDataTypes::INTEGER),
-            StructField::not_null("c", DeltaDataTypes::INTEGER),
+        KernelDataType::struct_type([
+            StructField::nullable("b", KernelDataType::INTEGER),
+            StructField::not_null("c", KernelDataType::INTEGER),
         ]),
     )]));
     let expected_schema = Arc::new(Schema::new(vec![Field::new(
@@ -582,12 +641,12 @@ fn test_create_one_nested() {
 
 #[test]
 fn test_create_one_nested_null() {
-    let values: &[Scalar] = &[Scalar::Null(DeltaDataTypes::INTEGER), 1.into()];
+    let values: &[Scalar] = &[Scalar::Null(KernelDataType::INTEGER), 1.into()];
     let schema = Arc::new(StructType::new([StructField::not_null(
         "a",
-        DeltaDataTypes::struct_type([
-            StructField::nullable("b", DeltaDataTypes::INTEGER),
-            StructField::not_null("c", DeltaDataTypes::INTEGER),
+        KernelDataType::struct_type([
+            StructField::nullable("b", KernelDataType::INTEGER),
+            StructField::not_null("c", KernelDataType::INTEGER),
         ]),
     )]));
     let expected_schema = Arc::new(Schema::new(vec![Field::new(
@@ -621,14 +680,14 @@ fn test_create_one_nested_null() {
 #[test]
 fn test_create_one_not_null_struct() {
     let values: &[Scalar] = &[
-        Scalar::Null(DeltaDataTypes::INTEGER),
-        Scalar::Null(DeltaDataTypes::INTEGER),
+        Scalar::Null(KernelDataType::INTEGER),
+        Scalar::Null(KernelDataType::INTEGER),
     ];
     let schema = Arc::new(StructType::new([StructField::not_null(
         "a",
-        DeltaDataTypes::struct_type([
-            StructField::not_null("b", DeltaDataTypes::INTEGER),
-            StructField::nullable("c", DeltaDataTypes::INTEGER),
+        KernelDataType::struct_type([
+            StructField::not_null("b", KernelDataType::INTEGER),
+            StructField::nullable("c", KernelDataType::INTEGER),
         ]),
     )]));
     let handler = ArrowEvaluationHandler;
@@ -637,12 +696,12 @@ fn test_create_one_not_null_struct() {
 
 #[test]
 fn test_create_one_top_level_null() {
-    let values = &[Scalar::Null(DeltaDataTypes::INTEGER)];
+    let values = &[Scalar::Null(KernelDataType::INTEGER)];
     let handler = ArrowEvaluationHandler;
 
     let schema = Arc::new(StructType::new([StructField::not_null(
         "col_1",
-        DeltaDataTypes::INTEGER,
+        KernelDataType::INTEGER,
     )]));
     assert!(matches!(
         handler.create_one(schema, values),
@@ -654,7 +713,7 @@ fn test_create_one_top_level_null() {
 fn test_scalar_map() -> DeltaResult<()> {
     // making an 2-row array each with a map with 2 pairs.
     // result: { key1: 1, key2: null }, { key1: 1, key2: null }
-    let map_type = MapType::new(DeltaDataTypes::STRING, DeltaDataTypes::INTEGER, true);
+    let map_type = MapType::new(KernelDataType::STRING, KernelDataType::INTEGER, true);
     let map_data = MapData::try_new(
         map_type,
         [("key1".to_string(), 1.into()), ("key2".to_string(), None)],
@@ -689,8 +748,8 @@ fn test_scalar_map() -> DeltaResult<()> {
 
 #[test]
 fn test_null_scalar_map() -> DeltaResult<()> {
-    let map_type = MapType::new(DeltaDataTypes::STRING, DeltaDataTypes::STRING, false);
-    let null_scalar_map = Scalar::Null(DeltaDataTypes::Map(Box::new(map_type)));
+    let map_type = MapType::new(KernelDataType::STRING, KernelDataType::STRING, false);
+    let null_scalar_map = Scalar::Null(KernelDataType::Map(Box::new(map_type)));
     let arrow_array = null_scalar_map.to_array(1)?;
     let map_array = arrow_array.as_any().downcast_ref::<MapArray>().unwrap();
 

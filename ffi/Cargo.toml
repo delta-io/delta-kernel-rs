@@ -24,7 +24,7 @@ url = "2"
 delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
 ] }
-delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.10.0" }
+delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.11.0" }
 
 [build-dependencies]
 cbindgen = "0.28"
@@ -40,6 +40,5 @@ trybuild = "1.0"
 default = ["default-engine"]
 default-engine = ["delta_kernel/default-engine", "delta_kernel/arrow"]
 tracing = [ "tracing-core", "tracing-subscriber" ]
-sync-engine = ["delta_kernel/sync-engine", "delta_kernel/arrow"]
 internal-api = []
 test-ffi = []

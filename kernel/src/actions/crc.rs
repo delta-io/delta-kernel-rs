@@ -1,6 +1,14 @@
 //! CRC (version checksum) file
+use std::sync::LazyLock;
 
+use super::visitors::{visit_metadata_at, visit_protocol_at};
 use super::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
+use crate::actions::PROTOCOL_NAME;
+use crate::engine_data::GetData;
+use crate::schema::ToSchema as _;
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
+use crate::utils::require;
+use crate::{DeltaResult, Error, RowVisitor};
 use delta_kernel_derive::ToSchema;
 
 /// Though technically not an action, we include the CRC (version checksum) file here. A [CRC file]
@@ -86,11 +94,65 @@ pub(crate) struct DeletedRecordCountsHistogram {
     pub(crate) deleted_record_counts: Vec<i64>,
 }
 
+/// For now we just define a visitor for Protocol and Metadata in CRC files since (for now) that's
+/// the only optimization we implement. Since CRC files can contain lots of other data, we have a
+/// specific visitor for only Protocol/Metadata here.
+#[allow(unused)] // TODO: remove after we read CRCs
+#[derive(Debug, Default)]
+pub(crate) struct CrcProtocolMetadataVisitor {
+    pub(crate) protocol: Protocol,
+    pub(crate) metadata: Metadata,
+}
+
+impl RowVisitor for CrcProtocolMetadataVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            // annoyingly, the 'metadata' in CRC is under the name 'metadata', not 'metaData'
+            let mut cols = Metadata::to_schema().leaves("metadata");
+            cols.extend(Protocol::to_schema().leaves(PROTOCOL_NAME));
+            cols
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        // getters = sum of Protocol + Metadata
+        require!(
+            getters.len() == 13,
+            Error::InternalError(format!(
+                "Wrong number of CrcProtocolMetadataVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        if row_count != 1 {
+            return Err(Error::InternalError(format!(
+                "Expected 1 row for CRC file, but got {row_count}",
+            )));
+        }
+
+        self.metadata = visit_metadata_at(0, &getters[..9])?
+            .ok_or(Error::generic("Metadata not found in CRC file"))?;
+        self.protocol = visit_protocol_at(0, &getters[9..])?
+            .ok_or(Error::generic("Protocol not found in CRC file"))?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Arc;
+
+    use crate::arrow::array::StringArray;
+
+    use crate::actions::{Format, Metadata, Protocol};
+    use crate::engine::sync::SyncEngine;
     use crate::schema::derive_macro_utils::ToDataType as _;
-    use crate::schema::{ArrayType, DataType, StructField, StructType, ToSchema as _};
+    use crate::schema::{ArrayType, DataType, StructField, StructType};
+    use crate::table_features::{ReaderFeature, WriterFeature};
+    use crate::utils::test_utils::string_array_to_engine_data;
+    use crate::Engine;
 
     #[test]
     fn test_file_size_histogram_schema() {
@@ -143,5 +205,73 @@ mod tests {
             ),
         ]);
         assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn test_crc_protocol_metadata_visitor() {
+        // create CRC to visit
+        let crc_json = serde_json::json!({
+            "tableSizeBytes": 100,
+            "numFiles": 10,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": {
+                "id": "testId",
+                "format": {
+                    "provider": "parquet",
+                    "options": {}
+                },
+                "schemaString": r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#,
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.columnMapping.mode": "none"
+                },
+                "createdTime": 1677811175
+            },
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["columnMapping"],
+                "writerFeatures": ["columnMapping"]
+            }
+        });
+
+        // convert JSON -> StringArray -> (string)EngineData -> actual CRC EngineData
+        let json_string = crc_json.to_string();
+        let json_strings = StringArray::from(vec![json_string.as_str()]);
+        let engine_data = string_array_to_engine_data(json_strings);
+        let engine = SyncEngine::new();
+        let json_handler = engine.json_handler();
+        let output_schema = Arc::new(Crc::to_schema());
+        let data = json_handler.parse_json(engine_data, output_schema).unwrap();
+
+        // run the visitor
+        let mut visitor = CrcProtocolMetadataVisitor::default();
+        visitor.visit_rows_of(data.as_ref()).unwrap();
+
+        let expected_protocol = Protocol {
+            min_reader_version: 3,
+            min_writer_version: 7,
+            reader_features: Some(vec![ReaderFeature::ColumnMapping]),
+            writer_features: Some(vec![WriterFeature::ColumnMapping]),
+        };
+        let expected_metadata = Metadata {
+            id: "testId".to_string(),
+            name: None,
+            description: None,
+            format: Format {
+                provider: "parquet".to_string(),
+                options: std::collections::HashMap::new(),
+            },
+            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
+            partition_columns: vec![],
+            created_time: Some(1677811175),
+            configuration: std::collections::HashMap::from([
+                ("delta.columnMapping.mode".to_string(), "none".to_string()),
+            ]),
+        };
+
+        assert_eq!(visitor.protocol, expected_protocol);
+        assert_eq!(visitor.metadata, expected_metadata);
     }
 }

@@ -92,7 +92,7 @@ mod arrow_compat;
 #[cfg(any(feature = "arrow-54", feature = "arrow-55"))]
 pub use arrow_compat::*;
 
-pub(crate) mod kernel_predicates;
+pub mod kernel_predicates;
 pub(crate) mod utils;
 
 // for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
@@ -124,11 +124,7 @@ use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
 use schema::{SchemaTransform, StructField, StructType};
 
-#[cfg(any(
-    feature = "default-engine",
-    feature = "sync-engine",
-    feature = "arrow-conversion"
-))]
+#[cfg(any(feature = "default-engine", feature = "arrow-conversion"))]
 pub mod engine;
 
 /// Delta table version is 8 byte unsigned int
