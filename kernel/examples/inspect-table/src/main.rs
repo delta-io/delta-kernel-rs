@@ -222,7 +222,7 @@ fn try_main() -> DeltaResult<()> {
 
             let mut visitor = LogVisitor::new();
             for action in actions {
-                visitor.visit_rows_of(action?.0.as_ref())?;
+                visitor.visit_rows_of(action?.actions())?;
             }
 
             if oldest_first {
