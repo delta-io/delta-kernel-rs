@@ -198,9 +198,9 @@ impl<'seen> FileActionDeduplicator<'seen> {
 #[internal_api]
 pub(crate) struct ActionsBatch {
     /// The batch of actions to be processed: each row is an action from the log.
-    pub(crate) actions: Box<dyn EngineData>,
+    pub actions: Box<dyn EngineData>,
     /// Whether the batch is from a commit log (=true) or a checkpoint/CRC/elsewhere (=false).
-    pub(crate) is_log_batch: bool,
+    pub is_log_batch: bool,
 }
 
 impl ActionsBatch {
