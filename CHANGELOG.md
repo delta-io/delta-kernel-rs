@@ -1,5 +1,130 @@
 # Changelog
 
+## [v0.11.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.11.0/) (2025-05-27)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.10.0...v0.11.0)
+
+### 🏗️ Breaking changes
+1. Add in-commit timestamp table feature ([#894])
+2. Make `Error` non_exhaustive (will reduce future breaking changes!) ([#913])
+3. `Scalar::Map` support ([#881])
+   - New `Scalar::Map(MapData)` variant and `MapData` struct to describe `Scalar` maps.
+   - New `visit_literal_map` FFI
+4. Split out predicates as different from expressions ([#775]): pervasive change which moves some
+   expressions to new predicate type.
+5. Bump MSRV from 1.81 to 1.82 ([#942])
+6. `DataSkippingPredicateEvaluator`'s associated types `TypedStat` and `IntStat` combined into one
+   `ColumnStat` type ([#939])
+7. Code movement in FFI crate ([#940]):
+   - Rename `ffi::expressions::engine` mod as `kernel_visitor`
+   - Rename `ffi::expressions::kernel` mod as `engine_visitor`
+   - Move the `free_kernel_[expression|predicate]` functions to the `expressions` mod
+   - Move the `EnginePredicate` struct to the `ffi::scan` module
+8. Fix timestamp ntz in physical to logical cdf ([#948]): now `TableChangesScan::execute` returns
+   a schema with `_commit_timestamp` of type `Timestamp` (UTC) instead of `TimestampNtz`.
+9. Add TryIntoKernel/Arrow traits ([#946]): Removes old `From`/`Into` implementations for kernel
+   schema types, replaces with `TryFromKernel`/`TryIntoKernel`/`TryFromArrow`/`TryIntoArrow`.
+   Migration should be as simple as changing a `.try_into()` to a `.try_into_kernel()` or
+   `.try_into_arrow()`.
+10. Remove `SyncEngine` (now test-only), use `DefaultEngine` everywhere else ([#957])
+
+### 🚀 Features / new APIs
+
+1. Add `Snapshot::checkpoint()` & `Table::checkpoint()` API ([#797])
+2. Add CRC ParsedLogPath ([#889])
+3. Use arrow array builders in Scalar::to_array ([#905])
+4. Add `domainMetadata` read support ([#875])
+5. Support maps and arrays in literal_expression_transform ([#882])
+6. Add `CheckpointWriter::finalize()` API ([#851])
+7. `DataSkippingPredicate` dyn compatible ([#939]): `finish_eval_pred_junction` now takes `&dyn Iterator`
+8. Store compacted log files in LogSegment ([#936])
+9. Add CRC, FileSizeHistogram, and DeletedRecordCountsHistogram schemas ([#917])
+10. Scan from previous result ([#829])
+11. Include latest CRC in LogSegment ([#964])
+12. CRC protocol+metadata visitor ([#972])
+13. Make several types/function pub and fix their doc comments ([#977])
+    - `KernelPredicateEvaluator` and `KernelPredicateEvaluatorDefaults` are now pub.
+    - `DataSkippingPredicateEvaluator` is now pub.
+    - add new type aliases `DirectDataSkippingPredicateEvaluator` and `IndirectDataSkippingPredicateEvaluator`
+    - Arrow engine `evaluate_expression` and `evaluate_predicate` are now pub.
+    - `Expression::predicate` renamed to `Expression::from_pred`
+
+### 🐛 Bug Fixes
+
+1. Fix incorrect results for `Scalar::Array::to_array` ([#905])
+2. Use object_store::Path::from_url_path when appropriate ([#924])
+3. Don't include modules via a macro ([#935])
+4. Rustc 1.87 clippy fixes ([#955])
+5. Allow CheckpointDataIterator to be used across await ([#961])
+6. Remove `target-cpu=native` rustflags ([#960])
+7. Rename `drop_null_container_values` to `allow_null_container_values` ([#965])
+8. Make `ActionsBatch` fields pub for `internal-api` ([#983])
+
+### 📚 Documentation
+
+1. Add readme badges ([#904])
+
+### 🚜 Refactor
+
+1. Combine actions counts in `CheckpointVisitor` ([#883])
+2. Simplify Display for Expression and Predicate ([#938])
+3. Macro traits cleanup ([#967])
+4. Remove redundant binary predicate operations ([#949])
+5. Make arrow predicate eval directly invertible ([#956])
+6. Add `ActionsBatch` ([#974])
+
+### ⚙️ Chores/CI
+
+1. Remove abs_diff since we have rust 1.81 ([#909])
+2. Conditional compilation instead of suppressing clippy warnings ([#945])
+3. Expose some more arrow utils via `internal-api` ([#971])
+4. Use consistent naming of kernel data type in arrow eval tests ([#978])
+5. Cargo doc workspace + all-features ([#981])
+
+
+[#797]: https://github.com/delta-io/delta-kernel-rs/pull/797
+[#909]: https://github.com/delta-io/delta-kernel-rs/pull/909
+[#889]: https://github.com/delta-io/delta-kernel-rs/pull/889
+[#904]: https://github.com/delta-io/delta-kernel-rs/pull/904
+[#894]: https://github.com/delta-io/delta-kernel-rs/pull/894
+[#905]: https://github.com/delta-io/delta-kernel-rs/pull/905
+[#913]: https://github.com/delta-io/delta-kernel-rs/pull/913
+[#881]: https://github.com/delta-io/delta-kernel-rs/pull/881
+[#883]: https://github.com/delta-io/delta-kernel-rs/pull/883
+[#875]: https://github.com/delta-io/delta-kernel-rs/pull/875
+[#775]: https://github.com/delta-io/delta-kernel-rs/pull/775
+[#924]: https://github.com/delta-io/delta-kernel-rs/pull/924
+[#882]: https://github.com/delta-io/delta-kernel-rs/pull/882
+[#851]: https://github.com/delta-io/delta-kernel-rs/pull/851
+[#935]: https://github.com/delta-io/delta-kernel-rs/pull/935
+[#942]: https://github.com/delta-io/delta-kernel-rs/pull/942
+[#938]: https://github.com/delta-io/delta-kernel-rs/pull/938
+[#939]: https://github.com/delta-io/delta-kernel-rs/pull/939
+[#940]: https://github.com/delta-io/delta-kernel-rs/pull/940
+[#945]: https://github.com/delta-io/delta-kernel-rs/pull/945
+[#936]: https://github.com/delta-io/delta-kernel-rs/pull/936
+[#955]: https://github.com/delta-io/delta-kernel-rs/pull/955
+[#917]: https://github.com/delta-io/delta-kernel-rs/pull/917
+[#961]: https://github.com/delta-io/delta-kernel-rs/pull/961
+[#948]: https://github.com/delta-io/delta-kernel-rs/pull/948
+[#960]: https://github.com/delta-io/delta-kernel-rs/pull/960
+[#965]: https://github.com/delta-io/delta-kernel-rs/pull/965
+[#967]: https://github.com/delta-io/delta-kernel-rs/pull/967
+[#829]: https://github.com/delta-io/delta-kernel-rs/pull/829
+[#949]: https://github.com/delta-io/delta-kernel-rs/pull/949
+[#956]: https://github.com/delta-io/delta-kernel-rs/pull/956
+[#946]: https://github.com/delta-io/delta-kernel-rs/pull/946
+[#957]: https://github.com/delta-io/delta-kernel-rs/pull/957
+[#964]: https://github.com/delta-io/delta-kernel-rs/pull/964
+[#972]: https://github.com/delta-io/delta-kernel-rs/pull/972
+[#974]: https://github.com/delta-io/delta-kernel-rs/pull/974
+[#971]: https://github.com/delta-io/delta-kernel-rs/pull/971
+[#978]: https://github.com/delta-io/delta-kernel-rs/pull/978
+[#977]: https://github.com/delta-io/delta-kernel-rs/pull/977
+[#981]: https://github.com/delta-io/delta-kernel-rs/pull/981
+[#983]: https://github.com/delta-io/delta-kernel-rs/pull/983
+
+
 ## [v0.10.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.10.0/) (2025-04-28)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.9.0...v0.10.0)
