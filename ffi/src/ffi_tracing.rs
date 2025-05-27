@@ -85,7 +85,7 @@ pub type TracingEventFn = extern "C" fn(event: Event);
 /// Returns `true` if the callback was setup successfully, false on failure (i.e. if called a second
 /// time)
 ///
-/// [`event`] based tracing gives an engine maximal flexibility in formatting event log
+/// Event-based tracing gives an engine maximal flexibility in formatting event log
 /// lines. Kernel can also format events for the engine. If this is desired call
 /// [`enable_log_line_tracing`] instead of this method.
 ///

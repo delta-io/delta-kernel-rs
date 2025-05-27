@@ -39,7 +39,7 @@ mod tests;
 /// - `OR` is rewritten only if all operands are eligible for data skipping. Otherwise, the whole OR
 ///   predicate is dropped.
 #[cfg(test)]
-fn as_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
+pub(crate) fn as_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
     DataSkippingPredicateCreator.eval(pred)
 }
 

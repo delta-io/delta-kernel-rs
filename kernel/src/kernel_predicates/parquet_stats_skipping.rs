@@ -27,8 +27,7 @@ pub(crate) trait ParquetStatsProvider {
     fn get_parquet_rowcount_stat(&self) -> i64;
 }
 
-/// Blanket implementation that converts a [`ParquetStatsProvider`] into a
-/// [`DataSkippingPredicateEvaluator`].
+// Blanket implementation for all types that impl ParquetStatsProvider.
 impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
     type Output = bool;
     type ColumnStat = Scalar;
