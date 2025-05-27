@@ -125,8 +125,12 @@ pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[cfg_attr(
+    any(test, feature = "internal-api"),
+    derive(Serialize, Deserialize),
+    serde(rename_all = "camelCase")
+)]
 #[internal_api]
-#[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
 pub(crate) struct Format {
     /// Name of the encoding for files in this table
     pub(crate) provider: String,
@@ -144,7 +148,11 @@ impl Default for Format {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
+#[cfg_attr(
+    any(test, feature = "internal-api"),
+    derive(Serialize, Deserialize),
+    serde(rename_all = "camelCase")
+)]
 #[internal_api]
 pub(crate) struct Metadata {
     /// Unique identifier for this table
