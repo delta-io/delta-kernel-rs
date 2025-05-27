@@ -8,25 +8,26 @@
 1. Add in-commit timestamp table feature ([#894])
 2. Make `Error` non_exhaustive ([#913])
 3. `Scalar::Map` support ([#881])
-  - New `Scalar::Map(MapData)` variant and `MapData` struct to describe `Scalar` maps.
-  - New `visit_literal_map` FFI
+   - New `Scalar::Map(MapData)` variant and `MapData` struct to describe `Scalar` maps.
+   - New `visit_literal_map` FFI
 4. Split out predicates as different from expressions ([#775]): pervasive change which moves some
    expressions to new predicate type.
 5. Bump MSRV from 1.81 to 1.82 ([#942])
-6. Make `DataSkippingPredicate` dyn compatible ([#939]): combined the associated types `TypedStat`
-   and `IntStat` into one `ColumnStat` type.
-7. Code movement in FFI crate ([#940]):
-  - Rename `ffi::expressions::engine` mod as `kernel_visitor`
-  - Rename `ffi::expressions::kernel` mod as `engine_visitor`
-  - Move the `free_kernel_[expression|predicate]` functions to the `expressions` mod
-  - Move the `EnginePredicate` struct to the `ffi::scan` module
-8. Fix timestamp ntz in physical to logical cdf ([#948]): now `TableChangesScan::execute` returns
+6. Make `DataSkippingPredicate` dyn compatible ([#939])
+7. `DataSkippingPredicateEvaluator`'s associated types `TypedStat` and `IntStat` combined into one
+   `ColumnStat` type ([#939])
+8. Code movement in FFI crate ([#940]):
+   - Rename `ffi::expressions::engine` mod as `kernel_visitor`
+   - Rename `ffi::expressions::kernel` mod as `engine_visitor`
+   - Move the `free_kernel_[expression|predicate]` functions to the `expressions` mod
+   - Move the `EnginePredicate` struct to the `ffi::scan` module
+9. Fix timestamp ntz in physical to logical cdf ([#948]): now `TableChangesScan::execute` returns
    a schema with `_commit_timestamp` of type `Timestamp` (UTC) instead of `TimestampNtz`.
-9. Add TryIntoKernel/Arrow traits ([#946]): Removes old `From`/`Into` implementations for kernel
+10. Add TryIntoKernel/Arrow traits ([#946]): Removes old `From`/`Into` implementations for kernel
    schema types, replaces with `TryFromKernel`/`TryIntoKernel`/`TryFromArrow`/`TryIntoArrow`.
    Migration should be as simple as changing a `.try_into()` to a `.try_into_kernel()` or
    `.try_into_arrow()`.
-10. Remove `SyncEngine` (now test-only), use `DefaultEngine` everywhere else ([#957])
+11. Remove `SyncEngine` (now test-only), use `DefaultEngine` everywhere else ([#957])
 
 ### 🚀 Features / new APIs
 
@@ -36,27 +37,29 @@
 4. Add `domainMetadata` read support ([#875])
 5. Support maps and arrays in literal_expression_transform ([#882])
 6. Add `CheckpointWriter::finalize()` API ([#851])
-7. Store compacted log files in LogSegment ([#936])
-8. Add CRC, FileSizeHistogram, and DeletedRecordCountsHistogram schemas ([#917])
-9. Scan from previous result ([#829])
-10. Include latest CRC in LogSegment ([#964])
-11. CRC protocol+metadata visitor ([#972])
-12. Make several types/function pub and fix their doc comments ([#977])
-  - `KernelPredicateEvaluator` and `KernelPredicateEvaluatorDefaults` are now pub.
-  - `DataSkippingPredicateEvaluator` is now pub.
-  - add new type aliases `DirectDataSkippingPredicateEvaluator` and `IndirectDataSkippingPredicateEvaluator`
-  - Arrow engine `evaluate_expression` and `evaluate_predicate` are now pub.
-  - `Expression::predicate` renamed to `Expression::from_pred`
+7. `DataSkippingPredicate` dyn compatible ([#939]): `finish_eval_pred_junction` now takes `&dyn Iterator`
+8. Store compacted log files in LogSegment ([#936])
+9. Add CRC, FileSizeHistogram, and DeletedRecordCountsHistogram schemas ([#917])
+10. Scan from previous result ([#829])
+11. Include latest CRC in LogSegment ([#964])
+12. CRC protocol+metadata visitor ([#972])
+13. Make several types/function pub and fix their doc comments ([#977])
+   - `KernelPredicateEvaluator` and `KernelPredicateEvaluatorDefaults` are now pub.
+   - `DataSkippingPredicateEvaluator` is now pub.
+   - add new type aliases `DirectDataSkippingPredicateEvaluator` and `IndirectDataSkippingPredicateEvaluator`
+   - Arrow engine `evaluate_expression` and `evaluate_predicate` are now pub.
+   - `Expression::predicate` renamed to `Expression::from_pred`
 
 ### 🐛 Bug Fixes
 
-1. Use object_store::Path::from_url_path when appropriate ([#924])
-2. Don't include modules via a macro ([#935])
-3. Rustc 1.87 clippy fixes ([#955])
-4. Allow CheckpointDataIterator to be used across await ([#961])
-5. Remove `target-cpu=native` rustflags ([#960])
-6. Rename `drop_null_container_values` to `allow_null_container_values` ([#965])
-7. Make `ActionsBatch` fields pub for `internal-api` ([#983])
+1. Fix incorrect results for `Scalar::Array::to_array` ([#905])
+2. Use object_store::Path::from_url_path when appropriate ([#924])
+3. Don't include modules via a macro ([#935])
+4. Rustc 1.87 clippy fixes ([#955])
+5. Allow CheckpointDataIterator to be used across await ([#961])
+6. Remove `target-cpu=native` rustflags ([#960])
+7. Rename `drop_null_container_values` to `allow_null_container_values` ([#965])
+8. Make `ActionsBatch` fields pub for `internal-api` ([#983])
 
 ### 📚 Documentation
 
