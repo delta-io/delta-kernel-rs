@@ -13,21 +13,20 @@
 4. Split out predicates as different from expressions ([#775]): pervasive change which moves some
    expressions to new predicate type.
 5. Bump MSRV from 1.81 to 1.82 ([#942])
-6. Make `DataSkippingPredicate` dyn compatible ([#939])
-7. `DataSkippingPredicateEvaluator`'s associated types `TypedStat` and `IntStat` combined into one
+6. `DataSkippingPredicateEvaluator`'s associated types `TypedStat` and `IntStat` combined into one
    `ColumnStat` type ([#939])
-8. Code movement in FFI crate ([#940]):
+7. Code movement in FFI crate ([#940]):
    - Rename `ffi::expressions::engine` mod as `kernel_visitor`
    - Rename `ffi::expressions::kernel` mod as `engine_visitor`
    - Move the `free_kernel_[expression|predicate]` functions to the `expressions` mod
    - Move the `EnginePredicate` struct to the `ffi::scan` module
-9. Fix timestamp ntz in physical to logical cdf ([#948]): now `TableChangesScan::execute` returns
+8. Fix timestamp ntz in physical to logical cdf ([#948]): now `TableChangesScan::execute` returns
    a schema with `_commit_timestamp` of type `Timestamp` (UTC) instead of `TimestampNtz`.
-10. Add TryIntoKernel/Arrow traits ([#946]): Removes old `From`/`Into` implementations for kernel
+9. Add TryIntoKernel/Arrow traits ([#946]): Removes old `From`/`Into` implementations for kernel
    schema types, replaces with `TryFromKernel`/`TryIntoKernel`/`TryFromArrow`/`TryIntoArrow`.
    Migration should be as simple as changing a `.try_into()` to a `.try_into_kernel()` or
    `.try_into_arrow()`.
-11. Remove `SyncEngine` (now test-only), use `DefaultEngine` everywhere else ([#957])
+10. Remove `SyncEngine` (now test-only), use `DefaultEngine` everywhere else ([#957])
 
 ### 🚀 Features / new APIs
 
