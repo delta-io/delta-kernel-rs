@@ -6,7 +6,7 @@
 
 ### 🏗️ Breaking changes
 1. Add in-commit timestamp table feature ([#894])
-2. Make `Error` non_exhaustive ([#913])
+2. Make `Error` non_exhaustive (will reduce future breaking changes!) ([#913])
 3. `Scalar::Map` support ([#881])
    - New `Scalar::Map(MapData)` variant and `MapData` struct to describe `Scalar` maps.
    - New `visit_literal_map` FFI
