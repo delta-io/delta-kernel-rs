@@ -4,24 +4,49 @@
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.10.0...v0.11.0)
 
+### 🏗️ Breaking changes
+1. Add in-commit timestamp table feature ([#894])
+2. Make `Error` non_exhaustive ([#913])
+3. `Scalar::Map` support ([#881])
+  - New `Scalar::Map(MapData)` variant and `MapData` struct to describe `Scalar` maps.
+  - New `visit_literal_map` FFI
+4. Split out predicates as different from expressions ([#775]): pervasive change which moves some
+   expressions to new predicate type.
+5. Bump MSRV from 1.81 to 1.82 ([#942])
+6. Make `DataSkippingPredicate` dyn compatible ([#939]): combined the associated types `TypedStat`
+   and `IntStat` into one `ColumnStat` type.
+7. Code movement in FFI crate ([#940]):
+  - Rename `ffi::expressions::engine` mod as `kernel_visitor`
+  - Rename `ffi::expressions::kernel` mod as `engine_visitor`
+  - Move the `free_kernel_[expression|predicate]` functions to the `expressions` mod
+  - Move the `EnginePredicate` struct to the `ffi::scan` module
+8. Fix timestamp ntz in physical to logical cdf ([#948]): now `TableChangesScan::execute` returns
+   a schema with `_commit_timestamp` of type `Timestamp` (UTC) instead of `TimestampNtz`.
+9. Add TryIntoKernel/Arrow traits ([#946]): Removes old `From`/`Into` implementations for kernel
+   schema types, replaces with `TryFromKernel`/`TryIntoKernel`/`TryFromArrow`/`TryIntoArrow`.
+   Migration should be as simple as changing a `.try_into()` to a `.try_into_kernel()` or
+   `.try_into_arrow()`.
+10. Remove `SyncEngine` (now test-only), use `DefaultEngine` everywhere else ([#957])
 
 ### 🚀 Features / new APIs
 
 1. Add `Snapshot::checkpoint()` & `Table::checkpoint()` API ([#797])
 2. Add CRC ParsedLogPath ([#889])
-3. Add in-commit timestamp table feature ([#894])
-4. Use arrow array builders in Scalar::to_array ([#905])
-5. Make `Error` non_exhaustive ([#913])
-6. `Scalar::Map` support ([#881])
-7. Add `domainMetadata` read support ([#875])
-8. Split out predicates as different from expressions ([#775])
-9. Support maps and arrays in literal_expression_transform ([#882])
-10. Add `CheckpointWriter::finalize()` API ([#851])
-11. Store compacted log files in LogSegment ([#936])
-12. Add CRC, FileSizeHistogram, and DeletedRecordCountsHistogram schemas ([#917])
-13. Scan from previous result ([#829])
-14. Include latest CRC in LogSegment ([#964])
-15. CRC protocol+metadata visitor ([#972])
+3. Use arrow array builders in Scalar::to_array ([#905])
+4. Add `domainMetadata` read support ([#875])
+5. Support maps and arrays in literal_expression_transform ([#882])
+6. Add `CheckpointWriter::finalize()` API ([#851])
+7. Store compacted log files in LogSegment ([#936])
+8. Add CRC, FileSizeHistogram, and DeletedRecordCountsHistogram schemas ([#917])
+9. Scan from previous result ([#829])
+10. Include latest CRC in LogSegment ([#964])
+11. CRC protocol+metadata visitor ([#972])
+12. Make several types/function pub and fix their doc comments ([#977])
+  - `KernelPredicateEvaluator` and `KernelPredicateEvaluatorDefaults` are now pub.
+  - `DataSkippingPredicateEvaluator` is now pub.
+  - add new type aliases `DirectDataSkippingPredicateEvaluator` and `IndirectDataSkippingPredicateEvaluator`
+  - Arrow engine `evaluate_expression` and `evaluate_predicate` are now pub.
+  - `Expression::predicate` renamed to `Expression::from_pred`
 
 ### 🐛 Bug Fixes
 
@@ -29,10 +54,9 @@
 2. Don't include modules via a macro ([#935])
 3. Rustc 1.87 clippy fixes ([#955])
 4. Allow CheckpointDataIterator to be used across await ([#961])
-5. Fix timestamp ntz in physical to logical cdf ([#948])
-6. Remove `target-cpu=native` rustflags ([#960])
-7. Rename `drop_null_container_values` to `allow_null_container_values` ([#965])
-8. Make `ActionsBatch` fields pub for `internal-api` ([#983])
+5. Remove `target-cpu=native` rustflags ([#960])
+6. Rename `drop_null_container_values` to `allow_null_container_values` ([#965])
+7. Make `ActionsBatch` fields pub for `internal-api` ([#983])
 
 ### 📚 Documentation
 
@@ -42,24 +66,18 @@
 
 1. Combine actions counts in `CheckpointVisitor` ([#883])
 2. Simplify Display for Expression and Predicate ([#938])
-3. Make DataSkippingPredicate dyn compatible ([#939])
-4. Code movement in FFI crate ([#940])
-5. Macro traits cleanup ([#967])
-6. Remove redundant binary predicate operations ([#949])
-7. Make arrow predicate eval directly invertible ([#956])
-8. Add TryIntoKernel/Arrow traits ([#946])
-9. Make `SyncEngine` test-only, use `DefaultEngine` everywhere else ([#957])
-10. Add `ActionsBatch` ([#974])
+3. Macro traits cleanup ([#967])
+4. Remove redundant binary predicate operations ([#949])
+5. Make arrow predicate eval directly invertible ([#956])
+6. Add `ActionsBatch` ([#974])
 
 ### ⚙️ Chores/CI
 
 1. Remove abs_diff since we have rust 1.81 ([#909])
-2. Bump msrv from 1.81 to 1.82 ([#942])
-3. Conditional compilation instead of suppressing clippy warnings ([#945])
-4. Expose some more arrow utils via `internal-api` ([#971])
-5. Use consistent naming of kernel data type in arrow eval tests ([#978])
-6. Make several types/function pub and fix their doc comments ([#977])
-7. Cargo doc workspace + all-features ([#981])
+2. Conditional compilation instead of suppressing clippy warnings ([#945])
+3. Expose some more arrow utils via `internal-api` ([#971])
+4. Use consistent naming of kernel data type in arrow eval tests ([#978])
+5. Cargo doc workspace + all-features ([#981])
 
 
 [#797]: https://github.com/delta-io/delta-kernel-rs/pull/797
