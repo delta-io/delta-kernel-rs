@@ -73,7 +73,8 @@ fn extract_column(mut parent: &dyn ProvidesColumnByName, col: &[String]) -> Delt
     }
 }
 
-pub(crate) fn evaluate_expression(
+/// Evaluates a kernel expression over a record batch
+pub fn evaluate_expression(
     expression: &Expression,
     batch: &RecordBatch,
     result_type: Option<&DataType>,
@@ -131,7 +132,7 @@ pub(crate) fn evaluate_expression(
 }
 
 /// Evaluates a (possibly inverted) kernel predicate over a record batch
-pub(crate) fn evaluate_predicate(
+pub fn evaluate_predicate(
     predicate: &Predicate,
     batch: &RecordBatch,
     inverted: bool,

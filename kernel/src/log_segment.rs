@@ -9,6 +9,7 @@ use crate::actions::{
     get_log_schema, Metadata, Protocol, ADD_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
     SIDECAR_NAME,
 };
+use crate::log_replay::ActionsBatch;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::snapshot::LastCheckpointHint;
@@ -204,9 +205,9 @@ impl LogSegment {
         LogSegment::try_new(listed_files, log_root, end_version)
     }
 
-    /// Read a stream of actions from this log segment. This returns an iterator of (EngineData,
-    /// bool) pairs, where the boolean flag indicates whether the data was read from a commit file
-    /// (true) or a checkpoint file (false).
+    /// Read a stream of actions from this log segment. This returns an iterator of
+    /// [`ActionsBatch`]s which includes EngineData of actions + a boolean flag indicating whether
+    /// the data was read from a commit file (true) or a checkpoint file (false).
     ///
     /// The log files will be read from most recent to oldest.
     ///
@@ -223,7 +224,7 @@ impl LogSegment {
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         // `replay` expects commit files to be sorted in descending order, so we reverse the sorted
         // commit files
         let commit_files: Vec<_> = self
@@ -235,7 +236,7 @@ impl LogSegment {
         let commit_stream = engine
             .json_handler()
             .read_json_files(&commit_files, commit_read_schema, meta_predicate.clone())?
-            .map_ok(|batch| (batch, true));
+            .map_ok(|batch| ActionsBatch::new(batch, true));
 
         let checkpoint_stream =
             self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate)?;
@@ -259,7 +260,7 @@ impl LogSegment {
         engine: &dyn Engine,
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
             || checkpoint_read_schema.contains(REMOVE_NAME);
         require!(
@@ -335,7 +336,7 @@ impl LogSegment {
                     .chain(sidecar_content.into_iter().flatten())
                     // The boolean flag indicates whether the batch originated from a commit file
                     // (true) or a checkpoint file (false).
-                    .map_ok(|sidecar_batch| (sidecar_batch, false));
+                    .map_ok(|sidecar_batch| ActionsBatch::new(sidecar_batch, false));
 
                 Ok(combined_batches)
             })
@@ -385,15 +386,15 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        let data_batches = self.replay_for_metadata(engine)?;
+        let actions_batches = self.replay_for_metadata(engine)?;
         let (mut metadata_opt, mut protocol_opt) = (None, None);
-        for batch in data_batches {
-            let (batch, _) = batch?;
+        for actions_batch in actions_batches {
+            let actions = actions_batch?.actions;
             if metadata_opt.is_none() {
-                metadata_opt = Metadata::try_new_from_data(batch.as_ref())?;
+                metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
             }
             if protocol_opt.is_none() {
-                protocol_opt = Protocol::try_new_from_data(batch.as_ref())?;
+                protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
             }
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 // we've found both, we can stop
@@ -417,7 +418,7 @@ impl LogSegment {
     fn replay_for_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let schema = get_log_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
         // filter out log files that do not contain metadata or protocol information
         static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
