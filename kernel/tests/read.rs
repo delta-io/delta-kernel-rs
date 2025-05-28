@@ -1328,7 +1328,6 @@ fn timestamp_partitioned_table() -> Result<(), Box<dyn std::error::Error>> {
     read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
 }
 
-
 #[test]
 fn compacted_log_files_table() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
