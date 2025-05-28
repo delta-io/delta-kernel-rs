@@ -88,7 +88,7 @@ pub trait OpaqueExpressionOp: DynPartialEq + std::fmt::Debug {
     /// etc); the operation is disqualified from participating in partition pruning.
     ///
     /// `Ok(Scalar::Null)` means the operation actually produced a legitimately NULL result.
-    fn eval_expr_scalar(&self, _values: &[Option<Scalar>]) -> DeltaResult<Scalar>;
+    fn eval_expr_scalar(&self, values: &[Option<Scalar>]) -> DeltaResult<Scalar>;
 }
 
 /// An opaque predicate operation (ie defined and implemented by the engine).

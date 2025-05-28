@@ -128,7 +128,8 @@ pub fn evaluate_expression(
 
             Ok(eval(&left_arr, &right_arr)?)
         }
-        (Opaque(_) | Unknown(_), _) => todo!(),
+        (Opaque(_), _) => Err(Error::unsupported("Cannot evaluate opaque expressions")),
+        (Unknown(name), _) => Err(Error::unsupported(format!("Unknown expression: {name:?}"))),
     }
 }
 
