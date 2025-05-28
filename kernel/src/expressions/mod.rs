@@ -77,7 +77,7 @@ pub trait OpaqueExpressionOp: DynPartialEq + std::fmt::Debug {
     /// Succinctly identifies this op
     fn name(&self) -> &str;
 
-    /// Attempts to apply this expression operation to a set of scalar values on behalf of a.
+    /// Attempts scalar evaluation of this opaque expression on behalf of a
     /// [`DirectDataSkippingPredicateEvaluator`], e.g. to implement partition pruning.
     ///
     /// An input of `None` means kernel was unable to evaluate that particular input arg. Otherwise,
@@ -88,7 +88,7 @@ pub trait OpaqueExpressionOp: DynPartialEq + std::fmt::Debug {
     /// etc); the operation is disqualified from participating in partition pruning.
     ///
     /// `Ok(Scalar::Null)` means the operation actually produced a legitimately NULL result.
-    fn eval_expr_scalar(&self, _values: &[Option<Scalar>]) -> DeltaResult<Scalar>;
+    fn eval_expr_scalar(&self, values: &[Option<Scalar>]) -> DeltaResult<Scalar>;
 }
 
 /// An opaque predicate operation (ie defined and implemented by the engine).
@@ -96,10 +96,10 @@ pub trait OpaquePredicateOp: DynPartialEq + std::fmt::Debug {
     /// Succinctly identifies this op
     fn name(&self) -> &str;
 
-    /// Attempts to apply this (possibly inverted) opaque predicate to a set of scalar values on
-    /// behalf of a [`DirectDataSkippingPredicateEvaluator`], e.g. to implement partition pruning or
-    /// to evaluate opaque data skipping predicates produced previously by an
-    /// [`IndirectDataSkippingPredicateEvaluator`].
+    /// Attempts scalar evaluation of this (possibly inverted) opaque predicate on behalf of a
+    /// [`DirectDataSkippingPredicateEvaluator`], e.g. as part of partition pruning or when
+    /// evaluating an opaque data skipping predicate an [`IndirectDataSkippingPredicateEvaluator`]
+    /// produced previously.
     ///
     /// An input of `None` means kernel was unable to evaluate that particular input arg. Otherwise,
     /// it is `Some(Scalar)` result of that evaluation (possibly `Scalar::Null` if NULL).
@@ -115,9 +115,8 @@ pub trait OpaquePredicateOp: DynPartialEq + std::fmt::Debug {
         inverted: bool,
     ) -> DeltaResult<Option<bool>>;
 
-    /// Attempts to use this (possibly inverted) opaque predicate for stats-based data skipping on
-    /// behalf of a [`DirectDataSkippingPredicateEvaluator`] that e.g. implements parquet row group
-    /// skipping.
+    /// Evaluates this (possibly inverted) opaque predicate for data skipping on behalf of a
+    /// [`DirectDataSkippingPredicateEvaluator`], e.g. for parquet row group skipping.
     ///
     /// An output of `None` indicates that this operation does not support evaluation as a data
     /// skipping predicate, or was invoked incorrectly (e.g. wrong number and/or types of arguments,
@@ -129,9 +128,8 @@ pub trait OpaquePredicateOp: DynPartialEq + std::fmt::Debug {
         inverted: bool,
     ) -> Option<bool>;
 
-    /// Attempts to convert this (possibly inverted) opaque predicate to a data skipping predicate
-    /// on behalf of an [`IndirectDataSkippingPredicateEvaluator`] that e.g. implements stats-based
-    /// file pruning.
+    /// Converts this (possibly inverted) opaque predicate to a data skipping predicate on behalf of
+    /// an [`IndirectDataSkippingPredicateEvaluator`], e.g. for stats-based file pruning.
     ///
     /// An output of `None` indicates that this operation does not support conversion to a data
     /// skipping predicate, or was invoked incorrectly (e.g. wrong number and/or types of arguments,
@@ -193,9 +191,9 @@ pub struct JunctionPredicate {
     pub preds: Vec<Predicate>,
 }
 
-// NOTE: We have to use `Arc<dyn OpaquePredicateOpRef>` instead of `Box<dyn OpaquePredicateOpRef>`
-// because we cannot require `OpaquePredicateOpRef: Clone`. The latter is not a dyn-compatible trait
-// and so we must rely on cheap `Arc` clone instead
+// NOTE: We have to use `Arc<dyn OpaquePredicateOp>` instead of `Box<dyn OpaquePredicateOp>` because
+// we cannot require `OpaquePredicateOp: Clone` (not a dyn-compatible trait). Instead, we must rely
+// on cheap `Arc` clone, which does not duplicate the inner object.
 #[derive(Clone, Debug)]
 pub struct OpaquePredicate {
     pub op: OpaquePredicateOpRef,
@@ -209,9 +207,9 @@ impl OpaquePredicate {
     }
 }
 
-// NOTE: We have to use `Arc<dyn OpaqueExpressionOpRef>` instead of `Box<dyn OpaqueExpressionOpRef>`
-// because we cannot require `OpaqueExpressionOpRef: Clone`. The latter is not a dyn-compatible trait and
-// so we must rely on cheap `Arc` clone instead.
+// NOTE: We have to use `Arc<dyn OpaqueExpressionOp>` instead of `Box<dyn OpaqueExpressionOp>`
+// because we cannot require `OpaqueExpressionOp: Clone` (not a dyn-compatible trait). Instead, we
+// must rely on cheap `Arc` clone, which does not duplicate the inner object.
 #[derive(Clone, Debug)]
 pub struct OpaqueExpression {
     pub op: OpaqueExpressionOpRef,
@@ -242,13 +240,17 @@ pub enum Expression {
     Struct(Vec<Expression>),
     /// An expression that takes two expressions as input.
     Binary(BinaryExpression),
-    /// An opaque expression (ie defined and implemented by the engine). Kernel does not attempt to
-    /// interpret the expression at all, but will preserve it so the engine can still evaluate it.
+    /// An expression that the engine defines and implements. Kernel interacts with the expression
+    /// only through methods provided by the [`OpaqueExpressionOp`] trait.
     Opaque(OpaqueExpression),
-    /// An unknown predicate (i.e. one that neither kernel nor engine attempts to evaluate). Kernel
-    /// refuses to evaluate expression trees containing unknown expressions, and engines should do
-    /// the same. Use an `Expression::Opaque` for expressions kernel doesn't understand but which
-    /// engine can still evaluate.
+    /// An unknown expression (i.e. one that neither kernel nor engine attempts to evaluate). For
+    /// data skipping purposes, kernel treats unknown expressions as if they were literal NULL
+    /// values (which may disable skipping if it "poisons" the predicate), but engines MUST NOT
+    /// attempt to interpret them as NULL when evaluating query filters because it could produce
+    /// incorrect results. For example, converting `WHERE <fancy-udf-invocation> IS NULL` to `WHERE
+    /// <unknown> IS NULL` to `WHERE NULL IS NULL` is equivalent to `WHERE TRUE` and would include
+    /// all rows -- almost certainly NOT what the query author intended. Use `Expression::Opaque`
+    /// for expressions kernel doesn't understand but which engine can still evaluate.
     Unknown(String),
 }
 
@@ -274,15 +276,17 @@ pub enum Predicate {
     Binary(BinaryPredicate),
     /// A junction operation (AND/OR).
     Junction(JunctionPredicate),
-    /// An opaque predicate (ie defined and implemented by the engine). The predicate is not
-    /// eligible for data skipping, but can participate in partition pruning if it provides scalar
-    /// evaluation.
+    /// A predicate that the engine defines and implements. Kernel interacts with the predicate
+    /// only through methods provided by the [`OpaquePredicateOp`] trait.
     Opaque(OpaquePredicate),
-    /// An unknown predicate (i.e. one that neither kernel nor engine attempts to
-    /// evaluate). Kernel's predicate evaluation implementations treat such predicates just like any
-    /// other predicate that doesn't support data skipping, but engines should refuse to evaluate
-    /// predicate trees containing unknown predicates. Use a `Predicate::Opaque` for predicates
-    /// kernel doesn't understand but which engine can still evaluate.
+    /// An unknown predicate (i.e. one that neither kernel nor engine attempts to evaluate). For
+    /// data skipping purposes, kernel treats unknown predicates as if they were literal NULL values
+    /// (which may disable skipping if it "poisons" the predicate), but engines MUST NOT attempt to
+    /// interpret them as NULL when evaluating query filters because it could produce incorrect
+    /// results. For example, converting `WHERE <fancy-udf-invocation>` to `WHERE NULL` is
+    /// equivalent to `WHERE FALSE` and would filter out all rows -- almost certainly NOT what the
+    /// query author intended. Use `Predicate::Opaque` for predicates kernel doesn't understand
+    /// but which engine can still evaluate.
     Unknown(String),
 }
 
