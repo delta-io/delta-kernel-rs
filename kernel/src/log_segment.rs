@@ -502,7 +502,7 @@ fn list_log_files(
 }
 
 /// A struct to hold the result of listing log files. The commit and compaction files are guaranteed
-/// to be sorted in ascending order by version. The elements of `checkpoint_parts` are all the parts
+/// to be contiguously sorted in ascending order by version. The elements of `checkpoint_parts` are all the parts
 /// of the same checkpoint. Checkpoint parts share the same version. The `latest_crc_file` includes
 /// the latest (highest version) CRC file, if any, which may not correspond to the latest commit.
 #[derive(Debug)]
@@ -520,9 +520,15 @@ impl ListedLogFiles {
         checkpoint_parts: Vec<ParsedLogPath>,
         latest_crc_file: Option<ParsedLogPath>,
     ) -> Self {
-        debug_assert!(ascending_commit_files.is_sorted_by_key(|f| f.version));
-        debug_assert!(ascending_compaction_files.is_sorted_by_key(|f| f.version));
-        // Debug assert for checking that checkpoint_parts are from the same checkpoint.
+        debug_assert!(ascending_commit_files.windows(2).all(|f| f[0].version == f[1].version-1));
+        debug_assert!(ascending_compaction_files.windows(2).all(|f| f[0].version == f[1].version-1));
+        debug_assert!(checkpoint_parts.iter().all(|p| p.is_checkpoint()));
+        debug_assert!(checkpoint_parts.windows(2).all(|p| p[0].file_type == p[1].file_type));
+        debug_assert!(
+            checkpoint_parts.is_empty() || 
+            !matches!(checkpoint_parts[0].file_type, LogPathFileType::MultiPartCheckpoint { .. }) ||
+            matches!(checkpoint_parts[0].file_type, LogPathFileType::MultiPartCheckpoint { num_parts, .. } if checkpoint_parts.len() == num_parts as usize)
+        );
         debug_assert!(checkpoint_parts.windows(2).all(|f| f[0].version == f[1].version));
 
         ListedLogFiles {
