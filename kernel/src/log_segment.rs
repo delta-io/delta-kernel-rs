@@ -229,7 +229,11 @@ impl LogSegment {
         let commits_and_compactions = self.find_commit_cover();
         let commit_stream = engine
             .json_handler()
-            .read_json_files(&commits_and_compactions, commit_read_schema, meta_predicate.clone())?
+            .read_json_files(
+                &commits_and_compactions,
+                commit_read_schema,
+                meta_predicate.clone(),
+            )?
             .map_ok(|batch| ActionsBatch::new(batch, true));
 
         let checkpoint_stream =

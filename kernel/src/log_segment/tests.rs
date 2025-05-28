@@ -1351,7 +1351,6 @@ fn create_segment_for(
     LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), None, version_to_load).unwrap()
 }
 
-
 #[test]
 fn test_list_log_files_with_version() -> DeltaResult<()> {
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -1701,8 +1700,3 @@ fn test_commit_cover_minimal_overlap() {
         ],
     );
 }
-||||||| 9da2514
-=======
-
-
->>>>>>> main
