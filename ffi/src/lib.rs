@@ -806,8 +806,7 @@ mod tests {
         }
     }
 
-    pub(crate) fn get_default_engine() -> Handle<SharedExternEngine> {
-        let path = "memory:///doesntmatter/foo";
+    pub(crate) fn get_default_engine(path: &str) -> Handle<SharedExternEngine> {
         let path = kernel_string_slice!(path);
         let builder = unsafe { ok_or_panic(get_engine_builder(path, allocate_err)) };
         unsafe { ok_or_panic(builder_build(builder)) }
@@ -815,7 +814,7 @@ mod tests {
 
     #[test]
     fn engine_builder() {
-        let engine = get_default_engine();
+        let engine = get_default_engine("memory:///doesntmatter/foo");
         unsafe {
             free_engine(engine);
         }
