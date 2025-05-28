@@ -15,13 +15,13 @@ use crate::schema::SchemaRef;
 use crate::snapshot::LastCheckpointHint;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, Expression, ParquetHandler, Predicate, PredicateRef,
-    RowVisitor, StorageHandler, Version,
+    DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
+    PredicateRef, RowVisitor, StorageHandler, Version,
 };
 use delta_kernel_derive::internal_api;
 
 use itertools::Itertools;
-use tracing::warn;
+use tracing::{debug, warn};
 use url::Url;
 
 #[cfg(test)]
@@ -225,23 +225,64 @@ impl LogSegment {
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        // `replay` expects commit files to be sorted in descending order, so we reverse the sorted
-        // commit files
-        let commit_files: Vec<_> = self
-            .ascending_commit_files
-            .iter()
-            .rev()
-            .map(|f| f.location.clone())
-            .collect();
+        // `replay` expects commit files to be sorted in descending order, so the return value here is correct
+        let commits_and_compactions = self.find_commit_cover();
         let commit_stream = engine
             .json_handler()
-            .read_json_files(&commit_files, commit_read_schema, meta_predicate.clone())?
+            .read_json_files(
+                &commits_and_compactions,
+                commit_read_schema,
+                meta_predicate.clone(),
+            )?
             .map_ok(|batch| ActionsBatch::new(batch, true));
 
         let checkpoint_stream =
             self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate)?;
 
         Ok(commit_stream.chain(checkpoint_stream))
+    }
+
+    /// find a minimal set to cover the range of commits we want. This is greedy so not always
+    /// optimal, but we assume there are rarely overlapping compactions so this is okay. NB: This
+    /// returns files is DESCENDING ORDER, as that's what `replay` expects. This function assumes
+    /// that all files in `self.ascending_commit_files` and `self.ascending_compaction_files` are in
+    /// range for this log segment. This invariant is maintained by our listing code.
+    fn find_commit_cover(&self) -> Vec<FileMeta> {
+        // Create an iterator sorted in ascending order by (initial version, end version), e.g.
+        // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
+        //  10.19.compacted.json, 11.json, ...]
+        let all_files = itertools::Itertools::merge_by(
+            self.ascending_commit_files.iter(),
+            self.ascending_compaction_files.iter(),
+            |path_a, path_b| path_a.version <= path_b.version,
+        );
+
+        let mut last_pushed: Option<&ParsedLogPath> = None;
+
+        let mut selected_files = vec![];
+        for next in all_files {
+            match last_pushed {
+                // Resolve version number ties in favor of the later file (it covers a wider range)
+                Some(prev) if prev.version == next.version => {
+                    let removed = selected_files.pop();
+                    debug!("Selecting {next:?} rather than {removed:?}, it covers a wider range");
+                }
+                // Skip later files whose start overlaps with the previous end
+                Some(&ParsedLogPath {
+                    file_type: LogPathFileType::CompactedCommit { hi },
+                    ..
+                }) if next.version <= hi => {
+                    debug!("Skipping log file {next:?}, it's already covered.");
+                    continue;
+                }
+                _ => {} // just fall through
+            }
+            debug!("Provisionally selecting {next:?}");
+            last_pushed = Some(next);
+            selected_files.push(next.location.clone());
+        }
+        selected_files.reverse();
+        selected_files
     }
 
     /// Returns an iterator over checkpoint data, processing sidecar files when necessary.

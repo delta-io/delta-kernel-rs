@@ -1327,3 +1327,22 @@ fn timestamp_partitioned_table() -> Result<(), Box<dyn std::error::Error>> {
     let test_path = test_dir.path().join(test_name);
     read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
 }
+
+#[test]
+fn compacted_log_files_table() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+----+--------------------+",
+        "| id | comment            |",
+        "+----+--------------------+",
+        "| 0  | new                |",
+        "| 1  | after-large-delete |",
+        "| 2  |                    |",
+        "| 10 | merge1-insert      |",
+        "| 12 | merge2-insert      |",
+        "+----+--------------------+",
+    ];
+    let test_name = "compacted-log-files-table";
+    let test_dir = common::load_test_data("./tests/data", test_name).unwrap();
+    let test_path = test_dir.path().join(test_name);
+    read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
+}

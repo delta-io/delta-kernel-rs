@@ -4,6 +4,7 @@ use std::{path::PathBuf, sync::Arc};
 use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
 use futures::executor::block_on;
 use itertools::Itertools;
+use test_log::test;
 use url::Url;
 
 use crate::actions::visitors::AddVisitor;
@@ -27,7 +28,7 @@ use crate::snapshot::LastCheckpointHint;
 use crate::utils::test_utils::{assert_batch_matches, Action};
 use crate::{
     DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor,
-    StorageHandler, Table,
+    StorageHandler, Table, Version,
 };
 use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
 
@@ -1325,12 +1326,12 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
     Ok(())
 }
 
-fn test_compaction_listing(
+fn create_segment_for(
     commit_versions: &[u64],
     compaction_versions: &[(u64, u64)],
     checkpoint_version: Option<u64>,
     version_to_load: Option<u64>,
-) {
+) -> LogSegment {
     let mut paths: Vec<Path> = commit_versions
         .iter()
         .map(|version| delta_path_for_version(*version, "json"))
@@ -1347,10 +1348,46 @@ fn test_compaction_listing(
         ));
     }
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None);
-    let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), None, version_to_load)
-            .unwrap();
+    LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), None, version_to_load).unwrap()
+}
 
+#[test]
+fn test_list_log_files_with_version() -> DeltaResult<()> {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(0, "crc"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(1, "crc"),
+            delta_path_for_version(2, "json"),
+        ],
+        None,
+    );
+    let result = list_log_files_with_version(storage.as_ref(), &log_root, Some(0), None)?;
+    let latest_crc = result.latest_crc_file.unwrap();
+    assert_eq!(
+        latest_crc.location.location.path(),
+        "/_delta_log/00000000000000000001.crc".to_string()
+    );
+    assert_eq!(latest_crc.version, 1);
+    assert_eq!(latest_crc.filename, "00000000000000000001.crc".to_string());
+    assert_eq!(latest_crc.extension, "crc".to_string());
+    assert_eq!(latest_crc.file_type, LogPathFileType::Crc);
+    Ok(())
+}
+
+fn test_compaction_listing(
+    commit_versions: &[u64],
+    compaction_versions: &[(u64, u64)],
+    checkpoint_version: Option<u64>,
+    version_to_load: Option<u64>,
+) {
+    let log_segment = create_segment_for(
+        commit_versions,
+        compaction_versions,
+        checkpoint_version,
+        version_to_load,
+    );
     let version_to_load = version_to_load.unwrap_or(u64::MAX);
     let checkpoint_cuttoff = checkpoint_version.map(|v| v as i64).unwrap_or(-1);
     let expected_commit_versions: Vec<&u64> = commit_versions
@@ -1478,27 +1515,188 @@ fn test_compaction_starts_at_checkpoint() {
     );
 }
 
+enum ExpectedFile {
+    Commit(Version),
+    Compaction(Version, Version),
+}
+
+fn test_commit_cover(
+    commit_versions: &[u64],
+    compaction_versions: &[(u64, u64)],
+    checkpoint_version: Option<u64>,
+    version_to_load: Option<u64>,
+    expected_files: &[ExpectedFile],
+) {
+    let log_segment = create_segment_for(
+        commit_versions,
+        compaction_versions,
+        checkpoint_version,
+        version_to_load,
+    );
+    let cover = log_segment.find_commit_cover();
+    // our test-utils include "_delta_log" in the path, which is already in log_segment.log_root, so
+    // we don't use them. TODO: Unify this
+    let expected_locations = expected_files.iter().map(|ef| match ef {
+        ExpectedFile::Commit(version) => log_segment
+            .log_root
+            .join(&format!("{version:020}.json"))
+            .expect("Couldn't join"),
+        ExpectedFile::Compaction(lo, hi) => log_segment
+            .log_root
+            .join(&format!("{lo:020}.{hi:020}.compacted.json"))
+            .expect("Couldn't join"),
+    });
+    assert_eq!(cover.len(), expected_locations.len());
+    for (location, expected_location) in cover.iter().zip(expected_locations) {
+        assert_eq!(location.location, expected_location);
+    }
+}
+
 #[test]
-fn test_list_log_files_with_version() -> DeltaResult<()> {
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+fn test_commit_cover_one_compaction() {
+    test_commit_cover(
+        &[0, 1, 2],
+        &[(1, 2)],
+        None, // checkpoint version
+        None, // version to load
+        &[ExpectedFile::Compaction(1, 2), ExpectedFile::Commit(0)],
+    );
+}
+
+#[test]
+fn test_commit_cover_in_version_range() {
+    test_commit_cover(
+        &[0, 1, 2, 3],
+        &[(1, 2)],
+        None,    // checkpoint version
+        Some(2), // version to load
+        &[ExpectedFile::Compaction(1, 2), ExpectedFile::Commit(0)],
+    );
+}
+
+#[test]
+fn test_commit_cover_out_of_version_range() {
+    test_commit_cover(
+        &[0, 1, 2, 3, 4],
+        &[(1, 3)],
+        None,    // checkpoint version
+        Some(2), // version to load
         &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(0, "crc"),
-            delta_path_for_version(1, "json"),
-            delta_path_for_version(1, "crc"),
-            delta_path_for_version(2, "json"),
+            ExpectedFile::Commit(2),
+            ExpectedFile::Commit(1),
+            ExpectedFile::Commit(0),
         ],
-        None,
     );
-    let result = list_log_files_with_version(storage.as_ref(), &log_root, Some(0), None)?;
-    let latest_crc = result.latest_crc_file.unwrap();
-    assert_eq!(
-        latest_crc.location.location.path(),
-        "/_delta_log/00000000000000000001.crc".to_string()
+}
+
+#[test]
+fn test_commit_cover_multi_compaction() {
+    test_commit_cover(
+        &[0, 1, 2, 3, 4, 5],
+        &[(1, 2), (3, 5)],
+        None, // checkpoint version
+        None, //version to load
+        &[
+            ExpectedFile::Compaction(3, 5),
+            ExpectedFile::Compaction(1, 2),
+            ExpectedFile::Commit(0),
+        ],
     );
-    assert_eq!(latest_crc.version, 1);
-    assert_eq!(latest_crc.filename, "00000000000000000001.crc".to_string());
-    assert_eq!(latest_crc.extension, "crc".to_string());
-    assert_eq!(latest_crc.file_type, LogPathFileType::Crc);
-    Ok(())
+}
+
+#[test]
+fn test_commit_cover_multi_compaction_one_out_of_range() {
+    test_commit_cover(
+        &[0, 1, 2, 3, 4, 5],
+        &[(1, 2), (3, 5)],
+        None,    // checkpoint version
+        Some(4), // version to load
+        &[
+            ExpectedFile::Commit(4),
+            ExpectedFile::Commit(3),
+            ExpectedFile::Compaction(1, 2),
+            ExpectedFile::Commit(0),
+        ],
+    );
+}
+
+#[test]
+fn test_commit_cover_compaction_with_checkpoint() {
+    test_commit_cover(
+        &[0, 1, 2, 4, 5],
+        &[(1, 2), (4, 5)],
+        Some(3), // checkpoint version
+        None,    // version to load
+        &[ExpectedFile::Compaction(4, 5)],
+    );
+}
+
+#[test]
+fn test_commit_cover_too_early_with_checkpoint() {
+    test_commit_cover(
+        &[0, 1, 2, 4, 5],
+        &[(1, 2)],
+        Some(3), // checkpoint version
+        None,    // version to load
+        &[ExpectedFile::Commit(5), ExpectedFile::Commit(4)],
+    );
+}
+
+#[test]
+fn test_commit_cover_starts_at_checkpoint() {
+    test_commit_cover(
+        &[0, 1, 2, 4, 5],
+        &[(3, 5)],
+        Some(3), // checkpoint version
+        None,    // version to load
+        &[ExpectedFile::Commit(5), ExpectedFile::Commit(4)],
+    );
+}
+
+#[test]
+fn test_commit_cover_wider_range() {
+    test_commit_cover(
+        &Vec::from_iter(0..20),
+        &[(0, 5), (0, 10), (5, 10), (13, 19)],
+        None, // checkpoint version
+        None, // version to load
+        &[
+            ExpectedFile::Compaction(13, 19),
+            ExpectedFile::Commit(12),
+            ExpectedFile::Commit(11),
+            ExpectedFile::Compaction(0, 10),
+        ],
+    );
+}
+
+#[test]
+fn test_commit_cover_no_compactions() {
+    test_commit_cover(
+        &Vec::from_iter(0..4),
+        &[],
+        None, // checkpoint version
+        None, // version to load
+        &[
+            ExpectedFile::Commit(3),
+            ExpectedFile::Commit(2),
+            ExpectedFile::Commit(1),
+            ExpectedFile::Commit(0),
+        ],
+    );
+}
+
+#[test]
+fn test_commit_cover_minimal_overlap() {
+    test_commit_cover(
+        &Vec::from_iter(0..6),
+        &[(0, 2), (2, 5)],
+        None, // checkpoint version
+        None, // version to load
+        &[
+            ExpectedFile::Commit(5),
+            ExpectedFile::Commit(4),
+            ExpectedFile::Commit(3),
+            ExpectedFile::Compaction(0, 2),
+        ],
+    );
 }
