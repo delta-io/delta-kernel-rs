@@ -196,12 +196,12 @@ impl LogSegment {
                 start_version
             ))
         );
-        let listed_files = ListedLogFiles {
+        let listed_files = ListedLogFiles::new (
             ascending_commit_files,
-            ascending_compaction_files: vec![],
-            checkpoint_parts: vec![],
-            latest_crc_file: None, // TODO: use CRC files for table changes?
-        };
+            vec![],
+            vec![],
+            None, // TODO: use CRC files for table changes?
+        );
         LogSegment::try_new(listed_files, log_root, end_version)
     }
 
@@ -505,13 +505,33 @@ fn list_log_files(
 /// to be sorted in ascending order by version. The elements of `checkpoint_parts` are all the parts
 /// of the same checkpoint. Checkpoint parts share the same version. The `latest_crc_file` includes
 /// the latest (highest version) CRC file, if any, which may not correspond to the latest commit.
-// TODO: debug asserts in a `new` method to enforce the above?
 #[derive(Debug)]
 pub(crate) struct ListedLogFiles {
     pub ascending_commit_files: Vec<ParsedLogPath>,
     pub ascending_compaction_files: Vec<ParsedLogPath>,
     pub checkpoint_parts: Vec<ParsedLogPath>,
     pub latest_crc_file: Option<ParsedLogPath>,
+}
+
+impl ListedLogFiles {
+    fn new(
+        ascending_commit_files: Vec<ParsedLogPath>,
+        ascending_compaction_files: Vec<ParsedLogPath>,
+        checkpoint_parts: Vec<ParsedLogPath>,
+        latest_crc_file: Option<ParsedLogPath>,
+    ) -> Self {
+        debug_assert!(ascending_commit_files.is_sorted_by_key(|f| f.version));
+        debug_assert!(ascending_compaction_files.is_sorted_by_key(|f| f.version));
+        // Debug assert for checking that checkpoint_parts are from the same checkpoint.
+        debug_assert!(checkpoint_parts.windows(2).all(|f| f[0].version == f[1].version));
+
+        ListedLogFiles {
+            ascending_commit_files,
+            ascending_compaction_files,
+            checkpoint_parts,
+            latest_crc_file,
+        }
+    }
 }
 
 /// List all commit and checkpoint files with versions above the provided `start_version` (inclusive).
@@ -580,12 +600,12 @@ pub(crate) fn list_log_files_with_version(
             }
         }
 
-        ListedLogFiles {
+        ListedLogFiles::new (
             ascending_commit_files,
             ascending_compaction_files,
             checkpoint_parts,
             latest_crc_file,
-        }
+        )
     })
 }
 

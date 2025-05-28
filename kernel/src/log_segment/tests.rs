@@ -34,23 +34,6 @@ use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
 
 use super::*;
 
-// utility to easily create ListedLogFiles
-impl ListedLogFiles {
-    fn new(
-        ascending_commit_files: Vec<ParsedLogPath>,
-        ascending_compaction_files: Vec<ParsedLogPath>,
-        checkpoint_parts: Vec<ParsedLogPath>,
-        latest_crc_file: Option<ParsedLogPath>,
-    ) -> Self {
-        ListedLogFiles {
-            ascending_commit_files,
-            ascending_compaction_files,
-            checkpoint_parts,
-            latest_crc_file,
-        }
-    }
-}
-
 // NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
 // that the parquet reader properly infers nullcount = rowcount for missing columns. The two
 // checkpoint part files that contain transaction app ids have truncated schemas that would
