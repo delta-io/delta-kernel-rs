@@ -1687,3 +1687,56 @@ fn test_commit_cover_minimal_overlap() {
         ],
     );
 }
+
+#[test]
+#[should_panic]
+#[cfg(debug_assertions)]
+fn test_debug_assert_listed_log_file_non_contiguous_compaction_files() {
+    let _listed_log_file = ListedLogFiles::new(
+        vec![],
+        vec![
+            create_log_path(
+                "file:///00000000000000000000.00000000000000000004.compacted.json",
+            ), create_log_path(
+                "file:///00000000000000000000.00000000000000000003.compacted.json",
+            )],
+        vec![],
+        None,
+    );
+}
+
+#[test]
+#[should_panic]
+#[cfg(debug_assertions)]
+fn test_debug_assert_listed_log_file_different_checkpoint_versions() {
+    let _listed_log_file = ListedLogFiles::new(
+        vec![],
+        vec![],
+        vec![
+            create_log_path(
+                "00000000000000000010.checkpoint.0000000001.0000000002.parquet",
+            ), create_log_path(
+                "00000000000000000011.checkpoint.0000000002.0000000002.parquet",
+            )    
+        ],
+        None,
+    );
+}
+
+#[test]
+#[should_panic]
+#[cfg(debug_assertions)]
+fn test_debug_assert_listed_log_file_invalid_multipart_checkpoint() {
+    let _listed_log_file = ListedLogFiles::new(
+        vec![],
+        vec![],
+        vec![
+            create_log_path(
+                "00000000000000000010.checkpoint.0000000001.0000000003.parquet",
+            ), create_log_path(
+                "00000000000000000011.checkpoint.0000000002.0000000003.parquet",
+            )  
+        ],
+        None,
+    );
+}
