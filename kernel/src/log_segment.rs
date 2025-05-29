@@ -529,9 +529,9 @@ impl ListedLogFiles {
         {
             ascending_compaction_files
                 .windows(2)
-                .all(|f| match (&f[0].file_type, &f[1]) {
-                    (LogPathFileType::CompactedCommit { hi }, next) => *hi <= next.version - 1,
-                    _ => true,
+                .all(|f| match (&f[0].file_type, &f[1].file_type) {
+                    (LogPathFileType::CompactedCommit { hi }, ..) => *hi <= f[1].version - 1,
+                    _ => f[0].version == f[1].version - 1,
                 })
         } else {
             ascending_compaction_files
