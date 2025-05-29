@@ -502,7 +502,7 @@ fn list_log_files(
 }
 
 /// A struct to hold the result of listing log files. The commit and compaction files are guaranteed
-/// to be contiguous and sorted in ascending order by version. The elements of `checkpoint_parts` are all the parts
+/// to be sorted in ascending order by version. The elements of `checkpoint_parts` are all the parts
 /// of the same checkpoint. Checkpoint parts share the same version. The `latest_crc_file` includes
 /// the latest (highest version) CRC file, if any, which may not correspond to the latest commit.
 #[derive(Debug)]
