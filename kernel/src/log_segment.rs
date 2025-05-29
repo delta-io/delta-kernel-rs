@@ -536,11 +536,9 @@ impl ListedLogFiles {
         debug_assert!(checkpoint_parts
             .windows(2)
             .all(|p| p[0].version == p[1].version));
-        debug_assert!(if checkpoint_parts
-            .iter()
-            .any(|p| matches!(p.file_type, LogPathFileType::MultiPartCheckpoint { .. }))
-        {
-            checkpoint_parts
+        debug_assert!(
+            checkpoint_parts.len() <= 1
+            || checkpoint_parts
                 .iter()
                 .all(|p| matches!(p.file_type, LogPathFileType::MultiPartCheckpoint { .. }))
                 && matches!(
@@ -548,18 +546,7 @@ impl ListedLogFiles {
                     LogPathFileType::MultiPartCheckpoint { num_parts, .. }
                     if checkpoint_parts.len() == num_parts as usize
                 )
-        } else if checkpoint_parts
-            .iter()
-            .any(|p| matches!(p.file_type, LogPathFileType::CompactedCommit { .. }))
-        {
-            checkpoint_parts
-                .iter()
-                .all(|p| matches!(p.file_type, LogPathFileType::CompactedCommit { .. }))
-        } else {
-            checkpoint_parts
-                .windows(2)
-                .all(|p| p[0].file_type == p[1].file_type)
-        });
+        );
 
         ListedLogFiles {
             ascending_commit_files,
