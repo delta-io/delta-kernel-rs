@@ -167,6 +167,7 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<WriterFeature>> = Lazy
         WriterFeature::AppendOnly,
         WriterFeature::DeletionVectors,
         WriterFeature::Invariants,
+        WriterFeature::TimestampWithoutTimezone,
     ]
 });
 
