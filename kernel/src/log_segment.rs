@@ -524,7 +524,7 @@ impl ListedLogFiles {
             .windows(2)
             .all(|f| f[0].version + 1 == f[1].version));
         debug_assert!(ascending_compaction_files.windows(2).all(|pair| {
-            let (first, second) = (&pair[0], &pair[1]);
+            let [first, second] = pair else { unreachable!() };
             match (&first.file_type, &second.file_type) {
                 (
                     LogPathFileType::CompactedCommit { hi: hi0 },
