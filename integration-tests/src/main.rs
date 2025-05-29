@@ -1,4 +1,5 @@
 use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
+use delta_kernel::engine::arrow_conversion::TryFromArrow as _;
 
 fn create_arrow_schema() -> Schema {
     let field_a = Field::new("a", DataType::Int64, false);
@@ -17,7 +18,7 @@ fn main() {
     let arrow_schema = create_arrow_schema();
     let kernel_schema = create_kernel_schema();
     let converted: delta_kernel::schema::Schema =
-        delta_kernel::schema::Schema::try_from(&arrow_schema).expect("couldn't convert");
+        delta_kernel::schema::Schema::try_from_arrow(&arrow_schema).expect("couldn't convert");
     assert!(kernel_schema == converted);
     println!("Okay, made it");
 }

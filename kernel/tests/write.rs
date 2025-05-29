@@ -17,6 +17,7 @@ use serde_json::Deserializer;
 use serde_json::{json, to_vec};
 use url::Url;
 
+use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
@@ -396,7 +397,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
         // create two new arrow record batches to append
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
             let data = RecordBatch::try_new(
-                Arc::new(schema.as_ref().try_into()?),
+                Arc::new(schema.as_ref().try_into_arrow()?),
                 vec![Arc::new(Int32Array::from(data.to_vec()))],
             )?;
             Ok(Box::new(ArrowEngineData::new(data)))
@@ -490,7 +491,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
 
         test_read(
             &ArrowEngineData::new(RecordBatch::try_new(
-                Arc::new(schema.as_ref().try_into()?),
+                Arc::new(schema.as_ref().try_into_arrow()?),
                 vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
             )?),
             &table,
@@ -530,7 +531,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         // create two new arrow record batches to append
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
             let data = RecordBatch::try_new(
-                Arc::new(data_schema.as_ref().try_into()?),
+                Arc::new(data_schema.as_ref().try_into_arrow()?),
                 vec![Arc::new(Int32Array::from(data.to_vec()))],
             )?;
             Ok(Box::new(ArrowEngineData::new(data)))
@@ -632,7 +633,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
 
         test_read(
             &ArrowEngineData::new(RecordBatch::try_new(
-                Arc::new(table_schema.as_ref().try_into()?),
+                Arc::new(table_schema.as_ref().try_into_arrow()?),
                 vec![
                     Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6])),
                     Arc::new(StringArray::from(vec!["a", "a", "a", "b", "b", "b"])),
@@ -670,7 +671,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
         // create two new arrow record batches to append
         let append_data = [["a", "b"], ["c", "d"]].map(|data| -> DeltaResult<_> {
             let data = RecordBatch::try_new(
-                Arc::new(data_schema.as_ref().try_into()?),
+                Arc::new(data_schema.as_ref().try_into_arrow()?),
                 vec![Arc::new(StringArray::from(data.to_vec()))],
             )?;
             Ok(Box::new(ArrowEngineData::new(data)))
