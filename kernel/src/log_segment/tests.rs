@@ -758,7 +758,24 @@ fn build_table_changes_with_commit_versions() {
 }
 
 #[test]
-fn test_non_contiguous_log() {
+#[should_panic]
+#[cfg(debug_assertions)]
+fn test_non_contiguous_log_debug_panic() {
+    // In debug builds, this should panic due to debug_assert
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(2, "json"),
+        ],
+        None,
+    );
+
+    let _log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 0, None);
+}
+
+#[test]
+#[cfg(not(debug_assertions))]
+fn test_non_contiguous_log_release() {
     // Commit with version 1 is missing
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
@@ -969,7 +986,9 @@ fn test_create_checkpoint_stream_errors_when_schema_has_remove_but_no_sidecar_ac
         ListedLogFiles::new(
             vec![],
             vec![],
-            vec![create_log_path("file:///00000000000000000001.parquet")],
+            vec![create_log_path(
+                "file:///00000000000000000001.checkpoint.parquet",
+            )],
             None,
         ),
         log_root,
@@ -998,7 +1017,9 @@ fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_actio
         ListedLogFiles::new(
             vec![],
             vec![],
-            vec![create_log_path("file:///00000000000000000001.parquet")],
+            vec![create_log_path(
+                "file:///00000000000000000001.checkpoint.parquet",
+            )],
             None,
         ),
         log_root,
@@ -1173,6 +1194,8 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
+    let filename = "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json";
+
     write_json_to_store(
         &store,
         vec![Action::Add(Add {
@@ -1180,12 +1203,10 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
             data_change: true,
             ..Default::default()
         })],
-        "00000000000000000001.checkpoint.json",
+        filename,
     )?;
 
-    let checkpoint_one_file = log_root
-        .join("00000000000000000001.checkpoint.json")?
-        .to_string();
+    let checkpoint_one_file = log_root.join(filename)?.to_string();
 
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
