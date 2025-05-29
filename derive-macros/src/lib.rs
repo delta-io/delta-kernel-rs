@@ -166,29 +166,25 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
     let field_types = fields.iter().map(|f| &f.ty);
 
     let expanded = quote! {
-        // Wrap the whole thing in a const block so we don't pollute the caller's namespace (e.g.
-        // with our EvaluationHandlerExtension import). Note that impls are globally defined no
-        // matter how deeply they're nested, so we can just leave it all inside the const block.
-        const _: () = {
-            use crate::EvaluationHandlerExtension as _;
-            #[automatically_derived]
-            impl crate::IntoEngineData for #struct_name
-            where
-                #(#field_types: Into<crate::expressions::Scalar>),*
-            {
-                fn into_engine_data(
-                    self,
-                    schema: crate::schema::SchemaRef,
-                    engine: &dyn crate::Engine)
-                -> crate::DeltaResult<Box<dyn crate::EngineData>> {
-                    let values = [
-                        #(self.#field_idents.into()),*
-                    ];
-                    let evaluator = engine.evaluation_handler();
-                    evaluator.create_one(schema, &values)
-                }
+        #[automatically_derived]
+        impl crate::IntoEngineData for #struct_name
+        where
+            #(#field_types: Into<crate::expressions::Scalar>),*
+        {
+            fn into_engine_data(
+                self,
+                schema: crate::schema::SchemaRef,
+                engine: &dyn crate::Engine)
+            -> crate::DeltaResult<Box<dyn crate::EngineData>> {
+                // NB: we `use` here to avoid polluting the caller's namespace
+                use crate::EvaluationHandlerExtension as _;
+                let values = [
+                    #(self.#field_idents.into()),*
+                ];
+                let evaluator = engine.evaluation_handler();
+                evaluator.create_one(schema, &values)
             }
-        };
+        }
     };
 
     proc_macro::TokenStream::from(expanded)
