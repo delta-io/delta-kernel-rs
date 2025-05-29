@@ -507,10 +507,11 @@ mod tests {
     use super::*;
     use crate::expressions::{
         column_expr, column_pred, Expression as Expr, OpaqueExpressionOp, OpaquePredicateOp,
-        Predicate as Pred,
+        Predicate as Pred, ScalarExpressionEvaluator,
     };
     use crate::kernel_predicates::{
-        DirectDataSkippingPredicateEvaluator, IndirectDataSkippingPredicateEvaluator,
+        DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
+        IndirectDataSkippingPredicateEvaluator,
     };
     use crate::DeltaResult;
 
@@ -521,7 +522,11 @@ mod tests {
         fn name(&self) -> &str {
             &self.0
         }
-        fn eval_expr_scalar(&self, _values: &[Option<Scalar>]) -> DeltaResult<Scalar> {
+        fn eval_expr_scalar(
+            &self,
+            _eval_expr: &ScalarExpressionEvaluator<'_>,
+            _exprs: &[Expression],
+        ) -> DeltaResult<Scalar> {
             unimplemented!()
         }
     }
@@ -533,7 +538,9 @@ mod tests {
 
         fn eval_pred_scalar(
             &self,
-            _values: &[Option<Scalar>],
+            _eval_expr: &ScalarExpressionEvaluator<'_>,
+            _evaluator: &DirectPredicateEvaluator<'_>,
+            _exprs: &[Expr],
             _inverted: bool,
         ) -> DeltaResult<Option<bool>> {
             unimplemented!()

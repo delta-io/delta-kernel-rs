@@ -19,13 +19,18 @@ pub(crate) mod parquet_stats_skipping;
 #[cfg(test)]
 mod tests;
 
+// NOTE: When creating `&dyn Foo` for some `impl<'a> Bar<'a>`, the compiler infers `&'r dyn Foo +
+// 'a` (and then elides the lifetimes because `'a: 'r`). Creating a type alias for `dyn Foo` causes
+// the compiler to infer `dyn Foo + 'static` (the lifetime of the alias). Which in turn requires
+// `impl Bar<'static>`, which is almost always an impossible constraint. Defining the type aliases
+// below with generic lifetimes allows `&'r DynFoo<'a>` (again with `'a: 'r`). Unfortunately,
+// generic lifetimes cannot be hidden, so we end up with `&DynFoo<'_>` at every use site.
+
+/// A predicate evaluator that directly evaluates predicates, resolving column references to scalar values.
+pub type DirectPredicateEvaluator<'a> = dyn KernelPredicateEvaluator<Output = bool> + 'a;
+
 /// A data skipping predicate evaluator that directly applies data skipping, resolving column
 /// references to scalar stats values such as those provided by parquet footer stats.
-//
-// NOTE: We need a generic lifetime here to inform the compiler that this typedef only needs to live
-// as long as whatever is using it. Otherwise the compiler infers the static lifetime, which is too
-// long for any concrete implementation that has a lifetime parameter of its own (such as the
-// `RowGroupFilter` used by parquet data skipping). Downside is a `<'_>` at every use site.
 pub type DirectDataSkippingPredicateEvaluator<'a> =
     dyn DataSkippingPredicateEvaluator<Output = bool, ColumnStat = Scalar> + 'a;
 
@@ -613,14 +618,12 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                 };
                 op_fn(&self.eval_expr(left)?, &self.eval_expr(right)?)
             }
-            Expr::Opaque(OpaqueExpression { op, exprs }) => {
-                let values: Vec<_> = exprs.iter().map(|expr| self.eval_expr(expr)).collect();
-                op.eval_expr_scalar(&values)
-                    .inspect_err(|err| {
-                        warn!("Failed to evaluate {:?}: {err:?}", op.as_ref());
-                    })
-                    .ok()
-            }
+            Expr::Opaque(OpaqueExpression { op, exprs }) => op
+                .eval_expr_scalar(&|expr| self.eval_expr(expr), exprs)
+                .inspect_err(|err| {
+                    warn!("Failed to evaluate {:?}: {err:?}", op.as_ref());
+                })
+                .ok(),
             Expr::Unknown(_) => None,
         }
     }
@@ -694,8 +697,7 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
         exprs: &[Expr],
         inverted: bool,
     ) -> Option<bool> {
-        let values: Vec<_> = exprs.iter().map(|expr| self.eval_expr(expr)).collect();
-        op.eval_pred_scalar(&values, inverted)
+        op.eval_pred_scalar(&|expr| self.eval_expr(expr), self, exprs, inverted)
             .unwrap_or_else(|err| {
                 warn!("Unable to evaluate {:?}: {err:?}", op.as_ref());
                 None
@@ -708,8 +710,7 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
         exprs: &[Expr],
         inverted: bool,
     ) -> Option<bool> {
-        let values: Vec<_> = exprs.iter().map(|expr| self.eval_expr(expr)).collect();
-        match op.eval_expr_scalar(&values) {
+        match op.eval_expr_scalar(&|expr| self.eval_expr(expr), exprs) {
             Ok(Scalar::Boolean(val)) => Some(val != inverted),
             Ok(Scalar::Null(DataType::BOOLEAN)) => None,
             Ok(other) => {

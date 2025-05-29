@@ -12,7 +12,8 @@ pub use self::column_names::{
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use self::transforms::{ExpressionTransform as _, GetColumnReferences};
 use crate::kernel_predicates::{
-    DirectDataSkippingPredicateEvaluator, IndirectDataSkippingPredicateEvaluator,
+    DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
+    IndirectDataSkippingPredicateEvaluator,
 };
 use crate::{DataType, DeltaResult, DynPartialEq};
 
@@ -72,23 +73,35 @@ pub enum JunctionPredicateOp {
     Or,
 }
 
+/// A kernel-supplied scalar expression evaluator which in particular can convert column references
+/// (i.e. [`Expression::Column`]) to [`Scalar`] values. [`OpaqueExpressionOp::eval_expr_scalar`] and
+/// [`OpaquePredicateOp::eval_pred_scalar`] rely on this evaluator.
+///
+/// If the evaluator produces `None`, it means kernel was unable to evaluate
+/// the input expression. Otherwise, `Some(Scalar)` is the result of that evaluation (possibly
+/// `Scalar::Null` if the output was NULL).
+pub type ScalarExpressionEvaluator<'a> = dyn Fn(&Expression) -> Option<Scalar> + 'a;
+
 /// An opaque expression operation (ie defined and implemented by the engine).
 pub trait OpaqueExpressionOp: DynPartialEq + std::fmt::Debug {
     /// Succinctly identifies this op
     fn name(&self) -> &str;
 
-    /// Attempts scalar evaluation of this opaque expression on behalf of a
-    /// [`DirectDataSkippingPredicateEvaluator`], e.g. to implement partition pruning.
+    /// Attempts scalar evaluation of this opaque expression, e.g. for partition pruning.
     ///
-    /// An input of `None` means kernel was unable to evaluate that particular input arg. Otherwise,
-    /// `Some(Scalar)` is the result of that evaluation (possibly `Scalar::Null` if NULL).
+    /// Implementations can evaluate the child expressions however they see fit, possibly by
+    /// invoking the provided [`ScalarExpressionEvaluator`],
     ///
     /// An output of `Err` indicates that this operation does not support scalar evaluation, or was
     /// invoked incorrectly (e.g. with the wrong number and/or types of arguments, None input,
     /// etc); the operation is disqualified from participating in partition pruning.
     ///
     /// `Ok(Scalar::Null)` means the operation actually produced a legitimately NULL result.
-    fn eval_expr_scalar(&self, values: &[Option<Scalar>]) -> DeltaResult<Scalar>;
+    fn eval_expr_scalar(
+        &self,
+        eval_expr: &ScalarExpressionEvaluator<'_>,
+        exprs: &[Expression],
+    ) -> DeltaResult<Scalar>;
 }
 
 /// An opaque predicate operation (ie defined and implemented by the engine).
@@ -97,12 +110,12 @@ pub trait OpaquePredicateOp: DynPartialEq + std::fmt::Debug {
     fn name(&self) -> &str;
 
     /// Attempts scalar evaluation of this (possibly inverted) opaque predicate on behalf of a
-    /// [`DirectDataSkippingPredicateEvaluator`], e.g. as part of partition pruning or when
-    /// evaluating an opaque data skipping predicate an [`IndirectDataSkippingPredicateEvaluator`]
-    /// produced previously.
+    /// [`DirectPredicateEvaluator`], e.g. for partition pruning or to evaluate an opaque data
+    /// skipping predicate produced previously by an [`IndirectDataSkippingPredicateEvaluator`].
     ///
-    /// An input of `None` means kernel was unable to evaluate that particular input arg. Otherwise,
-    /// it is `Some(Scalar)` result of that evaluation (possibly `Scalar::Null` if NULL).
+    /// Implementations can evaluate the child expressions however they see fit, possibly by
+    /// invoking the provided [`ScalarExpressionEvaluator`] or by delegating back to the owning
+    /// [`DirectPredicateEvaluator`].
     ///
     /// An output of `Err` indicates that this operation does not support scalar evaluation, or was
     /// invoked incorrectly (e.g. wrong number and/or types of arguments, None input, etc); the
@@ -111,25 +124,33 @@ pub trait OpaquePredicateOp: DynPartialEq + std::fmt::Debug {
     /// `Ok(None)` means the operation actually produced a legitimately NULL output.
     fn eval_pred_scalar(
         &self,
-        values: &[Option<Scalar>],
+        eval_expr: &ScalarExpressionEvaluator<'_>,
+        eval_pred: &DirectPredicateEvaluator<'_>,
+        exprs: &[Expression],
         inverted: bool,
     ) -> DeltaResult<Option<bool>>;
 
     /// Evaluates this (possibly inverted) opaque predicate for data skipping on behalf of a
     /// [`DirectDataSkippingPredicateEvaluator`], e.g. for parquet row group skipping.
     ///
+    /// Implementations can evaluate the child expressions however they see fit, possibly by
+    /// delegating back to the owning [`DirectDataSkippingPredicateEvaluator`].
+    ///
     /// An output of `None` indicates that this operation does not support evaluation as a data
     /// skipping predicate, or was invoked incorrectly (e.g. wrong number and/or types of arguments,
     /// None input, etc.); the operation is disqualified from participating in row group skipping.
     fn eval_as_data_skipping_predicate(
         &self,
-        predicate_evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
+        evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
         exprs: &[Expression],
         inverted: bool,
     ) -> Option<bool>;
 
     /// Converts this (possibly inverted) opaque predicate to a data skipping predicate on behalf of
     /// an [`IndirectDataSkippingPredicateEvaluator`], e.g. for stats-based file pruning.
+    ///
+    /// Implementations can transform the predicate and its child expressions however they see fit,
+    /// possibly by delegating back to the owning [`IndirectDataSkippingPredicateEvaluator`].
     ///
     /// An output of `None` indicates that this operation does not support conversion to a data
     /// skipping predicate, or was invoked incorrectly (e.g. wrong number and/or types of arguments,
@@ -139,7 +160,7 @@ pub trait OpaquePredicateOp: DynPartialEq + std::fmt::Debug {
     // predicate rewrite can reuse the same operation. But sadly, that would not be dyn-compatible.
     fn as_data_skipping_predicate(
         &self,
-        predicate_evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+        evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
         exprs: &[Expression],
         inverted: bool,
     ) -> Option<Predicate>;
