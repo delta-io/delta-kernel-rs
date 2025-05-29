@@ -196,7 +196,7 @@ impl LogSegment {
                 start_version
             ))
         );
-        let listed_files = ListedLogFiles::new (
+        let listed_files = ListedLogFiles::new(
             ascending_commit_files,
             vec![],
             vec![],
@@ -520,16 +520,52 @@ impl ListedLogFiles {
         checkpoint_parts: Vec<ParsedLogPath>,
         latest_crc_file: Option<ParsedLogPath>,
     ) -> Self {
-        debug_assert!(ascending_commit_files.windows(2).all(|f| f[0].version == f[1].version-1));
-        debug_assert!(ascending_compaction_files.windows(2).all(|f| f[0].version == f[1].version-1));
+        debug_assert!(ascending_commit_files
+            .windows(2)
+            .all(|f| f[0].version == f[1].version - 1));
+        debug_assert!(if ascending_compaction_files
+            .iter()
+            .any(|f| matches!(f.file_type, LogPathFileType::CompactedCommit { .. }))
+        {
+            ascending_compaction_files
+                .windows(2)
+                .all(|f| match (&f[0].file_type, &f[1]) {
+                    (LogPathFileType::CompactedCommit { hi }, next) => *hi == next.version - 1,
+                    _ => true,
+                })
+        } else {
+            ascending_compaction_files
+                .windows(2)
+                .all(|f| f[0].version == f[1].version - 1)
+        });
         debug_assert!(checkpoint_parts.iter().all(|p| p.is_checkpoint()));
-        debug_assert!(checkpoint_parts.windows(2).all(|p| p[0].file_type == p[1].file_type));
-        debug_assert!(
-            checkpoint_parts.is_empty() || 
-            !matches!(checkpoint_parts[0].file_type, LogPathFileType::MultiPartCheckpoint { .. }) ||
-            matches!(checkpoint_parts[0].file_type, LogPathFileType::MultiPartCheckpoint { num_parts, .. } if checkpoint_parts.len() == num_parts as usize)
-        );
-        debug_assert!(checkpoint_parts.windows(2).all(|f| f[0].version == f[1].version));
+        debug_assert!(checkpoint_parts
+            .windows(2)
+            .all(|p| p[0].version == p[1].version));
+        debug_assert!(if checkpoint_parts
+            .iter()
+            .any(|p| matches!(p.file_type, LogPathFileType::MultiPartCheckpoint { .. }))
+        {
+            checkpoint_parts
+                .iter()
+                .all(|p| matches!(p.file_type, LogPathFileType::MultiPartCheckpoint { .. }))
+                && matches!(
+                    checkpoint_parts[0].file_type,
+                    LogPathFileType::MultiPartCheckpoint { num_parts, .. }
+                    if checkpoint_parts.len() == num_parts as usize
+                )
+        } else if checkpoint_parts
+            .iter()
+            .any(|p| matches!(p.file_type, LogPathFileType::CompactedCommit { .. }))
+        {
+            checkpoint_parts
+                .iter()
+                .all(|p| matches!(p.file_type, LogPathFileType::CompactedCommit { .. }))
+        } else {
+            checkpoint_parts
+                .windows(2)
+                .all(|p| p[0].file_type == p[1].file_type)
+        });
 
         ListedLogFiles {
             ascending_commit_files,
@@ -606,7 +642,7 @@ pub(crate) fn list_log_files_with_version(
             }
         }
 
-        ListedLogFiles::new (
+        ListedLogFiles::new(
             ascending_commit_files,
             ascending_compaction_files,
             checkpoint_parts,
