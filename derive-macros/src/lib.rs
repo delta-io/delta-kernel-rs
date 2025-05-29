@@ -138,6 +138,58 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
     quote! { #(#schema_fields),* }
 }
 
+/// Derive an IntoEngineData trait for a struct that has all fields implement `Into<Scalar>`.
+///
+/// This is a relatively simple macro to produce the boilerplate for converting a struct into
+/// EngineData using the `create_one` method. TODO: (doc)tests included in the delta_kernel crate:
+/// `IntoEngineData` trait.
+#[proc_macro_derive(IntoEngineData)]
+pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let struct_name = &input.ident;
+
+    let Data::Struct(DataStruct {
+        fields: Fields::Named(fields),
+        ..
+    }) = &input.data
+    else {
+        return Error::new(
+            struct_name.span(),
+            "IntoEngineData can only be derived for structs with named fields",
+        )
+        .to_compile_error()
+        .into();
+    };
+
+    let fields = &fields.named;
+    let field_idents = fields.iter().map(|f| &f.ident);
+    let field_types = fields.iter().map(|f| &f.ty);
+
+    let expanded = quote! {
+        #[automatically_derived]
+        impl crate::IntoEngineData for #struct_name
+        where
+            #(#field_types: Into<crate::expressions::Scalar>),*
+        {
+            fn into_engine_data(
+                self,
+                schema: crate::schema::SchemaRef,
+                engine: &dyn crate::Engine)
+            -> crate::DeltaResult<Box<dyn crate::EngineData>> {
+                // NB: we `use` here to avoid polluting the caller's namespace
+                use crate::EvaluationHandlerExtension as _;
+                let values = [
+                    #(self.#field_idents.into()),*
+                ];
+                let evaluator = engine.evaluation_handler();
+                evaluator.create_one(schema, &values)
+            }
+        }
+    };
+
+    proc_macro::TokenStream::from(expanded)
+}
+
 /// Mark items as `internal_api` to make them public iff the `internal-api` feature is enabled.
 /// Note this doesn't work for inline module definitions (see `internal_mod!` macro in delta_kernel
 /// crate - can't export macro_rules! from proc macro crate).
