@@ -75,6 +75,7 @@ impl LogSegment {
             checkpoint_file.version
         });
 
+        // TODO: consider unifying this with debug_asserts in the ListedLogFiles::new()
         // We require that commits that are contiguous. In other words, there must be no gap between commit versions.
         require!(
             ascending_commit_files
@@ -520,9 +521,7 @@ impl ListedLogFiles {
         checkpoint_parts: Vec<ParsedLogPath>,
         latest_crc_file: Option<ParsedLogPath>,
     ) -> Self {
-        debug_assert!(ascending_commit_files
-            .windows(2)
-            .all(|f| f[0].version + 1 == f[1].version));
+        // We are adding debug_asserts here, so they don't impact the runtime performance of the released binaries
         debug_assert!(ascending_compaction_files.windows(2).all(|pair| {
             let [first, second] = pair else { unreachable!() };
             match (&first.file_type, &second.file_type) {

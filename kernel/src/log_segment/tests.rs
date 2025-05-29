@@ -758,24 +758,7 @@ fn build_table_changes_with_commit_versions() {
 }
 
 #[test]
-#[should_panic]
-#[cfg(debug_assertions)]
-fn test_non_contiguous_log_debug_panic() {
-    // In debug builds, this should panic due to debug_assert
-    let (storage, log_root) = build_log_with_paths_and_checkpoint(
-        &[
-            delta_path_for_version(0, "json"),
-            delta_path_for_version(2, "json"),
-        ],
-        None,
-    );
-
-    let _log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 0, None);
-}
-
-#[test]
-#[cfg(not(debug_assertions))]
-fn test_non_contiguous_log_release() {
+fn test_non_contiguous_log() {
     // Commit with version 1 is missing
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
