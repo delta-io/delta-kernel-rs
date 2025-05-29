@@ -522,22 +522,17 @@ impl ListedLogFiles {
     ) -> Self {
         debug_assert!(ascending_commit_files
             .windows(2)
-            .all(|f| f[0].version == f[1].version - 1));
-        debug_assert!(if ascending_compaction_files
-            .iter()
-            .any(|f| matches!(f.file_type, LogPathFileType::CompactedCommit { .. }))
-        {
-            ascending_compaction_files.windows(2).all(|f| {
-                match (&f[0].file_type, &f[1].file_type) {
-                    (LogPathFileType::CompactedCommit { hi }, ..) => *hi >= f[1].version - 1,
-                    _ => f[0].version == f[1].version - 1,
-                }
-            })
-        } else {
-            ascending_compaction_files
-                .windows(2)
-                .all(|f| f[0].version == f[1].version - 1)
-        });
+            .all(|f| f[0].version + 1 == f[1].version));
+        debug_assert!(ascending_compaction_files.windows(2).all(|pair| {
+            let (first, second) = (&pair[0], &pair[1]);
+            match (&first.file_type, &second.file_type) {
+                (
+                    LogPathFileType::CompactedCommit { hi: hi0 },
+                    LogPathFileType::CompactedCommit { hi: hi1 },
+                ) => first.version <= second.version && *hi0 <= *hi1,
+                _ => false,
+            }
+        }));
         debug_assert!(checkpoint_parts.iter().all(|p| p.is_checkpoint()));
         debug_assert!(checkpoint_parts
             .windows(2)
