@@ -6,10 +6,12 @@ use crate::expressions::{SharedExpression, SharedPredicate};
 use crate::handle::Handle;
 use delta_kernel::expressions::{
     column_expr, column_pred, ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr,
-    MapData, OpaqueExpressionOp, OpaquePredicateOp, Predicate as Pred, Scalar, StructData,
+    MapData, OpaqueExpressionOp, OpaquePredicateOp, Predicate as Pred, Scalar,
+    ScalarExpressionEvaluator, StructData,
 };
 use delta_kernel::kernel_predicates::{
-    DirectDataSkippingPredicateEvaluator, IndirectDataSkippingPredicateEvaluator,
+    DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
+    IndirectDataSkippingPredicateEvaluator,
 };
 use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
 use delta_kernel::DeltaResult;
@@ -21,7 +23,11 @@ impl OpaqueExpressionOp for OpaqueTestOp {
     fn name(&self) -> &str {
         &self.0
     }
-    fn eval_expr_scalar(&self, _values: &[Option<Scalar>]) -> DeltaResult<Scalar> {
+    fn eval_expr_scalar(
+        &self,
+        _eval_expr: &ScalarExpressionEvaluator<'_>,
+        _exprs: &[Expr],
+    ) -> DeltaResult<Scalar> {
         unimplemented!()
     }
 }
@@ -33,7 +39,9 @@ impl OpaquePredicateOp for OpaqueTestOp {
 
     fn eval_pred_scalar(
         &self,
-        _values: &[Option<Scalar>],
+        _eval_expr: &ScalarExpressionEvaluator<'_>,
+        _evaluator: &DirectPredicateEvaluator<'_>,
+        _exprs: &[Expr],
         _inverted: bool,
     ) -> DeltaResult<Option<bool>> {
         unimplemented!()
@@ -41,7 +49,7 @@ impl OpaquePredicateOp for OpaqueTestOp {
 
     fn eval_as_data_skipping_predicate(
         &self,
-        _predicate_evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
+        _evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
         _exprs: &[Expr],
         _inverted: bool,
     ) -> Option<bool> {
@@ -50,7 +58,7 @@ impl OpaquePredicateOp for OpaqueTestOp {
 
     fn as_data_skipping_predicate(
         &self,
-        _predicate_evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+        _evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
         _exprs: &[Expr],
         _inverted: bool,
     ) -> Option<Pred> {
