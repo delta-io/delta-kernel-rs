@@ -523,7 +523,9 @@ impl ListedLogFiles {
     ) -> Self {
         // We are adding debug_asserts here, so they don't impact the runtime performance of the released binaries
         debug_assert!(ascending_compaction_files.windows(2).all(|pair| {
-            let [first, second] = pair else { unreachable!() };
+            let [first, second] = pair else {
+                unreachable!()
+            };
             match (&first.file_type, &second.file_type) {
                 (
                     LogPathFileType::CompactedCommit { hi: hi0 },
@@ -538,14 +540,14 @@ impl ListedLogFiles {
             .all(|p| p[0].version == p[1].version));
         debug_assert!(
             checkpoint_parts.len() <= 1
-            || checkpoint_parts
-                .iter()
-                .all(|p| matches!(p.file_type, LogPathFileType::MultiPartCheckpoint { .. }))
-                && matches!(
-                    checkpoint_parts[0].file_type,
-                    LogPathFileType::MultiPartCheckpoint { num_parts, .. }
-                    if checkpoint_parts.len() == num_parts as usize
-                )
+                || checkpoint_parts
+                    .iter()
+                    .all(|p| matches!(p.file_type, LogPathFileType::MultiPartCheckpoint { .. }))
+                    && matches!(
+                        checkpoint_parts[0].file_type,
+                        LogPathFileType::MultiPartCheckpoint { num_parts, .. }
+                        if checkpoint_parts.len() == num_parts as usize
+                    )
         );
 
         ListedLogFiles {
