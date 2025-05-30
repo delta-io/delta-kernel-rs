@@ -522,18 +522,17 @@ impl ListedLogFiles {
         latest_crc_file: Option<ParsedLogPath>,
     ) -> Self {
         // We are adding debug_asserts here since we want to validate invariants that are (relatively) expensive to compute
-        debug_assert!(ascending_compaction_files.windows(2).all(|f| {
-            let (first, second) = (&f[0], &f[1]);
-            match (&first.file_type, &second.file_type) {
-                (
-                    LogPathFileType::CompactedCommit { hi: hi0 },
-                    LogPathFileType::CompactedCommit { hi: hi1 },
-                ) => {
-                    first.version < second.version
-                        || (first.version == second.version && *hi0 <= *hi1)
-                }
-                _ => false,
-            }
+        debug_assert!(ascending_compaction_files.windows(2).all(|f| match f {
+            [ParsedLogPath {
+                version: version0,
+                file_type: LogPathFileType::CompactedCommit { hi: hi0 },
+                ..
+            }, ParsedLogPath {
+                version: version1,
+                file_type: LogPathFileType::CompactedCommit { hi: hi1 },
+                ..
+            }] => version0 < version1 || (version0 == version1 && hi0 <= hi1),
+            _ => false,
         }));
         debug_assert!(checkpoint_parts.iter().all(|p| p.is_checkpoint()));
         debug_assert!(checkpoint_parts
