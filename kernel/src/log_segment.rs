@@ -528,7 +528,10 @@ impl ListedLogFiles {
                 (
                     LogPathFileType::CompactedCommit { hi: hi0 },
                     LogPathFileType::CompactedCommit { hi: hi1 },
-                ) => first.version < second.version || (first.version == second.version && *hi0 <= *hi1),
+                ) => {
+                    first.version < second.version
+                        || (first.version == second.version && *hi0 <= *hi1)
+                }
                 _ => false,
             }
         }));
