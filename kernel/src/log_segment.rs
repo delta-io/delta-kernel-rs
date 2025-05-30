@@ -75,7 +75,7 @@ impl LogSegment {
             checkpoint_file.version
         });
 
-        // TODO: consider unifying this with debug_asserts in the ListedLogFiles::new()
+        // TODO: consider unifying this with debug_asserts in the ListedLogFiles::new(); issue#995
         // We require that commits that are contiguous. In other words, there must be no gap between commit versions.
         require!(
             ascending_commit_files
