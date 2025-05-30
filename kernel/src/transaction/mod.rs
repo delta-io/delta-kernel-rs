@@ -13,6 +13,8 @@ use crate::schema::{MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::{DataType, DeltaResult, Engine, EngineData, Expression, IntoEngineData, Version};
 
+pub mod hook;
+
 use url::Url;
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -159,7 +161,7 @@ impl Transaction {
         // step three: commit the actions as a json file in the log
         let json_handler = engine.json_handler();
         match json_handler.write_json_file(&commit_path.location, Box::new(actions), false) {
-            Ok(()) => Ok(CommitResult::Committed(commit_version)),
+            Ok(()) => Ok(CommitResult::Committed(commit_version, vec![])),
             Err(Error::FileAlreadyExists(_)) => Ok(CommitResult::Conflict(self, commit_version)),
             Err(e) => Err(e),
         }
@@ -300,8 +302,9 @@ impl WriteContext {
 // update the transaction to a new version etc.
 #[derive(Debug)]
 pub enum CommitResult {
-    /// The transaction was successfully committed at the version.
-    Committed(Version),
+    /// The transaction was successfully committed at the version. Any [`hook::PostCommitHook`]s
+    /// that should run are in the vector.
+    Committed(Version, Vec<Box<dyn hook::PostCommitHook>>),
     /// This transaction conflicted with an existing version (at the version given).
     Conflict(Transaction, Version),
 }
