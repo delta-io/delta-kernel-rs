@@ -126,7 +126,7 @@ pub trait KernelPredicateEvaluator {
     fn finish_eval_pred_junction(
         &self,
         op: JunctionPredicateOp,
-        preds: impl IntoIterator<Item = Option<Self::Output>>,
+        preds: &mut dyn Iterator<Item = Option<Self::Output>>,
         inverted: bool,
     ) -> Option<Self::Output>;
 
@@ -194,11 +194,12 @@ pub trait KernelPredicateEvaluator {
         if let Scalar::Null(_) = val {
             self.eval_pred_is_null(col, !inverted)
         } else {
-            let args = [
+            let mut args = [
                 self.eval_pred_is_null(col, inverted),
                 self.eval_pred_eq(col, val, !inverted),
-            ];
-            self.finish_eval_pred_junction(JunctionPredicateOp::Or, args, inverted)
+            ]
+            .into_iter();
+            self.finish_eval_pred_junction(JunctionPredicateOp::Or, &mut args, inverted)
         }
     }
 
@@ -260,8 +261,8 @@ pub trait KernelPredicateEvaluator {
         preds: &[Pred],
         inverted: bool,
     ) -> Option<Self::Output> {
-        let preds = preds.iter().map(|pred| self.eval_pred(pred, inverted));
-        self.finish_eval_pred_junction(op, preds, inverted)
+        let mut preds = preds.iter().map(|pred| self.eval_pred(pred, inverted));
+        self.finish_eval_pred_junction(op, &mut preds, inverted)
     }
 
     /// Dispatches a predicate to the specific implementation for each predicate variant.
@@ -387,28 +388,30 @@ pub trait KernelPredicateEvaluator {
         match pred {
             Junction(JunctionPredicate { op, preds }) => {
                 // Recursively invoke `eval_pred_sql_where` instead of the usual `eval_pred` for AND/OR.
-                let preds = preds
+                let mut preds = preds
                     .iter()
                     .map(|pred| self.eval_pred_sql_where(pred, inverted));
-                self.finish_eval_pred_junction(*op, preds, inverted)
+                self.finish_eval_pred_junction(*op, &mut preds, inverted)
             }
             Binary(BinaryPredicate { op, left, right }) if op.is_null_intolerant() => {
                 // Perform a nullsafe comparison instead of the usual `eval_pred_binary`
-                let preds = [
+                let mut preds = [
                     self.eval_pred_unary(UnaryPredicateOp::IsNull, left, true),
                     self.eval_pred_unary(UnaryPredicateOp::IsNull, right, true),
                     self.eval_pred_binary(*op, left, right, inverted),
-                ];
-                self.finish_eval_pred_junction(JunctionPredicateOp::And, preds, false)
+                ]
+                .into_iter();
+                self.finish_eval_pred_junction(JunctionPredicateOp::And, &mut preds, false)
             }
             Not(pred) => self.eval_pred_sql_where(pred, !inverted),
             BooleanExpression(Expr::Column(col)) => {
                 // Perform a nullsafe comparison instead of the usual `eval_pred_column`
-                let preds = [
+                let mut preds = [
                     self.eval_pred_is_null(col, true),
                     self.eval_pred_column(col, inverted),
-                ];
-                self.finish_eval_pred_junction(JunctionPredicateOp::And, preds, false)
+                ]
+                .into_iter();
+                self.finish_eval_pred_junction(JunctionPredicateOp::And, &mut preds, false)
             }
             BooleanExpression(Expr::Literal(val)) if val.is_null() => {
                 // AND(NULL IS NOT NULL, NULL) = AND(FALSE, NULL) = FALSE
@@ -510,26 +513,22 @@ impl KernelPredicateEvaluatorDefaults {
     /// non-dominant value. Inverting the operation also inverts the dominant value.
     pub fn finish_eval_pred_junction(
         op: JunctionPredicateOp,
-        preds: impl IntoIterator<Item = Option<bool>>,
+        preds: &mut dyn Iterator<Item = Option<bool>>,
         inverted: bool,
     ) -> Option<bool> {
         let dominator = match op {
             JunctionPredicateOp::And => inverted,
             JunctionPredicateOp::Or => !inverted,
         };
-        let result = preds.into_iter().try_fold(false, |found_null, val| {
+        let mut found_null = false;
+        for val in preds {
             match val {
-                Some(val) if val == dominator => None, // (1) short circuit, dominant found
-                Some(_) => Some(found_null),
-                None => Some(true), // (2) null found (but keep looking for a dominant value)
+                Some(val) if val == dominator => return Some(dominator), // short circuit!
+                None => found_null = true,
+                Some(_) => (), // ignore non-dominant values
             }
-        });
-
-        match result {
-            None => Some(dominator), // (1) short circuit, dominant found
-            Some(false) => Some(!dominator),
-            Some(true) => None, // (2) null found, dominant not found
         }
+        (!found_null).then_some(!dominator)
     }
 }
 
@@ -658,7 +657,7 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
     fn finish_eval_pred_junction(
         &self,
         op: JunctionPredicateOp,
-        preds: impl IntoIterator<Item = Option<bool>>,
+        preds: &mut dyn Iterator<Item = Option<bool>>,
         inverted: bool,
     ) -> Option<bool> {
         KernelPredicateEvaluatorDefaults::finish_eval_pred_junction(op, preds, inverted)
@@ -872,12 +871,18 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
     fn finish_eval_pred_junction(
         &self,
         op: JunctionPredicateOp,
-        preds: impl IntoIterator<Item = Option<Self::Output>>,
+        preds: &mut dyn Iterator<Item = Option<Self::Output>>,
         inverted: bool,
     ) -> Option<Self::Output> {
-        self.finish_eval_pred_junction(op, &mut preds.into_iter(), inverted)
+        self.finish_eval_pred_junction(op, preds, inverted)
     }
 }
+
+// Statically verify that both forms of the trait are dyn compatible
+#[cfg(test)]
+const _: Option<&dyn KernelPredicateEvaluator<Output = Pred>> = None;
+#[cfg(test)]
+const _: Option<&dyn KernelPredicateEvaluator<Output = bool>> = None;
 
 // Statically verify that both forms of the trait are dyn compatible
 #[cfg(test)]
