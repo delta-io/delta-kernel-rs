@@ -1,6 +1,5 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of  checkpoint and commit
 //! files.
-use core::f64;
 use std::collections::HashMap;
 use std::convert::identity;
 use std::sync::{Arc, LazyLock};
