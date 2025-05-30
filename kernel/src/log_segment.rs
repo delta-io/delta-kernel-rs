@@ -521,7 +521,7 @@ impl ListedLogFiles {
         checkpoint_parts: Vec<ParsedLogPath>,
         latest_crc_file: Option<ParsedLogPath>,
     ) -> Self {
-        // We are adding debug_asserts here, so they don't impact the runtime performance of the released binaries
+        // We are adding debug_asserts here since we want to validate invariants that are (relatively) expensive to compute
         debug_assert!(ascending_compaction_files.windows(2).all(|pair| {
             let [first, second] = pair else {
                 unreachable!()
