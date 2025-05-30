@@ -10,7 +10,7 @@ use std::borrow::Cow;
 
 /// Validates that if a table schema contains TIMESTAMP_NTZ columns, the table must have the
 /// TimestampWithoutTimezone feature in both reader and writer features.
-pub fn validate_timestamp_ntz_feature_support(
+pub(crate) fn validate_timestamp_ntz_feature_support(
     schema: &Schema,
     protocol: &Protocol,
 ) -> DeltaResult<()> {

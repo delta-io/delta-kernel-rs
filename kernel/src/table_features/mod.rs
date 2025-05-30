@@ -8,7 +8,7 @@ use crate::schema::DataType;
 
 pub(crate) use column_mapping::column_mapping_mode;
 pub use column_mapping::{validate_schema_column_mapping, ColumnMappingMode};
-pub use timestamp_ntz::validate_timestamp_ntz_feature_support;
+pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
 mod column_mapping;
 mod timestamp_ntz;
 
