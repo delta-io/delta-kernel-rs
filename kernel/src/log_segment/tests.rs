@@ -1689,9 +1689,23 @@ fn test_commit_cover_minimal_overlap() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
+fn test_debug_assert_listed_log_file_in_order_compaction_files() {
+    let _ = ListedLogFiles::new(
+        vec![],
+        vec![
+            create_log_path("file:///00000000000000000000.00000000000000000004.compacted.json"),
+            create_log_path("file:///00000000000000000001.00000000000000000002.compacted.json"),
+        ],
+        vec![],
+        None,
+    );
+}
+
+#[test]
 #[should_panic]
 #[cfg(debug_assertions)]
-fn test_debug_assert_listed_log_file_non_contiguous_compaction_files() {
+fn test_debug_assert_listed_log_file_out_of_order_compaction_files() {
     let _ = ListedLogFiles::new(
         vec![],
         vec![
@@ -1706,7 +1720,7 @@ fn test_debug_assert_listed_log_file_non_contiguous_compaction_files() {
 #[test]
 #[should_panic]
 #[cfg(debug_assertions)]
-fn test_debug_assert_listed_log_file_different_checkpoint_versions() {
+fn test_debug_assert_listed_log_file_different_multipart_checkpoint_versions() {
     let _ = ListedLogFiles::new(
         vec![],
         vec![],
