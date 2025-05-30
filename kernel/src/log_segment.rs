@@ -20,6 +20,7 @@ use crate::{
 };
 use delta_kernel_derive::internal_api;
 
+use crate::actions::crc::ProtocolMetadata;
 use itertools::Itertools;
 use tracing::{debug, warn};
 use url::Url;
@@ -421,12 +422,40 @@ impl LogSegment {
         )?))
     }
 
-    // Do a lightweight protocol+metadata log replay to find the latest Protocol and Metadata in
-    // the LogSegment
+    // Find the latest Protocol and Metadata in the LogSegment. This is done by replaying the log
+    // until the latest_crc_file/latest checkpoint is reached, at which point we can just return the
+    // P+M from the CRC directly or read from checkpoint.
     pub(crate) fn protocol_and_metadata(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
+        // simple case if we have CRC at this version
+        if let Some(latest_crc_file) = &self.latest_crc_file {
+            if self.end_version == latest_crc_file.version {
+                let path = &latest_crc_file.location;
+                let pm = ProtocolMetadata::try_from_crc(path.clone(), engine)?;
+                return Ok((Some(pm.metadata), Some(pm.protocol)));
+            }
+        }
+
+        // construct a "protocol-metadata log segment"
+        // -> if we have a CRC file, we only need commits (CRC_version, target_version]
+        // -> if we don't have a CRC, we proceed as normal
+        // let protocol_metadata_log_segment = if let Some(latest_crc_file) = self.latest_crc_file {
+        //     // TODO move this
+        //     let mut log_segment = self.clone();
+        //     log_segment.checkpoint_version = None;
+        //     log_segment.checkpoint_parts.clear();
+        //     // only keep commits from CRC_version + 1 to target version
+        //     log_segment
+        //         .ascending_commit_files
+        //         .iter()
+        //         .filter(|commit| commit.version > latest_crc_file.version);
+        //     log_segment
+        // } else {
+        //     self
+        // };
+
         let actions_batches = self.replay_for_metadata(engine)?;
         let (mut metadata_opt, mut protocol_opt) = (None, None);
         for actions_batch in actions_batches {
