@@ -538,6 +538,8 @@ impl ListedLogFiles {
         debug_assert!(checkpoint_parts
             .windows(2)
             .all(|p| p[0].version == p[1].version));
+        // check that only one of the following exists: (1) a singular `SinglePartCheckpoint` or
+        // `UUID` checkpoint or (2) a multi-part, and all parts are there and nothing else
         debug_assert!(
             checkpoint_parts.len() <= 1
                 || checkpoint_parts
