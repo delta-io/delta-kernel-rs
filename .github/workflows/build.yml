@@ -67,7 +67,7 @@ jobs:
       - name: Install minimal stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: build docs
-        run: cargo doc
+        run: cargo doc --workspace --all-features
 
 
   # When we run cargo { build, clippy } --no-default-features, we want to build/lint the kernel to

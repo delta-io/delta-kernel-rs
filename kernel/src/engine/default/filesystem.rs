@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use delta_kernel_derive::internal_api;
 use futures::stream::StreamExt;
 use itertools::Itertools;
 use url::Url;
@@ -20,6 +21,7 @@ pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
 }
 
 impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
+    #[internal_api]
     pub(crate) fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
         Self {
             inner: store,
