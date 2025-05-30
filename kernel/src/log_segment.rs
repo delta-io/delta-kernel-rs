@@ -1,5 +1,6 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of  checkpoint and commit
 //! files.
+use core::f64;
 use std::collections::HashMap;
 use std::convert::identity;
 use std::sync::{Arc, LazyLock};
@@ -522,10 +523,8 @@ impl ListedLogFiles {
         latest_crc_file: Option<ParsedLogPath>,
     ) -> Self {
         // We are adding debug_asserts here since we want to validate invariants that are (relatively) expensive to compute
-        debug_assert!(ascending_compaction_files.windows(2).all(|pair| {
-            let [first, second] = pair else {
-                unreachable!()
-            };
+        debug_assert!(ascending_compaction_files.windows(2).all(|f| {
+            let (first, second) = (&f[0], &f[1]);
             match (&first.file_type, &second.file_type) {
                 (
                     LogPathFileType::CompactedCommit { hi: hi0 },

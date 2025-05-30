@@ -1692,7 +1692,7 @@ fn test_commit_cover_minimal_overlap() {
 #[should_panic]
 #[cfg(debug_assertions)]
 fn test_debug_assert_listed_log_file_non_contiguous_compaction_files() {
-    let _listed_log_file = ListedLogFiles::new(
+    let _ = ListedLogFiles::new(
         vec![],
         vec![
             create_log_path("file:///00000000000000000000.00000000000000000004.compacted.json"),
@@ -1707,7 +1707,7 @@ fn test_debug_assert_listed_log_file_non_contiguous_compaction_files() {
 #[should_panic]
 #[cfg(debug_assertions)]
 fn test_debug_assert_listed_log_file_different_checkpoint_versions() {
-    let _listed_log_file = ListedLogFiles::new(
+    let _ = ListedLogFiles::new(
         vec![],
         vec![],
         vec![
@@ -1722,7 +1722,7 @@ fn test_debug_assert_listed_log_file_different_checkpoint_versions() {
 #[should_panic]
 #[cfg(debug_assertions)]
 fn test_debug_assert_listed_log_file_invalid_multipart_checkpoint() {
-    let _listed_log_file = ListedLogFiles::new(
+    let _ = ListedLogFiles::new(
         vec![],
         vec![],
         vec![
