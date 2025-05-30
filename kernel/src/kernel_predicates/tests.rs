@@ -181,6 +181,135 @@ fn test_default_partial_cmp_scalars() {
     }
 }
 
+#[test]
+fn test_default_scalar_arithmetic() {
+    use Scalar::*;
+    let left = &[Byte(2), Short(200), Integer(20000), Long(2000000)];
+    let right = &[Byte(3), Short(30), Integer(3000), Long(300000)];
+    let expected = [
+        (Byte(5), Byte(-1), Byte(6), Byte(0)),
+        (Short(230), Short(170), Short(6000), Short(6)),
+        (
+            Integer(23000),
+            Integer(17000),
+            Integer(60000000),
+            Integer(6),
+        ),
+        (Long(2300000), Long(1700000), Long(600000000000), Long(6)),
+    ];
+
+    let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
+    for ((l, r), (add, sub, mul, div)) in left.iter().zip(right).zip(expected) {
+        expect_eq!(
+            filter.eval_expr(&(Expr::literal(l.clone()) + Expr::literal(r.clone()))),
+            Some(add),
+            "add({l:?}, {r:?})"
+        );
+        expect_eq!(
+            filter.eval_expr(&(Expr::literal(l.clone()) - Expr::literal(r.clone()))),
+            Some(sub),
+            "sub({l:?}, {r:?})"
+        );
+        expect_eq!(
+            filter.eval_expr(&(Expr::literal(l.clone()) * Expr::literal(r.clone()))),
+            Some(mul),
+            "mul({l:?}, {r:?})"
+        );
+        expect_eq!(
+            filter.eval_expr(&(Expr::literal(l.clone()) / Expr::literal(r.clone()))),
+            Some(div),
+            "div({l:?}, {r:?})"
+        );
+    }
+
+    // Invalid type combinations
+    expect_eq!(
+        filter.eval_expr(&(Expr::literal("hi") + Expr::literal("ho"))),
+        None,
+        "add(string, string)"
+    );
+    expect_eq!(
+        filter.eval_expr(&(Expr::literal(1i8) + Expr::literal(1i64))),
+        None,
+        "add(byte, long)"
+    );
+    expect_eq!(
+        filter.eval_expr(&(Expr::literal(1i8) - Expr::literal(1i64))),
+        None,
+        "sub(byte, long)"
+    );
+    expect_eq!(
+        filter.eval_expr(&(Expr::literal(1i8) * Expr::literal(1i64))),
+        None,
+        "mul(byte, long)"
+    );
+    expect_eq!(
+        filter.eval_expr(&(Expr::literal(1i8) / Expr::literal(1i64))),
+        None,
+        "div(byte, long)"
+    );
+
+    // Addition overflow
+    let args = [
+        (Byte(i8::MAX), Byte(1)),
+        (Short(i16::MAX), Short(1)),
+        (Integer(i32::MAX), Integer(1)),
+        (Long(i64::MAX), Long(1)),
+    ];
+    for (l, r) in args {
+        expect_eq!(
+            filter.eval_expr(&(Expr::literal(l.clone()) + Expr::literal(r.clone()))),
+            None,
+            "add({l:?}, {r:?})"
+        );
+    }
+
+    // Subtraction overflow
+    let args = [
+        (Byte(i8::MIN), Byte(1)),
+        (Short(i16::MIN), Short(1)),
+        (Integer(i32::MIN), Integer(1)),
+        (Long(i64::MIN), Long(1)),
+    ];
+    for (l, r) in args {
+        expect_eq!(
+            filter.eval_expr(&(Expr::literal(l.clone()) - Expr::literal(r.clone()))),
+            None,
+            "sub({l:?}, {r:?})"
+        );
+    }
+
+    // Multiplication overflow
+    let args = [
+        Byte(i8::MAX),
+        Short(i16::MAX),
+        Integer(i32::MAX),
+        Long(i64::MAX),
+    ];
+    for arg in args {
+        expect_eq!(
+            filter.eval_expr(&(Expr::literal(arg.clone()) * Expr::literal(arg.clone()))),
+            None,
+            "mul({arg:?}, {arg:?})"
+        );
+    }
+
+    // Division overflow
+    let args = [
+        (Byte(i8::MAX), Byte(0)),
+        (Short(i16::MAX), Short(0)),
+        (Integer(i32::MAX), Integer(0)),
+        (Long(i64::MAX), Long(0)),
+    ];
+    for (l, r) in args {
+        expect_eq!(
+            filter.eval_expr(&(Expr::literal(l.clone()) / Expr::literal(r.clone()))),
+            None,
+            "div({l:?}, {r:?})"
+        );
+    }
+}
+
 // Verifies that eval_binary_scalars uses partial_cmp_scalars correctly
 #[test]
 fn test_eval_binary_scalars() {
