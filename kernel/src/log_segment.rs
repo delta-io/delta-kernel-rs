@@ -521,36 +521,39 @@ impl ListedLogFiles {
         checkpoint_parts: Vec<ParsedLogPath>,
         latest_crc_file: Option<ParsedLogPath>,
     ) -> Self {
-        // We are adding debug_asserts here since we want to validate invariants that are (relatively) expensive to compute
-        debug_assert!(ascending_compaction_files.windows(2).all(|f| match f {
-            [ParsedLogPath {
-                version: version0,
-                file_type: LogPathFileType::CompactedCommit { hi: hi0 },
-                ..
-            }, ParsedLogPath {
-                version: version1,
-                file_type: LogPathFileType::CompactedCommit { hi: hi1 },
-                ..
-            }] => version0 < version1 || (version0 == version1 && hi0 <= hi1),
-            _ => false,
-        }));
-        debug_assert!(checkpoint_parts.iter().all(|p| p.is_checkpoint()));
-        debug_assert!(checkpoint_parts
-            .windows(2)
-            .all(|p| p[0].version == p[1].version));
-        // check that only one of the following exists: (1) a singular `SinglePartCheckpoint` or
-        // `UUID` checkpoint or (2) a multi-part, and all parts are there and nothing else
-        debug_assert!(
-            checkpoint_parts.len() <= 1
-                || checkpoint_parts
-                    .iter()
-                    .all(|p| matches!(p.file_type, LogPathFileType::MultiPartCheckpoint { .. }))
-                    && matches!(
-                        checkpoint_parts[0].file_type,
-                        LogPathFileType::MultiPartCheckpoint { num_parts, .. }
-                        if checkpoint_parts.len() == num_parts as usize
-                    )
-        );
+        // We are adding debug_assertions here since we want to validate invariants that are (relatively) expensive to compute
+        #[cfg(debug_assertions)]
+        {
+            assert!(ascending_compaction_files
+                .windows(2)
+                .all(|pair| match pair {
+                    [ParsedLogPath {
+                        version: version0,
+                        file_type: LogPathFileType::CompactedCommit { hi: hi0 },
+                        ..
+                    }, ParsedLogPath {
+                        version: version1,
+                        file_type: LogPathFileType::CompactedCommit { hi: hi1 },
+                        ..
+                    }] => version0 < version1 || (version0 == version1 && hi0 <= hi1),
+                    _ => false,
+                }));
+
+            assert!(checkpoint_parts.iter().all(|part| part.is_checkpoint()));
+
+            // for a multi-part checkpoint, check that they are all same version and all the parts are there
+            if checkpoint_parts.len() > 1 {
+                assert!(checkpoint_parts
+                    .windows(2)
+                    .all(|pair| pair[0].version == pair[1].version));
+
+                assert!(checkpoint_parts.iter().all(|part| matches!(
+                    part.file_type,
+                    LogPathFileType::MultiPartCheckpoint { num_parts, .. }
+                    if checkpoint_parts.len() == num_parts as usize
+                )));
+            }
+        }
 
         ListedLogFiles {
             ascending_commit_files,
