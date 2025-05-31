@@ -415,9 +415,9 @@ where
     )))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, ToSchema)]
 #[internal_api]
-#[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
+#[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
 pub(crate) struct CommitInfo {
     /// The time this logical file was created, as milliseconds since the epoch.
     /// Read: optional, write: required (that is, kernel always writes).

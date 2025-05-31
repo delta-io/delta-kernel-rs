@@ -1,17 +1,18 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::actions::SetTransaction;
-use crate::actions::COMMIT_INFO_NAME;
-use crate::actions::{get_log_add_schema, get_log_commit_info_schema, get_log_txn_schema};
+use crate::actions::{get_log_add_schema, get_log_commit_info_schema};
+use crate::actions::{CommitInfo, SetTransaction};
 use crate::error::Error;
-use crate::expressions::{column_expr, Scalar, StructData};
+use crate::expressions::{MapData, Scalar};
 use crate::path::ParsedLogPath;
 use crate::schema::{MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
-use crate::{DataType, DeltaResult, Engine, EngineData, Expression, IntoEngineData, Version};
+use crate::{
+    DataType, DeltaResult, Engine, EngineData, EvaluationHandlerExtension, Expression, Version,
+};
 
 use url::Url;
 
@@ -54,8 +55,7 @@ pub fn get_write_metadata_schema() -> &'static SchemaRef {
 /// ```
 pub struct Transaction {
     read_snapshot: Arc<Snapshot>,
-    operation: Option<String>,
-    commit_info: Option<Arc<dyn EngineData>>,
+    commit_info: Option<CommitInfo>,
     write_metadata: Vec<Box<dyn EngineData>>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
@@ -71,9 +71,9 @@ pub struct Transaction {
 impl std::fmt::Debug for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&format!(
-            "Transaction {{ read_snapshot version: {}, commit_info: {} }}",
+            "Transaction {{ read_snapshot version: {}, commit_info: {:#?} }}",
             self.read_snapshot.version(),
-            self.commit_info.is_some()
+            self.commit_info
         ))
     }
 }
@@ -102,7 +102,6 @@ impl Transaction {
 
         Ok(Transaction {
             read_snapshot,
-            operation: None,
             commit_info: None,
             write_metadata: vec![],
             set_transactions: vec![],
@@ -135,16 +134,13 @@ impl Transaction {
             .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
 
         // step one: construct the iterator of commit info + file actions we want to commit
-        let engine_commit_info = self
+        let commit_info = self
             .commit_info
-            .as_ref()
+            .clone()
             .ok_or_else(|| Error::MissingCommitInfo)?;
-        let commit_info_actions = generate_commit_info(
-            engine,
-            self.operation.as_deref(),
-            self.commit_timestamp,
-            engine_commit_info.as_ref(),
-        );
+
+        let commit_info_actions = generate_commit_info(engine, &commit_info, self.commit_timestamp);
+
         let add_actions = generate_adds(engine, self.write_metadata.iter().map(|a| a.as_ref()));
 
         let actions = iter::once(commit_info_actions)
@@ -165,10 +161,53 @@ impl Transaction {
         }
     }
 
+    // Set the timestmap of this transaction.
+    pub fn with_timestamp(mut self, timestamp: i64) -> Self {
+        self.commit_info.get_or_insert_default().timestamp = Some(timestamp);
+        self
+    }
+
+    /// Set the in-commit timestamp for this transaction. This is used for In-Commit Timestamps (ICT) feature.
+    /// When ICT is enabled, this timestamp must be monotonically increasing across commits.
+    ///
+    /// Note: For full ICT compliance, the caller should ensure this timestamp is greater than
+    /// the previous commit's inCommitTimestamp.
+    pub fn with_in_commit_timestamp(mut self, in_commit_timestamp: i64) -> Self {
+        self.commit_info.get_or_insert_default().in_commit_timestamp = Some(in_commit_timestamp);
+        self
+    }
+
     /// Set the operation that this transaction is performing. This string will be persisted in the
     /// commit and visible to anyone who describes the table history.
     pub fn with_operation(mut self, operation: String) -> Self {
-        self.operation = Some(operation);
+        self.commit_info.get_or_insert_default().operation = Some(operation);
+        self
+    }
+
+    // Set the operation parameters for the operation that this transaction is performing.
+    pub fn with_operation_parameters(
+        mut self,
+        operation_parameters: HashMap<String, String>,
+    ) -> Self {
+        self.commit_info
+            .get_or_insert_default()
+            .operation_parameters = Some(operation_parameters);
+        self
+    }
+
+    // Set the version of the delta_kernel crate used to write this transaction.
+    pub fn with_kernel_version(mut self, kernel_version: String) -> Self {
+        self.commit_info.get_or_insert_default().kernel_version = Some(kernel_version);
+        self
+    }
+
+    // Set the engine commit info of this transaction.
+    //
+    // Note: The engine data passed here must have exactly one row, and we
+    /// only read one column: `engineCommitInfo` which must be a map<string, string> encoding the
+    /// metadata.
+    pub fn with_engine_commit_info(mut self, engine_commit_info: HashMap<String, String>) -> Self {
+        self.commit_info.get_or_insert_default().engine_commit_info = Some(engine_commit_info);
         self
     }
 
@@ -180,24 +219,6 @@ impl Transaction {
     pub fn with_transaction_id(mut self, app_id: String, version: i64) -> Self {
         let set_transaction = SetTransaction::new(app_id, version, Some(self.commit_timestamp));
         self.set_transactions.push(set_transaction);
-        self
-    }
-
-    /// WARNING: This is an unstable API and will likely change in the future.
-    ///
-    /// Add commit info to the transaction. This is commit-wide metadata that is written as the
-    /// first action in the commit. The engine data passed here must have exactly one row, and we
-    /// only read one column: `engineCommitInfo` which must be a map<string, string> encoding the
-    /// metadata.
-    ///
-    /// The engine is required to provide commit info before committing the transaction. If the
-    /// engine would like to omit engine-specific commit info, it can do so by passing pass a
-    /// commit_info engine data chunk with one row and one column of type `Map<string, string>`
-    /// that can either be `null` or contain an empty map.
-    ///
-    /// Any other columns in the data chunk are ignored.
-    pub fn with_commit_info(mut self, commit_info: Box<dyn EngineData>) -> Self {
-        self.commit_info = Some(commit_info.into());
         self
     }
 
@@ -306,77 +327,72 @@ pub enum CommitResult {
     Conflict(Transaction, Version),
 }
 
-// given the engine's commit info we want to create commitInfo action to commit (and append more actions to)
+// given the CommitInfo struct we want to materialize it into a commitInfo action to commit (and append more actions to)
 fn generate_commit_info(
     engine: &dyn Engine,
-    operation: Option<&str>,
-    timestamp: i64,
-    engine_commit_info: &dyn EngineData,
+    commit_info: &CommitInfo,
+    commit_timestamp: i64,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    if engine_commit_info.len() != 1 {
-        return Err(Error::InvalidCommitInfo(format!(
-            "Engine commit info should have exactly one row, found {}",
-            engine_commit_info.len()
-        )));
+    if let Some(engine_commit_info) = &commit_info.engine_commit_info {
+        if engine_commit_info.len() != 1 {
+            return Err(Error::InvalidCommitInfo(format!(
+                "Engine commit info should have exactly one row, found {}",
+                engine_commit_info.len()
+            )));
+        }
     }
 
-    let commit_info_exprs = [
-        Expression::literal(timestamp),
-        Expression::literal(operation.unwrap_or(UNKNOWN_OPERATION)),
-        // HACK (part 1/2): since we don't have proper map support, we create a literal struct with
-        // one null field to create data that serializes as "operationParameters": {}
-        Expression::literal(Scalar::Struct(StructData::try_new(
-            vec![StructField::nullable(
-                "operation_parameter_int",
-                DataType::INTEGER,
-            )],
-            vec![Scalar::Null(DataType::INTEGER)],
-        )?)),
-        Expression::literal(format!("v{}", KERNEL_VERSION)),
-        column_expr!("engineCommitInfo"),
-    ];
-    let commit_info_expr = Expression::struct_from([Expression::struct_from(commit_info_exprs)]);
-    let commit_info_schema = get_log_commit_info_schema().as_ref();
-
-    // HACK (part 2/2): we need to modify the commit info schema to match the expression above (a
-    // struct with a single null int field).
-    let mut commit_info_empty_struct_schema = commit_info_schema.clone();
-    let commit_info_field = commit_info_empty_struct_schema
-        .fields
-        .get_mut(COMMIT_INFO_NAME)
-        .ok_or_else(|| Error::missing_column(COMMIT_INFO_NAME))?;
-    let DataType::Struct(mut commit_info_data_type) = commit_info_field.data_type().clone() else {
-        return Err(Error::internal_error(
-            "commit_info_field should be a struct",
-        ));
+    // Helper function to convert HashMap to Scalar for commit_info
+    let hashmap_to_scalar = |hm: &Option<HashMap<String, String>>| -> DeltaResult<Scalar> {
+        match hm {
+            Some(map) => {
+                let pairs = map.iter().map(|(k, v)| (k.clone(), v.clone()));
+                let map_data = MapData::try_new(
+                    MapType::new(DataType::STRING, DataType::STRING, false),
+                    pairs,
+                )?;
+                Ok(Scalar::Map(map_data))
+            }
+            None => {
+                let map_data = MapData::try_new(
+                    MapType::new(DataType::STRING, DataType::STRING, false),
+                    std::iter::empty::<(String, String)>(),
+                )?;
+                Ok(Scalar::Map(map_data))
+            }
+        }
     };
-    let engine_commit_info_schema =
-        commit_info_data_type.project_as_struct(&["engineCommitInfo"])?;
-    let hack_data_type = DataType::Struct(Box::new(StructType::new(vec![StructField::nullable(
-        "hack_operation_parameter_int",
-        DataType::INTEGER,
-    )])));
 
-    commit_info_data_type
-        .fields
-        .get_mut("operationParameters")
-        .ok_or_else(|| Error::missing_column("operationParameters"))?
-        .data_type = hack_data_type;
+    let commit_info_schema = get_log_commit_info_schema();
 
-    // Since writing in-commit timestamps is not supported, we remove the field so it is not
-    // written to the log
-    commit_info_data_type
-        .fields
-        .shift_remove("inCommitTimestamp");
-    commit_info_field.data_type = DataType::Struct(commit_info_data_type);
+    let commit_info_values = vec![
+        // timestamp
+        Scalar::Long(commit_info.timestamp.unwrap_or(commit_timestamp)),
+        // in_commit_timestamp
+        Scalar::Long(commit_info.in_commit_timestamp.unwrap_or(commit_timestamp)),
+        //operation
+        Scalar::String(
+            commit_info
+                .operation
+                .clone()
+                .unwrap_or(UNKNOWN_OPERATION.to_string()),
+        ),
+        // operation parameters
+        hashmap_to_scalar(&commit_info.operation_parameters)?,
+        // kernel_version
+        Scalar::String(
+            commit_info
+                .kernel_version
+                .clone()
+                .unwrap_or(format!("v{}", KERNEL_VERSION)),
+        ),
+        // engine_commit_info
+        hashmap_to_scalar(&commit_info.engine_commit_info)?,
+    ];
 
-    let commit_info_evaluator = engine.evaluation_handler().new_expression_evaluator(
-        engine_commit_info_schema.into(),
-        commit_info_expr,
-        commit_info_empty_struct_schema.into(),
-    );
-
-    commit_info_evaluator.evaluate(engine_commit_info)
+    engine
+        .evaluation_handler()
+        .create_one(commit_info_schema.clone(), &commit_info_values)
 }
 
 #[cfg(test)]
@@ -388,9 +404,6 @@ mod tests {
     use crate::schema::MapType;
     use crate::{EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
 
-    use crate::arrow::array::{MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder};
-    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-    use crate::arrow::error::ArrowError;
     use crate::arrow::json::writer::LineDelimitedWriter;
     use crate::arrow::record_batch::RecordBatch;
 
@@ -420,23 +433,6 @@ mod tests {
         }
     }
 
-    fn build_map(entries: Vec<(&str, &str)>) -> MapArray {
-        let key_builder = StringBuilder::new();
-        let val_builder = StringBuilder::new();
-        let names = MapFieldNames {
-            entry: "entries".to_string(),
-            key: "key".to_string(),
-            value: "value".to_string(),
-        };
-        let mut builder = MapBuilder::new(Some(names), key_builder, val_builder);
-        for (key, val) in entries {
-            builder.keys().append_value(key);
-            builder.values().append_value(val);
-            builder.append(true).unwrap();
-        }
-        builder.finish()
-    }
-
     // convert it to JSON just for ease of comparison (and since we ultimately persist as JSON)
     fn as_json(data: Box<dyn EngineData>) -> serde_json::Value {
         let record_batch: RecordBatch = data
@@ -457,260 +453,86 @@ mod tests {
     #[test]
     fn test_generate_commit_info() -> DeltaResult<()> {
         let engine = ExprEngine::new();
-        let engine_commit_info_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "engineCommitInfo",
-            ArrowDataType::Map(
-                Arc::new(Field::new(
-                    "entries",
-                    ArrowDataType::Struct(
-                        vec![
-                            Field::new("key", ArrowDataType::Utf8, false),
-                            Field::new("value", ArrowDataType::Utf8, true),
-                        ]
-                        .into(),
-                    ),
-                    false,
-                )),
-                false,
+
+        let commit_info = CommitInfo {
+            timestamp: None,
+            in_commit_timestamp: Some(123),
+            operation: Some("test operation".to_string()),
+            kernel_version: Some(format!("v{}", env!("CARGO_PKG_VERSION"))),
+            operation_parameters: Some(HashMap::new()),
+            engine_commit_info: Some(
+                vec![("engineInfo".to_string(), "default engine".to_string())]
+                    .into_iter()
+                    .collect(),
             ),
-            false,
-        )]));
-
-        let map_array = build_map(vec![("engineInfo", "default engine")]);
-        let commit_info_batch =
-            RecordBatch::try_new(engine_commit_info_schema, vec![Arc::new(map_array)])?;
-
-        let actions = generate_commit_info(
-            &engine,
-            Some("test operation"),
-            123456789,
-            &ArrowEngineData::new(commit_info_batch),
-        )?;
-
-        let expected = serde_json::json!({
-            "commitInfo": {
-                "timestamp": 123456789,
-                "operation": "test operation",
-                "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
-                "operationParameters": {},
-                "engineCommitInfo": {
-                    "engineInfo": "default engine"
-                }
-            }
-        });
-
-        assert_eq!(actions.len(), 1);
-        let result = as_json(actions);
-        assert_eq!(result, expected);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_commit_info_with_multiple_columns() -> DeltaResult<()> {
-        let engine = ExprEngine::new();
-        let engine_commit_info_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new(
-                "engineCommitInfo",
-                ArrowDataType::Map(
-                    Arc::new(Field::new(
-                        "entries",
-                        ArrowDataType::Struct(
-                            vec![
-                                Field::new("key", ArrowDataType::Utf8, false),
-                                Field::new("value", ArrowDataType::Utf8, true),
-                            ]
-                            .into(),
-                        ),
-                        false,
-                    )),
-                    false,
-                ),
-                false,
-            ),
-            Field::new("operation", ArrowDataType::Utf8, true),
-        ]));
-
-        let map_array = build_map(vec![("engineInfo", "default engine")]);
-
-        let commit_info_batch = RecordBatch::try_new(
-            engine_commit_info_schema,
-            vec![
-                Arc::new(map_array),
-                Arc::new(StringArray::from(vec!["some_string"])),
-            ],
-        )?;
-
-        let actions = generate_commit_info(
-            &engine,
-            Some("test operation"),
-            123456789,
-            &ArrowEngineData::new(commit_info_batch),
-        )?;
-
-        let expected = serde_json::json!({
-            "commitInfo": {
-                "timestamp": 123456789,
-                "operation": "test operation",
-                "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
-                "operationParameters": {},
-                "engineCommitInfo": {
-                    "engineInfo": "default engine"
-                }
-            }
-        });
-
-        assert_eq!(actions.len(), 1);
-        let result = as_json(actions);
-        assert_eq!(result, expected);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_invalid_commit_info_missing_column() -> DeltaResult<()> {
-        let engine = ExprEngine::new();
-        let engine_commit_info_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "some_column_name",
-            ArrowDataType::Utf8,
-            true,
-        )]));
-        let commit_info_batch = RecordBatch::try_new(
-            engine_commit_info_schema,
-            vec![Arc::new(StringArray::new_null(1))],
-        )?;
-
-        let _ = generate_commit_info(
-            &engine,
-            Some("test operation"),
-            123456789,
-            &ArrowEngineData::new(commit_info_batch),
-        )
-        .map_err(|e| match e {
-            Error::Arrow(ArrowError::SchemaError(_)) => (),
-            Error::Backtraced { source, .. }
-                if matches!(&*source, Error::Arrow(ArrowError::SchemaError(_))) => {}
-            _ => panic!("expected arrow schema error error, got {:?}", e),
-        });
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_invalid_commit_info_invalid_column_type() -> DeltaResult<()> {
-        let engine = ExprEngine::new();
-        let engine_commit_info_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "engineCommitInfo",
-            ArrowDataType::Utf8,
-            true,
-        )]));
-        let commit_info_batch = RecordBatch::try_new(
-            engine_commit_info_schema,
-            vec![Arc::new(StringArray::new_null(1))],
-        )?;
-
-        let _ = generate_commit_info(
-            &engine,
-            Some("test operation"),
-            123456789,
-            &ArrowEngineData::new(commit_info_batch),
-        )
-        .map_err(|e| match e {
-            Error::Arrow(ArrowError::InvalidArgumentError(_)) => (),
-            Error::Backtraced { source, .. }
-                if matches!(&*source, Error::Arrow(ArrowError::InvalidArgumentError(_))) => {}
-            _ => panic!("expected arrow invalid arg error, got {:?}", e),
-        });
-
-        Ok(())
-    }
-
-    fn assert_empty_commit_info(
-        data: Box<dyn EngineData>,
-        write_engine_commit_info: bool,
-        timestamp: i64,
-    ) -> DeltaResult<()> {
-        assert_eq!(data.len(), 1);
-        let expected = if write_engine_commit_info {
-            serde_json::json!({
-                "commitInfo": {
-                    "timestamp": timestamp,
-                    "operation": "test operation",
-                    "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
-                    "operationParameters": {},
-                    "engineCommitInfo": {}
-                }
-            })
-        } else {
-            serde_json::json!({
-                "commitInfo": {
-                    "timestamp": timestamp,
-                    "operation": "test operation",
-                    "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
-                    "operationParameters": {},
-                }
-            })
         };
-        let result = as_json(data);
+
+        let actions = generate_commit_info(&engine, &commit_info, 123456789)?;
+
+        let expected = serde_json::json!({
+            "commitInfo": {
+                "timestamp": 123456789,
+                "inCommitTimestamp": 123,
+                "operation": "test operation",
+                "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
+                "operationParameters": {},
+                "engineCommitInfo": {
+                    "engineInfo": "default engine"
+                }
+            }
+        });
+
+        assert_eq!(actions.len(), 1);
+        let result = as_json(actions);
         assert_eq!(result, expected);
+
         Ok(())
     }
 
-    // Three cases for empty commit info:
-    // 1. `engineCommitInfo` column with an empty Map<string, string>
-    // 2. `engineCommitInfo` null column of type Map<string, string>
-    // 3. a column that has a name other than `engineCommitInfo`; Delta can detect that the column
-    //    is missing and substitute a null literal in its place. The type of that column doesn't
-    //    matter, Delta will ignore it.
     #[test]
-    fn test_empty_commit_info() -> DeltaResult<()> {
-        // test with null map and empty map
-        for is_null in [true, false] {
-            let engine = ExprEngine::new();
-            let engine_commit_info_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-                "engineCommitInfo",
-                ArrowDataType::Map(
-                    Arc::new(Field::new(
-                        "entries",
-                        ArrowDataType::Struct(
-                            vec![
-                                Field::new("key", ArrowDataType::Utf8, false),
-                                Field::new("value", ArrowDataType::Utf8, true),
-                            ]
-                            .into(),
-                        ),
-                        false,
-                    )),
-                    false,
-                ),
-                true,
-            )]));
+    fn test_generate_commit_info_invalid_engine_commit_info() -> DeltaResult<()> {
+        let engine = ExprEngine::new();
 
-            let key_builder = StringBuilder::new();
-            let val_builder = StringBuilder::new();
-            let names = crate::arrow::array::MapFieldNames {
-                entry: "entries".to_string(),
-                key: "key".to_string(),
-                value: "value".to_string(),
-            };
-            let mut builder =
-                crate::arrow::array::MapBuilder::new(Some(names), key_builder, val_builder);
-            builder.append(is_null).unwrap();
-            let array = builder.finish();
+        let mut commit_info = CommitInfo {
+            timestamp: Some(123456789),
+            in_commit_timestamp: Some(123),
+            operation: Some("test operation".to_string()),
+            kernel_version: Some(format!("v{}", env!("CARGO_PKG_VERSION"))),
+            operation_parameters: Some(HashMap::new()),
+            engine_commit_info: Some(HashMap::new()),
+        };
 
-            let commit_info_batch =
-                RecordBatch::try_new(engine_commit_info_schema, vec![Arc::new(array)])?;
-
-            let timestamp = 123456;
-            let actions = generate_commit_info(
-                &engine,
-                Some("test operation"),
-                timestamp,
-                &ArrowEngineData::new(commit_info_batch),
-            )?;
-
-            assert_empty_commit_info(actions, is_null, timestamp)?;
+        match generate_commit_info(&engine, &commit_info, 0) {
+            Err(Error::InvalidCommitInfo(msg)) => {
+                assert_eq!(
+                    msg,
+                    "Engine commit info should have exactly one row, found 0"
+                );
+            }
+            _ => panic!("Expected InvalidCommitInfo error"),
         }
+
+        commit_info
+            .engine_commit_info
+            .as_mut()
+            .unwrap()
+            .insert("row1".to_string(), "default engine".to_string());
+        commit_info
+            .engine_commit_info
+            .as_mut()
+            .unwrap()
+            .insert("row2".to_string(), "default engine".to_string());
+
+        match generate_commit_info(&engine, &commit_info, 0) {
+            Err(Error::InvalidCommitInfo(msg)) => {
+                assert_eq!(
+                    msg,
+                    "Engine commit info should have exactly one row, found 2"
+                );
+            }
+            _ => panic!("Expected InvalidCommitInfo error"),
+        }
+
         Ok(())
     }
 

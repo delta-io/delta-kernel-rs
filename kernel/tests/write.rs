@@ -1,10 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{
-    Int32Array, MapBuilder, MapFieldNames, StringArray, StringBuilder, TimestampMicrosecondArray,
-};
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+use delta_kernel::arrow::array::{Int32Array, StringArray};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
 
@@ -124,46 +121,6 @@ async fn create_table(
     Ok(Table::new(table_path))
 }
 
-// create commit info in arrow of the form {engineInfo: "default engine"}
-fn new_commit_info() -> DeltaResult<Box<ArrowEngineData>> {
-    // create commit info of the form {engineCommitInfo: Map { "engineInfo": "default engine" } }
-    let commit_info_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-        "engineCommitInfo",
-        ArrowDataType::Map(
-            Arc::new(Field::new(
-                "entries",
-                ArrowDataType::Struct(
-                    vec![
-                        Field::new("key", ArrowDataType::Utf8, false),
-                        Field::new("value", ArrowDataType::Utf8, true),
-                    ]
-                    .into(),
-                ),
-                false,
-            )),
-            false,
-        ),
-        false,
-    )]));
-
-    let key_builder = StringBuilder::new();
-    let val_builder = StringBuilder::new();
-    let names = MapFieldNames {
-        entry: "entries".to_string(),
-        key: "key".to_string(),
-        value: "value".to_string(),
-    };
-    let mut builder = MapBuilder::new(Some(names), key_builder, val_builder);
-    builder.keys().append_value("engineInfo");
-    builder.values().append_value("default engine");
-    builder.append(true).unwrap();
-    let array = builder.finish();
-
-    let commit_info_batch =
-        RecordBatch::try_new(commit_info_schema.clone(), vec![Arc::new(array)])?;
-    Ok(Box::new(ArrowEngineData::new(commit_info_batch)))
-}
-
 async fn setup_tables(
     schema: SchemaRef,
     partition_columns: &[&str],
@@ -222,12 +179,12 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     )]));
 
     for (table, engine, store, table_name) in setup_tables(schema, &[]).await? {
-        let commit_info = new_commit_info()?;
-
         // create a transaction
-        let txn = table
-            .new_transaction(&engine)?
-            .with_commit_info(commit_info);
+        let txn = table.new_transaction(&engine)?.with_engine_commit_info(
+            vec![("engineInfo".to_string(), "default engine".to_string())]
+                .into_iter()
+                .collect(),
+        );
 
         // commit!
         txn.commit(&engine)?;
@@ -245,9 +202,16 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
             .get_mut("timestamp")
             .unwrap() = serde_json::Value::Number(0.into());
 
+        *parsed_commit
+            .get_mut("commitInfo")
+            .unwrap()
+            .get_mut("inCommitTimestamp")
+            .unwrap() = serde_json::Value::Number(0.into());
+
         let expected_commit = json!({
             "commitInfo": {
                 "timestamp": 0,
+                "inCommitTimestamp": 0,
                 "operation": "UNKNOWN",
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                 "operationParameters": {},
@@ -293,12 +257,9 @@ async fn test_invalid_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     )]));
     for (table, engine, _store, _table_name) in setup_tables(schema, &[]).await? {
         // empty commit info test
-        let commit_info_schema = Arc::new(ArrowSchema::empty());
-        let commit_info_batch = RecordBatch::new_empty(commit_info_schema.clone());
-        assert!(commit_info_batch.num_rows() == 0);
         let txn = table
             .new_transaction(&engine)?
-            .with_commit_info(Box::new(ArrowEngineData::new(commit_info_batch)));
+            .with_engine_commit_info(HashMap::new());
 
         // commit!
         assert!(matches!(
@@ -307,22 +268,14 @@ async fn test_invalid_commit_info() -> Result<(), Box<dyn std::error::Error>> {
         ));
 
         // two-row commit info test
-        let commit_info_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "engineInfo",
-            ArrowDataType::Utf8,
-            true,
-        )]));
-        let commit_info_batch = RecordBatch::try_new(
-            commit_info_schema.clone(),
-            vec![Arc::new(StringArray::from(vec![
-                "row1: default engine",
-                "row2: default engine",
-            ]))],
-        )?;
-
-        let txn = table
-            .new_transaction(&engine)?
-            .with_commit_info(Box::new(ArrowEngineData::new(commit_info_batch)));
+        let txn = table.new_transaction(&engine)?.with_engine_commit_info(
+            vec![
+                ("row1".to_string(), "default engine".to_string()),
+                ("row2".to_string(), "default engine".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
 
         // commit!
         assert!(matches!(
@@ -391,6 +344,71 @@ async fn get_and_check_all_parquet_sizes(store: Arc<dyn ObjectStore>, path: &str
 }
 
 #[tokio::test]
+async fn test_comit_info_action() -> Result<(), Box<dyn std::error::Error>> {
+    // setup tracing
+    let _ = tracing_subscriber::fmt::try_init();
+    // create a simple table: one int column named 'number'
+    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )]));
+
+    for (table, engine, store, table_name) in setup_tables(schema.clone(), &[]).await? {
+        let txn = table
+            .new_transaction(&engine)?
+            .with_timestamp(1)
+            .with_in_commit_timestamp(2)
+            .with_operation("INSERT".to_string())
+            .with_operation_parameters(
+                vec![
+                    ("mode".to_string(), "Append".to_string()),
+                    ("partitionBy".to_string(), "[]".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .with_kernel_version("v0.11.0".to_string())
+            .with_engine_commit_info(
+                vec![("engineInfo".to_string(), "default engine".to_string())]
+                    .into_iter()
+                    .collect(),
+            );
+
+        txn.commit(&engine)?;
+
+        let commit = store
+            .get(&Path::from(format!(
+                "/{table_name}/_delta_log/00000000000000000001.json"
+            )))
+            .await?;
+
+        let parsed_commits: Vec<_> = Deserializer::from_slice(&commit.bytes().await?)
+            .into_iter::<serde_json::Value>()
+            .try_collect()?;
+
+        let expected_commit = vec![json!({
+            "commitInfo": {
+                "timestamp": 1,
+                "inCommitTimestamp": 2,
+                "operation": "INSERT",
+                "kernelVersion": "v0.11.0",
+                "operationParameters": {
+                    "mode": "Append",
+                    "partitionBy": "[]"
+                },
+                "engineCommitInfo": {
+                    "engineInfo": "default engine"
+                }
+            }
+        })];
+
+        assert_eq!(parsed_commits, expected_commit);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
@@ -401,11 +419,11 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
     )]));
 
     for (table, engine, store, table_name) in setup_tables(schema.clone(), &[]).await? {
-        let commit_info = new_commit_info()?;
-
-        let mut txn = table
-            .new_transaction(&engine)?
-            .with_commit_info(commit_info);
+        let mut txn = table.new_transaction(&engine)?.with_engine_commit_info(
+            vec![("engineInfo".to_string(), "default engine".to_string())]
+                .into_iter()
+                .collect(),
+        );
 
         // create two new arrow record batches to append
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -463,6 +481,11 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
         // set timestamps to 0 and paths to known string values for comparison
         // (otherwise timestamps are non-deterministic and paths are random UUIDs)
         set_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+        set_value(
+            &mut parsed_commits[0],
+            "commitInfo.inCommitTimestamp",
+            json!(0),
+        )?;
         set_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
         set_value(&mut parsed_commits[1], "add.path", json!("first.parquet"))?;
         set_value(&mut parsed_commits[2], "add.modificationTime", json!(0))?;
@@ -472,6 +495,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
             json!({
                 "commitInfo": {
                     "timestamp": 0,
+                    "inCommitTimestamp": 0,
                     "operation": "UNKNOWN",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
@@ -535,11 +559,11 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     for (table, engine, store, table_name) in
         setup_tables(table_schema.clone(), &[partition_col]).await?
     {
-        let commit_info = new_commit_info()?;
-
-        let mut txn = table
-            .new_transaction(&engine)?
-            .with_commit_info(commit_info);
+        let mut txn = table.new_transaction(&engine)?.with_engine_commit_info(
+            vec![("engineInfo".to_string(), "default engine".to_string())]
+                .into_iter()
+                .collect(),
+        );
 
         // create two new arrow record batches to append
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -601,6 +625,11 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         // set timestamps to 0 and paths to known string values for comparison
         // (otherwise timestamps are non-deterministic and paths are random UUIDs)
         set_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+        set_value(
+            &mut parsed_commits[0],
+            "commitInfo.inCommitTimestamp",
+            json!(0),
+        )?;
         set_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
         set_value(&mut parsed_commits[1], "add.path", json!("first.parquet"))?;
         set_value(&mut parsed_commits[2], "add.modificationTime", json!(0))?;
@@ -610,6 +639,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
             json!({
                 "commitInfo": {
                     "timestamp": 0,
+                    "inCommitTimestamp": 0,
                     "operation": "UNKNOWN",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
@@ -675,11 +705,11 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
     )]));
 
     for (table, engine, _store, _table_name) in setup_tables(table_schema, &[]).await? {
-        let commit_info = new_commit_info()?;
-
-        let txn = table
-            .new_transaction(&engine)?
-            .with_commit_info(commit_info);
+        let txn = table.new_transaction(&engine)?.with_engine_commit_info(
+            vec![("engineInfo".to_string(), "default engine".to_string())]
+                .into_iter()
+                .collect(),
+        );
 
         // create two new arrow record batches to append
         let append_data = [["a", "b"], ["c", "d"]].map(|data| -> DeltaResult<_> {
@@ -733,8 +763,6 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
     )]));
 
     for (table, engine, store, table_name) in setup_tables(schema, &[]).await? {
-        let commit_info = new_commit_info()?;
-
         // can't have duplicate app_id in same transaction
         assert!(matches!(
             table
@@ -747,7 +775,11 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
 
         let txn = table
             .new_transaction(&engine)?
-            .with_commit_info(commit_info)
+            .with_engine_commit_info(
+                vec![("engineInfo".to_string(), "default engine".to_string())]
+                    .into_iter()
+                    .collect(),
+            )
             .with_transaction_id("app_id1".to_string(), 1)
             .with_transaction_id("app_id2".to_string(), 2);
 
@@ -779,6 +811,12 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             .get_mut("commitInfo")
             .unwrap()
             .get_mut("timestamp")
+            .unwrap() = serde_json::Value::Number(0.into());
+
+        *parsed_commits[0]
+            .get_mut("commitInfo")
+            .unwrap()
+            .get_mut("inCommitTimestamp")
             .unwrap() = serde_json::Value::Number(0.into());
 
         let time_ms: i64 = std::time::SystemTime::now()
@@ -822,6 +860,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             json!({
                 "commitInfo": {
                     "timestamp": 0,
+                    "inCommitTimestamp": 0,
                     "operation": "UNKNOWN",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
