@@ -1,13 +1,17 @@
-//! Defines [`LogReplayScanner`] used by [`TableChangesScan`] to process commit files and extract
-//! the metadata needed to generate the Change Data Feed.
-
+//! This module handles the log replay for Change Data Feed. This is done in two phases:
+//! [`ProcessedCdfCommit::try_new`], and [`ProcessedCdfCommit::into_scan_batches`]. The first phase
+//! pre-processes the commit file to validate the [`TableConfiguration`] and to collect information
+//! about the commit's timestamp and presence of cdc actions. Then [`TableChangesScanMetadata`] are
+//! generated in the second phase. Note: As a consequence of the two phases, we must iterate over
+//! each action in the commit twice. It also may use an unbounded amount of memory, proportional to
+//! the number of `add` + `remove` actions in the _single_ commit.
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::visitors::{visit_deletion_vector_at, visit_protocol_at};
 use crate::actions::{
-    get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, METADATA_NAME,
-    PROTOCOL_NAME, REMOVE_NAME,
+    get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, COMMIT_INFO_NAME,
+    METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
@@ -19,8 +23,7 @@ use crate::schema::{
     ToSchema as _,
 };
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
-use crate::table_changes::{check_cdf_table_properties, ensure_cdf_read_supported};
-use crate::table_properties::TableProperties;
+use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
 
@@ -54,77 +57,53 @@ pub(crate) fn table_changes_action_iter(
     commit_files: impl IntoIterator<Item = ParsedLogPath>,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
+    mut table_configuration: TableConfiguration,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
     let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
+    let process_engine_ref = engine.clone();
     let result = commit_files
         .into_iter()
         .map(move |commit_file| -> DeltaResult<_> {
-            let scanner = LogReplayScanner::try_new(engine.as_ref(), commit_file, &table_schema)?;
-            scanner.into_scan_batches(engine.clone(), filter.clone())
+            ProcessedCdfCommit::try_new(
+                process_engine_ref.as_ref(),
+                commit_file,
+                &table_schema,
+                &mut table_configuration,
+            )?
+            .into_scan_batches(engine.clone(), filter.clone())
         }) //Iterator-Result-Iterator-Result
         .flatten_ok() // Iterator-Result-Result
         .map(|x| x?); // Iterator-Result
     Ok(result)
 }
 
-/// Processes a single commit file from the log to generate an iterator of
-/// [`TableChangesScanMetadata`]. The scanner operates in two phases that _must_ be performed in the
-/// following order:
-/// 1. Prepare phase [`LogReplayScanner::try_new`]: This iterates over every action in the commit.
-///    In this phase, we do the following:
-///     - Determine if there exist any `cdc` actions. We determine this in the first phase because
-///       the selection vectors for actions are lazily constructed in phase 2. We must know ahead
-///       of time whether to filter out add/remove actions.
-///     - Constructs the remove deletion vector map from paths belonging to `remove` actions to the
-///       action's corresponding [`DvInfo`]. This map will be filtered to only contain paths that
-///       exists in another `add` action _within the same commit_. We store the result in `remove_dvs`.
-///       Deletion vector resolution affects whether a remove action is selected in the second
-///       phase, so we must perform it ahead of time in phase 1.
-///     - Ensure that reading is supported on any protocol updates.
-///     - Ensure that Change Data Feed is enabled for any metadata update. See  [`TableProperties`]
-///     - Ensure that any schema update is compatible with the provided `schema`. Currently, schema
-///       compatibility is checked through schema equality. This will be expanded in the future to
-///       allow limited schema evolution.
-///
-/// Note: We check the protocol, change data feed enablement, and schema compatibility in phase 1
-/// in order to detect errors and fail early.
-///
-/// Note: The reader feature [`ReaderFeatures::DeletionVectors`] controls whether the table is
-/// allowed to contain deletion vectors. [`TableProperties`].enable_deletion_vectors only
-/// determines whether writers are allowed to create _new_ deletion vectors. Hence, we do not need
-/// to check the table property for deletion vector enablement.
-///
-/// See https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors
-///
-/// TODO: When the kernel supports in-commit timestamps, we will also have to inspect CommitInfo
-/// actions to find the timestamp. These are generated when incommit timestamps is enabled.
-/// This must be done in the first phase because the second phase lazily transforms engine data with
-/// an extra timestamp column. Thus, the timestamp must be known ahead of time.
-/// See https://github.com/delta-io/delta-kernel-rs/issues/559
-///
-/// 2. Scan file generation phase [`LogReplayScanner::into_scan_batches`]: This iterates over every
-///    action in the commit, and generates [`TableChangesScanMetadata`]. It does so by transforming the
-///    actions using [`add_transform_expr`], and generating selection vectors with the following rules:
-///     - If a `cdc` action was found in the prepare phase, only `cdc` actions are selected
-///     - Otherwise, select `add` and `remove` actions. Note that only `remove` actions that do not
-///       share a path with an `add` action are selected.
-///
-/// Note: As a consequence of the two phases, LogReplayScanner will iterate over each action in the
-/// commit twice. It also may use an unbounded amount of memory, proportional to the number of
-/// `add` + `remove` actions in the _single_ commit.
-struct LogReplayScanner {
-    // True if a `cdc` action was found after running [`LogReplayScanner::try_new`]
+/// Represents a single commit file that's been processed by [`ProcessedCdfCommit::try_new`]. If
+/// successfully constructed, the [`ProcessedCdfCommit`] will hold:
+/// - The `timestamp` of the commit. Currently this is the file modification timestamp. When the
+///   kernel supports in-commit timestamps, we will also have to inspect CommitInfo actions to find
+///   the in-commit timestamp. These are generated when the incommit timestamps table property is
+///   enabled. This must be done in [`ProcessedCdfCommit::try_new`] instead of the
+///   [`ProcessedCdfCommit::into_scan_batches`] because it lazily transforms engine data with an
+///   extra timestamp column. Thus, the timestamp must be known before the next phase.
+///   See <https://github.com/delta-io/delta-kernel-rs/issues/559>
+/// - `remove_dvs`, a map from each remove action's path to its [`DvInfo`]. This will be used to
+///   resolve the deletion vectors to find the rows that were changed this commit.
+///   See [`crate::table_changes::resolve_dvs`]
+/// - `has_cdc_action` which is `true` when there is a `cdc` action present in the commit. This is
+///   used in [`ProcessedCdfCommit::into_scan_batches`] to correctly generate a selection vector
+///   over the actions in the commit.
+struct ProcessedCdfCommit {
+    // True if a `cdc` action was found in the commit
     has_cdc_action: bool,
     // A map from path to the deletion vector from the remove action. It is guaranteed that there
     // is an add action with the same path in this commit
     remove_dvs: HashMap<String, DvInfo>,
-    // The commit file that this replay scanner will operate on.
+    // The commit file that this [`ProcessedCdfCommit`] represents.
     commit_file: ParsedLogPath,
     // The timestamp associated with this commit. This is the file modification time
     // from the commit's [`FileMeta`].
     //
-    //
-    // TODO when incommit timestamps are supported: If there is a [`CommitInfo`] with a timestamp
+    // TODO when in-commit timestamps are supported: If there is a [`CommitInfo`] with a timestamp
     // generated by in-commit timestamps, that timestamp will be used instead.
     //
     // Note: This will be used once an expression is introduced to transform the engine data in
@@ -132,22 +111,38 @@ struct LogReplayScanner {
     timestamp: i64,
 }
 
-impl LogReplayScanner {
-    /// Constructs a LogReplayScanner, performing the Prepare phase detailed in [`LogReplayScanner`].
-    /// This iterates over each action in the commit. It performs the following:
-    /// 1. Check the commits for the presence of a `cdc` action.
-    /// 2. Construct a map from path to deletion vector of remove actions that share the same path
-    ///    as an add action.
-    /// 3. Perform validation on each protocol and metadata action in the commit.
+impl ProcessedCdfCommit {
+    /// This processes a commit file to prepare for generating [`TableChangesScanMetadata`]. To do so, it
+    /// performs the following:
+    ///     - Determine if there exist any `cdc` actions. We determine this in this phase because the
+    ///       selection vectors for actions are lazily constructed in the following phase. We must know
+    ///       ahead of time whether to filter out add/remove actions.
+    ///     - Constructs the map from paths belonging to `remove` action's path to its [`DvInfo`]. This
+    ///       map will be filtered to only contain paths that exists in another `add` action _within the
+    ///       same commit_. We store the result in `remove_dvs`. Deletion vector resolution affects
+    ///       whether a remove action is selected in the second phase, so we must perform it before
+    ///       [`ProcessedCdfCommit::into_scan_batches`].
+    ///     - Ensure that reading is supported on any protocol updates.
+    ///     - Ensure that Change Data Feed is enabled for any metadata update. See [`TableProperties`]
+    ///     - Ensure that any schema update is compatible with the provided `schema`. Currently, schema
+    ///       compatibility is checked through schema equality. This will be expanded in the future to
+    ///       allow limited schema evolution.
     ///
-    /// For more details, see the documentation for [`LogReplayScanner`].
+    /// Note: We check the protocol, change data feed enablement, and schema compatibility in
+    /// ['ProcessedCdfCommit::try_new'] in order to detect errors and fail early.
+    ///
+    /// Note: The reader feature [`ReaderFeatures::DeletionVectors`] controls whether the table is
+    /// allowed to contain deletion vectors. [`TableProperties`].enable_deletion_vectors only
+    /// determines whether writers are allowed to create _new_ deletion vectors. Hence, we do not need
+    /// to check the table property for deletion vector enablement.
+    ///
+    /// See https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors
     fn try_new(
         engine: &dyn Engine,
         commit_file: ParsedLogPath,
         table_schema: &SchemaRef,
+        table_configuration: &mut TableConfiguration,
     ) -> DeltaResult<Self> {
-        let visitor_schema = PreparePhaseVisitor::schema();
-
         // Note: We do not perform data skipping yet because we need to visit all add and
         // remove actions for deletion vector resolution to be correct.
         //
@@ -159,41 +154,61 @@ impl LogReplayScanner {
         // vectors are resolved so that we can skip both actions in the pair.
         let action_iter = engine.json_handler().read_json_files(
             &[commit_file.location.clone()],
-            visitor_schema,
+            ProcessedCdfCommitVisitor::schema(),
             None, // not safe to apply data skipping yet
         )?;
 
         let mut remove_dvs = HashMap::default();
         let mut add_paths = HashSet::default();
         let mut has_cdc_action = false;
-        for actions in action_iter {
+        let mut timestamp = commit_file.location.last_modified;
+        for (i, actions) in action_iter.enumerate() {
             let actions = actions?;
 
-            let mut visitor = PreparePhaseVisitor {
+            let mut visitor = ProcessedCdfCommitVisitor {
                 add_paths: &mut add_paths,
                 remove_dvs: &mut remove_dvs,
                 has_cdc_action: &mut has_cdc_action,
+                commit_timestamp: None,
                 protocol: None,
-                metadata_info: None,
+                metadata: None,
+                is_first_batch: i == 0,
             };
-            visitor.visit_rows_of(actions.as_ref())?;
 
-            if let Some(protocol) = visitor.protocol {
-                ensure_cdf_read_supported(&protocol)
-                    .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;
+            visitor.visit_rows_of(actions.as_ref())?;
+            let metadata_changed = visitor.metadata.is_some();
+            match (visitor.protocol, visitor.metadata) {
+                (None, None) => {} // no change
+                (protocol, metadata) => {
+                    // at least one of protocol and metadata changed, so update the table configuration
+                    *table_configuration = TableConfiguration::try_new(
+                        metadata.unwrap_or_else(|| table_configuration.metadata().clone()),
+                        protocol.unwrap_or_else(|| table_configuration.protocol().clone()),
+                        table_configuration.table_root().clone(),
+                        commit_file.version,
+                    )?;
+                    if !table_configuration.is_cdf_read_supported() {
+                        return Err(Error::change_data_feed_unsupported(commit_file.version));
+                    }
+                }
             }
-            if let Some((schema, configuration)) = visitor.metadata_info {
-                let schema: StructType = serde_json::from_str(&schema)?;
+            if metadata_changed {
                 // Currently, schema compatibility is defined as having equal schema types. In the
-                // future, more permisive schema evolution will be supported.
+                // future, more permissive schema evolution will be supported.
                 // See: https://github.com/delta-io/delta-kernel-rs/issues/523
                 require!(
-                    table_schema.as_ref() == &schema,
-                    Error::change_data_feed_incompatible_schema(table_schema, &schema)
+                    *table_schema == table_configuration.schema(),
+                    Error::change_data_feed_incompatible_schema(
+                        table_schema,
+                        table_configuration.schema().as_ref()
+                    )
                 );
-                let table_properties = TableProperties::from(configuration);
-                check_cdf_table_properties(&table_properties)
-                    .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;
+            }
+            if let Some(in_commit_timestamp) = visitor.commit_timestamp {
+                // Only take the in-commit timestamp if the table feature is enabled
+                if table_configuration.is_in_commit_timestamps_enabled() {
+                    timestamp = in_commit_timestamp;
+                }
             }
         }
         // We resolve the remove deletion vector map after visiting the entire commit.
@@ -204,16 +219,20 @@ impl LogReplayScanner {
             // same as an `add` action.
             remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
         }
-        Ok(LogReplayScanner {
-            timestamp: commit_file.location.last_modified,
+        Ok(ProcessedCdfCommit {
+            timestamp,
             commit_file,
             has_cdc_action,
             remove_dvs,
         })
     }
-    /// Generates an iterator of [`TableChangesScanMetadata`] by iterating over each action of the
-    /// commit, generating a selection vector, and transforming the engine data. This performs
-    /// phase 2 of [`LogReplayScanner`].
+
+    /// Generates an iterator of [`TableChangesScanMetadata`] by consuming a [`ProcessedCdfCommit`] and iterating
+    /// over each action in the commit. This generates a selection vector and transforms the actions using
+    /// [`add_transform_expr`]. Selection vectors are generated using the following rules:
+    ///     - If a `cdc` action was found in the prepare phase, only `cdc` actions are selected
+    ///     - Otherwise, select `add` and `remove` actions. Note that only `remove` actions that do not
+    ///       share a path with an `add` action are selected.
     fn into_scan_batches(
         self,
         engine: Arc<dyn Engine>,
@@ -223,7 +242,6 @@ impl LogReplayScanner {
             has_cdc_action,
             remove_dvs,
             commit_file,
-            // TODO: Add the timestamp as a column with an expression
             timestamp,
         } = self;
         let remove_dvs = Arc::new(remove_dvs);
@@ -268,37 +286,44 @@ impl LogReplayScanner {
     }
 }
 
-// This is a visitor used in the prepare phase of [`LogReplayScanner`]. See
-// [`LogReplayScanner::try_new`] for details usage.
-struct PreparePhaseVisitor<'a> {
+/// This is a visitor used in [`ProcessedCdfCommit::try_new`].
+struct ProcessedCdfCommitVisitor<'a> {
     protocol: Option<Protocol>,
-    metadata_info: Option<(String, HashMap<String, String>)>,
+    metadata: Option<Metadata>,
     has_cdc_action: &'a mut bool,
     add_paths: &'a mut HashSet<String>,
     remove_dvs: &'a mut HashMap<String, DvInfo>,
+    commit_timestamp: Option<i64>,
+    is_first_batch: bool,
 }
-impl PreparePhaseVisitor<'_> {
-    fn schema() -> Arc<StructType> {
-        Arc::new(StructType::new(vec![
-            StructField::nullable(ADD_NAME, Add::to_schema()),
-            StructField::nullable(REMOVE_NAME, Remove::to_schema()),
-            StructField::nullable(CDC_NAME, Cdc::to_schema()),
-            StructField::nullable(METADATA_NAME, Metadata::to_schema()),
-            StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
-        ]))
+
+impl ProcessedCdfCommitVisitor<'_> {
+    fn schema() -> SchemaRef {
+        static PREPARE_PHASE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+            let ict_type = StructField::new("inCommitTimestamp", DataType::LONG, true);
+            Arc::new(StructType::new(vec![
+                Option::<Add>::get_struct_field(ADD_NAME),
+                Option::<Remove>::get_struct_field(REMOVE_NAME),
+                Option::<Cdc>::get_struct_field(CDC_NAME),
+                Option::<Metadata>::get_struct_field(METADATA_NAME),
+                Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
+                StructField::new(COMMIT_INFO_NAME, StructType::new([ict_type]), true),
+            ]))
+        });
+        PREPARE_PHASE_SCHEMA.clone()
     }
 }
 
-impl RowVisitor for PreparePhaseVisitor<'_> {
+impl RowVisitor for ProcessedCdfCommitVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        // NOTE: The order of the names and types is based on [`PreparePhaseVisitor::schema`]
+        // NOTE: The order of the names and types is based on [`ProcessedCdfCommitVisitor::schema`]
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             const STRING: DataType = DataType::STRING;
             const INTEGER: DataType = DataType::INTEGER;
             const LONG: DataType = DataType::LONG;
             const BOOLEAN: DataType = DataType::BOOLEAN;
-            let string_list: DataType = ArrayType::new(STRING, false).into();
-            let string_string_map = MapType::new(STRING, STRING, false).into();
+            let str_list: DataType = ArrayType::new(STRING, false).into();
+            let str_str_map: DataType = MapType::new(STRING, STRING, false).into();
             let types_and_names = vec![
                 (STRING, column_name!("add.path")),
                 (BOOLEAN, column_name!("add.dataChange")),
@@ -310,12 +335,15 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 (INTEGER, column_name!("remove.deletionVector.sizeInBytes")),
                 (LONG, column_name!("remove.deletionVector.cardinality")),
                 (STRING, column_name!("cdc.path")),
+                (STRING, column_name!("metaData.id")),
                 (STRING, column_name!("metaData.schemaString")),
-                (string_string_map, column_name!("metaData.configuration")),
+                (str_list.clone(), column_name!("metaData.partitionColumns")),
+                (str_str_map, column_name!("metaData.configuration")),
                 (INTEGER, column_name!("protocol.minReaderVersion")),
                 (INTEGER, column_name!("protocol.minWriterVersion")),
-                (string_list.clone(), column_name!("protocol.readerFeatures")),
-                (string_list, column_name!("protocol.writerFeatures")),
+                (str_list.clone(), column_name!("protocol.readerFeatures")),
+                (str_list, column_name!("protocol.writerFeatures")),
+                (LONG, column_name!("commitInfo.inCommitTimestamp")),
             ];
             let (types, names) = types_and_names.into_iter().unzip();
             (names, types).into()
@@ -325,9 +353,9 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
 
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 16,
+            getters.len() == 19,
             Error::InternalError(format!(
-                "Wrong number of PreparePhaseVisitor getters: {}",
+                "Wrong number of ProcessedCdfCommitVisitor getters: {}",
                 getters.len()
             ))
         );
@@ -346,20 +374,40 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 }
             } else if getters[9].get_str(i, "cdc.path")?.is_some() {
                 *self.has_cdc_action = true;
-            } else if let Some(schema) = getters[10].get_str(i, "metaData.schemaString")? {
-                let configuration_map_opt = getters[11].get_opt(i, "metadata.configuration")?;
-                let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
-                self.metadata_info = Some((schema.to_string(), configuration));
-            } else if let Some(protocol) = visit_protocol_at(i, &getters[12..])? {
+            } else if let Some(id) = getters[10].get_opt(i, "metaData.id")? {
+                let configuration_map_opt = getters[13].get_opt(i, "metaData.configuration")?;
+                self.metadata = Some(Metadata {
+                    id,
+                    schema_string: getters[11].get(i, "metaData.schemaString")?,
+                    partition_columns: getters[12].get(i, "metaData.partitionColumns")?,
+                    configuration: configuration_map_opt.unwrap_or_else(HashMap::new),
+                    ..Default::default() // Other fields are ignored
+                });
+            } else if let Some(min_reader_version) =
+                getters[14].get_int(i, "protocol.min_reader_version")?
+            {
+                let protocol =
+                    ProtocolVisitor::visit_protocol(i, min_reader_version, &getters[14..=17])?;
                 self.protocol = Some(protocol);
+            } else if let Some(in_commit_timestamp) =
+                getters[18].get_long(i, "commitInfo.inCommitTimestamp")?
+            {
+                require!(
+                    self.is_first_batch && i == 0,
+                    Error::InvalidCommitInfo(
+                        "When in-commit timestamps is enabled, CommitInfo must be the first action in a commit, \
+                        but found it in position {i} of the batch.".to_string()
+                    )
+                );
+                self.commit_timestamp = Some(in_commit_timestamp);
             }
         }
         Ok(())
     }
 }
 
-// This visitor generates selection vectors based on the rules specified in [`LogReplayScanner`].
-// See [`LogReplayScanner::into_scan_batches`] for usage.
+/// This visitor generates selection vectors based on the rules specified in
+/// [`ProcessedCdfCommit::into_scan_batches`].
 struct FileActionSelectionVisitor<'a> {
     selection_vector: Vec<bool>,
     has_cdc_action: bool,
