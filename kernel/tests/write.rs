@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{Int32Array, StringArray};
+use delta_kernel::arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
 
@@ -912,11 +912,11 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let commit_info = new_commit_info()?;
-
-    let mut txn = table
-        .new_transaction(&engine)?
-        .with_commit_info(commit_info);
+    let mut txn = table.new_transaction(&engine)?.with_engine_commit_info(
+        vec![("engineInfo".to_string(), "default engine".to_string())]
+            .into_iter()
+            .collect(),
+    );
 
     // Create Arrow data with TIMESTAMP_NTZ values including edge cases
     // These are microseconds since Unix epoch
