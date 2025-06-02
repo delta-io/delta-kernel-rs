@@ -9,18 +9,19 @@ use crate::actions::{
     get_log_schema, Metadata, Protocol, ADD_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
     SIDECAR_NAME,
 };
+use crate::log_replay::ActionsBatch;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::snapshot::LastCheckpointHint;
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, Expression, ParquetHandler, Predicate, PredicateRef,
-    RowVisitor, StorageHandler, Version,
+    DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
+    PredicateRef, RowVisitor, StorageHandler, Version,
 };
 use delta_kernel_derive::internal_api;
 
 use itertools::Itertools;
-use tracing::warn;
+use tracing::{debug, warn};
 use url::Url;
 
 #[cfg(test)]
@@ -51,6 +52,8 @@ pub(crate) struct LogSegment {
     pub ascending_compaction_files: Vec<ParsedLogPath>,
     /// Checkpoint files in the log segment.
     pub checkpoint_parts: Vec<ParsedLogPath>,
+    /// Latest CRC (checksum) file
+    pub latest_crc_file: Option<ParsedLogPath>,
 }
 
 impl LogSegment {
@@ -63,6 +66,7 @@ impl LogSegment {
             mut ascending_commit_files,
             ascending_compaction_files,
             checkpoint_parts,
+            latest_crc_file,
         } = listed_files;
 
         // Commit file versions must be greater than the most recent checkpoint version if it exists
@@ -71,6 +75,7 @@ impl LogSegment {
             checkpoint_file.version
         });
 
+        // TODO: consider unifying this with debug_asserts in the ListedLogFiles::new(); issue#995
         // We require that commits that are contiguous. In other words, there must be no gap between commit versions.
         require!(
             ascending_commit_files
@@ -119,6 +124,7 @@ impl LogSegment {
             ascending_commit_files,
             ascending_compaction_files,
             checkpoint_parts,
+            latest_crc_file,
         })
     }
 
@@ -191,17 +197,18 @@ impl LogSegment {
                 start_version
             ))
         );
-        let listed_files = ListedLogFiles {
+        let listed_files = ListedLogFiles::new(
             ascending_commit_files,
-            ascending_compaction_files: vec![],
-            checkpoint_parts: vec![],
-        };
+            vec![],
+            vec![],
+            None, // TODO: use CRC files for table changes?
+        );
         LogSegment::try_new(listed_files, log_root, end_version)
     }
 
-    /// Read a stream of actions from this log segment. This returns an iterator of (EngineData,
-    /// bool) pairs, where the boolean flag indicates whether the data was read from a commit file
-    /// (true) or a checkpoint file (false).
+    /// Read a stream of actions from this log segment. This returns an iterator of
+    /// [`ActionsBatch`]s which includes EngineData of actions + a boolean flag indicating whether
+    /// the data was read from a commit file (true) or a checkpoint file (false).
     ///
     /// The log files will be read from most recent to oldest.
     ///
@@ -218,24 +225,65 @@ impl LogSegment {
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
-        // `replay` expects commit files to be sorted in descending order, so we reverse the sorted
-        // commit files
-        let commit_files: Vec<_> = self
-            .ascending_commit_files
-            .iter()
-            .rev()
-            .map(|f| f.location.clone())
-            .collect();
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+        // `replay` expects commit files to be sorted in descending order, so the return value here is correct
+        let commits_and_compactions = self.find_commit_cover();
         let commit_stream = engine
             .json_handler()
-            .read_json_files(&commit_files, commit_read_schema, meta_predicate.clone())?
-            .map_ok(|batch| (batch, true));
+            .read_json_files(
+                &commits_and_compactions,
+                commit_read_schema,
+                meta_predicate.clone(),
+            )?
+            .map_ok(|batch| ActionsBatch::new(batch, true));
 
         let checkpoint_stream =
             self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate)?;
 
         Ok(commit_stream.chain(checkpoint_stream))
+    }
+
+    /// find a minimal set to cover the range of commits we want. This is greedy so not always
+    /// optimal, but we assume there are rarely overlapping compactions so this is okay. NB: This
+    /// returns files is DESCENDING ORDER, as that's what `replay` expects. This function assumes
+    /// that all files in `self.ascending_commit_files` and `self.ascending_compaction_files` are in
+    /// range for this log segment. This invariant is maintained by our listing code.
+    fn find_commit_cover(&self) -> Vec<FileMeta> {
+        // Create an iterator sorted in ascending order by (initial version, end version), e.g.
+        // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
+        //  10.19.compacted.json, 11.json, ...]
+        let all_files = itertools::Itertools::merge_by(
+            self.ascending_commit_files.iter(),
+            self.ascending_compaction_files.iter(),
+            |path_a, path_b| path_a.version <= path_b.version,
+        );
+
+        let mut last_pushed: Option<&ParsedLogPath> = None;
+
+        let mut selected_files = vec![];
+        for next in all_files {
+            match last_pushed {
+                // Resolve version number ties in favor of the later file (it covers a wider range)
+                Some(prev) if prev.version == next.version => {
+                    let removed = selected_files.pop();
+                    debug!("Selecting {next:?} rather than {removed:?}, it covers a wider range");
+                }
+                // Skip later files whose start overlaps with the previous end
+                Some(&ParsedLogPath {
+                    file_type: LogPathFileType::CompactedCommit { hi },
+                    ..
+                }) if next.version <= hi => {
+                    debug!("Skipping log file {next:?}, it's already covered.");
+                    continue;
+                }
+                _ => {} // just fall through
+            }
+            debug!("Provisionally selecting {next:?}");
+            last_pushed = Some(next);
+            selected_files.push(next.location.clone());
+        }
+        selected_files.reverse();
+        selected_files
     }
 
     /// Returns an iterator over checkpoint data, processing sidecar files when necessary.
@@ -254,7 +302,7 @@ impl LogSegment {
         engine: &dyn Engine,
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
             || checkpoint_read_schema.contains(REMOVE_NAME);
         require!(
@@ -330,7 +378,7 @@ impl LogSegment {
                     .chain(sidecar_content.into_iter().flatten())
                     // The boolean flag indicates whether the batch originated from a commit file
                     // (true) or a checkpoint file (false).
-                    .map_ok(|sidecar_batch| (sidecar_batch, false));
+                    .map_ok(|sidecar_batch| ActionsBatch::new(sidecar_batch, false));
 
                 Ok(combined_batches)
             })
@@ -380,15 +428,15 @@ impl LogSegment {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        let data_batches = self.replay_for_metadata(engine)?;
+        let actions_batches = self.replay_for_metadata(engine)?;
         let (mut metadata_opt, mut protocol_opt) = (None, None);
-        for batch in data_batches {
-            let (batch, _) = batch?;
+        for actions_batch in actions_batches {
+            let actions = actions_batch?.actions;
             if metadata_opt.is_none() {
-                metadata_opt = Metadata::try_new_from_data(batch.as_ref())?;
+                metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
             }
             if protocol_opt.is_none() {
-                protocol_opt = Protocol::try_new_from_data(batch.as_ref())?;
+                protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
             }
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 // we've found both, we can stop
@@ -412,7 +460,7 @@ impl LogSegment {
     fn replay_for_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>> + Send> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let schema = get_log_schema().project(&[PROTOCOL_NAME, METADATA_NAME])?;
         // filter out log files that do not contain metadata or protocol information
         static META_PREDICATE: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
@@ -426,10 +474,10 @@ impl LogSegment {
     }
 }
 
-/// Returns a fallible iterator of [`ParsedLogPath`] that are between the provided `start_version` (inclusive)
-/// and `end_version` (inclusive). [`ParsedLogPath`] may be a commit or a checkpoint.  If `start_version` is
-/// not specified, the files will begin from version number 0. If `end_version` is not specified, files up to
-/// the most recent version will be included.
+/// Returns a fallible iterator of [`ParsedLogPath`] that are between the provided `start_version`
+/// (inclusive) and `end_version` (inclusive). [`ParsedLogPath`] may be a commit or a checkpoint.
+/// If `start_version` is not specified, the files will begin from version number 0. If
+/// `end_version` is not specified, files up to the most recent version will be included.
 ///
 /// Note: this calls [`StorageHandler::list_from`] to get the list of log files.
 fn list_log_files(
@@ -456,13 +504,64 @@ fn list_log_files(
 
 /// A struct to hold the result of listing log files. The commit and compaction files are guaranteed
 /// to be sorted in ascending order by version. The elements of `checkpoint_parts` are all the parts
-/// of the same checkpoint. Checkpoint parts share the same version.
-// TODO: debug asserts in a `new` method to enforce the above?
+/// of the same checkpoint. Checkpoint parts share the same version. The `latest_crc_file` includes
+/// the latest (highest version) CRC file, if any, which may not correspond to the latest commit.
 #[derive(Debug)]
 pub(crate) struct ListedLogFiles {
     pub ascending_commit_files: Vec<ParsedLogPath>,
     pub ascending_compaction_files: Vec<ParsedLogPath>,
     pub checkpoint_parts: Vec<ParsedLogPath>,
+    pub latest_crc_file: Option<ParsedLogPath>,
+}
+
+impl ListedLogFiles {
+    fn new(
+        ascending_commit_files: Vec<ParsedLogPath>,
+        ascending_compaction_files: Vec<ParsedLogPath>,
+        checkpoint_parts: Vec<ParsedLogPath>,
+        latest_crc_file: Option<ParsedLogPath>,
+    ) -> Self {
+        // We are adding debug_assertions here since we want to validate invariants that are (relatively) expensive to compute
+        #[cfg(debug_assertions)]
+        {
+            assert!(ascending_compaction_files
+                .windows(2)
+                .all(|pair| match pair {
+                    [ParsedLogPath {
+                        version: version0,
+                        file_type: LogPathFileType::CompactedCommit { hi: hi0 },
+                        ..
+                    }, ParsedLogPath {
+                        version: version1,
+                        file_type: LogPathFileType::CompactedCommit { hi: hi1 },
+                        ..
+                    }] => version0 < version1 || (version0 == version1 && hi0 <= hi1),
+                    _ => false,
+                }));
+
+            assert!(checkpoint_parts.iter().all(|part| part.is_checkpoint()));
+
+            // for a multi-part checkpoint, check that they are all same version and all the parts are there
+            if checkpoint_parts.len() > 1 {
+                assert!(checkpoint_parts
+                    .windows(2)
+                    .all(|pair| pair[0].version == pair[1].version));
+
+                assert!(checkpoint_parts.iter().all(|part| matches!(
+                    part.file_type,
+                    LogPathFileType::MultiPartCheckpoint { num_parts, .. }
+                    if checkpoint_parts.len() == num_parts as usize
+                )));
+            }
+        }
+
+        ListedLogFiles {
+            ascending_commit_files,
+            ascending_compaction_files,
+            checkpoint_parts,
+            latest_crc_file,
+        }
+    }
 }
 
 /// List all commit and checkpoint files with versions above the provided `start_version` (inclusive).
@@ -485,6 +584,7 @@ pub(crate) fn list_log_files_with_version(
         let mut ascending_commit_files = Vec::with_capacity(10);
         let mut ascending_compaction_files = Vec::with_capacity(2);
         let mut checkpoint_parts = vec![];
+        let mut latest_crc_file: Option<ParsedLogPath> = None;
 
         // Group log files by version
         let log_files_per_version = iter.chunk_by(|x| x.version);
@@ -502,7 +602,12 @@ pub(crate) fn list_log_files_with_version(
                     SinglePartCheckpoint | UuidCheckpoint(_) | MultiPartCheckpoint { .. } => {
                         new_checkpoint_parts.push(file)
                     }
-                    Crc => (), // TODO: Keep only the latest one
+                    Crc => {
+                        let latest_crc_ref = latest_crc_file.as_ref();
+                        if latest_crc_ref.is_none_or(|latest| latest.version < file.version) {
+                            latest_crc_file = Some(file);
+                        }
+                    }
                     Unknown => {
                         warn!(
                             "Found file {} with unknown file type {:?} at version {}",
@@ -525,11 +630,12 @@ pub(crate) fn list_log_files_with_version(
             }
         }
 
-        ListedLogFiles {
+        ListedLogFiles::new(
             ascending_commit_files,
             ascending_compaction_files,
             checkpoint_parts,
-        }
+            latest_crc_file,
+        )
     })
 }
 

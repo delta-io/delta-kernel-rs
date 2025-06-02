@@ -67,7 +67,7 @@ jobs:
       - name: Install minimal stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: build docs
-        run: cargo doc
+        run: cargo doc --workspace --all-features
 
 
   # When we run cargo { build, clippy } --no-default-features, we want to build/lint the kernel to
@@ -178,7 +178,7 @@ jobs:
           cargo build
           popd
           pushd ffi
-          cargo b --features default-engine,sync-engine,test-ffi,tracing
+          cargo b --features default-engine,test-ffi,tracing
           popd
       - name: build and run read-table test
         run: |
@@ -210,7 +210,7 @@ jobs:
       - name: Test with Miri
         run: |
           pushd ffi
-          MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --features sync-engine,default-engine
+          MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --features default-engine
 
   coverage:
     runs-on: ubuntu-latest

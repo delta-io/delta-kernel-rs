@@ -2,12 +2,12 @@
 //! [`crate::engine_data::EngineData`] types.
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType, ToSchema as _};
+use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType, Schema, StructField};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
@@ -21,48 +21,6 @@ pub(crate) struct MetadataVisitor {
     pub(crate) metadata: Option<Metadata>,
 }
 
-impl MetadataVisitor {
-    #[internal_api]
-    fn visit_metadata<'a>(
-        row_index: usize,
-        id: String,
-        getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<Metadata> {
-        require!(
-            getters.len() == 9,
-            Error::InternalError(format!(
-                "Wrong number of MetadataVisitor getters: {}",
-                getters.len()
-            ))
-        );
-        let name: Option<String> = getters[1].get_opt(row_index, "metadata.name")?;
-        let description: Option<String> = getters[2].get_opt(row_index, "metadata.description")?;
-        // get format out of primitives
-        let format_provider: String = getters[3].get(row_index, "metadata.format.provider")?;
-        // options for format is always empty, so skip getters[4]
-        let schema_string: String = getters[5].get(row_index, "metadata.schema_string")?;
-        let partition_columns: Vec<_> = getters[6].get(row_index, "metadata.partition_list")?;
-        let created_time: Option<i64> = getters[7].get_opt(row_index, "metadata.created_time")?;
-        let configuration_map_opt: Option<HashMap<_, _>> =
-            getters[8].get_opt(row_index, "metadata.configuration")?;
-        let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
-
-        Ok(Metadata {
-            id,
-            name,
-            description,
-            format: Format {
-                provider: format_provider,
-                options: HashMap::new(),
-            },
-            schema_string,
-            partition_columns,
-            created_time,
-            configuration,
-        })
-    }
-}
-
 impl RowVisitor for MetadataVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
@@ -72,9 +30,8 @@ impl RowVisitor for MetadataVisitor {
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
-            // Since id column is required, use it to detect presence of a metadata action
-            if let Some(id) = getters[0].get_opt(i, "metadata.id")? {
-                self.metadata = Some(Self::visit_metadata(i, id, getters)?);
+            if let Some(metadata) = visit_metadata_at(i, getters)? {
+                self.metadata = Some(metadata);
                 break;
             }
         }
@@ -116,35 +73,6 @@ pub(crate) struct ProtocolVisitor {
     pub(crate) protocol: Option<Protocol>,
 }
 
-impl ProtocolVisitor {
-    #[internal_api]
-    pub(crate) fn visit_protocol<'a>(
-        row_index: usize,
-        min_reader_version: i32,
-        getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<Protocol> {
-        require!(
-            getters.len() == 4,
-            Error::InternalError(format!(
-                "Wrong number of ProtocolVisitor getters: {}",
-                getters.len()
-            ))
-        );
-        let min_writer_version: i32 = getters[1].get(row_index, "protocol.min_writer_version")?;
-        let reader_features: Option<Vec<_>> =
-            getters[2].get_opt(row_index, "protocol.reader_features")?;
-        let writer_features: Option<Vec<_>> =
-            getters[3].get_opt(row_index, "protocol.writer_features")?;
-
-        Protocol::try_new(
-            min_reader_version,
-            min_writer_version,
-            reader_features,
-            writer_features,
-        )
-    }
-}
-
 impl RowVisitor for ProtocolVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
@@ -153,9 +81,8 @@ impl RowVisitor for ProtocolVisitor {
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
-            // Since minReaderVersion column is required, use it to detect presence of a Protocol action
-            if let Some(mrv) = getters[0].get_opt(i, "protocol.min_reader_version")? {
-                self.protocol = Some(Self::visit_protocol(i, mrv, getters)?);
+            if let Some(protocol) = visit_protocol_at(i, getters)? {
+                self.protocol = Some(protocol);
                 break;
             }
         }
@@ -590,14 +517,165 @@ pub(crate) fn visit_deletion_vector_at<'a>(
     }
 }
 
+/// Get a Metadata out of some engine data. Note that Ok(None) is returned if there is no Metadata
+/// found. The caller is responsible for slicing the `getters` slice such that the first element
+/// contains the `id` element of the metadata.
+#[internal_api]
+pub(crate) fn visit_metadata_at<'a>(
+    row_index: usize,
+    getters: &[&'a dyn GetData<'a>],
+) -> DeltaResult<Option<Metadata>> {
+    require!(
+        getters.len() == 9,
+        Error::InternalError(format!(
+            "Wrong number of MetadataVisitor getters: {}",
+            getters.len()
+        ))
+    );
+
+    // Since id column is required, use it to detect presence of a metadata action
+    let Some(id) = getters[0].get_opt(row_index, "metadata.id")? else {
+        return Ok(None);
+    };
+
+    let name: Option<String> = getters[1].get_opt(row_index, "metadata.name")?;
+    let description: Option<String> = getters[2].get_opt(row_index, "metadata.description")?;
+    // get format out of primitives
+    let format_provider: String = getters[3].get(row_index, "metadata.format.provider")?;
+    // options for format is always empty, so skip getters[4]
+    let schema_string: String = getters[5].get(row_index, "metadata.schema_string")?;
+    let partition_columns: Vec<_> = getters[6].get(row_index, "metadata.partition_list")?;
+    let created_time: Option<i64> = getters[7].get_opt(row_index, "metadata.created_time")?;
+    let configuration_map_opt: Option<HashMap<_, _>> =
+        getters[8].get_opt(row_index, "metadata.configuration")?;
+    let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
+
+    Ok(Some(Metadata {
+        id,
+        name,
+        description,
+        format: Format {
+            provider: format_provider,
+            options: HashMap::new(),
+        },
+        schema_string,
+        partition_columns,
+        created_time,
+        configuration,
+    }))
+}
+
+/// Get a Protocol out of some engine data. Note that Ok(None) is returned if there is no Protocol
+/// found. The caller is responsible for slicing the `getters` slice such that the first element
+/// contains the `min_reader_version` element of the protocol.
+#[internal_api]
+pub(crate) fn visit_protocol_at<'a>(
+    row_index: usize,
+    getters: &[&'a dyn GetData<'a>],
+) -> DeltaResult<Option<Protocol>> {
+    require!(
+        getters.len() == 4,
+        Error::InternalError(format!(
+            "Wrong number of ProtocolVisitor getters: {}",
+            getters.len()
+        ))
+    );
+    // Since minReaderVersion column is required, use it to detect presence of a Protocol action
+    let Some(min_reader_version) = getters[0].get_opt(row_index, "protocol.min_reader_version")?
+    else {
+        return Ok(None);
+    };
+    let min_writer_version: i32 = getters[1].get(row_index, "protocol.min_writer_version")?;
+    let reader_features: Option<Vec<_>> =
+        getters[2].get_opt(row_index, "protocol.reader_features")?;
+    let writer_features: Option<Vec<_>> =
+        getters[3].get_opt(row_index, "protocol.writer_features")?;
+
+    let protocol = Protocol::try_new(
+        min_reader_version,
+        min_writer_version,
+        reader_features,
+        writer_features,
+    )?;
+    Ok(Some(protocol))
+}
+
+/// This visitor extracts the in-commit timestamp (ICT) from a CommitInfo action in the log it is
+/// present. The [`EngineData`] being visited must have the schema defined in
+/// [`InCommitTimestampVisitor::schema`].
+///
+/// Only the a single row of the engine data is checked (the first row). This is because in-commit
+/// timestamps requires that the CommitInfo containing the ICT be the first action in the log.
+#[allow(unused)]
+#[derive(Default)]
+pub(crate) struct InCommitTimestampVisitor {
+    pub(crate) in_commit_timestamp: Option<i64>,
+}
+
+impl InCommitTimestampVisitor {
+    #[allow(unused)]
+    /// Get the schema that the visitor expects the data to have.
+    pub(crate) fn schema() -> Arc<Schema> {
+        static SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
+            let ict_type = StructField::new("inCommitTimestamp", DataType::LONG, true);
+            Arc::new(StructType::new(vec![StructField::new(
+                COMMIT_INFO_NAME,
+                StructType::new([ict_type]),
+                true,
+            )]))
+        });
+        SCHEMA.clone()
+    }
+}
+impl RowVisitor for InCommitTimestampVisitor {
+    fn selected_column_names_and_types(
+        &self,
+    ) -> (&'static [crate::schema::ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            let names = vec![column_name!("commitInfo.inCommitTimestamp")];
+            let types = vec![DataType::LONG];
+
+            (names, types).into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(
+        &mut self,
+        row_count: usize,
+        getters: &[&'a dyn crate::engine_data::GetData<'a>],
+    ) -> DeltaResult<()> {
+        require!(
+            getters.len() == 1,
+            Error::InternalError(format!(
+                "Wrong number of InCommitTimestampVisitor getters: {}",
+                getters.len()
+            ))
+        );
+
+        // If the batch is empty, return
+        if row_count == 0 {
+            return Ok(());
+        }
+        // CommitInfo must be the first action in a commit
+        if let Some(in_commit_timestamp) = getters[0].get_long(0, "commitInfo.inCommitTimestamp")? {
+            self.in_commit_timestamp = Some(in_commit_timestamp);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::arrow::array::StringArray;
 
+    use crate::engine::sync::SyncEngine;
+    use crate::expressions::{column_expr, Expression};
     use crate::table_features::{ReaderFeature, WriterFeature};
     use crate::utils::test_utils::{action_batch, parse_json_batch};
+    use crate::Engine;
 
     #[test]
     fn test_parse_protocol() -> DeltaResult<()> {
@@ -974,5 +1052,59 @@ mod tests {
             .visit_rows_of(commit_0.as_ref())
             .unwrap();
         assert!(domain_metadata_visitor.domain_metadatas.is_empty());
+    }
+
+    /*************************************
+     *  In-commit timestamp visitor tests *
+     **************************************/
+
+    fn add_action() -> &'static str {
+        r#"{"add":{"path":"file1","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true}}"#
+    }
+    fn commit_info_action() -> &'static str {
+        r#"{"commitInfo":{"inCommitTimestamp":1677811178585, "timestamp":1677811178585,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isolationLevel":"WriteSerializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"10","numOutputBytes":"635"},"engineInfo":"Databricks-Runtime/<unknown>","txnId":"a6a94671-55ef-450e-9546-b8465b9147de"}}"#
+    }
+
+    fn transform_batch(batch: Box<dyn EngineData>) -> Box<dyn EngineData> {
+        let engine = SyncEngine::new();
+        engine
+            .evaluation_handler()
+            .new_expression_evaluator(
+                get_log_schema().clone(),
+                Expression::Struct(vec![Expression::Struct(vec![column_expr!(
+                    "commitInfo.inCommitTimestamp"
+                )])]),
+                InCommitTimestampVisitor::schema().into(),
+            )
+            .evaluate(batch.as_ref())
+            .unwrap()
+    }
+
+    // Helper function to reduce duplication in tests
+    fn run_timestamp_visitor_test(json_strings: Vec<&str>, expected_timestamp: Option<i64>) {
+        let json_strings: StringArray = json_strings.into();
+        let batch = parse_json_batch(json_strings);
+        let batch = transform_batch(batch);
+        let mut visitor = InCommitTimestampVisitor::default();
+        visitor.visit_rows_of(batch.as_ref()).unwrap();
+        assert_eq!(visitor.in_commit_timestamp, expected_timestamp);
+    }
+
+    #[test]
+    fn commit_info_not_first() {
+        run_timestamp_visitor_test(vec![add_action(), commit_info_action()], None);
+    }
+
+    #[test]
+    fn commit_info_not_present() {
+        run_timestamp_visitor_test(vec![add_action()], None);
+    }
+
+    #[test]
+    fn commit_info_get() {
+        run_timestamp_visitor_test(
+            vec![commit_info_action(), add_action()],
+            Some(1677811178585), // Retrieved ICT
+        );
     }
 }

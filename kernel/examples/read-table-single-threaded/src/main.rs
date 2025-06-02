@@ -8,11 +8,10 @@ use arrow::util::pretty::print_batches;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::engine::sync::SyncEngine;
 use delta_kernel::schema::Schema;
-use delta_kernel::{DeltaResult, Engine, Table};
+use delta_kernel::{DeltaResult, Table};
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use itertools::Itertools;
 
 /// An example program that dumps out the data of a delta table. Struct and Map types are not
@@ -23,10 +22,6 @@ use itertools::Itertools;
 struct Cli {
     /// Path to the table to inspect
     path: String,
-
-    /// Which Engine to use
-    #[arg(short, long, value_enum, default_value_t = EngineType::Default)]
-    engine: EngineType,
 
     /// Comma separated list of columns to select
     #[arg(long, value_delimiter=',', num_args(0..))]
@@ -47,14 +42,6 @@ struct Cli {
     schema_only: bool,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-enum EngineType {
-    /// Use the default, async engine
-    Default,
-    /// Use the sync engine (local files only)
-    Sync,
-}
-
 fn main() -> ExitCode {
     env_logger::init();
     match try_main() {
@@ -73,24 +60,19 @@ fn try_main() -> DeltaResult<()> {
     let table = Table::try_from_uri(&cli.path)?;
     println!("Reading {}", table.location());
 
-    let engine: Arc<dyn Engine> = match cli.engine {
-        EngineType::Default => {
-            let mut options = if let Some(region) = cli.region {
-                HashMap::from([("region", region)])
-            } else {
-                HashMap::new()
-            };
-            if cli.public {
-                options.insert("skip_signature", "true".to_string());
-            }
-            Arc::new(DefaultEngine::try_new(
-                table.location(),
-                options,
-                Arc::new(TokioBackgroundExecutor::new()),
-            )?)
-        }
-        EngineType::Sync => Arc::new(SyncEngine::new()),
+    let mut options = if let Some(region) = cli.region {
+        HashMap::from([("region", region)])
+    } else {
+        HashMap::new()
     };
+    if cli.public {
+        options.insert("skip_signature", "true".to_string());
+    }
+    let engine = Arc::new(DefaultEngine::try_new(
+        table.location(),
+        options,
+        Arc::new(TokioBackgroundExecutor::new()),
+    )?);
 
     let snapshot = table.snapshot(engine.as_ref(), None)?;
 

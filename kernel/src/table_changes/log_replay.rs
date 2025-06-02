@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
-use crate::actions::visitors::{visit_deletion_vector_at, ProtocolVisitor};
+use crate::actions::visitors::{visit_deletion_vector_at, visit_protocol_at};
 use crate::actions::{
     get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, METADATA_NAME,
     PROTOCOL_NAME, REMOVE_NAME,
@@ -350,11 +350,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 let configuration_map_opt = getters[11].get_opt(i, "metadata.configuration")?;
                 let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
                 self.metadata_info = Some((schema.to_string(), configuration));
-            } else if let Some(min_reader_version) =
-                getters[12].get_int(i, "protocol.min_reader_version")?
-            {
-                let protocol =
-                    ProtocolVisitor::visit_protocol(i, min_reader_version, &getters[12..=15])?;
+            } else if let Some(protocol) = visit_protocol_at(i, &getters[12..])? {
                 self.protocol = Some(protocol);
             }
         }
