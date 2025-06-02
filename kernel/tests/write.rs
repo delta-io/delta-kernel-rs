@@ -180,7 +180,7 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
 
     for (table, engine, store, table_name) in setup_tables(schema, &[]).await? {
         // create a transaction
-        let txn = table.new_transaction(&engine)?.with_engine_commit_info(
+        let txn = table.new_transaction(&engine)?.with_commit_info(
             vec![("engineInfo".to_string(), "default engine".to_string())]
                 .into_iter()
                 .collect(),
@@ -315,19 +315,8 @@ async fn test_comit_info_action() -> Result<(), Box<dyn std::error::Error>> {
     for (table, engine, store, table_name) in setup_tables(schema.clone(), &[]).await? {
         let txn = table
             .new_transaction(&engine)?
-            .with_timestamp(1)
-            .with_in_commit_timestamp(2)
             .with_operation("INSERT".to_string())
-            .with_operation_parameters(
-                vec![
-                    ("mode".to_string(), "Append".to_string()),
-                    ("partitionBy".to_string(), "[]".to_string()),
-                ]
-                .into_iter()
-                .collect(),
-            )
-            .with_kernel_version("v0.11.0".to_string())
-            .with_engine_commit_info(
+            .with_commit_info(
                 vec![("engineInfo".to_string(), "default engine".to_string())]
                     .into_iter()
                     .collect(),
@@ -341,20 +330,26 @@ async fn test_comit_info_action() -> Result<(), Box<dyn std::error::Error>> {
             )))
             .await?;
 
-        let parsed_commits: Vec<_> = Deserializer::from_slice(&commit.bytes().await?)
+        let mut parsed_commits: Vec<_> = Deserializer::from_slice(&commit.bytes().await?)
             .into_iter::<serde_json::Value>()
             .try_collect()?;
 
+        // set timestamps to 0 and paths to known string values for comparison
+        // (otherwise timestamps are non-deterministic and paths are random UUIDs)
+        set_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+        set_value(
+            &mut parsed_commits[0],
+            "commitInfo.inCommitTimestamp",
+            json!(0),
+        )?;
+
         let expected_commit = vec![json!({
             "commitInfo": {
-                "timestamp": 1,
-                "inCommitTimestamp": 2,
+                "timestamp": 0,
+                "inCommitTimestamp": 0,
                 "operation": "INSERT",
-                "kernelVersion": "v0.11.0",
-                "operationParameters": {
-                    "mode": "Append",
-                    "partitionBy": "[]"
-                },
+                "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
+                "operationParameters": {},
                 "engineCommitInfo": {
                     "engineInfo": "default engine"
                 }
@@ -378,7 +373,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
     )]));
 
     for (table, engine, store, table_name) in setup_tables(schema.clone(), &[]).await? {
-        let mut txn = table.new_transaction(&engine)?.with_engine_commit_info(
+        let mut txn = table.new_transaction(&engine)?.with_commit_info(
             vec![("engineInfo".to_string(), "default engine".to_string())]
                 .into_iter()
                 .collect(),
@@ -518,7 +513,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     for (table, engine, store, table_name) in
         setup_tables(table_schema.clone(), &[partition_col]).await?
     {
-        let mut txn = table.new_transaction(&engine)?.with_engine_commit_info(
+        let mut txn = table.new_transaction(&engine)?.with_commit_info(
             vec![("engineInfo".to_string(), "default engine".to_string())]
                 .into_iter()
                 .collect(),
@@ -664,7 +659,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
     )]));
 
     for (table, engine, _store, _table_name) in setup_tables(table_schema, &[]).await? {
-        let txn = table.new_transaction(&engine)?.with_engine_commit_info(
+        let txn = table.new_transaction(&engine)?.with_commit_info(
             vec![("engineInfo".to_string(), "default engine".to_string())]
                 .into_iter()
                 .collect(),
@@ -734,7 +729,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
 
         let txn = table
             .new_transaction(&engine)?
-            .with_engine_commit_info(
+            .with_commit_info(
                 vec![("engineInfo".to_string(), "default engine".to_string())]
                     .into_iter()
                     .collect(),
@@ -871,7 +866,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let mut txn = table.new_transaction(&engine)?.with_engine_commit_info(
+    let mut txn = table.new_transaction(&engine)?.with_commit_info(
         vec![("engineInfo".to_string(), "default engine".to_string())]
             .into_iter()
             .collect(),

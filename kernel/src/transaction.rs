@@ -3,8 +3,8 @@ use std::iter;
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::actions::SetTransaction;
 use crate::actions::{get_log_add_schema, get_log_commit_info_schema, get_log_txn_schema};
-use crate::actions::{CommitInfo, SetTransaction};
 use crate::error::Error;
 use crate::expressions::{MapData, Scalar};
 use crate::path::ParsedLogPath;
@@ -56,7 +56,8 @@ pub fn get_write_metadata_schema() -> &'static SchemaRef {
 /// ```
 pub struct Transaction {
     read_snapshot: Arc<Snapshot>,
-    commit_info: Option<Box<CommitInfo>>,
+    operation: Option<String>,
+    engine_commit_info: Option<HashMap<String, String>>,
     write_metadata: Vec<Box<dyn EngineData>>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
@@ -74,7 +75,7 @@ impl std::fmt::Debug for Transaction {
         f.write_str(&format!(
             "Transaction {{ read_snapshot version: {}, commit_info: {} }}",
             self.read_snapshot.version(),
-            self.commit_info.is_some()
+            self.engine_commit_info.is_some()
         ))
     }
 }
@@ -103,7 +104,8 @@ impl Transaction {
 
         Ok(Transaction {
             read_snapshot,
-            commit_info: None,
+            operation: None,
+            engine_commit_info: None,
             write_metadata: vec![],
             set_transactions: vec![],
             commit_timestamp,
@@ -135,12 +137,17 @@ impl Transaction {
             .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
 
         // step one: construct the iterator of commit info + file actions we want to commit
-        let commit_info = self
-            .commit_info
+        let engine_commit_info = self
+            .engine_commit_info
             .as_ref()
             .ok_or_else(|| Error::MissingCommitInfo)?;
 
-        let commit_info_actions = generate_commit_info(engine, commit_info, self.commit_timestamp);
+        let commit_info_actions = generate_commit_info(
+            engine,
+            self.operation.as_deref(),
+            self.commit_timestamp,
+            engine_commit_info,
+        );
 
         let add_actions = generate_adds(engine, self.write_metadata.iter().map(|a| a.as_ref()));
 
@@ -162,55 +169,20 @@ impl Transaction {
         }
     }
 
-    // Set the timestmap of this transaction.
-    pub fn with_timestamp(mut self, timestamp: i64) -> Self {
-        self.commit_info.get_or_insert_with(Box::default).timestamp = Some(timestamp);
-        self
-    }
-
-    /// Set the in-commit timestamp for this transaction. This is used for In-Commit Timestamps (ICT) feature.
-    /// When ICT is enabled, this timestamp must be monotonically increasing across commits.
-    ///
-    /// Note: For full ICT compliance, the caller should ensure this timestamp is greater than
-    /// the previous commit's inCommitTimestamp.
-    pub fn with_in_commit_timestamp(mut self, in_commit_timestamp: i64) -> Self {
-        self.commit_info
-            .get_or_insert_with(Box::default)
-            .in_commit_timestamp = Some(in_commit_timestamp);
-        self
-    }
-
     /// Set the operation that this transaction is performing. This string will be persisted in the
     /// commit and visible to anyone who describes the table history.
     pub fn with_operation(mut self, operation: String) -> Self {
-        self.commit_info.get_or_insert_with(Box::default).operation = Some(operation);
+        self.operation = Some(operation);
         self
     }
 
-    // Set the operation parameters for the operation that this transaction is performing.
-    pub fn with_operation_parameters(
-        mut self,
-        operation_parameters: HashMap<String, String>,
-    ) -> Self {
-        self.commit_info
-            .get_or_insert_with(Box::default)
-            .operation_parameters = Some(operation_parameters);
-        self
-    }
-
-    // Set the version of the delta_kernel crate used to write this transaction.
-    pub fn with_kernel_version(mut self, kernel_version: String) -> Self {
-        self.commit_info
-            .get_or_insert_with(Box::default)
-            .kernel_version = Some(kernel_version);
-        self
-    }
-
-    // Set the engine commit info of this transaction.
-    pub fn with_engine_commit_info(mut self, engine_commit_info: HashMap<String, String>) -> Self {
-        self.commit_info
-            .get_or_insert_with(Box::default)
-            .engine_commit_info = Some(engine_commit_info);
+    // Add commit info to this transactions while append the argument as its engine_commit_info.
+    //
+    // The engine is required to provide commit info before committing the transaction. If the
+    // engine would like to omit engine-specific commit info, it can do so by passing pass an
+    // empty map.
+    pub fn with_commit_info(mut self, engine_commit_info: HashMap<String, String>) -> Self {
+        self.engine_commit_info = Some(engine_commit_info);
         self
     }
 
@@ -333,11 +305,12 @@ pub enum CommitResult {
 // given the CommitInfo struct we want to materialize it into a commitInfo action to commit (and append more actions to)
 fn generate_commit_info(
     engine: &dyn Engine,
-    commit_info: &CommitInfo,
-    commit_timestamp: i64,
+    operation: Option<&str>,
+    timestamp: i64,
+    engine_commit_info: &HashMap<String, String>,
 ) -> DeltaResult<Box<dyn EngineData>> {
     // Helper function to convert HashMap to Scalar for commit_info
-    let hashmap_to_scalar = |hm: &Option<HashMap<String, String>>| -> DeltaResult<Scalar> {
+    let hashmap_to_scalar = |hm: Option<&HashMap<String, String>>| -> DeltaResult<Scalar> {
         match hm {
             Some(map) => {
                 let pairs = map.iter().map(|(k, v)| (k.clone(), v.clone()));
@@ -361,27 +334,17 @@ fn generate_commit_info(
 
     let commit_info_values = vec![
         // timestamp
-        Scalar::Long(commit_info.timestamp.unwrap_or(commit_timestamp)),
-        // in_commit_timestamp
-        Scalar::Long(commit_info.in_commit_timestamp.unwrap_or(commit_timestamp)),
+        Scalar::Long(timestamp),
+        // in-commit timestamp
+        Scalar::Long(timestamp),
         //operation
-        Scalar::String(
-            commit_info
-                .operation
-                .clone()
-                .unwrap_or(UNKNOWN_OPERATION.to_string()),
-        ),
+        Scalar::String(operation.unwrap_or(UNKNOWN_OPERATION).to_string()),
         // operation parameters
-        hashmap_to_scalar(&commit_info.operation_parameters)?,
+        hashmap_to_scalar(None)?,
         // kernel_version
-        Scalar::String(
-            commit_info
-                .kernel_version
-                .clone()
-                .unwrap_or(format!("v{}", KERNEL_VERSION)),
-        ),
+        Scalar::String(format!("v{}", KERNEL_VERSION)),
         // engine_commit_info
-        hashmap_to_scalar(&commit_info.engine_commit_info)?,
+        hashmap_to_scalar(Some(engine_commit_info))?,
     ];
 
     engine
@@ -448,25 +411,16 @@ mod tests {
     fn test_generate_commit_info() -> DeltaResult<()> {
         let engine = ExprEngine::new();
 
-        let commit_info = CommitInfo {
-            timestamp: None,
-            in_commit_timestamp: Some(123),
-            operation: Some("test operation".to_string()),
-            kernel_version: Some(format!("v{}", env!("CARGO_PKG_VERSION"))),
-            operation_parameters: Some(HashMap::new()),
-            engine_commit_info: Some(
-                vec![("engineInfo".to_string(), "default engine".to_string())]
-                    .into_iter()
-                    .collect(),
-            ),
-        };
+        let operation = Some("test operation");
+        let mut engine_commit_info = HashMap::new();
+        engine_commit_info.insert("engineInfo".to_string(), "default engine".to_string());
 
-        let actions = generate_commit_info(&engine, &commit_info, 123456789)?;
+        let actions = generate_commit_info(&engine, operation, 123456789, &engine_commit_info)?;
 
         let expected = serde_json::json!({
             "commitInfo": {
                 "timestamp": 123456789,
-                "inCommitTimestamp": 123,
+                "inCommitTimestamp": 123456789,
                 "operation": "test operation",
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                 "operationParameters": {},
