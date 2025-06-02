@@ -337,7 +337,7 @@ fn generate_commit_info(
         Scalar::Long(timestamp),
         // in-commit timestamp
         Scalar::Long(timestamp),
-        //operation
+        // operation
         Scalar::String(operation.unwrap_or(UNKNOWN_OPERATION).to_string()),
         // operation parameters
         hashmap_to_scalar(None)?,
