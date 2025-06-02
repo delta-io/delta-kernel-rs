@@ -176,7 +176,7 @@ impl Transaction {
         self
     }
 
-    // Add commit info to this transactions while append the argument as its engine_commit_info.
+    // Add commit info to this transactions and append the argument as its engine_commit_info.
     //
     // The engine is required to provide commit info before committing the transaction. If the
     // engine would like to omit engine-specific commit info, it can do so by passing pass an
@@ -302,7 +302,7 @@ pub enum CommitResult {
     Conflict(Transaction, Version),
 }
 
-// given the CommitInfo struct we want to materialize it into a commitInfo action to commit (and append more actions to)
+// given data for CommitInfo, we want to materialize it into a commitInfo action to commit (and append more actions to)
 fn generate_commit_info(
     engine: &dyn Engine,
     operation: Option<&str>,
