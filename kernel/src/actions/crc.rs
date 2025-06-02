@@ -8,7 +8,7 @@ use crate::engine_data::GetData;
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{DeltaResult, Error, RowVisitor};
+use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor};
 use delta_kernel_derive::ToSchema;
 
 /// Though technically not an action, we include the CRC (version checksum) file here. A [CRC file]
@@ -92,6 +92,30 @@ pub(crate) struct DeletedRecordCountsHistogram {
     /// Array of size 10 where each element represents the count of files falling into a specific
     /// deletion count range.
     pub(crate) deleted_record_counts: Vec<i64>,
+}
+
+pub(crate) struct ProtocolMetadata {
+    pub(crate) protocol: Protocol,
+    pub(crate) metadata: Metadata,
+}
+
+impl ProtocolMetadata {
+    pub(crate) fn try_from_crc(path: FileMeta, engine: &dyn Engine) -> DeltaResult<Self> {
+        let json = engine.json_handler();
+        let crc_schema = Crc::to_schema().into();
+
+        let mut crc_data = json.read_json_files(&[path], crc_schema, None)?;
+        let crc_batch = crc_data.next().ok_or(Error::generic(
+            "CRC file should contain exactly one JSON object (and therefore one batch)",
+        ))?;
+
+        let mut visitor = CrcProtocolMetadataVisitor::default();
+        visitor.visit_rows_of(crc_batch?.as_ref())?;
+        Ok(Self {
+            protocol: visitor.protocol,
+            metadata: visitor.metadata,
+        })
+    }
 }
 
 /// For now we just define a visitor for Protocol and Metadata in CRC files since (for now) that's
