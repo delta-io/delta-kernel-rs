@@ -15,20 +15,11 @@ use crate::{
     DeltaResult, Engine, EngineData, Error,
 };
 use roaring::RoaringTreemap;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tracing::warn;
 
 use super::log_replay::SCAN_ROW_SCHEMA;
 use super::ScanMetadata;
-
-/// State that doesn't change between scans
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GlobalScanState {
-    pub table_root: String,
-    pub partition_columns: Vec<String>,
-    pub logical_schema: SchemaRef,
-    pub physical_schema: SchemaRef,
-}
 
 /// this struct can be used by an engine to materialize a selection vector
 #[derive(Default, Debug, Clone, PartialEq, Eq)]

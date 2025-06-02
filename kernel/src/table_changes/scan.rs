@@ -7,7 +7,6 @@ use tracing::debug;
 use url::Url;
 
 use crate::actions::deletion_vector::split_vector;
-use crate::scan::state::GlobalScanState;
 use crate::scan::{ColumnType, PhysicalPredicate, ScanResult};
 use crate::schema::{SchemaRef, StructType};
 use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
@@ -204,23 +203,22 @@ impl TableChangesScan {
         Ok(Some(it).into_iter().flatten())
     }
 
-    /// Get global state that is valid for the entire scan. This is somewhat expensive so should
-    /// only be called once per scan.
-    fn global_scan_state(&self) -> GlobalScanState {
-        let end_snapshot = &self.table_changes.end_snapshot;
-        GlobalScanState {
-            table_root: self.table_changes.table_root.to_string(),
-            partition_columns: end_snapshot.metadata().partition_columns.clone(),
-            logical_schema: self.logical_schema.clone(),
-            physical_schema: self.physical_schema.clone(),
-        }
-    }
-
-    /// Get a shared reference to the [`Schema`] of the table changes scan.
+    /// Get a shared reference to the logical [`Schema`] of the table changes scan.
     ///
     /// [`Schema`]: crate::schema::Schema
-    pub fn schema(&self) -> &SchemaRef {
+    pub fn logical_schema(&self) -> &SchemaRef {
         &self.logical_schema
+    }
+
+    /// Get a shared reference to the physical [`Schema`] of the table changes scan.
+    ///
+    /// [`Schema`]: crate::schema::Schema
+    pub fn physical_schema(&self) -> &SchemaRef {
+        &self.physical_schema
+    }
+
+    pub fn table_root(&self) -> &Url {
+        self.table_changes.table_root()
     }
 
     /// Get the predicate [`PredicateRef`] of the scan.
@@ -239,11 +237,10 @@ impl TableChangesScan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>> + use<'_>> {
         let scan_metadata = self.scan_metadata(engine.clone())?;
         let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
-        let global_scan_state = self.global_scan_state();
         let table_root = self.table_changes.table_root().clone();
         let all_fields = self.all_fields.clone();
         let physical_predicate = self.physical_predicate();
@@ -258,7 +255,9 @@ impl TableChangesScan {
                 read_scan_file(
                     engine.as_ref(),
                     resolved_scan_file?,
-                    &global_scan_state,
+                    self.table_root(),
+                    self.logical_schema(),
+                    self.physical_schema(),
                     &all_fields,
                     physical_predicate.clone(),
                 )
@@ -275,7 +274,9 @@ impl TableChangesScan {
 fn read_scan_file(
     engine: &dyn Engine,
     resolved_scan_file: ResolvedCdfScanFile,
-    global_state: &GlobalScanState,
+    table_root: &Url,
+    logical_schema: &SchemaRef,
+    physical_schema: &SchemaRef,
     all_fields: &[ColumnType],
     _physical_predicate: Option<PredicateRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
@@ -285,18 +286,16 @@ fn read_scan_file(
     } = resolved_scan_file;
 
     let physical_to_logical_expr =
-        physical_to_logical_expr(&scan_file, global_state.logical_schema.as_ref(), all_fields)?;
-    let physical_schema =
-        scan_file_physical_schema(&scan_file, global_state.physical_schema.as_ref());
+        physical_to_logical_expr(&scan_file, logical_schema.as_ref(), all_fields)?;
+    let physical_schema = scan_file_physical_schema(&scan_file, physical_schema.as_ref());
     let phys_to_logical_eval = engine.evaluation_handler().new_expression_evaluator(
         physical_schema.clone(),
         physical_to_logical_expr,
-        global_state.logical_schema.clone().into(),
+        logical_schema.clone().into(),
     );
     // Determine if the scan file was derived from a deletion vector pair
     let is_dv_resolved_pair = scan_file.remove_dv.is_some();
 
-    let table_root = Url::parse(&global_state.table_root)?;
     let location = table_root.join(&scan_file.path)?;
     let file = FileMeta {
         last_modified: 0,
