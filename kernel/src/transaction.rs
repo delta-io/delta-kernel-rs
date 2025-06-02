@@ -164,7 +164,9 @@ impl Transaction {
 
     // Set the timestmap of this transaction.
     pub fn with_timestamp(mut self, timestamp: i64) -> Self {
-        self.commit_info.get_or_insert_default().timestamp = Some(timestamp);
+        self.commit_info
+            .get_or_insert_with(Default::default)
+            .timestamp = Some(timestamp);
         self
     }
 
@@ -174,14 +176,18 @@ impl Transaction {
     /// Note: For full ICT compliance, the caller should ensure this timestamp is greater than
     /// the previous commit's inCommitTimestamp.
     pub fn with_in_commit_timestamp(mut self, in_commit_timestamp: i64) -> Self {
-        self.commit_info.get_or_insert_default().in_commit_timestamp = Some(in_commit_timestamp);
+        self.commit_info
+            .get_or_insert_with(Default::default)
+            .in_commit_timestamp = Some(in_commit_timestamp);
         self
     }
 
     /// Set the operation that this transaction is performing. This string will be persisted in the
     /// commit and visible to anyone who describes the table history.
     pub fn with_operation(mut self, operation: String) -> Self {
-        self.commit_info.get_or_insert_default().operation = Some(operation);
+        self.commit_info
+            .get_or_insert_with(Default::default)
+            .operation = Some(operation);
         self
     }
 
@@ -191,20 +197,24 @@ impl Transaction {
         operation_parameters: HashMap<String, String>,
     ) -> Self {
         self.commit_info
-            .get_or_insert_default()
+            .get_or_insert_with(Default::default)
             .operation_parameters = Some(operation_parameters);
         self
     }
 
     // Set the version of the delta_kernel crate used to write this transaction.
     pub fn with_kernel_version(mut self, kernel_version: String) -> Self {
-        self.commit_info.get_or_insert_default().kernel_version = Some(kernel_version);
+        self.commit_info
+            .get_or_insert_with(Default::default)
+            .kernel_version = Some(kernel_version);
         self
     }
 
     // Set the engine commit info of this transaction.
     pub fn with_engine_commit_info(mut self, engine_commit_info: HashMap<String, String>) -> Self {
-        self.commit_info.get_or_insert_default().engine_commit_info = Some(engine_commit_info);
+        self.commit_info
+            .get_or_insert_with(Default::default)
+            .engine_commit_info = Some(engine_commit_info);
         self
     }
 
