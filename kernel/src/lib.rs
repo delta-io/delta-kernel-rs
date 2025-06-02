@@ -114,6 +114,11 @@ pub mod log_segment;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod log_segment;
 
+#[cfg(feature = "internal-api")]
+pub mod history_manager;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod history_manager;
+
 pub use delta_kernel_derive;
 pub use engine_data::{EngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
