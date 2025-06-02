@@ -72,7 +72,7 @@ pub struct Transaction {
 impl std::fmt::Debug for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&format!(
-            "Transaction {{ read_snapshot version: {}, commit_info: {:#?} }}",
+            "Transaction {{ read_snapshot version: {}, commit_info: {} }}",
             self.read_snapshot.version(),
             self.commit_info.is_some()
         ))
