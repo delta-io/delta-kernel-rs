@@ -15,8 +15,8 @@ use url::Url;
 use crate::actions::{ensure_supported_features, Metadata, Protocol};
 use crate::schema::{InvariantChecker, SchemaRef};
 use crate::table_features::{
-    column_mapping_mode, validate_schema_column_mapping, ColumnMappingMode, ReaderFeature,
-    WriterFeature,
+    column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
+    ColumnMappingMode, ReaderFeature, WriterFeature,
 };
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error, Version};
@@ -78,6 +78,9 @@ impl TableConfiguration {
 
         // validate column mapping mode -- all schema fields should be correctly (un)annotated
         validate_schema_column_mapping(&schema, column_mapping_mode)?;
+
+        validate_timestamp_ntz_feature_support(&schema, &protocol)?;
+
         Ok(Self {
             schema,
             metadata,
@@ -573,5 +576,56 @@ mod test {
             table_config.column_mapping_mode()
         );
         assert_eq!(new_table_config.table_root(), table_config.table_root());
+    }
+
+    #[test]
+    fn test_timestamp_ntz_validation_integration() {
+        // Schema with TIMESTAMP_NTZ column
+        let schema_string = r#"{"type":"struct","fields":[{"name":"ts","type":"timestamp_ntz","nullable":true,"metadata":{}}]}"#.to_string();
+        let metadata = Metadata {
+            schema_string,
+            ..Default::default()
+        };
+
+        let protocol_without_timestamp_ntz_features = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some::<Vec<String>>(vec![]),
+        )
+        .unwrap();
+
+        let protocol_with_timestamp_ntz_features = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::TimestampWithoutTimezone]),
+            Some([WriterFeature::TimestampWithoutTimezone]),
+        )
+        .unwrap();
+
+        let table_root = Url::try_from("file:///").unwrap();
+
+        let result = TableConfiguration::try_new(
+            metadata.clone(),
+            protocol_without_timestamp_ntz_features,
+            table_root.clone(),
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "Should fail when TIMESTAMP_NTZ is used without required features"
+        );
+        assert!(result.unwrap_err().to_string().contains("timestampNtz"));
+
+        let result = TableConfiguration::try_new(
+            metadata,
+            protocol_with_timestamp_ntz_features,
+            table_root,
+            0,
+        );
+        assert!(
+            result.is_ok(),
+            "Should succeed when TIMESTAMP_NTZ is used with required features"
+        );
     }
 }

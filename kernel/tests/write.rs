@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    Int32Array, MapBuilder, MapFieldNames, StringArray, StringBuilder,
+    Int32Array, MapBuilder, MapFieldNames, StringArray, StringBuilder, TimestampMicrosecondArray,
 };
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::error::ArrowError;
@@ -63,17 +63,28 @@ async fn create_table(
     schema: SchemaRef,
     partition_columns: &[&str],
     use_37_protocol: bool,
+    enable_timestamp_without_timezone: bool,
 ) -> Result<Table, Box<dyn std::error::Error>> {
     let table_id = "test_id";
     let schema = serde_json::to_string(&schema)?;
+
+    let (reader_features, writer_features) = {
+        let mut reader_features = vec![];
+        let mut writer_features = vec![];
+        if enable_timestamp_without_timezone {
+            reader_features.push("timestampNtz");
+            writer_features.push("timestampNtz");
+        }
+        (reader_features, writer_features)
+    };
 
     let protocol = if use_37_protocol {
         json!({
             "protocol": {
                 "minReaderVersion": 3,
                 "minWriterVersion": 7,
-                "readerFeatures": [],
-                "writerFeatures": []
+                "readerFeatures": reader_features,
+                "writerFeatures": writer_features,
             }
         })
     } else {
@@ -175,6 +186,7 @@ async fn setup_tables(
                 schema.clone(),
                 partition_columns,
                 true,
+                false,
             )
             .await?,
             engine_37,
@@ -187,6 +199,7 @@ async fn setup_tables(
                 table_location_11,
                 schema,
                 partition_columns,
+                false,
                 false,
             )
             .await?,
@@ -835,5 +848,90 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
 
         assert_eq!(parsed_commits, expected_commit);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
+    // setup tracing
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // create a table with TIMESTAMP_NTZ column
+    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+        "ts_ntz",
+        DataType::TIMESTAMP_NTZ,
+    )]));
+
+    let (store, engine, table_location) = setup("test_table_timestamp_ntz", true);
+    let table = create_table(
+        store.clone(),
+        table_location,
+        schema.clone(),
+        &[],
+        true,
+        true, // enable "timestamp without timezone" feature
+    )
+    .await?;
+
+    let commit_info = new_commit_info()?;
+
+    let mut txn = table
+        .new_transaction(&engine)?
+        .with_commit_info(commit_info);
+
+    // Create Arrow data with TIMESTAMP_NTZ values including edge cases
+    // These are microseconds since Unix epoch
+    let timestamp_values = vec![
+        0i64,                  // Unix epoch (1970-01-01T00:00:00.000000)
+        1634567890123456i64,   // 2021-10-18T12:31:30.123456
+        1634567950654321i64,   // 2021-10-18T12:32:30.654321
+        1672531200000000i64,   // 2023-01-01T00:00:00.000000
+        253402300799999999i64, // 9999-12-31T23:59:59.999999 (near max valid timestamp)
+        -62135596800000000i64, // 0001-01-01T00:00:00.000000 (near min valid timestamp)
+    ];
+
+    let data = RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(TimestampMicrosecondArray::from(timestamp_values))],
+    )?;
+
+    // Write data
+    let engine = Arc::new(engine);
+    let write_context = Arc::new(txn.get_write_context());
+
+    let write_metadata = engine
+        .write_parquet(
+            &ArrowEngineData::new(data.clone()),
+            write_context.as_ref(),
+            HashMap::new(),
+            true,
+        )
+        .await?;
+
+    txn.add_write_metadata(write_metadata);
+
+    // Commit the transaction
+    txn.commit(engine.as_ref())?;
+
+    // Verify the commit was written correctly
+    let commit1 = store
+        .get(&Path::from(
+            "/test_table_timestamp_ntz/_delta_log/00000000000000000001.json",
+        ))
+        .await?;
+
+    let parsed_commits: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
+        .into_iter::<serde_json::Value>()
+        .try_collect()?;
+
+    // Check that we have the expected number of commits (commitInfo + add)
+    assert_eq!(parsed_commits.len(), 2);
+
+    // Check that the add action exists
+    assert!(parsed_commits[1].get("add").is_some());
+
+    // Verify the data can be read back correctly
+    test_read(&ArrowEngineData::new(data), &table, engine)?;
+
     Ok(())
 }
