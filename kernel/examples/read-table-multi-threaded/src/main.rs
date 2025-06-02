@@ -11,9 +11,8 @@ use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::engine::sync::SyncEngine;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
-use delta_kernel::schema::Schema;
+use delta_kernel::schema::{Schema, SchemaRef};
 use delta_kernel::{DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Table};
 
 use clap::Parser;
@@ -234,8 +233,6 @@ fn try_main() -> DeltaResult<()> {
 fn do_work(
     engine: &dyn Engine,
     scan_state: Arc<ScanState>,
-    engine: &dyn Engine,
-    scan_state: Arc<GlobalScanState>,
     record_batch_tx: Sender<RecordBatch>,
     scan_file_rx: spmc::Receiver<ScanFile>,
 ) {
