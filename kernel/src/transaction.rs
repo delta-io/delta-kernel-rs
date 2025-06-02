@@ -303,6 +303,18 @@ pub enum CommitResult {
     Conflict(Transaction, Version),
 }
 
+// Helper function to convert HashMap to Scalar for commit_info
+// TODO: should we implement Scalar::From<HashMap>?
+fn hashmap_to_scalar(hm: Option<&HashMap<String, String>>) -> DeltaResult<Scalar> {
+    let map_data = MapData::try_new(
+        MapType::new(DataType::STRING, DataType::STRING, false),
+        hm.into_iter()
+            .flatten()
+            .map(|(k, v)| (k.clone(), v.clone())),
+    )?;
+    Ok(Scalar::Map(map_data))
+}
+
 // given data for CommitInfo, we want to materialize it into a commitInfo action to commit (and append more actions to)
 fn generate_commit_info(
     engine: &dyn Engine,
@@ -310,27 +322,6 @@ fn generate_commit_info(
     timestamp: i64,
     engine_commit_info: &HashMap<String, String>,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    // Helper function to convert HashMap to Scalar for commit_info
-    let hashmap_to_scalar = |hm: Option<&HashMap<String, String>>| -> DeltaResult<Scalar> {
-        match hm {
-            Some(map) => {
-                let pairs = map.iter().map(|(k, v)| (k.clone(), v.clone()));
-                let map_data = MapData::try_new(
-                    MapType::new(DataType::STRING, DataType::STRING, false),
-                    pairs,
-                )?;
-                Ok(Scalar::Map(map_data))
-            }
-            None => {
-                let map_data = MapData::try_new(
-                    MapType::new(DataType::STRING, DataType::STRING, false),
-                    std::iter::empty::<(String, String)>(),
-                )?;
-                Ok(Scalar::Map(map_data))
-            }
-        }
-    };
-
     let mut commit_info_schema = get_log_commit_info_schema().as_ref().clone();
 
     // Remove the inCommitTimestamp field from the schema
