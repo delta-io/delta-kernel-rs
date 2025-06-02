@@ -202,16 +202,9 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
             .get_mut("timestamp")
             .unwrap() = serde_json::Value::Number(0.into());
 
-        *parsed_commit
-            .get_mut("commitInfo")
-            .unwrap()
-            .get_mut("inCommitTimestamp")
-            .unwrap() = serde_json::Value::Number(0.into());
-
         let expected_commit = json!({
             "commitInfo": {
                 "timestamp": 0,
-                "inCommitTimestamp": 0,
                 "operation": "UNKNOWN",
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                 "operationParameters": {},
@@ -337,16 +330,10 @@ async fn test_comit_info_action() -> Result<(), Box<dyn std::error::Error>> {
         // set timestamps to 0 and paths to known string values for comparison
         // (otherwise timestamps are non-deterministic and paths are random UUIDs)
         set_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
-        set_value(
-            &mut parsed_commits[0],
-            "commitInfo.inCommitTimestamp",
-            json!(0),
-        )?;
 
         let expected_commit = vec![json!({
             "commitInfo": {
                 "timestamp": 0,
-                "inCommitTimestamp": 0,
                 "operation": "INSERT",
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                 "operationParameters": {},
@@ -435,11 +422,6 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
         // set timestamps to 0 and paths to known string values for comparison
         // (otherwise timestamps are non-deterministic and paths are random UUIDs)
         set_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
-        set_value(
-            &mut parsed_commits[0],
-            "commitInfo.inCommitTimestamp",
-            json!(0),
-        )?;
         set_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
         set_value(&mut parsed_commits[1], "add.path", json!("first.parquet"))?;
         set_value(&mut parsed_commits[2], "add.modificationTime", json!(0))?;
@@ -449,7 +431,6 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
             json!({
                 "commitInfo": {
                     "timestamp": 0,
-                    "inCommitTimestamp": 0,
                     "operation": "UNKNOWN",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
@@ -579,11 +560,6 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         // set timestamps to 0 and paths to known string values for comparison
         // (otherwise timestamps are non-deterministic and paths are random UUIDs)
         set_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
-        set_value(
-            &mut parsed_commits[0],
-            "commitInfo.inCommitTimestamp",
-            json!(0),
-        )?;
         set_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
         set_value(&mut parsed_commits[1], "add.path", json!("first.parquet"))?;
         set_value(&mut parsed_commits[2], "add.modificationTime", json!(0))?;
@@ -593,7 +569,6 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
             json!({
                 "commitInfo": {
                     "timestamp": 0,
-                    "inCommitTimestamp": 0,
                     "operation": "UNKNOWN",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
@@ -767,12 +742,6 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             .get_mut("timestamp")
             .unwrap() = serde_json::Value::Number(0.into());
 
-        *parsed_commits[0]
-            .get_mut("commitInfo")
-            .unwrap()
-            .get_mut("inCommitTimestamp")
-            .unwrap() = serde_json::Value::Number(0.into());
-
         let time_ms: i64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis()
@@ -814,7 +783,6 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             json!({
                 "commitInfo": {
                     "timestamp": 0,
-                    "inCommitTimestamp": 0,
                     "operation": "UNKNOWN",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},

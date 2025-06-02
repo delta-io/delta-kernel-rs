@@ -4,6 +4,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::actions::SetTransaction;
+use crate::actions::COMMIT_INFO_NAME;
 use crate::actions::{get_log_add_schema, get_log_commit_info_schema, get_log_txn_schema};
 use crate::error::Error;
 use crate::expressions::{MapData, Scalar};
@@ -330,12 +331,21 @@ fn generate_commit_info(
         }
     };
 
-    let commit_info_schema = get_log_commit_info_schema();
+    let mut commit_info_schema = get_log_commit_info_schema().as_ref().clone();
+
+    // Remove the inCommitTimestamp field from the schema
+    let commit_info_field = commit_info_schema
+        .fields
+        .get_mut(COMMIT_INFO_NAME)
+        .ok_or_else(|| Error::missing_column(COMMIT_INFO_NAME))?;
+    let DataType::Struct(mut commit_info_struct) = commit_info_field.data_type().clone() else {
+        return Err(Error::internal_error("commitInfo field should be a struct"));
+    };
+    commit_info_struct.fields.shift_remove("inCommitTimestamp");
+    commit_info_field.data_type = DataType::Struct(commit_info_struct);
 
     let commit_info_values = vec![
         // timestamp
-        Scalar::Long(timestamp),
-        // in-commit timestamp
         Scalar::Long(timestamp),
         // operation
         Scalar::String(operation.unwrap_or(UNKNOWN_OPERATION).to_string()),
@@ -349,7 +359,7 @@ fn generate_commit_info(
 
     engine
         .evaluation_handler()
-        .create_one(commit_info_schema.clone(), &commit_info_values)
+        .create_one(Arc::new(commit_info_schema), &commit_info_values)
 }
 
 #[cfg(test)]
@@ -420,7 +430,6 @@ mod tests {
         let expected = serde_json::json!({
             "commitInfo": {
                 "timestamp": 123456789,
-                "inCommitTimestamp": 123456789,
                 "operation": "test operation",
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                 "operationParameters": {},
