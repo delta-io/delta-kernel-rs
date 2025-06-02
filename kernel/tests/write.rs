@@ -245,47 +245,6 @@ async fn test_empty_commit() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[tokio::test]
-async fn test_invalid_commit_info() -> Result<(), Box<dyn std::error::Error>> {
-    // setup tracing
-    let _ = tracing_subscriber::fmt::try_init();
-
-    // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )]));
-    for (table, engine, _store, _table_name) in setup_tables(schema, &[]).await? {
-        // empty commit info test
-        let txn = table
-            .new_transaction(&engine)?
-            .with_engine_commit_info(HashMap::new());
-
-        // commit!
-        assert!(matches!(
-            txn.commit(&engine),
-            Err(KernelError::InvalidCommitInfo(_))
-        ));
-
-        // two-row commit info test
-        let txn = table.new_transaction(&engine)?.with_engine_commit_info(
-            vec![
-                ("row1".to_string(), "default engine".to_string()),
-                ("row2".to_string(), "default engine".to_string()),
-            ]
-            .into_iter()
-            .collect(),
-        );
-
-        // commit!
-        assert!(matches!(
-            txn.commit(&engine),
-            Err(KernelError::InvalidCommitInfo(_))
-        ));
-    }
-    Ok(())
-}
-
 // check that the timestamps in commit_info and add actions are within 10s of SystemTime::now()
 fn check_action_timestamps<'a>(
     parsed_commits: impl Iterator<Item = &'a serde_json::Value>,

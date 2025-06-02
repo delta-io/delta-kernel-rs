@@ -74,7 +74,7 @@ impl std::fmt::Debug for Transaction {
         f.write_str(&format!(
             "Transaction {{ read_snapshot version: {}, commit_info: {:#?} }}",
             self.read_snapshot.version(),
-            self.commit_info
+            self.commit_info.is_some()
         ))
     }
 }
@@ -137,10 +137,10 @@ impl Transaction {
         // step one: construct the iterator of commit info + file actions we want to commit
         let commit_info = self
             .commit_info
-            .clone()
+            .as_ref()
             .ok_or_else(|| Error::MissingCommitInfo)?;
 
-        let commit_info_actions = generate_commit_info(engine, &commit_info, self.commit_timestamp);
+        let commit_info_actions = generate_commit_info(engine, commit_info, self.commit_timestamp);
 
         let add_actions = generate_adds(engine, self.write_metadata.iter().map(|a| a.as_ref()));
 
@@ -203,10 +203,6 @@ impl Transaction {
     }
 
     // Set the engine commit info of this transaction.
-    //
-    // Note: The engine data passed here must have exactly one row, and we
-    /// only read one column: `engineCommitInfo` which must be a map<string, string> encoding the
-    /// metadata.
     pub fn with_engine_commit_info(mut self, engine_commit_info: HashMap<String, String>) -> Self {
         self.commit_info.get_or_insert_default().engine_commit_info = Some(engine_commit_info);
         self
@@ -334,15 +330,6 @@ fn generate_commit_info(
     commit_info: &CommitInfo,
     commit_timestamp: i64,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    if let Some(engine_commit_info) = &commit_info.engine_commit_info {
-        if engine_commit_info.len() != 1 {
-            return Err(Error::InvalidCommitInfo(format!(
-                "Engine commit info should have exactly one row, found {}",
-                engine_commit_info.len()
-            )));
-        }
-    }
-
     // Helper function to convert HashMap to Scalar for commit_info
     let hashmap_to_scalar = |hm: &Option<HashMap<String, String>>| -> DeltaResult<Scalar> {
         match hm {
@@ -486,53 +473,6 @@ mod tests {
         assert_eq!(actions.len(), 1);
         let result = as_json(actions);
         assert_eq!(result, expected);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_generate_commit_info_invalid_engine_commit_info() -> DeltaResult<()> {
-        let engine = ExprEngine::new();
-
-        let mut commit_info = CommitInfo {
-            timestamp: Some(123456789),
-            in_commit_timestamp: Some(123),
-            operation: Some("test operation".to_string()),
-            kernel_version: Some(format!("v{}", env!("CARGO_PKG_VERSION"))),
-            operation_parameters: Some(HashMap::new()),
-            engine_commit_info: Some(HashMap::new()),
-        };
-
-        match generate_commit_info(&engine, &commit_info, 0) {
-            Err(Error::InvalidCommitInfo(msg)) => {
-                assert_eq!(
-                    msg,
-                    "Engine commit info should have exactly one row, found 0"
-                );
-            }
-            _ => panic!("Expected InvalidCommitInfo error"),
-        }
-
-        commit_info
-            .engine_commit_info
-            .as_mut()
-            .unwrap()
-            .insert("row1".to_string(), "default engine".to_string());
-        commit_info
-            .engine_commit_info
-            .as_mut()
-            .unwrap()
-            .insert("row2".to_string(), "default engine".to_string());
-
-        match generate_commit_info(&engine, &commit_info, 0) {
-            Err(Error::InvalidCommitInfo(msg)) => {
-                assert_eq!(
-                    msg,
-                    "Engine commit info should have exactly one row, found 2"
-                );
-            }
-            _ => panic!("Expected InvalidCommitInfo error"),
-        }
 
         Ok(())
     }
