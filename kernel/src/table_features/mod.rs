@@ -8,7 +8,9 @@ use crate::schema::DataType;
 
 pub(crate) use column_mapping::column_mapping_mode;
 pub use column_mapping::{validate_schema_column_mapping, ColumnMappingMode};
+pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
 mod column_mapping;
+mod timestamp_ntz;
 
 /// Reader features communicate capabilities that must be implemented in order to correctly read a
 /// given table. That is, readers must implement and respect all features listed in a table's
@@ -167,6 +169,7 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<WriterFeature>> = Lazy
         WriterFeature::AppendOnly,
         WriterFeature::DeletionVectors,
         WriterFeature::Invariants,
+        WriterFeature::TimestampWithoutTimezone,
     ]
 });
 

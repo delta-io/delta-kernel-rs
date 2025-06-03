@@ -31,7 +31,6 @@ use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
 
 use self::log_replay::scan_action_iter;
-use self::state::GlobalScanState;
 
 pub(crate) mod data_skipping;
 pub mod log_replay;
@@ -346,7 +345,8 @@ pub struct ScanMetadata {
     /// optional expression that must be applied to convert the file's data into the logical schema
     /// expected by the scan:
     ///
-    /// - `Some(expr)`: Apply this expression to transform the data to match [`Scan::schema()`].
+    /// - `Some(expr)`: Apply this expression to transform the data to match
+    ///   [`Scan::logical_schema()`].
     /// - `None`: No transformation is needed; the data is already in the correct logical form.
     ///
     /// Note: This vector can be indexed by row number, as rows masked by the selection vector will
@@ -397,11 +397,36 @@ impl std::fmt::Debug for Scan {
 }
 
 impl Scan {
-    /// Get a shared reference to the [`Schema`] of the scan.
+    /// The table's root URL. Any relative paths returned from `scan_data` (or in a callback from
+    /// [`ScanMetadata::visit_scan_files`]) must be resolved against this root to get the actual path to
+    /// the file.
+    ///
+    /// [`ScanMetadata::visit_scan_files`]: crate::scan::ScanMetadata::visit_scan_files
+    // NOTE: this is obviously included in the snapshot, just re-exposed here for convenience.
+    pub fn table_root(&self) -> &Url {
+        self.snapshot.table_root()
+    }
+
+    /// Get a shared reference to the [`Snapshot`] of this scan.
+    pub fn snapshot(&self) -> &Arc<Snapshot> {
+        &self.snapshot
+    }
+
+    /// Get a shared reference to the logical [`Schema`] of the scan (i.e. the output schema of the
+    /// scan). Note that the logical schema can differ from the physical schema due to e.g.
+    /// partition columns which are present in the logical schema but not in the physical schema.
     ///
     /// [`Schema`]: crate::schema::Schema
-    pub fn schema(&self) -> &SchemaRef {
+    pub fn logical_schema(&self) -> &SchemaRef {
         &self.logical_schema
+    }
+
+    /// Get a shared reference to the physical [`Schema`] of the scan. This represents the schema
+    /// of the underlying data files which must be read from storage.
+    ///
+    /// [`Schema`]: crate::schema::Schema
+    pub fn physical_schema(&self) -> &SchemaRef {
+        &self.physical_schema
     }
 
     /// Get the predicate [`Expression`] of the scan.
@@ -627,17 +652,6 @@ impl Scan {
         )
     }
 
-    /// Get global state that is valid for the entire scan. This is somewhat expensive so should
-    /// only be called once per scan.
-    pub fn global_scan_state(&self) -> GlobalScanState {
-        GlobalScanState {
-            table_root: self.snapshot.table_root().to_string(),
-            partition_columns: self.snapshot.metadata().partition_columns.clone(),
-            logical_schema: self.logical_schema.clone(),
-            physical_schema: self.physical_schema.clone(),
-        }
-    }
-
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all
     /// the data for the query. Each [`ScanResult`] in the resultant iterator encapsulates the raw
     /// data and an optional boolean vector built from the deletion vector if it was present. See
@@ -649,7 +663,7 @@ impl Scan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>> + use<'_>> {
         struct ScanFile {
             path: String,
             size: i64,
@@ -678,7 +692,6 @@ impl Scan {
             self.logical_schema, self.physical_schema
         );
 
-        let global_state = Arc::new(self.global_scan_state());
         let table_root = self.snapshot.table_root().clone();
 
         let scan_metadata_iter = self.scan_metadata(engine.as_ref())?;
@@ -714,21 +727,20 @@ impl Scan {
                 // TODO(#860): we disable predicate pushdown until we support row indexes.
                 let read_result_iter = engine.parquet_handler().read_parquet_files(
                     &[meta],
-                    global_state.physical_schema.clone(),
+                    self.physical_schema().clone(),
                     None,
                 )?;
 
                 // Arc clones
                 let engine = engine.clone();
-                let global_state = global_state.clone();
                 Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
                     let read_result = read_result?;
                     // transform the physical data into the correct logical form
                     let logical = state::transform_to_logical(
                         engine.as_ref(),
                         read_result,
-                        &global_state.physical_schema,
-                        &global_state.logical_schema,
+                        self.physical_schema(),
+                        self.logical_schema(),
                         &scan_file.transform,
                     );
                     let len = logical.as_ref().map_or(0, |res| res.len());

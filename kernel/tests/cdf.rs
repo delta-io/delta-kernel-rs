@@ -41,7 +41,8 @@ fn read_cdf_for_table(
         .with_schema(schema)
         .with_predicate(predicate)
         .build()?;
-    let scan_schema_as_arrow = ArrowSchema::try_from_kernel(scan.schema().as_ref()).unwrap();
+    let scan_schema_as_arrow =
+        ArrowSchema::try_from_kernel(scan.logical_schema().as_ref()).unwrap();
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
         .map(|scan_result| -> DeltaResult<_> {
