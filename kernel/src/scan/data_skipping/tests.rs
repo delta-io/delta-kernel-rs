@@ -339,3 +339,85 @@ fn test_sql_where() {
     do_test(ALL_NULL, pred, PRESENT, None, Some(false));
     do_test(ALL_NULL, pred, MISSING, None, None);
 }
+
+// TODO(#1002): we currently don't support file skipping on timestamp columns since they are
+// truncated to milliseconds in add.stats.
+#[test]
+fn test_timestamp_skipping_disabled() {
+    let creator = DataSkippingPredicateCreator;
+    let col = &column_name!("timestamp_col");
+
+    // Test that get_min_stat returns None for timestamp types
+    assert_eq!(
+        creator.get_min_stat(col, &DataType::TIMESTAMP),
+        None,
+        "get_min_stat should return None: no data skipping on timestamp columns"
+    );
+
+    assert_eq!(
+        creator.get_max_stat(col, &DataType::TIMESTAMP),
+        None,
+        "get_max_stat should return None: no data skipping on timestamp columns"
+    );
+
+    // Test that get_min_stat returns None for timestamp_ntz types
+    assert_eq!(
+        creator.get_min_stat(col, &DataType::TIMESTAMP_NTZ),
+        None,
+        "get_min_stat should return None: no data skipping on timestamp_ntz columns"
+    );
+
+    assert_eq!(
+        creator.get_max_stat(col, &DataType::TIMESTAMP_NTZ),
+        None,
+        "get_max_stat should return None: no data skipping on timestamp_ntz columns"
+    );
+
+    // Test that non-timestamp types still work
+    assert!(
+        creator.get_min_stat(col, &DataType::INTEGER).is_some(),
+        "get_min_stat should still work for non-timestamp columns"
+    );
+
+    assert!(
+        creator.get_max_stat(col, &DataType::INTEGER).is_some(),
+        "get_max_stat should still work for non-timestamp columns"
+    );
+}
+
+// TODO(#1002): we currently don't support file skipping on timestamp columns since they are
+// truncated to milliseconds in add.stats.
+#[test]
+fn test_timestamp_predicates_dont_data_skip() {
+    let col = &column_expr!("ts_col");
+    for timestamp in [&Scalar::Timestamp(1000000), &Scalar::TimestampNtz(2000000)] {
+        // Test predicates that use min/max stats (lt, gt, eq, ne)
+        let pred = Pred::lt(col.clone(), timestamp.clone());
+        let skipping_pred = as_data_skipping_predicate(&pred);
+        assert!(
+            skipping_pred.is_none(),
+            "Expected no data skipping for timestamp predicate: {pred:#?}, got {skipping_pred:#?}"
+        );
+        let pred = Pred::gt(col.clone(), timestamp.clone());
+        let skipping_pred = as_data_skipping_predicate(&pred);
+        assert!(
+            skipping_pred.is_none(),
+            "Expected no data skipping for timestamp predicate: {pred:#?}, got {skipping_pred:#?}"
+        );
+
+        let pred = Pred::eq(col.clone(), timestamp.clone());
+        let skipping_pred = as_data_skipping_predicate(&pred);
+        // doesn't work with:
+        // Some(Pred::Junction(JunctionPredicate {
+        //     op: JunctionPredicateOp::And,
+        //     preds: vec![Pred::BooleanExpression(Expr::Literal(Scalar::Null(
+        //         DataType::Primitive(PrimitiveType::Boolean),
+        //     )))],
+        // }));
+        assert_eq!(skipping_pred.unwrap().to_string(), "AND(null)");
+
+        let pred = Pred::ne(col.clone(), timestamp.clone());
+        let skipping_pred = as_data_skipping_predicate(&pred);
+        assert_eq!(skipping_pred.unwrap().to_string(), "OR(null)");
+    }
+}
