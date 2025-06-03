@@ -52,6 +52,8 @@ pub enum ReaderFeature {
     /// vacuumProtocolCheck ReaderWriter feature ensures consistent application of reader and writer
     /// protocol checks during VACUUM operations
     VacuumProtocolCheck,
+    /// This feature enables support for the variant data type, which stores semi-structured data.
+    VariantType,
     #[serde(untagged)]
     #[strum(default)]
     Unknown(String),
@@ -118,6 +120,13 @@ pub enum WriterFeature {
     /// vacuumProtocolCheck ReaderWriter feature ensures consistent application of reader and writer
     /// protocol checks during VACUUM operations
     VacuumProtocolCheck,
+    /// The Clustered Table feature facilitates the physical clustering of rows
+    /// that share similar values on a predefined set of clustering columns.
+    #[strum(serialize = "clustering")]
+    #[serde(rename = "clustering")]
+    ClusteredTable,
+    /// This feature enables support for the variant data type, which stores semi-structured data.
+    VariantType,
     #[serde(untagged)]
     #[strum(default)]
     Unknown(String),
@@ -221,6 +230,7 @@ mod tests {
             (ReaderFeature::TypeWideningPreview, "typeWidening-preview"),
             (ReaderFeature::V2Checkpoint, "v2Checkpoint"),
             (ReaderFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
+            (ReaderFeature::VariantType, "variantType"),
             (ReaderFeature::unknown("something"), "something"),
         ];
 
@@ -260,6 +270,8 @@ mod tests {
             (WriterFeature::IcebergCompatV1, "icebergCompatV1"),
             (WriterFeature::IcebergCompatV2, "icebergCompatV2"),
             (WriterFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
+            (WriterFeature::ClusteredTable, "clustering"),
+            (WriterFeature::VariantType, "variantType"),
             (WriterFeature::unknown("something"), "something"),
         ];
 
