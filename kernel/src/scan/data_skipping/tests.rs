@@ -347,38 +347,32 @@ fn test_timestamp_skipping_disabled() {
     let creator = DataSkippingPredicateCreator;
     let col = &column_name!("timestamp_col");
 
-    // Test that get_min_stat returns None for timestamp types
     assert_eq!(
         creator.get_min_stat(col, &DataType::TIMESTAMP),
         None,
         "get_min_stat should return None: no data skipping on timestamp columns"
     );
-
     assert_eq!(
         creator.get_max_stat(col, &DataType::TIMESTAMP),
         None,
         "get_max_stat should return None: no data skipping on timestamp columns"
     );
-
-    // Test that get_min_stat returns None for timestamp_ntz types
     assert_eq!(
         creator.get_min_stat(col, &DataType::TIMESTAMP_NTZ),
         None,
         "get_min_stat should return None: no data skipping on timestamp_ntz columns"
     );
-
     assert_eq!(
         creator.get_max_stat(col, &DataType::TIMESTAMP_NTZ),
         None,
         "get_max_stat should return None: no data skipping on timestamp_ntz columns"
     );
 
-    // Test that non-timestamp types still work
+    // non-timestamp still work
     assert!(
         creator.get_min_stat(col, &DataType::INTEGER).is_some(),
         "get_min_stat should still work for non-timestamp columns"
     );
-
     assert!(
         creator.get_max_stat(col, &DataType::INTEGER).is_some(),
         "get_max_stat should still work for non-timestamp columns"
