@@ -161,7 +161,7 @@ impl Transaction {
         match json_handler.write_json_file(&commit_path.location, Box::new(actions), false) {
             Ok(()) => Ok(CommitResult::Committed {
                 version: commit_version,
-                post_commit_actions: vec![]
+                post_commit_actions: vec![],
             }),
             Err(Error::FileAlreadyExists(_)) => Ok(CommitResult::Conflict(self, commit_version)),
             Err(e) => Err(e),
@@ -296,7 +296,6 @@ impl WriteContext {
     }
 }
 
-
 /// Kernel can indicate to the engine that it should perform certain actions post commit. To do so
 /// it returns a set of `PostCommitAction`s in a [`CommitResult`], where each action indicates something the
 /// engine should do.
@@ -316,7 +315,7 @@ pub enum CommitResult {
         /// the version of the table that was just committed
         version: Version,
         /// Any [`PostCommitAction`]s that should be run by the engine
-        post_commit_actions: Vec<PostCommitAction>
+        post_commit_actions: Vec<PostCommitAction>,
     },
     /// This transaction conflicted with an existing version (at the version given). The transaction
     /// is returned so the caller can resolve the conflict (along with the version which
