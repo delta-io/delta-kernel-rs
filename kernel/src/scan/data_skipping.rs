@@ -197,21 +197,16 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
     type ColumnStat = Expr;
 
     /// Retrieves the minimum value of a column, if it exists and has the requested type.
-    // TODO(#1002): we currently don't support file skipping on timestamp columns since they are
-    // truncated to milliseconds in add.stats.
-    fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
-        match data_type {
-            DataType::Primitive(PrimitiveType::Timestamp | PrimitiveType::TimestampNtz) => None,
-            _ => Some(joined_column_expr!("minValues", col)),
-        }
+    fn get_min_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
+        Some(joined_column_expr!("minValues", col))
     }
 
     /// Retrieves the maximum value of a column, if it exists and has the requested type.
-    // TODO(#1002): we currently don't support file skipping on timestamp columns since they are
-    // truncated to milliseconds in add.stats.
+    // TODO(#1002): we currently don't support file skipping on timestamp columns' max stat since
+    // they are truncated to milliseconds in add.stats.
     fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
         match data_type {
-            DataType::Primitive(PrimitiveType::Timestamp | PrimitiveType::TimestampNtz) => None,
+            &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ => None,
             _ => Some(joined_column_expr!("maxValues", col)),
         }
     }
