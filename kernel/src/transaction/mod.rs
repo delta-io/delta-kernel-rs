@@ -302,9 +302,10 @@ impl WriteContext {
 /// engine should do.
 #[derive(Debug)]
 pub enum PostCommitAction {
-    /// The table is ready for checkpointing. The engine should follow the proceedure outlined in
-    /// [module@crate::checkpoint] to create a checkpoint for this table
-    Checkpoint,
+    /// The table is ready for checkpointing, and should be checkpointed at the included
+    /// `Version`. The engine should follow the proceedure outlined in [module@crate::checkpoint] to
+    /// create a checkpoint for this table.
+    Checkpoint(Version),
 }
 
 /// Result of committing a transaction.
