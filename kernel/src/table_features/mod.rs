@@ -5,6 +5,7 @@ use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumString};
 
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::DataType;
+use delta_kernel_derive::internal_api;
 
 pub(crate) use column_mapping::column_mapping_mode;
 pub use column_mapping::{validate_schema_column_mapping, ColumnMappingMode};
