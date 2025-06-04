@@ -339,3 +339,70 @@ fn test_sql_where() {
     do_test(ALL_NULL, pred, PRESENT, None, Some(false));
     do_test(ALL_NULL, pred, MISSING, None, None);
 }
+
+// TODO(#1002): we currently don't support file skipping on timestamp columns' max stat since they
+// are truncated to milliseconds in add.stats.
+#[test]
+fn test_timestamp_skipping_disabled() {
+    let creator = DataSkippingPredicateCreator;
+    let col = &column_name!("timestamp_col");
+
+    assert!(
+        creator.get_min_stat(col, &DataType::TIMESTAMP).is_some(),
+        "get_min_stat should return Some: allow data skipping on timestamp minValues"
+    );
+    assert_eq!(
+        creator.get_max_stat(col, &DataType::TIMESTAMP),
+        None,
+        "get_max_stat should return None: no data skipping on timestamp maxValues"
+    );
+    assert!(
+        creator
+            .get_min_stat(col, &DataType::TIMESTAMP_NTZ)
+            .is_some(),
+        "get_min_stat should return Some: allow data skipping on timestamp_ntz minValues"
+    );
+    assert_eq!(
+        creator.get_max_stat(col, &DataType::TIMESTAMP_NTZ),
+        None,
+        "get_max_stat should return None: no data skipping on timestamp_ntz maxValues"
+    );
+}
+
+// TODO(#1002): we currently don't support file skipping on timestamp columns' max stat since they
+// are truncated to milliseconds in add.stats.
+#[test]
+fn test_timestamp_predicates_dont_data_skip() {
+    let col = &column_expr!("ts_col");
+    for timestamp in [&Scalar::Timestamp(1000000), &Scalar::TimestampNtz(1000000)] {
+        // LT will do minValues -> OK
+        let pred = Pred::lt(col.clone(), timestamp.clone());
+        let skipping_pred = as_data_skipping_predicate(&pred);
+        assert_eq!(
+            skipping_pred.unwrap().to_string(),
+            "Column(minValues.ts_col) < 1000000"
+        );
+
+        // GT will do maxValues -> BLOCKED
+        let pred = Pred::gt(col.clone(), timestamp.clone());
+        let skipping_pred = as_data_skipping_predicate(&pred);
+        assert!(
+            skipping_pred.is_none(),
+            "Expected no data skipping for timestamp predicate: {pred:#?}, got {skipping_pred:#?}"
+        );
+
+        let pred = Pred::eq(col.clone(), timestamp.clone());
+        let skipping_pred = as_data_skipping_predicate(&pred);
+        assert_eq!(
+            skipping_pred.unwrap().to_string(),
+            "AND(NOT(Column(minValues.ts_col) > 1000000), null)"
+        );
+
+        let pred = Pred::ne(col.clone(), timestamp.clone());
+        let skipping_pred = as_data_skipping_predicate(&pred);
+        assert_eq!(
+            skipping_pred.unwrap().to_string(),
+            "OR(NOT(Column(minValues.ts_col) = 1000000), null)"
+        );
+    }
+}
