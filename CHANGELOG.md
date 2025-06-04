@@ -1,5 +1,43 @@
 # Changelog
 
+## [v0.12.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.12.0/) (2025-06-04)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.11.0...v0.12.0)
+
+### 🏗️ Breaking changes
+1. Remove `GlobalScanState`: instead use new `Scan` APIs directly (`logical_schema`, `physical_schema`, etc.) ([#947])
+
+### 🚀 Features / new APIs
+
+1. Use compacted log files in log-replay ([#950])
+2. New `#[derive(IntoEngineData)]` proc macro ([#830])
+3. Add support for kernel default expression evaluation ([#979])
+4. Add `debug_assert` to the constructor of `struct ListedLogFiles` ([#986])
+5. Create visitor for getting In-commit Timestamp ([#897])
+6. Binary searching utility function for timestamp to version conversion ([#896])
+7. Enable "TimestampWithoutTimezone" table feature and add protocol validation for it ([#988])
+
+### 🐛 Bug Fixes
+
+1. Disable timestamp column's `maxValues` for data skipping ([#1003])
+
+### 🚜 Refactor
+
+1. Make KernelPredicateEvaluator trait dyn-compatible ([#994])
+
+
+[#950]: https://github.com/delta-io/delta-kernel-rs/pull/950
+[#830]: https://github.com/delta-io/delta-kernel-rs/pull/830
+[#979]: https://github.com/delta-io/delta-kernel-rs/pull/979
+[#994]: https://github.com/delta-io/delta-kernel-rs/pull/994
+[#986]: https://github.com/delta-io/delta-kernel-rs/pull/986
+[#897]: https://github.com/delta-io/delta-kernel-rs/pull/897
+[#896]: https://github.com/delta-io/delta-kernel-rs/pull/896
+[#988]: https://github.com/delta-io/delta-kernel-rs/pull/988
+[#947]: https://github.com/delta-io/delta-kernel-rs/pull/947
+[#1003]: https://github.com/delta-io/delta-kernel-rs/pull/1003
+
+
 ## [v0.11.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.11.0/) (2025-05-27)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.10.0...v0.11.0)
