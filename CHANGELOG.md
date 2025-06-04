@@ -6,6 +6,7 @@
 
 ### 🏗️ Breaking changes
 1. Remove `GlobalScanState`: instead use new `Scan` APIs directly (`logical_schema`, `physical_schema`, etc.) ([#947])
+1. table feature enums are now `internal_api` (not public, unless `internal-api` flag is set) ([#998])
 
 ### 🚀 Features / new APIs
 
@@ -16,6 +17,7 @@
 5. Create visitor for getting In-commit Timestamp ([#897])
 6. Binary searching utility function for timestamp to version conversion ([#896])
 7. Enable "TimestampWithoutTimezone" table feature and add protocol validation for it ([#988])
+8. add missing reader/writer features (variantType/clustered) ([#998])
 
 ### 🐛 Bug Fixes
 
@@ -36,6 +38,7 @@
 [#988]: https://github.com/delta-io/delta-kernel-rs/pull/988
 [#947]: https://github.com/delta-io/delta-kernel-rs/pull/947
 [#1003]: https://github.com/delta-io/delta-kernel-rs/pull/1003
+[#998]: https://github.com/delta-io/delta-kernel-rs/pull/998
 
 
 ## [v0.11.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.11.0/) (2025-05-27)
