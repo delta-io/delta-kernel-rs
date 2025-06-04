@@ -6,14 +6,14 @@
 
 ### 🏗️ Breaking changes
 1. Remove `GlobalScanState`: instead use new `Scan` APIs directly (`logical_schema`, `physical_schema`, etc.) ([#947])
-1. table feature enums are now `internal_api` (not public, unless `internal-api` flag is set) ([#998])
+2. table feature enums are now `internal_api` (not public, unless `internal-api` flag is set) ([#998])
 
 ### 🚀 Features / new APIs
 
 1. Use compacted log files in log-replay ([#950])
 2. New `#[derive(IntoEngineData)]` proc macro ([#830])
 3. Add support for kernel default expression evaluation ([#979])
-4. Add `debug_assert` to the constructor of `struct ListedLogFiles` ([#986])
+4. **New: panic in debug builds if ListedLogFiles breaks invariants** ([#986])
 5. Create visitor for getting In-commit Timestamp ([#897])
 6. Binary searching utility function for timestamp to version conversion ([#896])
 7. Enable "TimestampWithoutTimezone" table feature and add protocol validation for it ([#988])
