@@ -85,9 +85,27 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         let (sender, receiver) = std::sync::mpsc::sync_channel(4_000);
         let url = path.clone();
         self.task_executor.spawn(async move {
+            // remove prefix "kerneltest/" from prefix
+            println!("old offset: {offset}");
+            println!("old prefix: {prefix}");
+            // let prefix = Path::from_iter(prefix.parts().skip(1));
+            // let offset = Path::from_iter(offset.parts().skip(1));
             let mut stream = store.list_with_offset(Some(&prefix), &offset);
+            println!(
+                "GET {:?}",
+                store
+                    .get(&Path::from(
+                        "checkpoint_table/_delta_log/00000000000000000000.json"
+                    ))
+                    .await
+            );
+
+            println!("Listing files from: {url}");
+            println!("new offset: {offset}");
+            println!("new prefix: {prefix}");
 
             while let Some(meta) = stream.next().await {
+                println!("Listed {meta:?}");
                 match meta {
                     Ok(meta) => {
                         let mut location = url.clone();

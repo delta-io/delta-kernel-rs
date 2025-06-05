@@ -1,7 +1,7 @@
 use std::sync::LazyLock;
 use std::{path::PathBuf, sync::Arc};
 
-use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
+use crate::object_store::{memory::InMemory, path::Path, ObjectStore, PutPayload};
 use futures::executor::block_on;
 use itertools::Itertools;
 use test_log::test;
@@ -133,12 +133,13 @@ fn new_in_memory_store() -> (Arc<InMemory>, Url) {
     )
 }
 
-// Writes a record batch obtained from engine data to the in-memory store at a given path.
+// Writes a record batch obtained from engine data to the in-memory store at a given path and
+// returns the size of the written data in bytes.
 fn write_parquet_to_store(
     store: &Arc<InMemory>,
     path: String,
     data: Box<dyn EngineData>,
-) -> DeltaResult<()> {
+) -> DeltaResult<u64> {
     let batch = ArrowEngineData::try_from_engine_data(data)?;
     let record_batch = batch.record_batch();
 
@@ -147,9 +148,10 @@ fn write_parquet_to_store(
     writer.write(record_batch)?;
     writer.close()?;
 
+    let size = buffer.len();
     block_on(async { store.put(&Path::from(path), buffer.into()).await })?;
 
-    Ok(())
+    Ok(size.try_into().unwrap())
 }
 
 /// Writes all actions to a _delta_log parquet checkpoint file in the store.
@@ -158,7 +160,7 @@ pub(crate) fn add_checkpoint_to_store(
     store: &Arc<InMemory>,
     data: Box<dyn EngineData>,
     filename: &str,
-) -> DeltaResult<()> {
+) -> DeltaResult<u64> {
     let path = format!("_delta_log/{}", filename);
     write_parquet_to_store(store, path, data)
 }
@@ -169,18 +171,19 @@ fn add_sidecar_to_store(
     store: &Arc<InMemory>,
     data: Box<dyn EngineData>,
     filename: &str,
-) -> DeltaResult<()> {
+) -> DeltaResult<u64> {
     let path = format!("_delta_log/_sidecars/{}", filename);
     write_parquet_to_store(store, path, data)
 }
 
 /// Writes all actions to a _delta_log json checkpoint file in the store.
 /// This function formats the provided filename into the _delta_log directory.
+/// Returns number of bytes written.
 fn write_json_to_store(
     store: &Arc<InMemory>,
     actions: Vec<Action>,
     filename: &str,
-) -> DeltaResult<()> {
+) -> DeltaResult<u64> {
     let json_lines: Vec<String> = actions
         .into_iter()
         .map(|action| serde_json::to_string(&action).expect("action to string"))
@@ -188,22 +191,20 @@ fn write_json_to_store(
     let content = json_lines.join("\n");
     let checkpoint_path = format!("_delta_log/{}", filename);
 
+    let content: PutPayload = content.into();
+    let len = content.content_length();
     tokio::runtime::Runtime::new()
         .expect("create tokio runtime")
-        .block_on(async {
-            store
-                .put(&Path::from(checkpoint_path), content.into())
-                .await
-        })?;
+        .block_on(async { store.put(&Path::from(checkpoint_path), content).await })?;
 
-    Ok(())
+    Ok(len.try_into().unwrap())
 }
 
-fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
+fn create_log_path(path: &str, size: u64) -> ParsedLogPath<FileMeta> {
     ParsedLogPath::try_from(FileMeta {
         location: Url::parse(path).expect("Invalid file URL"),
         last_modified: 0,
-        size: 0,
+        size,
     })
     .unwrap()
     .unwrap()
@@ -858,19 +859,22 @@ fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
     let read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
-    add_sidecar_to_store(
+    let size1 = add_sidecar_to_store(
         &store,
         add_batch_simple(read_schema.clone()),
         "sidecarfile1.parquet",
     )?;
-    add_sidecar_to_store(
+    let size2 = add_sidecar_to_store(
         &store,
         add_batch_with_remove(read_schema.clone()),
         "sidecarfile2.parquet",
     )?;
 
     let checkpoint_batch = sidecar_batch_with_given_paths(
-        vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
+        vec![
+            ("sidecarfile1.parquet", size1),
+            ("sidecarfile2.parquet", size2),
+        ],
         read_schema.clone(),
     );
 
@@ -898,7 +902,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
     let checkpoint_batch = sidecar_batch_with_given_paths(
-        vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
+        vec![("sidecarfile1.parquet", 1), ("sidecarfile2.parquet", 2)],
         get_log_schema().clone(),
     );
 
@@ -925,15 +929,14 @@ fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
     let read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
-    let checkpoint_batch =
-        sidecar_batch_with_given_paths(vec!["sidecarfile1.parquet"], read_schema.clone());
-
     // Add a sidecar file with only add actions
-    add_sidecar_to_store(
+    let size = add_sidecar_to_store(
         &store,
         add_batch_simple(read_schema.clone()),
         "sidecarfile1.parquet",
     )?;
+    let checkpoint_batch =
+        sidecar_batch_with_given_paths(vec![("sidecarfile1.parquet", size)], read_schema.clone());
 
     // Filter out sidecar files that do not contain remove actions
     let remove_predicate: LazyLock<Option<PredicateRef>> = LazyLock::new(|| {
@@ -971,6 +974,7 @@ fn test_create_checkpoint_stream_errors_when_schema_has_remove_but_no_sidecar_ac
             vec![],
             vec![create_log_path(
                 "file:///00000000000000000001.checkpoint.parquet",
+                100,
             )],
             None,
         ),
@@ -1002,6 +1006,7 @@ fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_actio
             vec![],
             vec![create_log_path(
                 "file:///00000000000000000001.checkpoint.parquet",
+                100,
             )],
             None,
         ),
@@ -1021,10 +1026,10 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
-    add_checkpoint_to_store(
+    let checkpoint_size = add_checkpoint_to_store(
         &store,
         // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are not read.
-        sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_log_schema().clone()),
+        sidecar_batch_with_given_paths(vec![("sidecar1.parquet", 1)], get_log_schema().clone()),
         "00000000000000000001.checkpoint.parquet",
     )?;
 
@@ -1038,7 +1043,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
         ListedLogFiles::new(
             vec![],
             vec![],
-            vec![create_log_path(&checkpoint_one_file)],
+            vec![create_log_path(&checkpoint_one_file, checkpoint_size)],
             None,
         ),
         log_root,
@@ -1055,7 +1060,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
     assert!(!is_log_batch);
     assert_batch_matches(
         first_batch,
-        sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], v2_checkpoint_read_schema),
+        sidecar_batch_with_given_paths(vec![("sidecar1.parquet", 1)], v2_checkpoint_read_schema),
     );
     assert!(iter.next().is_none());
 
@@ -1077,14 +1082,14 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
     let checkpoint_part_1 = "00000000000000000001.checkpoint.0000000001.0000000002.parquet";
     let checkpoint_part_2 = "00000000000000000001.checkpoint.0000000002.0000000002.parquet";
 
-    add_checkpoint_to_store(
+    let checkpoint1_size = add_checkpoint_to_store(
         &store,
-        sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_log_schema().clone()),
+        sidecar_batch_with_given_paths(vec![("sidecar1.parquet", 1)], get_log_schema().clone()),
         checkpoint_part_1,
     )?;
-    add_checkpoint_to_store(
+    let checkpoint2_size = add_checkpoint_to_store(
         &store,
-        sidecar_batch_with_given_paths(vec!["sidecar2.parquet"], get_log_schema().clone()),
+        sidecar_batch_with_given_paths(vec![("sidecar2.parquet", 1)], get_log_schema().clone()),
         checkpoint_part_2,
     )?;
 
@@ -1098,8 +1103,8 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
             vec![],
             vec![],
             vec![
-                create_log_path(&checkpoint_one_file),
-                create_log_path(&checkpoint_two_file),
+                create_log_path(&checkpoint_one_file, checkpoint1_size),
+                create_log_path(&checkpoint_two_file, checkpoint2_size),
             ],
             None,
         ),
@@ -1119,7 +1124,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
         assert_batch_matches(
             batch,
             sidecar_batch_with_given_paths(
-                vec![expected_sidecar],
+                vec![(expected_sidecar, 1)],
                 v2_checkpoint_read_schema.clone(),
             ),
         );
@@ -1135,7 +1140,7 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
-    add_checkpoint_to_store(
+    let checkpoint1_size = add_checkpoint_to_store(
         &store,
         add_batch_simple(get_log_schema().clone()),
         "00000000000000000001.checkpoint.parquet",
@@ -1151,7 +1156,7 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
         ListedLogFiles::new(
             vec![],
             vec![],
-            vec![create_log_path(&checkpoint_one_file)],
+            vec![create_log_path(&checkpoint_one_file, checkpoint1_size)],
             None,
         ),
         log_root,
@@ -1179,7 +1184,7 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
 
     let filename = "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json";
 
-    write_json_to_store(
+    let checkpoint_size = write_json_to_store(
         &store,
         vec![Action::Add(Add {
             path: "fake_path_1".into(),
@@ -1197,7 +1202,7 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
         ListedLogFiles::new(
             vec![],
             vec![],
-            vec![create_log_path(&checkpoint_one_file)],
+            vec![create_log_path(&checkpoint_one_file, checkpoint_size)],
             None,
         ),
         log_root,
@@ -1234,24 +1239,27 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
-    add_checkpoint_to_store(
-        &store,
-        sidecar_batch_with_given_paths(
-            vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
-            get_log_schema().clone(),
-        ),
-        "00000000000000000001.checkpoint.parquet",
-    )?;
-
-    add_sidecar_to_store(
+    let size1 = add_sidecar_to_store(
         &store,
         add_batch_simple(get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?),
         "sidecarfile1.parquet",
     )?;
-    add_sidecar_to_store(
+    let size2 = add_sidecar_to_store(
         &store,
         add_batch_with_remove(get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?),
         "sidecarfile2.parquet",
+    )?;
+
+    let checkpoint_size = add_checkpoint_to_store(
+        &store,
+        sidecar_batch_with_given_paths(
+            vec![
+                ("sidecarfile1.parquet", size1),
+                ("sidecarfile2.parquet", size2),
+            ],
+            get_log_schema().clone(),
+        ),
+        "00000000000000000001.checkpoint.parquet",
     )?;
 
     let checkpoint_file_path = log_root
@@ -1264,7 +1272,7 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         ListedLogFiles::new(
             vec![],
             vec![],
-            vec![create_log_path(&checkpoint_file_path)],
+            vec![create_log_path(&checkpoint_file_path, checkpoint_size)],
             None,
         ),
         log_root,
@@ -1282,7 +1290,10 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
     assert_batch_matches(
         first_batch,
         sidecar_batch_with_given_paths(
-            vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
+            vec![
+                ("sidecarfile1.parquet", size1),
+                ("sidecarfile2.parquet", size2),
+            ],
             get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?,
         ),
     );
@@ -1694,8 +1705,14 @@ fn test_debug_assert_listed_log_file_in_order_compaction_files() {
     let _ = ListedLogFiles::new(
         vec![],
         vec![
-            create_log_path("file:///00000000000000000000.00000000000000000004.compacted.json"),
-            create_log_path("file:///00000000000000000001.00000000000000000002.compacted.json"),
+            create_log_path(
+                "file:///00000000000000000000.00000000000000000004.compacted.json",
+                1,
+            ),
+            create_log_path(
+                "file:///00000000000000000001.00000000000000000002.compacted.json",
+                1,
+            ),
         ],
         vec![],
         None,
@@ -1709,8 +1726,14 @@ fn test_debug_assert_listed_log_file_out_of_order_compaction_files() {
     let _ = ListedLogFiles::new(
         vec![],
         vec![
-            create_log_path("file:///00000000000000000000.00000000000000000004.compacted.json"),
-            create_log_path("file:///00000000000000000000.00000000000000000003.compacted.json"),
+            create_log_path(
+                "file:///00000000000000000000.00000000000000000004.compacted.json",
+                1,
+            ),
+            create_log_path(
+                "file:///00000000000000000000.00000000000000000003.compacted.json",
+                1,
+            ),
         ],
         vec![],
         None,
@@ -1725,8 +1748,14 @@ fn test_debug_assert_listed_log_file_different_multipart_checkpoint_versions() {
         vec![],
         vec![],
         vec![
-            create_log_path("00000000000000000010.checkpoint.0000000001.0000000002.parquet"),
-            create_log_path("00000000000000000011.checkpoint.0000000002.0000000002.parquet"),
+            create_log_path(
+                "00000000000000000010.checkpoint.0000000001.0000000002.parquet",
+                1,
+            ),
+            create_log_path(
+                "00000000000000000011.checkpoint.0000000002.0000000002.parquet",
+                1,
+            ),
         ],
         None,
     );
@@ -1740,8 +1769,14 @@ fn test_debug_assert_listed_log_file_invalid_multipart_checkpoint() {
         vec![],
         vec![],
         vec![
-            create_log_path("00000000000000000010.checkpoint.0000000001.0000000003.parquet"),
-            create_log_path("00000000000000000011.checkpoint.0000000002.0000000003.parquet"),
+            create_log_path(
+                "00000000000000000010.checkpoint.0000000001.0000000003.parquet",
+                1,
+            ),
+            create_log_path(
+                "00000000000000000011.checkpoint.0000000002.0000000003.parquet",
+                1,
+            ),
         ],
         None,
     );

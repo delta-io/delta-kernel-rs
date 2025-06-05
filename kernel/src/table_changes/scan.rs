@@ -297,9 +297,10 @@ fn read_scan_file(
     let is_dv_resolved_pair = scan_file.remove_dv.is_some();
 
     let location = table_root.join(&scan_file.path)?;
+    let size = scan_file.size;
     let file = FileMeta {
         last_modified: 0,
-        size: 0,
+        size,
         location,
     };
     // TODO(#860): we disable predicate pushdown until we support row indexes.

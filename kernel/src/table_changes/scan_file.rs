@@ -32,6 +32,8 @@ pub(crate) struct CdfScanFile {
     pub scan_type: CdfScanFileType,
     /// A `&str` which is the path to the file
     pub path: String,
+    /// The size of the file
+    pub size: i64,
     /// A [`DvInfo`] struct with the path to the action's deletion vector
     pub dv_info: DvInfo,
     /// An optional [`DvInfo`] struct. If present, this is deletion vector of a remove action with
@@ -155,6 +157,7 @@ impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
                 remove_dv: self.remove_dvs.get(&path).cloned(),
                 scan_type,
                 path,
+                size,
                 dv_info: DvInfo { deletion_vector },
                 partition_values,
                 commit_timestamp: getters[16].get(row_index, "scanFile.timestamp")?,
@@ -188,6 +191,7 @@ pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
 
         let add = StructType::new([
             StructField::nullable("path", DataType::STRING),
+            StructField::nullable("size", DataType::LONG),
             StructField::nullable("deletionVector", deletion_vector.clone()),
             StructField::nullable("fileConstantValues", file_constant_values.clone()),
         ]);

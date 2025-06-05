@@ -884,16 +884,16 @@ pub(crate) mod test_utils {
     // Generates a batch of sidecar actions with the given paths.
     // The schema is provided as null columns affect equality checks.
     pub(crate) fn sidecar_batch_with_given_paths(
-        paths: Vec<&str>,
+        path_sizes: Vec<(&str, u64)>,
         output_schema: SchemaRef,
     ) -> Box<ArrowEngineData> {
         let handler = SyncJsonHandler {};
 
-        let mut json_strings: Vec<String> = paths
+        let mut json_strings: Vec<String> = path_sizes
         .iter()
-        .map(|path| {
+        .map(|(path, size)| {
             format!(
-                r#"{{"sidecar":{{"path":"{path}","sizeInBytes":9268,"modificationTime":1714496113961,"tags":{{"tag_foo":"tag_bar"}}}}}}"#
+                r#"{{"sidecar":{{"path":"{path}","sizeInBytes":{size},"modificationTime":1714496113961,"tags":{{"tag_foo":"tag_bar"}}}}}}"#
             )
         })
         .collect();

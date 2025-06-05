@@ -265,7 +265,13 @@ impl FileOpener for ParquetOpener {
 
         Ok(Box::pin(async move {
             #[cfg(feature = "arrow-55")]
-            let mut reader = ParquetObjectReader::new(store, path);
+            let mut reader = {
+                println!("Opening parquet file: {}", path);
+                let meta = store.head(&path).await?;
+                println!("File size: {}", file_meta.size);
+                println!("actual file size: {}", meta.size);
+                ParquetObjectReader::new(store, path).with_file_size(file_meta.size)
+            };
             #[cfg(all(feature = "arrow-54", not(feature = "arrow-55")))]
             let mut reader = {
                 // TODO avoid IO by converting passed file meta to ObjectMeta (no longer an issue
