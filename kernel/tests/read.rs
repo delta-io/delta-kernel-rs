@@ -18,8 +18,8 @@ use delta_kernel::{Engine, FileMeta, Snapshot};
 use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use test_utils::{
-    actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
-    record_batch_to_bytes, record_batch_to_bytes_with_props, IntoArray, TestAction, METADATA,
+    add_commit, generate_batch, generate_simple_batch, into_record_batch, record_batch_to_bytes,
+    record_batch_to_bytes_with_props, IntoArray, METADATA,
 };
 use url::Url;
 
@@ -35,27 +35,27 @@ const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c00
 async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
-    add_commit(
-        storage.as_ref(),
-        0,
-        actions_to_string(vec![
-            TestAction::Metadata,
-            TestAction::Add(PARQUET_FILE1.to_string()),
-            TestAction::Add(PARQUET_FILE2.to_string()),
-        ]),
-    )
-    .await?;
+
+    // Compute actual parquet file size
+    let parquet_bytes = record_batch_to_bytes(&batch);
+    let file_size = parquet_bytes.len() as u64;
+
+    let actions = [
+        METADATA.to_string(),
+        format!(
+            r#"{{"add":{{"path":"{PARQUET_FILE1}","partitionValues":{{}},"size":{file_size},"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 1}},\"maxValues\":{{\"id\":3}}}}"}}}}"#
+        ),
+        format!(
+            r#"{{"add":{{"path":"{PARQUET_FILE2}","partitionValues":{{}},"size":{file_size},"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 1}},\"maxValues\":{{\"id\":3}}}}"}}}}"#
+        ),
+    ];
+
+    add_commit(storage.as_ref(), 0, actions.iter().join("\n")).await?;
     storage
-        .put(
-            &Path::from(PARQUET_FILE1),
-            record_batch_to_bytes(&batch).into(),
-        )
+        .put(&Path::from(PARQUET_FILE1), parquet_bytes.clone().into())
         .await?;
     storage
-        .put(
-            &Path::from(PARQUET_FILE2),
-            record_batch_to_bytes(&batch).into(),
-        )
+        .put(&Path::from(PARQUET_FILE2), parquet_bytes.into())
         .await?;
 
     let location = Url::parse("memory:///")?;
@@ -85,32 +85,31 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
 async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
-    add_commit(
-        storage.as_ref(),
-        0,
-        actions_to_string(vec![
-            TestAction::Metadata,
-            TestAction::Add(PARQUET_FILE1.to_string()),
-        ]),
-    )
-    .await?;
-    add_commit(
-        storage.as_ref(),
-        1,
-        actions_to_string(vec![TestAction::Add(PARQUET_FILE2.to_string())]),
-    )
-    .await?;
+
+    // Compute actual parquet file size
+    let parquet_bytes = record_batch_to_bytes(&batch);
+    let file_size = parquet_bytes.len() as u64;
+
+    // Commit 0 with metadata and first file
+    let actions_0 = [
+        METADATA.to_string(),
+        format!(
+            r#"{{"add":{{"path":"{PARQUET_FILE1}","partitionValues":{{}},"size":{file_size},"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 1}},\"maxValues\":{{\"id\":3}}}}"}}}}"#
+        ),
+    ];
+    add_commit(storage.as_ref(), 0, actions_0.iter().join("\n")).await?;
+
+    // Commit 1 with second file
+    let actions_1 = [format!(
+        r#"{{"add":{{"path":"{PARQUET_FILE2}","partitionValues":{{}},"size":{file_size},"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 1}},\"maxValues\":{{\"id\":3}}}}"}}}}"#
+    )];
+    add_commit(storage.as_ref(), 1, actions_1.iter().join("\n")).await?;
+
     storage
-        .put(
-            &Path::from(PARQUET_FILE1),
-            record_batch_to_bytes(&batch).into(),
-        )
+        .put(&Path::from(PARQUET_FILE1), parquet_bytes.clone().into())
         .await?;
     storage
-        .put(
-            &Path::from(PARQUET_FILE2),
-            record_batch_to_bytes(&batch).into(),
-        )
+        .put(&Path::from(PARQUET_FILE2), parquet_bytes.into())
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
@@ -138,32 +137,34 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
 async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
-    add_commit(
-        storage.as_ref(),
-        0,
-        actions_to_string(vec![
-            TestAction::Metadata,
-            TestAction::Add(PARQUET_FILE1.to_string()),
-        ]),
-    )
-    .await?;
-    add_commit(
-        storage.as_ref(),
-        1,
-        actions_to_string(vec![TestAction::Add(PARQUET_FILE2.to_string())]),
-    )
-    .await?;
-    add_commit(
-        storage.as_ref(),
-        2,
-        actions_to_string(vec![TestAction::Remove(PARQUET_FILE2.to_string())]),
-    )
-    .await?;
+
+    // Compute actual parquet file size
+    let parquet_bytes = record_batch_to_bytes(&batch);
+    let file_size = parquet_bytes.len() as u64;
+
+    // Commit 0 with metadata and first file
+    let actions_0 = [
+        METADATA.to_string(),
+        format!(
+            r#"{{"add":{{"path":"{PARQUET_FILE1}","partitionValues":{{}},"size":{file_size},"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 1}},\"maxValues\":{{\"id\":3}}}}"}}}}"#
+        ),
+    ];
+    add_commit(storage.as_ref(), 0, actions_0.iter().join("\n")).await?;
+
+    // Commit 1 adds second file
+    let actions_1 = [format!(
+        r#"{{"add":{{"path":"{PARQUET_FILE2}","partitionValues":{{}},"size":{file_size},"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 1}},\"maxValues\":{{\"id\":3}}}}"}}}}"#
+    )];
+    add_commit(storage.as_ref(), 1, actions_1.iter().join("\n")).await?;
+
+    // Commit 2 removes second file
+    let actions_2 = [format!(
+        r#"{{"remove":{{"path":"{PARQUET_FILE2}","partitionValues":{{}},"size":{file_size},"modificationTime":1587968586000,"dataChange":true}}}}"#
+    )];
+    add_commit(storage.as_ref(), 2, actions_2.iter().join("\n")).await?;
+
     storage
-        .put(
-            &Path::from(PARQUET_FILE1),
-            record_batch_to_bytes(&batch).into(),
-        )
+        .put(&Path::from(PARQUET_FILE1), parquet_bytes.into())
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
@@ -188,53 +189,40 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn stats() -> Result<(), Box<dyn std::error::Error>> {
-    fn generate_commit2(actions: Vec<TestAction>) -> String {
-        actions
-            .into_iter()
-            .map(|test_action| match test_action {
-                TestAction::Add(path) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 5}},\"maxValues\":{{\"id\":7}}}}"}}}}"#, action = "add", path = path),
-                TestAction::Remove(path) => format!(r#"{{"{action}":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true}}}}"#, action = "remove", path = path),
-                TestAction::Metadata => METADATA.into(),
-            })
-            .fold(String::new(), |a, b| a + &b + "\n")
-    }
-
     let batch1 = generate_simple_batch()?;
     let batch2 = generate_batch(vec![
         ("id", vec![5, 7].into_array()),
         ("val", vec!["e", "g"].into_array()),
     ])?;
     let storage = Arc::new(InMemory::new());
-    // valid commit with min/max (0, 2)
-    add_commit(
-        storage.as_ref(),
-        0,
-        actions_to_string(vec![
-            TestAction::Metadata,
-            TestAction::Add(PARQUET_FILE1.to_string()),
-        ]),
-    )
-    .await?;
-    // storage.add_commit(1, &format!("{}\n", r#"{{"add":{{"path":"doesnotexist","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 0}},\"maxValues\":{{\"id\":2}}}}"}}}}"#));
-    add_commit(
-        storage.as_ref(),
-        1,
-        generate_commit2(vec![TestAction::Add(PARQUET_FILE2.to_string())]),
-    )
-    .await?;
+
+    // Compute actual parquet file sizes
+    let parquet_bytes1 = record_batch_to_bytes(&batch1);
+    let parquet_bytes2 = record_batch_to_bytes(&batch2);
+    let file_size1 = parquet_bytes1.len() as u64;
+    let file_size2 = parquet_bytes2.len() as u64;
+
+    // Commit 0 with metadata and first file (min/max 1,3)
+    let actions_0 = [
+        METADATA.to_string(),
+        format!(
+            r#"{{"add":{{"path":"{PARQUET_FILE1}","partitionValues":{{}},"size":{file_size1},"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 1}},\"maxValues\":{{\"id\":3}}}}"}}}}"#
+        ),
+    ];
+    add_commit(storage.as_ref(), 0, actions_0.iter().join("\n")).await?;
+
+    // Commit 1 with second file (min/max 5,7)
+    let actions_1 = [format!(
+        r#"{{"add":{{"path":"{PARQUET_FILE2}","partitionValues":{{}},"size":{file_size2},"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 5}},\"maxValues\":{{\"id\":7}}}}"}}}}"#
+    )];
+    add_commit(storage.as_ref(), 1, actions_1.iter().join("\n")).await?;
 
     storage
-        .put(
-            &Path::from(PARQUET_FILE1),
-            record_batch_to_bytes(&batch1).into(),
-        )
+        .put(&Path::from(PARQUET_FILE1), parquet_bytes1.into())
         .await?;
 
     storage
-        .put(
-            &Path::from(PARQUET_FILE2),
-            record_batch_to_bytes(&batch2).into(),
-        )
+        .put(&Path::from(PARQUET_FILE2), parquet_bytes2.into())
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
@@ -1029,25 +1017,30 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
     let batch = generate_batch(vec![("val", vec!["a", "b", "c"].into_array())])?;
 
     let storage = Arc::new(InMemory::new());
+
+    // Compute actual parquet file sizes
+    let parquet_bytes = record_batch_to_bytes(&batch);
+    let file_size = parquet_bytes.len() as u64;
+
     let actions = [
         r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
         r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[\"id\"]"},"isBlindAppend":true}}"#.to_string(),
         r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}}]}","partitionColumns":["id"],"configuration":{},"createdTime":1587968585495}}"#.to_string(),
-        format!(r#"{{"add":{{"path":"id=1/{PARQUET_FILE1}","partitionValues":{{"id":"1"}},"size":0,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":3,\"nullCount\":{{\"val\":0}},\"minValues\":{{\"val\":\"a\"}},\"maxValues\":{{\"val\":\"c\"}}}}"}}}}"#),
-        format!(r#"{{"add":{{"path":"id=2/{PARQUET_FILE2}","partitionValues":{{"id":"2"}},"size":0,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":3,\"nullCount\":{{\"val\":0}},\"minValues\":{{\"val\":\"a\"}},\"maxValues\":{{\"val\":\"c\"}}}}"}}}}"#),
+        format!(r#"{{"add":{{"path":"id=1/{PARQUET_FILE1}","partitionValues":{{"id":"1"}},"size":{file_size},"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":3,\"nullCount\":{{\"val\":0}},\"minValues\":{{\"val\":\"a\"}},\"maxValues\":{{\"val\":\"c\"}}}}"}}}}"#),
+        format!(r#"{{"add":{{"path":"id=2/{PARQUET_FILE2}","partitionValues":{{"id":"2"}},"size":{file_size},"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":3,\"nullCount\":{{\"val\":0}},\"minValues\":{{\"val\":\"a\"}},\"maxValues\":{{\"val\":\"c\"}}}}"}}}}"#),
     ];
 
     add_commit(storage.as_ref(), 0, actions.iter().join("\n")).await?;
     storage
         .put(
             &Path::from("id=1").child(PARQUET_FILE1),
-            record_batch_to_bytes(&batch).into(),
+            parquet_bytes.clone().into(),
         )
         .await?;
     storage
         .put(
             &Path::from("id=2").child(PARQUET_FILE2),
-            record_batch_to_bytes(&batch).into(),
+            parquet_bytes.into(),
         )
         .await?;
 
@@ -1085,32 +1078,34 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
     let batch_2 = generate_batch(vec![("val", vec!["d", "e", "f"].into_array())])?;
 
     let storage = Arc::new(InMemory::new());
-    let actions = [
-        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
-        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}"#.to_string(),
-        r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"val\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#.to_string(),
-        // Add one file with stats, one file without
-        format!(r#"{{"add":{{"path":"{PARQUET_FILE1}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":3,\"nullCount\":{{\"val\":0}},\"minValues\":{{\"val\":\"a\"}},\"maxValues\":{{\"val\":\"c\"}}}}"}}}}"#),
-        format!(r#"{{"add":{{"path":"{PARQUET_FILE2}","partitionValues":{{}},"size":0,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":3,\"nullCount\":{{}},\"minValues\":{{}},\"maxValues\":{{}}}}"}}}}"#),
-    ];
 
     // Disable writing Parquet statistics so these cannot be used for pruning row groups
     let writer_props = WriterProperties::builder()
         .set_statistics_enabled(EnabledStatistics::None)
         .build();
 
+    // Compute actual parquet file sizes
+    let parquet_bytes_1 = record_batch_to_bytes_with_props(&batch_1, writer_props.clone());
+    let parquet_bytes_2 = record_batch_to_bytes_with_props(&batch_2, writer_props.clone());
+    let file_size_1 = parquet_bytes_1.len() as u64;
+    let file_size_2 = parquet_bytes_2.len() as u64;
+
+    // Update actions with correct file sizes
+    let actions = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#.to_string(),
+        r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}"#.to_string(),
+        r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"val\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#.to_string(),
+        // Add one file with stats, one file without
+        format!(r#"{{"add":{{"path":"{PARQUET_FILE1}","partitionValues":{{}},"size":{file_size_1},"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":3,\"nullCount\":{{\"val\":0}},\"minValues\":{{\"val\":\"a\"}},\"maxValues\":{{\"val\":\"c\"}}}}"}}}}"#),
+        format!(r#"{{"add":{{"path":"{PARQUET_FILE2}","partitionValues":{{}},"size":{file_size_2},"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":3,\"nullCount\":{{}},\"minValues\":{{}},\"maxValues\":{{}}}}"}}}}"#),
+    ];
+
     add_commit(storage.as_ref(), 0, actions.iter().join("\n")).await?;
     storage
-        .put(
-            &Path::from(PARQUET_FILE1),
-            record_batch_to_bytes_with_props(&batch_1, writer_props.clone()).into(),
-        )
+        .put(&Path::from(PARQUET_FILE1), parquet_bytes_1.into())
         .await?;
     storage
-        .put(
-            &Path::from(PARQUET_FILE2),
-            record_batch_to_bytes_with_props(&batch_2, writer_props).into(),
-        )
+        .put(&Path::from(PARQUET_FILE2), parquet_bytes_2.into())
         .await?;
 
     let location = Url::parse("memory:///")?;

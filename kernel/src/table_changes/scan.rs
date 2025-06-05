@@ -9,7 +9,7 @@ use url::Url;
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::{ColumnType, PhysicalPredicate, ScanResult};
 use crate::schema::{SchemaRef, StructType};
-use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
+use crate::{DeltaResult, Engine, Error, FileMeta, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::{physical_to_logical_expr, scan_file_physical_schema};
@@ -299,9 +299,13 @@ fn read_scan_file(
     let is_dv_resolved_pair = scan_file.remove_dv.is_some();
 
     let location = table_root.join(&scan_file.path)?;
+    let size: u64 = scan_file
+        .size
+        .try_into()
+        .map_err(|_| Error::generic("Unable to convert from i64 to u64"))?;
     let file = FileMeta {
         last_modified: 0,
-        size: 0,
+        size,
         location,
     };
     // TODO(#860): we disable predicate pushdown until we support row indexes.

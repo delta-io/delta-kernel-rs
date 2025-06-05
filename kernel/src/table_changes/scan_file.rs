@@ -32,6 +32,8 @@ pub(crate) struct CdfScanFile {
     pub scan_type: CdfScanFileType,
     /// A `&str` which is the path to the file
     pub path: String,
+    /// The size of the file
+    pub size: i64,
     /// A [`DvInfo`] struct with the path to the action's deletion vector
     pub dv_info: DvInfo,
     /// An optional [`DvInfo`] struct. If present, this is deletion vector of a remove action with
@@ -116,7 +118,7 @@ struct CdfScanFileVisitor<'a, T> {
 impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 18,
+            getters.len() == 21,
             Error::InternalError(format!(
                 "Wrong number of CdfScanFileVisitor getters: {}",
                 getters.len()
@@ -127,26 +129,35 @@ impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
                 continue;
             }
 
-            let (scan_type, path, deletion_vector, partition_values) =
+            let (scan_type, path, size, deletion_vector, partition_values) =
                 if let Some(path) = getters[0].get_opt(row_index, "scanFile.add.path")? {
                     let scan_type = CdfScanFileType::Add;
-                    let deletion_vector = visit_deletion_vector_at(row_index, &getters[1..=5])?;
-                    let partition_values = getters[6]
+                    let size = getters[1]
+                        .get_opt(row_index, "scanFile.add.size")?
+                        .unwrap_or(0);
+                    let deletion_vector = visit_deletion_vector_at(row_index, &getters[2..=6])?;
+                    let partition_values = getters[7]
                         .get_opt(row_index, "scanFile.add.fileConstantValues.partitionValues")?;
-                    (scan_type, path, deletion_vector, partition_values)
-                } else if let Some(path) = getters[7].get_opt(row_index, "scanFile.remove.path")? {
+                    (scan_type, path, size, deletion_vector, partition_values)
+                } else if let Some(path) = getters[8].get_opt(row_index, "scanFile.remove.path")? {
                     let scan_type = CdfScanFileType::Remove;
-                    let deletion_vector = visit_deletion_vector_at(row_index, &getters[8..=12])?;
-                    let partition_values = getters[13].get_opt(
+                    let size = getters[9]
+                        .get_opt(row_index, "scanFile.remove.size")?
+                        .unwrap_or(0);
+                    let deletion_vector = visit_deletion_vector_at(row_index, &getters[10..=14])?;
+                    let partition_values = getters[15].get_opt(
                         row_index,
                         "scanFile.remove.fileConstantValues.partitionValues",
                     )?;
-                    (scan_type, path, deletion_vector, partition_values)
-                } else if let Some(path) = getters[14].get_opt(row_index, "scanFile.cdc.path")? {
+                    (scan_type, path, size, deletion_vector, partition_values)
+                } else if let Some(path) = getters[16].get_opt(row_index, "scanFile.cdc.path")? {
                     let scan_type = CdfScanFileType::Cdc;
-                    let partition_values = getters[15]
+                    let size = getters[17]
+                        .get_opt(row_index, "scanFile.cdc.size")?
+                        .unwrap_or(0);
+                    let partition_values = getters[18]
                         .get_opt(row_index, "scanFile.cdc.fileConstantValues.partitionValues")?;
-                    (scan_type, path, None, partition_values)
+                    (scan_type, path, size, None, partition_values)
                 } else {
                     continue;
                 };
@@ -155,10 +166,11 @@ impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
                 remove_dv: self.remove_dvs.get(&path).cloned(),
                 scan_type,
                 path,
+                size,
                 dv_info: DvInfo { deletion_vector },
                 partition_values,
-                commit_timestamp: getters[16].get(row_index, "scanFile.timestamp")?,
-                commit_version: getters[17].get(row_index, "scanFile.commit_version")?,
+                commit_timestamp: getters[19].get(row_index, "scanFile.timestamp")?,
+                commit_version: getters[20].get(row_index, "scanFile.commit_version")?,
             };
             (self.callback)(&mut self.context, scan_file)
         }
@@ -188,16 +200,19 @@ pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
 
         let add = StructType::new([
             StructField::nullable("path", DataType::STRING),
+            StructField::nullable("size", DataType::LONG),
             StructField::nullable("deletionVector", deletion_vector.clone()),
             StructField::nullable("fileConstantValues", file_constant_values.clone()),
         ]);
         let remove = StructType::new([
             StructField::nullable("path", DataType::STRING),
+            StructField::nullable("size", DataType::LONG),
             StructField::nullable("deletionVector", deletion_vector),
             StructField::nullable("fileConstantValues", file_constant_values.clone()),
         ]);
         let cdc = StructType::new([
             StructField::nullable("path", DataType::STRING),
+            StructField::nullable("size", DataType::LONG),
             StructField::nullable("fileConstantValues", file_constant_values),
         ]);
 
@@ -218,16 +233,19 @@ pub(crate) fn cdf_scan_row_expression(commit_timestamp: i64, commit_number: i64)
     Expression::struct_from([
         Expression::struct_from([
             column_expr!("add.path"),
+            column_expr!("add.size"),
             column_expr!("add.deletionVector"),
             Expression::struct_from([column_expr!("add.partitionValues")]),
         ]),
         Expression::struct_from([
             column_expr!("remove.path"),
+            column_expr!("remove.size"),
             column_expr!("remove.deletionVector"),
             Expression::struct_from([column_expr!("remove.partitionValues")]),
         ]),
         Expression::struct_from([
             column_expr!("cdc.path"),
+            column_expr!("cdc.size"),
             Expression::struct_from([column_expr!("cdc.partitionValues")]),
         ]),
         Expression::literal(commit_timestamp),
@@ -357,6 +375,7 @@ mod tests {
             CdfScanFile {
                 scan_type: CdfScanFileType::Add,
                 path: add_paired.path,
+                size: add_paired.size,
                 dv_info: DvInfo {
                     deletion_vector: add_paired.deletion_vector,
                 },
@@ -368,6 +387,7 @@ mod tests {
             CdfScanFile {
                 scan_type: CdfScanFileType::Remove,
                 path: remove.path,
+                size: remove.size.unwrap_or(0),
                 dv_info: DvInfo {
                     deletion_vector: remove.deletion_vector,
                 },
@@ -379,6 +399,7 @@ mod tests {
             CdfScanFile {
                 scan_type: CdfScanFileType::Cdc,
                 path: cdc.path,
+                size: cdc.size,
                 dv_info: DvInfo {
                     deletion_vector: None,
                 },
@@ -390,6 +411,7 @@ mod tests {
             CdfScanFile {
                 scan_type: CdfScanFileType::Remove,
                 path: remove_no_partition.path,
+                size: remove_no_partition.size.unwrap_or(0),
                 dv_info: DvInfo {
                     deletion_vector: None,
                 },
