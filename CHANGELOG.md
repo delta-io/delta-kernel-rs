@@ -1,5 +1,18 @@
 # Changelog
 
+## [v0.12.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.12.1/) (2025-06-05)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.12.0...v0.12.1)
+
+
+### 🐛 Bug Fixes
+
+1. Remove azure suffix range request ([#1006])
+
+
+[#1006]: https://github.com/delta-io/delta-kernel-rs/pull/1006
+
+
 ## [v0.12.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.12.0/) (2025-06-04)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.11.0...v0.12.0)
