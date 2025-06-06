@@ -108,7 +108,7 @@ impl LogReplayProcessor for CheckpointLogReplayProcessor {
             self.seen_protocol,
             self.seen_metadata,
             &mut self.seen_txns,
-            self.txn_retention_timestamp
+            self.txn_retention_timestamp,
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
@@ -135,7 +135,10 @@ impl LogReplayProcessor for CheckpointLogReplayProcessor {
 }
 
 impl CheckpointLogReplayProcessor {
-    pub(crate) fn new(minimum_file_retention_timestamp: i64, txn_retention_timestamp: Option<i64>) -> Self {
+    pub(crate) fn new(
+        minimum_file_retention_timestamp: i64,
+        txn_retention_timestamp: Option<i64>,
+    ) -> Self {
         Self {
             seen_file_keys: Default::default(),
             seen_protocol: false,
@@ -254,7 +257,7 @@ impl CheckpointVisitor<'_> {
             seen_protocol,
             seen_metadata,
             seen_txns,
-            txn_retention_timestamp
+            txn_retention_timestamp,
         }
     }
 
@@ -369,7 +372,11 @@ impl CheckpointVisitor<'_> {
     /// Returns Ok(true) if the row contains a valid txn action.
     /// Returns Ok(false) if the row doesn't contain a txn action or is a duplicate.
     /// Returns Err(...) if there was an error processing the action.
-    fn check_txn_action<'a>(&mut self, i: usize, getter: &[&'a dyn GetData<'a>]) -> DeltaResult<bool> {
+    fn check_txn_action<'a>(
+        &mut self,
+        i: usize,
+        getter: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<bool> {
         // Check for txn field
         let Some(app_id) = getter[11].get_str(i, "txn.appId")? else {
             return Ok(false); // Not a txn action
@@ -500,7 +507,7 @@ mod tests {
     fn run_checkpoint_test(
         input_batches: Vec<ActionsBatch>,
     ) -> DeltaResult<(Vec<FilteredEngineData>, i64, i64)> {
-        let processed_batches: Vec<_> = CheckpointLogReplayProcessor::new(0,Some(0))
+        let processed_batches: Vec<_> = CheckpointLogReplayProcessor::new(0, Some(0))
             .process_actions_iter(input_batches.into_iter().map(Ok))
             .try_collect()?;
         let total_count: i64 = processed_batches.iter().map(|b| b.actions_count).sum();
@@ -525,7 +532,7 @@ mod tests {
             false,
             false,
             &mut seen_txns,
-            Some(0)
+            Some(0),
         );
 
         visitor.visit_rows_of(data.as_ref())?;
@@ -580,7 +587,7 @@ mod tests {
             false,
             false,
             &mut seen_txns,
-            Some(0)
+            Some(0),
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -611,7 +618,7 @@ mod tests {
             false,
             false,
             &mut seen_txns,
-            Some(0)
+            Some(0),
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -650,7 +657,7 @@ mod tests {
             false,
             false,
             &mut seen_txns,
-            Some(0)
+            Some(0),
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -685,7 +692,7 @@ mod tests {
             true,           // The visior has already seen a protocol action
             true,           // The visitor has already seen a metadata action
             &mut seen_txns, // Pre-populated transaction
-            Some(0)
+            Some(0),
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -723,7 +730,7 @@ mod tests {
             false,
             false,
             &mut seen_txns,
-            Some(0)
+            Some(0),
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -913,10 +920,7 @@ mod tests {
             r#"{"txn":{"appId":"another_old","version":4,"lastUpdated":500}}"#,
         ];
 
-        let input_batches = vec![
-            create_batch(batch1)?,
-            create_batch(batch2)?,
-        ];
+        let input_batches = vec![create_batch(batch1)?, create_batch(batch2)?];
 
         // Create processor with retention timestamp
         let processor = CheckpointLogReplayProcessor::new(0, Some(1000));
@@ -926,11 +930,14 @@ mod tests {
 
         // Verify results
         assert_eq!(results.len(), 2);
-        
+
         // First batch: protocol, metadata, and one recent txn (old_app filtered out)
-        assert_eq!(results[0].filtered_data.selection_vector, vec![true, true, false, true]);
+        assert_eq!(
+            results[0].filtered_data.selection_vector,
+            vec![true, true, false, true]
+        );
         assert_eq!(results[0].actions_count, 3);
-        
+
         // Second batch: timeless_app kept, another_old filtered out
         assert_eq!(results[1].filtered_data.selection_vector, vec![true, false]);
         assert_eq!(results[1].actions_count, 1);

@@ -312,7 +312,7 @@ impl SetTransactionVisitor {
         SetTransactionVisitor {
             set_transactions: HashMap::default(),
             application_id,
-            retention_timestamp
+            retention_timestamp,
         }
     }
 

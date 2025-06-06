@@ -252,13 +252,15 @@ impl CheckpointWriter {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_err(|e| Error::generic(format!("Failed to get current time: {}", e)))?;
-                
-                let now_ms = i64::try_from(now.as_millis())
-                    .map_err(|_| Error::checkpoint_write("Current timestamp exceeds i64 millisecond range"))?;
-                
-                let retention_ms = i64::try_from(duration.as_millis())
-                    .map_err(|_| Error::checkpoint_write("Retention duration exceeds i64 millisecond range"))?;
-                
+
+                let now_ms = i64::try_from(now.as_millis()).map_err(|_| {
+                    Error::checkpoint_write("Current timestamp exceeds i64 millisecond range")
+                })?;
+
+                let retention_ms = i64::try_from(duration.as_millis()).map_err(|_| {
+                    Error::checkpoint_write("Retention duration exceeds i64 millisecond range")
+                })?;
+
                 Ok(Some(now_ms - retention_ms))
             }
             None => Ok(None),
@@ -295,12 +297,11 @@ impl CheckpointWriter {
         )?;
 
         // Create iterator over actions for checkpoint data
-        let checkpoint_data =
-            CheckpointLogReplayProcessor::new(
-                self.deleted_file_retention_timestamp()?,
-                self.transaction_retention_timestamp()?,
-            )
-            .process_actions_iter(actions);
+        let checkpoint_data = CheckpointLogReplayProcessor::new(
+            self.deleted_file_retention_timestamp()?,
+            self.transaction_retention_timestamp()?,
+        )
+        .process_actions_iter(actions);
 
         let checkpoint_metadata =
             is_v2_checkpoints_supported.then(|| self.create_checkpoint_metadata_batch(engine));

@@ -20,10 +20,14 @@ impl SetTransactionScanner {
         log_segment: &LogSegment,
         application_id: &str,
         engine: &dyn Engine,
-        retention_timestamp: Option<i64>
+        retention_timestamp: Option<i64>,
     ) -> DeltaResult<Option<SetTransaction>> {
-        let mut transactions =
-            scan_application_transactions(log_segment, Some(application_id), engine, retention_timestamp)?;
+        let mut transactions = scan_application_transactions(
+            log_segment,
+            Some(application_id),
+            engine,
+            retention_timestamp,
+        )?;
         Ok(transactions.remove(application_id))
     }
 
@@ -35,7 +39,7 @@ impl SetTransactionScanner {
     pub(crate) fn get_all(
         log_segment: &LogSegment,
         engine: &dyn Engine,
-        retention_timestamp: Option<i64>
+        retention_timestamp: Option<i64>,
     ) -> DeltaResult<SetTransactionMap> {
         scan_application_transactions(log_segment, None, engine, retention_timestamp)
     }
@@ -48,9 +52,10 @@ fn scan_application_transactions(
     log_segment: &LogSegment,
     application_id: Option<&str>,
     engine: &dyn Engine,
-    retention_timestamp: Option<i64>
+    retention_timestamp: Option<i64>,
 ) -> DeltaResult<SetTransactionMap> {
-    let mut visitor = SetTransactionVisitor::new(application_id.map(|s| s.to_owned()),retention_timestamp);
+    let mut visitor =
+        SetTransactionVisitor::new(application_id.map(|s| s.to_owned()), retention_timestamp);
     // If a specific id is requested then we can terminate log replay early as soon as it was
     // found. If all ids are requested then we are forced to replay the entire log.
     for maybe_data in replay_for_app_ids(log_segment, engine)? {
@@ -188,12 +193,9 @@ mod tests {
         // Test with retention that filters out old transactions
         // Assuming the test data has transactions with different timestamps
         let retention_timestamp = Some(i64::MAX); // Very recent timestamp
-        let filtered_txns = SetTransactionScanner::get_all(
-            log_segment, 
-            &engine, 
-            retention_timestamp
-        ).unwrap();
-        
+        let filtered_txns =
+            SetTransactionScanner::get_all(log_segment, &engine, retention_timestamp).unwrap();
+
         // Should only include transactions without lastUpdated
         // Exact count depends on test data
         assert!(filtered_txns.len() <= all_txns.len());
@@ -207,10 +209,10 @@ mod tests {
         ]
         .into();
         let batch = parse_json_batch(json_strings);
-        
+
         let mut visitor = SetTransactionVisitor::new(None, Some(1000));
         visitor.visit_rows_of(batch.as_ref()).unwrap();
-        
+
         // app_with_last_updated should be filtered out (100 < 1000)
         // app_without_last_updated should be kept
         assert_eq!(visitor.set_transactions.len(), 1);
