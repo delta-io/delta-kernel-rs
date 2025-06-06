@@ -13,7 +13,7 @@ use std::fmt::Debug;
 /// * [`Bound::GreatestLower`] - Finds the largest index `i` such that `values[i] <= key`.
 ///   This represents the last element less than or equal to the search key.
 #[allow(unused)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Bound {
     LeastUpper,
     GreatestLower,
