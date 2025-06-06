@@ -159,7 +159,10 @@ impl Transaction {
         // step three: commit the actions as a json file in the log
         let json_handler = engine.json_handler();
         match json_handler.write_json_file(&commit_path.location, Box::new(actions), false) {
-            Ok(()) => Ok(CommitResult::Committed(commit_version)),
+            Ok(()) => Ok(CommitResult::Committed {
+                version: commit_version,
+                post_commit_actions: vec![],
+            }),
             Err(Error::FileAlreadyExists(_)) => Ok(CommitResult::Conflict(self, commit_version)),
             Err(e) => Err(e),
         }
@@ -293,16 +296,32 @@ impl WriteContext {
     }
 }
 
-/// Result after committing a transaction. If 'committed', the version is the new version written
-/// to the log. If 'conflict', the transaction is returned so the caller can resolve the conflict
-/// (along with the version which conflicted).
-// TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
-// update the transaction to a new version etc.
+/// Kernel can indicate to the engine that it should perform certain actions post commit. To do so
+/// it returns a set of `PostCommitAction`s in a [`CommitResult`], where each action indicates something the
+/// engine should do.
+#[derive(Debug)]
+pub enum PostCommitAction {
+    /// The table is ready for checkpointing, and should be checkpointed at the included
+    /// `Version`. The engine should follow the proceedure outlined in [module@crate::checkpoint] to
+    /// create a checkpoint for this table.
+    Checkpoint(Version),
+}
+
+/// Result of committing a transaction.
 #[derive(Debug)]
 pub enum CommitResult {
-    /// The transaction was successfully committed at the version.
-    Committed(Version),
-    /// This transaction conflicted with an existing version (at the version given).
+    /// The transaction was successfully committed.
+    Committed {
+        /// the version of the table that was just committed
+        version: Version,
+        /// Any [`PostCommitAction`]s that should be run by the engine
+        post_commit_actions: Vec<PostCommitAction>,
+    },
+    /// This transaction conflicted with an existing version (at the version given). The transaction
+    /// is returned so the caller can resolve the conflict (along with the version which
+    /// conflicted).
+    // TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
+    // update the transaction to a new version etc.
     Conflict(Transaction, Version),
 }
 
