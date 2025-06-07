@@ -507,7 +507,7 @@ mod tests {
     fn run_checkpoint_test(
         input_batches: Vec<ActionsBatch>,
     ) -> DeltaResult<(Vec<FilteredEngineData>, i64, i64)> {
-        let processed_batches: Vec<_> = CheckpointLogReplayProcessor::new(0, Some(0))
+        let processed_batches: Vec<_> = CheckpointLogReplayProcessor::new(0, None)
             .process_actions_iter(input_batches.into_iter().map(Ok))
             .try_collect()?;
         let total_count: i64 = processed_batches.iter().map(|b| b.actions_count).sum();
@@ -532,7 +532,7 @@ mod tests {
             false,
             false,
             &mut seen_txns,
-            Some(0),
+            None,
         );
 
         visitor.visit_rows_of(data.as_ref())?;
@@ -583,11 +583,11 @@ mod tests {
             &mut seen_file_keys,
             true,
             vec![true; 4],
-            100, // minimum_file_expiration_timestamp (threshold set to 100)
+            100, // minimum_file_retention_timestamp (threshold set to 100)
             false,
             false,
             &mut seen_txns,
-            Some(0),
+            None,
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -618,7 +618,7 @@ mod tests {
             false,
             false,
             &mut seen_txns,
-            Some(0),
+            None,
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -657,7 +657,7 @@ mod tests {
             false,
             false,
             &mut seen_txns,
-            Some(0),
+            None,
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -692,7 +692,7 @@ mod tests {
             true,           // The visior has already seen a protocol action
             true,           // The visitor has already seen a metadata action
             &mut seen_txns, // Pre-populated transaction
-            Some(0),
+            None,
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -726,11 +726,11 @@ mod tests {
             &mut seen_file_keys,
             true, // is_log_batch
             vec![true; 7],
-            0, // minimum_file_expiration_timestamp
+            0, // minimum_file_retention_timestamp
             false,
             false,
             &mut seen_txns,
-            Some(0),
+            None,
         );
 
         visitor.visit_rows_of(batch.as_ref())?;

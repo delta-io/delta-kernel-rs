@@ -2,7 +2,6 @@
 //! has schema etc.)
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::set_transaction::SetTransactionScanner;
@@ -14,6 +13,7 @@ use crate::schema::{Schema, SchemaRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
+use crate::utils::calculate_transaction_expiration_timestamp;
 use crate::{DeltaResult, Engine, Error, StorageHandler, Version};
 use delta_kernel_derive::internal_api;
 
@@ -343,7 +343,8 @@ impl Snapshot {
         application_id: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
-        let expiration_timestamp = self.calculate_transaction_expiration_timestamp()?;
+        let expiration_timestamp =
+            calculate_transaction_expiration_timestamp(self.table_properties())?;
         let txn = SetTransactionScanner::get_one(
             self.log_segment(),
             application_id,
@@ -369,30 +370,6 @@ impl Snapshot {
         }
 
         domain_metadata_configuration(self.log_segment(), domain, engine)
-    }
-
-    /// Calculate retention timestamp for transactions
-    fn calculate_transaction_expiration_timestamp(&self) -> DeltaResult<Option<i64>> {
-        let retention_duration = self.table_properties().set_transaction_retention_duration;
-
-        match retention_duration {
-            Some(duration) => {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|e| Error::generic(format!("Failed to get current time: {}", e)))?;
-
-                let now_ms = i64::try_from(now.as_millis()).map_err(|_| {
-                    Error::generic("Current timestamp exceeds i64 millisecond range")
-                })?;
-
-                let retention_ms = i64::try_from(duration.as_millis()).map_err(|_| {
-                    Error::generic("Retention duration exceeds i64 millisecond range")
-                })?;
-
-                Ok(Some(now_ms - retention_ms))
-            }
-            None => Ok(None),
-        }
     }
 }
 

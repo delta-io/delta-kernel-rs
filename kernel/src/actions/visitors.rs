@@ -302,7 +302,7 @@ pub(crate) struct SetTransactionVisitor {
     pub(crate) set_transactions: SetTransactionMap,
     pub(crate) application_id: Option<String>,
     /// Minimum timestamp for transaction retention. Transactions with last_updated
-    /// older than this timestamp will be filtered out. None means no filtering.
+    /// older than or equal to this timestamp will be filtered out. None means no filtering.
     expiration_timestamp: Option<i64>,
 }
 
@@ -359,14 +359,11 @@ impl RowVisitor for SetTransactionVisitor {
                     let txn = SetTransactionVisitor::visit_txn(i, app_id, getters)?;
                     // Check retention: filter out transactions that are old
                     // If last_updated is None, the transaction never expires
-                    if let Some(retention_ts) = self.expiration_timestamp {
-                        if let Some(last_updated) = txn.last_updated {
-                            if last_updated <= retention_ts {
-                                // Transaction is old, skip it
-                                continue;
-                            }
+                    match self.expiration_timestamp.zip(txn.last_updated) {
+                        Some((expiration_ts, last_updated)) if last_updated <= expiration_ts => {
+                            continue
                         }
-                        // If last_updated is None, we keep the transaction (never expires)
+                        _ => (),
                     }
                     if !self.set_transactions.contains_key(&txn.app_id) {
                         self.set_transactions.insert(txn.app_id.clone(), txn);
