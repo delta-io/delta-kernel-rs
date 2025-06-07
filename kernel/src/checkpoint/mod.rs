@@ -241,7 +241,7 @@ impl CheckpointWriter {
     }
 
     /// Calculate the transaction retention timestamp
-    fn transaction_retention_timestamp(&self) -> DeltaResult<Option<i64>> {
+    fn transaction_expiration_timestamp(&self) -> DeltaResult<Option<i64>> {
         let retention_duration = self
             .snapshot
             .table_properties()
@@ -299,7 +299,7 @@ impl CheckpointWriter {
         // Create iterator over actions for checkpoint data
         let checkpoint_data = CheckpointLogReplayProcessor::new(
             self.deleted_file_retention_timestamp()?,
-            self.transaction_retention_timestamp()?,
+            self.transaction_expiration_timestamp()?,
         )
         .process_actions_iter(actions);
 

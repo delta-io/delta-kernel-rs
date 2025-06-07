@@ -59,7 +59,7 @@ pub(crate) struct CheckpointLogReplayProcessor {
     /// Minimum timestamp for file retention, used for filtering expired tombstones.
     minimum_file_retention_timestamp: i64,
     /// Transaction retention timestamp for filtering old transactions
-    txn_retention_timestamp: Option<i64>,
+    txn_expiration_timestamp: Option<i64>,
 }
 
 /// This struct is the output of the [`CheckpointLogReplayProcessor`].
@@ -108,7 +108,7 @@ impl LogReplayProcessor for CheckpointLogReplayProcessor {
             self.seen_protocol,
             self.seen_metadata,
             &mut self.seen_txns,
-            self.txn_retention_timestamp,
+            self.txn_expiration_timestamp,
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
@@ -137,7 +137,7 @@ impl LogReplayProcessor for CheckpointLogReplayProcessor {
 impl CheckpointLogReplayProcessor {
     pub(crate) fn new(
         minimum_file_retention_timestamp: i64,
-        txn_retention_timestamp: Option<i64>,
+        txn_expiration_timestamp: Option<i64>,
     ) -> Self {
         Self {
             seen_file_keys: Default::default(),
@@ -145,7 +145,7 @@ impl CheckpointLogReplayProcessor {
             seen_metadata: false,
             seen_txns: Default::default(),
             minimum_file_retention_timestamp,
-            txn_retention_timestamp,
+            txn_expiration_timestamp,
         }
     }
 }
@@ -213,7 +213,7 @@ pub(crate) struct CheckpointVisitor<'seen> {
     // This set has O(N) memory usage where N = number of txn actions with unique appIds
     seen_txns: &'seen mut HashSet<String>,
     /// Retention timestamp for filtering old transactions
-    txn_retention_timestamp: Option<i64>,
+    txn_expiration_timestamp: Option<i64>,
 }
 
 #[allow(unused)]
@@ -239,7 +239,7 @@ impl CheckpointVisitor<'_> {
         seen_protocol: bool,
         seen_metadata: bool,
         seen_txns: &'seen mut HashSet<String>,
-        txn_retention_timestamp: Option<i64>,
+        txn_expiration_timestamp: Option<i64>,
     ) -> CheckpointVisitor<'seen> {
         CheckpointVisitor {
             deduplicator: FileActionDeduplicator::new(
@@ -257,7 +257,7 @@ impl CheckpointVisitor<'_> {
             seen_protocol,
             seen_metadata,
             seen_txns,
-            txn_retention_timestamp,
+            txn_expiration_timestamp,
         }
     }
 
@@ -383,7 +383,7 @@ impl CheckpointVisitor<'_> {
         };
 
         // Check retention if last_updated is present
-        if let Some(retention_ts) = self.txn_retention_timestamp {
+        if let Some(retention_ts) = self.txn_expiration_timestamp {
             if let Some(last_updated) = getter[12].get_opt(i, "txn.lastUpdated")? {
                 let last_updated: i64 = last_updated;
                 if last_updated <= retention_ts {
@@ -583,7 +583,7 @@ mod tests {
             &mut seen_file_keys,
             true,
             vec![true; 4],
-            100, // minimum_file_retention_timestamp (threshold set to 100)
+            100, // minimum_file_expiration_timestamp (threshold set to 100)
             false,
             false,
             &mut seen_txns,
@@ -726,7 +726,7 @@ mod tests {
             &mut seen_file_keys,
             true, // is_log_batch
             vec![true; 7],
-            0, // minimum_file_retention_timestamp
+            0, // minimum_file_expiration_timestamp
             false,
             false,
             &mut seen_txns,

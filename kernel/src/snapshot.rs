@@ -343,12 +343,12 @@ impl Snapshot {
         application_id: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
-        let retention_timestamp = self.calculate_transaction_retention_timestamp()?;
+        let expiration_timestamp = self.calculate_transaction_expiration_timestamp()?;
         let txn = SetTransactionScanner::get_one(
             self.log_segment(),
             application_id,
             engine,
-            retention_timestamp,
+            expiration_timestamp,
         )?;
         Ok(txn.map(|t| t.version))
     }
@@ -372,7 +372,7 @@ impl Snapshot {
     }
 
     /// Calculate retention timestamp for transactions
-    fn calculate_transaction_retention_timestamp(&self) -> DeltaResult<Option<i64>> {
+    fn calculate_transaction_expiration_timestamp(&self) -> DeltaResult<Option<i64>> {
         let retention_duration = self.table_properties().set_transaction_retention_duration;
 
         match retention_duration {

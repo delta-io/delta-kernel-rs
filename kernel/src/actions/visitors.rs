@@ -303,16 +303,16 @@ pub(crate) struct SetTransactionVisitor {
     pub(crate) application_id: Option<String>,
     /// Minimum timestamp for transaction retention. Transactions with last_updated
     /// older than this timestamp will be filtered out. None means no filtering.
-    retention_timestamp: Option<i64>,
+    expiration_timestamp: Option<i64>,
 }
 
 impl SetTransactionVisitor {
     /// Create a new visitor. When application_id is set then bookkeeping is only for that id only
-    pub(crate) fn new(application_id: Option<String>, retention_timestamp: Option<i64>) -> Self {
+    pub(crate) fn new(application_id: Option<String>, expiration_timestamp: Option<i64>) -> Self {
         SetTransactionVisitor {
             set_transactions: HashMap::default(),
             application_id,
-            retention_timestamp,
+            expiration_timestamp,
         }
     }
 
@@ -359,7 +359,7 @@ impl RowVisitor for SetTransactionVisitor {
                     let txn = SetTransactionVisitor::visit_txn(i, app_id, getters)?;
                     // Check retention: filter out transactions that are old
                     // If last_updated is None, the transaction never expires
-                    if let Some(retention_ts) = self.retention_timestamp {
+                    if let Some(retention_ts) = self.expiration_timestamp {
                         if let Some(last_updated) = txn.last_updated {
                             if last_updated <= retention_ts {
                                 // Transaction is old, skip it
