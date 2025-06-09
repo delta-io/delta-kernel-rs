@@ -14,7 +14,7 @@ macro_rules! require {
 
 pub(crate) use require;
 
-/// Calculates the transaction retention timestamp based on table properties.
+/// Calculates the transaction expiration timestamp based on table properties.
 /// Returns None if set_transaction_retention_duration is not set.
 pub(crate) fn calculate_transaction_expiration_timestamp(
     table_properties: &TableProperties,

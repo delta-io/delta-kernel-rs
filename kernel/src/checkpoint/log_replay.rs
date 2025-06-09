@@ -58,7 +58,7 @@ pub(crate) struct CheckpointLogReplayProcessor {
     seen_txns: HashSet<String>,
     /// Minimum timestamp for file retention, used for filtering expired tombstones.
     minimum_file_retention_timestamp: i64,
-    /// Transaction retention timestamp for filtering old transactions
+    /// Transaction expiration timestamp for filtering old transactions
     txn_expiration_timestamp: Option<i64>,
 }
 
@@ -212,7 +212,7 @@ pub(crate) struct CheckpointVisitor<'seen> {
     // Set of transaction IDs to deduplicate by appId
     // This set has O(N) memory usage where N = number of txn actions with unique appIds
     seen_txns: &'seen mut HashSet<String>,
-    /// Retention timestamp for filtering old transactions
+    /// Transaction expiration timestamp for filtering old transactions
     txn_expiration_timestamp: Option<i64>,
 }
 
@@ -867,7 +867,7 @@ mod tests {
             r#"{"txn":{"appId":"app2","version":2,"lastUpdated":2000}}"#,
             // Transaction without lastUpdated (should be kept)
             r#"{"txn":{"appId":"app3","version":3}}"#,
-            // Transaction exactly at retention timestamp (should be filtered)
+            // Transaction exactly at expiration timestamp (should be filtered)
             r#"{"txn":{"appId":"app4","version":4,"lastUpdated":1000}}"#,
         ]
         .into();
@@ -883,7 +883,7 @@ mod tests {
             false,
             false,
             &mut seen_txns,
-            Some(1000), // retention timestamp
+            Some(1000), // expiration timestamp
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -921,7 +921,7 @@ mod tests {
 
         let input_batches = vec![create_batch(batch1)?, create_batch(batch2)?];
 
-        // Create processor with retention timestamp
+        // Create processor with txn expiration timestamp
         let processor = CheckpointLogReplayProcessor::new(0, Some(1000));
         let results: Vec<_> = processor
             .process_actions_iter(input_batches.into_iter().map(Ok))
