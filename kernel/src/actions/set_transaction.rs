@@ -118,8 +118,8 @@ mod tests {
         let log_segment = snapshot.log_segment();
 
         (
-            SetTransactionScanner::get_all(log_segment, &engine, Some(0)).unwrap(),
-            SetTransactionScanner::get_one(log_segment, app_id, &engine, Some(0)).unwrap(),
+            SetTransactionScanner::get_all(log_segment, &engine, None).unwrap(),
+            SetTransactionScanner::get_one(log_segment, app_id, &engine, None).unwrap(),
         )
     }
 

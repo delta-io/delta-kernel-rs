@@ -19,8 +19,9 @@ pub(crate) use require;
 pub(crate) fn calculate_transaction_expiration_timestamp(
     table_properties: &TableProperties,
 ) -> DeltaResult<Option<i64>> {
-    match table_properties.set_transaction_retention_duration {
-        Some(duration) => {
+    table_properties
+        .set_transaction_retention_duration
+        .map(|duration| -> DeltaResult<i64> {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|e| Error::generic(format!("Failed to get current time: {}", e)))?;
@@ -31,10 +32,9 @@ pub(crate) fn calculate_transaction_expiration_timestamp(
             let expiration_ms = i64::try_from(duration.as_millis())
                 .map_err(|_| Error::generic("Retention duration exceeds i64 millisecond range"))?;
 
-            Ok(Some(now_ms - expiration_ms))
-        }
-        None => Ok(None),
-    }
+            Ok(now_ms - expiration_ms)
+        })
+        .transpose()
 }
 
 #[cfg(test)]
