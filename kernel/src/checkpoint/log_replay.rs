@@ -385,8 +385,7 @@ impl CheckpointVisitor<'_> {
         // Check retention if last_updated is present
         if let Some(retention_ts) = self.txn_expiration_timestamp {
             if let Some(last_updated) = getter[12].get_opt(i, "txn.lastUpdated")? {
-                let last_updated: i64 = last_updated;
-                if last_updated <= retention_ts {
+                if i64::le(&last_updated, &retention_ts) {
                     // Transaction is old, exclude it from checkpoint
                     return Ok(false);
                 }
