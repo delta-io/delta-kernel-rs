@@ -102,7 +102,7 @@ mod tests {
     use crate::utils::test_utils::parse_json_batch;
     use crate::Table;
 
-    use arrow_55::array::StringArray;
+    use crate::arrow::array::StringArray;
     use itertools::Itertools;
 
     fn get_latest_transactions(
