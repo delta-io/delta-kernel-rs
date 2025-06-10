@@ -37,6 +37,10 @@ StructExpression
   StructExpression
     Integer(5)
     Long(20)
+  OpaqueExpression(foo)
+    Integer(42)
+    Double(1.111000)
+  Unknown(mystery)
   Divide
     Integer(0)
     Integer(0)
@@ -75,6 +79,10 @@ And
   Not
     IsNull
       Column(col)
+  OpaquePredicate(bar)
+    Integer(42)
+    Double(1.111000)
+  Unknown(intrigue)
   Equal
     Integer(0)
     Integer(0)
