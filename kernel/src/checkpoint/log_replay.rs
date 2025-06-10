@@ -217,6 +217,7 @@ pub(crate) struct CheckpointVisitor<'seen> {
 }
 
 #[allow(unused)]
+#[allow(clippy::too_many_arguments)]
 impl CheckpointVisitor<'_> {
     // These index positions correspond to the order of columns defined in
     // `selected_column_names_and_types()`
