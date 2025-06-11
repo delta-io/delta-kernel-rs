@@ -217,7 +217,6 @@ pub(crate) struct CheckpointVisitor<'seen> {
 }
 
 #[allow(unused)]
-#[allow(clippy::too_many_arguments)]
 impl CheckpointVisitor<'_> {
     // These index positions correspond to the order of columns defined in
     // `selected_column_names_and_types()`
@@ -232,6 +231,7 @@ impl CheckpointVisitor<'_> {
     const PROTOCOL_MIN_READER_VERSION: &'static str = "protocol.minReaderVersion";
     const METADATA_ID: &'static str = "metaData.id";
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new<'seen>(
         seen_file_keys: &'seen mut HashSet<FileActionKey>,
         is_log_batch: bool,
