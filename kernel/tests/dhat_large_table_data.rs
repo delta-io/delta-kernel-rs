@@ -1,6 +1,7 @@
 //! This tests our memory usage for reading tables with large data files.
 
 use std::fs::File;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -11,7 +12,6 @@ use delta_kernel::parquet::file::properties::WriterProperties;
 
 use serde_json::json;
 use tempfile::tempdir;
-use tracing::info;
 
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
@@ -83,7 +83,9 @@ fn create_commit(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }),
     ];
 
-    file.write_all(actions.join("\n").as_bytes())?;
+    for action in actions {
+        writeln!(file, "{}", action)?;
+    }
 
     Ok(())
 }
