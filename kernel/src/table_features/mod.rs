@@ -56,6 +56,9 @@ pub(crate) enum ReaderFeature {
     VacuumProtocolCheck,
     /// This feature enables support for the variant data type, which stores semi-structured data.
     VariantType,
+    #[strum(serialize = "variantType-preview")]
+    #[serde(rename = "variantType-preview")]
+    VariantTypePreview,
     #[serde(untagged)]
     #[strum(default)]
     Unknown(String),
@@ -130,6 +133,9 @@ pub(crate) enum WriterFeature {
     ClusteredTable,
     /// This feature enables support for the variant data type, which stores semi-structured data.
     VariantType,
+    #[strum(serialize = "variantType-preview")]
+    #[serde(rename = "variantType-preview")]
+    VariantTypePreview,
     #[serde(untagged)]
     #[strum(default)]
     Unknown(String),
@@ -170,6 +176,8 @@ pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> = Lazy
         ReaderFeature::TypeWideningPreview,
         ReaderFeature::VacuumProtocolCheck,
         ReaderFeature::V2Checkpoint,
+        ReaderFeature::VariantType,
+        ReaderFeature::VariantTypePreview,
     ]
 });
 
@@ -182,6 +190,8 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<WriterFeature>> = Lazy
         WriterFeature::DeletionVectors,
         WriterFeature::Invariants,
         WriterFeature::TimestampWithoutTimezone,
+        WriterFeature::VariantType,
+        WriterFeature::VariantTypePreview,
     ]
 });
 
@@ -234,6 +244,7 @@ mod tests {
             (ReaderFeature::V2Checkpoint, "v2Checkpoint"),
             (ReaderFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
             (ReaderFeature::VariantType, "variantType"),
+            (ReaderFeature::VariantTypePreview, "variantType-preview"),
             (ReaderFeature::unknown("something"), "something"),
         ];
 
@@ -275,6 +286,7 @@ mod tests {
             (WriterFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
             (WriterFeature::ClusteredTable, "clustering"),
             (WriterFeature::VariantType, "variantType"),
+            (WriterFeature::VariantTypePreview, "variantType-preview"),
             (WriterFeature::unknown("something"), "something"),
         ];
 

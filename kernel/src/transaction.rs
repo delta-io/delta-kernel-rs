@@ -215,6 +215,18 @@ impl Transaction {
         Expression::struct_from(fields)
     }
 
+    fn generate_logical_to_physical_with_schema(&self, schema: &SchemaRef) -> Expression {
+        // for now, we just pass through all the columns except partition columns.
+        // note this is _incorrect_ if table config deems we need partition columns.
+        let partition_columns = &self.read_snapshot.metadata().partition_columns;
+        let schema = schema;
+        let fields = schema
+            .fields()
+            .filter(|f| !partition_columns.contains(f.name()))
+            .map(|f| Expression::column([f.name()]));
+        Expression::struct_from(fields)
+    }
+
     /// Get the write context for this transaction. At the moment, this is constant for the whole
     /// transaction.
     // Note: after we introduce metadata updates (modify table schema, etc.), we need to make sure
@@ -225,6 +237,12 @@ impl Transaction {
         let snapshot_schema = self.read_snapshot.schema();
         let logical_to_physical = self.generate_logical_to_physical();
         WriteContext::new(target_dir.clone(), snapshot_schema, logical_to_physical)
+    }
+
+    pub fn get_write_context_with_schema(&self, schema: SchemaRef) -> WriteContext {
+        let target_dir = self.read_snapshot.table_root();
+        let logical_to_physical = self.generate_logical_to_physical_with_schema(&schema);
+        WriteContext::new(target_dir.clone(), schema, logical_to_physical)
     }
 
     /// Add write metadata about files to include in the transaction. This API can be called

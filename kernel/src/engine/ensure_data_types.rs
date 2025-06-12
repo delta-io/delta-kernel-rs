@@ -65,6 +65,9 @@ impl EnsureDataTypes {
             (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
             }
+            (&DataType::VARIANT, _) => {
+                check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
+            }
             // strings, bools, and binary  aren't primitive in arrow
             (&DataType::BOOLEAN, ArrowDataType::Boolean)
             | (&DataType::STRING, ArrowDataType::Utf8)
@@ -261,6 +264,9 @@ mod tests {
 
     use crate::engine::arrow_conversion::TryFromKernel as _;
     use crate::schema::{ArrayType, DataType, MapType, StructField};
+    use crate::schema::variant_utils::{
+        variant_arrow_type, variant_arrow_type_without_tag, hard_coded_variant_arrow_type,
+    };
 
     use super::*;
 
@@ -319,6 +325,28 @@ mod tests {
         assert!(!can_upcast_to_decimal(&Int32, 10u8, 1i8));
         assert!(!can_upcast_to_decimal(&Int64, 19u8, 0i8));
         assert!(!can_upcast_to_decimal(&Int64, 20u8, 1i8));
+    }
+
+    #[test]
+    fn ensure_variants() {
+        assert!(ensure_data_types(
+            &DataType::VARIANT,
+            &variant_arrow_type(),
+            true
+        )
+        .is_ok());
+        assert!(ensure_data_types(
+            &DataType::VARIANT,
+            &hard_coded_variant_arrow_type(),
+            true
+        )
+        .is_ok());
+        assert!(ensure_data_types(
+            &DataType::VARIANT,
+            &variant_arrow_type_without_tag(),
+            true
+        )
+        .is_err());
     }
 
     #[test]
