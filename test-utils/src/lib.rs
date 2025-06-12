@@ -170,7 +170,6 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
 /// Note: we implment this extension trait here so that we can import this trait (from test-utils
 /// crate) and get to use all these test-only helper methods from places where we don't have access
 pub trait DefaultEngineExtension {
-    /// to #[cfg(test)] (i.e. in examples/integration tests).
     type Executor: TaskExecutor;
 
     fn new_local() -> Arc<DefaultEngine<Self::Executor>>;
@@ -340,7 +339,6 @@ pub fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
 }
 
 // TODO (zach): this is listed as unused for acceptance crate
-#[allow(unused)]
 pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<RecordBatch>> {
     let scan_results = scan.execute(engine)?;
     scan_results
@@ -359,7 +357,6 @@ pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<Record
 }
 
 // TODO (zach): this is listed as unused for acceptance crate
-#[allow(unused)]
 pub fn test_read(
     expected: &ArrowEngineData,
     table: &Table,
