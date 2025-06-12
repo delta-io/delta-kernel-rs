@@ -6,6 +6,7 @@ use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray}
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::{path::Path, ObjectStore};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
@@ -152,6 +153,7 @@ pub trait DefaultEngineExtension {
     type Executor: TaskExecutor;
 
     fn new_local() -> Arc<DefaultEngine<Self::Executor>>;
+    fn new_memory() -> (Arc<DefaultEngine<Self::Executor>>, Arc<InMemory>);
 }
 
 impl DefaultEngineExtension for DefaultEngine<TokioBackgroundExecutor> {
@@ -163,5 +165,16 @@ impl DefaultEngineExtension for DefaultEngine<TokioBackgroundExecutor> {
             object_store,
             TokioBackgroundExecutor::new().into(),
         ))
+    }
+
+    fn new_memory() -> (Arc<DefaultEngine<TokioBackgroundExecutor>>, Arc<InMemory>) {
+        let store = Arc::new(InMemory::new());
+        (
+            Arc::new(DefaultEngine::new(
+                store.clone(),
+                TokioBackgroundExecutor::new().into(),
+            )),
+            store,
+        )
     }
 }
