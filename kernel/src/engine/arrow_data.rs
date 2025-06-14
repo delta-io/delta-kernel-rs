@@ -19,6 +19,7 @@ pub use crate::engine::arrow_utils::fix_nested_null_masks;
 /// WARNING: Row visitors require that all leaf columns of the record batch have correctly computed
 /// NULL masks. The arrow parquet reader is known to produce incomplete NULL masks, for
 /// example. When in doubt, call [`fix_nested_null_masks`] first.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ArrowEngineData {
     data: RecordBatch,
 }

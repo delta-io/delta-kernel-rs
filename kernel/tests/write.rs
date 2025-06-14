@@ -435,9 +435,9 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
             })
         });
 
-        let write_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-        for meta in write_metadata {
-            txn.add_write_metadata(meta?);
+        let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
+        for meta in add_files_metadata {
+            txn.add_files(meta?);
         }
 
         // commit!
@@ -573,9 +573,9 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                 })
             });
 
-        let write_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-        for meta in write_metadata {
-            txn.add_write_metadata(meta?);
+        let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
+        for meta in add_files_metadata {
+            txn.add_files(meta?);
         }
 
         // commit!
@@ -709,8 +709,8 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
             })
         });
 
-        let mut write_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-        assert!(write_metadata.all(|res| match res {
+        let mut add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
+        assert!(add_files_metadata.all(|res| match res {
             Err(KernelError::Arrow(ArrowError::SchemaError(_))) => true,
             Err(KernelError::Backtraced { source, .. })
                 if matches!(&*source, KernelError::Arrow(ArrowError::SchemaError(_))) =>
@@ -899,7 +899,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     let engine = Arc::new(engine);
     let write_context = Arc::new(txn.get_write_context());
 
-    let write_metadata = engine
+    let add_files_metadata = engine
         .write_parquet(
             &ArrowEngineData::new(data.clone()),
             write_context.as_ref(),
@@ -908,7 +908,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    txn.add_write_metadata(write_metadata);
+    txn.add_files(add_files_metadata);
 
     // Commit the transaction
     txn.commit(engine.as_ref())?;
@@ -933,5 +933,132 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     // Verify the data can be read back correctly
     test_read(&ArrowEngineData::new(data), &table, engine)?;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_remove() -> Result<(), Box<dyn std::error::Error>> {
+    // setup tracing
+    let _ = tracing_subscriber::fmt::try_init();
+    // create a simple table: one int column named 'number'
+    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )]));
+
+    for (table, engine, store, table_name) in setup_tables(schema.clone(), &[]).await? {
+        let commit_info = new_commit_info()?;
+
+        let mut txn = table
+            .new_transaction(&engine)?
+            .with_commit_info(commit_info);
+
+        // create two new arrow record batches to append
+        let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
+            let data = RecordBatch::try_new(
+                Arc::new(schema.as_ref().try_into_arrow()?),
+                vec![Arc::new(Int32Array::from(data.to_vec()))],
+            )?;
+            Ok(Box::new(ArrowEngineData::new(data)))
+        });
+
+        // write data out by spawning async tasks to simulate executors
+        let engine = Arc::new(engine);
+        let write_context = Arc::new(txn.get_write_context());
+        let tasks = append_data.into_iter().map(|data| {
+            // arc clones
+            let engine = engine.clone();
+            let write_context = write_context.clone();
+            tokio::task::spawn(async move {
+                engine
+                    .write_parquet(
+                        data.as_ref().unwrap(),
+                        write_context.as_ref(),
+                        HashMap::new(),
+                        true,
+                    )
+                    .await
+            })
+        });
+
+        let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
+        for meta in add_files_metadata {
+            let meta = meta?;
+            let arrow = ArrowEngineData::try_from_engine_data(meta).unwrap();
+            txn.add_files(arrow.clone());
+            txn.remove_files(arrow);
+        }
+
+        // commit!
+        txn.commit(engine.as_ref())?;
+
+        let commit1 = store
+            .get(&Path::from(format!(
+                "/{table_name}/_delta_log/00000000000000000001.json"
+            )))
+            .await?;
+
+        let mut parsed_commits: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
+            .into_iter::<serde_json::Value>()
+            .try_collect()?;
+
+        let size =
+            get_and_check_all_parquet_sizes(store.clone(), format!("/{table_name}/").as_str())
+                .await;
+        // check that the timestamps in commit_info and add actions are within 10s of SystemTime::now()
+        // before we clear them for comparison
+        check_action_timestamps(parsed_commits.iter())?;
+
+        // set timestamps to 0 and paths to known string values for comparison
+        // (otherwise timestamps are non-deterministic and paths are random UUIDs)
+        set_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+        set_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
+        set_value(&mut parsed_commits[1], "add.path", json!("first.parquet"))?;
+        set_value(&mut parsed_commits[2], "add.modificationTime", json!(0))?;
+        set_value(&mut parsed_commits[2], "add.path", json!("second.parquet"))?;
+
+        let expected_commit = vec![
+            json!({
+                "commitInfo": {
+                    "timestamp": 0,
+                    "operation": "UNKNOWN",
+                    "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
+                    "operationParameters": {},
+                    "engineCommitInfo": {
+                        "engineInfo": "default engine"
+                    }
+                }
+            }),
+            json!({
+                "add": {
+                    "path": "first.parquet",
+                    "partitionValues": {},
+                    "size": size,
+                    "modificationTime": 0,
+                    "dataChange": true
+                }
+            }),
+            json!({
+                "add": {
+                    "path": "second.parquet",
+                    "partitionValues": {},
+                    "size": size,
+                    "modificationTime": 0,
+                    "dataChange": true
+                }
+            }),
+        ];
+
+        assert_eq!(parsed_commits, expected_commit);
+
+        test_read(
+            &ArrowEngineData::new(RecordBatch::try_new(
+                Arc::new(schema.as_ref().try_into_arrow()?),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
+            )?),
+            &table,
+            engine,
+        )?;
+    }
     Ok(())
 }
