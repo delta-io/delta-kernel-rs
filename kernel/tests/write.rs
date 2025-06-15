@@ -21,8 +21,8 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
-use delta_kernel::Error as KernelError;
+use delta_kernel::schema::{DataType, MapType, SchemaRef, StructField, StructType};
+use delta_kernel::{transaction, Error as KernelError};
 use delta_kernel::{DeltaResult, Table};
 
 mod common;
@@ -435,9 +435,9 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
             })
         });
 
-        let write_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-        for meta in write_metadata {
-            txn.add_write_metadata(meta?);
+        let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
+        for meta in add_files_metadata {
+            txn.add_files(meta?);
         }
 
         // commit!
@@ -573,9 +573,9 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                 })
             });
 
-        let write_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-        for meta in write_metadata {
-            txn.add_write_metadata(meta?);
+        let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
+        for meta in add_files_metadata {
+            txn.add_files(meta?);
         }
 
         // commit!
@@ -709,8 +709,8 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
             })
         });
 
-        let mut write_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-        assert!(write_metadata.all(|res| match res {
+        let mut add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
+        assert!(add_files_metadata.all(|res| match res {
             Err(KernelError::Arrow(ArrowError::SchemaError(_))) => true,
             Err(KernelError::Backtraced { source, .. })
                 if matches!(&*source, KernelError::Arrow(ArrowError::SchemaError(_))) =>
@@ -899,7 +899,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     let engine = Arc::new(engine);
     let write_context = Arc::new(txn.get_write_context());
 
-    let write_metadata = engine
+    let add_files_metadata = engine
         .write_parquet(
             &ArrowEngineData::new(data.clone()),
             write_context.as_ref(),
@@ -908,7 +908,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    txn.add_write_metadata(write_metadata);
+    txn.add_files(add_files_metadata);
 
     // Commit the transaction
     txn.commit(engine.as_ref())?;
@@ -933,5 +933,91 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     // Verify the data can be read back correctly
     test_read(&ArrowEngineData::new(data), &table, engine)?;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_remove() -> Result<(), Box<dyn std::error::Error>> {
+    // setup tracing
+    let _ = tracing_subscriber::fmt::try_init();
+    // create a simple table: one int column named 'number'
+    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )]));
+
+    for (table, engine, store, table_name) in setup_tables(schema.clone(), &[]).await? {
+        let commit_info = new_commit_info()?;
+
+        let mut txn = table
+            .new_transaction(&engine)?
+            .with_commit_info(commit_info.clone());
+
+        // create two new arrow record batches to append
+        let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
+            let data = RecordBatch::try_new(
+                Arc::new(schema.as_ref().try_into_arrow()?),
+                vec![Arc::new(Int32Array::from(data.to_vec()))],
+            )?;
+            Ok(Box::new(ArrowEngineData::new(data)))
+        });
+
+        // write data out by spawning async tasks to simulate executors
+        let engine = Arc::new(engine);
+        let write_context = Arc::new(txn.get_write_context());
+        let tasks = append_data.into_iter().map(|data| {
+            // arc clones
+            let engine = engine.clone();
+            let write_context = write_context.clone();
+            tokio::task::spawn(async move {
+                engine
+                    .write_parquet(
+                        data.as_ref().unwrap(),
+                        write_context.as_ref(),
+                        HashMap::new(),
+                        true,
+                    )
+                    .await
+            })
+        });
+
+        let mut add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
+        let meta = add_files_metadata.next().unwrap()?;
+        let arrow = ArrowEngineData::try_from_engine_data(meta).unwrap();
+        txn.add_files(arrow.clone());
+        txn.commit(engine.as_ref())?;
+
+        let mut txn = table
+            .new_transaction(engine.as_ref())?
+            .with_commit_info(commit_info);
+
+        use delta_kernel::{Engine, Expression};
+
+        let expr = Expression::struct_from([
+            Expression::column(["path"]),
+            Expression::null_literal(DataType::LONG),
+            Expression::column(["dataChange"]),
+            Expression::null_literal(DataType::BOOLEAN),
+            Expression::null_literal(DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::STRING,
+                true,
+            )))),
+            Expression::null_literal(DataType::LONG),
+        ]);
+        let eval = engine.evaluation_handler().new_expression_evaluator(
+            transaction::add_files_schema().clone(),
+            expr,
+            transaction::remove_files_schema().clone().into(),
+        );
+        let removes = eval.evaluate(arrow.as_ref()).unwrap();
+        txn.remove_files(removes);
+        txn.commit(engine.as_ref())?;
+
+        let snapshot = table.snapshot(engine.as_ref(), None)?;
+        let scan = snapshot.into_scan_builder().build()?;
+        let batches = common::read_scan(&scan, engine)?;
+        assert!(batches.is_empty());
+    }
     Ok(())
 }

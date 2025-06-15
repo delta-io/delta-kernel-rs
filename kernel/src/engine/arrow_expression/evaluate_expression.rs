@@ -104,9 +104,9 @@ pub fn evaluate_expression(
             let result = StructArray::try_new(output_fields.into(), output_cols, None)?;
             Ok(Arc::new(result))
         }
-        (Struct(_), _) => Err(Error::generic(
-            "Data type is required to evaluate struct expressions",
-        )),
+        (Struct(_), dt) => Err(Error::Generic(format!(
+            "Struct expression expects a DataType::Struct result, but got {dt:?}"
+        ))),
         (Predicate(pred), None | Some(&DataType::BOOLEAN)) => {
             let result = evaluate_predicate(pred, batch, false)?;
             Ok(Arc::new(result))
