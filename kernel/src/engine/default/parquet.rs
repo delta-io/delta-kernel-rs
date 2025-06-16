@@ -51,6 +51,7 @@ impl DataFileMetadata {
     // convert DataFileMetadata into a record batch which matches the 'write_metadata' schema
     fn as_record_batch(
         &self,
+        write_metadata_schema: SchemaRef,
         partition_values: &HashMap<String, String>,
         data_change: bool,
     ) -> DeltaResult<Box<dyn EngineData>> {
@@ -62,7 +63,6 @@ impl DataFileMetadata {
                     size,
                 },
         } = self;
-        let write_metadata_schema = crate::transaction::get_write_metadata_schema();
 
         // create the record batch of the write metadata
         let path = Arc::new(StringArray::from(vec![location.to_string()]));
@@ -166,19 +166,18 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     }
 
     /// Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
-    /// metadata as an EngineData batch which matches the [write metadata] schema (where `<uuid>` is
+    /// metadata as an EngineData batch which matches the `write_metadata_schema` (where `<uuid>` is
     /// a generated UUIDv4).
-    ///
-    /// [write metadata]: crate::transaction::get_write_metadata_schema
     pub async fn write_parquet_file(
         &self,
         path: &url::Url,
         data: Box<dyn EngineData>,
+        write_metadata_schema: SchemaRef,
         partition_values: HashMap<String, String>,
         data_change: bool,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let parquet_metadata = self.write_parquet(path, data).await?;
-        parquet_metadata.as_record_batch(&partition_values, data_change)
+        parquet_metadata.as_record_batch(write_metadata_schema, &partition_values, data_change)
     }
 }
 
@@ -406,6 +405,7 @@ mod tests {
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::schema::{DataType, MapType, StructField, StructType};
     use crate::EngineData;
 
     use itertools::Itertools;
@@ -472,17 +472,25 @@ mod tests {
         let data_file_metadata = DataFileMetadata::new(file_metadata);
         let partition_values = HashMap::from([("partition1".to_string(), "a".to_string())]);
         let data_change = true;
+        let write_metadata_schema = Arc::new(StructType::new(vec![
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null(
+                "partitionValues",
+                MapType::new(DataType::STRING, DataType::STRING, true),
+            ),
+            StructField::not_null("size", DataType::LONG),
+            StructField::not_null("modificationTime", DataType::LONG),
+            StructField::not_null("dataChange", DataType::BOOLEAN),
+        ]));
         let actual = data_file_metadata
-            .as_record_batch(&partition_values, data_change)
+            .as_record_batch(
+                write_metadata_schema.clone(),
+                &partition_values,
+                data_change,
+            )
             .unwrap();
         let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
 
-        let schema = Arc::new(
-            crate::transaction::get_write_metadata_schema()
-                .as_ref()
-                .try_into_arrow()
-                .unwrap(),
-        );
         let key_builder = StringBuilder::new();
         let val_builder = StringBuilder::new();
         let mut partition_values_builder = MapBuilder::new(
@@ -499,7 +507,7 @@ mod tests {
         partition_values_builder.append(true).unwrap();
         let partition_values = partition_values_builder.finish();
         let expected = RecordBatch::try_new(
-            schema,
+            Arc::new(write_metadata_schema.as_ref().try_into_arrow().unwrap()),
             vec![
                 Arc::new(StringArray::from(vec![location.to_string()])),
                 Arc::new(partition_values),
