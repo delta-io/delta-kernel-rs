@@ -26,9 +26,11 @@ use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
     StructType,
 };
+use crate::schema::variant_utils::UsesVariant;
 use crate::snapshot::Snapshot;
 use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
+use crate::utils::require;
 
 use self::log_replay::scan_action_iter;
 
@@ -118,19 +120,19 @@ impl ScanBuilder {
             None => PhysicalPredicate::None,
         };
 
-        Ok(Scan {
-            snapshot: self.snapshot,
+        Scan::new(
+            self.snapshot,
             logical_schema,
-            physical_schema: Arc::new(StructType::new(state_info.read_fields)),
+            Arc::new(StructType::new(state_info.read_fields)),
             physical_predicate,
-            all_fields: Arc::new(state_info.all_fields),
-            have_partition_cols: state_info.have_partition_cols,
-        })
+            Arc::new(state_info.all_fields),
+            state_info.have_partition_cols,
+        )
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum PhysicalPredicate {
+pub enum PhysicalPredicate {
     Some(PredicateRef, SchemaRef),
     StaticSkipAll,
     None,
@@ -397,6 +399,43 @@ impl std::fmt::Debug for Scan {
 }
 
 impl Scan {
+    pub fn new(
+        snapshot: Arc<Snapshot>,
+        logical_schema: SchemaRef,
+        physical_schema: SchemaRef,
+        physical_predicate: PhysicalPredicate,
+        all_fields: Arc<Vec<ColumnType>>,
+        have_partition_cols: bool
+    ) -> DeltaResult<Self> {
+        Self::validate_logical_schema(&logical_schema)?;
+
+        Ok(Self {
+            snapshot,
+            logical_schema,
+            physical_schema,
+            physical_predicate,
+            all_fields,
+            have_partition_cols
+        })
+    }
+
+    fn validate_logical_schema(logical_schema: &SchemaRef) -> DeltaResult<()> {
+        // Ensure logical schema does not contain Variant. If entire Variant data is to be scanned
+        // as Struct<value: Binary, metadata: Binary>, the logical schema must contain the struct
+        // representation instead. This is to ensure extensibility to shredding.
+        let mut uses_variant = UsesVariant::default();
+        uses_variant.transform_struct(&*logical_schema);
+        require!(
+            !uses_variant.0,
+            Error::unsupported(
+                "The logical schema must not contain `VARIANT`. It must be ".to_owned() +
+                "specific about the scanned format of VARIANT columns (for example, " +
+                "STRUCT<value: BINARY, metadata: BINARY>)."
+            )
+        );
+        Ok(())
+    }
+
     /// The table's root URL. Any relative paths returned from `scan_data` (or in a callback from
     /// [`ScanMetadata::visit_scan_files`]) must be resolved against this root to get the actual path to
     /// the file.
@@ -664,6 +703,9 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>> + use<'_>> {
+        // Redundant check to make sure we never scan an invalid logical schema.
+        Self::validate_logical_schema(&self.logical_schema)?;
+
         struct ScanFile {
             path: String,
             size: i64,
