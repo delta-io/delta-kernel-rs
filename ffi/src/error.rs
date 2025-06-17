@@ -8,19 +8,19 @@ use crate::{kernel_string_slice, ExternEngine, KernelStringSlice};
 pub enum KernelError {
     UnknownError, // catch-all for unrecognized kernel Error types
     FFIError,     // errors encountered in the code layer that supports FFI
-    #[cfg(feature = "default-engine")]
+    #[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
     ArrowError,
     EngineDataTypeError,
     ExtractError,
     GenericError,
     IOErrorError,
-    #[cfg(feature = "default-engine")]
+    #[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
     ParquetError,
-    #[cfg(feature = "default-engine")]
+    #[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
     ObjectStoreError,
-    #[cfg(feature = "default-engine")]
+    #[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
     ObjectStorePathError,
-    #[cfg(feature = "default-engine")]
+    #[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
     ReqwestError,
     FileNotFoundError,
     MissingColumnError,
@@ -62,7 +62,7 @@ impl From<Error> for KernelError {
     fn from(e: Error) -> Self {
         match e {
             // NOTE: By definition, no kernel Error maps to FFIError
-            #[cfg(feature = "default-engine")]
+            #[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
             Error::Arrow(_) => KernelError::ArrowError,
             Error::CheckpointWrite(_) => KernelError::CheckpointWriteError,
             Error::EngineDataType(_) => KernelError::EngineDataTypeError,
@@ -70,13 +70,13 @@ impl From<Error> for KernelError {
             Error::Generic(_) => KernelError::GenericError,
             Error::GenericError { .. } => KernelError::GenericError,
             Error::IOError(_) => KernelError::IOErrorError,
-            #[cfg(feature = "default-engine")]
+            #[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
             Error::Parquet(_) => KernelError::ParquetError,
-            #[cfg(feature = "default-engine")]
+            #[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
             Error::ObjectStore(_) => KernelError::ObjectStoreError,
-            #[cfg(feature = "default-engine")]
+            #[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
             Error::ObjectStorePath(_) => KernelError::ObjectStorePathError,
-            #[cfg(feature = "default-engine")]
+            #[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
             Error::Reqwest(_) => KernelError::ReqwestError,
             Error::FileNotFound(_) => KernelError::FileNotFoundError,
             Error::MissingColumn(_) => KernelError::MissingColumnError,

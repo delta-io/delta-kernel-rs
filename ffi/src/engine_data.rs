@@ -1,17 +1,17 @@
 //! EngineData related ffi code
 
-#[cfg(feature = "default-engine")]
+#[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
 use delta_kernel::arrow::array::{
     ffi::{FFI_ArrowArray, FFI_ArrowSchema},
     ArrayData, StructArray,
 };
-#[cfg(feature = "default-engine")]
+#[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
 use delta_kernel::DeltaResult;
 use delta_kernel::EngineData;
 use std::ffi::c_void;
 
 use crate::ExclusiveEngineData;
-#[cfg(feature = "default-engine")]
+#[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
 use crate::{ExternResult, IntoExternResult, SharedExternEngine};
 
 use super::handle::Handle;
@@ -51,7 +51,7 @@ unsafe fn get_raw_engine_data_impl(data: &mut Handle<ExclusiveEngineData>) -> &m
 /// Struct to allow binding to the arrow [C Data
 /// Interface](https://arrow.apache.org/docs/format/CDataInterface.html). This includes the data and
 /// the schema.
-#[cfg(feature = "default-engine")]
+#[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
 #[repr(C)]
 pub struct ArrowFFIData {
     pub array: FFI_ArrowArray,
@@ -66,7 +66,7 @@ pub struct ArrowFFIData {
 /// # Safety
 /// data_handle must be a valid ExclusiveEngineData as read by the
 /// [`delta_kernel::engine::default::DefaultEngine`] obtained from `get_default_engine`.
-#[cfg(feature = "default-engine")]
+#[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
 #[no_mangle]
 pub unsafe extern "C" fn get_raw_arrow_data(
     data: Handle<ExclusiveEngineData>,
@@ -78,7 +78,7 @@ pub unsafe extern "C" fn get_raw_arrow_data(
 }
 
 // TODO: This method leaks the returned pointer memory. How will the engine free it?
-#[cfg(feature = "default-engine")]
+#[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
 fn get_raw_arrow_data_impl(data: Box<dyn EngineData>) -> DeltaResult<*mut ArrowFFIData> {
     let record_batch: delta_kernel::arrow::array::RecordBatch = data
         .into_any()
