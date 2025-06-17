@@ -6,14 +6,15 @@ use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use itertools::Itertools;
 
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::{DeltaResult, Error, PredicateRef, Table, Version};
 
 use test_utils::DefaultEngineExtension;
 
 mod common;
-use common::{load_test_data, to_arrow};
+use common::load_test_data;
+
+use test_utils::to_arrow;
 
 fn read_cdf_for_table(
     test_name: impl AsRef<str>,

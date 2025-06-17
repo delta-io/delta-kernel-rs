@@ -17,7 +17,7 @@ use delta_kernel::object_store::{local::LocalFileSystem, ObjectStore};
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
-use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Table};
+use delta_kernel::{DeltaResult, Table};
 use futures::{stream::TryStreamExt, StreamExt};
 
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
@@ -25,7 +25,9 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 
 mod common;
-use common::{load_test_data, to_arrow};
+use common::load_test_data;
+
+use test_utils::to_arrow;
 
 // NB adapted from DAT: read all parquet files in the directory and concatenate them
 async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {

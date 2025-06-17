@@ -8,121 +8,22 @@ use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
 
-use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStore;
 use itertools::Itertools;
+use serde_json::json;
 use serde_json::Deserializer;
-use serde_json::{json, to_vec};
-use url::Url;
 
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::DeltaResult;
 use delta_kernel::Error as KernelError;
-use delta_kernel::{DeltaResult, Table};
+
+use test_utils::{create_table, engine_store_setup, setup_test_tables};
 
 mod common;
-use common::test_read;
-
-// setup default engine with in-memory (=true) or local fs (=false) object store.
-fn setup(
-    table_name: &str,
-    in_memory: bool,
-) -> (
-    Arc<dyn ObjectStore>,
-    DefaultEngine<TokioBackgroundExecutor>,
-    Url,
-) {
-    let (storage, base_path, base_url): (Arc<dyn ObjectStore>, &str, &str) = if in_memory {
-        (Arc::new(InMemory::new()), "/", "memory:///")
-    } else {
-        (
-            Arc::new(LocalFileSystem::new()),
-            "./kernel_write_tests/",
-            "file://",
-        )
-    };
-
-    let table_root_path = Path::from(format!("{base_path}{table_name}"));
-    let url = Url::parse(&format!("{base_url}{table_root_path}/")).unwrap();
-    let executor = Arc::new(TokioBackgroundExecutor::new());
-    let engine = DefaultEngine::new(Arc::clone(&storage), executor);
-
-    (storage, engine, url)
-}
-
-// we provide this table creation function since we only do appends to existing tables for now.
-// this will just create an empty table with the given schema. (just protocol + metadata actions)
-async fn create_table(
-    store: Arc<dyn ObjectStore>,
-    table_path: Url,
-    schema: SchemaRef,
-    partition_columns: &[&str],
-    use_37_protocol: bool,
-    enable_timestamp_without_timezone: bool,
-) -> Result<Table, Box<dyn std::error::Error>> {
-    let table_id = "test_id";
-    let schema = serde_json::to_string(&schema)?;
-
-    let (reader_features, writer_features) = {
-        let mut reader_features = vec![];
-        let mut writer_features = vec![];
-        if enable_timestamp_without_timezone {
-            reader_features.push("timestampNtz");
-            writer_features.push("timestampNtz");
-        }
-        (reader_features, writer_features)
-    };
-
-    let protocol = if use_37_protocol {
-        json!({
-            "protocol": {
-                "minReaderVersion": 3,
-                "minWriterVersion": 7,
-                "readerFeatures": reader_features,
-                "writerFeatures": writer_features,
-            }
-        })
-    } else {
-        json!({
-            "protocol": {
-                "minReaderVersion": 1,
-                "minWriterVersion": 1,
-            }
-        })
-    };
-    let metadata = json!({
-        "metaData": {
-            "id": table_id,
-            "format": {
-                "provider": "parquet",
-                "options": {}
-            },
-            "schemaString": schema,
-            "partitionColumns": partition_columns,
-            "configuration": {},
-            "createdTime": 1677811175819u64
-        }
-    });
-
-    let data = [
-        to_vec(&protocol).unwrap(),
-        b"\n".to_vec(),
-        to_vec(&metadata).unwrap(),
-    ]
-    .concat();
-
-    // put 0.json with protocol + metadata
-    let path = table_path.join("_delta_log/00000000000000000000.json")?;
-    store
-        .put(&Path::from_url_path(path.path())?, data.into())
-        .await?;
-    Ok(Table::new(table_path))
-}
+use test_utils::test_read;
 
 // create commit info in arrow of the form {engineInfo: "default engine"}
 fn new_commit_info() -> DeltaResult<Box<ArrowEngineData>> {
@@ -164,52 +65,6 @@ fn new_commit_info() -> DeltaResult<Box<ArrowEngineData>> {
     Ok(Box::new(ArrowEngineData::new(commit_info_batch)))
 }
 
-async fn setup_tables(
-    schema: SchemaRef,
-    partition_columns: &[&str],
-) -> Result<
-    Vec<(
-        Table,
-        DefaultEngine<TokioBackgroundExecutor>,
-        Arc<dyn ObjectStore>,
-        &'static str,
-    )>,
-    Box<dyn std::error::Error>,
-> {
-    let (store_37, engine_37, table_location_37) = setup("test_table_37", true);
-    let (store_11, engine_11, table_location_11) = setup("test_table_11", true);
-    Ok(vec![
-        (
-            create_table(
-                store_37.clone(),
-                table_location_37,
-                schema.clone(),
-                partition_columns,
-                true,
-                false,
-            )
-            .await?,
-            engine_37,
-            store_37,
-            "test_table_37",
-        ),
-        (
-            create_table(
-                store_11.clone(),
-                table_location_11,
-                schema,
-                partition_columns,
-                false,
-                false,
-            )
-            .await?,
-            engine_11,
-            store_11,
-            "test_table_11",
-        ),
-    ])
-}
-
 #[tokio::test]
 async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
@@ -221,7 +76,7 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
         DataType::INTEGER,
     )]));
 
-    for (table, engine, store, table_name) in setup_tables(schema, &[]).await? {
+    for (table, engine, store, table_name) in setup_test_tables(schema, &[]).await? {
         let commit_info = new_commit_info()?;
 
         // create a transaction
@@ -272,7 +127,7 @@ async fn test_empty_commit() -> Result<(), Box<dyn std::error::Error>> {
         DataType::INTEGER,
     )]));
 
-    for (table, engine, _store, _table_name) in setup_tables(schema, &[]).await? {
+    for (table, engine, _store, _table_name) in setup_test_tables(schema, &[]).await? {
         assert!(matches!(
             table.new_transaction(&engine)?.commit(&engine).unwrap_err(),
             KernelError::MissingCommitInfo
@@ -291,7 +146,7 @@ async fn test_invalid_commit_info() -> Result<(), Box<dyn std::error::Error>> {
         "number",
         DataType::INTEGER,
     )]));
-    for (table, engine, _store, _table_name) in setup_tables(schema, &[]).await? {
+    for (table, engine, _store, _table_name) in setup_test_tables(schema, &[]).await? {
         // empty commit info test
         let commit_info_schema = Arc::new(ArrowSchema::empty());
         let commit_info_batch = RecordBatch::new_empty(commit_info_schema.clone());
@@ -400,7 +255,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
         DataType::INTEGER,
     )]));
 
-    for (table, engine, store, table_name) in setup_tables(schema.clone(), &[]).await? {
+    for (table, engine, store, table_name) in setup_test_tables(schema.clone(), &[]).await? {
         let commit_info = new_commit_info()?;
 
         let mut txn = table
@@ -533,7 +388,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     )]));
 
     for (table, engine, store, table_name) in
-        setup_tables(table_schema.clone(), &[partition_col]).await?
+        setup_test_tables(table_schema.clone(), &[partition_col]).await?
     {
         let commit_info = new_commit_info()?;
 
@@ -674,7 +529,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
         DataType::STRING,
     )]));
 
-    for (table, engine, _store, _table_name) in setup_tables(table_schema, &[]).await? {
+    for (table, engine, _store, _table_name) in setup_test_tables(table_schema, &[]).await? {
         let commit_info = new_commit_info()?;
 
         let txn = table
@@ -732,7 +587,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         DataType::INTEGER,
     )]));
 
-    for (table, engine, store, table_name) in setup_tables(schema, &[]).await? {
+    for (table, engine, store, table_name) in setup_test_tables(schema, &[]).await? {
         let commit_info = new_commit_info()?;
 
         // can't have duplicate app_id in same transaction
@@ -862,7 +717,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
         DataType::TIMESTAMP_NTZ,
     )]));
 
-    let (store, engine, table_location) = setup("test_table_timestamp_ntz", true);
+    let (store, engine, table_location) = engine_store_setup("test_table_timestamp_ntz", true);
     let table = create_table(
         store.clone(),
         table_location,
