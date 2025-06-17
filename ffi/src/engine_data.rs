@@ -7,7 +7,7 @@ use delta_kernel::arrow::array::{
 };
 #[cfg(feature = "default-engine")]
 use delta_kernel::DeltaResult;
-use delta_kernel::EngineData;
+use delta_kernel::{EngineData};
 use std::ffi::c_void;
 
 use crate::ExclusiveEngineData;
@@ -112,7 +112,6 @@ pub unsafe extern "C" fn get_engine_data(
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<ExclusiveEngineData>> {
     get_engine_data_impl(array, schema)
-        .map(Into::into)
         .into_extern_result(&engine.as_ref())
 }
 
@@ -120,10 +119,10 @@ pub unsafe extern "C" fn get_engine_data(
 unsafe fn get_engine_data_impl(
     array: FFI_ArrowArray,
     schema: &FFI_ArrowSchema,
-) -> DeltaResult<Box<dyn EngineData>> {
+) -> DeltaResult<Handle<ExclusiveEngineData>> {
     let array_data = unsafe { from_ffi(array, schema) };
     let array = StructArray::from(array_data?);
     let record_batch = delta_kernel::arrow::array::RecordBatch::from(array);
-    let engine_data = delta_kernel::engine::arrow_data::ArrowEngineData::from(record_batch);
-    Ok(Box::new(engine_data))
+    let engine_data : Box<dyn EngineData> = Box::new(delta_kernel::engine::arrow_data::ArrowEngineData::from(record_batch));
+    Ok(engine_data.into())
 }
