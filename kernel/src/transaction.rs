@@ -230,7 +230,7 @@ impl Transaction {
     /// Add write metadata about files to include in the transaction. This API can be called
     /// multiple times to add multiple batches.
     ///
-    /// The expected schema for `write_metadata` is given by [`get_write_metadata_schema`].
+    /// The expected schema for `write_metadata` is given by [`WriteContext::write_metadata_schema`].
     pub fn add_write_metadata(&mut self, write_metadata: Box<dyn EngineData>) {
         self.write_metadata.push(write_metadata);
     }
