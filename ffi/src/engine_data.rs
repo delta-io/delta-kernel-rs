@@ -1,10 +1,14 @@
 //! EngineData related ffi code
 
 #[cfg(feature = "default-engine-base")]
+use delta_kernel::arrow;
+#[cfg(feature = "default-engine-base")]
 use delta_kernel::arrow::array::{
     ffi::{FFI_ArrowArray, FFI_ArrowSchema},
-    ArrayData, StructArray,
+    ArrayData, RecordBatch, StructArray,
 };
+#[cfg(feature = "default-engine-base")]
+use delta_kernel::engine::arrow_data::ArrowEngineData;
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::DeltaResult;
 use delta_kernel::EngineData;
@@ -82,7 +86,7 @@ pub unsafe extern "C" fn get_raw_arrow_data(
 fn get_raw_arrow_data_impl(data: Box<dyn EngineData>) -> DeltaResult<*mut ArrowFFIData> {
     let record_batch: delta_kernel::arrow::array::RecordBatch = data
         .into_any()
-        .downcast::<delta_kernel::engine::arrow_data::ArrowEngineData>()
+        .downcast::<ArrowEngineData>()
         .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
         .into();
     let sa: StructArray = record_batch.into();
@@ -92,4 +96,36 @@ fn get_raw_arrow_data_impl(data: Box<dyn EngineData>) -> DeltaResult<*mut ArrowF
     let schema = FFI_ArrowSchema::try_from(array_data.data_type())?;
     let ret_data = Box::new(ArrowFFIData { array, schema });
     Ok(Box::leak(ret_data))
+}
+
+/// Creates engine data from Arrow C Data Interface array and schema.
+///
+/// Converts the provided Arrow C Data Interface array and schema into delta-kernel's internal
+/// engine data format. Note that ownership of the array is transferred to the kernel, whereas the
+/// ownership of the schema stays the engine's.
+///
+/// # Safety
+/// - `array` must be a valid FFI_ArrowArray
+/// - `schema` must be a valid pointer to a FFI_ArrowSchema
+/// - `engine` must be a valid Handle to a SharedExternEngine
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn get_engine_data(
+    array: FFI_ArrowArray,
+    schema: &FFI_ArrowSchema,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveEngineData>> {
+    get_engine_data_impl(array, schema).into_extern_result(&engine.as_ref())
+}
+
+#[cfg(feature = "default-engine-base")]
+unsafe fn get_engine_data_impl(
+    array: FFI_ArrowArray,
+    schema: &FFI_ArrowSchema,
+) -> DeltaResult<Handle<ExclusiveEngineData>> {
+    let array_data = unsafe { arrow::array::ffi::from_ffi(array, schema) };
+    let record_batch: RecordBatch = StructArray::from(array_data?).into();
+    let arrow_engine_data: ArrowEngineData = record_batch.into();
+    let engine_data: Box<dyn EngineData> = Box::new(arrow_engine_data);
+    Ok(engine_data.into())
 }
