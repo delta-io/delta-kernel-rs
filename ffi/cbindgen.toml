@@ -8,9 +8,11 @@ pragma_once = true
 
 # only applies to Cxx
 namespace = "ffi"
+cpp_compat = true
 
 [defines]
 "feature = default-engine" = "DEFINE_DEFAULT_ENGINE"
+"feature = default-engine-rustls" = "DEFINE_DEFAULT_ENGINE_RUSTLS"
 
 [export.mangle]
 remove_underscores = true
