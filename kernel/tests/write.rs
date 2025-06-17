@@ -27,10 +27,9 @@ use serde_json::Deserializer;
 
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 
-use test_utils::{create_table, engine_store_setup, setup_test_tables};
+use test_utils::{create_table, engine_store_setup, setup_test_tables, test_read};
 
 mod common;
-use test_utils::test_read;
 use url::Url;
 
 #[tokio::test]
@@ -44,7 +43,8 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
         DataType::INTEGER,
     )]));
 
-    for (table_url, engine, store, table_name) in setup_test_tables(schema, &[]).await? {
+    for (table_url, engine, store, table_name) in setup_test_tables(schema, &[],  None, "test_table").await? {
+
         // create a transaction
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
         let txn = snapshot.transaction()?.with_engine_info("default engine");
@@ -379,7 +379,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     )]));
 
     for (table_url, engine, store, table_name) in
-        setup_test_tables(table_schema.clone(), &[partition_col]).await?
+        setup_test_tables(table_schema.clone(), &[partition_col], None, "test_table").await?
     {
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
         let mut txn = snapshot.transaction()?.with_engine_info("default engine");
@@ -515,7 +515,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
         DataType::STRING,
     )]));
 
-    for (table_url, engine, _store, _table_name) in setup_test_tables(table_schema, &[]).await? {
+    for (table_url, engine, _store, _table_name) in setup_test_tables(table_schema, &[],  None, "test_table").await? {
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
@@ -570,7 +570,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         DataType::INTEGER,
     )]));
 
-    for (table_url, engine, store, table_name) in setup_test_tables(schema, &[]).await? {
+    for (table_url, engine, store, table_name) in setup_test_tables(schema, &[], None, "test_table").await? {
         // can't have duplicate app_id in same transaction
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
         assert!(matches!(
@@ -698,7 +698,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
         DataType::TIMESTAMP_NTZ,
     )]));
 
-    let (store, engine, table_location) = engine_store_setup("test_table_timestamp_ntz", true);
+    let (store, engine, table_location) = engine_store_setup("test_table_timestamp_ntz", None);
     let table_url = create_table(
         store.clone(),
         table_location,
