@@ -1,17 +1,14 @@
 //! This module holds functionality for managing transactions.
 mod write_context;
-use write_context::{free_write_context, get_write_context, get_write_path, get_write_schema};
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::unwrap_and_parse_path_as_url;
 use crate::KernelStringSlice;
-use crate::{free_engine, free_schema};
-use crate::{kernel_string_slice, ExclusiveEngineData, SharedExternEngine};
 use crate::{DeltaResult, ExternEngine, Table, Url};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
-use std::sync::Arc;
+use crate::{ExclusiveEngineData, SharedExternEngine};
 
 #[handle_descriptor(target=Transaction, mutable=true, sized=true)]
 pub struct ExclusiveTransaction;
@@ -125,7 +122,12 @@ mod tests {
 
     use delta_kernel_ffi::tests::{get_default_engine, ok_or_panic};
 
+    use write_context::{free_write_context, get_write_context, get_write_path, get_write_schema};
+    use crate::{free_engine, free_schema, kernel_string_slice};
+
     use test_utils::{setup_test_tables, test_read};
+
+    use std::sync::Arc;
 
     use super::*;
 
