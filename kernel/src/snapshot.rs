@@ -76,13 +76,7 @@ impl Snapshot {
         let storage = engine.storage_handler();
         let log_root = table_root.join("_delta_log/")?;
 
-        // Read the last checkpoint if possible: if it returns an error, return None and log a
-        // warning.
-        let checkpoint_hint = read_last_checkpoint(storage.as_ref(), &log_root)
-            .inspect_err(|e| {
-                warn!("Could not read _last_checkpoint file: {e}");
-            })
-            .ok();
+        let checkpoint_hint = read_last_checkpoint(storage.as_ref(), &log_root)?;
 
         let log_segment =
             LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_hint, version)?;
@@ -393,22 +387,30 @@ pub(crate) struct LastCheckpointHint {
     pub(crate) checksum: Option<String>,
 }
 
-/// Try reading the `_last_checkpoint` file. Note that this file is optional and may not exist -
-/// causing this function to return an Err.
+/// Try reading the `_last_checkpoint` file.
 ///
 /// Note that we typically want to ignore a missing/invalid `_last_checkpoint` file without failing
-/// the read. Thus, callers should likely not just propagate the error, but instead log a warning.
+/// the read. Thus, the semantics of this function are to return `None` if the file is not found or
+/// is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and are assumed to
+/// cause failure.
+// TODO: weird that we propagate FileNotFound as part of the iterator instead of top-level
+// result coming from storage.read_files
 fn read_last_checkpoint(
     storage: &dyn StorageHandler,
     log_root: &Url,
-) -> DeltaResult<LastCheckpointHint> {
+) -> DeltaResult<Option<LastCheckpointHint>> {
     let file_path = log_root.join(LAST_CHECKPOINT_FILE_NAME)?;
-    let last_checkpoint_data = storage
-        .read_files(vec![(file_path, None)])?
-        .next()
-        .ok_or_else(|| Error::generic("_last_checkpoint file is empty"))?;
-    serde_json::from_slice(&last_checkpoint_data?)
-        .map_err(|e| Error::Generic(format!("invalid _last_checkpoint JSON: {e}")))
+    match storage.read_files(vec![(file_path, None)])?.next() {
+        Some(Ok(data)) => Ok(serde_json::from_slice(&data)
+            .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
+            .ok()),
+        Some(Err(Error::FileNotFound(_))) => Ok(None),
+        Some(Err(err)) => Err(err),
+        None => {
+            warn!("empty _last_checkpoint file");
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -805,8 +807,8 @@ mod tests {
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
-        let cp = read_last_checkpoint(&storage, &url);
-        assert!(matches!(cp, Err(Error::FileNotFound(_))));
+        let cp = read_last_checkpoint(&storage, &url).unwrap();
+        assert!(cp.is_none());
     }
 
     fn valid_last_checkpoint() -> Vec<u8> {
@@ -840,9 +842,9 @@ mod tests {
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
         let url = Url::parse("memory:///valid/").expect("valid url");
-        let valid = read_last_checkpoint(&storage, &url);
+        let valid = read_last_checkpoint(&storage, &url).expect("read last checkpoint");
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = read_last_checkpoint(&storage, &url);
+        let invalid = read_last_checkpoint(&storage, &url).expect("read last checkpoint");
         let expected = LastCheckpointHint {
             version: 1,
             size: 8,
@@ -853,8 +855,7 @@ mod tests {
             checksum: None,
         };
         assert_eq!(valid.unwrap(), expected);
-        assert!(matches!(invalid, Err(Error::Generic(msg))
-                if msg == "invalid _last_checkpoint JSON: expected value at line 1 column 1"));
+        assert!(invalid.is_none());
     }
 
     #[test_log::test]
