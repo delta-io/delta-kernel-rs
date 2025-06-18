@@ -1,17 +1,17 @@
 //! EngineData related ffi code
 
-#[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
+#[cfg(feature = "default-engine-base")]
 use delta_kernel::arrow::array::{
     ffi::{FFI_ArrowArray, FFI_ArrowSchema},
     ArrayData, StructArray,
 };
-#[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
+#[cfg(feature = "default-engine-base")]
 use delta_kernel::DeltaResult;
 use delta_kernel::EngineData;
 use std::ffi::c_void;
 
 use crate::ExclusiveEngineData;
-#[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
+#[cfg(feature = "default-engine-base")]
 use crate::{ExternResult, IntoExternResult, SharedExternEngine};
 
 use super::handle::Handle;
@@ -51,7 +51,7 @@ unsafe fn get_raw_engine_data_impl(data: &mut Handle<ExclusiveEngineData>) -> &m
 /// Struct to allow binding to the arrow [C Data
 /// Interface](https://arrow.apache.org/docs/format/CDataInterface.html). This includes the data and
 /// the schema.
-#[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
+#[cfg(feature = "default-engine-base")]
 #[repr(C)]
 pub struct ArrowFFIData {
     pub array: FFI_ArrowArray,
@@ -66,7 +66,7 @@ pub struct ArrowFFIData {
 /// # Safety
 /// data_handle must be a valid ExclusiveEngineData as read by the
 /// [`delta_kernel::engine::default::DefaultEngine`] obtained from `get_default_engine`.
-#[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
+#[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn get_raw_arrow_data(
     data: Handle<ExclusiveEngineData>,
@@ -78,7 +78,7 @@ pub unsafe extern "C" fn get_raw_arrow_data(
 }
 
 // TODO: This method leaks the returned pointer memory. How will the engine free it?
-#[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
+#[cfg(feature = "default-engine-base")]
 fn get_raw_arrow_data_impl(data: Box<dyn EngineData>) -> DeltaResult<*mut ArrowFFIData> {
     let record_batch: delta_kernel::arrow::array::RecordBatch = data
         .into_any()

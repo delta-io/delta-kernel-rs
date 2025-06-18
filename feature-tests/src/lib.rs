@@ -7,7 +7,7 @@
 ///
 /// These run in our build CI.
 pub fn test_default_engine_feature_flags() {
-    #[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
+    #[cfg(feature = "default-engine-base")]
     {
         #[allow(unused_imports)]
         use delta_kernel::engine::default::DefaultEngine;
