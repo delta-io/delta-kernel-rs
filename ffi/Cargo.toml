@@ -38,8 +38,13 @@ trybuild = "1.0"
 
 [features]
 default = ["default-engine"]
-default-engine = ["delta_kernel/default-engine", "delta_kernel/arrow"]
-default-engine-rustls = ["delta_kernel/default-engine-rustls", "delta_kernel/arrow"]
+default-engine = ["delta_kernel/default-engine", "default-engine-base"]
+default-engine-rustls = ["delta_kernel/default-engine-rustls", "default-engine-base"]
+
+# this is an 'internal' feature flag which has all the shared bits from default-engine and
+# default-engine-rustls
+default-engine-base = ["delta_kernel/default-engine-base", "delta_kernel/arrow"]
+
 tracing = [ "tracing-core", "tracing-subscriber" ]
 internal-api = []
 test-ffi = []
