@@ -18,7 +18,7 @@ use url::Url;
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
 
-pub(crate) static WRITE_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new(vec![
         StructField::not_null("path", DataType::STRING),
         StructField::not_null(
@@ -31,11 +31,14 @@ pub(crate) static WRITE_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| 
     ]))
 });
 
-/// Get the expected schema for engine data passed to [`add_write_metadata`].
+/// This function specifies the schema for the add_files metadata (and soon remove_files metadata).
+/// Concretely, it is the expected schema for engine data passed to [`add_files`].
 ///
-/// [`add_write_metadata`]: crate::transaction::Transaction::add_write_metadata
-pub fn get_write_metadata_schema() -> &'static SchemaRef {
-    &WRITE_METADATA_SCHEMA
+/// Each row represents metadata about a file to be added to the table.
+///
+/// [`add_files`]: crate::transaction::Transaction::add_files
+pub fn add_files_schema() -> &'static SchemaRef {
+    &ADD_FILES_SCHEMA
 }
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
@@ -56,7 +59,7 @@ pub struct Transaction {
     read_snapshot: Arc<Snapshot>,
     operation: Option<String>,
     commit_info: Option<Arc<dyn EngineData>>,
-    write_metadata: Vec<Box<dyn EngineData>>,
+    add_files_metadata: Vec<Box<dyn EngineData>>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
     // HashSet::insert drops the to-be-inserted value without returning the existing one, which
@@ -104,7 +107,7 @@ impl Transaction {
             read_snapshot,
             operation: None,
             commit_info: None,
-            write_metadata: vec![],
+            add_files_metadata: vec![],
             set_transactions: vec![],
             commit_timestamp,
         })
@@ -145,7 +148,7 @@ impl Transaction {
             self.commit_timestamp,
             engine_commit_info.as_ref(),
         );
-        let add_actions = generate_adds(engine, self.write_metadata.iter().map(|a| a.as_ref()));
+        let add_actions = generate_adds(engine, self.add_files_metadata.iter().map(|a| a.as_ref()));
 
         let actions = iter::once(commit_info_actions)
             .chain(add_actions)
@@ -227,37 +230,38 @@ impl Transaction {
         WriteContext::new(target_dir.clone(), snapshot_schema, logical_to_physical)
     }
 
-    /// Add write metadata about files to include in the transaction. This API can be called
-    /// multiple times to add multiple batches.
+    /// Add files to include in this transaction. This API generally enables the engine to
+    /// add/append/insert data (files) to the table. Note that this API can be called multiple times
+    /// to add multiple batches.
     ///
-    /// The expected schema for `write_metadata` is given by [`get_write_metadata_schema`].
-    pub fn add_write_metadata(&mut self, write_metadata: Box<dyn EngineData>) {
-        self.write_metadata.push(write_metadata);
+    /// The expected schema for `add_metadata` is given by [`add_files_schema`].
+    pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
+        self.add_files_metadata.push(add_metadata);
     }
 }
 
-// convert write_metadata into add actions using an expression to transform the data in a single
+// convert add_files_metadata into add actions using an expression to transform the data in a single
 // pass
 fn generate_adds<'a>(
     engine: &dyn Engine,
-    write_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
+    add_files_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
 ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a {
     let evaluation_handler = engine.evaluation_handler();
-    let write_metadata_schema = get_write_metadata_schema();
+    let add_files_schema = add_files_schema();
     let log_schema = get_log_add_schema();
 
-    write_metadata.map(move |write_metadata_batch| {
+    add_files_metadata.map(move |add_files_batch| {
         let adds_expr = Expression::struct_from([Expression::struct_from(
-            write_metadata_schema
+            add_files_schema
                 .fields()
                 .map(|f| Expression::column([f.name()])),
         )]);
         let adds_evaluator = evaluation_handler.new_expression_evaluator(
-            write_metadata_schema.clone(),
+            add_files_schema.clone(),
             adds_expr,
             log_schema.clone().into(),
         );
-        adds_evaluator.evaluate(write_metadata_batch)
+        adds_evaluator.evaluate(add_files_batch)
     })
 }
 
@@ -715,8 +719,8 @@ mod tests {
     }
 
     #[test]
-    fn test_write_metadata_schema() {
-        let schema = get_write_metadata_schema();
+    fn test_add_files_schema() {
+        let schema = add_files_schema();
         let expected = StructType::new(vec![
             StructField::not_null("path", DataType::STRING),
             StructField::not_null(
