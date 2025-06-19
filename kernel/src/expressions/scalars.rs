@@ -565,8 +565,6 @@ impl PrimitiveType {
     pub fn parse_scalar(&self, raw: &str) -> Result<Scalar, Error> {
         use PrimitiveType::*;
 
-        println!("RAW: {raw:?}");
-
         if raw.is_empty() {
             return Ok(Scalar::Null(self.data_type()));
         }
