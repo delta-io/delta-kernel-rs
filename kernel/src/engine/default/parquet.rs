@@ -265,7 +265,28 @@ impl FileOpener for ParquetOpener {
 
         Ok(Box::pin(async move {
             #[cfg(feature = "arrow-55")]
-            let mut reader = ParquetObjectReader::new(store, path);
+            let mut reader = {
+                use crate::object_store::ObjectStoreScheme;
+                // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
+                // request which isn't supported by Azure. For now we just detect if the URL is
+                // pointing to azure and if so, do a HEAD request so we can pass in file size to the
+                // reader which will cause the reader to avoid a suffix range request.
+                // see also: https://github.com/delta-io/delta-kernel-rs/issues/968
+                //
+                // TODO(#1010): Note that we don't need this at all and can actually just _always_
+                // do the `with_file_size` but need to (1) update our unit tests which often
+                // hardcode size=0 and (2) update CDF execute which also hardcodes size=0.
+                if let Ok((ObjectStoreScheme::MicrosoftAzure, _)) =
+                    ObjectStoreScheme::parse(&file_meta.location)
+                {
+                    // also note doing HEAD then actual GET isn't atomic, and leaves us vulnerable
+                    // to file changing between the two calls.
+                    let meta = store.head(&path).await?;
+                    ParquetObjectReader::new(store, path).with_file_size(meta.size)
+                } else {
+                    ParquetObjectReader::new(store, path)
+                }
+            };
             #[cfg(all(feature = "arrow-54", not(feature = "arrow-55")))]
             let mut reader = {
                 // TODO avoid IO by converting passed file meta to ObjectMeta (no longer an issue
