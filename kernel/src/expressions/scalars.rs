@@ -565,13 +565,19 @@ impl PrimitiveType {
     pub fn parse_scalar(&self, raw: &str) -> Result<Scalar, Error> {
         use PrimitiveType::*;
 
+        println!("RAW: {raw:?}");
+
         if raw.is_empty() {
             return Ok(Scalar::Null(self.data_type()));
         }
 
         match self {
             String => Ok(Scalar::String(raw.to_string())),
-            Binary => Ok(Scalar::Binary(raw.to_string().into_bytes())),
+            Binary => Ok(Scalar::Binary(
+                raw.chars()
+                    .map(|c| c.try_into().map_err(|_| Error::CharOutOfRange(c)))
+                    .try_collect()?,
+            )),
             Byte => self.parse_str_as_scalar(raw, Scalar::Byte),
             Decimal(dtype) => Self::parse_decimal(raw, *dtype),
             Short => self.parse_str_as_scalar(raw, Scalar::Short),
@@ -691,8 +697,9 @@ impl PrimitiveType {
 mod tests {
     use std::f32::consts::PI;
 
+    use crate::actions::visitors::AddVisitor;
     use crate::expressions::{column_expr, BinaryPredicateOp};
-    use crate::{Expression as Expr, Predicate as Pred};
+    use crate::{Expression as Expr, Predicate as Pred, RowVisitor};
 
     use super::*;
 
@@ -976,6 +983,49 @@ mod tests {
         // assert that NULL values are incomparable
         let null = Scalar::Null(DataType::INTEGER);
         assert_eq!(null.partial_cmp(&null), None);
+    }
+
+    #[test]
+    fn test_parse_binary() {
+        use crate::arrow::array::StringArray;
+        use crate::utils::test_utils::parse_json_batch;
+        // we use the add visitor to test here since this is the way encoded binary strings will
+        // actually be read in practice.
+        // note: two high surrogates (i.e. "\uD800\uD801") cause the arrow json handler to panic :(
+        // See: https://github.com/apache/arrow-rs/issues/7712
+        let json_strings: StringArray = vec![
+            r#"{"add":{"path":"x.parquet","partitionValues":{"binary":"\u0001\u0002\u0003"},"size":452,"modificationTime":1670892998135,"dataChange":true}}"#,
+            r#"{"add":{"path":"x.parquet","partitionValues":{"binary":"\u00FF\u0000\u003A"},"size":452,"modificationTime":1670892998135,"dataChange":true}}"#,
+            r#"{"add":{"path":"x.parquet","partitionValues":{"binary":"\u0100"},"size":452,"modificationTime":1670892998135,"dataChange":true}}"#,
+            r#"{"add":{"path":"x.parquet","partitionValues":{"binary":"\u0000\u0100"},"size":452,"modificationTime":1670892998135,"dataChange":true}}"#,
+            r#"{"add":{"path":"x.parquet","partitionValues":{"binary":"\uFFFF\u0000"},"size":452,"modificationTime":1670892998135,"dataChange":true}}"#,
+            r#"{"add":{"path":"x.parquet","partitionValues":{"binary":"\uD800\uD801"},"size":452,"modificationTime":1670892998135,"dataChange":true}}"#,
+        ].into();
+        let batch = parse_json_batch(json_strings);
+        let mut add_visitor = AddVisitor::default();
+        add_visitor.visit_rows_of(batch.as_ref()).unwrap();
+        for (test_add, expected) in add_visitor.adds.into_iter().zip([
+            Ok(Scalar::Binary(vec![1, 2, 3])),
+            Ok(Scalar::Binary(vec![0xFF, 0x00, 0x3A])),
+            Err('\u{0100}'),
+            Err('Ā'),
+            Err('\u{FFFF}'),
+            Err('\u{10000}'),
+        ]) {
+            let binary_str = test_add.partition_values.get("binary").unwrap();
+            let scalar_res = PrimitiveType::Binary.parse_scalar(binary_str);
+            match expected {
+                Ok(expected_scalar) => assert_eq!(scalar_res.unwrap(), expected_scalar),
+                Err(expected_err_char) => {
+                    let err = scalar_res.unwrap_err();
+                    if let Error::CharOutOfRange(c) = err {
+                        assert_eq!(c, expected_err_char)
+                    } else {
+                        panic!("Got wrong error: {err}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

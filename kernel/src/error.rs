@@ -152,6 +152,10 @@ pub enum Error {
     #[error("Could not parse int: {0}")]
     ParseIntError(#[from] ParseIntError),
 
+    /// Could not convert an escaped json char to u8
+    #[error("{0} is out of range for conversion to binary")]
+    CharOutOfRange(char),
+
     #[error("Invalid column mapping mode: {0}")]
     InvalidColumnMappingMode(String),
 
