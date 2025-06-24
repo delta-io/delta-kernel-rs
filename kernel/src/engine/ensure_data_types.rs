@@ -44,7 +44,7 @@ struct EnsureDataTypes {
 }
 
 /// Capture the compatibility between two data-types, as passed to [`ensure_data_types`]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub(crate) enum DataTypeCompat {
     /// The two types are the same
     Identical,
