@@ -1,4 +1,7 @@
 //! Various utility functions/macros used throughout the kernel
+use crate::table_properties::TableProperties;
+use crate::{DeltaResult, Error};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// convenient way to return an error if a condition isn't true
 macro_rules! require {
@@ -10,6 +13,29 @@ macro_rules! require {
 }
 
 pub(crate) use require;
+
+/// Calculates the transaction expiration timestamp based on table properties.
+/// Returns None if set_transaction_retention_duration is not set.
+pub(crate) fn calculate_transaction_expiration_timestamp(
+    table_properties: &TableProperties,
+) -> DeltaResult<Option<i64>> {
+    table_properties
+        .set_transaction_retention_duration
+        .map(|duration| -> DeltaResult<i64> {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| Error::generic(format!("Failed to get current time: {}", e)))?;
+
+            let now_ms = i64::try_from(now.as_millis())
+                .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))?;
+
+            let expiration_ms = i64::try_from(duration.as_millis())
+                .map_err(|_| Error::generic("Retention duration exceeds i64 millisecond range"))?;
+
+            Ok(now_ms - expiration_ms)
+        })
+        .transpose()
+}
 
 #[cfg(test)]
 pub(crate) mod test_utils {

@@ -13,6 +13,7 @@ use crate::schema::{Schema, SchemaRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
+use crate::utils::calculate_transaction_expiration_timestamp;
 use crate::{DeltaResult, Engine, Error, StorageHandler, Version};
 use delta_kernel_derive::internal_api;
 
@@ -333,7 +334,7 @@ impl Snapshot {
         ScanBuilder::new(self)
     }
 
-    /// Fetch the latest version of the provided `application_id` for this snapshot.
+    /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the txn based on the SetTransactionRetentionDuration property and lastUpdated
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
@@ -342,7 +343,14 @@ impl Snapshot {
         application_id: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
-        let txn = SetTransactionScanner::get_one(self.log_segment(), application_id, engine)?;
+        let expiration_timestamp =
+            calculate_transaction_expiration_timestamp(self.table_properties())?;
+        let txn = SetTransactionScanner::get_one(
+            self.log_segment(),
+            application_id,
+            engine,
+            expiration_timestamp,
+        )?;
         Ok(txn.map(|t| t.version))
     }
 
