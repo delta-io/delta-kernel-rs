@@ -7,7 +7,8 @@ use itertools::Itertools;
 
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::{DeltaResult, Error, PredicateRef, Table, Version};
+use delta_kernel::table_changes::TableChanges;
+use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
 
 use test_utils::DefaultEngineExtension;
 
@@ -24,9 +25,14 @@ fn read_cdf_for_table(
 ) -> DeltaResult<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
     let test_path = test_dir.path().join(test_name.as_ref());
-    let table = Table::try_from_uri(test_path.to_str().expect("table path to string")).unwrap();
+    let test_path = delta_kernel::try_parse_uri(test_path.to_str().expect("table path to string"))?;
     let engine = DefaultEngine::new_local();
-    let table_changes = table.table_changes(engine.as_ref(), start_version, end_version)?;
+    let table_changes = TableChanges::try_new(
+        test_path,
+        engine.as_ref(),
+        start_version,
+        end_version.into(),
+    )?;
 
     // Project out the commit timestamp since file modification time may change anytime git clones
     // or switches branches

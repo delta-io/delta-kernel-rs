@@ -17,7 +17,7 @@ use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::{DeltaResult, Engine, EngineData, Table};
+use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::executor::TaskExecutor;
@@ -223,7 +223,7 @@ pub async fn create_table(
     partition_columns: &[&str],
     use_37_protocol: bool,
     enable_timestamp_without_timezone: bool,
-) -> Result<Table, Box<dyn std::error::Error>> {
+) -> Result<Url, Box<dyn std::error::Error>> {
     let table_id = "test_id";
     let schema = serde_json::to_string(&schema)?;
 
@@ -280,7 +280,7 @@ pub async fn create_table(
     store
         .put(&Path::from_url_path(path.path())?, data.into())
         .await?;
-    Ok(Table::new(table_path))
+    Ok(table_path)
 }
 
 /// Creates two empty test tables, one with 3/7 protocol and one with 1/1 protocol
@@ -289,7 +289,7 @@ pub async fn setup_test_tables(
     partition_columns: &[&str],
 ) -> Result<
     Vec<(
-        Table,
+        Url,
         DefaultEngine<TokioBackgroundExecutor>,
         Arc<dyn ObjectStore>,
         &'static str,
@@ -359,10 +359,10 @@ pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<Record
 // TODO (zach): this is listed as unused for acceptance crate
 pub fn test_read(
     expected: &ArrowEngineData,
-    table: &Table,
+    url: &Url,
     engine: Arc<dyn Engine>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = table.snapshot(engine.as_ref(), None)?;
+    let snapshot = Snapshot::try_new(url.clone(), engine.as_ref(), None)?;
     let scan = snapshot.into_scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;
     let formatted = pretty_format_batches(&batches).unwrap().to_string();
