@@ -334,7 +334,7 @@ impl Snapshot {
         ScanBuilder::new(self)
     }
 
-    /// Fetch the latest version of the provided `application_id` for this snapshot.
+    /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the txn based on the SetTransactionRetentionDuration property and lastUpdated
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all

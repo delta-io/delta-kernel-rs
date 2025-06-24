@@ -371,7 +371,7 @@ impl CheckpointVisitor<'_> {
     /// Processes a potential txn action to determine if it should be included in the checkpoint.
     ///
     /// Returns Ok(true) if the row contains a valid txn action.
-    /// Returns Ok(false) if the row doesn't contain a txn action or is a duplicate.
+    /// Returns Ok(false) if the row doesn't contain a txn action or is a duplicate or is expired.
     /// Returns Err(...) if there was an error processing the action.
     fn check_txn_action<'a>(
         &mut self,
