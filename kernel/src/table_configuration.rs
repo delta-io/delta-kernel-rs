@@ -32,9 +32,8 @@ use delta_kernel_derive::internal_api;
 /// to validate that Metadata and Protocol are correctly formatted and mutually compatible. If
 /// `try_new` successfully returns `TableConfiguration`, it is also guaranteed that reading the
 /// table is supported.
-#[internal_api]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TableConfiguration {
+pub struct TableConfiguration {
     metadata: Metadata,
     protocol: Protocol,
     schema: SchemaRef,
@@ -64,7 +63,7 @@ impl TableConfiguration {
     ///     - Column mapping is the only legacy feature present in kernel. No future delta versions
     ///       will introduce new legacy features.
     /// See: <https://github.com/delta-io/delta-kernel-rs/issues/650>
-    pub(crate) fn try_new(
+    pub fn try_new(
         metadata: Metadata,
         protocol: Protocol,
         table_root: Url,

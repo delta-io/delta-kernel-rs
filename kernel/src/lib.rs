@@ -106,6 +106,8 @@ pub mod path;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod path;
 
+pub use path::ParsedLogPath;
+
 #[cfg(feature = "internal-api")]
 pub mod log_replay;
 #[cfg(not(feature = "internal-api"))]
@@ -115,6 +117,8 @@ pub(crate) mod log_replay;
 pub mod log_segment;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod log_segment;
+
+pub use log_segment::LogSegment;
 
 #[cfg(feature = "internal-api")]
 pub mod history_manager;

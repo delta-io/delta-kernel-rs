@@ -55,30 +55,30 @@ impl std::fmt::Debug for Snapshot {
 }
 
 impl Snapshot {
-    fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
+    pub fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
         Self {
             log_segment,
             table_configuration,
         }
     }
 
-    /// Create a new [`Snapshot`] instance for the given version by parsing the given uri string.
-    ///
-    /// # Parameters
-    ///
-    /// - `table_root`: string-encoded URI pointing at the table root (where `_delta_log` folder is
-    ///   located)
-    /// - `engine`: Implementation of [`Engine`] apis.
-    /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
-    ///   version of the table.
-    pub fn try_from_uri(
-        uri: impl AsRef<str>,
-        engine: &dyn Engine,
-        version: Option<Version>,
-    ) -> DeltaResult<Self> {
-        let url = try_parse_uri(uri)?;
-        Self::try_new(url, engine, version)
-    }
+    // /// Create a new [`Snapshot`] instance for the given version by parsing the given uri string.
+    // ///
+    // /// # Parameters
+    // ///
+    // /// - `table_root`: string-encoded URI pointing at the table root (where `_delta_log` folder is
+    // ///   located)
+    // /// - `engine`: Implementation of [`Engine`] apis.
+    // /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
+    // ///   version of the table.
+    // pub fn try_from_uri(
+    //     uri: impl AsRef<str>,
+    //     engine: &dyn Engine,
+    //     version: Option<Version>,
+    // ) -> DeltaResult<Self> {
+    //     let url = try_parse_uri(uri)?;
+    //     Self::try_new(url, engine, version)
+    // }
 
     /// Create a new [`Snapshot`] instance for the given version.
     ///
@@ -88,18 +88,18 @@ impl Snapshot {
     /// - `engine`: Implementation of [`Engine`] apis.
     /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
     ///   version of the table.
-    pub fn try_new(
+    pub(crate) fn try_new(
         table_root: Url,
         engine: &dyn Engine,
         version: Option<Version>,
     ) -> DeltaResult<Self> {
+        // FIXME: should remove this in future, for now just powering CDF, must check
+        // catalogManaged = false
+
         let storage = engine.storage_handler();
         let log_root = table_root.join("_delta_log/")?;
 
-        let checkpoint_hint = read_last_checkpoint(storage.as_ref(), &log_root)?;
-
-        let log_segment =
-            LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_hint, version)?;
+        let log_segment = LogSegment::for_snapshot(storage.as_ref(), log_root, vec![], version)?;
 
         // try_new_from_log_segment will ensure the protocol is supported
         Self::try_new_from_log_segment(table_root, log_segment, engine)
@@ -130,6 +130,8 @@ impl Snapshot {
         engine: &dyn Engine,
         version: impl Into<Option<Version>>,
     ) -> DeltaResult<Arc<Self>> {
+        // FIXME: need to make this do log tail
+        // for now just disallow catalogManaged tables
         let old_log_segment = &existing_snapshot.log_segment;
         let old_version = existing_snapshot.version();
         let new_version = version.into();
@@ -427,7 +429,8 @@ pub(crate) struct LastCheckpointHint {
 /// cause failure.
 ///
 /// TODO: java kernel retries three times before failing, should we do the same?
-fn read_last_checkpoint(
+// TODO: move to log segment
+pub(crate) fn read_last_checkpoint(
     storage: &dyn StorageHandler,
     log_root: &Url,
 ) -> DeltaResult<Option<LastCheckpointHint>> {
