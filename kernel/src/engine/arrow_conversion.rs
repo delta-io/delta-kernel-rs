@@ -9,6 +9,7 @@ use crate::arrow::datatypes::{
 use crate::arrow::error::ArrowError;
 use itertools::Itertools;
 
+use crate::engine::arrow_utils::variant_arrow_type;
 use crate::error::Error;
 use crate::schema::{
     ArrayType, DataType, MapType, MetadataValue, PrimitiveType, StructField, StructType,
@@ -148,6 +149,7 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                     PrimitiveType::TimestampNtz => {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
+                    PrimitiveType::Variant => Ok(variant_arrow_type()),
                 }
             }
             DataType::Struct(s) => Ok(ArrowDataType::Struct(

@@ -133,6 +133,7 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
                 Self::decimal_from_bytes(b.min_bytes_opt(), *d)?
             }
             (Decimal(..), _) => return None,
+            (Variant, _) => return None,
         };
         Some(value)
     }
@@ -179,6 +180,7 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
                 Self::decimal_from_bytes(b.max_bytes_opt(), *d)?
             }
             (Decimal(..), _) => return None,
+            (Variant, _) => return None,
         };
         Some(value)
     }

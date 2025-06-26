@@ -624,6 +624,8 @@ impl PrimitiveType {
                     _ => unreachable!(),
                 }
             }
+            // Scalar Variant is not supported yet.
+            Variant => Err(self.parse_error(raw)),
         }
     }
 
@@ -845,6 +847,16 @@ mod tests {
         expect_fail_parse("0.999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999", 1, 0);
         // scale will be too small to fit in i8
         expect_fail_parse("0.E170141183460469231731687303715884105727", 1, 0);
+    }
+
+    #[test]
+    fn test_variant_expect_fail() {
+        let s = PrimitiveType::Variant;
+        let res = s.parse_scalar("1");
+        assert!(
+            res.is_err(),
+            "Variant scalar works even though it is not supposed to."
+        );
     }
 
     #[test]
