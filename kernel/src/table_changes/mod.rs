@@ -147,11 +147,14 @@ impl TableChanges {
             end_version,
         )?;
 
+        // FIXME: block catalogManaged here
+
         // Both snapshots ensure that reading is supported at the start and end version using
         // `ensure_read_supported`. Note that we must still verify that reading is
         // supported for every protocol action in the CDF range.
         let start_snapshot = Arc::new(Snapshot::try_new(
             table_root.as_url().clone(),
+            vec![],
             engine,
             Some(start_version),
         )?);

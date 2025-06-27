@@ -8,9 +8,8 @@ use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::table_configuration::TableConfiguration;
 use delta_kernel::FileMeta;
-use delta_kernel::LogSegment;
 use delta_kernel::Snapshot;
-use delta_kernel::{Engine, ParsedLogPath, Version};
+use delta_kernel::{ParsedLogPath, Version};
 
 use url::Url;
 
@@ -223,20 +222,11 @@ fn setup_test() -> Result<Arc<DefaultEngine<TokioBackgroundExecutor>>, Box<dyn s
 // - this is super verbose
 
 #[test]
-fn test_catalog_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+fn test_path_snapshot() -> Result<(), Box<dyn std::error::Error>> {
     let engine = setup_test()?;
     let table_root = Url::parse("memory:///test_table/")?;
 
-    let log_segment =
-        LogSegment::try_new_latest(engine.storage_handler().as_ref(), table_root.clone())?;
-
-    // if the catalog didn't track P+M+version, would have to do PM query on LogSegment:
-    let (metadata, protocol) = log_segment.read_metadata(engine.as_ref())?;
-    let version = log_segment.version();
-
-    let table_configuration = TableConfiguration::try_new(metadata, protocol, table_root, version)?;
-
-    let snapshot = Snapshot::new(log_segment, table_configuration);
+    let snapshot = Snapshot::try_new(table_root, vec![], engine.as_ref(), None)?;
 
     // now we have the usual kernel APIs
     let scan = snapshot.into_scan_builder().build()?;
@@ -249,21 +239,21 @@ fn test_catalog_snapshot() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn test_catalog_pm_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+fn test_catalog_snapshot() -> Result<(), Box<dyn std::error::Error>> {
     let engine = setup_test()?;
     let table_root = Url::parse("memory:///test_table")?;
 
     let (protocol, metadata, version, log_files) = mock_catalog_get_table()?;
 
-    let log_segment = LogSegment::try_new_catalog(
-        engine.storage_handler().as_ref(),
-        table_root.clone(),
-        log_files,
-        Some(version),
-    )?;
-    let table_configuration = TableConfiguration::try_new(metadata, protocol, table_root, version)?;
+    let table_configuration =
+        TableConfiguration::try_new(metadata, protocol, table_root.clone(), version)?;
 
-    let snapshot = Snapshot::new(log_segment, table_configuration);
+    let snapshot = Snapshot::try_new_from_metadata(
+        table_root,
+        log_files,
+        engine.as_ref(),
+        table_configuration,
+    )?;
 
     // now we have the usual kernel APIs
     let scan = snapshot.into_scan_builder().build()?;

@@ -118,8 +118,6 @@ pub mod log_segment;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod log_segment;
 
-pub use log_segment::LogSegment;
-
 #[cfg(feature = "internal-api")]
 pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]

@@ -41,7 +41,7 @@ mod tests;
 ///
 /// [`Snapshot`]: crate::snapshot::Snapshot
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LogSegment {
+pub(crate) struct LogSegment {
     pub(crate) end_version: Version,
     pub(crate) checkpoint_version: Option<Version>,
     pub(crate) log_root: Url,
@@ -56,36 +56,6 @@ pub struct LogSegment {
 }
 
 impl LogSegment {
-    pub fn try_new_latest(storage: &dyn StorageHandler, table_root: Url) -> DeltaResult<Self> {
-        Self::try_new_path(storage, table_root, None)
-    }
-    pub fn try_new_at(
-        storage: &dyn StorageHandler,
-        table_root: Url,
-        version: Version,
-    ) -> DeltaResult<Self> {
-        Self::try_new_path(storage, table_root, Some(version))
-    }
-    pub fn try_new_catalog(
-        storage: &dyn StorageHandler,
-        table_root: Url,
-        log_tail: Vec<ParsedLogPath>,
-        version: Option<Version>,
-    ) -> DeltaResult<Self> {
-        let log_root = table_root.join("_delta_log/")?;
-        Self::for_snapshot(storage, log_root, log_tail, version)
-    }
-
-    fn try_new_path(
-        storage: &dyn StorageHandler,
-        table_root: Url,
-        version: Option<Version>,
-    ) -> DeltaResult<Self> {
-        let log_root = table_root.join("_delta_log/")?;
-        // TODO: verify no catalogManaged feature
-        Self::for_snapshot(storage, log_root, vec![], version)
-    }
-
     pub(crate) fn try_new(
         listed_files: ListedLogFiles,
         log_root: Url,
