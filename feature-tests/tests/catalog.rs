@@ -6,9 +6,8 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::object_store::memory::InMemory;
-use delta_kernel::table_configuration::TableConfiguration;
 use delta_kernel::FileMeta;
-use delta_kernel::Snapshot;
+use delta_kernel::SnapshotBuilder;
 use delta_kernel::{ParsedLogPath, Version};
 
 use url::Url;
@@ -226,7 +225,7 @@ fn test_path_snapshot() -> Result<(), Box<dyn std::error::Error>> {
     let engine = setup_test()?;
     let table_root = Url::parse("memory:///test_table/")?;
 
-    let snapshot = Snapshot::try_new(table_root, vec![], engine.as_ref(), None)?;
+    let snapshot = SnapshotBuilder::new_latest(table_root).build_snapshot(engine.as_ref())?;
 
     // now we have the usual kernel APIs
     let scan = snapshot.into_scan_builder().build()?;
@@ -245,15 +244,12 @@ fn test_catalog_snapshot() -> Result<(), Box<dyn std::error::Error>> {
 
     let (protocol, metadata, version, log_files) = mock_catalog_get_table()?;
 
-    let table_configuration =
-        TableConfiguration::try_new(metadata, protocol, table_root.clone(), version)?;
-
-    let snapshot = Snapshot::try_new_from_metadata(
-        table_root,
-        log_files,
-        engine.as_ref(),
-        table_configuration,
-    )?;
+    // FIXME: passing version twice - gross
+    let snapshot = SnapshotBuilder::new_at(table_root, version)
+        .with_log_tail(log_files)
+        .build_metadata(protocol, metadata, version)?
+        .build_snapshot(engine.as_ref())?;
+    // could have also done .build_metadata if we only wanted metadata for e.g. Transaction
 
     // now we have the usual kernel APIs
     let scan = snapshot.into_scan_builder().build()?;

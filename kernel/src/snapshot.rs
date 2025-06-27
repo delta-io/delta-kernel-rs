@@ -55,7 +55,7 @@ impl std::fmt::Debug for Snapshot {
 }
 
 impl Snapshot {
-    fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
+    pub(crate) fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
         Self {
             log_segment,
             table_configuration,
@@ -88,7 +88,7 @@ impl Snapshot {
     /// - `engine`: Implementation of [`Engine`] apis.
     /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
     ///   version of the table.
-    pub fn try_new(
+    pub(crate) fn try_new(
         table_root: Url,
         log_tail: Vec<ParsedLogPath>,
         engine: &dyn Engine,
@@ -101,20 +101,6 @@ impl Snapshot {
 
         // try_new_from_log_segment will ensure the protocol is supported
         Self::try_new_from_log_segment(table_root, log_segment, engine)
-    }
-
-    pub fn try_new_from_metadata(
-        table_root: Url,
-        log_tail: Vec<ParsedLogPath>,
-        engine: &dyn Engine,
-        table_configuration: TableConfiguration,
-    ) -> DeltaResult<Self> {
-        let storage = engine.storage_handler();
-        let log_root = table_root.join("_delta_log/")?;
-
-        let log_segment = LogSegment::for_snapshot(storage.as_ref(), log_root, log_tail, None)?;
-
-        Ok(Self::new(log_segment, table_configuration))
     }
 
     /// Create a new [`Snapshot`] instance from an existing [`Snapshot`]. This is useful when you

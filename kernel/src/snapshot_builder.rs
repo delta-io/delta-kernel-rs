@@ -15,36 +15,27 @@ enum SnapshotVersion {
     At(Version),
 }
 
-pub struct SnapshotBuilder<S: State> {
+pub struct SnapshotBuilder {
     table_root: Url,
     log_tail: Vec<ParsedLogPath>,
     target_version: SnapshotVersion,
-    state: S,
 }
 
-struct Empty {}
-struct Pmv {
-    // TODO: consider read/write generics or latest/time travel generic
+pub struct ResolvedMetadata {
+    table_root: Url,
+    log_tail: Vec<ParsedLogPath>,
     table_config: TableConfiguration,
-    // optional log segment included here since we may 'end up' with a log segment on our way to
-    // producing a Snapshot (e.g. if we do our own PM replay)
-    log_segment: Option<LogSegment>,
 }
-
-trait State {}
-impl State for Empty {}
-impl State for Pmv {}
 
 // concern: where to do catalogManaged check? how does the engine say "yes I went to the catalog
 // before building this snapshot"?
 
-impl SnapshotBuilder<Empty> {
+impl SnapshotBuilder {
     pub fn new_at(table_root: Url, version: Version) -> Self {
         Self {
             table_root,
             log_tail: Vec::new(),
             target_version: SnapshotVersion::At(version),
-            state: Empty {},
         }
     }
 
@@ -54,75 +45,63 @@ impl SnapshotBuilder<Empty> {
             table_root,
             log_tail: Vec::new(),
             target_version: SnapshotVersion::Latest,
-            state: Empty {},
         }
     }
 
-    // if you know PM @ version
-    pub fn resolve_table_metadata(self, engine: &dyn Engine) -> DeltaResult<SnapshotBuilder<Pmv>> {
+    // FIXME: don't like this
+    pub fn with_log_tail(mut self, log_tail: Vec<ParsedLogPath>) -> Self {
+        self.log_tail = log_tail;
+        self
+    }
+
+    // if you don't know PM @ version -> get back Snapshot
+    // note this does (maybe)LIST + PM replay
+    pub fn build_snapshot(self, engine: &dyn Engine) -> DeltaResult<Snapshot> {
         let version = match self.target_version {
             SnapshotVersion::Latest => None,
             SnapshotVersion::At(v) => Some(v),
         };
+        Snapshot::try_new(self.table_root, self.log_tail, engine, version)
+    }
+
+    // if you know PM @ version -> get back ResolvedMetadata (which you can then call
+    // resolve_snapshot() on)
+    //
+    // skips PM replay
+    pub fn build_metadata(
+        self,
+        protocol: Protocol,
+        metadata: Metadata,
+        version: Version,
+    ) -> DeltaResult<ResolvedMetadata> {
+        // FIXME: if target version is present it must match version here
+        // OR we could remove version here and then just require that a version exists when you
+        // call this API
+
+        // TODO: fix table_root duplication
+        Ok(ResolvedMetadata {
+            table_root: self.table_root.clone(),
+            log_tail: self.log_tail,
+            table_config: TableConfiguration::try_new(
+                metadata,
+                protocol,
+                self.table_root,
+                version,
+            )?,
+        })
+    }
+}
+
+impl ResolvedMetadata {
+    // just does LIST (no PM replay)
+    pub fn build_snapshot(self, engine: &dyn Engine) -> DeltaResult<Snapshot> {
         let log_root = self.table_root.join("_delta_log/")?;
         let log_segment = LogSegment::for_snapshot(
             engine.storage_handler().as_ref(),
             log_root,
             self.log_tail,
-            version,
+            self.table_config.version(),
         )?;
-        let resolved_version = log_segment.end_version;
-        let (metadata, protocol) = log_segment.read_metadata(engine)?;
-        Ok(SnapshotBuilder {
-            table_root: self.table_root.clone(),
-            log_tail: self.log_tail,
-            // FIXME: remove - no target ver, resolved version
-            target_version: SnapshotVersion::At(resolved_version),
-            state: Pmv {
-                table_config: TableConfiguration::try_new(
-                    metadata,
-                    protocol,
-                    self.table_root,
-                    resolved_version,
-                )?,
-                log_segment: Some(log_segment),
-            },
-        })
-    }
-
-    // if you know PM @ version
-    pub fn with_protocol_metadata_version(
-        self,
-        protocol: Protocol,
-        metadata: Metadata,
-        version: Version,
-    ) -> DeltaResult<SnapshotBuilder<Pmv>> {
-        // FIXME: if target version is present it must match version here
-        // OR we could remove version here and then just require that a version exists when you
-        // call this API
-
-        // TODO: make transition helper
-        // TODO: fix table_root duplication
-        Ok(SnapshotBuilder {
-            table_root: self.table_root.clone(),
-            log_tail: self.log_tail,
-            target_version: Some(SnapshotVersion::At(version)),
-            state: Pmv {
-                table_config: TableConfiguration::try_new(
-                    metadata,
-                    protocol,
-                    self.table_root,
-                    version,
-                )?,
-                log_segment: None,
-            },
-        })
-    }
-}
-
-impl<S: State> SnapshotBuilder<S> {
-    pub fn with_log_tail(mut self, log_tail: Vec<ParsedLogPath>) -> Self {
-        self.log_tail = log_tail;
-        self
+        Ok(Snapshot::new(log_segment, self.table_config))
     }
 }
