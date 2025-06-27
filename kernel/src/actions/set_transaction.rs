@@ -100,7 +100,7 @@ mod tests {
     use super::*;
     use crate::engine::sync::SyncEngine;
     use crate::utils::test_utils::parse_json_batch;
-    use crate::Table;
+    use crate::Snapshot;
 
     use crate::arrow::array::StringArray;
     use itertools::Itertools;
@@ -113,8 +113,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
 
-        let table = Table::new(url);
-        let snapshot = table.snapshot(&engine, None).unwrap();
+        let snapshot = Snapshot::try_new(url, &engine, None).unwrap();
         let log_segment = snapshot.log_segment();
 
         (
@@ -164,8 +163,7 @@ mod tests {
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = SyncEngine::new();
 
-        let table = Table::new(url);
-        let snapshot = table.snapshot(&engine, None).unwrap();
+        let snapshot = Snapshot::try_new(url, &engine, None).unwrap();
         let log_segment = snapshot.log_segment();
 
         // The checkpoint has five parts, each containing one action. There are two app ids.
@@ -182,8 +180,7 @@ mod tests {
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = SyncEngine::new();
 
-        let table = Table::new(url);
-        let snapshot = table.snapshot(&engine, None).unwrap();
+        let snapshot = Snapshot::try_new(url, &engine, None).unwrap();
         let log_segment = snapshot.log_segment();
 
         // Test with no retention (should get all transactions)

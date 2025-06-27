@@ -81,7 +81,7 @@ pub mod expressions;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
-pub mod table;
+pub mod snapshot_builder;
 pub mod table_changes;
 pub mod table_configuration;
 pub mod table_features;
@@ -95,6 +95,9 @@ pub use arrow_compat::*;
 pub mod kernel_predicates;
 pub(crate) mod utils;
 
+#[cfg(feature = "internal-api")]
+pub use utils::try_parse_uri;
+
 // for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
 // macros, and so will not format the files associated with these modules if we get too clever. see:
 // https://github.com/rust-lang/rustfmt/issues/3253
@@ -103,6 +106,8 @@ pub(crate) mod utils;
 pub mod path;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod path;
+
+pub use path::ParsedLogPath;
 
 #[cfg(feature = "internal-api")]
 pub mod log_replay;
@@ -123,7 +128,8 @@ pub use delta_kernel_derive;
 pub use engine_data::{EngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
-pub use table::Table;
+pub use snapshot::Snapshot;
+pub use snapshot_builder::SnapshotBuilder;
 
 use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
