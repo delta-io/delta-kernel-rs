@@ -58,6 +58,8 @@ pub(crate) struct CheckpointLogReplayProcessor {
     seen_txns: HashSet<String>,
     /// Minimum timestamp for file retention, used for filtering expired tombstones.
     minimum_file_retention_timestamp: i64,
+    /// Transaction expiration timestamp for filtering old transactions
+    txn_expiration_timestamp: Option<i64>,
 }
 
 /// This struct is the output of the [`CheckpointLogReplayProcessor`].
@@ -106,6 +108,7 @@ impl LogReplayProcessor for CheckpointLogReplayProcessor {
             self.seen_protocol,
             self.seen_metadata,
             &mut self.seen_txns,
+            self.txn_expiration_timestamp,
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
@@ -132,13 +135,17 @@ impl LogReplayProcessor for CheckpointLogReplayProcessor {
 }
 
 impl CheckpointLogReplayProcessor {
-    pub(crate) fn new(minimum_file_retention_timestamp: i64) -> Self {
+    pub(crate) fn new(
+        minimum_file_retention_timestamp: i64,
+        txn_expiration_timestamp: Option<i64>,
+    ) -> Self {
         Self {
             seen_file_keys: Default::default(),
             seen_protocol: false,
             seen_metadata: false,
             seen_txns: Default::default(),
             minimum_file_retention_timestamp,
+            txn_expiration_timestamp,
         }
     }
 }
@@ -205,6 +212,8 @@ pub(crate) struct CheckpointVisitor<'seen> {
     // Set of transaction IDs to deduplicate by appId
     // This set has O(N) memory usage where N = number of txn actions with unique appIds
     seen_txns: &'seen mut HashSet<String>,
+    /// Transaction expiration timestamp for filtering old transactions
+    txn_expiration_timestamp: Option<i64>,
 }
 
 #[allow(unused)]
@@ -222,6 +231,7 @@ impl CheckpointVisitor<'_> {
     const PROTOCOL_MIN_READER_VERSION: &'static str = "protocol.minReaderVersion";
     const METADATA_ID: &'static str = "metaData.id";
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new<'seen>(
         seen_file_keys: &'seen mut HashSet<FileActionKey>,
         is_log_batch: bool,
@@ -230,6 +240,7 @@ impl CheckpointVisitor<'_> {
         seen_protocol: bool,
         seen_metadata: bool,
         seen_txns: &'seen mut HashSet<String>,
+        txn_expiration_timestamp: Option<i64>,
     ) -> CheckpointVisitor<'seen> {
         CheckpointVisitor {
             deduplicator: FileActionDeduplicator::new(
@@ -247,6 +258,7 @@ impl CheckpointVisitor<'_> {
             seen_protocol,
             seen_metadata,
             seen_txns,
+            txn_expiration_timestamp,
         }
     }
 
@@ -359,13 +371,28 @@ impl CheckpointVisitor<'_> {
     /// Processes a potential txn action to determine if it should be included in the checkpoint.
     ///
     /// Returns Ok(true) if the row contains a valid txn action.
-    /// Returns Ok(false) if the row doesn't contain a txn action or is a duplicate.
+    /// Returns Ok(false) if the row doesn't contain a txn action or is a duplicate or is expired.
     /// Returns Err(...) if there was an error processing the action.
-    fn check_txn_action<'a>(&mut self, i: usize, getter: &'a dyn GetData<'a>) -> DeltaResult<bool> {
+    fn check_txn_action<'a>(
+        &mut self,
+        i: usize,
+        getter: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<bool> {
         // Check for txn field
-        let Some(app_id) = getter.get_str(i, "txn.appId")? else {
+        let Some(app_id) = getter[11].get_str(i, "txn.appId")? else {
             return Ok(false); // Not a txn action
         };
+
+        // Check retention if last_updated is present
+        if let Some(retention_ts) = self.txn_expiration_timestamp {
+            if let Some(last_updated) = getter[12].get_opt(i, "txn.lastUpdated")? {
+                if i64::le(&last_updated, &retention_ts) {
+                    // Transaction is old, exclude it from checkpoint
+                    return Ok(false);
+                }
+            }
+            // Note: transactions without last_updated are kept for backward compatibility
+        }
 
         // If the app ID already exists in the set, the insertion will return false,
         // indicating that this is a duplicate.
@@ -396,7 +423,7 @@ impl CheckpointVisitor<'_> {
         // The `||` operator short-circuits the evaluation, so if any of the checks return true,
         // the rest will not be evaluated.
         let is_valid = self.check_file_action(i, getters)?
-            || self.check_txn_action(i, getters[11])?
+            || self.check_txn_action(i, getters)?
             || self.check_protocol_action(i, getters[10])?
             || self.check_metadata_action(i, getters[9])?;
 
@@ -435,6 +462,7 @@ impl RowVisitor for CheckpointVisitor<'_> {
                 (STRING, column_name!("metaData.id")),
                 (INTEGER, column_name!("protocol.minReaderVersion")),
                 (STRING, column_name!("txn.appId")),
+                (LONG, column_name!("txn.lastUpdated")),
             ];
             let (types, names) = types_and_names.into_iter().unzip();
             (names, types).into()
@@ -444,7 +472,7 @@ impl RowVisitor for CheckpointVisitor<'_> {
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 12,
+            getters.len() == 13,
             Error::InternalError(format!(
                 "Wrong number of visitor getters: {}",
                 getters.len()
@@ -479,7 +507,7 @@ mod tests {
     fn run_checkpoint_test(
         input_batches: Vec<ActionsBatch>,
     ) -> DeltaResult<(Vec<FilteredEngineData>, i64, i64)> {
-        let processed_batches: Vec<_> = CheckpointLogReplayProcessor::new(0)
+        let processed_batches: Vec<_> = CheckpointLogReplayProcessor::new(0, None)
             .process_actions_iter(input_batches.into_iter().map(Ok))
             .try_collect()?;
         let total_count: i64 = processed_batches.iter().map(|b| b.actions_count).sum();
@@ -504,6 +532,7 @@ mod tests {
             false,
             false,
             &mut seen_txns,
+            None,
         );
 
         visitor.visit_rows_of(data.as_ref())?;
@@ -558,6 +587,7 @@ mod tests {
             false,
             false,
             &mut seen_txns,
+            None,
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -588,6 +618,7 @@ mod tests {
             false,
             false,
             &mut seen_txns,
+            None,
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -626,6 +657,7 @@ mod tests {
             false,
             false,
             &mut seen_txns,
+            None,
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -660,6 +692,7 @@ mod tests {
             true,           // The visior has already seen a protocol action
             true,           // The visitor has already seen a metadata action
             &mut seen_txns, // Pre-populated transaction
+            None,
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -697,6 +730,7 @@ mod tests {
             false,
             false,
             &mut seen_txns,
+            None,
         );
 
         visitor.visit_rows_of(batch.as_ref())?;
@@ -821,6 +855,92 @@ mod tests {
         assert_eq!(results[1].selection_vector, vec![false, false, true]);
         assert_eq!(actions_count, 3);
         assert_eq!(add_actions, 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_visitor_txn_retention() -> DeltaResult<()> {
+        let json_strings: StringArray = vec![
+            // Transaction with old timestamp (should be filtered)
+            r#"{"txn":{"appId":"app1","version":1,"lastUpdated":100}}"#,
+            // Transaction with recent timestamp (should be kept)
+            r#"{"txn":{"appId":"app2","version":2,"lastUpdated":2000}}"#,
+            // Transaction without lastUpdated (should be kept)
+            r#"{"txn":{"appId":"app3","version":3}}"#,
+            // Transaction exactly at expiration timestamp (should be filtered)
+            r#"{"txn":{"appId":"app4","version":4,"lastUpdated":1000}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+
+        let mut seen_file_keys = HashSet::new();
+        let mut seen_txns = HashSet::new();
+        let mut visitor = CheckpointVisitor::new(
+            &mut seen_file_keys,
+            true,
+            vec![true; 4],
+            0,
+            false,
+            false,
+            &mut seen_txns,
+            Some(1000), // expiration timestamp
+        );
+
+        visitor.visit_rows_of(batch.as_ref())?;
+
+        // app1 and app4 should be filtered out (too old)
+        // app2 and app3 should be kept
+        let expected = vec![false, true, true, false];
+        assert_eq!(visitor.selection_vector, expected);
+        assert_eq!(visitor.actions_count, 2);
+        assert_eq!(visitor.seen_txns.len(), 2);
+        assert!(visitor.seen_txns.contains("app2"));
+        assert!(visitor.seen_txns.contains("app3"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_actions_iter_with_txn_retention() -> DeltaResult<()> {
+        // Test that transaction retention works across multiple batches
+        let batch1 = vec![
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"test1","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{},"createdTime":1670892997849}}"#,
+            // Old transaction
+            r#"{"txn":{"appId":"old_app","version":1,"lastUpdated":100}}"#,
+            // Recent transaction
+            r#"{"txn":{"appId":"new_app","version":2,"lastUpdated":2000}}"#,
+        ];
+
+        let batch2 = vec![
+            // Transaction without lastUpdated
+            r#"{"txn":{"appId":"timeless_app","version":3}}"#,
+            // Another old transaction
+            r#"{"txn":{"appId":"another_old","version":4,"lastUpdated":500}}"#,
+        ];
+
+        let input_batches = vec![create_batch(batch1)?, create_batch(batch2)?];
+
+        // Create processor with txn expiration timestamp
+        let processor = CheckpointLogReplayProcessor::new(0, Some(1000));
+        let results: Vec<_> = processor
+            .process_actions_iter(input_batches.into_iter().map(Ok))
+            .try_collect()?;
+
+        // Verify results
+        assert_eq!(results.len(), 2);
+
+        // First batch: protocol, metadata, and one recent txn (old_app filtered out)
+        assert_eq!(
+            results[0].filtered_data.selection_vector,
+            vec![true, true, false, true]
+        );
+        assert_eq!(results[0].actions_count, 3);
+
+        // Second batch: timeless_app kept, another_old filtered out
+        assert_eq!(results[1].filtered_data.selection_vector, vec![true, false]);
+        assert_eq!(results[1].actions_count, 1);
 
         Ok(())
     }
