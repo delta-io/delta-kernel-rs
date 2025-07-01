@@ -175,7 +175,7 @@ fn try_main() -> DeltaResult<()> {
     let (mut scan_file_tx, scan_file_rx) = spmc::channel();
 
     // fire up each thread. they will be automatically joined at the end due to the scope
-    thread::scope(|s| -> DeltaResult<()> {
+    thread::scope(|s| {
         (0..cli.thread_count).for_each(|_| {
             // items that we need to send to the other thread
             let scan_state = Arc::new(ScanState {
@@ -223,7 +223,6 @@ fn try_main() -> DeltaResult<()> {
             // simply gather up all batches
             record_batch_rx.iter().collect()
         };
-
         print_batches(&batches)?;
         Ok(())
     })
