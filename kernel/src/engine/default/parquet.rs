@@ -137,8 +137,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         // fail if path does not end with a trailing slash
         if !path.path().ends_with('/') {
             return Err(Error::generic(format!(
-                "Path must end with a trailing slash: {}",
-                path
+                "Path must end with a trailing slash: {path}"
             )));
         }
         let path = path.join(&name)?;

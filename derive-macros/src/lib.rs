@@ -241,7 +241,7 @@ fn make_public(mut item: Item) -> Item {
         // foreign mod, impl block, and all others not handled
         _ => Err(Error::new(
             item.span(),
-            format!("unsupported item type for #[internal_api]: {:?}", item),
+            format!("unsupported item type for #[internal_api]: {item:?}"),
         )),
     };
 

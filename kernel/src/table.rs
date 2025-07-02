@@ -54,14 +54,13 @@ impl Table {
                     )));
                 }
                 let path = std::fs::canonicalize(path).map_err(|err| {
-                    let msg = format!("Invalid table location: {} Error: {:?}", uri, err);
+                    let msg = format!("Invalid table location: {uri} Error: {err:?}");
                     Error::InvalidTableLocation(msg)
                 })?;
                 Url::from_directory_path(path.clone()).map_err(|_| {
                     let msg = format!(
-                        "Could not construct a URL from canonicalized path: {:?}.\n\
-                         Something must be very wrong with the table path.",
-                        path
+                        "Could not construct a URL from canonicalized path: {path:?}.\n\
+                         Something must be very wrong with the table path."
                     );
                     Error::InvalidTableLocation(msg)
                 })?
