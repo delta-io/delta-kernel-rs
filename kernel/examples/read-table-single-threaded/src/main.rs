@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
-use common::CommonArgs;
+use common::{LocationArgs, ScanArgs};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::DeltaResult;
 
@@ -21,7 +21,10 @@ struct Cli {
     // for consistency with the multi-threaded version and to make it easy to add unique options in
     // the future
     #[command(flatten)]
-    common_args: CommonArgs,
+    location_args: LocationArgs,
+
+    #[command(flatten)]
+    scan_args: ScanArgs,
 }
 
 fn main() -> ExitCode {
@@ -37,15 +40,17 @@ fn main() -> ExitCode {
 
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
-
-    let (scan, engine) = match common::get_scan(&cli.common_args)? {
-        Some((scan, engine)) => (scan, Arc::new(engine)),
+    let table = common::get_table(&cli.location_args)?;
+    let engine = common::get_engine(&table, &cli.location_args)?;
+    let scan = match common::get_scan(&table, &engine, &cli.scan_args)? {
+        Some(scan) => scan,
         None => return Ok(()),
     };
 
+    let mut rows_so_far = 0;
     let batches: Vec<RecordBatch> = scan
-        .execute(engine)?
-        .map(|scan_result| -> DeltaResult<_> {
+        .execute(Arc::new(engine))?
+        .map(|scan_result| -> DeltaResult<Option<_>> {
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();
             let data = scan_result.raw_data?;
@@ -54,13 +59,35 @@ fn try_main() -> DeltaResult<()> {
                 .downcast::<ArrowEngineData>()
                 .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
                 .into();
-            if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
+            let batch = if let Some(mask) = mask {
+                filter_record_batch(&record_batch, &mask.into())?
             } else {
-                Ok(record_batch)
+                record_batch
+            };
+            if let Some(limit) = cli.scan_args.limit {
+                let batch_rows = batch.num_rows();
+                let final_batch = if rows_so_far < limit {
+                    let batch = if rows_so_far + batch_rows > limit {
+                        // truncate this batch
+                        common::truncate_batch(batch, limit - rows_so_far)
+                    } else {
+                        batch
+                    };
+                    Ok(Some(batch))
+                } else {
+                    Ok(None)
+                };
+                rows_so_far += batch_rows;
+                final_batch
+            } else {
+                Ok(Some(batch))
             }
         })
+        .flatten_ok()
         .try_collect()?;
+    if let Some(limit) = cli.scan_args.limit {
+        println!("Printing first {limit} rows of {rows_so_far} total rows");
+    }
     print_batches(&batches)?;
     Ok(())
 }
