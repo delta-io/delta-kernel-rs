@@ -50,9 +50,6 @@ pub fn get_engine(
     table: &Table,
     args: &LocationArgs,
 ) -> DeltaResult<DefaultEngine<TokioBackgroundExecutor>> {
-    // build a table and get the latest snapshot from it
-    println!("Reading {}", table.location());
-
     let mut options = if let Some(ref region) = args.region {
         HashMap::from([("region", region.clone())])
     } else {
