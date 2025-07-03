@@ -1,7 +1,10 @@
+/// Common code to be shared between all examples. Mostly argument parsing, and a few other
+/// utilities
 use std::{collections::HashMap, sync::Arc};
 
 use clap::Args;
 use delta_kernel::{
+    arrow::array::RecordBatch,
     engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine},
     scan::Scan,
     schema::Schema,
@@ -9,16 +12,9 @@ use delta_kernel::{
 };
 
 #[derive(Args)]
-pub struct CommonArgs {
+pub struct LocationArgs {
     /// Path to the table to inspect
     pub path: String,
-
-    // /// how many threads to read with (1 - 2048)
-    // #[arg(short, long, default_value_t = 2, value_parser = 1..=2048)]
-    // thread_count: i64,
-    /// Comma separated list of columns to select
-    #[arg(long, value_delimiter=',', num_args(0..))]
-    pub columns: Option<Vec<String>>,
 
     /// Region to specify to the cloud access store (only applies if using the default engine)
     #[arg(long)]
@@ -29,7 +25,10 @@ pub struct CommonArgs {
     /// to the aws metadata server, which will fail unless you're on an ec2 instance.
     #[arg(long)]
     pub public: bool,
+}
 
+#[derive(Args)]
+pub struct ScanArgs {
     /// Limit to printing only LIMIT rows.
     #[arg(short, long)]
     pub limit: Option<usize>,
@@ -37,15 +36,21 @@ pub struct CommonArgs {
     /// Only print the schema of the table
     #[arg(long)]
     pub schema_only: bool,
+
+    /// Comma separated list of columns to select
+    #[arg(long, value_delimiter=',', num_args(0..))]
+    pub columns: Option<Vec<String>>,
 }
 
-/// Utility function to take in the specified `CommonArgs` and configure a scan as
-/// specified. Returns the constructed engine and scan
-pub fn get_scan(
-    args: &CommonArgs,
-) -> DeltaResult<Option<(Scan, DefaultEngine<TokioBackgroundExecutor>)>> {
+pub fn get_table(args: &LocationArgs) -> DeltaResult<Table> {
+    Table::try_from_uri(&args.path)
+}
+
+pub fn get_engine(
+    table: &Table,
+    args: &LocationArgs,
+) -> DeltaResult<DefaultEngine<TokioBackgroundExecutor>> {
     // build a table and get the latest snapshot from it
-    let table = Table::try_from_uri(&args.path)?;
     println!("Reading {}", table.location());
 
     let mut options = if let Some(ref region) = args.region {
@@ -56,13 +61,21 @@ pub fn get_scan(
     if args.public {
         options.insert("skip_signature", "true".to_string());
     }
-    let engine = DefaultEngine::try_new(
+    DefaultEngine::try_new(
         table.location(),
         options,
         Arc::new(TokioBackgroundExecutor::new()),
-    )?;
+    )
+}
 
-    let snapshot = table.snapshot(&engine, None)?;
+/// Utility function to take in the specified `CommonArgs` and configure a scan as
+/// specified. Returns the constructed engine and scan
+pub fn get_scan(
+    table: &Table,
+    engine: &DefaultEngine<TokioBackgroundExecutor>,
+    args: &ScanArgs,
+) -> DeltaResult<Option<Scan>> {
+    let snapshot = table.snapshot(engine, None)?;
 
     if args.schema_only {
         println!("{:#?}", snapshot.schema());
@@ -85,11 +98,20 @@ pub fn get_scan(
             Schema::try_new(selected_fields).map(Arc::new)
         })
         .transpose()?;
-    Ok(Some((
+    Ok(Some(
         snapshot
             .into_scan_builder()
             .with_schema_opt(read_schema_opt)
             .build()?,
-        engine,
-    )))
+    ))
+}
+
+/// truncate a `RecordBatch` to the specified number of rows
+pub fn truncate_batch(batch: RecordBatch, rows: usize) -> RecordBatch {
+    let cols = batch
+        .columns()
+        .iter()
+        .map(|col| col.slice(0, rows))
+        .collect();
+    RecordBatch::try_new(batch.schema(), cols).unwrap()
 }

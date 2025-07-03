@@ -7,7 +7,7 @@ use std::thread;
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
-use common::CommonArgs;
+use common::{LocationArgs, ScanArgs};
 use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
@@ -25,7 +25,10 @@ use url::Url;
 #[command(propagate_version = true)]
 struct Cli {
     #[command(flatten)]
-    common_args: CommonArgs,
+    location_args: LocationArgs,
+
+    #[command(flatten)]
+    scan_args: ScanArgs,
 
     /// how many threads to read with (1 - 2048)
     #[arg(short, long, default_value_t = 2, value_parser = 1..=2048)]
@@ -61,16 +64,6 @@ fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
         .into())
 }
 
-// truncate a batch to the specified number of rows
-fn truncate_batch(batch: RecordBatch, rows: usize) -> RecordBatch {
-    let cols = batch
-        .columns()
-        .iter()
-        .map(|col| col.slice(0, rows))
-        .collect();
-    RecordBatch::try_new(batch.schema(), cols).unwrap()
-}
-
 // This is the callback that will be called for each valid scan row
 fn send_scan_file(
     scan_tx: &mut spmc::Sender<ScanFile>,
@@ -98,9 +91,10 @@ struct ScanState {
 
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
-
-    let (scan, engine) = match common::get_scan(&cli.common_args)? {
-        Some((scan, engine)) => (scan, engine),
+    let table = common::get_table(&cli.location_args)?;
+    let engine = common::get_engine(&table, &cli.location_args)?;
+    let scan = match common::get_scan(&table, &engine, &cli.scan_args)? {
+        Some(scan) => scan,
         None => return Ok(()),
     };
 
@@ -144,7 +138,7 @@ fn try_main() -> DeltaResult<()> {
 
         drop(scan_file_tx);
 
-        let batches = if let Some(limit) = cli.common_args.limit {
+        let batches = if let Some(limit) = cli.scan_args.limit {
             // gather batches while we need
             let mut batches = vec![];
             let mut rows_so_far = 0;
@@ -153,7 +147,7 @@ fn try_main() -> DeltaResult<()> {
                 if rows_so_far < limit {
                     if rows_so_far + batch_rows > limit {
                         // truncate this batch
-                        batch = truncate_batch(batch, limit - rows_so_far);
+                        batch = common::truncate_batch(batch, limit - rows_so_far);
                     }
                     batches.push(batch);
                 }
