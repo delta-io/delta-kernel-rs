@@ -1,15 +1,12 @@
-use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
+use common::{LocationArgs, ScanArgs};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::schema::Schema;
-use delta_kernel::{DeltaResult, Table};
+use delta_kernel::DeltaResult;
 
 use clap::Parser;
 use itertools::Itertools;
@@ -20,26 +17,14 @@ use itertools::Itertools;
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
-    /// Path to the table to inspect
-    path: String,
+    // today we don't have any args unique to this version, but we keep this as flattened this way
+    // for consistency with the multi-threaded version and to make it easy to add unique options in
+    // the future
+    #[command(flatten)]
+    location_args: LocationArgs,
 
-    /// Comma separated list of columns to select
-    #[arg(long, value_delimiter=',', num_args(0..))]
-    columns: Option<Vec<String>>,
-
-    /// Region to specify to the cloud access store (only applies if using the default engine)
-    #[arg(long)]
-    region: Option<String>,
-
-    /// Specify that the table is "public" (i.e. no cloud credentials are needed). This is required
-    /// for things like s3 public buckets, otherwise the kernel will try and authenticate by talking
-    /// to the aws metadata server, which will fail unless you're on an ec2 instance.
-    #[arg(long)]
-    public: bool,
-
-    /// Only print the schema of the table
-    #[arg(long)]
-    schema_only: bool,
+    #[command(flatten)]
+    scan_args: ScanArgs,
 }
 
 fn main() -> ExitCode {
@@ -55,55 +40,18 @@ fn main() -> ExitCode {
 
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
-
-    // build a table and get the latest snapshot from it
-    let table = Table::try_from_uri(&cli.path)?;
+    let table = common::get_table(&cli.location_args)?;
     println!("Reading {}", table.location());
-
-    let mut options = if let Some(region) = cli.region {
-        HashMap::from([("region", region)])
-    } else {
-        HashMap::new()
+    let engine = common::get_engine(&table, &cli.location_args)?;
+    let scan = match common::get_scan(&table, &engine, &cli.scan_args)? {
+        Some(scan) => scan,
+        None => return Ok(()),
     };
-    if cli.public {
-        options.insert("skip_signature", "true".to_string());
-    }
-    let engine = Arc::new(DefaultEngine::try_new(
-        table.location(),
-        options,
-        Arc::new(TokioBackgroundExecutor::new()),
-    )?);
 
-    let snapshot = table.snapshot(engine.as_ref(), None)?;
-
-    if cli.schema_only {
-        println!("{:#?}", snapshot.schema());
-        return Ok(());
-    }
-
-    let read_schema_opt = cli
-        .columns
-        .map(|cols| -> DeltaResult<_> {
-            let table_schema = snapshot.schema();
-            let selected_fields = cols.iter().map(|col| {
-                table_schema
-                    .field(col)
-                    .cloned()
-                    .ok_or(delta_kernel::Error::Generic(format!(
-                        "Table has no such column: {col}"
-                    )))
-            });
-            Schema::try_new(selected_fields).map(Arc::new)
-        })
-        .transpose()?;
-    let scan = snapshot
-        .into_scan_builder()
-        .with_schema_opt(read_schema_opt)
-        .build()?;
-
+    let mut rows_so_far = 0;
     let batches: Vec<RecordBatch> = scan
-        .execute(engine)?
-        .map(|scan_result| -> DeltaResult<_> {
+        .execute(Arc::new(engine))?
+        .map(|scan_result| -> DeltaResult<Option<_>> {
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();
             let data = scan_result.raw_data?;
@@ -112,13 +60,35 @@ fn try_main() -> DeltaResult<()> {
                 .downcast::<ArrowEngineData>()
                 .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
                 .into();
-            if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
+            let batch = if let Some(mask) = mask {
+                filter_record_batch(&record_batch, &mask.into())?
             } else {
-                Ok(record_batch)
+                record_batch
+            };
+            if let Some(limit) = cli.scan_args.limit {
+                let batch_rows = batch.num_rows();
+                let final_batch = if rows_so_far < limit {
+                    let batch = if rows_so_far + batch_rows > limit {
+                        // truncate this batch
+                        common::truncate_batch(batch, limit - rows_so_far)
+                    } else {
+                        batch
+                    };
+                    Ok(Some(batch))
+                } else {
+                    Ok(None)
+                };
+                rows_so_far += batch_rows;
+                final_batch
+            } else {
+                Ok(Some(batch))
             }
         })
+        .flatten_ok()
         .try_collect()?;
+    if let Some(limit) = cli.scan_args.limit {
+        println!("Printing first {limit} rows of {rows_so_far} total rows");
+    }
     print_batches(&batches)?;
     Ok(())
 }
