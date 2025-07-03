@@ -92,6 +92,7 @@ struct ScanState {
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
     let table = common::get_table(&cli.location_args)?;
+    println!("Reading {}", table.location());
     let engine = common::get_engine(&table, &cli.location_args)?;
     let scan = match common::get_scan(&table, &engine, &cli.scan_args)? {
         Some(scan) => scan,
