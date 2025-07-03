@@ -1,11 +1,12 @@
 //! Some utilities for working with arrow data types
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::ensure_data_types::DataTypeCompat;
+use crate::schema::variant_utils::unshredded_variant_schema;
 use crate::{
     engine::arrow_data::ArrowEngineData,
     schema::{DataType, Schema, SchemaRef, StructField, StructType},
@@ -258,6 +259,36 @@ fn _count_cols(dt: &ArrowDataType) -> usize {
     }
 }
 
+/// Validate that a given field in a parquet file which is presumed to represent data of the
+/// `VARIANT` type is represented as `STRUCT<metadata: BINARY, value: BINARY>`. This is to make
+/// sure that the default engine does not try to read shredded Variants, which it currently does
+/// not support.
+fn validate_parquet_variant(field: &ArrowField) -> DeltaResult<()> {
+    fn variant_parquet_error(field_name: &String) -> Error {
+        Error::Generic(format!(
+            "The field {} presumed to be of Variant type might be \
+            shredded in the parquet file. The default engine does not support \
+            shredded reads yet.",
+            field_name
+        ))
+    }
+    match field.data_type() {
+        ArrowDataType::Struct(fields) => {
+            if fields.len() != 2 {
+                return Err(variant_parquet_error(field.name()));
+            }
+            if !matches!(
+                (fields[0].name().as_str(), fields[1].name().as_str()),
+                ("value", "metadata") | ("metadata", "value")
+            ) {
+                return Err(variant_parquet_error(field.name()));
+            }
+            Ok(())
+        }
+        _ => Err(variant_parquet_error(field.name())),
+    }
+}
+
 /// helper function, does the same as `get_requested_indices` but at an offset. used to recurse into
 /// structs, lists, and maps. `parquet_offset` is how many parquet fields exist before processing
 /// this potentially nested schema. returns the number of parquet fields in `fields` (regardless of
@@ -284,9 +315,17 @@ fn get_indices(
             field.name()
         );
         if let Some((index, _, requested_field)) = field_info {
+            // If the field is a variant, make sure the parquet schema matches the unshredded variant
+            // representation. This is to ensure that shredded reads are not performed.
+            if requested_field.data_type == unshredded_variant_schema() {
+                validate_parquet_variant(field)?;
+            }
             match field.data_type() {
                 ArrowDataType::Struct(fields) => {
-                    if let DataType::Struct(ref requested_schema) = requested_field.data_type {
+                    if let DataType::Struct(ref requested_schema)
+                    | DataType::Variant(ref requested_schema) =
+                        requested_field.data_type
+                    {
                         let (parquet_advance, children) = get_indices(
                             parquet_index + parquet_offset,
                             requested_schema.as_ref(),
@@ -442,7 +481,7 @@ fn get_indices(
 /// parquet file, and simply contains an entry for each index we wish to select from the parquet
 /// file set to the index of the requested column in the parquet. `reorder_indices` is used for
 /// re-ordering. See the documentation for [`ReorderIndex`] to understand what each element in the
-/// returned array means
+/// returned array means.
 pub(crate) fn get_requested_indices(
     requested_schema: &SchemaRef,
     parquet_schema: &ArrowSchemaRef,
@@ -745,6 +784,19 @@ pub(crate) fn to_json_bytes(
     Ok(writer.into_inner())
 }
 
+/// The variant type for arrow is a struct where where the `metadata` field is tagged with some
+/// additional metadata saying `__VARIANT__ = true`.
+pub fn variant_arrow_type() -> ArrowDataType {
+    let mut tag = HashMap::new();
+    tag.insert("__VARIANT__".to_string(), "true".to_string());
+
+    let metadata_field =
+        ArrowField::new("metadata", ArrowDataType::Binary, true).with_metadata(tag);
+    let value_field = ArrowField::new("value", ArrowDataType::Binary, true);
+    let fields = vec![metadata_field, value_field];
+    ArrowDataType::Struct(fields.into())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -852,6 +904,123 @@ mod tests {
         ];
         assert_eq!(mask_indices, expect_mask);
         assert_eq!(reorder_indices, expect_reorder);
+    }
+
+    #[test]
+    fn test_variant_masks() {
+        fn unshredded_variant_parquet_schema() -> ArrowField {
+            ArrowField::new(
+                "v",
+                ArrowDataType::Struct(
+                    vec![
+                        ArrowField::new("metadata", ArrowDataType::Binary, true),
+                        ArrowField::new("value", ArrowDataType::Binary, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            )
+        }
+        fn shredded_variant_parquet_schema() -> ArrowField {
+            ArrowField::new(
+                "v",
+                ArrowDataType::Struct(
+                    vec![
+                        ArrowField::new("metadata", ArrowDataType::Binary, true),
+                        ArrowField::new("value", ArrowDataType::Binary, true),
+                        ArrowField::new("typed_value", ArrowDataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            )
+        }
+        // Top level variant
+        let requested_schema = Arc::new(StructType::new([StructField::nullable(
+            "v",
+            unshredded_variant_schema(),
+        )]));
+        let unshredded_parquet_schema =
+            Arc::new(ArrowSchema::new(vec![unshredded_variant_parquet_schema()]));
+        let shredded_parquet_schema =
+            Arc::new(ArrowSchema::new(vec![shredded_variant_parquet_schema()]));
+        let result_unshredded =
+            get_requested_indices(&requested_schema, &unshredded_parquet_schema);
+        assert!(result_unshredded.is_ok());
+        let result_shredded = get_requested_indices(&requested_schema, &shredded_parquet_schema);
+        assert!(matches!(result_shredded,
+            Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
+
+        // Struct of Variant
+        let requested_schema = Arc::new(StructType::new([StructField::nullable(
+            "struct_v",
+            StructType::new([StructField::nullable("v", unshredded_variant_schema())]),
+        )]));
+        let unshredded_parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "struct_v",
+            ArrowDataType::Struct(vec![unshredded_variant_parquet_schema()].into()),
+            true,
+        )]));
+        let shredded_parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "struct_v",
+            ArrowDataType::Struct(vec![shredded_variant_parquet_schema()].into()),
+            true,
+        )]));
+        let result_unshredded =
+            get_requested_indices(&requested_schema, &unshredded_parquet_schema);
+        let result_shredded = get_requested_indices(&requested_schema, &shredded_parquet_schema);
+        assert!(result_unshredded.is_ok());
+        assert!(matches!(result_shredded,
+            Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
+        // Array of Variant
+        let requested_schema = Arc::new(StructType::new([StructField::nullable(
+            "array_v",
+            ArrayType::new(unshredded_variant_schema().into(), true),
+        )]));
+        let unshredded_parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "array_v",
+            ArrowDataType::List(Arc::new(unshredded_variant_parquet_schema())),
+            true,
+        )]));
+        let shredded_parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "array_v",
+            ArrowDataType::List(Arc::new(shredded_variant_parquet_schema())),
+            true,
+        )]));
+        let result_unshredded =
+            get_requested_indices(&requested_schema, &unshredded_parquet_schema);
+        let result_shredded = get_requested_indices(&requested_schema, &shredded_parquet_schema);
+        assert!(result_unshredded.is_ok());
+        assert!(matches!(result_shredded,
+            Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
+
+        // Map of Variant
+        let requested_schema = Arc::new(StructType::new([StructField::nullable(
+            "map_v",
+            MapType::new(DataType::STRING, unshredded_variant_schema(), true),
+        )]));
+        let unshredded_parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new_map(
+            "map_v",
+            "struc_v",
+            ArrowField::new("s", ArrowDataType::Utf8, false),
+            unshredded_variant_parquet_schema(),
+            false,
+            false,
+        )]));
+        let shredded_parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new_map(
+            "map_v",
+            "struc_v",
+            ArrowField::new("s", ArrowDataType::Utf8, false),
+            shredded_variant_parquet_schema(),
+            false,
+            false,
+        )]));
+        let result_unshredded =
+            get_requested_indices(&requested_schema, &unshredded_parquet_schema);
+        let result_shredded = get_requested_indices(&requested_schema, &shredded_parquet_schema);
+        assert!(result_unshredded.is_ok());
+        assert!(matches!(result_shredded,
+            Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
     }
 
     #[test]

@@ -7,6 +7,8 @@ use crate::arrow::datatypes::{
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
+use crate::engine::arrow_utils::variant_arrow_type;
+use crate::schema::variant_utils::unshredded_variant_schema;
 use itertools::Itertools;
 
 use crate::error::Error;
@@ -161,6 +163,17 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                 Arc::new(m.as_ref().try_into_arrow()?),
                 false,
             )),
+            DataType::Variant(_) => {
+                if *t == unshredded_variant_schema() {
+                    Ok(variant_arrow_type())
+                } else {
+                    // TODO: Test this
+                    Err(ArrowError::SchemaError(format!(
+                        "Incorrect Variant Schema: {}",
+                        t
+                    )))
+                }
+            }
         }
     }
 }

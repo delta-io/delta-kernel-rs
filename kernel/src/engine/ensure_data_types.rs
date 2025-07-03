@@ -65,6 +65,9 @@ impl EnsureDataTypes {
             (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
                 check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
             }
+            (&DataType::Variant(_), _) => {
+                check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
+            }
             // strings, bools, and binary  aren't primitive in arrow
             (&DataType::BOOLEAN, ArrowDataType::Boolean)
             | (&DataType::STRING, ArrowDataType::Utf8)
@@ -256,6 +259,8 @@ mod tests {
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
 
     use crate::engine::arrow_conversion::TryFromKernel as _;
+    use crate::engine::arrow_utils::variant_arrow_type;
+    use crate::schema::variant_utils::unshredded_variant_schema;
     use crate::schema::{ArrayType, DataType, MapType, StructField};
 
     use super::*;
@@ -315,6 +320,29 @@ mod tests {
         assert!(!can_upcast_to_decimal(&Int32, 10u8, 1i8));
         assert!(!can_upcast_to_decimal(&Int64, 19u8, 0i8));
         assert!(!can_upcast_to_decimal(&Int64, 20u8, 1i8));
+    }
+
+    #[test]
+    fn ensure_variants() {
+        fn variant_arrow_type_without_tag() -> ArrowDataType {
+            let metadata_field = ArrowField::new("metadata", ArrowDataType::Binary, true);
+            let value_field = ArrowField::new("value", ArrowDataType::Binary, true);
+            let fields = vec![metadata_field, value_field];
+            ArrowDataType::Struct(fields.into())
+        }
+
+        assert!(ensure_data_types(
+            &unshredded_variant_schema().into(),
+            &variant_arrow_type(),
+            true
+        )
+        .is_ok());
+        assert!(ensure_data_types(
+            &unshredded_variant_schema().into(),
+            &variant_arrow_type_without_tag(),
+            true
+        )
+        .is_err());
     }
 
     #[test]

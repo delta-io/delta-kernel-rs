@@ -11,12 +11,14 @@ use serde::{Deserialize, Serialize};
 
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
+use crate::schema::variant_utils::unshredded_variant_schema;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
 pub(crate) mod compare;
 pub(crate) mod derive_macro_utils;
+pub mod variant_utils;
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
@@ -142,6 +144,7 @@ impl StructField {
         Self::new(name, data_type, false)
     }
 
+    /// Replaces `self.metadata` with the list of <key, value> pairs in `metadata`.
     pub fn with_metadata(
         mut self,
         metadata: impl IntoIterator<Item = (impl Into<String>, impl Into<MetadataValue>)>,
@@ -150,6 +153,16 @@ impl StructField {
             .into_iter()
             .map(|(k, v)| (k.into(), v.into()))
             .collect();
+        self
+    }
+
+    /// Extends `self.metadata` to include the <key, value> pairs in `metadata`.
+    pub fn add_metadata(
+        mut self,
+        metadata: impl IntoIterator<Item = (impl Into<String>, impl Into<MetadataValue>)>,
+    ) -> Self {
+        self.metadata
+            .extend(metadata.into_iter().map(|(k, v)| (k.into(), v.into())));
         self
     }
 
@@ -604,6 +617,30 @@ where
     DecimalType::try_new(precision, scale).map_err(serde::de::Error::custom)
 }
 
+fn serialize_variant<S: serde::Serializer>(
+    _: &StructType,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str("variant")
+}
+
+fn deserialize_variant<'de, D>(deserializer: D) -> Result<Box<StructType>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let str_value = String::deserialize(deserializer)?;
+    require!(
+        str_value == "variant",
+        serde::de::Error::custom(format!("Invalid variant: {}", str_value))
+    );
+    match unshredded_variant_schema() {
+        DataType::Variant(st) => Ok(st),
+        _ => Err(serde::de::Error::custom(
+            "Issue in unshredded_variant_schema(). Please contact support.",
+        )),
+    }
+}
+
 impl Display for PrimitiveType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -639,6 +676,14 @@ pub enum DataType {
     /// A map stores an arbitrary length collection of key-value pairs
     /// with a single keyType and a single valueType
     Map(Box<MapType>),
+    /// The Variant data type. While Variant may have a flexible physical representation to
+    /// facilitate shredded reads, it is a primitive type from a logical perspective.
+    #[serde(
+        serialize_with = "serialize_variant",
+        deserialize_with = "deserialize_variant",
+        untagged
+    )]
+    Variant(Box<StructType>),
 }
 
 impl From<DecimalType> for PrimitiveType {
@@ -714,6 +759,10 @@ impl DataType {
         Ok(StructType::try_new(fields)?.into())
     }
 
+    pub fn variant_type(fields: impl IntoIterator<Item = StructField>) -> Self {
+        DataType::Variant(Box::new(StructType::new(fields)))
+    }
+
     pub fn as_primitive_opt(&self) -> Option<&PrimitiveType> {
         match self {
             DataType::Primitive(ptype) => Some(ptype),
@@ -738,6 +787,7 @@ impl Display for DataType {
                 write!(f, ">")
             }
             DataType::Map(m) => write!(f, "map<{}, {}>", m.key_type, m.value_type),
+            DataType::Variant(_) => write!(f, "variant"),
         }
     }
 }
@@ -808,6 +858,11 @@ pub trait SchemaTransform<'a> {
         self.transform(etype)
     }
 
+    /// Called for each variant values encountered. By default does nothing
+    fn transform_variant(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
+        Some(Cow::Borrowed(etype))
+    }
+
     /// General entry point for a recursive traversal over any data type. Also invoked internally to
     /// dispatch on nested data types encountered during the traversal.
     fn transform(&mut self, data_type: &'a DataType) -> Option<Cow<'a, DataType>> {
@@ -829,6 +884,7 @@ pub trait SchemaTransform<'a> {
             Array(atype) => apply_transform!(transform_array, atype),
             Struct(stype) => apply_transform!(transform_struct, stype),
             Map(mtype) => apply_transform!(transform_map, mtype),
+            Variant(_) => apply_transform!(transform_variant, data_type),
         }
     }
 
@@ -1008,6 +1064,8 @@ impl<'a> SchemaTransform<'a> for SchemaDepthChecker {
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::variant_utils::unshredded_variant_schema;
+
     use super::*;
     use serde_json;
 
@@ -1102,6 +1160,26 @@ mod tests {
         assert_eq!(
             json_str,
             r#"{"name":"a","type":"decimal(10,2)","nullable":false,"metadata":{}}"#
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_variant() {
+        let data = r#"
+        {
+            "name": "v",
+            "type": "variant",
+            "nullable": false,
+            "metadata": {}
+        }
+        "#;
+        let field: StructField = serde_json::from_str(data).unwrap();
+        assert_eq!(field.data_type, unshredded_variant_schema().into());
+
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(
+            json_str,
+            r#"{"name":"v","type":"variant","nullable":false,"metadata":{}}"#
         );
     }
 
