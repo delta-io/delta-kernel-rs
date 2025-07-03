@@ -42,10 +42,12 @@ pub struct ScanArgs {
     pub columns: Option<Vec<String>>,
 }
 
+/// Get a [`Table`] from the specified location args
 pub fn get_table(args: &LocationArgs) -> DeltaResult<Table> {
     Table::try_from_uri(&args.path)
 }
 
+/// Get an engine configured to read table specified by `table` and `LocationArgs`
 pub fn get_engine(
     table: &Table,
     args: &LocationArgs,
@@ -65,8 +67,8 @@ pub fn get_engine(
     )
 }
 
-/// Utility function to take in the specified `CommonArgs` and configure a scan as
-/// specified. Returns the constructed engine and scan
+/// Construct a scan at the latest snapshot. This is over the specified table and using the passed
+/// engine. Parameters of the scan are controlled by the specified `ScanArgs`
 pub fn get_scan(
     table: &Table,
     engine: &DefaultEngine<TokioBackgroundExecutor>,
