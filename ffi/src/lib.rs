@@ -659,6 +659,41 @@ pub unsafe extern "C" fn get_partition_columns(
     iter.into()
 }
 
+/// Get the domainMetadata for a specific domain in this snapshot
+///
+/// # Safety
+///
+/// Caller is responsible for passing in a valid handle
+#[no_mangle]
+pub unsafe extern "C" fn get_domain_metadata(
+    snapshot: Handle<SharedSnapshot>,
+    domain: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+    allocate_fn: AllocateStringFn,
+) -> ExternResult<NullableCvoid> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+
+    get_domain_metadata_impl(snapshot, domain, engine, allocate_fn).into_extern_result(&engine)
+}
+
+fn get_domain_metadata_impl(
+    snapshot: &Snapshot,
+    domain: KernelStringSlice,
+    extern_engine: &dyn ExternEngine,
+    allocate_fn: AllocateStringFn,
+) -> DeltaResult<NullableCvoid> {
+    let domain = unsafe { String::try_from_slice(&domain)? };
+
+    match snapshot.get_domain_metadata(&domain, extern_engine.engine().as_ref())? {
+        Some(config) => {
+            let config = config.as_str();
+            Ok(allocate_fn(kernel_string_slice!(config)))
+        }
+        None => Ok(None.into()),
+    }
+}
+
 type StringIter = dyn Iterator<Item = String> + Send;
 
 #[handle_descriptor(target=StringIter, mutable=true, sized=false)]
@@ -882,6 +917,150 @@ mod tests {
 
         unsafe { free_string_slice_data(partition_iter) }
         unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_domain_metadata() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+
+        // Create a table with domain metadata
+        // {
+        //      "domain": "test-domain",
+        //      "configuration": "domain-initialcommit",
+        //      "removed": false
+        // }
+        let initial_domain_metadata = r#"{"domainMetadata":{"domain":"test-domain","configuration":"domain-initialcommit","removed":false}}"#;
+        let commit_data = format!(
+            "{}\n{}",
+            actions_to_string(vec![TestAction::Metadata]),
+            initial_domain_metadata
+        );
+        add_commit(storage.as_ref(), 0, commit_data).await?;
+
+        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let path = "memory:///";
+
+        let initial_snapshot =
+            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+
+        // Test 1: Get existing domain metadata
+        let domain_name = "test-domain";
+        let result = unsafe {
+            get_domain_metadata(
+                initial_snapshot.shallow_copy(),
+                kernel_string_slice!(domain_name),
+                engine.shallow_copy(),
+                allocate_str,
+            )
+        };
+        let metadata_ptr = ok_or_panic(result);
+        assert!(
+            metadata_ptr.is_some(),
+            "Should return domain metadata for existing domain"
+        );
+        assert_eq!(
+            recover_string(metadata_ptr.unwrap()),
+            "domain-initialcommit",
+            "Domain metadata should be 'domain-initialcommit"
+        );
+
+        // Test 2: Get non-existent domain metadata
+        let nonexistent_domain = "non-existent-domain";
+        let result = unsafe {
+            get_domain_metadata(
+                initial_snapshot.shallow_copy(),
+                kernel_string_slice!(nonexistent_domain),
+                engine.shallow_copy(),
+                allocate_str,
+            )
+        };
+
+        let metadata_ptr = ok_or_panic(result);
+        assert!(
+            metadata_ptr.is_none(),
+            "Should return None for 'non-existent domain'"
+        );
+
+        // Test 3: Append another domain metadata
+        // {
+        //      "domain": "another-domain",
+        //      "configuration": "domain-secondcommit",
+        //      "removed": false
+        // }
+        let another_domain_metadata = r#"{"domainMetadata":{"domain":"another-domain","configuration":"domain-secondcommit","removed":false}}"#;
+        add_commit(storage.as_ref(), 1, another_domain_metadata.to_string()).await?;
+
+        let updated_snapshot =
+            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+
+        let another_domain = "another-domain";
+        let result = unsafe {
+            get_domain_metadata(
+                updated_snapshot.shallow_copy(),
+                kernel_string_slice!(another_domain),
+                engine.shallow_copy(),
+                allocate_str,
+            )
+        };
+        let metadata_ptr = ok_or_panic(result);
+        assert!(
+            metadata_ptr.is_some(),
+            "Should return domain metadata for another domain"
+        );
+
+        // Test 4: Test domain metadata removal
+        // {
+        //      "domain": "test-domain",
+        //      "configuration": "{}",
+        //      "removed": true
+        // }
+        let remove_domain_metadata =
+            r#"{"domainMetadata":{"domain":"test-domain","configuration":"{}","removed":true}}"#;
+        add_commit(storage.as_ref(), 2, remove_domain_metadata.to_string()).await?;
+
+        let final_snapshot =
+            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+
+        let result = unsafe {
+            get_domain_metadata(
+                final_snapshot.shallow_copy(),
+                kernel_string_slice!(domain_name),
+                engine.shallow_copy(),
+                allocate_str,
+            )
+        };
+        let metadata_ptr = ok_or_panic(result);
+        assert!(
+            metadata_ptr.is_none(),
+            "Removed domain should not be accessible"
+        );
+
+        // another-domain should still exist
+        let result = unsafe {
+            get_domain_metadata(
+                final_snapshot.shallow_copy(),
+                kernel_string_slice!(another_domain),
+                engine.shallow_copy(),
+                allocate_str,
+            )
+        };
+        let metadata_ptr = ok_or_panic(result);
+        assert!(
+            metadata_ptr.is_some(),
+            "Another domain should still be accessible after first domain removal"
+        );
+        assert_eq!(
+            recover_string(metadata_ptr.unwrap()),
+            "domain-secondcommit",
+            "Domain metadata should be 'domain-secondcommit"
+        );
+
+        unsafe { free_snapshot(initial_snapshot) }
+        unsafe { free_snapshot(updated_snapshot) }
+        unsafe { free_snapshot(final_snapshot) }
         unsafe { free_engine(engine) }
         Ok(())
     }
