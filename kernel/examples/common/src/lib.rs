@@ -16,7 +16,7 @@ pub struct LocationArgs {
     /// Path to the table to inspect
     pub path: String,
 
-    /// Region to specify to the cloud access store (only applies if using the default engine)
+    /// Region to specify to the cloud access store (only applies to S3)
     #[arg(long)]
     pub region: Option<String>,
 
