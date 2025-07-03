@@ -13,7 +13,7 @@ use delta_kernel::{
 
 #[derive(Args)]
 pub struct LocationArgs {
-    /// Path to the table to inspect
+    /// Path to the table
     pub path: String,
 
     /// Region to specify to the cloud access store (only applies to S3)
