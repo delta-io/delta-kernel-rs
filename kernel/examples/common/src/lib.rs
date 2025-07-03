@@ -1,5 +1,5 @@
-/// Common code to be shared between all examples. Mostly argument parsing, and a few other
-/// utilities
+//! Common code to be shared between all examples. Mostly argument parsing, and a few other
+//! utilities
 use std::{collections::HashMap, sync::Arc};
 
 use clap::Args;
