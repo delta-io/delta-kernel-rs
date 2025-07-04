@@ -113,6 +113,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             .write_parquet_file(
                 write_context.target_dir(),
                 physical_data,
+                write_context.write_metadata_schema().clone(),
                 partition_values,
                 data_change,
             )
