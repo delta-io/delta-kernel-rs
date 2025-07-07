@@ -393,7 +393,7 @@ pub(crate) struct LastCheckpointHint {
 /// the read. Thus, the semantics of this function are to return `None` if the file is not found or
 /// is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and are assumed to
 /// cause failure.
-// TODO: weird that we propagate FileNotFound as part of the iterator instead of top-level
+// TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-level
 // result coming from storage.read_files
 fn read_last_checkpoint(
     storage: &dyn StorageHandler,
@@ -813,6 +813,31 @@ mod tests {
 
     fn valid_last_checkpoint() -> Vec<u8> {
         r#"{"size":8,"sizeInBytes":21857,"version":1}"#.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn test_read_table_with_empty_last_checkpoint() {
+        // in memory file system
+        let store = Arc::new(InMemory::new());
+
+        // do a _last_checkpoint file with "{}" as content
+        let empty = "{}".as_bytes().to_vec();
+        let invalid_path = Path::from("invalid/_last_checkpoint");
+
+        tokio::runtime::Runtime::new()
+            .expect("create tokio runtime")
+            .block_on(async {
+                store
+                    .put(&invalid_path, empty.into())
+                    .await
+                    .expect("put _last_checkpoint");
+            });
+
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let url = Url::parse("memory:///invalid/").expect("valid url");
+        let invalid = read_last_checkpoint(&storage, &url).expect("read last checkpoint");
+        assert!(invalid.is_none())
     }
 
     #[test]
