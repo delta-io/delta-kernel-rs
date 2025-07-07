@@ -414,7 +414,7 @@ impl CheckpointWriter {
             retention_duration,
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map_err(|e| Error::generic(format!("Failed to calculate system time: {}", e)))?,
+                .map_err(|e| Error::generic(format!("Failed to calculate system time: {e}")))?,
         )
     }
 }
