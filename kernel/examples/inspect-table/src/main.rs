@@ -230,12 +230,12 @@ fn try_main() -> DeltaResult<()> {
             }
             for (action, row) in visitor.actions.iter() {
                 match action {
-                    Action::Metadata(md) => println!("\nAction {row}:\n{:#?}", md),
-                    Action::Protocol(p) => println!("\nAction {row}:\n{:#?}", p),
-                    Action::Remove(r) => println!("\nAction {row}:\n{:#?}", r),
-                    Action::Add(a) => println!("\nAction {row}:\n{:#?}", a),
-                    Action::SetTransaction(t) => println!("\nAction {row}:\n{:#?}", t),
-                    Action::Cdc(c) => println!("\nAction {row}:\n{:#?}", c),
+                    Action::Metadata(md) => println!("\nAction {row}:\n{md:#?}"),
+                    Action::Protocol(p) => println!("\nAction {row}:\n{p:#?}"),
+                    Action::Remove(r) => println!("\nAction {row}:\n{r:#?}"),
+                    Action::Add(a) => println!("\nAction {row}:\n{a:#?}"),
+                    Action::SetTransaction(t) => println!("\nAction {row}:\n{t:#?}"),
+                    Action::Cdc(c) => println!("\nAction {row}:\n{c:#?}"),
                 }
             }
         }

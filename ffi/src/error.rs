@@ -214,7 +214,7 @@ impl<T> IntoExternResult<T> for DeltaResult<T> {
         match self {
             Ok(ok) => ExternResult::Ok(ok),
             Err(err) => {
-                let msg = format!("{}", err);
+                let msg = format!("{err}");
                 let err = unsafe { alloc.allocate_error(err.into(), kernel_string_slice!(msg)) };
                 ExternResult::Err(err)
             }

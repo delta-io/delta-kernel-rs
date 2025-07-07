@@ -332,7 +332,7 @@ fn generate_commit_info(
             )],
             vec![Scalar::Null(DataType::INTEGER)],
         )?)),
-        Expression::literal(format!("v{}", KERNEL_VERSION)),
+        Expression::literal(format!("v{KERNEL_VERSION}")),
         column_expr!("engineCommitInfo"),
     ];
     let commit_info_expr = Expression::struct_from([Expression::struct_from(commit_info_exprs)]);
@@ -590,7 +590,7 @@ mod tests {
             Error::Arrow(ArrowError::SchemaError(_)) => (),
             Error::Backtraced { source, .. }
                 if matches!(&*source, Error::Arrow(ArrowError::SchemaError(_))) => {}
-            _ => panic!("expected arrow schema error error, got {:?}", e),
+            _ => panic!("expected arrow schema error error, got {e:?}"),
         });
 
         Ok(())
@@ -619,7 +619,7 @@ mod tests {
             Error::Arrow(ArrowError::InvalidArgumentError(_)) => (),
             Error::Backtraced { source, .. }
                 if matches!(&*source, Error::Arrow(ArrowError::InvalidArgumentError(_))) => {}
-            _ => panic!("expected arrow invalid arg error, got {:?}", e),
+            _ => panic!("expected arrow invalid arg error, got {e:?}"),
         });
 
         Ok(())

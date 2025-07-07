@@ -13,6 +13,7 @@ use crate::schema::{Schema, SchemaRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
+use crate::utils::calculate_transaction_expiration_timestamp;
 use crate::{DeltaResult, Engine, Error, StorageHandler, Version};
 use delta_kernel_derive::internal_api;
 
@@ -121,8 +122,7 @@ impl Snapshot {
             if new_version < old_version {
                 // Hint is too new: error since this is effectively an incorrect optimization
                 return Err(Error::Generic(format!(
-                    "Requested snapshot version {} is older than snapshot hint version {}",
-                    new_version, old_version
+                    "Requested snapshot version {new_version} is older than snapshot hint version {old_version}"
                 )));
             }
         }
@@ -151,8 +151,7 @@ impl Snapshot {
                 Some(new_version) if new_version != old_version => {
                     // No new commits, but we are looking for a new version
                     return Err(Error::Generic(format!(
-                        "Requested snapshot version {} is newer than the latest version {}",
-                        new_version, old_version
+                        "Requested snapshot version {new_version} is newer than the latest version {old_version}"
                     )));
                 }
                 _ => {
@@ -172,8 +171,7 @@ impl Snapshot {
             // we should never see a new log segment with a version < the existing snapshot
             // version, that would mean a commit was incorrectly deleted from the log
             return Err(Error::Generic(format!(
-                "Unexpected state: The newest version in the log {} is older than the old version {}",
-                new_end_version, old_version)));
+                "Unexpected state: The newest version in the log {new_end_version} is older than the old version {old_version}")));
         }
         if new_end_version == old_version {
             // No new commits, just return the same snapshot
@@ -333,7 +331,7 @@ impl Snapshot {
         ScanBuilder::new(self)
     }
 
-    /// Fetch the latest version of the provided `application_id` for this snapshot.
+    /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the txn based on the SetTransactionRetentionDuration property and lastUpdated
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
     // TODO: add a get_app_id_versions to fetch all at once using SetTransactionScanner::get_all
@@ -342,7 +340,14 @@ impl Snapshot {
         application_id: &str,
         engine: &dyn Engine,
     ) -> DeltaResult<Option<i64>> {
-        let txn = SetTransactionScanner::get_one(self.log_segment(), application_id, engine)?;
+        let expiration_timestamp =
+            calculate_transaction_expiration_timestamp(self.table_properties())?;
+        let txn = SetTransactionScanner::get_one(
+            self.log_segment(),
+            application_id,
+            engine,
+            expiration_timestamp,
+        )?;
         Ok(txn.map(|t| t.version))
     }
 
