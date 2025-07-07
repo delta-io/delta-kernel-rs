@@ -147,6 +147,6 @@ mod tests {
         let path = PathBuf::from("./tests/dat/out/reader_tests/generated/with_schema_change");
         let case = read_dat_case(path).unwrap();
         let versions = case.versions().await.unwrap();
-        println!("{:?}", versions)
+        println!("{versions:?}")
     }
 }

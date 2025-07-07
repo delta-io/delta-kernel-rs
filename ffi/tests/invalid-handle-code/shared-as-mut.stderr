@@ -14,7 +14,13 @@ error[E0271]: type mismatch resolving `<SharedFoo as HandleDescriptor>::Mutable 
   --> tests/invalid-handle-code/shared-as-mut.rs:11:44
    |
 11 |     let h: Handle<SharedFoo> = Box::new(s).into();
-   |                                            ^^^^ expected `True`, found `False`
+   |                                            ^^^^ type mismatch resolving `<SharedFoo as HandleDescriptor>::Mutable == True`
    |
+note: expected this to be `True`
+  --> tests/invalid-handle-code/shared-as-mut.rs:6:1
+   |
+6  | #[handle_descriptor(target=Foo, mutable=false, sized=true)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    = note: required for `Handle<SharedFoo>` to implement `From<Box<Foo>>`
    = note: required for `Box<Foo>` to implement `Into<Handle<SharedFoo>>`
+   = note: this error originates in the attribute macro `handle_descriptor` (in Nightly builds, run with -Z macro-backtrace for more info)

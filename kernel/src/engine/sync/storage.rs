@@ -14,9 +14,9 @@ impl StorageHandler for SyncStorageHandler {
         url_path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
         if url_path.scheme() == "file" {
-            let path = url_path.to_file_path().map_err(|_| {
-                Error::Generic(format!("Invalid path for list_from: {:?}", url_path))
-            })?;
+            let path = url_path
+                .to_file_path()
+                .map_err(|_| Error::Generic(format!("Invalid path for list_from: {url_path:?}")))?;
 
             let (path_to_read, min_file_name) = if path.is_dir() {
                 // passed path is an existing dir, don't strip anything and don't filter the results
@@ -26,12 +26,10 @@ impl StorageHandler for SyncStorageHandler {
                 // that and use it as the min_file_name to return
                 let parent = path
                     .parent()
-                    .ok_or_else(|| {
-                        Error::Generic(format!("Invalid path for list_from: {:?}", path))
-                    })?
+                    .ok_or_else(|| Error::Generic(format!("Invalid path for list_from: {path:?}")))?
                     .to_path_buf();
                 let file_name = path.file_name().ok_or_else(|| {
-                    Error::Generic(format!("Invalid path for list_from: {:?}", path))
+                    Error::Generic(format!("Invalid path for list_from: {path:?}"))
                 })?;
                 (parent, Some(file_name))
             };

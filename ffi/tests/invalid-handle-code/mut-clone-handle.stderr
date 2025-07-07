@@ -14,10 +14,16 @@ error[E0271]: type mismatch resolving `<MutFoo as HandleDescriptor>::Mutable == 
   --> tests/invalid-handle-code/mut-clone-handle.rs:12:41
    |
 12 |     let h: Handle<MutFoo> = Arc::new(s).into();
-   |                                         ^^^^ expected `False`, found `True`
+   |                                         ^^^^ type mismatch resolving `<MutFoo as HandleDescriptor>::Mutable == False`
    |
+note: expected this to be `False`
+  --> tests/invalid-handle-code/mut-clone-handle.rs:7:1
+   |
+7  | #[handle_descriptor(target=Foo, mutable=true, sized=true)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    = note: required for `Handle<MutFoo>` to implement `From<Arc<Foo>>`
    = note: required for `Arc<Foo>` to implement `Into<Handle<MutFoo>>`
+   = note: this error originates in the attribute macro `handle_descriptor` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0599]: the method `clone_handle` exists for struct `Handle<MutFoo>`, but its trait bounds were not satisfied
   --> tests/invalid-handle-code/mut-clone-handle.rs:14:15

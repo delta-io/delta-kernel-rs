@@ -122,8 +122,7 @@ impl Snapshot {
             if new_version < old_version {
                 // Hint is too new: error since this is effectively an incorrect optimization
                 return Err(Error::Generic(format!(
-                    "Requested snapshot version {} is older than snapshot hint version {}",
-                    new_version, old_version
+                    "Requested snapshot version {new_version} is older than snapshot hint version {old_version}"
                 )));
             }
         }
@@ -152,8 +151,7 @@ impl Snapshot {
                 Some(new_version) if new_version != old_version => {
                     // No new commits, but we are looking for a new version
                     return Err(Error::Generic(format!(
-                        "Requested snapshot version {} is newer than the latest version {}",
-                        new_version, old_version
+                        "Requested snapshot version {new_version} is newer than the latest version {old_version}"
                     )));
                 }
                 _ => {
@@ -173,8 +171,7 @@ impl Snapshot {
             // we should never see a new log segment with a version < the existing snapshot
             // version, that would mean a commit was incorrectly deleted from the log
             return Err(Error::Generic(format!(
-                "Unexpected state: The newest version in the log {} is older than the old version {}",
-                new_end_version, old_version)));
+                "Unexpected state: The newest version in the log {new_end_version} is older than the old version {old_version}")));
         }
         if new_end_version == old_version {
             // No new commits, just return the same snapshot

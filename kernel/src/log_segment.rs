@@ -82,8 +82,7 @@ impl LogSegment {
                 .windows(2)
                 .all(|cfs| cfs[0].version + 1 == cfs[1].version),
             Error::generic(format!(
-                "Expected ordered contiguous commit files {:?}",
-                ascending_commit_files
+                "Expected ordered contiguous commit files {ascending_commit_files:?}"
             ))
         );
 
@@ -111,8 +110,7 @@ impl LogSegment {
             require!(
                 effective_version == end_version,
                 Error::generic(format!(
-                    "LogSegment end version {} not the same as the specified end version {}",
-                    effective_version, end_version
+                    "LogSegment end version {effective_version} not the same as the specified end version {end_version}"
                 ))
             );
         }
@@ -193,8 +191,7 @@ impl LogSegment {
                 .first()
                 .is_some_and(|first_commit| first_commit.version == start_version),
             Error::generic(format!(
-                "Expected the first commit to have version {}",
-                start_version
+                "Expected the first commit to have version {start_version}"
             ))
         );
         let listed_files = ListedLogFiles::new(
@@ -488,7 +485,7 @@ fn list_log_files(
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
     let start_version = start_version.into().unwrap_or(0);
     let end_version = end_version.into();
-    let version_prefix = format!("{:020}", start_version);
+    let version_prefix = format!("{start_version:020}");
     let start_from = log_root.join(&version_prefix)?;
 
     Ok(storage

@@ -1030,8 +1030,7 @@ mod tests {
             assert_eq!(
                 can_statically_skip_all_files(&predicate),
                 should_skip,
-                "Failed for predicate: {:#?}",
-                predicate
+                "Failed for predicate: {predicate:#?}"
             );
         }
     }
@@ -1171,8 +1170,7 @@ mod tests {
             let result = PhysicalPredicate::try_new(&predicate, &logical_schema).ok();
             assert_eq!(
                 result, expected,
-                "Failed for predicate: {:#?}, expected {:#?}, got {:#?}",
-                predicate, expected, result
+                "Failed for predicate: {predicate:#?}, expected {expected:#?}, got {result:#?}"
             );
         }
     }
