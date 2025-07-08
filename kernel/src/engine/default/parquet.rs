@@ -48,7 +48,7 @@ impl DataFileMetadata {
         Self { file_meta }
     }
 
-    // convert DataFileMetadata into a record batch which matches the 'write_metadata' schema
+    // convert DataFileMetadata into a record batch which matches the 'add_files_schema' schema
     fn as_record_batch(
         &self,
         partition_values: &HashMap<String, String>,
@@ -62,7 +62,7 @@ impl DataFileMetadata {
                     size,
                 },
         } = self;
-        let write_metadata_schema = crate::transaction::get_write_metadata_schema();
+        let add_files_schema = crate::transaction::add_files_schema();
 
         // create the record batch of the write metadata
         let path = Arc::new(StringArray::from(vec![location.to_string()]));
@@ -88,7 +88,7 @@ impl DataFileMetadata {
         let data_change = Arc::new(BooleanArray::from(vec![data_change]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(write_metadata_schema.as_ref().try_into_arrow()?),
+            Arc::new(add_files_schema.as_ref().try_into_arrow()?),
             vec![path, partitions, size, modification_time, data_change],
         )?)))
     }
@@ -165,10 +165,10 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     }
 
     /// Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
-    /// metadata as an EngineData batch which matches the [write metadata] schema (where `<uuid>` is
-    /// a generated UUIDv4).
+    /// metadata as an EngineData batch which matches the [add file metadata] schema (where `<uuid>`
+    /// is a generated UUIDv4).
     ///
-    /// [write metadata]: crate::transaction::get_write_metadata_schema
+    /// [add file metadata]: crate::transaction::add_files_schema
     pub async fn write_parquet_file(
         &self,
         path: &url::Url,
@@ -477,7 +477,7 @@ mod tests {
         let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
 
         let schema = Arc::new(
-            crate::transaction::get_write_metadata_schema()
+            crate::transaction::add_files_schema()
                 .as_ref()
                 .try_into_arrow()
                 .unwrap(),
