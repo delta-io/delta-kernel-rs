@@ -13,6 +13,7 @@ use url::Url;
 
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
+use delta_kernel::Version;
 use delta_kernel::{DeltaResult, Engine, EngineData, Table};
 use delta_kernel_ffi_macros::handle_descriptor;
 
@@ -568,14 +569,31 @@ pub unsafe extern "C" fn snapshot(
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    snapshot_impl(url, engine).into_extern_result(&engine)
+    snapshot_impl(url, engine, None).into_extern_result(&engine)
+}
+
+/// Get the snapshot from the specified table at a specific version
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles and path pointer.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_at_version(
+    path: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+    version: Version,
+) -> ExternResult<Handle<SharedSnapshot>> {
+    let url = unsafe { unwrap_and_parse_path_as_url(path) };
+    let engine = unsafe { engine.as_ref() };
+    snapshot_impl(url, engine, version.into()).into_extern_result(&engine)
 }
 
 fn snapshot_impl(
     url: DeltaResult<Url>,
     extern_engine: &dyn ExternEngine,
+    version: Option<Version>,
 ) -> DeltaResult<Handle<SharedSnapshot>> {
-    let snapshot = Snapshot::try_new(url?, extern_engine.engine().as_ref(), None)?;
+    let snapshot = Snapshot::try_new(url?, extern_engine.engine().as_ref(), version)?;
     Ok(Arc::new(snapshot).into())
 }
 
@@ -776,6 +794,11 @@ mod tests {
         Some(ptr)
     }
 
+    // helper to recover an error from the above
+    unsafe fn recover_error(ptr: *mut EngineError) -> EngineError {
+        *Box::from_raw(ptr)
+    }
+
     // helper to recover a string from the above
     fn recover_string(ptr: NonNull<c_void>) -> String {
         let ptr = ptr.as_ptr().cast();
@@ -834,18 +857,41 @@ mod tests {
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let path = "memory:///";
 
-        let snapshot =
+        // Test getting latest snapshot
+        let snapshot1 =
             unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+        let version1 = unsafe { version(snapshot1.shallow_copy()) };
+        assert_eq!(version1, 0);
 
-        let version = unsafe { version(snapshot.shallow_copy()) };
-        assert_eq!(version, 0);
+        // Test getting snapshot at version
+        let snapshot2 = unsafe {
+            ok_or_panic(snapshot_at_version(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+                0,
+            ))
+        };
+        let version2 = unsafe { version(snapshot2.shallow_copy()) };
+        assert_eq!(version2, 0);
 
-        let table_root = unsafe { snapshot_table_root(snapshot.shallow_copy(), allocate_str) };
+        // Test getting non-existent snapshot
+        let snapshot_at_non_existent_version =
+            unsafe { snapshot_at_version(kernel_string_slice!(path), engine.shallow_copy(), 1) };
+        assert!(snapshot_at_non_existent_version.is_err());
+
+        // Avoid leaking the error by recovering it
+        let ExternResult::Err(e) = snapshot_at_non_existent_version else {
+            panic!("Expected error but operation succeeded");
+        };
+        unsafe { recover_error(e) };
+
+        let table_root = unsafe { snapshot_table_root(snapshot1.shallow_copy(), allocate_str) };
         assert!(table_root.is_some());
         let s = recover_string(table_root.unwrap());
         assert_eq!(&s, path);
 
-        unsafe { free_snapshot(snapshot) }
+        unsafe { free_snapshot(snapshot1) }
+        unsafe { free_snapshot(snapshot2) }
         unsafe { free_engine(engine) }
         Ok(())
     }
