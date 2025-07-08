@@ -795,9 +795,8 @@ mod tests {
     }
 
     // helper to recover an error from the above
-    fn recover_error(ptr: *mut EngineError) -> EngineError {
-        let ptr = ptr.cast();
-        *unsafe { Box::from_raw(ptr) }
+    unsafe fn recover_error(ptr: *mut EngineError) -> EngineError {
+        *Box::from_raw(ptr)
     }
 
     // helper to recover a string from the above
@@ -881,9 +880,10 @@ mod tests {
         assert!(snapshot_at_non_existent_version.is_err());
 
         // Avoid leaking the error by recovering it
-        if let ExternResult::Err(e) = snapshot_at_non_existent_version {
-            recover_error(e);
-        }
+        let ExternResult::Err(e) = snapshot_at_non_existent_version else {
+            panic!("Expected error but operation succeeded");
+        };
+        unsafe { recover_error(e) };
 
         let table_root = unsafe { snapshot_table_root(snapshot1.shallow_copy(), allocate_str) };
         assert!(table_root.is_some());
