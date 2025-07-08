@@ -24,7 +24,7 @@ pub(crate) fn calculate_transaction_expiration_timestamp(
         .map(|duration| -> DeltaResult<i64> {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map_err(|e| Error::generic(format!("Failed to get current time: {}", e)))?;
+                .map_err(|e| Error::generic(format!("Failed to get current time: {e}")))?;
 
             let now_ms = i64::try_from(now.as_millis())
                 .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))?;
