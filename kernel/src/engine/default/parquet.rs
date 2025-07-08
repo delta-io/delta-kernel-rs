@@ -166,10 +166,10 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     }
 
     /// Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
-    /// metadata as an EngineData batch which matches the [file metadata] schema (where `<uuid>` is
-    /// a generated UUIDv4).
+    /// metadata as an EngineData batch which matches the [add file metadata] schema (where `<uuid>`
+    /// is a generated UUIDv4).
     ///
-    /// [file metadata]: crate::transaction::add_files_schema
+    /// [add file metadata]: crate::transaction::add_files_schema
     pub async fn write_parquet_file(
         &self,
         path: &url::Url,
