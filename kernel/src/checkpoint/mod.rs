@@ -468,6 +468,7 @@ fn deleted_file_retention_timestamp_with_time(
 ///
 /// TODO(#838): Add `checksum` field to `_last_checkpoint` file
 /// TODO(#839): Add `checkpoint_schema` field to `_last_checkpoint` file
+/// TODO(#1054): Add `tags` field to `_last_checkpoint` file
 /// TODO(#1052): Add `v2Checkpoint` field to `_last_checkpoint` file
 pub(crate) fn create_last_checkpoint_data(
     engine: &dyn Engine,
