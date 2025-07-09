@@ -355,20 +355,36 @@ fn get_indices(
                                 return Err(Error::generic("map fields had more than 2 members"));
                             }
                             let inner_schema = map_type.as_struct_schema(key_name, val_name);
-                            let (parquet_advance, _children) = get_indices(
+                            let (parquet_advance, mut children) = get_indices(
                                 parquet_index + parquet_offset,
                                 &inner_schema,
                                 inner_fields,
                                 mask_indices,
                             )?;
+
                             // advance the number of parquet fields, but subtract 1 because the
                             // map will be counted by the `enumerate` call but doesn't count as
                             // an actual index.
                             parquet_offset += parquet_advance - 1;
                             // note that we found this field
                             found_fields.insert(requested_field.name());
-                            // push the child reorder on, currently no reordering for maps
-                            reorder_indices.push(ReorderIndex::identity(index));
+
+                            if children.len() != 2 {
+                                return Err(Error::generic(
+                                    "Map call should have generated exactly two reorder indices",
+                                ));
+                            }
+                            // vec indexing is safe, we checked len above
+                            if children[0].needs_transform() || children[1].needs_transform() {
+                                // the indices are wrong, as they are index from the inner
+                                // schema. Adjust them to be consistent with our index.
+                                children[0].index = index;
+                                children[1].index = index + 1;
+                                reorder_indices.append(&mut children);
+                            } else {
+                                // no transform needed on the map, so just pass it on unchanged
+                                reorder_indices.push(ReorderIndex::identity(index));
+                            }
                         }
                         _ => {
                             return Err(Error::unexpected_column_type(field.name()));
@@ -1316,6 +1332,74 @@ mod tests {
                 vec![ReorderIndex::identity(0), ReorderIndex::identity(1)],
             ),
             ReorderIndex::identity(0),
+        ];
+        assert_eq!(mask_indices, expect_mask);
+        assert_eq!(reorder_indices, expect_reorder);
+    }
+
+    #[test]
+    fn reorder_map_with_structs() {
+        let requested_schema = Arc::new(StructType::new([
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::not_null(
+                "map",
+                MapType::new(
+                    StructType::new([
+                        StructField::not_null("k1", DataType::STRING),
+                        StructField::not_null("k2", DataType::STRING),
+                    ]),
+                    StructType::new([
+                        StructField::not_null("v2", DataType::STRING),
+                        StructField::not_null("v1", DataType::STRING),
+                    ]),
+                    false,
+                ),
+            ),
+        ]));
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", ArrowDataType::Int32, false),
+            ArrowField::new_map(
+                "map",
+                "entries",
+                ArrowField::new(
+                    "i",
+                    ArrowDataType::Struct(
+                        vec![
+                            ArrowField::new("k1", ArrowDataType::Utf8, false),
+                            ArrowField::new("k2", ArrowDataType::Utf8, false),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                ),
+                ArrowField::new(
+                    "v",
+                    ArrowDataType::Struct(
+                        vec![
+                            ArrowField::new("v1", ArrowDataType::Utf8, false),
+                            ArrowField::new("v2", ArrowDataType::Utf8, false),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                ),
+                false,
+                false,
+            ),
+        ]));
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+        let expect_mask = vec![0, 1, 2, 3, 4];
+        let expect_reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::nested(
+                1,
+                vec![ReorderIndex::identity(0), ReorderIndex::identity(1)],
+            ),
+            ReorderIndex::nested(
+                2,
+                vec![ReorderIndex::identity(1), ReorderIndex::identity(0)],
+            ),
         ];
         assert_eq!(mask_indices, expect_mask);
         assert_eq!(reorder_indices, expect_reorder);
