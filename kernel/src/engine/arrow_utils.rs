@@ -1545,7 +1545,6 @@ mod tests {
             .next()
             .unwrap()
             .unwrap();
-        println!("Batch 1: {batch1:?}");
 
         macro_rules! assert_nulls {
             ( $column: expr, $nulls: expr ) => {
@@ -1584,7 +1583,6 @@ mod tests {
             .next()
             .unwrap()
             .unwrap();
-        println!("Batch 2 before: {batch2:?}");
 
         // Starting from arrow-53.3, the parquet reader started returning broken nested NULL masks.
         let batch2 = RecordBatch::from(fix_nested_null_masks(batch2.into()));
