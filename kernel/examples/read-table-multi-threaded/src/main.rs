@@ -94,9 +94,8 @@ fn try_main() -> DeltaResult<()> {
     let table = common::get_table(&cli.location_args)?;
     println!("Reading {}", table.location());
     let engine = common::get_engine(&table, &cli.location_args)?;
-    let scan = match common::get_scan(&table, &engine, &cli.scan_args)? {
-        Some(scan) => scan,
-        None => return Ok(()),
+    let Some(scan) = common::get_scan(&table, &engine, &cli.scan_args)? else {
+        return Ok(());
     };
 
     // this gives us an iterator of (our engine data, selection vector). our engine data is just
