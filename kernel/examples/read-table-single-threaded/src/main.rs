@@ -51,7 +51,8 @@ fn try_main() -> DeltaResult<()> {
     let mut rows_so_far = 0;
     let batches: Vec<RecordBatch> = scan
         .execute(Arc::new(engine))?
-        .map(|scan_result| -> DeltaResult<Option<_>> {
+        .map(|scan_result| -> DeltaResult<_> {
+            // extract the batches and filter them if they have deletion vectors
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();
             let data = scan_result.raw_data?;
@@ -60,34 +61,40 @@ fn try_main() -> DeltaResult<()> {
                 .downcast::<ArrowEngineData>()
                 .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
                 .into();
-            let batch = if let Some(mask) = mask {
-                filter_record_batch(&record_batch, &mask.into())?
+            if let Some(mask) = mask {
+                Ok(filter_record_batch(&record_batch, &mask.into())?)
             } else {
-                record_batch
+                Ok(record_batch)
+            }
+        })
+        .scan(&mut rows_so_far, |rows_so_far, record_batch| {
+            // handle truncation if we've specified a limit
+            let Ok(batch) = record_batch else {
+                return Some(record_batch); // just forward the error
             };
-            if let Some(limit) = cli.scan_args.limit {
-                let batch_rows = batch.num_rows();
-                let final_batch = if rows_so_far < limit {
-                    let batch = if rows_so_far + batch_rows > limit {
-                        // truncate this batch
-                        common::truncate_batch(batch, limit - rows_so_far)
+            let batch_rows = batch.num_rows();
+            let result = match cli.scan_args.limit {
+                Some(limit) if **rows_so_far >= limit => return None, // over the limit, stop iteration
+                Some(limit) => {
+                    let batch = if **rows_so_far + batch_rows > limit {
+                        common::truncate_batch(batch, limit - **rows_so_far)
                     } else {
                         batch
                     };
-                    Ok(Some(batch))
-                } else {
-                    Ok(None)
-                };
-                rows_so_far += batch_rows;
-                final_batch
-            } else {
-                Ok(Some(batch))
-            }
+                    Ok(batch)
+                }
+                None => Ok(batch),
+            };
+            **rows_so_far += batch_rows;
+            Some(result)
         })
-        .flatten_ok()
         .try_collect()?;
     if let Some(limit) = cli.scan_args.limit {
-        println!("Printing first {limit} rows of {rows_so_far} total rows");
+        if limit >= rows_so_far {
+            println!("Printing all {rows_so_far} rows.");
+        } else {
+            println!("Printing first {limit} rows of at least {rows_so_far} total rows.");
+        }
     }
     print_batches(&batches)?;
     Ok(())
