@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tracing::debug;
 use url::Url;
 
+use delta_kernel::actions::DomainMetadata;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Version;
@@ -32,6 +33,7 @@ use handle::Handle;
 // relies on `crate::`
 extern crate self as delta_kernel_ffi;
 
+mod domain_metadata;
 pub mod engine_data;
 pub mod engine_funcs;
 pub mod error;
@@ -558,6 +560,9 @@ pub struct SharedSchema;
 
 #[handle_descriptor(target=Snapshot, mutable=false, sized=true)]
 pub struct SharedSnapshot;
+
+#[handle_descriptor(target=DomainMetadata, mutable=false, sized=true)]
+pub struct SharedDomainMetadata;
 
 /// Get the latest snapshot from the specified table
 ///
