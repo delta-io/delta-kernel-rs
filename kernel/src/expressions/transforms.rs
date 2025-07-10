@@ -159,8 +159,7 @@ pub trait ExpressionTransform<'a> {
     /// child was removed, `Some(Cow::Owned)` if the child was changed, and `Some(Cow::Borrowed)`
     /// otherwise.
     fn recurse_into_pred_not(&mut self, p: &'a Predicate) -> Option<Cow<'a, Predicate>> {
-        let nested_result = self.transform_pred(p)?;
-        Some(nested_result.map_owned_or_else(p, Predicate::not))
+        Some(self.transform_pred(p)?.map_owned_or_else(p, Predicate::not))
     }
 
     /// Recursively transforms a unary predicate's child. Returns `None` if the child was removed,
