@@ -14,7 +14,7 @@ use crate::{
 };
 
 use crate::arrow::array::{
-    cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray,
+    cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray, MapArray,
     OffsetSizeTrait, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
@@ -377,7 +377,7 @@ fn get_indices(
                             // vec indexing is safe, we checked len above
                             let key_needs_transform = children[0].needs_transform();
                             let val_needs_transform = children[1].needs_transform();
-                            if  key_needs_transform || val_needs_transform {
+                            if key_needs_transform || val_needs_transform {
                                 // if one of the key or value does _NOT_ need a transform, replace
                                 // the computed transform with the identity
                                 if !key_needs_transform {
@@ -586,7 +586,11 @@ pub(crate) fn reorder_struct_array(
                         }
                         ArrowDataType::Map(_, _) => {
                             let map_array = input_cols[parquet_position].as_map().clone();
-                            println!("Need to reorder children of map: {children:?}");
+                            final_fields_cols[reorder_index.index] = reorder_map(
+                                map_array,
+                                input_fields[parquet_position].name(),
+                                children,
+                            )?;
                         }
                         _ => {
                             return Err(Error::internal_error(
@@ -654,6 +658,39 @@ fn reorder_list<O: OffsetSizeTrait>(
             "Nested reorder of list should have had struct child.",
         ))
     }
+}
+
+fn reorder_map(
+    map_array: MapArray,
+    input_field_name: &str,
+    children: &[ReorderIndex],
+) -> DeltaResult<FieldArrayOpt> {
+    let (map_field, offset_buffer, struct_array, null_buf, ordered) = map_array.into_parts();
+    let result_array = reorder_struct_array(struct_array, children)?;
+    let result_fields = result_array.fields();
+    let new_map_field = Arc::new(ArrowField::new_struct(
+        map_field.name(),
+        result_fields.clone(),
+        result_array.is_nullable(),
+    ));
+    let key_field = result_fields[0].clone();
+    let val_field = result_fields[1].clone();
+    let new_field = Arc::new(ArrowField::new_map(
+        input_field_name,
+        map_field.name(),
+        key_field,
+        val_field,
+        ordered,
+        map_field.is_nullable(),
+    ));
+    let map = Arc::new(MapArray::try_new(
+        new_map_field,
+        offset_buffer,
+        result_array,
+        null_buf,
+        ordered,
+    )?);
+    Ok(Some((new_field, map)))
 }
 
 /// Use this function to recursively compute properly unioned null masks for all nested
@@ -1407,7 +1444,10 @@ mod tests {
                 1,
                 vec![
                     ReorderIndex::identity(0), // key does not need re-ordering
-                    ReorderIndex::nested(1, vec![ReorderIndex::identity(1), ReorderIndex::identity(0)]),
+                    ReorderIndex::nested(
+                        1,
+                        vec![ReorderIndex::identity(1), ReorderIndex::identity(0)],
+                    ),
                 ],
             ),
         ];
@@ -1575,30 +1615,47 @@ mod tests {
     #[test]
     fn reorder_map_of_struct() {
         let int_array = Arc::new(Int32Array::from(vec![42]));
-        let int_dt = Arc::new(ArrowField::new(
-            "i",
-            int_array.data_type().clone(),
-            false,
-        ));
+        let int_dt = Arc::new(ArrowField::new("i", int_array.data_type().clone(), false));
         let map_array = Arc::new(build_arrow_map());
-        let map_dt = Arc::new(ArrowField::new(
-            "map",
-            map_array.data_type().clone(),
-            false,
-        ));
-        let struct_array = StructArray::from(vec![(int_dt, int_array as ArrowArrayRef), (map_dt, map_array as ArrowArrayRef)]);
+        let map_dt = Arc::new(ArrowField::new("map", map_array.data_type().clone(), false));
+        let struct_array = StructArray::from(vec![
+            (int_dt, int_array as ArrowArrayRef),
+            (map_dt, map_array as ArrowArrayRef),
+        ]);
         let reorder = vec![
-            ReorderIndex::identity(0),
+            ReorderIndex::identity(1),
             ReorderIndex::nested(
-                1,
+                0,
                 vec![
                     ReorderIndex::identity(0),
-                    ReorderIndex::nested(1, vec![ReorderIndex::identity(1), ReorderIndex::identity(0)]),
+                    ReorderIndex::nested(
+                        1,
+                        vec![ReorderIndex::identity(1), ReorderIndex::identity(0)],
+                    ),
                 ],
             ),
         ];
         let ordered = reorder_struct_array(struct_array, &reorder).unwrap();
-        assert!(false);
+        assert_eq!(ordered.column_names(), vec!["map", "i"]);
+        if let ArrowDataType::Map(field, _) = ordered.column(0).data_type() {
+            if let ArrowDataType::Struct(fields) = field.data_type() {
+                fn assert_col_order(field: &ArrowField, expected: Vec<&str>) {
+                    if let ArrowDataType::Struct(fields) = field.data_type() {
+                        let names: Vec<&str> =
+                            fields.iter().map(|field| field.name().as_str()).collect();
+                        assert_eq!(names, expected);
+                    } else {
+                        panic!("Expected struct field");
+                    }
+                }
+                assert_col_order(&fields[0], vec!["k1", "k2"]);
+                assert_col_order(&fields[1], vec!["v2", "v1"]);
+            } else {
+                panic!("Inner field should have been a struct");
+            }
+        } else {
+            panic!("Column 0 should have been a map");
+        }
     }
 
     #[test]
