@@ -37,6 +37,8 @@ pub mod engine_funcs;
 pub mod error;
 use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
 pub mod expressions;
+#[cfg(test)]
+mod ffi_test_utils;
 #[cfg(feature = "tracing")]
 pub mod ffi_tracing;
 pub mod scan;
@@ -773,46 +775,13 @@ impl<T> Default for ReferenceSet<T> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::ffi_test_utils::{
+        allocate_err, allocate_str, ok_or_panic, recover_error, recover_string,
+    };
     use delta_kernel::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
     use delta_kernel::object_store::memory::InMemory;
     use test_utils::{actions_to_string, actions_to_string_partitioned, add_commit, TestAction};
-
-    use super::*;
-    use crate::error::{EngineError, KernelError};
-
-    #[no_mangle]
-    extern "C" fn allocate_err(etype: KernelError, _: KernelStringSlice) -> *mut EngineError {
-        let boxed = Box::new(EngineError { etype });
-        Box::leak(boxed)
-    }
-
-    #[no_mangle]
-    extern "C" fn allocate_str(kernel_str: KernelStringSlice) -> NullableCvoid {
-        let s = unsafe { String::try_from_slice(&kernel_str) };
-        let ptr = Box::into_raw(Box::new(s.unwrap())).cast(); // never null
-        let ptr = unsafe { NonNull::new_unchecked(ptr) };
-        Some(ptr)
-    }
-
-    // helper to recover an error from the above
-    unsafe fn recover_error(ptr: *mut EngineError) -> EngineError {
-        *Box::from_raw(ptr)
-    }
-
-    // helper to recover a string from the above
-    fn recover_string(ptr: NonNull<c_void>) -> String {
-        let ptr = ptr.as_ptr().cast();
-        *unsafe { Box::from_raw(ptr) }
-    }
-
-    fn ok_or_panic<T>(result: ExternResult<T>) -> T {
-        match result {
-            ExternResult::Ok(t) => t,
-            ExternResult::Err(e) => unsafe {
-                panic!("Got engine error with type {:?}", (*e).etype);
-            },
-        }
-    }
 
     #[test]
     fn string_slice() {
