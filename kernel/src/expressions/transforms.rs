@@ -5,6 +5,7 @@ use crate::expressions::{
     BinaryExpression, BinaryPredicate, ColumnName, Expression, JunctionPredicate, Predicate,
     Scalar, UnaryPredicate,
 };
+use crate::utils::CowExt as _;
 
 /// Generic framework for recursive bottom-up transforms of expressions and
 /// predicates. Transformations return `Option<Cow>` with the following semantics:
@@ -105,7 +106,7 @@ pub trait ExpressionTransform<'a> {
                 .map_owned_or_else(expr, Expression::Column),
             Expression::Predicate(p) => self
                 .transform_expr_pred(p)?
-                .map_owned_or_else(expr, Into::into),
+                .map_owned_or_else(expr, Expression::from),
             Expression::Struct(s) => self
                 .transform_expr_struct(s)?
                 .map_owned_or_else(expr, Expression::Struct),
@@ -179,18 +180,10 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         b: &'a BinaryPredicate,
     ) -> Option<Cow<'a, BinaryPredicate>> {
-        use Cow::*;
         let left = self.transform_expr(&b.left)?;
         let right = self.transform_expr(&b.right)?;
-        let b = match (&left, &right) {
-            (Borrowed(_), Borrowed(_)) => Borrowed(b),
-            _ => Owned(BinaryPredicate::new(
-                b.op,
-                left.into_owned(),
-                right.into_owned(),
-            )),
-        };
-        Some(b)
+        let f = |(left, right)| BinaryPredicate::new(b.op, left, right);
+        Some((left, right).map_owned_or_else(b, f))
     }
 
     /// Recursively transforms a binary expression's children. Returns `None` if at least one child
@@ -200,18 +193,10 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         b: &'a BinaryExpression,
     ) -> Option<Cow<'a, BinaryExpression>> {
-        use Cow::*;
         let left = self.transform_expr(&b.left)?;
         let right = self.transform_expr(&b.right)?;
-        let b = match (&left, &right) {
-            (Borrowed(_), Borrowed(_)) => Borrowed(b),
-            _ => Owned(BinaryExpression::new(
-                b.op,
-                left.into_owned(),
-                right.into_owned(),
-            )),
-        };
-        Some(b)
+        let f = |(left, right)| BinaryExpression::new(b.op, left, right);
+        Some((left, right).map_owned_or_else(b, f))
     }
 
     /// Recursively transforms a junction predicate's children. Returns `None` if all children were
@@ -223,30 +208,6 @@ pub trait ExpressionTransform<'a> {
     ) -> Option<Cow<'a, JunctionPredicate>> {
         let nested_result = recurse_into_children(&j.preds, |p| self.transform_pred(p))?;
         Some(nested_result.map_owned_or_else(j, |preds| JunctionPredicate::new(j.op, preds)))
-    }
-}
-
-// Extension trait for Cow<'_, T>
-trait CowMapOwnedOrElse<T: ?Sized> {
-    fn map_owned_or_else<O, S>(self, s: &S, f: impl FnOnce(O) -> S) -> Cow<'_, S>
-    where
-        T: ToOwned<Owned = O>,
-        S: Clone;
-}
-
-impl<T: ToOwned + ?Sized> CowMapOwnedOrElse<T> for Cow<'_, T> {
-    // Propagate the results of nested transforms. If the nested transform made no change (borrowed
-    // `self`), then return a borrowed result `s` as well. Otherwise, invoke the provided mapping
-    // function `f` to convert the owned nested result into an owned result.
-    fn map_owned_or_else<O, S>(self, s: &S, f: impl FnOnce(O) -> S) -> Cow<'_, S>
-    where
-        T: ToOwned<Owned = O>,
-        S: Clone,
-    {
-        match self {
-            Cow::Owned(v) => Cow::Owned(f(v)),
-            Cow::Borrowed(_) => Cow::Borrowed(s),
-        }
     }
 }
 
