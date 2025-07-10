@@ -99,6 +99,7 @@ use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::{Snapshot, LAST_CHECKPOINT_FILE_NAME};
+use crate::utils::calculate_transaction_expiration_timestamp;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 use log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};
 
@@ -222,6 +223,10 @@ impl CheckpointWriter {
 
         Ok(Self { snapshot, version })
     }
+
+    fn get_transaction_expiration_timestamp(&self) -> DeltaResult<Option<i64>> {
+        calculate_transaction_expiration_timestamp(self.snapshot.table_properties())
+    }
     /// Returns the URL where the checkpoint file should be written.
     ///
     /// This method generates the checkpoint path based on the table's root and the version
@@ -239,7 +244,6 @@ impl CheckpointWriter {
         )
         .map(|parsed| parsed.location)
     }
-
     /// Returns the checkpoint data to be written to the checkpoint file.
     ///
     /// This method reads the actions from the log segment and processes them
@@ -271,9 +275,11 @@ impl CheckpointWriter {
         )?;
 
         // Create iterator over actions for checkpoint data
-        let checkpoint_data =
-            CheckpointLogReplayProcessor::new(self.deleted_file_retention_timestamp()?)
-                .process_actions_iter(actions);
+        let checkpoint_data = CheckpointLogReplayProcessor::new(
+            self.deleted_file_retention_timestamp()?,
+            self.get_transaction_expiration_timestamp()?,
+        )
+        .process_actions_iter(actions);
 
         let checkpoint_metadata =
             is_v2_checkpoints_supported.then(|| self.create_checkpoint_metadata_batch(engine));
@@ -408,7 +414,7 @@ impl CheckpointWriter {
             retention_duration,
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map_err(|e| Error::generic(format!("Failed to calculate system time: {}", e)))?,
+                .map_err(|e| Error::generic(format!("Failed to calculate system time: {e}")))?,
         )
     }
 }
@@ -456,12 +462,14 @@ fn deleted_file_retention_timestamp_with_time(
 /// A new [`EngineData`] batch with the `_last_checkpoint` fields:
 /// - `version` (i64, required): Table version number
 /// - `size` (i64, required): Total actions count
-/// - `parts` (i64, optional): Always 1 for single-file checkpoints
+/// - `parts` (i64, optional): Always None for single-file checkpoints
 /// - `sizeInBytes` (i64, optional): Size of checkpoint file in bytes
 /// - `numOfAddFiles` (i64, optional): Number of Add actions
 ///
-/// TODO(#838) Add `checksum` field to `_last_checkpoint` file
-/// TODO(#839) Add `checkpoint_schema` field to `_last_checkpoint` file
+/// TODO(#838): Add `checksum` field to `_last_checkpoint` file
+/// TODO(#839): Add `checkpoint_schema` field to `_last_checkpoint` file
+/// TODO(#1054): Add `tags` field to `_last_checkpoint` file
+/// TODO(#1052): Add `v2Checkpoint` field to `_last_checkpoint` file
 pub(crate) fn create_last_checkpoint_data(
     engine: &dyn Engine,
     version: i64,
@@ -474,7 +482,7 @@ pub(crate) fn create_last_checkpoint_data(
         &[
             version.into(),
             actions_counter.into(),
-            1i64.into(), // parts = 1 since we only support single-part checkpoint here
+            None::<i64>.into(), // parts = None since we only support single-part checkpoints
             size_in_bytes.into(),
             add_actions_counter.into(),
         ],

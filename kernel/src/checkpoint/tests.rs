@@ -144,7 +144,7 @@ fn test_create_last_checkpoint_data() -> DeltaResult<()> {
         vec![
             create_array!(Int64, [version]),
             create_array!(Int64, [total_actions_counter]),
-            create_array!(Int64, [1]),
+            create_array!(Int64, [None]),
             create_array!(Int64, [size_in_bytes]),
             create_array!(Int64, [add_actions_counter]),
         ],
@@ -247,7 +247,6 @@ fn assert_last_checkpoint_contents(
     let expected_data = json!({
         "version": expected_version,
         "size": expected_size,
-        "parts": 1,
         "sizeInBytes": expected_size_in_bytes,
         "numOfAddFiles": expected_num_add_files,
     });
