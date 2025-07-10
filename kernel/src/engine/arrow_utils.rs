@@ -142,6 +142,9 @@ where
 *      - `Nested` and the data is a `List<StructArray>`: get the inner struct array out of the list,
 *         reorder it recursively as above, rebuild the list, and the put the column at the correct
 *         location
+*      - `Nested` and the data is a `Map`. We expect the child order to contain two elements. The
+*         first specifies any needed reordering in the keys (i.e. if the key contains a struct),
+*         and the second any reordering needed in the values.
 *
 * Example:
 * The parquet crate `ProjectionMask::leaves` method only considers leaf columns -- a "flat" schema --
