@@ -375,12 +375,19 @@ fn get_indices(
                                 ));
                             }
                             // vec indexing is safe, we checked len above
-                            if children[0].needs_transform() || children[1].needs_transform() {
-                                // the indices are wrong, as they are index from the inner
-                                // schema. Adjust them to be consistent with our index.
-                                children[0].index = index;
-                                children[1].index = index + 1;
-                                reorder_indices.append(&mut children);
+                            let key_needs_transform = children[0].needs_transform();
+                            let val_needs_transform = children[1].needs_transform();
+                            if  key_needs_transform || val_needs_transform {
+                                // if one of the key or value does _NOT_ need a transform, replace
+                                // the computed transform with the identity
+                                if !key_needs_transform {
+                                    children[0] = ReorderIndex::identity(0);
+                                }
+                                if !val_needs_transform {
+                                    children[1] = ReorderIndex::identity(1);
+                                }
+                                // we bundle up the transforms for the key and value cols into a nested transform at our index
+                                reorder_indices.push(ReorderIndex::nested(index, children));
                             } else {
                                 // no transform needed on the map, so just pass it on unchanged
                                 reorder_indices.push(ReorderIndex::identity(index));
@@ -577,7 +584,10 @@ pub(crate) fn reorder_struct_array(
                                 children,
                             )?;
                         }
-                        // TODO: MAP
+                        ArrowDataType::Map(_, _) => {
+                            let map_array = input_cols[parquet_position].as_map().clone();
+                            println!("Need to reorder children of map: {children:?}");
+                        }
                         _ => {
                             return Err(Error::internal_error(
                                 "Nested reorder can only apply to struct/list/map.",
@@ -766,7 +776,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::arrow::array::{
-        Array, ArrayRef as ArrowArrayRef, BooleanArray, GenericListArray, Int32Array, StructArray,
+        Array, ArrayRef as ArrowArrayRef, BooleanArray, GenericListArray, Int32Array, Int32Builder,
+        MapArray, MapBuilder, StructArray, StructBuilder,
     };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
@@ -1394,11 +1405,10 @@ mod tests {
             ReorderIndex::identity(0),
             ReorderIndex::nested(
                 1,
-                vec![ReorderIndex::identity(0), ReorderIndex::identity(1)],
-            ),
-            ReorderIndex::nested(
-                2,
-                vec![ReorderIndex::identity(1), ReorderIndex::identity(0)],
+                vec![
+                    ReorderIndex::identity(0), // key does not need re-ordering
+                    ReorderIndex::nested(1, vec![ReorderIndex::identity(1), ReorderIndex::identity(0)]),
+                ],
             ),
         ];
         assert_eq!(mask_indices, expect_mask);
@@ -1526,6 +1536,69 @@ mod tests {
             let struct_item = array_item.as_struct();
             assert_eq!(struct_item.column_names(), vec!["c", "b"]);
         }
+    }
+
+    // boy howdy this is more complicated than expected
+    fn build_arrow_map() -> MapArray {
+        let key_struct_builder = StructBuilder::from_fields(
+            Fields::from(vec![
+                ArrowField::new("k1", ArrowDataType::Int32, false),
+                ArrowField::new("k2", ArrowDataType::Int32, false),
+            ]),
+            1,
+        );
+        let value_struct_builder = StructBuilder::from_fields(
+            Fields::from(vec![
+                ArrowField::new("v1", ArrowDataType::Int32, false),
+                ArrowField::new("v2", ArrowDataType::Int32, false),
+            ]),
+            1,
+        );
+        let mut map_builder = MapBuilder::new(None, key_struct_builder, value_struct_builder);
+
+        let (key_builder, value_builder) = map_builder.entries();
+        let key_k1_builder = key_builder.field_builder::<Int32Builder>(0).unwrap();
+        key_k1_builder.append_value(1);
+        let key_k2_builder = key_builder.field_builder::<Int32Builder>(1).unwrap();
+        key_k2_builder.append_value(2);
+        key_builder.append(true);
+
+        let value_v1_builder = value_builder.field_builder::<Int32Builder>(0).unwrap();
+        value_v1_builder.append_value(1);
+        let value_v2_builder = value_builder.field_builder::<Int32Builder>(1).unwrap();
+        value_v2_builder.append_value(2);
+        value_builder.append(true);
+        map_builder.append(true).unwrap();
+        map_builder.finish()
+    }
+
+    #[test]
+    fn reorder_map_of_struct() {
+        let int_array = Arc::new(Int32Array::from(vec![42]));
+        let int_dt = Arc::new(ArrowField::new(
+            "i",
+            int_array.data_type().clone(),
+            false,
+        ));
+        let map_array = Arc::new(build_arrow_map());
+        let map_dt = Arc::new(ArrowField::new(
+            "map",
+            map_array.data_type().clone(),
+            false,
+        ));
+        let struct_array = StructArray::from(vec![(int_dt, int_array as ArrowArrayRef), (map_dt, map_array as ArrowArrayRef)]);
+        let reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::nested(
+                1,
+                vec![
+                    ReorderIndex::identity(0),
+                    ReorderIndex::nested(1, vec![ReorderIndex::identity(1), ReorderIndex::identity(0)]),
+                ],
+            ),
+        ];
+        let ordered = reorder_struct_array(struct_array, &reorder).unwrap();
+        assert!(false);
     }
 
     #[test]
