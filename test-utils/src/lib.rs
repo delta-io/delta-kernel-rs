@@ -190,20 +190,20 @@ impl DefaultEngineExtension for DefaultEngine<TokioBackgroundExecutor> {
 // setup default engine with in-memory (=true) or local fs (=false) object store.
 pub fn engine_store_setup(
     table_name: &str,
-    in_memory: bool,
+    local_directory: Option<&str>,
 ) -> (
     Arc<dyn ObjectStore>,
     DefaultEngine<TokioBackgroundExecutor>,
     Url,
 ) {
-    let (storage, base_path, base_url): (Arc<dyn ObjectStore>, &str, &str) = if in_memory {
-        (Arc::new(InMemory::new()), "/", "memory:///")
-    } else {
-        (
+    let (storage, base_path, base_url): (Arc<dyn ObjectStore>, String, &str) = match local_directory
+    {
+        None => (Arc::new(InMemory::new()), "/".to_string(), "memory:///"),
+        Some(dir) => (
             Arc::new(LocalFileSystem::new()),
-            "./kernel_write_tests/",
-            "file://",
-        )
+            format!("{dir}/kernel_write_tests/"),
+            "file:///",
+        ),
     };
 
     let table_root_path = Path::from(format!("{base_path}{table_name}"));
@@ -283,10 +283,14 @@ pub async fn create_table(
     Ok(Table::new(table_path))
 }
 
-/// Creates two empty test tables, one with 3/7 protocol and one with 1/1 protocol
+/// Creates two empty test tables, one with 37 protocol and one with 11 protocol.
+/// the tables will be named {table_base_name}_11 and table_base_name}_37. The local_directory param
+/// can be set to write out the tables to the local filesystem, passing in None will create in-memory tables
 pub async fn setup_test_tables(
     schema: SchemaRef,
     partition_columns: &[&str],
+    local_directory: Option<&str>,
+    table_base_name: &str,
 ) -> Result<
     Vec<(
         Table,
@@ -296,8 +300,12 @@ pub async fn setup_test_tables(
     )>,
     Box<dyn std::error::Error>,
 > {
-    let (store_37, engine_37, table_location_37) = engine_store_setup("test_table_37", true);
-    let (store_11, engine_11, table_location_11) = engine_store_setup("test_table_11", true);
+    let table_name_11 = format!("{table_base_name}_11");
+    let table_name_37 = format!("{table_base_name}_37");
+    let (store_11, engine_11, table_location_11) =
+        engine_store_setup(table_name_11.as_str(), local_directory);
+    let (store_37, engine_37, table_location_37) =
+        engine_store_setup(table_name_37.as_str(), local_directory);
     Ok(vec![
         (
             create_table(
