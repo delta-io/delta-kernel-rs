@@ -1,4 +1,4 @@
-use crate::error::{AllocateErrorFn, ExternResult, IntoExternResult};
+use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::{
     kernel_string_slice, AllocateStringFn, KernelStringSlice, NullableCvoid, SharedExternEngine,
