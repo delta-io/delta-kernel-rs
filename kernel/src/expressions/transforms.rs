@@ -97,21 +97,21 @@ pub trait ExpressionTransform<'a> {
     /// on the child(ren) of non-leaf variants.
     fn transform_expr(&mut self, expr: &'a Expression) -> Option<Cow<'a, Expression>> {
         let expr = match expr {
-            Expression::Literal(s) => {
-                map_owned_or_else(self.transform_expr_literal(s)?, expr, Expression::Literal)
-            }
-            Expression::Column(c) => {
-                map_owned_or_else(self.transform_expr_column(c)?, expr, Expression::Column)
-            }
-            Expression::Predicate(p) => {
-                map_owned_or_else(self.transform_expr_pred(p)?, expr, Into::into)
-            }
-            Expression::Struct(s) => {
-                map_owned_or_else(self.transform_expr_struct(s)?, expr, Expression::Struct)
-            }
-            Expression::Binary(b) => {
-                map_owned_or_else(self.transform_expr_binary(b)?, expr, Expression::Binary)
-            }
+            Expression::Literal(s) => self
+                .transform_expr_literal(s)?
+                .map_owned_or_else(expr, Expression::Literal),
+            Expression::Column(c) => self
+                .transform_expr_column(c)?
+                .map_owned_or_else(expr, Expression::Column),
+            Expression::Predicate(p) => self
+                .transform_expr_pred(p)?
+                .map_owned_or_else(expr, Into::into),
+            Expression::Struct(s) => self
+                .transform_expr_struct(s)?
+                .map_owned_or_else(expr, Expression::Struct),
+            Expression::Binary(b) => self
+                .transform_expr_binary(b)?
+                .map_owned_or_else(expr, Expression::Binary),
         };
         Some(expr)
     }
@@ -121,19 +121,19 @@ pub trait ExpressionTransform<'a> {
     /// child(ren) of non-leaf variants.
     fn transform_pred(&mut self, pred: &'a Predicate) -> Option<Cow<'a, Predicate>> {
         let pred = match pred {
-            Predicate::BooleanExpression(e) => {
-                map_owned_or_else(self.transform_expr(e)?, pred, Predicate::BooleanExpression)
-            }
-            Predicate::Not(p) => map_owned_or_else(self.transform_pred_not(p)?, pred, |p| p),
-            Predicate::Unary(u) => {
-                map_owned_or_else(self.transform_pred_unary(u)?, pred, Predicate::Unary)
-            }
-            Predicate::Binary(b) => {
-                map_owned_or_else(self.transform_pred_binary(b)?, pred, Predicate::Binary)
-            }
-            Predicate::Junction(j) => {
-                map_owned_or_else(self.transform_pred_junction(j)?, pred, Predicate::Junction)
-            }
+            Predicate::BooleanExpression(e) => self
+                .transform_expr(e)?
+                .map_owned_or_else(pred, Predicate::BooleanExpression),
+            Predicate::Not(p) => self.transform_pred_not(p)?.map_owned_or_else(pred, |p| p),
+            Predicate::Unary(u) => self
+                .transform_pred_unary(u)?
+                .map_owned_or_else(pred, Predicate::Unary),
+            Predicate::Binary(b) => self
+                .transform_pred_binary(b)?
+                .map_owned_or_else(pred, Predicate::Binary),
+            Predicate::Junction(j) => self
+                .transform_pred_junction(j)?
+                .map_owned_or_else(pred, Predicate::Junction),
         };
         Some(pred)
     }
@@ -160,7 +160,7 @@ pub trait ExpressionTransform<'a> {
     /// otherwise.
     fn recurse_into_pred_not(&mut self, p: &'a Predicate) -> Option<Cow<'a, Predicate>> {
         let nested_result = self.transform_pred(p)?;
-        Some(map_owned_or_else(nested_result, p, Predicate::not))
+        Some(nested_result.map_owned_or_else(p, Predicate::not))
     }
 
     /// Recursively transforms a unary predicate's child. Returns `None` if the child was removed,
@@ -170,8 +170,7 @@ pub trait ExpressionTransform<'a> {
         u: &'a UnaryPredicate,
     ) -> Option<Cow<'a, UnaryPredicate>> {
         let nested_result = self.transform_expr(&u.expr)?;
-        let f = |expr| UnaryPredicate::new(u.op, expr);
-        Some(map_owned_or_else(nested_result, u, f))
+        Some(nested_result.map_owned_or_else(u, |expr| UnaryPredicate::new(u.op, expr)))
     }
 
     /// Recursively transforms a binary predicate's children. Returns `None` if at least one child
@@ -224,26 +223,31 @@ pub trait ExpressionTransform<'a> {
         j: &'a JunctionPredicate,
     ) -> Option<Cow<'a, JunctionPredicate>> {
         let nested_result = recurse_into_children(&j.preds, |p| self.transform_pred(p))?;
-        let f = |preds| JunctionPredicate::new(j.op, preds);
-        Some(map_owned_or_else(nested_result, j, f))
+        Some(nested_result.map_owned_or_else(j, |preds| JunctionPredicate::new(j.op, preds)))
     }
 }
 
-// Helper function used to propagate the results of nested transforms. If the nested transform made
-// no change (borrowed `nested_result`), then return a borrowed result `s` as well. Otherwise,
-// invoke the provided mapping function `f` to convert the owned nested result into an owned result.
-fn map_owned_or_else<'s, T, O, S>(
-    nested_result: Cow<'_, T>,
-    s: &'s S,
-    f: impl FnOnce(O) -> S,
-) -> Cow<'s, S>
-where
-    T: ToOwned<Owned = O> + ?Sized,
-    S: Clone,
-{
-    match nested_result {
-        Cow::Owned(v) => Cow::Owned(f(v)),
-        Cow::Borrowed(_) => Cow::Borrowed(s),
+// Extension trait for Cow<'_, T>
+trait CowMapOwnedOrElse<T: ?Sized> {
+    fn map_owned_or_else<O, S>(self, s: &S, f: impl FnOnce(O) -> S) -> Cow<'_, S>
+    where
+        T: ToOwned<Owned = O>,
+        S: Clone;
+}
+
+impl<T: ToOwned + ?Sized> CowMapOwnedOrElse<T> for Cow<'_, T> {
+    // Propagate the results of nested transforms. If the nested transform made no change (borrowed
+    // `self`), then return a borrowed result `s` as well. Otherwise, invoke the provided mapping
+    // function `f` to convert the owned nested result into an owned result.
+    fn map_owned_or_else<O, S>(self, s: &S, f: impl FnOnce(O) -> S) -> Cow<'_, S>
+    where
+        T: ToOwned<Owned = O>,
+        S: Clone,
+    {
+        match self {
+            Cow::Owned(v) => Cow::Owned(f(v)),
+            Cow::Borrowed(_) => Cow::Borrowed(s),
+        }
     }
 }
 
