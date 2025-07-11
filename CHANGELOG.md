@@ -4,15 +4,17 @@
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.12.1...v0.13.0)
 
+### 🏗️ Breaking changes
+1. Add support for opaque engine expressions ([#686])
+2. Rename `Transaction::add_write_metadata` to `Transaction::add_files` ([#1019])
 
 ### 🚀 Features / new APIs
 
-1. SetTransactionRetentionDuration ([#1013])
+1. add ability to only retain SetTransaction actions <= SetTransactionRetentionDuration ([#1013])
 2. *(ffi)* Add timetravel by version number ([#1044])
 3. Introduce a crate for args that are common between examples ([#1046])
-4. Add support for opaque engine expressions ([#686])
-5. Support reordering structs that are inside maps in default parquet reader ([#1060])
-6. Add default engine support for arrow eval of opaque expressions ([#980])
+4. Support reordering structs that are inside maps in default parquet reader ([#1060])
+5. Add default engine support for arrow eval of opaque expressions ([#980])
 
 ### 🐛 Bug Fixes
 
@@ -25,9 +27,8 @@
 ### 🚜 Refactor
 
 1. Move various test util functions to test-utils crate ([#985])
-2. Rename `Transaction::add_write_metadata` to `Transaction::add_files` ([#1019])
-3. Define and use a cow helper for transforms ([#1057])
-4. Expand capability and usage of cow helper for transforms ([#1061])
+2. Define and use a cow helper for transforms ([#1057])
+3. Expand capability and usage of cow helper for transforms ([#1061])
 
 
 [#985]: https://github.com/delta-io/delta-kernel-rs/pull/985
