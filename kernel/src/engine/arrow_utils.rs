@@ -14,7 +14,7 @@ use crate::{
 };
 
 use crate::arrow::array::{
-    cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray,
+    cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray, MapArray,
     OffsetSizeTrait, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
@@ -142,6 +142,9 @@ where
 *      - `Nested` and the data is a `List<StructArray>`: get the inner struct array out of the list,
 *         reorder it recursively as above, rebuild the list, and the put the column at the correct
 *         location
+*      - `Nested` and the data is a `Map`. We expect the child order to contain two elements. The
+*         first specifies any needed reordering in the keys (i.e. if the key contains a struct),
+*         and the second any reordering needed in the values.
 *
 * Example:
 * The parquet crate `ProjectionMask::leaves` method only considers leaf columns -- a "flat" schema --
@@ -355,20 +358,40 @@ fn get_indices(
                                 return Err(Error::generic("map fields had more than 2 members"));
                             }
                             let inner_schema = map_type.as_struct_schema(key_name, val_name);
-                            let (parquet_advance, _children) = get_indices(
+                            let (parquet_advance, mut children) = get_indices(
                                 parquet_index + parquet_offset,
                                 &inner_schema,
                                 inner_fields,
                                 mask_indices,
                             )?;
+
                             // advance the number of parquet fields, but subtract 1 because the
                             // map will be counted by the `enumerate` call but doesn't count as
                             // an actual index.
                             parquet_offset += parquet_advance - 1;
                             // note that we found this field
                             found_fields.insert(requested_field.name());
-                            // push the child reorder on, currently no reordering for maps
-                            reorder_indices.push(ReorderIndex::identity(index));
+
+                            if children.len() != 2 {
+                                return Err(Error::generic(
+                                    "Map call should have generated exactly two reorder indices",
+                                ));
+                            }
+                            // vec indexing is safe, we checked len above
+                            let mut num_identity_transforms = 0;
+                            if !children[0].needs_transform() {
+                                children[0] = ReorderIndex::identity(0);
+                                num_identity_transforms += 1;
+                            }
+                            if !children[1].needs_transform() {
+                                children[1] = ReorderIndex::identity(1);
+                                num_identity_transforms += 1;
+                            }
+                            let transform = match num_identity_transforms {
+                                2 => ReorderIndex::identity(index),
+                                _ => ReorderIndex::nested(index, children),
+                            };
+                            reorder_indices.push(transform);
                         }
                         _ => {
                             return Err(Error::unexpected_column_type(field.name()));
@@ -531,6 +554,7 @@ pub(crate) fn reorder_struct_array(
                     final_fields_cols[reorder_index.index] = Some((new_field, col));
                 }
                 ReorderIndexTransform::Nested(children) => {
+                    let input_field_name = input_fields[parquet_position].name();
                     match input_cols[parquet_position].data_type() {
                         ArrowDataType::Struct(_) => {
                             let struct_array = input_cols[parquet_position].as_struct().clone();
@@ -538,7 +562,7 @@ pub(crate) fn reorder_struct_array(
                                 Arc::new(reorder_struct_array(struct_array, children)?);
                             // create the new field specifying the correct order for the struct
                             let new_field = Arc::new(ArrowField::new_struct(
-                                input_fields[parquet_position].name(),
+                                input_field_name,
                                 result_array.fields().clone(),
                                 input_fields[parquet_position].is_nullable(),
                             ));
@@ -547,21 +571,19 @@ pub(crate) fn reorder_struct_array(
                         }
                         ArrowDataType::List(_) => {
                             let list_array = input_cols[parquet_position].as_list::<i32>().clone();
-                            final_fields_cols[reorder_index.index] = reorder_list(
-                                list_array,
-                                input_fields[parquet_position].name(),
-                                children,
-                            )?;
+                            final_fields_cols[reorder_index.index] =
+                                reorder_list(list_array, input_field_name, children)?;
                         }
                         ArrowDataType::LargeList(_) => {
                             let list_array = input_cols[parquet_position].as_list::<i64>().clone();
-                            final_fields_cols[reorder_index.index] = reorder_list(
-                                list_array,
-                                input_fields[parquet_position].name(),
-                                children,
-                            )?;
+                            final_fields_cols[reorder_index.index] =
+                                reorder_list(list_array, input_field_name, children)?;
                         }
-                        // TODO: MAP
+                        ArrowDataType::Map(_, _) => {
+                            let map_array = input_cols[parquet_position].as_map().clone();
+                            final_fields_cols[reorder_index.index] =
+                                reorder_map(map_array, input_field_name, children)?;
+                        }
                         _ => {
                             return Err(Error::internal_error(
                                 "Nested reorder can only apply to struct/list/map.",
@@ -628,6 +650,39 @@ fn reorder_list<O: OffsetSizeTrait>(
             "Nested reorder of list should have had struct child.",
         ))
     }
+}
+
+fn reorder_map(
+    map_array: MapArray,
+    input_field_name: &str,
+    children: &[ReorderIndex],
+) -> DeltaResult<FieldArrayOpt> {
+    let (map_field, offset_buffer, struct_array, null_buf, ordered) = map_array.into_parts();
+    let result_array = reorder_struct_array(struct_array, children)?;
+    let result_fields = result_array.fields();
+    let new_map_field = Arc::new(ArrowField::new_struct(
+        map_field.name(),
+        result_fields.clone(),
+        result_array.is_nullable(),
+    ));
+    let key_field = result_fields[0].clone();
+    let val_field = result_fields[1].clone();
+    let new_field = Arc::new(ArrowField::new_map(
+        input_field_name,
+        map_field.name(),
+        key_field,
+        val_field,
+        ordered,
+        map_field.is_nullable(),
+    ));
+    let map = Arc::new(MapArray::try_new(
+        new_map_field,
+        offset_buffer,
+        result_array,
+        null_buf,
+        ordered,
+    )?);
+    Ok(Some((new_field, map)))
 }
 
 /// Use this function to recursively compute properly unioned null masks for all nested
@@ -750,7 +805,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::arrow::array::{
-        Array, ArrayRef as ArrowArrayRef, BooleanArray, GenericListArray, Int32Array, StructArray,
+        Array, ArrayRef as ArrowArrayRef, BooleanArray, GenericListArray, Int32Array, Int32Builder,
+        MapArray, MapBuilder, StructArray, StructBuilder,
     };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
@@ -1321,6 +1377,76 @@ mod tests {
         assert_eq!(reorder_indices, expect_reorder);
     }
 
+    #[test]
+    fn reorder_map_with_structs() {
+        let requested_schema = Arc::new(StructType::new([
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::not_null(
+                "map",
+                MapType::new(
+                    StructType::new([
+                        StructField::not_null("k1", DataType::STRING),
+                        StructField::not_null("k2", DataType::STRING),
+                    ]),
+                    StructType::new([
+                        StructField::not_null("v2", DataType::STRING),
+                        StructField::not_null("v1", DataType::STRING),
+                    ]),
+                    false,
+                ),
+            ),
+        ]));
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", ArrowDataType::Int32, false),
+            ArrowField::new_map(
+                "map",
+                "entries",
+                ArrowField::new(
+                    "i",
+                    ArrowDataType::Struct(
+                        vec![
+                            ArrowField::new("k1", ArrowDataType::Utf8, false),
+                            ArrowField::new("k2", ArrowDataType::Utf8, false),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                ),
+                ArrowField::new(
+                    "v",
+                    ArrowDataType::Struct(
+                        vec![
+                            ArrowField::new("v1", ArrowDataType::Utf8, false),
+                            ArrowField::new("v2", ArrowDataType::Utf8, false),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                ),
+                false,
+                false,
+            ),
+        ]));
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+        let expect_mask = vec![0, 1, 2, 3, 4];
+        let expect_reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::nested(
+                1,
+                vec![
+                    ReorderIndex::identity(0), // key does not need re-ordering
+                    ReorderIndex::nested(
+                        1,
+                        vec![ReorderIndex::identity(1), ReorderIndex::identity(0)],
+                    ),
+                ],
+            ),
+        ];
+        assert_eq!(mask_indices, expect_mask);
+        assert_eq!(reorder_indices, expect_reorder);
+    }
+
     fn make_struct_array() -> StructArray {
         let boolean = Arc::new(BooleanArray::from(vec![false, false, true, true]));
         let int = Arc::new(Int32Array::from(vec![42, 28, 19, 31]));
@@ -1444,6 +1570,86 @@ mod tests {
         }
     }
 
+    // boy howdy this is more complicated than expected
+    fn build_arrow_map() -> MapArray {
+        let key_struct_builder = StructBuilder::from_fields(
+            Fields::from(vec![
+                ArrowField::new("k1", ArrowDataType::Int32, false),
+                ArrowField::new("k2", ArrowDataType::Int32, false),
+            ]),
+            1,
+        );
+        let value_struct_builder = StructBuilder::from_fields(
+            Fields::from(vec![
+                ArrowField::new("v1", ArrowDataType::Int32, false),
+                ArrowField::new("v2", ArrowDataType::Int32, false),
+            ]),
+            1,
+        );
+        let mut map_builder = MapBuilder::new(None, key_struct_builder, value_struct_builder);
+
+        let (key_builder, value_builder) = map_builder.entries();
+        let key_k1_builder = key_builder.field_builder::<Int32Builder>(0).unwrap();
+        key_k1_builder.append_value(1);
+        let key_k2_builder = key_builder.field_builder::<Int32Builder>(1).unwrap();
+        key_k2_builder.append_value(2);
+        key_builder.append(true);
+
+        let value_v1_builder = value_builder.field_builder::<Int32Builder>(0).unwrap();
+        value_v1_builder.append_value(1);
+        let value_v2_builder = value_builder.field_builder::<Int32Builder>(1).unwrap();
+        value_v2_builder.append_value(2);
+        value_builder.append(true);
+        map_builder.append(true).unwrap();
+        map_builder.finish()
+    }
+
+    #[test]
+    fn reorder_map_of_struct() {
+        let int_array = Arc::new(Int32Array::from(vec![42]));
+        let int_dt = Arc::new(ArrowField::new("i", int_array.data_type().clone(), false));
+        let map_array = Arc::new(build_arrow_map());
+        let map_dt = Arc::new(ArrowField::new("map", map_array.data_type().clone(), false));
+        let struct_array = StructArray::from(vec![
+            (int_dt, int_array as ArrowArrayRef),
+            (map_dt, map_array as ArrowArrayRef),
+        ]);
+        let reorder = vec![
+            ReorderIndex::identity(1),
+            ReorderIndex::nested(
+                0,
+                vec![
+                    ReorderIndex::identity(0),
+                    ReorderIndex::nested(
+                        1,
+                        vec![ReorderIndex::identity(1), ReorderIndex::identity(0)],
+                    ),
+                ],
+            ),
+        ];
+        let ordered = reorder_struct_array(struct_array, &reorder).unwrap();
+        assert_eq!(ordered.column_names(), vec!["map", "i"]);
+        if let ArrowDataType::Map(field, _) = ordered.column(0).data_type() {
+            if let ArrowDataType::Struct(fields) = field.data_type() {
+                fn assert_col_order(field: &ArrowField, expected: Vec<&str>) {
+                    if let ArrowDataType::Struct(fields) = field.data_type() {
+                        let names: Vec<&str> =
+                            fields.iter().map(|field| field.name().as_str()).collect();
+                        assert_eq!(names, expected);
+                    } else {
+                        panic!("Expected struct field");
+                    }
+                }
+                assert_col_order(&fields[0], vec!["k1", "k2"]);
+                assert_col_order(&fields[1], vec!["v2", "v1"]);
+            } else {
+                panic!("Inner field should have been a struct");
+            }
+        } else {
+            panic!("Column 0 should have been a map");
+        }
+    }
+
     #[test]
     fn no_matches() {
         let requested_schema = Arc::new(StructType::new([
@@ -1545,7 +1751,6 @@ mod tests {
             .next()
             .unwrap()
             .unwrap();
-        println!("Batch 1: {batch1:?}");
 
         macro_rules! assert_nulls {
             ( $column: expr, $nulls: expr ) => {
@@ -1584,7 +1789,6 @@ mod tests {
             .next()
             .unwrap()
             .unwrap();
-        println!("Batch 2 before: {batch2:?}");
 
         // Starting from arrow-53.3, the parquet reader started returning broken nested NULL masks.
         let batch2 = RecordBatch::from(fix_nested_null_masks(batch2.into()));
