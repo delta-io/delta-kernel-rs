@@ -298,11 +298,13 @@ impl Protocol {
     }
 
     /// Get the reader features for the protocol
+    #[internal_api]
     pub(crate) fn reader_features(&self) -> Option<&[ReaderFeature]> {
         self.reader_features.as_deref()
     }
 
     /// Get the writer features for the protocol
+    #[internal_api]
     pub(crate) fn writer_features(&self) -> Option<&[WriterFeature]> {
         self.writer_features.as_deref()
     }

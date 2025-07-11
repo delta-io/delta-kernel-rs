@@ -48,7 +48,7 @@ impl DataFileMetadata {
         Self { file_meta }
     }
 
-    // convert DataFileMetadata into a record batch which matches the 'write_metadata' schema
+    // convert DataFileMetadata into a record batch which matches the 'add_files_schema' schema
     fn as_record_batch(
         &self,
         partition_values: &HashMap<String, String>,
@@ -62,7 +62,7 @@ impl DataFileMetadata {
                     size,
                 },
         } = self;
-        let write_metadata_schema = crate::transaction::get_write_metadata_schema();
+        let add_files_schema = crate::transaction::add_files_schema();
 
         // create the record batch of the write metadata
         let path = Arc::new(StringArray::from(vec![location.to_string()]));
@@ -88,7 +88,7 @@ impl DataFileMetadata {
         let data_change = Arc::new(BooleanArray::from(vec![data_change]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(write_metadata_schema.as_ref().try_into_arrow()?),
+            Arc::new(add_files_schema.as_ref().try_into_arrow()?),
             vec![path, partitions, size, modification_time, data_change],
         )?)))
     }
@@ -137,8 +137,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         // fail if path does not end with a trailing slash
         if !path.path().ends_with('/') {
             return Err(Error::generic(format!(
-                "Path must end with a trailing slash: {}",
-                path
+                "Path must end with a trailing slash: {path}"
             )));
         }
         let path = path.join(&name)?;
@@ -166,10 +165,10 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     }
 
     /// Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
-    /// metadata as an EngineData batch which matches the [write metadata] schema (where `<uuid>` is
-    /// a generated UUIDv4).
+    /// metadata as an EngineData batch which matches the [add file metadata] schema (where `<uuid>`
+    /// is a generated UUIDv4).
     ///
-    /// [write metadata]: crate::transaction::get_write_metadata_schema
+    /// [add file metadata]: crate::transaction::add_files_schema
     pub async fn write_parquet_file(
         &self,
         path: &url::Url,
@@ -265,7 +264,28 @@ impl FileOpener for ParquetOpener {
 
         Ok(Box::pin(async move {
             #[cfg(feature = "arrow-55")]
-            let mut reader = ParquetObjectReader::new(store, path);
+            let mut reader = {
+                use crate::object_store::ObjectStoreScheme;
+                // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
+                // request which isn't supported by Azure. For now we just detect if the URL is
+                // pointing to azure and if so, do a HEAD request so we can pass in file size to the
+                // reader which will cause the reader to avoid a suffix range request.
+                // see also: https://github.com/delta-io/delta-kernel-rs/issues/968
+                //
+                // TODO(#1010): Note that we don't need this at all and can actually just _always_
+                // do the `with_file_size` but need to (1) update our unit tests which often
+                // hardcode size=0 and (2) update CDF execute which also hardcodes size=0.
+                if let Ok((ObjectStoreScheme::MicrosoftAzure, _)) =
+                    ObjectStoreScheme::parse(&file_meta.location)
+                {
+                    // also note doing HEAD then actual GET isn't atomic, and leaves us vulnerable
+                    // to file changing between the two calls.
+                    let meta = store.head(&path).await?;
+                    ParquetObjectReader::new(store, path).with_file_size(meta.size)
+                } else {
+                    ParquetObjectReader::new(store, path)
+                }
+            };
             #[cfg(all(feature = "arrow-54", not(feature = "arrow-55")))]
             let mut reader = {
                 // TODO avoid IO by converting passed file meta to ObjectMeta (no longer an issue
@@ -457,7 +477,7 @@ mod tests {
         let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
 
         let schema = Arc::new(
-            crate::transaction::get_write_metadata_schema()
+            crate::transaction::add_files_schema()
                 .as_ref()
                 .try_into_arrow()
                 .unwrap(),

@@ -5,10 +5,13 @@ use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumString};
 
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::DataType;
+use delta_kernel_derive::internal_api;
 
 pub(crate) use column_mapping::column_mapping_mode;
 pub use column_mapping::{validate_schema_column_mapping, ColumnMappingMode};
+pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
 mod column_mapping;
+mod timestamp_ntz;
 
 /// Reader features communicate capabilities that must be implemented in order to correctly read a
 /// given table. That is, readers must implement and respect all features listed in a table's
@@ -31,7 +34,8 @@ mod column_mapping;
 )]
 #[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
-pub enum ReaderFeature {
+#[internal_api]
+pub(crate) enum ReaderFeature {
     /// Mapping of one column to another
     ColumnMapping,
     /// Deletion vectors for merge, update, delete
@@ -50,6 +54,8 @@ pub enum ReaderFeature {
     /// vacuumProtocolCheck ReaderWriter feature ensures consistent application of reader and writer
     /// protocol checks during VACUUM operations
     VacuumProtocolCheck,
+    /// This feature enables support for the variant data type, which stores semi-structured data.
+    VariantType,
     #[serde(untagged)]
     #[strum(default)]
     Unknown(String),
@@ -75,7 +81,8 @@ pub enum ReaderFeature {
 )]
 #[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
-pub enum WriterFeature {
+#[internal_api]
+pub(crate) enum WriterFeature {
     /// Append Only Tables
     AppendOnly,
     /// Table invariants
@@ -116,6 +123,13 @@ pub enum WriterFeature {
     /// vacuumProtocolCheck ReaderWriter feature ensures consistent application of reader and writer
     /// protocol checks during VACUUM operations
     VacuumProtocolCheck,
+    /// The Clustered Table feature facilitates the physical clustering of rows
+    /// that share similar values on a predefined set of clustering columns.
+    #[strum(serialize = "clustering")]
+    #[serde(rename = "clustering")]
+    ClusteredTable,
+    /// This feature enables support for the variant data type, which stores semi-structured data.
+    VariantType,
     #[serde(untagged)]
     #[strum(default)]
     Unknown(String),
@@ -167,6 +181,7 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<WriterFeature>> = Lazy
         WriterFeature::AppendOnly,
         WriterFeature::DeletionVectors,
         WriterFeature::Invariants,
+        WriterFeature::TimestampWithoutTimezone,
     ]
 });
 
@@ -218,6 +233,7 @@ mod tests {
             (ReaderFeature::TypeWideningPreview, "typeWidening-preview"),
             (ReaderFeature::V2Checkpoint, "v2Checkpoint"),
             (ReaderFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
+            (ReaderFeature::VariantType, "variantType"),
             (ReaderFeature::unknown("something"), "something"),
         ];
 
@@ -226,7 +242,7 @@ mod tests {
         for (feature, expected) in cases {
             assert_eq!(feature.to_string(), expected);
             let serialized = serde_json::to_string(&feature).unwrap();
-            assert_eq!(serialized, format!("\"{}\"", expected));
+            assert_eq!(serialized, format!("\"{expected}\""));
 
             let deserialized: ReaderFeature = serde_json::from_str(&serialized).unwrap();
             assert_eq!(deserialized, feature);
@@ -257,6 +273,8 @@ mod tests {
             (WriterFeature::IcebergCompatV1, "icebergCompatV1"),
             (WriterFeature::IcebergCompatV2, "icebergCompatV2"),
             (WriterFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
+            (WriterFeature::ClusteredTable, "clustering"),
+            (WriterFeature::VariantType, "variantType"),
             (WriterFeature::unknown("something"), "something"),
         ];
 
@@ -265,7 +283,7 @@ mod tests {
         for (feature, expected) in cases {
             assert_eq!(feature.to_string(), expected);
             let serialized = serde_json::to_string(&feature).unwrap();
-            assert_eq!(serialized, format!("\"{}\"", expected));
+            assert_eq!(serialized, format!("\"{expected}\""));
 
             let deserialized: WriterFeature = serde_json::from_str(&serialized).unwrap();
             assert_eq!(deserialized, feature);

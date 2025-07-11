@@ -5,6 +5,7 @@ use crate::expressions::{
     BinaryExpression, BinaryPredicate, ColumnName, Expression, JunctionPredicate, OpaqueExpression,
     OpaquePredicate, Predicate, Scalar, UnaryPredicate,
 };
+use crate::utils::CowExt as _;
 
 /// Generic framework for recursive bottom-up transforms of expressions and
 /// predicates. Transformations return `Option<Cow>` with the following semantics:
@@ -124,36 +125,28 @@ pub trait ExpressionTransform<'a> {
     /// specific transform for each expression variant. Also invoked internally in order to recurse
     /// on the child(ren) of non-leaf variants.
     fn transform_expr(&mut self, expr: &'a Expression) -> Option<Cow<'a, Expression>> {
-        use Cow::*;
         let expr = match expr {
-            Expression::Literal(s) => match self.transform_expr_literal(s)? {
-                Owned(s) => Owned(Expression::Literal(s)),
-                Borrowed(_) => Borrowed(expr),
-            },
-            Expression::Column(c) => match self.transform_expr_column(c)? {
-                Owned(c) => Owned(Expression::Column(c)),
-                Borrowed(_) => Borrowed(expr),
-            },
-            Expression::Predicate(p) => match self.transform_expr_pred(p)? {
-                Owned(p) => Owned(p.into()),
-                Borrowed(_) => Borrowed(expr),
-            },
-            Expression::Struct(s) => match self.transform_expr_struct(s)? {
-                Owned(s) => Owned(Expression::Struct(s)),
-                Borrowed(_) => Borrowed(expr),
-            },
-            Expression::Binary(b) => match self.transform_expr_binary(b)? {
-                Owned(b) => Owned(Expression::Binary(b)),
-                Borrowed(_) => Borrowed(expr),
-            },
-            Expression::Opaque(o) => match self.transform_expr_opaque(o)? {
-                Owned(o) => Owned(Expression::Opaque(o)),
-                Borrowed(_) => Borrowed(expr),
-            },
-            Expression::Unknown(u) => match self.transform_expr_unknown(u)? {
-                Owned(u) => Owned(Expression::Unknown(u)),
-                Borrowed(_) => Borrowed(expr),
-            },
+            Expression::Literal(s) => self
+                .transform_expr_literal(s)?
+                .map_owned_or_else(expr, Expression::Literal),
+            Expression::Column(c) => self
+                .transform_expr_column(c)?
+                .map_owned_or_else(expr, Expression::Column),
+            Expression::Predicate(p) => self
+                .transform_expr_pred(p)?
+                .map_owned_or_else(expr, Expression::from),
+            Expression::Struct(s) => self
+                .transform_expr_struct(s)?
+                .map_owned_or_else(expr, Expression::Struct),
+            Expression::Binary(b) => self
+                .transform_expr_binary(b)?
+                .map_owned_or_else(expr, Expression::Binary),
+            Expression::Opaque(o) => self
+                .transform_expr_opaque(o)?
+                .map_owned_or_else(expr, Expression::Opaque),
+            Expression::Unknown(u) => self
+                .transform_expr_unknown(u)?
+                .map_owned_or_else(expr, Expression::Unknown),
         };
         Some(expr)
     }
@@ -162,36 +155,26 @@ pub trait ExpressionTransform<'a> {
     /// transform for each predicate variant. Also invoked internally in order to recurse on the
     /// child(ren) of non-leaf variants.
     fn transform_pred(&mut self, pred: &'a Predicate) -> Option<Cow<'a, Predicate>> {
-        use Cow::*;
         let pred = match pred {
-            Predicate::BooleanExpression(e) => match self.transform_expr(e)? {
-                Owned(e) => Owned(Predicate::BooleanExpression(e)),
-                Borrowed(_) => Borrowed(pred),
-            },
-            Predicate::Not(p) => match self.transform_pred_not(p)? {
-                Owned(p) => Owned(p),
-                Borrowed(_) => Borrowed(pred),
-            },
-            Predicate::Unary(u) => match self.transform_pred_unary(u)? {
-                Owned(u) => Owned(Predicate::Unary(u)),
-                Borrowed(_) => Borrowed(pred),
-            },
-            Predicate::Binary(b) => match self.transform_pred_binary(b)? {
-                Owned(b) => Owned(Predicate::Binary(b)),
-                Borrowed(_) => Borrowed(pred),
-            },
-            Predicate::Junction(j) => match self.transform_pred_junction(j)? {
-                Owned(j) => Owned(Predicate::Junction(j)),
-                Borrowed(_) => Borrowed(pred),
-            },
-            Predicate::Opaque(o) => match self.transform_pred_opaque(o)? {
-                Owned(o) => Owned(Predicate::Opaque(o)),
-                Borrowed(_) => Borrowed(pred),
-            },
-            Predicate::Unknown(u) => match self.transform_pred_unknown(u)? {
-                Owned(u) => Owned(Predicate::Unknown(u)),
-                Borrowed(_) => Borrowed(pred),
-            },
+            Predicate::BooleanExpression(e) => self
+                .transform_expr(e)?
+                .map_owned_or_else(pred, Predicate::BooleanExpression),
+            Predicate::Not(p) => self.transform_pred_not(p)?.map_owned_or_else(pred, |p| p),
+            Predicate::Unary(u) => self
+                .transform_pred_unary(u)?
+                .map_owned_or_else(pred, Predicate::Unary),
+            Predicate::Binary(b) => self
+                .transform_pred_binary(b)?
+                .map_owned_or_else(pred, Predicate::Binary),
+            Predicate::Junction(j) => self
+                .transform_pred_junction(j)?
+                .map_owned_or_else(pred, Predicate::Junction),
+            Predicate::Opaque(o) => self
+                .transform_pred_opaque(o)?
+                .map_owned_or_else(pred, Predicate::Opaque),
+            Predicate::Unknown(u) => self
+                .transform_pred_unknown(u)?
+                .map_owned_or_else(pred, Predicate::Unknown),
         };
         Some(pred)
     }
@@ -232,12 +215,7 @@ pub trait ExpressionTransform<'a> {
     /// child was removed, `Some(Cow::Owned)` if the child was changed, and `Some(Cow::Borrowed)`
     /// otherwise.
     fn recurse_into_pred_not(&mut self, p: &'a Predicate) -> Option<Cow<'a, Predicate>> {
-        use Cow::*;
-        let p = match self.transform_pred(p)? {
-            Owned(pred) => Owned(Predicate::not(pred)),
-            Borrowed(_) => Borrowed(p),
-        };
-        Some(p)
+        Some(self.transform_pred(p)?.map_owned_or_else(p, Predicate::not))
     }
 
     /// Recursively transforms a unary predicate's child. Returns `None` if the child was removed,
@@ -246,12 +224,8 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         u: &'a UnaryPredicate,
     ) -> Option<Cow<'a, UnaryPredicate>> {
-        use Cow::*;
-        let u = match self.transform_expr(&u.expr)? {
-            Owned(expr) => Owned(UnaryPredicate::new(u.op, expr)),
-            Borrowed(_) => Borrowed(u),
-        };
-        Some(u)
+        let nested_result = self.transform_expr(&u.expr)?;
+        Some(nested_result.map_owned_or_else(u, |expr| UnaryPredicate::new(u.op, expr)))
     }
 
     /// Recursively transforms a binary predicate's children. Returns `None` if at least one child
@@ -261,18 +235,10 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         b: &'a BinaryPredicate,
     ) -> Option<Cow<'a, BinaryPredicate>> {
-        use Cow::*;
         let left = self.transform_expr(&b.left)?;
         let right = self.transform_expr(&b.right)?;
-        let b = match (&left, &right) {
-            (Borrowed(_), Borrowed(_)) => Borrowed(b),
-            _ => Owned(BinaryPredicate::new(
-                b.op,
-                left.into_owned(),
-                right.into_owned(),
-            )),
-        };
-        Some(b)
+        let f = |(left, right)| BinaryPredicate::new(b.op, left, right);
+        Some((left, right).map_owned_or_else(b, f))
     }
 
     /// Recursively transforms a binary expression's children. Returns `None` if at least one child
@@ -282,18 +248,10 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         b: &'a BinaryExpression,
     ) -> Option<Cow<'a, BinaryExpression>> {
-        use Cow::*;
         let left = self.transform_expr(&b.left)?;
         let right = self.transform_expr(&b.right)?;
-        let b = match (&left, &right) {
-            (Borrowed(_), Borrowed(_)) => Borrowed(b),
-            _ => Owned(BinaryExpression::new(
-                b.op,
-                left.into_owned(),
-                right.into_owned(),
-            )),
-        };
-        Some(b)
+        let f = |(left, right)| BinaryExpression::new(b.op, left, right);
+        Some((left, right).map_owned_or_else(b, f))
     }
 
     /// Recursively transforms a junction predicate's children. Returns `None` if all children were
@@ -303,12 +261,8 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         j: &'a JunctionPredicate,
     ) -> Option<Cow<'a, JunctionPredicate>> {
-        use Cow::*;
-        let j = match recurse_into_children(&j.preds, |p| self.transform_pred(p))? {
-            Owned(preds) => Owned(JunctionPredicate::new(j.op, preds)),
-            Borrowed(_) => Borrowed(j),
-        };
-        Some(j)
+        let nested_result = recurse_into_children(&j.preds, |p| self.transform_pred(p))?;
+        Some(nested_result.map_owned_or_else(j, |preds| JunctionPredicate::new(j.op, preds)))
     }
 
     /// Recursively transforms the children of an [`OpaquePredicate`]. Returns `None` if all

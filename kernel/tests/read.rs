@@ -5,7 +5,6 @@ use std::sync::Arc;
 use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{
@@ -25,8 +24,9 @@ use test_utils::{
 use url::Url;
 
 mod common;
-use common::{read_scan, to_arrow};
+
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
+use test_utils::{read_scan, to_arrow};
 
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
 const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c000.snappy.parquet";
@@ -314,7 +314,9 @@ fn read_with_execute(
     scan: &Scan,
     expected: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let result_schema = Arc::new(ArrowSchema::try_from_kernel(scan.schema().as_ref())?);
+    let result_schema = Arc::new(ArrowSchema::try_from_kernel(
+        scan.logical_schema().as_ref(),
+    )?);
     let batches = read_scan(scan, engine)?;
 
     if expected.is_empty() {
@@ -356,8 +358,9 @@ fn read_with_scan_metadata(
     scan: &Scan,
     expected: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let global_state = scan.global_scan_state();
-    let result_schema = Arc::new(ArrowSchema::try_from_kernel(scan.schema().as_ref())?);
+    let result_schema = Arc::new(ArrowSchema::try_from_kernel(
+        scan.logical_schema().as_ref(),
+    )?);
     let scan_metadata = scan.scan_metadata(engine)?;
     let mut scan_files = vec![];
     for res in scan_metadata {
@@ -381,7 +384,7 @@ fn read_with_scan_metadata(
             .parquet_handler()
             .read_parquet_files(
                 &[meta],
-                global_state.physical_schema.clone(),
+                scan.physical_schema().clone(),
                 scan.physical_predicate().clone(),
             )
             .unwrap();
@@ -393,8 +396,8 @@ fn read_with_scan_metadata(
             let logical = transform_to_logical(
                 engine,
                 read_result,
-                &global_state.physical_schema,
-                &global_state.logical_schema,
+                scan.physical_schema(),
+                scan.logical_schema(),
                 &scan_file.transform,
             )
             .unwrap();

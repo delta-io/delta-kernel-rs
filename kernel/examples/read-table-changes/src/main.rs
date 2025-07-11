@@ -1,20 +1,20 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use clap::Parser;
+use common::LocationArgs;
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::{compute::filter_record_batch, util::pretty::print_batches};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::{DeltaResult, Table};
+use delta_kernel::DeltaResult;
 use itertools::Itertools;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
-    /// Path to the table to inspect
-    path: String,
+    #[command(flatten)]
+    location_args: LocationArgs,
+
     /// The start version of the table changes
     #[arg(short, long, default_value_t = 0)]
     start_version: u64,
@@ -25,18 +25,13 @@ struct Cli {
 
 fn main() -> DeltaResult<()> {
     let cli = Cli::parse();
-    let table = Table::try_from_uri(cli.path)?;
-    let options = HashMap::from([("skip_signature", "true".to_string())]);
-    let engine = Arc::new(DefaultEngine::try_new(
-        table.location(),
-        options,
-        Arc::new(TokioBackgroundExecutor::new()),
-    )?);
-    let table_changes = table.table_changes(engine.as_ref(), cli.start_version, cli.end_version)?;
+    let table = common::get_table(&cli.location_args)?;
+    let engine = common::get_engine(&table, &cli.location_args)?;
+    let table_changes = table.table_changes(&engine, cli.start_version, cli.end_version)?;
 
     let table_changes_scan = table_changes.into_scan_builder().build()?;
     let batches: Vec<RecordBatch> = table_changes_scan
-        .execute(engine.clone())?
+        .execute(Arc::new(engine))?
         .map(|scan_result| -> DeltaResult<_> {
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();

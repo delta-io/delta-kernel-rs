@@ -34,23 +34,6 @@ use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
 
 use super::*;
 
-// utility to easily create ListedLogFiles
-impl ListedLogFiles {
-    fn new(
-        ascending_commit_files: Vec<ParsedLogPath>,
-        ascending_compaction_files: Vec<ParsedLogPath>,
-        checkpoint_parts: Vec<ParsedLogPath>,
-        latest_crc_file: Option<ParsedLogPath>,
-    ) -> Self {
-        ListedLogFiles {
-            ascending_commit_files,
-            ascending_compaction_files,
-            checkpoint_parts,
-            latest_crc_file,
-        }
-    }
-}
-
 // NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
 // that the parquet reader properly infers nullcount = rowcount for missing columns. The two
 // checkpoint part files that contain transaction app ids have truncated schemas that would
@@ -176,7 +159,7 @@ pub(crate) fn add_checkpoint_to_store(
     data: Box<dyn EngineData>,
     filename: &str,
 ) -> DeltaResult<()> {
-    let path = format!("_delta_log/{}", filename);
+    let path = format!("_delta_log/{filename}");
     write_parquet_to_store(store, path, data)
 }
 
@@ -187,7 +170,7 @@ fn add_sidecar_to_store(
     data: Box<dyn EngineData>,
     filename: &str,
 ) -> DeltaResult<()> {
-    let path = format!("_delta_log/_sidecars/{}", filename);
+    let path = format!("_delta_log/_sidecars/{filename}");
     write_parquet_to_store(store, path, data)
 }
 
@@ -203,7 +186,7 @@ fn write_json_to_store(
         .map(|action| serde_json::to_string(&action).expect("action to string"))
         .collect();
     let content = json_lines.join("\n");
-    let checkpoint_path = format!("_delta_log/{}", filename);
+    let checkpoint_path = format!("_delta_log/{filename}");
 
     tokio::runtime::Runtime::new()
         .expect("create tokio runtime")
@@ -840,8 +823,7 @@ fn test_sidecar_to_filemeta_valid_paths() -> DeltaResult<()> {
         assert_eq!(
             filemeta.location.as_str(),
             expected_url,
-            "Mismatch for input path: {}",
-            input_path
+            "Mismatch for input path: {input_path}"
         );
     }
     Ok(())
@@ -986,7 +968,9 @@ fn test_create_checkpoint_stream_errors_when_schema_has_remove_but_no_sidecar_ac
         ListedLogFiles::new(
             vec![],
             vec![],
-            vec![create_log_path("file:///00000000000000000001.parquet")],
+            vec![create_log_path(
+                "file:///00000000000000000001.checkpoint.parquet",
+            )],
             None,
         ),
         log_root,
@@ -1015,7 +999,9 @@ fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_actio
         ListedLogFiles::new(
             vec![],
             vec![],
-            vec![create_log_path("file:///00000000000000000001.parquet")],
+            vec![create_log_path(
+                "file:///00000000000000000001.checkpoint.parquet",
+            )],
             None,
         ),
         log_root,
@@ -1190,6 +1176,8 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
+    let filename = "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json";
+
     write_json_to_store(
         &store,
         vec![Action::Add(Add {
@@ -1197,12 +1185,10 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
             data_change: true,
             ..Default::default()
         })],
-        "00000000000000000001.checkpoint.json",
+        filename,
     )?;
 
-    let checkpoint_one_file = log_root
-        .join("00000000000000000001.checkpoint.json")?
-        .to_string();
+    let checkpoint_one_file = log_root.join(filename)?.to_string();
 
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
@@ -1698,5 +1684,64 @@ fn test_commit_cover_minimal_overlap() {
             ExpectedFile::Commit(3),
             ExpectedFile::Compaction(0, 2),
         ],
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn test_debug_assert_listed_log_file_in_order_compaction_files() {
+    let _ = ListedLogFiles::new(
+        vec![],
+        vec![
+            create_log_path("file:///00000000000000000000.00000000000000000004.compacted.json"),
+            create_log_path("file:///00000000000000000001.00000000000000000002.compacted.json"),
+        ],
+        vec![],
+        None,
+    );
+}
+
+#[test]
+#[should_panic]
+#[cfg(debug_assertions)]
+fn test_debug_assert_listed_log_file_out_of_order_compaction_files() {
+    let _ = ListedLogFiles::new(
+        vec![],
+        vec![
+            create_log_path("file:///00000000000000000000.00000000000000000004.compacted.json"),
+            create_log_path("file:///00000000000000000000.00000000000000000003.compacted.json"),
+        ],
+        vec![],
+        None,
+    );
+}
+
+#[test]
+#[should_panic]
+#[cfg(debug_assertions)]
+fn test_debug_assert_listed_log_file_different_multipart_checkpoint_versions() {
+    let _ = ListedLogFiles::new(
+        vec![],
+        vec![],
+        vec![
+            create_log_path("00000000000000000010.checkpoint.0000000001.0000000002.parquet"),
+            create_log_path("00000000000000000011.checkpoint.0000000002.0000000002.parquet"),
+        ],
+        None,
+    );
+}
+
+#[test]
+#[should_panic]
+#[cfg(debug_assertions)]
+fn test_debug_assert_listed_log_file_invalid_multipart_checkpoint() {
+    let _ = ListedLogFiles::new(
+        vec![],
+        vec![],
+        vec![
+            create_log_path("00000000000000000010.checkpoint.0000000001.0000000003.parquet"),
+            create_log_path("00000000000000000011.checkpoint.0000000002.0000000003.parquet"),
+        ],
+        None,
     );
 }

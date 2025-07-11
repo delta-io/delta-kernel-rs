@@ -795,7 +795,7 @@ mod tests {
         ];
 
         for (expr, expected) in cases {
-            let result = format!("{}", expr);
+            let result = format!("{expr}");
             assert_eq!(result, expected);
         }
     }
@@ -838,7 +838,7 @@ mod tests {
         ];
 
         for (pred, expected) in cases {
-            let result = format!("{}", pred);
+            let result = format!("{pred}");
             assert_eq!(result, expected);
         }
     }

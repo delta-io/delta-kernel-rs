@@ -184,13 +184,13 @@ impl ParsedLogPath<Url> {
     fn create_path(table_root: &Url, filename: String) -> DeltaResult<Self> {
         let location = table_root.join(Self::DELTA_LOG_DIR)?.join(&filename)?;
         Self::try_from(location)?.ok_or_else(|| {
-            Error::internal_error(format!("Attempted to create an invalid path: {}", filename))
+            Error::internal_error(format!("Attempted to create an invalid path: {filename}"))
         })
     }
 
     /// Create a new ParsedCommitPath<Url> for a new json commit file
     pub(crate) fn new_commit(table_root: &Url, version: Version) -> DeltaResult<Self> {
-        let filename = format!("{:020}.json", version);
+        let filename = format!("{version:020}.json");
         let path = Self::create_path(table_root, filename)?;
         if !path.is_commit() {
             return Err(Error::internal_error(
@@ -206,7 +206,7 @@ impl ParsedLogPath<Url> {
         table_root: &Url,
         version: Version,
     ) -> DeltaResult<Self> {
-        let filename = format!("{:020}.checkpoint.parquet", version);
+        let filename = format!("{version:020}.checkpoint.parquet");
         let path = Self::create_path(table_root, filename)?;
         if !path.is_checkpoint() {
             return Err(Error::internal_error(
@@ -236,7 +236,7 @@ impl ParsedLogPath<Url> {
     #[allow(unused)]
     /// Create a new ParsedCommitPath<Url> for a new CRC file
     pub(crate) fn new_crc(table_root: &Url, version: Version) -> DeltaResult<Self> {
-        let filename = format!("{:020}.crc", version);
+        let filename = format!("{version:020}.crc");
         let path = Self::create_path(table_root, filename)?;
         if path.file_type != LogPathFileType::Crc {
             return Err(Error::internal_error(
@@ -297,8 +297,7 @@ mod tests {
                     ..
                 }))
             ),
-            "Expected Unknown file type, got {:?}",
-            result
+            "Expected Unknown file type, got {result:?}"
         );
 
         // ignored - version fails to parse

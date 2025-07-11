@@ -75,14 +75,14 @@ impl LogSegment {
             checkpoint_file.version
         });
 
+        // TODO: consider unifying this with debug_asserts in the ListedLogFiles::new(); issue#995
         // We require that commits that are contiguous. In other words, there must be no gap between commit versions.
         require!(
             ascending_commit_files
                 .windows(2)
                 .all(|cfs| cfs[0].version + 1 == cfs[1].version),
             Error::generic(format!(
-                "Expected ordered contiguous commit files {:?}",
-                ascending_commit_files
+                "Expected ordered contiguous commit files {ascending_commit_files:?}"
             ))
         );
 
@@ -110,8 +110,7 @@ impl LogSegment {
             require!(
                 effective_version == end_version,
                 Error::generic(format!(
-                    "LogSegment end version {} not the same as the specified end version {}",
-                    effective_version, end_version
+                    "LogSegment end version {effective_version} not the same as the specified end version {end_version}"
                 ))
             );
         }
@@ -192,16 +191,15 @@ impl LogSegment {
                 .first()
                 .is_some_and(|first_commit| first_commit.version == start_version),
             Error::generic(format!(
-                "Expected the first commit to have version {}",
-                start_version
+                "Expected the first commit to have version {start_version}"
             ))
         );
-        let listed_files = ListedLogFiles {
+        let listed_files = ListedLogFiles::new(
             ascending_commit_files,
-            ascending_compaction_files: vec![],
-            checkpoint_parts: vec![],
-            latest_crc_file: None, // TODO: use CRC files for table changes?
-        };
+            vec![],
+            vec![],
+            None, // TODO: use CRC files for table changes?
+        );
         LogSegment::try_new(listed_files, log_root, end_version)
     }
 
@@ -487,7 +485,7 @@ fn list_log_files(
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
     let start_version = start_version.into().unwrap_or(0);
     let end_version = end_version.into();
-    let version_prefix = format!("{:020}", start_version);
+    let version_prefix = format!("{start_version:020}");
     let start_from = log_root.join(&version_prefix)?;
 
     Ok(storage
@@ -505,13 +503,62 @@ fn list_log_files(
 /// to be sorted in ascending order by version. The elements of `checkpoint_parts` are all the parts
 /// of the same checkpoint. Checkpoint parts share the same version. The `latest_crc_file` includes
 /// the latest (highest version) CRC file, if any, which may not correspond to the latest commit.
-// TODO: debug asserts in a `new` method to enforce the above?
 #[derive(Debug)]
 pub(crate) struct ListedLogFiles {
     pub ascending_commit_files: Vec<ParsedLogPath>,
     pub ascending_compaction_files: Vec<ParsedLogPath>,
     pub checkpoint_parts: Vec<ParsedLogPath>,
     pub latest_crc_file: Option<ParsedLogPath>,
+}
+
+impl ListedLogFiles {
+    fn new(
+        ascending_commit_files: Vec<ParsedLogPath>,
+        ascending_compaction_files: Vec<ParsedLogPath>,
+        checkpoint_parts: Vec<ParsedLogPath>,
+        latest_crc_file: Option<ParsedLogPath>,
+    ) -> Self {
+        // We are adding debug_assertions here since we want to validate invariants that are (relatively) expensive to compute
+        #[cfg(debug_assertions)]
+        {
+            assert!(ascending_compaction_files
+                .windows(2)
+                .all(|pair| match pair {
+                    [ParsedLogPath {
+                        version: version0,
+                        file_type: LogPathFileType::CompactedCommit { hi: hi0 },
+                        ..
+                    }, ParsedLogPath {
+                        version: version1,
+                        file_type: LogPathFileType::CompactedCommit { hi: hi1 },
+                        ..
+                    }] => version0 < version1 || (version0 == version1 && hi0 <= hi1),
+                    _ => false,
+                }));
+
+            assert!(checkpoint_parts.iter().all(|part| part.is_checkpoint()));
+
+            // for a multi-part checkpoint, check that they are all same version and all the parts are there
+            if checkpoint_parts.len() > 1 {
+                assert!(checkpoint_parts
+                    .windows(2)
+                    .all(|pair| pair[0].version == pair[1].version));
+
+                assert!(checkpoint_parts.iter().all(|part| matches!(
+                    part.file_type,
+                    LogPathFileType::MultiPartCheckpoint { num_parts, .. }
+                    if checkpoint_parts.len() == num_parts as usize
+                )));
+            }
+        }
+
+        ListedLogFiles {
+            ascending_commit_files,
+            ascending_compaction_files,
+            checkpoint_parts,
+            latest_crc_file,
+        }
+    }
 }
 
 /// List all commit and checkpoint files with versions above the provided `start_version` (inclusive).
@@ -580,12 +627,12 @@ pub(crate) fn list_log_files_with_version(
             }
         }
 
-        ListedLogFiles {
+        ListedLogFiles::new(
             ascending_commit_files,
             ascending_compaction_files,
             checkpoint_parts,
             latest_crc_file,
-        }
+        )
     })
 }
 
