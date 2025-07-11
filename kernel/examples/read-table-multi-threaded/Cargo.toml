@@ -18,5 +18,6 @@ itertools = "0.14"
 spmc = "0.3.0"
 url = "2"
 
+# for cargo-release
 [package.metadata.release]
 release = false

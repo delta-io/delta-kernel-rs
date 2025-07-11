@@ -15,6 +15,7 @@ rust-version.workspace = true
 [package.metadata.docs.rs]
 all-features = true
 
+# for cargo-release
 [package.metadata.release]
 pre-release-replacements = [
   { file = "../README.md", search = "delta_kernel = \"[a-z0-9\\.-]+\"", replace = "delta_kernel = \"{{version}}\"" },
