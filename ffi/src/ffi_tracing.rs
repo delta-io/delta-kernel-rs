@@ -230,7 +230,7 @@ struct MessageFieldVisitor {
 impl Visit for MessageFieldVisitor {
     fn record_debug(&mut self, field: &TracingField, value: &dyn fmt::Debug) {
         if field.name() == "message" {
-            self.message = Some(format!("{:?}", value));
+            self.message = Some(format!("{value:?}"));
         }
     }
 
@@ -577,7 +577,7 @@ mod tests {
 
         // file path will use \ on windows
         use std::path::MAIN_SEPARATOR;
-        let expected_file = format!("ffi{}src{}ffi_tracing.rs", MAIN_SEPARATOR, MAIN_SEPARATOR);
+        let expected_file = format!("ffi{MAIN_SEPARATOR}src{MAIN_SEPARATOR}ffi_tracing.rs");
 
         let ok = event.level == Level::INFO
             && target == "delta_kernel_ffi::ffi_tracing::tests"

@@ -104,7 +104,7 @@ pub(crate) fn calculate_transaction_expiration_timestamp(
         .map(|duration| -> DeltaResult<i64> {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map_err(|e| Error::generic(format!("Failed to get current time: {}", e)))?;
+                .map_err(|e| Error::generic(format!("Failed to get current time: {e}")))?;
 
             let now_ms = i64::try_from(now.as_millis())
                 .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))?;
@@ -115,6 +115,41 @@ pub(crate) fn calculate_transaction_expiration_timestamp(
             Ok(now_ms - expiration_ms)
         })
         .transpose()
+}
+
+// Extension trait for Cow<'_, T>
+pub(crate) trait CowExt<T: ToOwned + ?Sized> {
+    /// The owned type that corresopnds to Self
+    type Owned;
+
+    /// Propagate the results of nested transforms. If the nested transform made no change (borrowed
+    /// `self`), then return a borrowed result `s` as well. Otherwise, invoke the provided mapping
+    /// function `f` to convert the owned nested result into an owned result.
+    fn map_owned_or_else<S: Clone>(self, s: &S, f: impl FnOnce(Self::Owned) -> S) -> Cow<'_, S>;
+}
+
+// Basic implementation for a single Cow value
+impl<T: ToOwned + ?Sized> CowExt<T> for Cow<'_, T> {
+    type Owned = T::Owned;
+
+    fn map_owned_or_else<S: Clone>(self, s: &S, f: impl FnOnce(T::Owned) -> S) -> Cow<'_, S> {
+        match self {
+            Cow::Owned(v) => Cow::Owned(f(v)),
+            Cow::Borrowed(_) => Cow::Borrowed(s),
+        }
+    }
+}
+
+// Additional implementation for a pair of Cow values
+impl<'a, T: ToOwned + ?Sized> CowExt<(Cow<'a, T>, Cow<'a, T>)> for (Cow<'a, T>, Cow<'a, T>) {
+    type Owned = (T::Owned, T::Owned);
+
+    fn map_owned_or_else<S: Clone>(self, s: &S, f: impl FnOnce(Self::Owned) -> S) -> Cow<'_, S> {
+        match self {
+            (Cow::Borrowed(_), Cow::Borrowed(_)) => Cow::Borrowed(s),
+            (left, right) => Cow::Owned(f((left.into_owned(), right.into_owned()))),
+        }
+    }
 }
 
 #[cfg(test)]
