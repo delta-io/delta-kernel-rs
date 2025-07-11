@@ -28,7 +28,7 @@
 
 1. Move various test util functions to test-utils crate ([#985])
 2. Define and use a cow helper for transforms ([#1057])
-3. Expand capability and usage of cow helper for transforms ([#1061])
+3. Expand capability and usage of `Cow` helper for transforms ([#1061])
 
 
 [#985]: https://github.com/delta-io/delta-kernel-rs/pull/985
