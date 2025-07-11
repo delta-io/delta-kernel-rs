@@ -618,11 +618,11 @@ fn test_opaque() {
 
     assert_eq!(
         format!("{expr:?}"),
-        "Opaque(OpaqueExpression { op: OpaqueLessThanOp, exprs: [Column(ColumnName { path: [\"x\"] }), Literal(Integer(10))] })"
+        "Opaque(OpaqueExpression { op: ArrowOpaqueExpressionOpAdaptor(OpaqueLessThanOp), exprs: [Column(ColumnName { path: [\"x\"] }), Literal(Integer(10))] })"
     );
     assert_eq!(
         format!("{pred:?}"),
-        "Opaque(OpaquePredicate { op: OpaqueLessThanOp, exprs: [Column(ColumnName { path: [\"x\"] }), Literal(Integer(10))] })"
+        "Opaque(OpaquePredicate { op: ArrowOpaquePredicateOpAdaptor(OpaqueLessThanOp), exprs: [Column(ColumnName { path: [\"x\"] }), Literal(Integer(10))] })"
     );
 
     assert_eq!(expr, expr);

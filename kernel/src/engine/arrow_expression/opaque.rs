@@ -128,6 +128,7 @@ impl ArrowOpaquePredicate for Predicate {
 /// there would be no way to recover a &dyn ArrowOpaqueExpressionOp` from it. Instead, we must
 /// downcast from `&dyn OpaqueExpressionOp` to the concrete `ArrowOpaqueExpressionOpAdaptor` type
 /// that implements both traits, and extract its inner `dyn ArrowOpaqueExpressionOp`.
+#[derive(Debug)]
 pub(crate) struct ArrowOpaqueExpressionOpAdaptor(Box<dyn ArrowOpaqueExpressionOp>);
 
 impl std::ops::Deref for ArrowOpaqueExpressionOpAdaptor {
@@ -135,12 +136,6 @@ impl std::ops::Deref for ArrowOpaqueExpressionOpAdaptor {
 
     fn deref(&self) -> &Self::Target {
         self.0.deref()
-    }
-}
-
-impl std::fmt::Debug for ArrowOpaqueExpressionOpAdaptor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        std::fmt::Debug::fmt(&**self, f)
     }
 }
 
@@ -173,6 +168,7 @@ impl OpaqueExpressionOp for ArrowOpaqueExpressionOpAdaptor {
 /// would be no way to recover a &dyn ArrowOpaquePredicateOp` from it. Instead, we must downcast
 /// from `&dyn OpaquePredicateOp` to the concrete `ArrowOpaquePredicateOpAdaptor` type that
 /// implements both traits, and extract its inner `dyn ArrowOpaquePredicateOp`.
+#[derive(Debug)]
 pub(crate) struct ArrowOpaquePredicateOpAdaptor(Box<dyn ArrowOpaquePredicateOp>);
 
 impl std::ops::Deref for ArrowOpaquePredicateOpAdaptor {
@@ -180,12 +176,6 @@ impl std::ops::Deref for ArrowOpaquePredicateOpAdaptor {
 
     fn deref(&self) -> &Self::Target {
         self.0.deref()
-    }
-}
-
-impl std::fmt::Debug for ArrowOpaquePredicateOpAdaptor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        std::fmt::Debug::fmt(&**self, f)
     }
 }
 
