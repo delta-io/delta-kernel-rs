@@ -52,7 +52,7 @@ enum LitType {
   Array,
   Map
 };
-enum ExpressionType { BinOp, Variadic, Literal, Unary, Column };
+enum ExpressionType { BinOp, Variadic, Literal, Unary, Column, OpaqueExpression, OpaquePredicate, Unknown };
 enum VariadicType {
   And,
   Or,
@@ -78,6 +78,17 @@ struct Variadic {
 struct Unary {
   enum UnaryType type;
   ExpressionItemList sub_expr;
+};
+struct OpaqueExpression {
+  HandleSharedOpaqueExpressionOp op;
+  ExpressionItemList exprs;
+};
+struct OpaquePredicate {
+  HandleSharedOpaquePredicateOp op;
+  ExpressionItemList exprs;
+};
+struct Unknown {
+  char* name;
 };
 struct BinaryData {
   uint8_t* buf;
@@ -265,6 +276,36 @@ DEFINE_VARIADIC(visit_expr_or, Or)
 DEFINE_VARIADIC(visit_expr_struct_expr, StructExpression)
 #undef DEFINE_VARIADIC
 
+void visit_opaque_expr(
+    void *data,
+    uintptr_t sibling_list_id,
+    HandleSharedOpaqueExpressionOp op,
+    uintptr_t child_list_id)
+{
+  struct OpaqueExpression* opaque = malloc(sizeof(struct OpaqueExpression));
+  opaque->op = op;
+  opaque->exprs = get_expr_list(data, child_list_id);
+  put_expr_item(data, sibling_list_id, opaque, OpaqueExpression);
+}
+
+void visit_opaque_pred(
+    void *data,
+    uintptr_t sibling_list_id,
+    HandleSharedOpaquePredicateOp op,
+    uintptr_t child_list_id)
+{
+  struct OpaquePredicate* opaque = malloc(sizeof(struct OpaquePredicate));
+  opaque->op = op;
+  opaque->exprs = get_expr_list(data, child_list_id);
+  put_expr_item(data, sibling_list_id, opaque, OpaquePredicate);
+}
+
+void visit_unknown(void *data, uintptr_t sibling_list_id, struct KernelStringSlice name) {
+  struct Unknown* unknown = malloc(sizeof(struct Unknown));
+  unknown->name = allocate_string(name);
+  put_expr_item(data, sibling_list_id, unknown, Unknown);
+}
+
 void visit_expr_array_literal(void* data, uintptr_t sibling_list_id, uintptr_t child_list_id) {
   struct Literal* literal = malloc(sizeof(struct Literal));
   literal->type = Array;
@@ -365,6 +406,9 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_divide = visit_expr_divide,
     .visit_column = visit_expr_column,
     .visit_struct_expr = visit_expr_struct_expr,
+    .visit_opaque_pred = visit_opaque_pred,
+    .visit_opaque_expr = visit_opaque_expr,
+    .visit_unknown = visit_unknown,
   };
   uintptr_t top_level_id = visit_expression(&expression, &visitor);
   ExpressionItemList top_level_expr = data.lists[top_level_id];
@@ -408,6 +452,9 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_divide = visit_expr_divide,
     .visit_column = visit_expr_column,
     .visit_struct_expr = visit_expr_struct_expr,
+    .visit_opaque_pred = visit_opaque_pred,
+    .visit_opaque_expr = visit_opaque_expr,
+    .visit_unknown = visit_unknown,
   };
   uintptr_t top_level_id = visit_predicate(&predicate, &visitor);
   ExpressionItemList top_level_expr = data.lists[top_level_id];
@@ -428,6 +475,26 @@ void free_expression_item(ExpressionItem ref) {
       struct Variadic* var = ref.ref;
       free_expression_list(var->exprs);
       free(var);
+      break;
+    };
+    case OpaqueExpression: {
+      struct OpaqueExpression* opaque = ref.ref;
+      free_kernel_opaque_expression_op(opaque->op);
+      free_expression_list(opaque->exprs);
+      free(opaque);
+      break;
+    };
+    case OpaquePredicate: {
+      struct OpaquePredicate* opaque = ref.ref;
+      free_kernel_opaque_predicate_op(opaque->op);
+      free_expression_list(opaque->exprs);
+      free(opaque);
+      break;
+    };
+    case Unknown: {
+      struct Unknown* unknown = ref.ref;
+      free(unknown->name);
+      free(unknown);
       break;
     };
     case Literal: {
