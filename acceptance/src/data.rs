@@ -10,7 +10,8 @@ use delta_kernel::object_store::{local::LocalFileSystem, ObjectStore};
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
-use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Engine, Error, Table};
+use delta_kernel::snapshot::Snapshot;
+use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Engine, Error};
 use futures::{stream::TryStreamExt, StreamExt};
 use itertools::Itertools;
 
@@ -114,8 +115,7 @@ pub async fn assert_scan_metadata(
     test_case: &TestCaseInfo,
 ) -> TestResult<()> {
     let table_root = test_case.table_root()?;
-    let table = Table::new(table_root);
-    let snapshot = table.snapshot(engine.as_ref(), None)?;
+    let snapshot = Snapshot::try_new(table_root, engine.as_ref(), None)?;
     let scan = snapshot.into_scan_builder().build()?;
     let mut schema = None;
     let batches: Vec<RecordBatch> = scan

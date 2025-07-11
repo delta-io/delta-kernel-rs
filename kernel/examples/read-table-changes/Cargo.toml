@@ -13,6 +13,7 @@ common = { path = "../common" }
 delta_kernel = { path = "../../../kernel", features = [
   "arrow",
   "default-engine",
+  "internal-api",
 ] }
 url = "2"
 itertools = "0.14"

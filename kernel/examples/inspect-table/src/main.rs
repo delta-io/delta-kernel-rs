@@ -12,7 +12,7 @@ use delta_kernel::expressions::ColumnName;
 use delta_kernel::scan::state::{DvInfo, Stats};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
-use delta_kernel::{DeltaResult, Error, ExpressionRef};
+use delta_kernel::{DeltaResult, Error, ExpressionRef, Snapshot};
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -180,9 +180,9 @@ fn print_scan_file(
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
 
-    let table = common::get_table(&cli.location_args)?;
-    let engine = common::get_engine(&table, &cli.location_args)?;
-    let snapshot = table.snapshot(&engine, None)?;
+    let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
+    let engine = common::get_engine(&url, &cli.location_args)?;
+    let snapshot = Snapshot::try_new(url, &engine, None)?;
 
     match cli.command {
         Commands::TableVersion => {
