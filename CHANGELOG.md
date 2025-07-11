@@ -22,7 +22,7 @@
 2. Move logic into the thread::scope call so it doesn't hang ([#1040])
 3. Remove panic from read_last_checkpoint ([#1022])
 4. Always write `_last_checkpoint` with parts = None ([#1053])
-5. Don't release `common` crate ([#1065])
+5. Don't release `common` crate (used only by example programs)  ([#1065])
 
 ### 🚜 Refactor
 
