@@ -378,23 +378,20 @@ fn get_indices(
                                 ));
                             }
                             // vec indexing is safe, we checked len above
-                            let key_needs_transform = children[0].needs_transform();
-                            let val_needs_transform = children[1].needs_transform();
-                            if key_needs_transform || val_needs_transform {
-                                // if one of the key or value does _NOT_ need a transform, replace
-                                // the computed transform with the identity
-                                if !key_needs_transform {
-                                    children[0] = ReorderIndex::identity(0);
-                                }
-                                if !val_needs_transform {
-                                    children[1] = ReorderIndex::identity(1);
-                                }
-                                // we bundle up the transforms for the key and value cols into a nested transform at our index
-                                reorder_indices.push(ReorderIndex::nested(index, children));
-                            } else {
-                                // no transform needed on the map, so just pass it on unchanged
-                                reorder_indices.push(ReorderIndex::identity(index));
+                            let mut num_identity_transforms = 0;
+                            if !children[0].needs_transform() {
+                                children[0] = ReorderIndex::identity(0);
+                                num_identity_transforms += 1;
                             }
+                            if !children[1].needs_transform() {
+                                children[1] = ReorderIndex::identity(1);
+                                num_identity_transforms += 1;
+                            }
+                            let transform = match num_identity_transforms {
+                                2 => ReorderIndex::identity(index),
+                                _ => ReorderIndex::nested(index, children),
+                            };
+                            reorder_indices.push(transform);
                         }
                         _ => {
                             return Err(Error::unexpected_column_type(field.name()));
@@ -557,6 +554,7 @@ pub(crate) fn reorder_struct_array(
                     final_fields_cols[reorder_index.index] = Some((new_field, col));
                 }
                 ReorderIndexTransform::Nested(children) => {
+                    let input_field_name = input_fields[parquet_position].name();
                     match input_cols[parquet_position].data_type() {
                         ArrowDataType::Struct(_) => {
                             let struct_array = input_cols[parquet_position].as_struct().clone();
@@ -564,7 +562,7 @@ pub(crate) fn reorder_struct_array(
                                 Arc::new(reorder_struct_array(struct_array, children)?);
                             // create the new field specifying the correct order for the struct
                             let new_field = Arc::new(ArrowField::new_struct(
-                                input_fields[parquet_position].name(),
+                                input_field_name,
                                 result_array.fields().clone(),
                                 input_fields[parquet_position].is_nullable(),
                             ));
@@ -573,27 +571,18 @@ pub(crate) fn reorder_struct_array(
                         }
                         ArrowDataType::List(_) => {
                             let list_array = input_cols[parquet_position].as_list::<i32>().clone();
-                            final_fields_cols[reorder_index.index] = reorder_list(
-                                list_array,
-                                input_fields[parquet_position].name(),
-                                children,
-                            )?;
+                            final_fields_cols[reorder_index.index] =
+                                reorder_list(list_array, input_field_name, children)?;
                         }
                         ArrowDataType::LargeList(_) => {
                             let list_array = input_cols[parquet_position].as_list::<i64>().clone();
-                            final_fields_cols[reorder_index.index] = reorder_list(
-                                list_array,
-                                input_fields[parquet_position].name(),
-                                children,
-                            )?;
+                            final_fields_cols[reorder_index.index] =
+                                reorder_list(list_array, input_field_name, children)?;
                         }
                         ArrowDataType::Map(_, _) => {
                             let map_array = input_cols[parquet_position].as_map().clone();
-                            final_fields_cols[reorder_index.index] = reorder_map(
-                                map_array,
-                                input_fields[parquet_position].name(),
-                                children,
-                            )?;
+                            final_fields_cols[reorder_index.index] =
+                                reorder_map(map_array, input_field_name, children)?;
                         }
                         _ => {
                             return Err(Error::internal_error(
