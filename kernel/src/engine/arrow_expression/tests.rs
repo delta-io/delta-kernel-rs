@@ -5,12 +5,20 @@ use crate::arrow::array::{
     ListArray, MapArray, MapBuilder, MapFieldNames, StringBuilder, StructArray,
 };
 use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
 use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
 
 use super::*;
+use crate::engine::arrow_expression::opaque::{
+    ArrowOpaqueExpression as _, ArrowOpaqueExpressionOp, ArrowOpaquePredicate as _,
+    ArrowOpaquePredicateOp,
+};
 use crate::expressions::*;
-use crate::schema::{ArrayType, MapType, StructField, StructType};
-use crate::DataType as KernelDataType;
+use crate::kernel_predicates::{
+    DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
+    IndirectDataSkippingPredicateEvaluator,
+};
+use crate::schema::{ArrayType, DataType as KernelDataType, MapType, StructField, StructType};
 use crate::EvaluationHandlerExtension as _;
 
 use Expression as Expr;
@@ -505,6 +513,137 @@ fn test_logical() {
     let results = evaluate_predicate(&pred_or_lit, &batch, true).unwrap();
     let expected = BooleanArray::from(vec![f, f, t, t, f, t]);
     assert_eq!(results, expected);
+}
+
+#[derive(Debug, PartialEq)]
+struct OpaqueLessThanOp;
+
+impl OpaqueLessThanOp {
+    fn name(&self) -> &str {
+        "less_than"
+    }
+
+    fn eval_pred(
+        &self,
+        args: &[Expression],
+        batch: &RecordBatch,
+        inverted: bool,
+    ) -> DeltaResult<BooleanArray> {
+        let op_fn = match inverted {
+            true => gt_eq,
+            false => lt,
+        };
+
+        let [left, right] = args else {
+            panic!("Invalid arg count: {}", args.len());
+        };
+
+        let eval = |arg| evaluate_expression(arg, batch, Some(&KernelDataType::BOOLEAN));
+        Ok(op_fn(&eval(left)?, &eval(right)?)?)
+    }
+}
+
+impl ArrowOpaqueExpressionOp for OpaqueLessThanOp {
+    fn name(&self) -> &str {
+        self.name()
+    }
+
+    fn eval_expr_scalar(
+        &self,
+        _eval_expr: &ScalarExpressionEvaluator<'_>,
+        _exprs: &[Expression],
+    ) -> DeltaResult<Scalar> {
+        unimplemented!() // OpaqueExpressionOp is already tested
+    }
+
+    fn eval_expr(
+        &self,
+        args: &[Expression],
+        batch: &RecordBatch,
+        result_type: Option<&KernelDataType>,
+    ) -> DeltaResult<ArrayRef> {
+        assert!(matches!(result_type, None | Some(&KernelDataType::BOOLEAN)));
+        let result = self.eval_pred(args, batch, false)?;
+        Ok(Arc::new(result))
+    }
+}
+
+impl ArrowOpaquePredicateOp for OpaqueLessThanOp {
+    fn name(&self) -> &str {
+        self.name()
+    }
+
+    fn eval_pred(
+        &self,
+        args: &[Expression],
+        batch: &RecordBatch,
+        inverted: bool,
+    ) -> DeltaResult<BooleanArray> {
+        self.eval_pred(args, batch, inverted)
+    }
+
+    fn eval_pred_scalar(
+        &self,
+        _eval_expr: &ScalarExpressionEvaluator<'_>,
+        _eval_pred: &DirectPredicateEvaluator<'_>,
+        _exprs: &[Expression],
+        _inverted: bool,
+    ) -> DeltaResult<Option<bool>> {
+        unimplemented!() // OpaquePredicateOp is already tested
+    }
+
+    fn eval_as_data_skipping_predicate(
+        &self,
+        _predicate_evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
+        _exprs: &[Expr],
+        _inverted: bool,
+    ) -> Option<bool> {
+        unimplemented!() // OpaquePredicateOp is already tested
+    }
+
+    fn as_data_skipping_predicate(
+        &self,
+        _predicate_evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+        _exprs: &[Expr],
+        _inverted: bool,
+    ) -> Option<Pred> {
+        unimplemented!() // OpaquePredicateOp is already tested
+    }
+}
+
+#[test]
+fn test_opaque() {
+    let expr = Expr::arrow_opaque(OpaqueLessThanOp, [column_expr!("x"), Expr::literal(10)]);
+    let pred = Pred::arrow_opaque(OpaqueLessThanOp, [column_expr!("x"), Expr::literal(10)]);
+
+    assert_eq!(
+        format!("{expr:?}"),
+        "Opaque(OpaqueExpression { op: ArrowOpaqueExpressionOpAdaptor(OpaqueLessThanOp), exprs: [Column(ColumnName { path: [\"x\"] }), Literal(Integer(10))] })"
+    );
+    assert_eq!(
+        format!("{pred:?}"),
+        "Opaque(OpaquePredicate { op: ArrowOpaquePredicateOpAdaptor(OpaqueLessThanOp), exprs: [Column(ColumnName { path: [\"x\"] }), Literal(Integer(10))] })"
+    );
+
+    assert_eq!(expr, expr);
+    assert_eq!(pred, pred);
+
+    let data = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![1, 10, 100]))],
+    )
+    .unwrap();
+
+    let lt_result = evaluate_predicate(&pred, &data, false).unwrap();
+    let lt_expected = BooleanArray::from(vec![true, false, false]);
+    assert_eq!(lt_result, lt_expected);
+
+    let not_lt_result = evaluate_predicate(&pred, &data, true).unwrap();
+    let not_lt_expected = BooleanArray::from(vec![false, true, true]);
+    assert_eq!(not_lt_result, not_lt_expected);
+
+    let lt_result = evaluate_expression(&expr, &data, Some(&KernelDataType::BOOLEAN)).unwrap();
+    assert_eq!(lt_result.as_ref(), &lt_expected);
 }
 
 #[test]
