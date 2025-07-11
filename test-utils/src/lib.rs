@@ -173,6 +173,7 @@ pub trait DefaultEngineExtension {
     type Executor: TaskExecutor;
 
     fn new_local() -> Arc<DefaultEngine<Self::Executor>>;
+    fn new_memory() -> (Arc<DefaultEngine<Self::Executor>>, Arc<InMemory>);
 }
 
 impl DefaultEngineExtension for DefaultEngine<TokioBackgroundExecutor> {
@@ -184,6 +185,17 @@ impl DefaultEngineExtension for DefaultEngine<TokioBackgroundExecutor> {
             object_store,
             TokioBackgroundExecutor::new().into(),
         ))
+    }
+
+    fn new_memory() -> (Arc<DefaultEngine<TokioBackgroundExecutor>>, Arc<InMemory>) {
+        let store = Arc::new(InMemory::new());
+        (
+            Arc::new(DefaultEngine::new(
+                store.clone(),
+                TokioBackgroundExecutor::new().into(),
+            )),
+            store,
+        )
     }
 }
 

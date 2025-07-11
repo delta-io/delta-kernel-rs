@@ -1,5 +1,6 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of  checkpoint and commit
 //! files.
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::identity;
 use std::sync::{Arc, LazyLock};
@@ -20,6 +21,7 @@ use crate::{
 };
 use delta_kernel_derive::internal_api;
 
+use crate::actions::crc::ProtocolMetadata;
 use itertools::Itertools;
 use tracing::{debug, warn};
 use url::Url;
@@ -419,27 +421,84 @@ impl LogSegment {
         )?))
     }
 
-    // Do a lightweight protocol+metadata log replay to find the latest Protocol and Metadata in
-    // the LogSegment
+    // Find the latest Protocol and Metadata in the LogSegment. This is done by replaying the log
+    // until the latest_crc_file/latest checkpoint is reached, at which point we can just return the
+    // P+M from the CRC directly or read from checkpoint.
+    //
+    // Note that according to the spec CRC files must contain the latest Protocol and Metadata. If
+    // we encounter a CRC file without P+M, this will return an error (and user should likely just
+    // remove such a file).
+    //
+    // Four steps:
+    // 1. If we have CRC at this version, we can just read the Protocol and Metadata from it.
+    // 2. Else, create a 'pruned' (CRC-rooted) log segment that is only the commits after the
+    //    latest CRC (if there is no CRC, we just use the whole log segment)
+    // 3. Do PM replay on the pruned log segment to find the latest Protocol/Metadata actions.
+    // 4. If no Protocol/Metadata was found, return Protocol/Metadata from CRC (if CRC doesn't
+    //    exist, we are guaranteed to get a Protocol/Metadata from checkpoint in (3)).
+    //
+    // Note that there is an optimization here: we _could_ have different types of log segments.
+    // Instead of a log segment always containing all metadata for the table, we could have a
+    // "PM-LogSegment" that is only guaranteed to contain Protocol and Metadata actions. Basically,
+    // a "PM-LogSegment" would be a log segment that is checkpoint OR CRC-rooted, whereas a full
+    // LogSegment must be checkpoint-rooted (or start from 0).
     pub(crate) fn protocol_and_metadata(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
-        let actions_batches = self.replay_for_metadata(engine)?;
+        // 1. simple case if we have CRC at this version
+        if let Some(latest_crc_file) = &self.latest_crc_file {
+            if self.end_version == latest_crc_file.version {
+                let path = &latest_crc_file.location;
+                let pm = ProtocolMetadata::try_from_crc(path.clone(), engine)?;
+                return Ok((Some(pm.metadata), Some(pm.protocol)));
+            }
+        }
+
+        // 2. construct a "protocol-metadata log segment"
+        //    a) if we have a CRC file, we only need commits (CRC_version, target_version]
+        //    b) if we don't have a CRC, we proceed as normal
+        let protocol_metadata_log_segment: Cow<'_, Self> =
+            if let Some(latest_crc_file) = &self.latest_crc_file {
+                let mut log_segment = self.clone();
+                log_segment.checkpoint_version = None;
+                log_segment.checkpoint_parts.clear();
+                // only keep commits from CRC_version + 1 to target version
+                log_segment
+                    .ascending_commit_files
+                    .retain(|commit| commit.version > latest_crc_file.version);
+                Cow::Owned(log_segment)
+            } else {
+                Cow::Borrowed(self)
+            };
+
+        // 3. do log replay
+        let actions_batches = protocol_metadata_log_segment.replay_for_metadata(engine)?;
         let (mut metadata_opt, mut protocol_opt) = (None, None);
         for actions_batch in actions_batches {
             let actions = actions_batch?.actions;
             if metadata_opt.is_none() {
-                metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
+                if let Some(metadata) = Metadata::try_new_from_data(actions.as_ref())? {
+                    metadata_opt = Some(metadata);
+                }
             }
             if protocol_opt.is_none() {
                 protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
             }
             if metadata_opt.is_some() && protocol_opt.is_some() {
                 // we've found both, we can stop
-                break;
+                return Ok((metadata_opt, protocol_opt));
             }
         }
+
+        // 4. if we didn't find one of Protocol/Metadata, we can read it from CRC
+        if let Some(latest_crc_file) = &self.latest_crc_file {
+            let path = &latest_crc_file.location;
+            let pm = ProtocolMetadata::try_from_crc(path.clone(), engine)?;
+            metadata_opt.get_or_insert(pm.metadata);
+            protocol_opt.get_or_insert(pm.protocol);
+        }
+
         Ok((metadata_opt, protocol_opt))
     }
 
