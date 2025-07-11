@@ -44,11 +44,6 @@ pub(crate) fn column_mapping_mode(
 /// When column mapping mode is enabled, verify that each field in the schema is annotated with a
 /// physical name and field_id; when not enabled, verify that no fields are annotated.
 pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> DeltaResult<()> {
-    // if mode == ColumnMappingMode::Id {
-    //     // TODO: Support column mapping ID mode
-    //     return Err(Error::unsupported("Column mapping ID mode not supported"));
-    // }
-
     let mut validator = ValidateColumnMappings {
         mode,
         path: vec![],
@@ -306,7 +301,18 @@ mod tests {
     }
 
     #[test]
-    fn test_column_mapping_enabled() {
+    fn test_column_mapping_mode_id() {
+        test_column_mapping_enabled(ColumnMappingMode::Id)
+    }
+
+    #[test]
+    fn test_column_mapping_mode_name() {
+        test_column_mapping_enabled(ColumnMappingMode::Name)
+    }
+
+
+
+    fn test_column_mapping_enabled(mode: ColumnMappingMode) {
         let schema = create_schema("5", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
         validate_schema_column_mapping(&schema, ColumnMappingMode::Name).unwrap();
         validate_schema_column_mapping(&schema, ColumnMappingMode::Id).expect_err("not supported");

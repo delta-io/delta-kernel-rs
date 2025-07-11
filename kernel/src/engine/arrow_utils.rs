@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::ensure_data_types::DataTypeCompat;
-use crate::schema::{ColumnMetadataKey, MetadataValue};
 use crate::{
     engine::arrow_data::ArrowEngineData,
     schema::{DataType, Schema, SchemaRef, StructField, StructType},
@@ -21,7 +20,7 @@ use crate::arrow::array::{
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::concat_batches;
 use crate::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef, Fields,
+    DataType as ArrowDataType, Field as ArrowField, Field, FieldRef as ArrowFieldRef, Fields,
     Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
 use crate::arrow::json::{LineDelimitedWriter, ReaderBuilder};
@@ -29,7 +28,6 @@ use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
-use parquet_55::format::ColumnMetaData;
 use tracing::debug;
 
 macro_rules! prim_array_cmp {
@@ -279,36 +277,12 @@ fn get_indices(
     // field, and info about where it appears in the requested_schema, or None if the field is not
     // requested
     let all_field_info = fields.iter().enumerate().map(|(parquet_index, field)| {
-        let field_id: Option<i64> = field
-            .metadata()
-            .get(PARQUET_FIELD_ID_META_KEY)
-            .and_then(|x| x.parse::<i64>().ok());
-        println!("Field id is: {field_id:?} for schema: {:?}", field.name());
         // How can we be sure that the field name in the requested schema == the arrow schema we
         // got form parquet metadata? Parquet metadata may only have physical name. Or it may only
         // be identifiable by column id?
         //
         let field_info = if using_id {
-            requested_schema
-                .fields
-                .iter()
-                .filter_map(|x| {
-                    let id =
-                        x.1.metadata()
-                            .get(ColumnMetadataKey::ColumnMappingId.as_ref());
-
-                    match id {
-                        Some(MetadataValue::Number(num)) => Some((x, num)),
-                        Some(_) => todo!(), // this is probably an error
-                        None => {
-                            println!("Couldn't find the field id for field");
-                            None
-                        }
-                    }
-                })
-                .find(|(_x, num)| Some(**num) == field_id)
-                .map(|(x, _num)| requested_schema.fields.get_full(x.0))
-                .flatten()
+            get_field_info_by_id(requested_schema, field)
         } else {
             requested_schema.fields.get_full(field.name())
         };
@@ -396,7 +370,7 @@ fn get_indices(
                             let (parquet_advance, _children) = get_indices(
                                 parquet_index + parquet_offset,
                                 &inner_schema,
-                                &inner_fields,
+                                inner_fields,
                                 mask_indices,
                                 using_id,
                             )?;
@@ -475,6 +449,24 @@ fn get_indices(
     ))
 }
 
+/// Extract the [[StructField]] from `requested_schema` that matches the field id of `field`.
+fn get_field_info_by_id<'a>(
+    requested_schema: &'a StructType,
+    field: &Field,
+) -> Option<(usize, &'a String, &'a StructField)> {
+    let field_id = field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)
+        .and_then(|x| x.parse::<i64>().ok())?;
+
+    let field= requested_schema
+        .fields()
+        .find_map(|delta_struct_field|{
+            (delta_struct_field.field_id()? == field_id).then_some(delta_struct_field)
+        })?;
+    requested_schema.fields.get_full(field.name())
+}
+
 /// Get the indices in `parquet_schema` of the specified columns in `requested_schema`. This returns
 /// a tuple of (mask_indices: Vec<parquet_schema_index>, reorder_indices:
 /// Vec<requested_index>). `mask_indices` is used for generating the mask for reading from the
@@ -485,6 +477,7 @@ fn get_indices(
 pub(crate) fn get_requested_indices(
     requested_schema: &SchemaRef,
     parquet_schema: &ArrowSchemaRef,
+    using_id: bool
 ) -> DeltaResult<(Vec<usize>, Vec<ReorderIndex>)> {
     let mut mask_indices = vec![];
     let (_, reorder_indexes) = get_indices(
@@ -492,22 +485,7 @@ pub(crate) fn get_requested_indices(
         requested_schema,
         parquet_schema.fields(),
         &mut mask_indices,
-        false,
-    )?;
-    Ok((mask_indices, reorder_indexes))
-}
-
-pub(crate) fn get_requested_indices_by_id(
-    requested_schema: &SchemaRef,
-    parquet_schema: &ArrowSchemaRef,
-) -> DeltaResult<(Vec<usize>, Vec<ReorderIndex>)> {
-    let mut mask_indices = vec![];
-    let (_, reorder_indexes) = get_indices(
-        0,
-        requested_schema,
-        parquet_schema.fields(),
-        &mut mask_indices,
-        true,
+        using_id,
     )?;
     Ok((mask_indices, reorder_indexes))
 }

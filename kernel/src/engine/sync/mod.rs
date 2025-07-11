@@ -62,10 +62,11 @@ fn read_files<F, I>(
     schema: SchemaRef,
     predicate: Option<PredicateRef>,
     mut try_create_from_file: F,
+    using_id: bool
 ) -> DeltaResult<FileDataReadResultIterator>
 where
     I: Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static,
-    F: FnMut(File, SchemaRef, ArrowSchemaRef, Option<PredicateRef>) -> DeltaResult<I>
+    F: FnMut(File, SchemaRef, ArrowSchemaRef, Option<PredicateRef>, bool) -> DeltaResult<I>
         + Send
         + 'static,
 {
@@ -89,6 +90,7 @@ where
                 schema.clone(),
                 arrow_schema.clone(),
                 predicate.clone(),
+                using_id
             )
         })
         // Flatten to Iterator<DeltaResult<DeltaResult<ArrowEngineData>>>

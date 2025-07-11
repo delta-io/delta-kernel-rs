@@ -17,6 +17,7 @@ fn try_create_from_parquet(
     schema: SchemaRef,
     _arrow_schema: ArrowSchemaRef,
     predicate: Option<PredicateRef>,
+    using_id: bool
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
     let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
 
@@ -32,7 +33,7 @@ fn try_create_from_parquet(
         .id();
     let parquet_schema = metadata.schema();
     let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let (indices, requested_ordering) = get_requested_indices(&schema, parquet_schema)?;
+    let (indices, requested_ordering) = get_requested_indices(&schema, parquet_schema, using_id)?;
     if let Some(mask) = generate_mask(&schema, parquet_schema, builder.parquet_schema(), &indices) {
         builder = builder.with_projection(mask);
     }
@@ -50,6 +51,15 @@ impl ParquetHandler for SyncParquetHandler {
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        read_files(files, schema, predicate, try_create_from_parquet)
+        read_files(files, schema, predicate, try_create_from_parquet, false)
+    }
+
+    fn read_parquet_files_by_id(
+        &self,
+        files: &[FileMeta],
+        schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        read_files(files, schema, predicate, try_create_from_parquet, true)
     }
 }

@@ -179,14 +179,13 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let parquet_metadata = self.write_parquet(path, data).await?;
         parquet_metadata.as_record_batch(&partition_values, data_change)
     }
-}
 
-impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
-    fn read_parquet_files(
+    fn read_parquet_files_internal(
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
+        using_id: bool
     ) -> DeltaResult<FileDataReadResultIterator> {
         if files.is_empty() {
             return Ok(Box::new(std::iter::empty()));
@@ -205,6 +204,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 1024,
                 physical_schema.clone(),
                 predicate,
+                using_id
             ))
         } else {
             Box::new(ParquetOpener::new(
@@ -212,7 +212,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 physical_schema.clone(),
                 predicate,
                 self.store.clone(),
-                false
+                using_id
             ))
         };
         FileStream::new_async_read_iterator(
@@ -223,6 +223,17 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             self.readahead,
         )
     }
+}
+
+impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        self.read_parquet_files_internal(files, physical_schema, predicate, false)
+    }
 
     fn read_parquet_files_by_id(
         &self,
@@ -230,40 +241,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-       if files.is_empty() {
-            return Ok(Box::new(std::iter::empty()));
-        }
-
-        // get the first FileMeta to decide how to fetch the file.
-        // NB: This means that every file in `FileMeta` _must_ have the same scheme or things will break
-        // s3://    -> aws   (ParquetOpener)
-        // nothing  -> local (ParquetOpener)
-        // https:// -> assume presigned URL (and fetch without object_store)
-        //   -> reqwest to get data
-        //   -> parse to parquet
-        // SAFETY: we did is_empty check above, this is ok.
-        let file_opener: Box<dyn FileOpener> = if files[0].location.is_presigned() {
-            Box::new(PresignedUrlOpener::new(
-                1024,
-                physical_schema.clone(),
-                predicate,
-            ))
-        } else {
-            Box::new(ParquetOpener::new(
-                1024,
-                physical_schema.clone(),
-                predicate,
-                self.store.clone(),
-                true
-            ))
-        };
-        FileStream::new_async_read_iterator(
-            self.task_executor.clone(),
-            Arc::new(physical_schema.as_ref().try_into_arrow()?),
-            file_opener,
-            files,
-            self.readahead,
-        )
+        self.read_parquet_files_internal(files, physical_schema, predicate, true)
     }
 }
 
@@ -307,6 +285,7 @@ impl FileOpener for ParquetOpener {
         let table_schema = self.table_schema.clone();
         let predicate = self.predicate.clone();
         let limit = self.limit;
+        let using_id = self.using_id;
 
         Ok(Box::pin(async move {
             #[cfg(feature = "arrow-55")]
@@ -342,7 +321,7 @@ impl FileOpener for ParquetOpener {
             let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
             let parquet_schema = metadata.schema();
             let (indices, requested_ordering) =
-                get_requested_indices(&table_schema, parquet_schema)?;
+                get_requested_indices(&table_schema, parquet_schema, using_id)?;
             let options = ArrowReaderOptions::new(); //.with_page_index(enable_page_index);
             let mut builder =
                 ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await?;
@@ -377,6 +356,7 @@ struct PresignedUrlOpener {
     limit: Option<usize>,
     table_schema: SchemaRef,
     client: reqwest::Client,
+    using_id: bool
 }
 
 impl PresignedUrlOpener {
@@ -384,6 +364,7 @@ impl PresignedUrlOpener {
         batch_size: usize,
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
+        using_id: bool
     ) -> Self {
         Self {
             batch_size,
@@ -391,6 +372,7 @@ impl PresignedUrlOpener {
             predicate,
             limit: None,
             client: reqwest::Client::new(),
+            using_id
         }
     }
 }
@@ -402,6 +384,7 @@ impl FileOpener for PresignedUrlOpener {
         let predicate = self.predicate.clone();
         let limit = self.limit;
         let client = self.client.clone(); // uses Arc internally according to reqwest docs
+        let using_id = self.using_id;
 
         Ok(Box::pin(async move {
             // fetch the file from the interweb
@@ -409,7 +392,7 @@ impl FileOpener for PresignedUrlOpener {
             let metadata = ArrowReaderMetadata::load(&reader, Default::default())?;
             let parquet_schema = metadata.schema();
             let (indices, requested_ordering) =
-                get_requested_indices(&table_schema, parquet_schema)?;
+                get_requested_indices(&table_schema, parquet_schema, using_id)?;
 
             let options = ArrowReaderOptions::new();
             let mut builder =

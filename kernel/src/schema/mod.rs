@@ -172,6 +172,16 @@ impl StructField {
         }
     }
 
+    pub fn field_id(&self) -> Option<i64> {
+        match self
+            .metadata
+            .get(ColumnMetadataKey::ColumnMappingId.as_ref())
+        {
+            Some(MetadataValue::Number(num)) => Some(*num),
+            _ => None,
+        }
+    }
+
     /// Change the name of a field. The field will preserve its data type and nullability. Note that
     /// this allocates a new field.
     pub fn with_name(&self, new_name: impl Into<String>) -> Self {
