@@ -20,17 +20,6 @@ fn try_create_from_parquet(
     using_id: bool
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
     let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
-
-    let schema = metadata
-        .metadata()
-        .file_metadata()
-        .schema_descr()
-        .root_schema()
-        .get_fields()
-        .first()
-        .unwrap()
-        .get_basic_info()
-        .id();
     let parquet_schema = metadata.schema();
     let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let (indices, requested_ordering) = get_requested_indices(&schema, parquet_schema, using_id)?;

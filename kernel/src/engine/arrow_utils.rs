@@ -277,10 +277,6 @@ fn get_indices(
     // field, and info about where it appears in the requested_schema, or None if the field is not
     // requested
     let all_field_info = fields.iter().enumerate().map(|(parquet_index, field)| {
-        // How can we be sure that the field name in the requested schema == the arrow schema we
-        // got form parquet metadata? Parquet metadata may only have physical name. Or it may only
-        // be identifiable by column id?
-        //
         let field_info = if using_id {
             get_field_info_by_id(requested_schema, field)
         } else {
