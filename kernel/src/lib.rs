@@ -594,6 +594,13 @@ pub trait ParquetHandler: AsAny {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
+
+    fn read_parquet_files_by_id(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator>;
 }
 
 /// The `Engine` trait encapsulates all the functionality an engine or connector needs to provide

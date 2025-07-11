@@ -404,7 +404,7 @@ golden_test!("snapshot-vacuumed", latest_snapshot_test);
 
 golden_test!("table-with-columnmapping-mode-name", latest_snapshot_test);
 // TODO fix column mapping
-skip_test!("table-with-columnmapping-mode-id": "id column mapping mode not supported");
+golden_test!("table-with-columnmapping-mode-id", latest_snapshot_test);
 
 // TODO scan at different versions
 golden_test!("time-travel-partition-changes-a", latest_snapshot_test);

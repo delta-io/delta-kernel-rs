@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::ensure_data_types::DataTypeCompat;
+use crate::schema::{ColumnMetadataKey, MetadataValue};
 use crate::{
     engine::arrow_data::ArrowEngineData,
     schema::{DataType, Schema, SchemaRef, StructField, StructType},
@@ -24,9 +25,11 @@ use crate::arrow::datatypes::{
     Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
 use crate::arrow::json::{LineDelimitedWriter, ReaderBuilder};
+use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
+use parquet_55::format::ColumnMetaData;
 use tracing::debug;
 
 macro_rules! prim_array_cmp {
@@ -270,6 +273,7 @@ fn get_indices(
     requested_schema: &Schema,
     fields: &Fields,
     mask_indices: &mut Vec<usize>,
+    using_id: bool,
 ) -> DeltaResult<(usize, Vec<ReorderIndex>)> {
     let mut found_fields = HashSet::with_capacity(requested_schema.fields.len());
     let mut reorder_indices = Vec::with_capacity(requested_schema.fields.len());
@@ -278,7 +282,39 @@ fn get_indices(
     // field, and info about where it appears in the requested_schema, or None if the field is not
     // requested
     let all_field_info = fields.iter().enumerate().map(|(parquet_index, field)| {
-        let field_info = requested_schema.fields.get_full(field.name());
+        let field_id: Option<i64> = field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|x| x.parse::<i64>().ok());
+        println!("Field id is: {field_id:?} for schema: {:?}", field.name());
+        // How can we be sure that the field name in the requested schema == the arrow schema we
+        // got form parquet metadata? Parquet metadata may only have physical name. Or it may only
+        // be identifiable by column id?
+        //
+        let field_info = if using_id {
+            requested_schema
+                .fields
+                .iter()
+                .filter_map(|x| {
+                    let id =
+                        x.1.metadata()
+                            .get(ColumnMetadataKey::ColumnMappingId.as_ref());
+
+                    match id {
+                        Some(MetadataValue::Number(num)) => Some((x, num)),
+                        Some(_) => todo!(), // this is probably an error
+                        None => {
+                            println!("Couldn't find the field id for field");
+                            None
+                        }
+                    }
+                })
+                .find(|(_x, num)| Some(**num) == field_id)
+                .map(|(x, _num)| requested_schema.fields.get_full(x.0))
+                .flatten()
+        } else {
+            requested_schema.fields.get_full(field.name())
+        };
         (parquet_index, field, field_info)
     });
     for (parquet_index, field, field_info) in all_field_info {
@@ -295,6 +331,7 @@ fn get_indices(
                             requested_schema.as_ref(),
                             fields,
                             mask_indices,
+                            using_id,
                         )?;
                         // advance the number of parquet fields, but subtract 1 because the
                         // struct will be counted by the `enumerate` call but doesn't count as
@@ -324,6 +361,7 @@ fn get_indices(
                             &requested_schema,
                             &[list_field.clone()].into(),
                             mask_indices,
+                            using_id,
                         )?;
                         // see comment above in struct match arm
                         parquet_offset += parquet_advance - 1;
@@ -361,8 +399,9 @@ fn get_indices(
                             let (parquet_advance, mut children) = get_indices(
                                 parquet_index + parquet_offset,
                                 &inner_schema,
-                                inner_fields,
+                                &inner_fields,
                                 mask_indices,
+                                using_id,
                             )?;
 
                             // advance the number of parquet fields, but subtract 1 because the
@@ -476,6 +515,22 @@ pub(crate) fn get_requested_indices(
         requested_schema,
         parquet_schema.fields(),
         &mut mask_indices,
+        false,
+    )?;
+    Ok((mask_indices, reorder_indexes))
+}
+
+pub(crate) fn get_requested_indices_by_id(
+    requested_schema: &SchemaRef,
+    parquet_schema: &ArrowSchemaRef,
+) -> DeltaResult<(Vec<usize>, Vec<ReorderIndex>)> {
+    let mut mask_indices = vec![];
+    let (_, reorder_indexes) = get_indices(
+        0,
+        requested_schema,
+        parquet_schema.fields(),
+        &mut mask_indices,
+        true,
     )?;
     Ok((mask_indices, reorder_indexes))
 }

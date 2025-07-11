@@ -212,6 +212,49 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 physical_schema.clone(),
                 predicate,
                 self.store.clone(),
+                false
+            ))
+        };
+        FileStream::new_async_read_iterator(
+            self.task_executor.clone(),
+            Arc::new(physical_schema.as_ref().try_into_arrow()?),
+            file_opener,
+            files,
+            self.readahead,
+        )
+    }
+
+    fn read_parquet_files_by_id(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+       if files.is_empty() {
+            return Ok(Box::new(std::iter::empty()));
+        }
+
+        // get the first FileMeta to decide how to fetch the file.
+        // NB: This means that every file in `FileMeta` _must_ have the same scheme or things will break
+        // s3://    -> aws   (ParquetOpener)
+        // nothing  -> local (ParquetOpener)
+        // https:// -> assume presigned URL (and fetch without object_store)
+        //   -> reqwest to get data
+        //   -> parse to parquet
+        // SAFETY: we did is_empty check above, this is ok.
+        let file_opener: Box<dyn FileOpener> = if files[0].location.is_presigned() {
+            Box::new(PresignedUrlOpener::new(
+                1024,
+                physical_schema.clone(),
+                predicate,
+            ))
+        } else {
+            Box::new(ParquetOpener::new(
+                1024,
+                physical_schema.clone(),
+                predicate,
+                self.store.clone(),
+                true
             ))
         };
         FileStream::new_async_read_iterator(
@@ -232,6 +275,7 @@ struct ParquetOpener {
     predicate: Option<PredicateRef>,
     limit: Option<usize>,
     store: Arc<DynObjectStore>,
+    using_id: bool
 }
 
 impl ParquetOpener {
@@ -240,6 +284,7 @@ impl ParquetOpener {
         table_schema: SchemaRef,
         predicate: Option<PredicateRef>,
         store: Arc<DynObjectStore>,
+        using_id: bool
     ) -> Self {
         Self {
             batch_size,
@@ -247,6 +292,7 @@ impl ParquetOpener {
             predicate,
             limit: None,
             store,
+            using_id
         }
     }
 }
