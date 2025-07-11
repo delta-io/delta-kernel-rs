@@ -41,7 +41,7 @@ fn main() -> ExitCode {
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
-    println!("Reading {}", url);
+    println!("Reading {url}");
     let engine = common::get_engine(&url, &cli.location_args)?;
     let snapshot = Snapshot::try_new(url, &engine, None)?;
     let Some(scan) = common::get_scan(snapshot, &cli.scan_args)? else {
