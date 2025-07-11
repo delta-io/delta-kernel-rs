@@ -872,7 +872,7 @@ mod tests {
             ArrowField::new("i2", ArrowDataType::Int32, true),
         ]));
         let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            get_requested_indices(&requested_schema, &parquet_schema, false).unwrap();
         let expect_mask = vec![0, 1, 2];
         let expect_reorder = vec![
             ReorderIndex::identity(0),
@@ -893,7 +893,7 @@ mod tests {
             ArrowField::new("i", ArrowDataType::Int32, false),
             ArrowField::new("s", ArrowDataType::Utf8, true),
         ]));
-        let res = get_requested_indices(&requested_schema, &parquet_schema);
+        let res = get_requested_indices(&requested_schema, &parquet_schema, false);
         assert!(res.is_err());
 
         let requested_schema = Arc::new(StructType::new([
@@ -904,7 +904,7 @@ mod tests {
             ArrowField::new("i", ArrowDataType::Int32, false),
             ArrowField::new("s", ArrowDataType::Int32, true),
         ]));
-        let res = get_requested_indices(&requested_schema, &parquet_schema);
+        let res = get_requested_indices(&requested_schema, &parquet_schema, false);
         assert!(res.is_err());
     }
 
@@ -923,7 +923,7 @@ mod tests {
             false,
         )]));
         let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            get_requested_indices(&requested_schema, &parquet_schema, false).unwrap();
         let expect_mask = vec![0, 1];
         let expect_reorder = vec![ReorderIndex::identity(0)];
         assert_eq!(mask_indices, expect_mask);
@@ -943,7 +943,7 @@ mod tests {
             ArrowField::new("s", ArrowDataType::Utf8, true),
         ]));
         let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            get_requested_indices(&requested_schema, &parquet_schema, false).unwrap();
         let expect_mask = vec![0, 1, 2];
         let expect_reorder = vec![
             ReorderIndex::identity(2),
@@ -966,7 +966,7 @@ mod tests {
             ArrowField::new("i2", ArrowDataType::Int32, true),
         ]));
         let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            get_requested_indices(&requested_schema, &parquet_schema, false).unwrap();
         let expect_mask = vec![0, 1];
         let expect_reorder = vec![
             ReorderIndex::identity(0),
@@ -992,7 +992,7 @@ mod tests {
         ]));
         let parquet_schema = nested_parquet_schema();
         let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            get_requested_indices(&requested_schema, &parquet_schema, false).unwrap();
         let expect_mask = vec![0, 1, 2, 3];
         let expect_reorder = vec![
             ReorderIndex::identity(0),
@@ -1021,7 +1021,7 @@ mod tests {
         ]));
         let parquet_schema = nested_parquet_schema();
         let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            get_requested_indices(&requested_schema, &parquet_schema, false).unwrap();
         let expect_mask = vec![0, 1, 2, 3];
         let expect_reorder = vec![
             ReorderIndex::identity(2),
@@ -1047,7 +1047,7 @@ mod tests {
         ]));
         let parquet_schema = nested_parquet_schema();
         let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            get_requested_indices(&requested_schema, &parquet_schema, false).unwrap();
         let expect_mask = vec![0, 1, 3];
         let expect_reorder = vec![
             ReorderIndex::identity(0),
@@ -1079,7 +1079,7 @@ mod tests {
             ArrowField::new("j", ArrowDataType::Int32, false),
         ]));
         let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            get_requested_indices(&requested_schema, &parquet_schema, false).unwrap();
         let expect_mask = vec![0, 1, 2];
         let expect_reorder = vec![
             ReorderIndex::identity(0),
@@ -1109,7 +1109,7 @@ mod tests {
             ),
         ]));
         let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            get_requested_indices(&requested_schema, &parquet_schema, false).unwrap();
         let expect_mask = vec![1];
         let expect_reorder = vec![ReorderIndex::identity(0)];
         assert_eq!(mask_indices, expect_mask);
@@ -1153,7 +1153,7 @@ mod tests {
             ArrowField::new("j", ArrowDataType::Int32, false),
         ]));
         let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            get_requested_indices(&requested_schema, &parquet_schema, false).unwrap();
         let expect_mask = vec![0, 1, 2, 3];
         let expect_reorder = vec![
             ReorderIndex::identity(0),
@@ -1193,7 +1193,7 @@ mod tests {
             ArrowField::new("j", ArrowDataType::Int32, false),
         ]));
         let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            get_requested_indices(&requested_schema, &parquet_schema, false).unwrap();
         let expect_mask = vec![0, 3];
         let expect_reorder = vec![ReorderIndex::identity(0), ReorderIndex::identity(1)];
         assert_eq!(mask_indices, expect_mask);
@@ -1233,7 +1233,7 @@ mod tests {
             ArrowField::new("j", ArrowDataType::Int32, false),
         ]));
         let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            get_requested_indices(&requested_schema, &parquet_schema, false).unwrap();
         let expect_mask = vec![0, 1, 3];
         let expect_reorder = vec![
             ReorderIndex::identity(0),
@@ -1282,7 +1282,7 @@ mod tests {
             ArrowField::new("j", ArrowDataType::Int32, false), // field 4
         ]));
         let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            get_requested_indices(&requested_schema, &parquet_schema, false).unwrap();
         let expect_mask = vec![0, 2, 3, 4];
         let expect_reorder = vec![
             ReorderIndex::identity(0),
@@ -1336,7 +1336,7 @@ mod tests {
             ArrowField::new("i", ArrowDataType::Int32, false),
         ]));
         let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            get_requested_indices(&requested_schema, &parquet_schema, false).unwrap();
         let expect_mask = vec![2, 3, 4, 5];
         let expect_reorder = vec![
             ReorderIndex::identity(2),
@@ -1486,7 +1486,7 @@ mod tests {
             noti2_field.clone(),
         ]));
         let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            get_requested_indices(&requested_schema, &parquet_schema, false).unwrap();
         let expect_mask: Vec<usize> = vec![];
         let expect_reorder = vec![
             ReorderIndex::missing(0, nots_field.with_name("s").into()),
@@ -1505,7 +1505,7 @@ mod tests {
             ArrowField::new("i2", ArrowDataType::Int32, true),
         ]));
         let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            get_requested_indices(&requested_schema, &parquet_schema, false).unwrap();
         let expect_mask: Vec<usize> = vec![];
         let expect_reorder = vec![];
         assert_eq!(mask_indices, expect_mask);

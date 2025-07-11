@@ -21,6 +21,7 @@ fn try_create_from_json(
     _schema: SchemaRef,
     arrow_schema: ArrowSchemaRef,
     _predicate: Option<PredicateRef>,
+    _using_id: bool
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
     let json = ReaderBuilder::new(arrow_schema)
         .build(BufReader::new(file))?
@@ -35,7 +36,7 @@ impl JsonHandler for SyncJsonHandler {
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        read_files(files, schema, predicate, try_create_from_json)
+        read_files(files, schema, predicate, try_create_from_json, false)
     }
 
     fn parse_json(
