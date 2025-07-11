@@ -196,12 +196,8 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         o: &'a OpaqueExpression,
     ) -> Option<Cow<'a, OpaqueExpression>> {
-        use Cow::*;
-        let o = match recurse_into_children(&o.exprs, |e| self.transform_expr(e))? {
-            Owned(exprs) => Owned(OpaqueExpression::new(o.op.clone(), exprs)),
-            Borrowed(_) => Borrowed(o),
-        };
-        Some(o)
+        let nested_result = recurse_into_children(&o.exprs, |e| self.transform_expr(e))?;
+        Some(nested_result.map_owned_or_else(o, |exprs| OpaqueExpression::new(o.op.clone(), exprs)))
     }
 
     /// Recursively transforms the child of an [`Expression::Predicate`]. Returns `None` if all
@@ -272,12 +268,8 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         o: &'a OpaquePredicate,
     ) -> Option<Cow<'a, OpaquePredicate>> {
-        use Cow::*;
-        let o = match recurse_into_children(&o.exprs, |e| self.transform_expr(e))? {
-            Owned(exprs) => Owned(OpaquePredicate::new(o.op.clone(), exprs)),
-            Borrowed(_) => Borrowed(o),
-        };
-        Some(o)
+        let nested_result = recurse_into_children(&o.exprs, |e| self.transform_expr(e))?;
+        Some(nested_result.map_owned_or_else(o, |exprs| OpaquePredicate::new(o.op.clone(), exprs)))
     }
 }
 

@@ -90,7 +90,7 @@ pub trait OpaqueExpressionOp: DynPartialEq + std::fmt::Debug {
     /// Attempts scalar evaluation of this opaque expression, e.g. for partition pruning.
     ///
     /// Implementations can evaluate the child expressions however they see fit, possibly by
-    /// invoking the provided [`ScalarExpressionEvaluator`],
+    /// calling back to the provided [`ScalarExpressionEvaluator`],
     ///
     /// An output of `Err` indicates that this operation does not support scalar evaluation, or was
     /// invoked incorrectly (e.g. with the wrong number and/or types of arguments, None input,
@@ -113,9 +113,8 @@ pub trait OpaquePredicateOp: DynPartialEq + std::fmt::Debug {
     /// [`DirectPredicateEvaluator`], e.g. for partition pruning or to evaluate an opaque data
     /// skipping predicate produced previously by an [`IndirectDataSkippingPredicateEvaluator`].
     ///
-    /// Implementations can evaluate the child expressions however they see fit, possibly by
-    /// invoking the provided [`ScalarExpressionEvaluator`] or by delegating back to the owning
-    /// [`DirectPredicateEvaluator`].
+    /// Implementations can evaluate the child expressions however they see fit, possibly by calling
+    /// back to the provided [`ScalarExpressionEvaluator`] and/or [`DirectPredicateEvaluator`].
     ///
     /// An output of `Err` indicates that this operation does not support scalar evaluation, or was
     /// invoked incorrectly (e.g. wrong number and/or types of arguments, None input, etc); the
@@ -134,7 +133,7 @@ pub trait OpaquePredicateOp: DynPartialEq + std::fmt::Debug {
     /// [`DirectDataSkippingPredicateEvaluator`], e.g. for parquet row group skipping.
     ///
     /// Implementations can evaluate the child expressions however they see fit, possibly by
-    /// delegating back to the owning [`DirectDataSkippingPredicateEvaluator`].
+    /// calling back to the provided [`DirectDataSkippingPredicateEvaluator`].
     ///
     /// An output of `None` indicates that this operation does not support evaluation as a data
     /// skipping predicate, or was invoked incorrectly (e.g. wrong number and/or types of arguments,
@@ -150,7 +149,7 @@ pub trait OpaquePredicateOp: DynPartialEq + std::fmt::Debug {
     /// an [`IndirectDataSkippingPredicateEvaluator`], e.g. for stats-based file pruning.
     ///
     /// Implementations can transform the predicate and its child expressions however they see fit,
-    /// possibly by delegating back to the owning [`IndirectDataSkippingPredicateEvaluator`].
+    /// possibly by calling back to the owning [`IndirectDataSkippingPredicateEvaluator`].
     ///
     /// An output of `None` indicates that this operation does not support conversion to a data
     /// skipping predicate, or was invoked incorrectly (e.g. wrong number and/or types of arguments,

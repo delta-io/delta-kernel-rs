@@ -337,10 +337,7 @@ pub trait DynPartialEq: AsAny {
 // Blanket implementation for all eligible types
 impl<T: PartialEq + AsAny> DynPartialEq for T {
     fn dyn_eq(&self, other: &dyn Any) -> bool {
-        match other.downcast_ref::<T>() {
-            Some(other) => self == other,
-            None => false,
-        }
+        other.downcast_ref::<T>().is_some_and(|other| self == other)
     }
 }
 
