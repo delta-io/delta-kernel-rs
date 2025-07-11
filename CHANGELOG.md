@@ -5,7 +5,10 @@
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.12.1...v0.13.0)
 
 ### 🏗️ Breaking changes
-1. Add support for opaque engine expressions ([#686])
+1. Add support for opaque engine expressions. Includes a number of changes: new `ExpressionType`s
+   (`OpaqueExpression`, `OpaquePredicate`, `Unknown`) and `Expression`/`Predicate` variants
+   (`Opaaque`, `Unknown`), and visitors, transforms, and evaluators changed to support
+   opaque/unknown expressions/predicate. ([#686])
 2. Rename `Transaction::add_write_metadata` to `Transaction::add_files` ([#1019])
 
 ### 🚀 Features / new APIs
@@ -19,7 +22,7 @@
 ### 🐛 Bug Fixes
 
 1. Clippy fmt cleanup ([#1042])
-2. Move logic into the thread::scope call so it doesn't hang ([#1040])
+2. Examples: move logic into the thread::scope call so examples don't hang ([#1040])
 3. Remove panic from read_last_checkpoint ([#1022])
 4. Always write `_last_checkpoint` with parts = None ([#1053])
 5. Don't release `common` crate (used only by example programs)  ([#1065])
