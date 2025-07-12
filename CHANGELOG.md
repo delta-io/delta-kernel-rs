@@ -7,7 +7,7 @@
 ### 🏗️ Breaking changes
 1. Add support for opaque engine expressions. Includes a number of changes: new `ExpressionType`s
    (`OpaqueExpression`, `OpaquePredicate`, `Unknown`) and `Expression`/`Predicate` variants
-   (`Opaaque`, `Unknown`), and visitors, transforms, and evaluators changed to support
+   (`Opaque`, `Unknown`), and visitors, transforms, and evaluators changed to support
    opaque/unknown expressions/predicate. ([#686])
 2. Rename `Transaction::add_write_metadata` to `Transaction::add_files` ([#1019])
 
