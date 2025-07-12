@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::arrow::array::{ArrayRef, BinaryArray, StructArray};
 use delta_kernel::arrow::array::{
     Int32Array, MapBuilder, MapFieldNames, StringArray, StringBuilder, TimestampMicrosecondArray,
 };
+use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
@@ -15,7 +17,8 @@ use serde_json::json;
 use serde_json::Deserializer;
 
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_data::{variant_arrow_type, ArrowEngineData};
+use delta_kernel::schema::variant_utils::unshredded_variant_schema;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::DeltaResult;
 use delta_kernel::Error as KernelError;
@@ -273,7 +276,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
 
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
-        let write_context = Arc::new(txn.get_write_context());
+        let write_context = Arc::new(txn.get_write_context(None));
         let tasks = append_data.into_iter().map(|data| {
             // arc clones
             let engine = engine.clone();
@@ -408,7 +411,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
 
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
-        let write_context = Arc::new(txn.get_write_context());
+        let write_context = Arc::new(txn.get_write_context(None));
         let tasks = append_data
             .into_iter()
             .zip(partition_vals)
@@ -547,7 +550,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
-        let write_context = Arc::new(txn.get_write_context());
+        let write_context = Arc::new(txn.get_write_context(None));
         let tasks = append_data.into_iter().map(|data| {
             // arc clones
             let engine = engine.clone();
@@ -725,6 +728,8 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
         &[],
         true,
         true, // enable "timestamp without timezone" feature
+        false,
+        false,
     )
     .await?;
 
@@ -752,7 +757,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write data
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.get_write_context(None));
 
     let add_files_metadata = engine
         .write_parquet(
@@ -787,6 +792,366 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify the data can be read back correctly
     test_read(&ArrowEngineData::new(data), &table, engine)?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
+    // setup tracing
+    let _ = tracing_subscriber::fmt::try_init();
+    fn unshredded_variant_schema_flipped() -> DataType {
+        DataType::variant_type([
+            StructField::not_null("value", DataType::BINARY),
+            StructField::not_null("metadata", DataType::BINARY),
+        ])
+    }
+    fn variant_arrow_type_flipped() -> ArrowDataType {
+        let metadata_field = Field::new("metadata", ArrowDataType::Binary, false);
+        let value_field = Field::new("value", ArrowDataType::Binary, false);
+        let fields = vec![value_field, metadata_field];
+        ArrowDataType::Struct(fields.into())
+    }
+
+    // create a table with VARIANT column
+    let table_schema = Arc::new(StructType::new(vec![
+        StructField::nullable("v", unshredded_variant_schema())
+            .with_metadata([("delta.columnMapping.physicalName", "col1")])
+            .add_metadata([("delta.columnMapping.id", 1)]),
+        StructField::nullable("i", DataType::INTEGER)
+            .with_metadata([("delta.columnMapping.physicalName", "col2")])
+            .add_metadata([("delta.columnMapping.id", 2)]),
+        StructField::nullable(
+            "nested",
+            // We flip the value and metadata fields in the actual parquet file for the test
+            StructType::new(vec![StructField::nullable(
+                "nested_v",
+                unshredded_variant_schema_flipped(),
+            )
+            .with_metadata([("delta.columnMapping.physicalName", "col21")])
+            .add_metadata([("delta.columnMapping.id", 3)])]),
+        )
+        .with_metadata([("delta.columnMapping.physicalName", "col3")])
+        .add_metadata([("delta.columnMapping.id", 4)]),
+    ]));
+
+    let write_schema = Arc::new(StructType::new(vec![
+        StructField::nullable("col1", unshredded_variant_schema()),
+        StructField::nullable("col2", DataType::INTEGER),
+        StructField::nullable(
+            "col3",
+            StructType::new(vec![StructField::nullable(
+                "col21",
+                unshredded_variant_schema_flipped(),
+            )]),
+        ),
+    ]));
+
+    let (store, engine, table_location) = engine_store_setup("test_table_variant", true);
+    let table = create_table(
+        store.clone(),
+        table_location,
+        table_schema.clone(),
+        &[],
+        true,
+        false,
+        true, // enable "variantType" feature
+        true, // enable "columnMapping" feature
+    )
+    .await?;
+
+    let commit_info = new_commit_info()?;
+
+    let mut txn = table
+        .new_transaction(&engine)?
+        .with_commit_info(commit_info);
+
+    // First value corresponds to the variant value "1". Third value corresponds to the variant
+    // representing the JSON Object {"a":2}.
+    let metadata_v = vec![
+        Some(&[0x01, 0x00, 0x00][..]),
+        None,
+        Some(&[0x01, 0x01, 0x00, 0x01, 0x61][..]),
+    ];
+    let value_v = vec![
+        Some(&[0x0C, 0x01][..]),
+        None,
+        Some(&[0x02, 0x01, 0x00, 0x00, 0x01, 0x02][..]),
+    ];
+
+    let metadata_v_array = Arc::new(BinaryArray::from(metadata_v)) as ArrayRef;
+    let value_v_array = Arc::new(BinaryArray::from(value_v)) as ArrayRef;
+
+    // First value corresponds to the variant value "2". Third value corresponds to the variant
+    // representing the JSON Object {"b":3}.
+    let metadata_nested_v = vec![
+        Some(&[0x01, 0x00, 0x00][..]),
+        None,
+        Some(&[0x01, 0x01, 0x00, 0x01, 0x62][..]),
+    ];
+    let value_nested_v = vec![
+        Some(&[0x0C, 0x02][..]),
+        None,
+        Some(&[0x02, 0x01, 0x00, 0x00, 0x01, 0x03][..]),
+    ];
+
+    let value_nested_v_array = Arc::new(BinaryArray::from(value_nested_v)) as ArrayRef;
+    let metadata_nested_v_array = Arc::new(BinaryArray::from(metadata_nested_v)) as ArrayRef;
+
+    let variant_arrow = variant_arrow_type();
+    let variant_arrow_flipped = variant_arrow_type_flipped();
+
+    let i_values = vec![31, 32, 33];
+
+    let fields = match variant_arrow {
+        ArrowDataType::Struct(fields) => Ok(fields),
+        _ => Err(KernelError::Generic(
+            "Variant arrow data type is not struct.".to_string(),
+        )),
+    }?;
+    let fields_flipped = match variant_arrow_flipped {
+        ArrowDataType::Struct(fields) => Ok(fields),
+        _ => Err(KernelError::Generic(
+            "Variant arrow data type is not struct.".to_string(),
+        )),
+    }?;
+
+    let null_bitmap = NullBuffer::from_iter([true, false, true]);
+
+    let variant_v_array = StructArray::try_new(
+        fields.clone(),
+        vec![metadata_v_array, value_v_array],
+        Some(null_bitmap.clone()),
+    )?;
+
+    let variant_nested_v_array = Arc::new(StructArray::try_new(
+        fields_flipped.clone(),
+        vec![
+            value_nested_v_array.clone(),
+            metadata_nested_v_array.clone(),
+        ],
+        Some(null_bitmap.clone()),
+    )?);
+
+    let data = RecordBatch::try_new(
+        Arc::new(write_schema.as_ref().try_into_arrow()?),
+        vec![
+            // v variant
+            Arc::new(variant_v_array.clone()),
+            // i int
+            Arc::new(Int32Array::from(i_values.clone())),
+            // nested struct<nested_v variant>
+            Arc::new(StructArray::try_new(
+                vec![Field::new("col21", variant_arrow_type_flipped(), true)].into(),
+                vec![variant_nested_v_array.clone()],
+                None,
+            )?),
+        ],
+    )
+    .unwrap();
+
+    // Write data
+    let engine = Arc::new(engine);
+    let write_context = Arc::new(txn.get_write_context(Some(write_schema.clone())));
+
+    let add_files_metadata = engine
+        .write_parquet(
+            &ArrowEngineData::new(data.clone()),
+            write_context.as_ref(),
+            HashMap::new(),
+            true,
+        )
+        .await?;
+
+    txn.add_files(add_files_metadata);
+
+    // Commit the transaction
+    txn.commit(engine.as_ref())?;
+
+    // Verify the commit was written correctly
+    let commit1 = store
+        .get(&Path::from(
+            "/test_table_variant/_delta_log/00000000000000000001.json",
+        ))
+        .await?;
+
+    let parsed_commits: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
+        .into_iter::<serde_json::Value>()
+        .try_collect()?;
+
+    // Check that we have the expected number of commits (commitInfo + add)
+    assert_eq!(parsed_commits.len(), 2);
+
+    // Check that the add action exists
+    assert!(parsed_commits[1].get("add").is_some());
+
+    // The scanned data will match the logical schema, not the physical one
+    let expected_schema = Arc::new(StructType::new(vec![
+        StructField::nullable("v", unshredded_variant_schema()),
+        StructField::nullable("i", DataType::INTEGER),
+        StructField::nullable(
+            "nested",
+            StructType::new(vec![StructField::nullable(
+                "nested_v",
+                unshredded_variant_schema(),
+            )]),
+        ),
+    ]));
+
+    // During the read, the flipped fields should be reordered into metadata, value.
+    let variant_nested_v_array_expected = Arc::new(StructArray::try_new(
+        fields,
+        vec![metadata_nested_v_array, value_nested_v_array],
+        Some(null_bitmap),
+    )?);
+    let expected_data = RecordBatch::try_new(
+        Arc::new(expected_schema.as_ref().try_into_arrow()?),
+        vec![
+            // v variant
+            Arc::new(variant_v_array),
+            // i int
+            Arc::new(Int32Array::from(i_values)),
+            // nested struct<nested_v variant>
+            Arc::new(StructArray::try_new(
+                vec![Field::new("nested_v", variant_arrow_type(), true)].into(),
+                vec![variant_nested_v_array_expected],
+                None,
+            )?),
+        ],
+    )
+    .unwrap();
+
+    test_read(&ArrowEngineData::new(expected_data), &table, engine)?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error::Error>> {
+    // Ensure that shredded variants are rejected by the default engine's parquet reader
+
+    // setup tracing
+    let _ = tracing_subscriber::fmt::try_init();
+    let table_schema = Arc::new(StructType::new(vec![StructField::nullable(
+        "v",
+        unshredded_variant_schema(),
+    )]));
+
+    // The table will be attempted to be written in this form but be read into
+    // STRUCT<metadata: BINARY, value: BINARY>. The read should fail because the default engine
+    // currently does not support shredded reads.
+    let shredded_write_schema = Arc::new(StructType::new(vec![StructField::nullable(
+        "v",
+        DataType::struct_type([
+            StructField::new("metadata", DataType::BINARY, true),
+            StructField::new("value", DataType::BINARY, true),
+            StructField::new("typed_value", DataType::INTEGER, true),
+        ]),
+    )]));
+
+    let (store, engine, table_location) = engine_store_setup("test_table_variant_2", true);
+    let table = create_table(
+        store.clone(),
+        table_location,
+        table_schema.clone(),
+        &[],
+        true,
+        false,
+        true,  // enable "variantType" feature
+        false, // enable "columnMapping" feature
+    )
+    .await?;
+
+    let commit_info = new_commit_info()?;
+
+    let mut txn = table
+        .new_transaction(&engine)?
+        .with_commit_info(commit_info);
+
+    // First value corresponds to the variant value "1". Third value corresponds to the variant
+    // representing the JSON Object {"a":2}.
+    let metadata_v = vec![
+        Some(&[0x01, 0x00, 0x00][..]),
+        Some(&[0x01, 0x01, 0x00, 0x01, 0x61][..]),
+    ];
+    let value_v = vec![
+        Some(&[0x0C, 0x01][..]),
+        Some(&[0x02, 0x01, 0x00, 0x00, 0x01, 0x02][..]),
+    ];
+    let typed_value_v = vec![Some(21), Some(3)];
+
+    let metadata_v_array = Arc::new(BinaryArray::from(metadata_v)) as ArrayRef;
+    let value_v_array = Arc::new(BinaryArray::from(value_v)) as ArrayRef;
+    let typed_value_v_array = Arc::new(Int32Array::from(typed_value_v)) as ArrayRef;
+
+    let variant_arrow = ArrowDataType::Struct(
+        vec![
+            Field::new("metadata", ArrowDataType::Binary, true),
+            Field::new("value", ArrowDataType::Binary, true),
+            Field::new("typed_value", ArrowDataType::Int32, true),
+        ]
+        .into(),
+    );
+
+    let fields = match variant_arrow {
+        ArrowDataType::Struct(fields) => Ok(fields),
+        _ => Err(KernelError::Generic(
+            "Variant arrow data type is not struct.".to_string(),
+        )),
+    }?;
+
+    let variant_v_array = StructArray::try_new(
+        fields.clone(),
+        vec![metadata_v_array, value_v_array, typed_value_v_array],
+        None,
+    )?;
+
+    let data = RecordBatch::try_new(
+        Arc::new(shredded_write_schema.as_ref().try_into_arrow()?),
+        vec![
+            // v variant
+            Arc::new(variant_v_array.clone()),
+        ],
+    )
+    .unwrap();
+
+    let engine = Arc::new(engine);
+    let write_context = Arc::new(txn.get_write_context(Some(shredded_write_schema.clone())));
+
+    let add_files_metadata = engine
+        .write_parquet(
+            &ArrowEngineData::new(data.clone()),
+            write_context.as_ref(),
+            HashMap::new(),
+            true,
+        )
+        .await?;
+
+    txn.add_files(add_files_metadata);
+
+    // Commit the transaction
+    txn.commit(engine.as_ref())?;
+
+    // Verify the commit was written correctly
+    let commit1 = store
+        .get(&Path::from(
+            "/test_table_variant_2/_delta_log/00000000000000000001.json",
+        ))
+        .await?;
+
+    let parsed_commits: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
+        .into_iter::<serde_json::Value>()
+        .try_collect()?;
+
+    // Check that we have the expected number of commits (commitInfo + add)
+    assert_eq!(parsed_commits.len(), 2);
+
+    // Check that the add action exists
+    assert!(parsed_commits[1].get("add").is_some());
+
+    let res = test_read(&ArrowEngineData::new(data), &table, engine);
+    assert!(matches!(res,
+        Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
 
     Ok(())
 }

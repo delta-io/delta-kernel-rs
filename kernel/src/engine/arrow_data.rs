@@ -7,7 +7,7 @@ use crate::arrow::array::types::{Int32Type, Int64Type};
 use crate::arrow::array::{
     Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray,
 };
-use crate::arrow::datatypes::{DataType as ArrowDataType, FieldRef};
+use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, FieldRef};
 use tracing::debug;
 
 use std::collections::{HashMap, HashSet};
@@ -21,6 +21,13 @@ pub use crate::engine::arrow_utils::fix_nested_null_masks;
 /// example. When in doubt, call [`fix_nested_null_masks`] first.
 pub struct ArrowEngineData {
     data: RecordBatch,
+}
+
+pub fn variant_arrow_type() -> ArrowDataType {
+    let metadata_field = ArrowField::new("metadata", ArrowDataType::Binary, false);
+    let value_field = ArrowField::new("value", ArrowDataType::Binary, false);
+    let fields = vec![metadata_field, value_field];
+    ArrowDataType::Struct(fields.into())
 }
 
 impl ArrowEngineData {

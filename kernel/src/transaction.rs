@@ -206,11 +206,10 @@ impl Transaction {
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
-    fn generate_logical_to_physical(&self) -> Expression {
+    fn generate_logical_to_physical(&self, schema: &SchemaRef) -> Expression {
         // for now, we just pass through all the columns except partition columns.
         // note this is _incorrect_ if table config deems we need partition columns.
         let partition_columns = &self.read_snapshot.metadata().partition_columns;
-        let schema = self.read_snapshot.schema();
         let fields = schema
             .fields()
             .filter(|f| !partition_columns.contains(f.name()))
@@ -219,15 +218,15 @@ impl Transaction {
     }
 
     /// Get the write context for this transaction. At the moment, this is constant for the whole
-    /// transaction.
+    /// transaction. If `schema` is None, the schema is derived from the table snapshot.
     // Note: after we introduce metadata updates (modify table schema, etc.), we need to make sure
     // that engines cannot call this method after a metadata change, since the write context could
     // have invalid metadata.
-    pub fn get_write_context(&self) -> WriteContext {
+    pub fn get_write_context(&self, schema: Option<SchemaRef>) -> WriteContext {
         let target_dir = self.read_snapshot.table_root();
-        let snapshot_schema = self.read_snapshot.schema();
-        let logical_to_physical = self.generate_logical_to_physical();
-        WriteContext::new(target_dir.clone(), snapshot_schema, logical_to_physical)
+        let schema = schema.unwrap_or_else(|| self.read_snapshot.schema());
+        let logical_to_physical = self.generate_logical_to_physical(&schema);
+        WriteContext::new(target_dir.clone(), schema, logical_to_physical)
     }
 
     /// Add files to include in this transaction. This API generally enables the engine to
