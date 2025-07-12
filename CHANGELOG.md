@@ -18,6 +18,7 @@
 3. Introduce a crate for args that are common between examples ([#1046])
 4. Support reordering structs that are inside maps in default parquet reader ([#1060])
 5. Add default engine support for arrow eval of opaque expressions ([#980])
+5. Expose descriptive fields on Metadata action ([#1051])
 
 ### 🐛 Bug Fixes
 
@@ -49,6 +50,7 @@
 [#686]: https://github.com/delta-io/delta-kernel-rs/pull/686
 [#1060]: https://github.com/delta-io/delta-kernel-rs/pull/1060
 [#980]: https://github.com/delta-io/delta-kernel-rs/pull/980
+[#1051]: https://github.com/delta-io/delta-kernel-rs/pull/1051
 
 
 ## [v0.12.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.12.1/) (2025-06-05)
