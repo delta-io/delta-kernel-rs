@@ -1,3 +1,4 @@
+use common::LocationArgs;
 use delta_kernel::actions::visitors::{
     visit_metadata_at, visit_protocol_at, AddVisitor, CdcVisitor, RemoveVisitor,
     SetTransactionVisitor,
@@ -6,18 +7,16 @@ use delta_kernel::actions::{
     get_log_schema, ADD_NAME, CDC_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
     SET_TRANSACTION_NAME,
 };
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::scan::state::{DvInfo, Stats};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
-use delta_kernel::{DeltaResult, Error, ExpressionRef, Table};
+use delta_kernel::{DeltaResult, Error, ExpressionRef};
 
 use std::collections::HashMap;
 use std::process::ExitCode;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use clap::{Parser, Subcommand};
 
@@ -25,12 +24,11 @@ use clap::{Parser, Subcommand};
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
-    /// Path to the table to inspect
-    #[arg(short, long)]
-    path: String,
-
     #[command(subcommand)]
     command: Commands,
+
+    #[command(flatten)]
+    location_args: LocationArgs,
 }
 
 #[derive(Subcommand)]
@@ -182,15 +180,8 @@ fn print_scan_file(
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
 
-    // build a table and get the latest snapshot from it
-    let table = Table::try_from_uri(&cli.path)?;
-
-    let engine = DefaultEngine::try_new(
-        table.location(),
-        HashMap::<String, String>::new(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    )?;
-
+    let table = common::get_table(&cli.location_args)?;
+    let engine = common::get_engine(&table, &cli.location_args)?;
     let snapshot = table.snapshot(&engine, None)?;
 
     match cli.command {

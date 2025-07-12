@@ -290,9 +290,9 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
             })
         });
 
-        let write_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-        for meta in write_metadata {
-            txn.add_write_metadata(meta?);
+        let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
+        for meta in add_files_metadata {
+            txn.add_files(meta?);
         }
 
         // commit!
@@ -428,9 +428,9 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                 })
             });
 
-        let write_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-        for meta in write_metadata {
-            txn.add_write_metadata(meta?);
+        let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
+        for meta in add_files_metadata {
+            txn.add_files(meta?);
         }
 
         // commit!
@@ -564,8 +564,8 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
             })
         });
 
-        let mut write_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-        assert!(write_metadata.all(|res| match res {
+        let mut add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
+        assert!(add_files_metadata.all(|res| match res {
             Err(KernelError::Arrow(ArrowError::SchemaError(_))) => true,
             Err(KernelError::Backtraced { source, .. })
                 if matches!(&*source, KernelError::Arrow(ArrowError::SchemaError(_))) =>
@@ -754,7 +754,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     let engine = Arc::new(engine);
     let write_context = Arc::new(txn.get_write_context());
 
-    let write_metadata = engine
+    let add_files_metadata = engine
         .write_parquet(
             &ArrowEngineData::new(data.clone()),
             write_context.as_ref(),
@@ -763,7 +763,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    txn.add_write_metadata(write_metadata);
+    txn.add_files(add_files_metadata);
 
     // Commit the transaction
     txn.commit(engine.as_ref())?;

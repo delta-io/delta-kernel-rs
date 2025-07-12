@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 arrow = { version = "55", features = ["prettyprint", "chrono-tz"] }
 clap = { version = "4.5", features = ["derive"] }
+common = { path = "../common" }
 delta_kernel = { path = "../../../kernel", features = [
   "arrow-55",
   "default-engine",
@@ -16,5 +17,6 @@ env_logger = "0.11.8"
 itertools = "0.14"
 url = "2"
 
+# for cargo-release
 [package.metadata.release]
 release = false

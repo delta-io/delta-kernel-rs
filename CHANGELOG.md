@@ -1,5 +1,58 @@
 # Changelog
 
+## [v0.13.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.13.0/) (2025-07-11)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.12.1...v0.13.0)
+
+### 🏗️ Breaking changes
+1. Add support for opaque engine expressions. Includes a number of changes: new `ExpressionType`s
+   (`OpaqueExpression`, `OpaquePredicate`, `Unknown`) and `Expression`/`Predicate` variants
+   (`Opaque`, `Unknown`), and visitors, transforms, and evaluators changed to support
+   opaque/unknown expressions/predicate. ([#686])
+2. Rename `Transaction::add_write_metadata` to `Transaction::add_files` ([#1019])
+
+### 🚀 Features / new APIs
+
+1. add ability to only retain SetTransaction actions <= SetTransactionRetentionDuration ([#1013])
+2. *(ffi)* Add timetravel by version number ([#1044])
+3. Introduce a crate for args that are common between examples ([#1046])
+4. Support reordering structs that are inside maps in default parquet reader ([#1060])
+5. Add default engine support for arrow eval of opaque expressions ([#980])
+5. Expose descriptive fields on Metadata action ([#1051])
+
+### 🐛 Bug Fixes
+
+1. Clippy fmt cleanup ([#1042])
+2. Examples: move logic into the thread::scope call so examples don't hang ([#1040])
+3. Remove panic from read_last_checkpoint ([#1022])
+4. Always write `_last_checkpoint` with parts = None ([#1053])
+5. Don't release `common` crate (used only by example programs)  ([#1065])
+
+### 🚜 Refactor
+
+1. Move various test util functions to test-utils crate ([#985])
+2. Define and use a cow helper for transforms ([#1057])
+3. Expand capability and usage of `Cow` helper for transforms ([#1061])
+
+
+[#985]: https://github.com/delta-io/delta-kernel-rs/pull/985
+[#1013]: https://github.com/delta-io/delta-kernel-rs/pull/1013
+[#1042]: https://github.com/delta-io/delta-kernel-rs/pull/1042
+[#1040]: https://github.com/delta-io/delta-kernel-rs/pull/1040
+[#1022]: https://github.com/delta-io/delta-kernel-rs/pull/1022
+[#1044]: https://github.com/delta-io/delta-kernel-rs/pull/1044
+[#1019]: https://github.com/delta-io/delta-kernel-rs/pull/1019
+[#1053]: https://github.com/delta-io/delta-kernel-rs/pull/1053
+[#1046]: https://github.com/delta-io/delta-kernel-rs/pull/1046
+[#1057]: https://github.com/delta-io/delta-kernel-rs/pull/1057
+[#1061]: https://github.com/delta-io/delta-kernel-rs/pull/1061
+[#1065]: https://github.com/delta-io/delta-kernel-rs/pull/1065
+[#686]: https://github.com/delta-io/delta-kernel-rs/pull/686
+[#1060]: https://github.com/delta-io/delta-kernel-rs/pull/1060
+[#980]: https://github.com/delta-io/delta-kernel-rs/pull/980
+[#1051]: https://github.com/delta-io/delta-kernel-rs/pull/1051
+
+
 ## [v0.12.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.12.1/) (2025-06-05)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.12.0...v0.12.1)
