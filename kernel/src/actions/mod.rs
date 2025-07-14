@@ -173,6 +173,31 @@ pub(crate) struct Metadata {
 }
 
 impl Metadata {
+    // TODO(#1068/1069): make these just pub directly or make better internal_api macro for fields
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn created_time(&self) -> Option<i64> {
+        self.created_time
+    }
+
     pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
         let mut visitor = MetadataVisitor::default();
         visitor.visit_rows_of(data)?;
@@ -185,6 +210,7 @@ impl Metadata {
         &self.configuration
     }
 
+    #[internal_api]
     pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
         Ok(serde_json::from_str(&self.schema_string)?)
     }
@@ -198,6 +224,7 @@ impl Metadata {
     /// Parse the metadata configuration HashMap<String, String> into a TableProperties struct.
     /// Note that parsing is infallible -- any items that fail to parse are simply propagated
     /// through to the `TableProperties.unknown_properties` field.
+    #[internal_api]
     pub(crate) fn parse_table_properties(&self) -> TableProperties {
         TableProperties::from(self.configuration.iter())
     }

@@ -11,11 +11,15 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, IntervalUnit, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
+use crate::engine::arrow_expression::opaque::{
+    ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
+};
 use crate::engine::arrow_utils::prim_array_cmp;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
-    JunctionPredicate, JunctionPredicateOp, Predicate, Scalar, UnaryPredicate, UnaryPredicateOp,
+    JunctionPredicate, JunctionPredicateOp, OpaqueExpression, OpaquePredicate, Predicate, Scalar,
+    UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
 use itertools::Itertools;
@@ -128,6 +132,18 @@ pub fn evaluate_expression(
 
             Ok(eval(&left_arr, &right_arr)?)
         }
+        (Opaque(OpaqueExpression { op, exprs }), _) => {
+            match op
+                .any_ref()
+                .downcast_ref::<ArrowOpaqueExpressionOpAdaptor>()
+            {
+                Some(op) => op.eval_expr(exprs, batch, result_type),
+                None => Err(Error::unsupported(format!(
+                    "Unsupported opaque expression: {op:?}"
+                ))),
+            }
+        }
+        (Unknown(name), _) => Err(Error::unsupported(format!("Unknown expression: {name:?}"))),
     }
 }
 
@@ -263,5 +279,14 @@ pub fn evaluate_predicate(
                 .reduce(|l, r| Ok(reducer(&l?, &r?)?))
                 .unwrap_or_else(|| Ok(BooleanArray::from(vec![default; batch.num_rows()])))
         }
+        Opaque(OpaquePredicate { op, exprs }) => {
+            match op.any_ref().downcast_ref::<ArrowOpaquePredicateOpAdaptor>() {
+                Some(op) => op.eval_pred(exprs, batch, inverted),
+                None => Err(Error::unsupported(format!(
+                    "Unsupported opaque predicate: {op:?}"
+                ))),
+            }
+        }
+        Unknown(name) => Err(Error::unsupported(format!("Unknown predicate: {name:?}"))),
     }
 }

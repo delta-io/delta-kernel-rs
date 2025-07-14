@@ -9,7 +9,7 @@ use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
 use crate::expressions::{
     column_expr, joined_column_expr, BinaryPredicateOp, ColumnName, Expression as Expr,
-    JunctionPredicateOp, Predicate as Pred, PredicateRef, Scalar,
+    JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -266,6 +266,15 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
     ) -> Option<Pred> {
         KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, inverted)
             .map(Pred::literal)
+    }
+
+    fn eval_pred_opaque(
+        &self,
+        op: &OpaquePredicateOpRef,
+        exprs: &[Expr],
+        inverted: bool,
+    ) -> Option<Pred> {
+        op.as_data_skipping_predicate(self, exprs, inverted)
     }
 
     fn finish_eval_pred_junction(

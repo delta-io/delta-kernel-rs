@@ -50,7 +50,7 @@ and the example will only print out the schema of the table, not the data.
 By default the VSCode C/C++ Extension does not use any defines flags. You can open `settings.json` and set the following line:
 ```
     "C_Cpp.default.defines": [
-        "DEFINE_DEFAULT_ENGINE",
+        "DEFINE_DEFAULT_ENGINE_BASE",
         "DEFINE_SYNC_ENGINE"
     ]
 ```

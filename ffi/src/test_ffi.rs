@@ -6,9 +6,65 @@ use crate::expressions::{SharedExpression, SharedPredicate};
 use crate::handle::Handle;
 use delta_kernel::expressions::{
     column_expr, column_pred, ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr,
-    MapData, Predicate as Pred, Scalar, StructData,
+    MapData, OpaqueExpressionOp, OpaquePredicateOp, Predicate as Pred, Scalar,
+    ScalarExpressionEvaluator, StructData,
+};
+use delta_kernel::kernel_predicates::{
+    DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
+    IndirectDataSkippingPredicateEvaluator,
 };
 use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
+use delta_kernel::DeltaResult;
+
+#[derive(Debug, PartialEq)]
+struct OpaqueTestOp(String);
+
+impl OpaqueExpressionOp for OpaqueTestOp {
+    fn name(&self) -> &str {
+        &self.0
+    }
+    fn eval_expr_scalar(
+        &self,
+        _eval_expr: &ScalarExpressionEvaluator<'_>,
+        _exprs: &[Expr],
+    ) -> DeltaResult<Scalar> {
+        unimplemented!()
+    }
+}
+
+impl OpaquePredicateOp for OpaqueTestOp {
+    fn name(&self) -> &str {
+        &self.0
+    }
+
+    fn eval_pred_scalar(
+        &self,
+        _eval_expr: &ScalarExpressionEvaluator<'_>,
+        _evaluator: &DirectPredicateEvaluator<'_>,
+        _exprs: &[Expr],
+        _inverted: bool,
+    ) -> DeltaResult<Option<bool>> {
+        unimplemented!()
+    }
+
+    fn eval_as_data_skipping_predicate(
+        &self,
+        _evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
+        _exprs: &[Expr],
+        _inverted: bool,
+    ) -> Option<bool> {
+        unimplemented!()
+    }
+
+    fn as_data_skipping_predicate(
+        &self,
+        _evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+        _exprs: &[Expr],
+        _inverted: bool,
+    ) -> Option<Pred> {
+        unimplemented!()
+    }
+}
 
 /// Constructs a kernel expression that is passed back as a [`SharedExpression`] handle. The expected
 /// output expression can be found in `ffi/tests/test_expression_visitor/expected.txt`.
@@ -78,6 +134,11 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         Scalar::Array(array_data).into(),
         Scalar::Map(map_data).into(),
         Expr::struct_from([Expr::literal(5_i32), Expr::literal(20_i64)]),
+        Expr::opaque(
+            OpaqueTestOp("foo".to_string()),
+            vec![Expr::literal(42), Expr::literal(1.111)],
+        ),
+        Expr::unknown("mystery"),
     ];
     sub_exprs.extend(
         [
@@ -127,6 +188,11 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
             Pred::ne(Expr::literal(20), Expr::literal(10)),
         ]),
         Pred::is_not_null(column_expr!("col")),
+        Pred::opaque(
+            OpaqueTestOp("bar".to_string()),
+            vec![Expr::literal(42), Expr::literal(1.111)],
+        ),
+        Pred::unknown("intrigue"),
     ];
     sub_exprs.extend(
         [
