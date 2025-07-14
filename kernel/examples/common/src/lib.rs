@@ -8,8 +8,10 @@ use delta_kernel::{
     engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine},
     scan::Scan,
     schema::Schema,
-    DeltaResult, Table,
+    DeltaResult, Snapshot,
 };
+
+use url::Url;
 
 #[derive(Args)]
 pub struct LocationArgs {
@@ -42,14 +44,9 @@ pub struct ScanArgs {
     pub columns: Option<Vec<String>>,
 }
 
-/// Get a [`Table`] from the specified location args
-pub fn get_table(args: &LocationArgs) -> DeltaResult<Table> {
-    Table::try_from_uri(&args.path)
-}
-
-/// Get an engine configured to read table specified by `table` and `LocationArgs`
+/// Get an engine configured to read table at `url` and `LocationArgs`
 pub fn get_engine(
-    table: &Table,
+    url: &Url,
     args: &LocationArgs,
 ) -> DeltaResult<DefaultEngine<TokioBackgroundExecutor>> {
     let mut options = if let Some(ref region) = args.region {
@@ -60,22 +57,12 @@ pub fn get_engine(
     if args.public {
         options.insert("skip_signature", "true".to_string());
     }
-    DefaultEngine::try_new(
-        table.location(),
-        options,
-        Arc::new(TokioBackgroundExecutor::new()),
-    )
+    DefaultEngine::try_new(url, options, Arc::new(TokioBackgroundExecutor::new()))
 }
 
 /// Construct a scan at the latest snapshot. This is over the specified table and using the passed
 /// engine. Parameters of the scan are controlled by the specified `ScanArgs`
-pub fn get_scan(
-    table: &Table,
-    engine: &DefaultEngine<TokioBackgroundExecutor>,
-    args: &ScanArgs,
-) -> DeltaResult<Option<Scan>> {
-    let snapshot = table.snapshot(engine, None)?;
-
+pub fn get_scan(snapshot: Snapshot, args: &ScanArgs) -> DeltaResult<Option<Scan>> {
     if args.schema_only {
         println!("{:#?}", snapshot.schema());
         return Ok(None);

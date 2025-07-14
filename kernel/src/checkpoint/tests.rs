@@ -9,8 +9,7 @@ use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
 use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
 use crate::utils::test_utils::Action;
-use crate::Table;
-use crate::{DeltaResult, FileMeta};
+use crate::{DeltaResult, FileMeta, Snapshot};
 
 use arrow_55::{
     array::{create_array, RecordBatch},
@@ -71,8 +70,7 @@ fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     )?;
 
     let table_root = Url::parse("memory:///")?;
-    let table = Table::new(table_root);
-    let snapshot = table.snapshot(&engine, None)?;
+    let snapshot = Snapshot::try_new(table_root, &engine, None)?;
     let writer = Arc::new(snapshot).checkpoint()?;
 
     let checkpoint_batch = writer.create_checkpoint_metadata_batch(&engine)?;
@@ -295,8 +293,8 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     )?;
 
     let table_root = Url::parse("memory:///")?;
-    let table = Table::new(table_root);
-    let writer = table.checkpoint(&engine, None)?;
+    let snapshot = Arc::new(Snapshot::try_new(table_root, &engine, None)?);
+    let writer = snapshot.checkpoint()?;
 
     // Verify the checkpoint file path is the latest version by default.
     assert_eq!(
@@ -362,9 +360,9 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     )?;
 
     let table_root = Url::parse("memory:///")?;
-    let table = Table::new(table_root);
     // Specify version 0 for checkpoint
-    let writer = table.checkpoint(&engine, Some(0))?;
+    let snapshot = Arc::new(Snapshot::try_new(table_root, &engine, Some(0))?);
+    let writer = snapshot.checkpoint()?;
 
     // Verify the checkpoint file path is the specified version.
     assert_eq!(
@@ -411,8 +409,8 @@ fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaR
     )?;
 
     let table_root = Url::parse("memory:///")?;
-    let table = Table::new(table_root);
-    let writer = table.checkpoint(&engine, Some(0))?;
+    let snapshot = Arc::new(Snapshot::try_new(table_root, &engine, Some(0))?);
+    let writer = snapshot.checkpoint()?;
     let data_iter = writer.checkpoint_data(&engine)?;
 
     /* The returned data iterator has batches that we do not consume */
@@ -465,8 +463,8 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     )?;
 
     let table_root = Url::parse("memory:///")?;
-    let table = Table::new(table_root);
-    let writer = table.checkpoint(&engine, None)?;
+    let snapshot = Arc::new(Snapshot::try_new(table_root, &engine, None)?);
+    let writer = snapshot.checkpoint()?;
 
     // Verify the checkpoint file path is the latest version by default.
     assert_eq!(

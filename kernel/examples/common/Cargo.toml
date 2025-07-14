@@ -17,3 +17,4 @@ delta_kernel = { path = "../../../kernel", features = [
   "default-engine",
   "internal-api",
 ] }
+url = "2"

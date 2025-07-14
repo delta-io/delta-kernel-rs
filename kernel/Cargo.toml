@@ -133,7 +133,7 @@ default-engine-rustls = [
 rustc_version = "0.4.1"
 
 [dev-dependencies]
-delta_kernel = { path = ".", features = ["arrow", "default-engine"] }
+delta_kernel = { path = ".", features = ["arrow", "default-engine", "internal-api"] }
 test_utils = { path = "../test-utils" }
 # Used for testing parse_url_opts extensibility
 hdfs-native-object-store = { version = "0.14.0" }

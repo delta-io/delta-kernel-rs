@@ -12,7 +12,7 @@ use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::{DeltaResult, Engine, EngineData, ExpressionRef, FileMeta};
+use delta_kernel::{DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Snapshot};
 
 use clap::Parser;
 use url::Url;
@@ -91,10 +91,12 @@ struct ScanState {
 
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
-    let table = common::get_table(&cli.location_args)?;
-    println!("Reading {}", table.location());
-    let engine = common::get_engine(&table, &cli.location_args)?;
-    let Some(scan) = common::get_scan(&table, &engine, &cli.scan_args)? else {
+
+    let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
+    println!("Reading {url}");
+    let engine = common::get_engine(&url, &cli.location_args)?;
+    let snapshot = Snapshot::try_new(url, &engine, None)?;
+    let Some(scan) = common::get_scan(snapshot, &cli.scan_args)? else {
         return Ok(());
     };
 

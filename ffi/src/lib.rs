@@ -14,7 +14,7 @@ use url::Url;
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Version;
-use delta_kernel::{DeltaResult, Engine, EngineData, Table};
+use delta_kernel::{DeltaResult, Engine, EngineData};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 // cbindgen doesn't understand our use of feature flags here, and by default it parses `mod handle`
@@ -404,8 +404,7 @@ impl ExternEngine for ExternEngineVtable {
 /// Caller is responsible for passing a valid path pointer.
 unsafe fn unwrap_and_parse_path_as_url(path: KernelStringSlice) -> DeltaResult<Url> {
     let path: &str = unsafe { TryFromStringSlice::try_from_slice(&path) }?;
-    let table = Table::try_from_uri(path)?;
-    Ok(table.location().clone())
+    delta_kernel::try_parse_uri(path)
 }
 
 /// A builder that allows setting options on the `Engine` before actually building it
