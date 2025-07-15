@@ -27,8 +27,8 @@ use crate::scan::test_utils::{
 use crate::snapshot::LastCheckpointHint;
 use crate::utils::test_utils::{assert_batch_matches, Action};
 use crate::{
-    DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor,
-    StorageHandler, Table, Version,
+    DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
+    StorageHandler,
 };
 use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
 
@@ -50,8 +50,7 @@ fn test_replay_for_metadata() {
     let url = url::Url::from_directory_path(path.unwrap()).unwrap();
     let engine = SyncEngine::new();
 
-    let table = Table::new(url);
-    let snapshot = table.snapshot(&engine, None).unwrap();
+    let snapshot = Snapshot::try_new(url, &engine, None).unwrap();
     let data: Vec<_> = snapshot
         .log_segment()
         .replay_for_metadata(&engine)
@@ -159,7 +158,7 @@ pub(crate) fn add_checkpoint_to_store(
     data: Box<dyn EngineData>,
     filename: &str,
 ) -> DeltaResult<()> {
-    let path = format!("_delta_log/{}", filename);
+    let path = format!("_delta_log/{filename}");
     write_parquet_to_store(store, path, data)
 }
 
@@ -170,7 +169,7 @@ fn add_sidecar_to_store(
     data: Box<dyn EngineData>,
     filename: &str,
 ) -> DeltaResult<()> {
-    let path = format!("_delta_log/_sidecars/{}", filename);
+    let path = format!("_delta_log/_sidecars/{filename}");
     write_parquet_to_store(store, path, data)
 }
 
@@ -186,7 +185,7 @@ fn write_json_to_store(
         .map(|action| serde_json::to_string(&action).expect("action to string"))
         .collect();
     let content = json_lines.join("\n");
-    let checkpoint_path = format!("_delta_log/{}", filename);
+    let checkpoint_path = format!("_delta_log/{filename}");
 
     tokio::runtime::Runtime::new()
         .expect("create tokio runtime")
@@ -823,8 +822,7 @@ fn test_sidecar_to_filemeta_valid_paths() -> DeltaResult<()> {
         assert_eq!(
             filemeta.location.as_str(),
             expected_url,
-            "Mismatch for input path: {}",
-            input_path
+            "Mismatch for input path: {input_path}"
         );
     }
     Ok(())

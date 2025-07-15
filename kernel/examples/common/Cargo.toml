@@ -1,8 +1,10 @@
 [package]
-name = "read-table-changes"
-version = "0.1.0"
-edition = "2021"
-publish = false
+name = "common"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+version.workspace = true
 
 # for cargo-release
 [package.metadata.release]
@@ -10,11 +12,9 @@ release = false
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-common = { path = "../common" }
 delta_kernel = { path = "../../../kernel", features = [
-  "arrow",
+  "arrow-55",
   "default-engine",
   "internal-api",
 ] }
 url = "2"
-itertools = "0.14"

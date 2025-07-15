@@ -53,11 +53,12 @@ pub struct TableChangesScan {
 /// # use test_utils::DefaultEngineExtension;
 /// # use delta_kernel::engine::default::DefaultEngine;
 /// # use delta_kernel::expressions::{column_expr, Scalar};
-/// # use delta_kernel::{Predicate, Table};
+/// # use delta_kernel::Predicate;
+/// # use delta_kernel::table_changes::TableChanges;
 /// # let path = "./tests/data/table-with-cdf";
 /// # let engine = DefaultEngine::new_local();
-/// # let table = Table::try_from_uri(path).unwrap();
-/// # let table_changes = table.table_changes(engine.as_ref(), 0, 1).unwrap();
+/// # let url = delta_kernel::try_parse_uri(path).unwrap();
+/// # let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1)).unwrap();
 /// let schema = table_changes
 ///     .schema()
 ///     .project(&["id", "_commit_version"])
@@ -361,17 +362,18 @@ mod tests {
     use crate::expressions::{column_expr, Scalar};
     use crate::scan::{ColumnType, PhysicalPredicate};
     use crate::schema::{DataType, StructField, StructType};
+    use crate::table_changes::TableChanges;
     use crate::table_changes::COMMIT_VERSION_COL_NAME;
-    use crate::{Predicate, Table};
+    use crate::Predicate;
 
     #[test]
     fn simple_table_changes_scan_builder() {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
-        let table = Table::try_from_uri(path).unwrap();
+        let url = delta_kernel::try_parse_uri(path).unwrap();
 
         // A field in the schema goes from being nullable to non-nullable
-        let table_changes = table.table_changes(engine.as_ref(), 0, 1).unwrap();
+        let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1)).unwrap();
 
         let scan = table_changes.into_scan_builder().build().unwrap();
         // Note that this table is not partitioned. `part` is a regular field
@@ -393,10 +395,10 @@ mod tests {
     fn projected_and_filtered_table_changes_scan_builder() {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
-        let table = Table::try_from_uri(path).unwrap();
+        let url = delta_kernel::try_parse_uri(path).unwrap();
 
         // A field in the schema goes from being nullable to non-nullable
-        let table_changes = table.table_changes(engine.as_ref(), 0, 1).unwrap();
+        let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1)).unwrap();
 
         let schema = table_changes
             .schema()

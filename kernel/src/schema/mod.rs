@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
-use crate::utils::require;
+use crate::utils::{require, CowExt as _};
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
@@ -511,8 +511,7 @@ impl DecimalType {
         require!(
             0 < precision && precision <= 38,
             Error::invalid_decimal(format!(
-                "precision must be in range 1..38 inclusive, found: {}.",
-                precision
+                "precision must be in range 1..38 inclusive, found: {precision}."
             ))
         );
         require!(
@@ -586,7 +585,7 @@ where
     let str_value = String::deserialize(deserializer)?;
     require!(
         str_value.starts_with("decimal(") && str_value.ends_with(')'),
-        serde::de::Error::custom(format!("Invalid decimal: {}", str_value))
+        serde::de::Error::custom(format!("Invalid decimal: {str_value}"))
     );
 
     let mut parts = str_value[8..str_value.len() - 1].split(',');
@@ -594,13 +593,13 @@ where
         .next()
         .and_then(|part| part.trim().parse::<u8>().ok())
         .ok_or_else(|| {
-            serde::de::Error::custom(format!("Invalid precision in decimal: {}", str_value))
+            serde::de::Error::custom(format!("Invalid precision in decimal: {str_value}"))
         })?;
     let scale = parts
         .next()
         .and_then(|part| part.trim().parse::<u8>().ok())
         .ok_or_else(|| {
-            serde::de::Error::custom(format!("Invalid scale in decimal: {}", str_value))
+            serde::de::Error::custom(format!("Invalid scale in decimal: {str_value}"))
         })?;
     DecimalType::try_new(precision, scale).map_err(serde::de::Error::custom)
 }
@@ -726,7 +725,7 @@ impl DataType {
 impl Display for DataType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            DataType::Primitive(p) => write!(f, "{}", p),
+            DataType::Primitive(p) => write!(f, "{p}"),
             DataType::Array(a) => write!(f, "array<{}>", a.element_type),
             DataType::Struct(s) => {
                 write!(f, "struct<")?;
@@ -812,25 +811,22 @@ pub trait SchemaTransform<'a> {
     /// General entry point for a recursive traversal over any data type. Also invoked internally to
     /// dispatch on nested data types encountered during the traversal.
     fn transform(&mut self, data_type: &'a DataType) -> Option<Cow<'a, DataType>> {
-        use Cow::*;
         use DataType::*;
-
-        // quick boilerplate helper
-        macro_rules! apply_transform {
-            ( $transform_fn:ident, $arg:ident ) => {
-                match self.$transform_fn($arg) {
-                    Some(Borrowed(_)) => Some(Borrowed(data_type)),
-                    Some(Owned(inner)) => Some(Owned(inner.into())),
-                    None => None,
-                }
-            };
-        }
-        match data_type {
-            Primitive(ptype) => apply_transform!(transform_primitive, ptype),
-            Array(atype) => apply_transform!(transform_array, atype),
-            Struct(stype) => apply_transform!(transform_struct, stype),
-            Map(mtype) => apply_transform!(transform_map, mtype),
-        }
+        let result = match data_type {
+            Primitive(ptype) => self
+                .transform_primitive(ptype)?
+                .map_owned_or_else(data_type, DataType::from),
+            Array(atype) => self
+                .transform_array(atype)?
+                .map_owned_or_else(data_type, DataType::from),
+            Struct(stype) => self
+                .transform_struct(stype)?
+                .map_owned_or_else(data_type, DataType::from),
+            Map(mtype) => self
+                .transform_map(mtype)?
+                .map_owned_or_else(data_type, DataType::from),
+        };
+        Some(result)
     }
 
     /// Recursively transforms a struct field's data type. If the data type changes, update the
@@ -839,17 +835,14 @@ pub trait SchemaTransform<'a> {
         &mut self,
         field: &'a StructField,
     ) -> Option<Cow<'a, StructField>> {
-        use Cow::*;
-        let field = match self.transform(&field.data_type)? {
-            Borrowed(_) => Borrowed(field),
-            Owned(new_data_type) => Owned(StructField {
-                name: field.name.clone(),
-                data_type: new_data_type,
-                nullable: field.nullable,
-                metadata: field.metadata.clone(),
-            }),
+        let result = self.transform(&field.data_type)?;
+        let f = |new_data_type| StructField {
+            name: field.name.clone(),
+            data_type: new_data_type,
+            nullable: field.nullable,
+            metadata: field.metadata.clone(),
         };
-        Some(field)
+        Some(result.map_owned_or_else(field, f))
     }
 
     /// Recursively transforms a struct's fields. If one or more fields were changed or removed,
@@ -882,34 +875,27 @@ pub trait SchemaTransform<'a> {
     /// Recursively transforms an array's element type. If the element type changes, update the
     /// array to reference it. Otherwise, no-op.
     fn recurse_into_array(&mut self, atype: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
-        use Cow::*;
-        let atype = match self.transform_array_element(&atype.element_type)? {
-            Borrowed(_) => Borrowed(atype),
-            Owned(element_type) => Owned(ArrayType {
-                type_name: atype.type_name.clone(),
-                element_type,
-                contains_null: atype.contains_null,
-            }),
+        let result = self.transform_array_element(&atype.element_type)?;
+        let f = |element_type| ArrayType {
+            type_name: atype.type_name.clone(),
+            element_type,
+            contains_null: atype.contains_null,
         };
-        Some(atype)
+        Some(result.map_owned_or_else(atype, f))
     }
 
     /// Recursively transforms a map's key and value types. If either one changes, update the map to
     /// reference them. If either one is removed, remove the map as well. Otherwise, no-op.
     fn recurse_into_map(&mut self, mtype: &'a MapType) -> Option<Cow<'a, MapType>> {
-        use Cow::*;
         let key_type = self.transform_map_key(&mtype.key_type)?;
         let value_type = self.transform_map_value(&mtype.value_type)?;
-        let mtype = match (&key_type, &value_type) {
-            (Borrowed(_), Borrowed(_)) => Borrowed(mtype),
-            _ => Owned(MapType {
-                type_name: mtype.type_name.clone(),
-                key_type: key_type.into_owned(),
-                value_type: value_type.into_owned(),
-                value_contains_null: mtype.value_contains_null,
-            }),
+        let f = |(key_type, value_type)| MapType {
+            type_name: mtype.type_name.clone(),
+            key_type,
+            value_type,
+            value_contains_null: mtype.value_contains_null,
         };
-        Some(mtype)
+        Some((key_type, value_type).map_owned_or_else(mtype, f))
     }
 }
 

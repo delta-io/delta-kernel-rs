@@ -524,7 +524,7 @@ async fn data_skipping_filter() {
     let logical_schema = get_schema();
     let predicate = match PhysicalPredicate::try_new(&predicate, &logical_schema) {
         Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
-        other => panic!("Unexpected result: {:?}", other),
+        other => panic!("Unexpected result: {other:?}"),
     };
     let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
         .unwrap()

@@ -356,18 +356,18 @@ impl Scalar {
 impl Display for Scalar {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Integer(i) => write!(f, "{}", i),
-            Self::Long(i) => write!(f, "{}", i),
-            Self::Short(i) => write!(f, "{}", i),
-            Self::Byte(i) => write!(f, "{}", i),
-            Self::Float(fl) => write!(f, "{}", fl),
-            Self::Double(fl) => write!(f, "{}", fl),
-            Self::String(s) => write!(f, "'{}'", s),
-            Self::Boolean(b) => write!(f, "{}", b),
-            Self::Timestamp(ts) => write!(f, "{}", ts),
-            Self::TimestampNtz(ts) => write!(f, "{}", ts),
-            Self::Date(d) => write!(f, "{}", d),
-            Self::Binary(b) => write!(f, "{:?}", b),
+            Self::Integer(i) => write!(f, "{i}"),
+            Self::Long(i) => write!(f, "{i}"),
+            Self::Short(i) => write!(f, "{i}"),
+            Self::Byte(i) => write!(f, "{i}"),
+            Self::Float(fl) => write!(f, "{fl}"),
+            Self::Double(fl) => write!(f, "{fl}"),
+            Self::String(s) => write!(f, "'{s}'"),
+            Self::Boolean(b) => write!(f, "{b}"),
+            Self::Timestamp(ts) => write!(f, "{ts}"),
+            Self::TimestampNtz(ts) => write!(f, "{ts}"),
+            Self::Date(d) => write!(f, "{d}"),
+            Self::Binary(b) => write!(f, "{b:?}"),
             Self::Decimal(d) => match d.scale().cmp(&0) {
                 Ordering::Equal => {
                     write!(f, "{}", d.bits())
@@ -681,7 +681,7 @@ impl PrimitiveType {
         require!(scale == dtype.scale(), parse_error());
         let int: i128 = match frac_part {
             None => int_part.parse()?,
-            Some(frac_part) => format!("{}{}", int_part, frac_part).parse()?,
+            Some(frac_part) => format!("{int_part}{frac_part}").parse()?,
         };
         Ok(Scalar::Decimal(DecimalData::try_new(int, dtype)?))
     }
@@ -868,10 +868,10 @@ mod tests {
             Expr::literal("Cool"),
             column,
         ));
-        assert_eq!(&format!("{}", array_op), "10 IN (1, 2, 3)");
-        assert_eq!(&format!("{}", array_not_op), "NOT(10 IN (1, 2, 3))");
-        assert_eq!(&format!("{}", column_op), "3.1415927 IN Column(item)");
-        assert_eq!(&format!("{}", column_not_op), "NOT('Cool' IN Column(item))");
+        assert_eq!(&format!("{array_op}"), "10 IN (1, 2, 3)");
+        assert_eq!(&format!("{array_not_op}"), "NOT(10 IN (1, 2, 3))");
+        assert_eq!(&format!("{column_op}"), "3.1415927 IN Column(item)");
+        assert_eq!(&format!("{column_not_op}"), "NOT('Cool' IN Column(item))");
     }
 
     #[test]

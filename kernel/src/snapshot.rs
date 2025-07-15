@@ -13,7 +13,8 @@ use crate::schema::{Schema, SchemaRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
-use crate::utils::calculate_transaction_expiration_timestamp;
+use crate::transaction::Transaction;
+use crate::utils::{calculate_transaction_expiration_timestamp, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler, Version};
 use delta_kernel_derive::internal_api;
 
@@ -59,6 +60,24 @@ impl Snapshot {
             log_segment,
             table_configuration,
         }
+    }
+
+    /// Create a new [`Snapshot`] instance for the given version by parsing the given uri string.
+    ///
+    /// # Parameters
+    ///
+    /// - `table_root`: string-encoded URI pointing at the table root (where `_delta_log` folder is
+    ///   located)
+    /// - `engine`: Implementation of [`Engine`] apis.
+    /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
+    ///   version of the table.
+    pub fn try_from_uri(
+        uri: impl AsRef<str>,
+        engine: &dyn Engine,
+        version: Option<Version>,
+    ) -> DeltaResult<Self> {
+        let url = try_parse_uri(uri)?;
+        Self::try_new(url, engine, version)
     }
 
     /// Create a new [`Snapshot`] instance for the given version.
@@ -122,8 +141,7 @@ impl Snapshot {
             if new_version < old_version {
                 // Hint is too new: error since this is effectively an incorrect optimization
                 return Err(Error::Generic(format!(
-                    "Requested snapshot version {} is older than snapshot hint version {}",
-                    new_version, old_version
+                    "Requested snapshot version {new_version} is older than snapshot hint version {old_version}"
                 )));
             }
         }
@@ -152,8 +170,7 @@ impl Snapshot {
                 Some(new_version) if new_version != old_version => {
                     // No new commits, but we are looking for a new version
                     return Err(Error::Generic(format!(
-                        "Requested snapshot version {} is newer than the latest version {}",
-                        new_version, old_version
+                        "Requested snapshot version {new_version} is newer than the latest version {old_version}"
                     )));
                 }
                 _ => {
@@ -173,8 +190,7 @@ impl Snapshot {
             // we should never see a new log segment with a version < the existing snapshot
             // version, that would mean a commit was incorrectly deleted from the log
             return Err(Error::Generic(format!(
-                "Unexpected state: The newest version in the log {} is older than the old version {}",
-                new_end_version, old_version)));
+                "Unexpected state: The newest version in the log {new_end_version} is older than the old version {old_version}")));
         }
         if new_end_version == old_version {
             // No new commits, just return the same snapshot
@@ -334,6 +350,11 @@ impl Snapshot {
         ScanBuilder::new(self)
     }
 
+    /// Create a [`Transaction`] for this `Arc<Snapshot>`.
+    pub fn transaction(self: Arc<Self>) -> DeltaResult<Transaction> {
+        Transaction::try_new(self)
+    }
+
     /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the txn based on the SetTransactionRetentionDuration property and lastUpdated
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).
@@ -374,7 +395,7 @@ impl Snapshot {
 }
 
 // Note: Schema can not be derived because the checkpoint schema is only known at runtime.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) struct LastCheckpointHint {
@@ -401,22 +422,23 @@ pub(crate) struct LastCheckpointHint {
 /// the read. Thus, the semantics of this function are to return `None` if the file is not found or
 /// is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and are assumed to
 /// cause failure.
-///
-/// TODO: java kernel retries three times before failing, should we do the same?
+// TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-level
+// result coming from storage.read_files
 fn read_last_checkpoint(
     storage: &dyn StorageHandler,
     log_root: &Url,
 ) -> DeltaResult<Option<LastCheckpointHint>> {
     let file_path = log_root.join(LAST_CHECKPOINT_FILE_NAME)?;
-    match storage
-        .read_files(vec![(file_path, None)])
-        .and_then(|mut data| data.next().expect("read_files should return one file"))
-    {
-        Ok(data) => Ok(serde_json::from_slice(&data)
+    match storage.read_files(vec![(file_path, None)])?.next() {
+        Some(Ok(data)) => Ok(serde_json::from_slice(&data)
             .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
             .ok()),
-        Err(Error::FileNotFound(_)) => Ok(None),
-        Err(err) => Err(err),
+        Some(Err(Error::FileNotFound(_))) => Ok(None),
+        Some(Err(err)) => Err(err),
+        None => {
+            warn!("empty _last_checkpoint file");
+            Ok(None)
+        }
     }
 }
 
@@ -803,7 +825,8 @@ mod tests {
     }
 
     #[test]
-    fn test_read_table_with_last_checkpoint() {
+    fn test_read_table_with_missing_last_checkpoint() {
+        // this table doesn't have a _last_checkpoint file
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/table-with-dv-small/_delta_log/",
         ))
@@ -814,19 +837,44 @@ mod tests {
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
         let cp = read_last_checkpoint(&storage, &url).unwrap();
-        assert!(cp.is_none())
+        assert!(cp.is_none());
     }
 
     fn valid_last_checkpoint() -> Vec<u8> {
-        r#"{"size":8,"size_in_bytes":21857,"version":1}"#.as_bytes().to_vec()
+        r#"{"size":8,"sizeInBytes":21857,"version":1}"#.as_bytes().to_vec()
     }
 
     #[test]
-    fn test_read_table_with_invalid_last_checkpoint() {
+    fn test_read_table_with_empty_last_checkpoint() {
         // in memory file system
         let store = Arc::new(InMemory::new());
 
-        // put _last_checkpoint file
+        // do a _last_checkpoint file with "{}" as content
+        let empty = "{}".as_bytes().to_vec();
+        let invalid_path = Path::from("invalid/_last_checkpoint");
+
+        tokio::runtime::Runtime::new()
+            .expect("create tokio runtime")
+            .block_on(async {
+                store
+                    .put(&invalid_path, empty.into())
+                    .await
+                    .expect("put _last_checkpoint");
+            });
+
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let url = Url::parse("memory:///invalid/").expect("valid url");
+        let invalid = read_last_checkpoint(&storage, &url).expect("read last checkpoint");
+        assert!(invalid.is_none())
+    }
+
+    #[test]
+    fn test_read_table_with_last_checkpoint() {
+        // in memory file system
+        let store = Arc::new(InMemory::new());
+
+        // put a valid/invalid _last_checkpoint file
         let data = valid_last_checkpoint();
         let invalid_data = "invalid".as_bytes().to_vec();
         let path = Path::from("valid/_last_checkpoint");
@@ -851,8 +899,17 @@ mod tests {
         let valid = read_last_checkpoint(&storage, &url).expect("read last checkpoint");
         let url = Url::parse("memory:///invalid/").expect("valid url");
         let invalid = read_last_checkpoint(&storage, &url).expect("read last checkpoint");
-        assert!(valid.is_some());
-        assert!(invalid.is_none())
+        let expected = LastCheckpointHint {
+            version: 1,
+            size: 8,
+            parts: None,
+            size_in_bytes: Some(21857),
+            num_of_add_files: None,
+            checkpoint_schema: None,
+            checksum: None,
+        };
+        assert_eq!(valid.unwrap(), expected);
+        assert!(invalid.is_none());
     }
 
     #[test_log::test]

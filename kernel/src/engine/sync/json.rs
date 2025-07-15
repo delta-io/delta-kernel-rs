@@ -60,8 +60,7 @@ impl JsonHandler for SyncJsonHandler {
             .map_err(|_| crate::Error::generic("sync client can only read local files"))?;
         let Some(parent) = path.parent() else {
             return Err(crate::Error::generic(format!(
-                "no parent found for {:?}",
-                path
+                "no parent found for {path:?}"
             )));
         };
 
@@ -167,7 +166,7 @@ mod tests {
                 Err(Error::FileAlreadyExists(err_path)) => {
                     assert_eq!(err_path, path.to_string_lossy().to_string());
                 }
-                _ => panic!("Expected FileAlreadyExists error, got: {:?}", result),
+                _ => panic!("Expected FileAlreadyExists error, got: {result:?}"),
             }
         }
 

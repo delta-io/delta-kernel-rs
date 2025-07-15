@@ -8,8 +8,7 @@ use futures::stream::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{Engine, Error, Table, Version};
+use delta_kernel::{Engine, Error, Snapshot, Version};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssertionError {
@@ -102,15 +101,14 @@ impl TestCaseInfo {
 
     pub async fn assert_metadata(&self, engine: Arc<dyn Engine>) -> TestResult<()> {
         let engine = engine.as_ref();
-        let table = Table::new(self.table_root()?);
-
         let (latest, versions) = self.versions().await?;
 
-        let snapshot = table.snapshot(engine, None)?;
+        let snapshot = Snapshot::try_new(self.table_root()?, engine, None)?;
         self.assert_snapshot_meta(&latest, &snapshot)?;
 
         for table_version in versions {
-            let snapshot = table.snapshot(engine, Some(table_version.version))?;
+            let snapshot =
+                Snapshot::try_new(self.table_root()?, engine, Some(table_version.version))?;
             self.assert_snapshot_meta(&table_version, &snapshot)?;
         }
 
@@ -147,6 +145,6 @@ mod tests {
         let path = PathBuf::from("./tests/dat/out/reader_tests/generated/with_schema_change");
         let case = read_dat_case(path).unwrap();
         let versions = case.versions().await.unwrap();
-        println!("{:?}", versions)
+        println!("{versions:?}")
     }
 }
