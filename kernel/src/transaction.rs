@@ -11,7 +11,10 @@ use crate::expressions::{MapData, Scalar};
 use crate::path::ParsedLogPath;
 use crate::schema::{MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
-use crate::{DataType, DeltaResult, Engine, EngineData, EvaluationHandlerExtension, Expression, IntoEngineData, Version};
+use crate::{
+    DataType, DeltaResult, Engine, EngineData, EvaluationHandlerExtension, Expression,
+    IntoEngineData, Version,
+};
 
 use url::Url;
 
@@ -177,7 +180,8 @@ impl Transaction {
     /// Add commit info to this transaction and append the argument as its engine_commit_info.
     /// The engine is required to provide commit info before committing the transcation.
     pub fn with_engine_commit_info(mut self, engine_commit_info: (String, String)) -> Self {
-        self.engine_commit_info.insert(engine_commit_info.0, engine_commit_info.1);
+        self.engine_commit_info
+            .insert(engine_commit_info.0, engine_commit_info.1);
         self
     }
 
@@ -407,7 +411,7 @@ mod tests {
     #[test]
     fn test_generate_commit_info() -> DeltaResult<()> {
         let engine = ExprEngine::new();
-        
+
         let operation = Some("test operation");
         let mut engine_commit_info = HashMap::new();
         engine_commit_info.insert("engineInfo".to_string(), "default engine".to_string());

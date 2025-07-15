@@ -201,7 +201,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
 
         assert_eq!(parsed_commits, expected_commit);
     }
-    Ok(()) 
+    Ok(())
 }
 
 #[tokio::test]
