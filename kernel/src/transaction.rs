@@ -7,7 +7,7 @@ use crate::actions::SetTransaction;
 use crate::actions::COMMIT_INFO_NAME;
 use crate::actions::{get_log_add_schema, get_log_commit_info_schema, get_log_txn_schema};
 use crate::error::Error;
-use crate::expressions::{column_expr, MapData, Scalar, StructData};
+use crate::expressions::{MapData, Scalar};
 use crate::path::ParsedLogPath;
 use crate::schema::{MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
@@ -339,7 +339,7 @@ fn generate_commit_info(
         // operation parameters
         hashmap_to_scalar(None)?,
         // kernel_version
-        Scalar::String(format!("v{}", KERNEL_VERSION)),
+        Scalar::String(format!("v{KERNEL_VERSION}")),
         // engine_commit_info
         hashmap_to_scalar(Some(engine_commit_info))?,
     ];
