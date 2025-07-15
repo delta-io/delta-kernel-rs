@@ -12,7 +12,7 @@ version.workspace = true
 release = false
 
 [dependencies]
-delta_kernel = { path = "../kernel", features = ["arrow_53"] }
+delta_kernel = { path = "../kernel", features = ["arrow"] }
 
 [features]
 default-engine = [ "delta_kernel/default-engine" ]

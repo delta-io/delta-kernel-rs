@@ -3,10 +3,10 @@ use crate::arrow::array::types::*;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Datum, RecordBatch, StructArray,
 };
-use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq};
+use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
-use crate::arrow::compute::{and_kleene, is_null, not, or_kleene};
+use crate::arrow::compute::{and_kleene, is_not_null, is_null, not, or_kleene};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, IntervalUnit, TimeUnit,
 };
@@ -14,22 +14,13 @@ use crate::arrow::error::ArrowError;
 use crate::engine::arrow_utils::prim_array_cmp;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
-    BinaryExpression, BinaryOperator, Expression, JunctionExpression, JunctionOperator, Scalar,
-    UnaryExpression, UnaryOperator,
+    BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
+    JunctionPredicate, JunctionPredicateOp, Predicate, Scalar, UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
 use itertools::Itertools;
+use std::borrow::Cow;
 use std::sync::Arc;
-
-fn downcast_to_bool(arr: &dyn Array) -> DeltaResult<&BooleanArray> {
-    arr.as_any()
-        .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| Error::generic("expected boolean array"))
-}
-
-fn wrap_comparison_result(arr: BooleanArray) -> ArrayRef {
-    Arc::new(arr) as _
-}
 
 trait ProvidesColumnByName {
     fn column_by_name(&self, name: &str) -> Option<&ArrayRef>;
@@ -82,12 +73,13 @@ fn extract_column(mut parent: &dyn ProvidesColumnByName, col: &[String]) -> Delt
     }
 }
 
-pub(crate) fn evaluate_expression(
+/// Evaluates a kernel expression over a record batch
+pub fn evaluate_expression(
     expression: &Expression,
     batch: &RecordBatch,
     result_type: Option<&DataType>,
 ) -> DeltaResult<ArrayRef> {
-    use BinaryOperator::*;
+    use BinaryExpressionOp::*;
     use Expression::*;
     match (expression, result_type) {
         (Literal(scalar), _) => Ok(scalar.to_array(batch.num_rows())?),
@@ -115,87 +107,13 @@ pub(crate) fn evaluate_expression(
         (Struct(_), _) => Err(Error::generic(
             "Data type is required to evaluate struct expressions",
         )),
-        (Unary(UnaryExpression { op, expr }), _) => {
-            let arr = evaluate_expression(expr.as_ref(), batch, None)?;
-            let result = match op {
-                UnaryOperator::Not => not(downcast_to_bool(&arr)?)?,
-                UnaryOperator::IsNull => is_null(&arr)?,
-            };
+        (Predicate(pred), None | Some(&DataType::BOOLEAN)) => {
+            let result = evaluate_predicate(pred, batch, false)?;
             Ok(Arc::new(result))
         }
-        (
-            Binary(BinaryExpression {
-                op: In,
-                left,
-                right,
-            }),
-            _,
-        ) => match (left.as_ref(), right.as_ref()) {
-            (Literal(_), Column(_)) => {
-                let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
-                let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
-                if let Some(string_arr) = left_arr.as_string_opt::<i32>() {
-                    if let Some(right_arr) = right_arr.as_list_opt::<i32>() {
-                        let result = in_list_utf8(string_arr, right_arr)?;
-                        return Ok(wrap_comparison_result(result));
-                    }
-                }
-                prim_array_cmp! {
-                    left_arr, right_arr,
-                    (ArrowDataType::Int8, Int8Type),
-                    (ArrowDataType::Int16, Int16Type),
-                    (ArrowDataType::Int32, Int32Type),
-                    (ArrowDataType::Int64, Int64Type),
-                    (ArrowDataType::UInt8, UInt8Type),
-                    (ArrowDataType::UInt16, UInt16Type),
-                    (ArrowDataType::UInt32, UInt32Type),
-                    (ArrowDataType::UInt64, UInt64Type),
-                    (ArrowDataType::Float16, Float16Type),
-                    (ArrowDataType::Float32, Float32Type),
-                    (ArrowDataType::Float64, Float64Type),
-                    (ArrowDataType::Timestamp(TimeUnit::Second, _), TimestampSecondType),
-                    (ArrowDataType::Timestamp(TimeUnit::Millisecond, _), TimestampMillisecondType),
-                    (ArrowDataType::Timestamp(TimeUnit::Microsecond, _), TimestampMicrosecondType),
-                    (ArrowDataType::Timestamp(TimeUnit::Nanosecond, _), TimestampNanosecondType),
-                    (ArrowDataType::Date32, Date32Type),
-                    (ArrowDataType::Date64, Date64Type),
-                    (ArrowDataType::Time32(TimeUnit::Second), Time32SecondType),
-                    (ArrowDataType::Time32(TimeUnit::Millisecond), Time32MillisecondType),
-                    (ArrowDataType::Time64(TimeUnit::Microsecond), Time64MicrosecondType),
-                    (ArrowDataType::Time64(TimeUnit::Nanosecond), Time64NanosecondType),
-                    (ArrowDataType::Duration(TimeUnit::Second), DurationSecondType),
-                    (ArrowDataType::Duration(TimeUnit::Millisecond), DurationMillisecondType),
-                    (ArrowDataType::Duration(TimeUnit::Microsecond), DurationMicrosecondType),
-                    (ArrowDataType::Duration(TimeUnit::Nanosecond), DurationNanosecondType),
-                    (ArrowDataType::Interval(IntervalUnit::DayTime), IntervalDayTimeType),
-                    (ArrowDataType::Interval(IntervalUnit::YearMonth), IntervalYearMonthType),
-                    (ArrowDataType::Interval(IntervalUnit::MonthDayNano), IntervalMonthDayNanoType),
-                    (ArrowDataType::Decimal128(_, _), Decimal128Type),
-                    (ArrowDataType::Decimal256(_, _), Decimal256Type)
-                }
-            }
-            (Literal(lit), Literal(Scalar::Array(ad))) => {
-                #[allow(deprecated)]
-                let exists = ad.array_elements().contains(lit);
-                Ok(Arc::new(BooleanArray::from(vec![exists])))
-            }
-            (l, r) => Err(Error::invalid_expression(format!(
-                "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
-            ))),
-        },
-        (
-            Binary(BinaryExpression {
-                op: NotIn,
-                left,
-                right,
-            }),
-            _,
-        ) => {
-            let reverse_op = Expression::binary(In, *left.clone(), *right.clone());
-            let reverse_expr = evaluate_expression(&reverse_op, batch, None)?;
-            let result = not(reverse_expr.as_boolean())?;
-            Ok(wrap_comparison_result(result))
-        }
+        (Predicate(_), Some(data_type)) => Err(Error::generic(format!(
+            "Predicate evaluation produces boolean output, but caller expects {data_type:?}"
+        ))),
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
@@ -206,38 +124,144 @@ pub(crate) fn evaluate_expression(
                 Minus => sub,
                 Multiply => mul,
                 Divide => div,
-                LessThan => |l, r| lt(l, r).map(wrap_comparison_result),
-                LessThanOrEqual => |l, r| lt_eq(l, r).map(wrap_comparison_result),
-                GreaterThan => |l, r| gt(l, r).map(wrap_comparison_result),
-                GreaterThanOrEqual => |l, r| gt_eq(l, r).map(wrap_comparison_result),
-                Equal => |l, r| eq(l, r).map(wrap_comparison_result),
-                NotEqual => |l, r| neq(l, r).map(wrap_comparison_result),
-                Distinct => |l, r| distinct(l, r).map(wrap_comparison_result),
-                // NOTE: [Not]In was already covered above
-                In | NotIn => return Err(Error::generic("Invalid expression given")),
             };
 
             Ok(eval(&left_arr, &right_arr)?)
         }
-        (Junction(JunctionExpression { op, exprs }), None | Some(&DataType::BOOLEAN)) => {
-            type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
-            let (reducer, default): (Operation, _) = match op {
-                JunctionOperator::And => (and_kleene, true),
-                JunctionOperator::Or => (or_kleene, false),
-            };
-            exprs
-                .iter()
-                .map(|expr| evaluate_expression(expr, batch, result_type))
-                .reduce(|l, r| {
-                    let result = reducer(downcast_to_bool(&l?)?, downcast_to_bool(&r?)?)?;
-                    Ok(wrap_comparison_result(result))
-                })
-                .unwrap_or_else(|| {
-                    evaluate_expression(&Expression::literal(default), batch, result_type)
-                })
+    }
+}
+
+/// Evaluates a (possibly inverted) kernel predicate over a record batch
+pub fn evaluate_predicate(
+    predicate: &Predicate,
+    batch: &RecordBatch,
+    inverted: bool,
+) -> DeltaResult<BooleanArray> {
+    use BinaryPredicateOp::*;
+    use Predicate::*;
+
+    // Helper to conditionally invert results of arrow operations if we couldn't push down the NOT.
+    let maybe_inverted = |result: Cow<'_, BooleanArray>| match inverted {
+        true => not(&result),
+        false => Ok(result.into_owned()),
+    };
+
+    match predicate {
+        BooleanExpression(expr) => {
+            // Grr -- there's no way to cast an `Arc<dyn Array>` back to its native type, so we
+            // can't use `Arc::into_inner` here and must clone instead. At least the inner `Buffer`
+            // instances are still cheaply clonable.
+            let arr = evaluate_expression(expr, batch, Some(&DataType::BOOLEAN))?;
+            match arr.as_any().downcast_ref::<BooleanArray>() {
+                Some(arr) => Ok(maybe_inverted(Cow::Borrowed(arr))?),
+                None => Err(Error::generic("expected boolean array")),
+            }
         }
-        (Junction(_), _) => Err(Error::Generic(format!(
-            "Junction {expression:?} is expected to return boolean results, got {result_type:?}"
-        ))),
+        Not(pred) => evaluate_predicate(pred, batch, !inverted),
+        Unary(UnaryPredicate { op, expr }) => {
+            let arr = evaluate_expression(expr.as_ref(), batch, None)?;
+            let eval_op_fn = match (op, inverted) {
+                (UnaryPredicateOp::IsNull, false) => is_null,
+                (UnaryPredicateOp::IsNull, true) => is_not_null,
+            };
+            Ok(eval_op_fn(&arr)?)
+        }
+        Binary(BinaryPredicate { op, left, right }) => {
+            let (left, right) = (left.as_ref(), right.as_ref());
+
+            // IN is different from all the others, and also quite complex, so factor it out.
+            //
+            // TODO: Factor out as a stand-alone function instead of a closure?
+            let eval_in = || match (left, right) {
+                (Expression::Literal(_), Expression::Column(_)) => {
+                    let left = evaluate_expression(left, batch, None)?;
+                    let right = evaluate_expression(right, batch, None)?;
+                    if let Some(string_arr) = left.as_string_opt::<i32>() {
+                        if let Some(list_arr) = right.as_list_opt::<i32>() {
+                            let result = in_list_utf8(string_arr, list_arr)?;
+                            return Ok(result);
+                        }
+                    }
+
+                    use ArrowDataType::*;
+                    prim_array_cmp! {
+                        left, right,
+                        (Int8, Int8Type),
+                        (Int16, Int16Type),
+                        (Int32, Int32Type),
+                        (Int64, Int64Type),
+                        (UInt8, UInt8Type),
+                        (UInt16, UInt16Type),
+                        (UInt32, UInt32Type),
+                        (UInt64, UInt64Type),
+                        (Float16, Float16Type),
+                        (Float32, Float32Type),
+                        (Float64, Float64Type),
+                        (Timestamp(TimeUnit::Second, _), TimestampSecondType),
+                        (Timestamp(TimeUnit::Millisecond, _), TimestampMillisecondType),
+                        (Timestamp(TimeUnit::Microsecond, _), TimestampMicrosecondType),
+                        (Timestamp(TimeUnit::Nanosecond, _), TimestampNanosecondType),
+                        (Date32, Date32Type),
+                        (Date64, Date64Type),
+                        (Time32(TimeUnit::Second), Time32SecondType),
+                        (Time32(TimeUnit::Millisecond), Time32MillisecondType),
+                        (Time64(TimeUnit::Microsecond), Time64MicrosecondType),
+                        (Time64(TimeUnit::Nanosecond), Time64NanosecondType),
+                        (Duration(TimeUnit::Second), DurationSecondType),
+                        (Duration(TimeUnit::Millisecond), DurationMillisecondType),
+                        (Duration(TimeUnit::Microsecond), DurationMicrosecondType),
+                        (Duration(TimeUnit::Nanosecond), DurationNanosecondType),
+                        (Interval(IntervalUnit::DayTime), IntervalDayTimeType),
+                        (Interval(IntervalUnit::YearMonth), IntervalYearMonthType),
+                        (Interval(IntervalUnit::MonthDayNano), IntervalMonthDayNanoType),
+                        (Decimal128(_, _), Decimal128Type),
+                        (Decimal256(_, _), Decimal256Type)
+                    }
+                }
+                (Expression::Literal(lit), Expression::Literal(Scalar::Array(ad))) => {
+                    #[allow(deprecated)]
+                    let exists = ad.array_elements().contains(lit);
+                    Ok(BooleanArray::from(vec![exists]))
+                }
+                (l, r) => Err(Error::invalid_expression(format!(
+                    "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
+                ))),
+            };
+
+            let eval_fn = match (op, inverted) {
+                (LessThan, false) => lt,
+                (LessThan, true) => gt_eq,
+                (GreaterThan, false) => gt,
+                (GreaterThan, true) => lt_eq,
+                (Equal, false) => eq,
+                (Equal, true) => neq,
+                (Distinct, false) => distinct,
+                (Distinct, true) => not_distinct,
+                (In, _) => return Ok(maybe_inverted(Cow::Owned(eval_in()?))?),
+            };
+
+            let left = evaluate_expression(left, batch, None)?;
+            let right = evaluate_expression(right, batch, None)?;
+            Ok(eval_fn(&left, &right)?)
+        }
+        Junction(JunctionPredicate { op, preds }) => {
+            // Leverage de Morgan's laws (invert the children and swap the operator):
+            // NOT(AND(A, B)) = OR(NOT(A), NOT(B))
+            // NOT(OR(A, B)) = AND(NOT(A), NOT(B))
+            //
+            // In case of an empty junction, we return a default value of TRUE (FALSE) for AND (OR),
+            // as a "hidden" extra child: AND(TRUE, ...) = AND(...) and OR(FALSE, ...) = OR(...).
+            use JunctionPredicateOp::*;
+            type Operation = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
+            let (reducer, default): (Operation, _) = match (op, inverted) {
+                (And, false) | (Or, true) => (and_kleene, true),
+                (Or, false) | (And, true) => (or_kleene, false),
+            };
+            preds
+                .iter()
+                .map(|pred| evaluate_predicate(pred, batch, inverted))
+                .reduce(|l, r| Ok(reducer(&l?, &r?)?))
+                .unwrap_or_else(|| Ok(BooleanArray::from(vec![default; batch.num_rows()])))
+        }
     }
 }

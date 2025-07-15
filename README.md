@@ -1,4 +1,13 @@
-# delta-kernel-rs
+# Delta Kernel (rust) &emsp; [![build-status]][actions] [![latest-version]][crates.io] [![docs]][docs.rs] [![rustc-version-1.82+]][rustc]
+
+[build-status]: https://img.shields.io/github/actions/workflow/status/delta-io/delta-kernel-rs/build.yml?branch=main
+[actions]: https://github.com/delta-io/delta-kernel-rs/actions/workflows/build.yml?query=branch%3Amain
+[latest-version]: https://img.shields.io/crates/v/delta_kernel.svg
+[crates.io]: https://crates.io/crates/delta\_kernel
+[rustc-version-1.82+]: https://img.shields.io/badge/rustc-1.82+-lightgray.svg
+[rustc]: https://blog.rust-lang.org/2024/10/17/Rust-1.82.0/
+[docs]: https://img.shields.io/docsrs/delta_kernel
+[docs.rs]: https://docs.rs/delta_kernel/latest/delta_kernel/
 
 Delta-kernel-rs is an experimental [Delta][delta] implementation focused on interoperability with a
 wide range of query engines. It currently supports reads and (experimental) writes. Only blind
@@ -43,10 +52,10 @@ consumer's own `Engine` trait, the kernel has a feature flag to enable a default
 ```toml
 # fewer dependencies, requires consumer to implement Engine trait.
 # allows consumers to implement their own in-memory format
-delta_kernel = "0.9.0"
+delta_kernel = "0.12.1"
 
 # or turn on the default engine, based on arrow
-delta_kernel = { version = "0.9.0", features = ["default-engine"] }
+delta_kernel = { version = "0.12.1", features = ["default-engine", "arrow-55"] }
 ```
 
 ### Feature flags
@@ -56,7 +65,6 @@ include:
 | Feature flag  | Description   |
 | ------------- | ------------- |
 | `default-engine`    | Turn on the 'default' engine: async, arrow-based `Engine` implementation  |
-| `sync-engine`       | Turn on the 'sync' engine: synchronous, arrow-based `Engine` implementation. Only supports local storage! |
 | `arrow-conversion`  | Conversion utilities for arrow/kernel schema interoperation |
 | `arrow-expression`  | Expression system implementation for arrow |
 
@@ -66,27 +74,27 @@ are still unstable. We therefore may break APIs within minor releases (that is, 
 we will not break APIs in patch releases (`0.1.0` -> `0.1.1`).
 
 ## Arrow versioning
-If you enable the `default-engine` or `sync-engine` features, you get an implementation of the
-`Engine` trait that uses [Arrow] as its data format.
+If you enable the `default-engine` feature, you get an implementation of the `Engine` trait that
+uses [Arrow] as its data format.
 
 The [`arrow crate`](https://docs.rs/arrow/latest/arrow/) tends to release new major versions rather
-quickly. To enable engines that already integrate arrow to also integrate kernel and not force them
-to track a specific version of arrow that kernel depends on, we take as broad dependency on arrow
-versions as we can.
+frequently. To enable engines that already integrate arrow to also integrate kernel and not force
+them to track a specific version of arrow that kernel depends on, we take as broad dependency on
+arrow versions as we can.
 
 We allow selecting the version of arrow to use via feature flags. Currently we support the following
 flags:
 
-- `arrow_53`: Use arrow version 53
-- `arrow_54`: Use arrow version 54
+- `arrow-54`: Use arrow version 54
+- `arrow-55`: Use arrow version 55
+- `arrow`: Use the latest arrow version. Note that this is an _unstable_ flag: we will bump this to
+  the latest arrow version at every arrow version release. Only removing old arrow versions will
+  cause a breaking change for kernel. If you require a specific version N of arrow, you should
+  specify it directly with `arrow-N`, e.g. `arrow-55`.
 
-Note that if more than one `arrow_x` feature is enabled, kernel will default to the _lowest_
-specified flag. This also means that if you use `--all-features` you will get the lowest version of
+Note that if more than one `arrow-x` feature is enabled, kernel will use the _highest_ (latest)
+specified flag. This also means that if you use `--all-features` you will get the latest version of
 arrow that kernel supports.
-
-If no arrow feature is enabled, but are least one of `default-engine`, `sync-engine`,
-`arrow-conversion` or, `arrow-expression` is enabled, the lowest supported arrow version will be
-enabled.
 
 ### Object Store
 You may also need to patch the `object_store` version used if the version of `parquet` you depend on

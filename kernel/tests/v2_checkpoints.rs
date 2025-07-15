@@ -1,21 +1,22 @@
-use std::sync::Arc;
-
 use delta_kernel::arrow::array::RecordBatch;
-use delta_kernel::engine::sync::SyncEngine;
+use delta_kernel::engine::default::DefaultEngine;
 
-use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::{DeltaResult, Table};
 
 mod common;
-use common::{load_test_data, read_scan};
+use common::load_test_data;
+
+use test_utils::DefaultEngineExtension;
+
 use itertools::Itertools;
+use test_utils::read_scan;
 
 fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
     let test_path = test_dir.path().join(test_name.as_ref());
 
     let table = Table::try_from_uri(test_path.to_str().expect("table path to string")).unwrap();
-    let engine = Arc::new(SyncEngine::new());
+    let engine = DefaultEngine::new_local();
     let snapshot = table.snapshot(engine.as_ref(), None)?;
     let scan = snapshot.into_scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;

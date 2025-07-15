@@ -34,21 +34,23 @@ pub fn parse_column_name(input: proc_macro::TokenStream) -> proc_macro::TokenStr
 /// action (this macro allows the use of standard rust snake_case, and will convert to the correct
 /// delta schema camelCase version).
 ///
-/// If a field sets `drop_null_container_values`, it means the underlying data can contain null in
+/// If a field sets `allow_null_container_values`, it means the underlying data can contain null in
 /// the values of the container (i.e. a `key` -> `null` in a `HashMap`). Therefore the schema should
 /// mark the value field as nullable, but those mappings will be dropped when converting to an
 /// actual rust `HashMap`. Currently this can _only_ be set on `HashMap` fields.
-#[proc_macro_derive(Schema, attributes(drop_null_container_values))]
-pub fn derive_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+#[proc_macro_derive(ToSchema, attributes(allow_null_container_values))]
+pub fn derive_to_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let struct_ident = input.ident;
 
     let schema_fields = gen_schema_fields(&input.data);
     let output = quote! {
         #[automatically_derived]
-        impl delta_kernel::actions::schemas::ToSchema for #struct_ident {
+        impl delta_kernel::schema::ToSchema for #struct_ident {
             fn to_schema() -> delta_kernel::schema::StructType {
-                use delta_kernel::actions::schemas::{ToDataType, GetStructField, GetNullableContainerStructField};
+                use delta_kernel::schema::derive_macro_utils::{
+                    ToDataType as _, GetStructField as _, GetNullableContainerStructField as _,
+                };
                 delta_kernel::schema::StructType::new([
                     #schema_fields
                 ])
@@ -99,9 +101,9 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
         let name = field.ident.as_ref().unwrap(); // we know these are named fields
         let name = get_schema_name(name);
         let have_schema_null = field.attrs.iter().any(|attr| {
-            // check if we have drop_null_container_values attr
+            // check if we have allow_null_container_values attr
             match &attr.meta {
-                Meta::Path(path) => path.get_ident().is_some_and(|ident| ident == "drop_null_container_values"),
+                Meta::Path(path) => path.get_ident().is_some_and(|ident| ident == "allow_null_container_values"),
                 _ => false,
             }
         });
@@ -121,7 +123,7 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
                         if last_ident != "HashMap" {
                            return Error::new(
                                 last_ident.span(),
-                                format!("Can only use drop_null_container_values on HashMap fields, not {last_ident}")
+                                format!("Can only use allow_null_container_values on HashMap fields, not {last_ident}")
                             ).to_compile_error()
                         }
                     }
@@ -134,6 +136,58 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
         }
     });
     quote! { #(#schema_fields),* }
+}
+
+/// Derive an IntoEngineData trait for a struct that has all fields implement `Into<Scalar>`.
+///
+/// This is a relatively simple macro to produce the boilerplate for converting a struct into
+/// EngineData using the `create_one` method. TODO: (doc)tests included in the delta_kernel crate:
+/// `IntoEngineData` trait.
+#[proc_macro_derive(IntoEngineData)]
+pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let struct_name = &input.ident;
+
+    let Data::Struct(DataStruct {
+        fields: Fields::Named(fields),
+        ..
+    }) = &input.data
+    else {
+        return Error::new(
+            struct_name.span(),
+            "IntoEngineData can only be derived for structs with named fields",
+        )
+        .to_compile_error()
+        .into();
+    };
+
+    let fields = &fields.named;
+    let field_idents = fields.iter().map(|f| &f.ident);
+    let field_types = fields.iter().map(|f| &f.ty);
+
+    let expanded = quote! {
+        #[automatically_derived]
+        impl crate::IntoEngineData for #struct_name
+        where
+            #(#field_types: Into<crate::expressions::Scalar>),*
+        {
+            fn into_engine_data(
+                self,
+                schema: crate::schema::SchemaRef,
+                engine: &dyn crate::Engine)
+            -> crate::DeltaResult<Box<dyn crate::EngineData>> {
+                // NB: we `use` here to avoid polluting the caller's namespace
+                use crate::EvaluationHandlerExtension as _;
+                let values = [
+                    #(self.#field_idents.into()),*
+                ];
+                let evaluator = engine.evaluation_handler();
+                evaluator.create_one(schema, &values)
+            }
+        }
+    };
+
+    proc_macro::TokenStream::from(expanded)
 }
 
 /// Mark items as `internal_api` to make them public iff the `internal-api` feature is enabled.

@@ -6,15 +6,19 @@ use itertools::Itertools;
 
 use super::data_skipping::DataSkippingFilter;
 use super::{ScanMetadata, Transform};
+use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{column_expr, column_name, ColumnName, Expression, ExpressionRef};
+use crate::expressions::{
+    column_expr, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
+};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
-use crate::log_replay::{FileActionDeduplicator, FileActionKey, LogReplayProcessor};
+use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::scan::{Scalar, TransformExpr};
+use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator};
+use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 
 /// [`ScanLogReplayProcessor`] performs log replay (processes actions) specifically for doing a table scan.
 ///
@@ -39,7 +43,7 @@ use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator};
 /// vector indicating which rows are valid, and any row-level transformation expressions that need
 /// to be applied to the selected rows.
 pub(crate) struct ScanLogReplayProcessor {
-    partition_filter: Option<ExpressionRef>,
+    partition_filter: Option<PredicateRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
     add_transform: Arc<dyn ExpressionEvaluator>,
     logical_schema: SchemaRef,
@@ -54,7 +58,7 @@ impl ScanLogReplayProcessor {
     /// Create a new [`ScanLogReplayProcessor`] instance
     fn new(
         engine: &dyn Engine,
-        physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+        physical_predicate: Option<(PredicateRef, SchemaRef)>,
         logical_schema: SchemaRef,
         transform: Option<Arc<Transform>>,
     ) -> Self {
@@ -82,7 +86,7 @@ struct AddRemoveDedupVisitor<'seen> {
     selection_vector: Vec<bool>,
     logical_schema: SchemaRef,
     transform: Option<Arc<Transform>>,
-    partition_filter: Option<ExpressionRef>,
+    partition_filter: Option<PredicateRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
 }
 
@@ -100,7 +104,7 @@ impl AddRemoveDedupVisitor<'_> {
         selection_vector: Vec<bool>,
         logical_schema: SchemaRef,
         transform: Option<Arc<Transform>>,
-        partition_filter: Option<ExpressionRef>,
+        partition_filter: Option<PredicateRef>,
         is_log_batch: bool,
     ) -> AddRemoveDedupVisitor<'_> {
         AddRemoveDedupVisitor {
@@ -308,19 +312,12 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
     let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
     let file_constant_values =
         StructType::new([StructField::nullable("partitionValues", partition_values)]);
-    let deletion_vector = StructType::new([
-        StructField::nullable("storageType", DataType::STRING),
-        StructField::nullable("pathOrInlineDv", DataType::STRING),
-        StructField::nullable("offset", DataType::INTEGER),
-        StructField::nullable("sizeInBytes", DataType::INTEGER),
-        StructField::nullable("cardinality", DataType::LONG),
-    ]);
     Arc::new(StructType::new([
         StructField::nullable("path", DataType::STRING),
         StructField::nullable("size", DataType::LONG),
         StructField::nullable("modificationTime", DataType::LONG),
         StructField::nullable("stats", DataType::STRING),
-        StructField::nullable("deletionVector", deletion_vector),
+        StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
         StructField::nullable("fileConstantValues", file_constant_values),
     ]))
 });
@@ -339,19 +336,32 @@ fn get_add_transform_expr() -> Expression {
     ])
 }
 
+// TODO: remove once `scan_metadata_from` is pub.
+#[allow(unused)]
+pub(crate) fn get_scan_metadata_transform_expr() -> Expression {
+    Expression::Struct(vec![Expression::Struct(vec![
+        column_expr!("path"),
+        column_expr!("fileConstantValues.partitionValues"),
+        column_expr!("size"),
+        column_expr!("modificationTime"),
+        column_expr!("stats"),
+        column_expr!("deletionVector"),
+    ])])
+}
+
 impl LogReplayProcessor for ScanLogReplayProcessor {
     type Output = ScanMetadata;
 
-    fn process_actions_batch(
-        &mut self,
-        actions_batch: Box<dyn EngineData>,
-        is_log_batch: bool,
-    ) -> DeltaResult<Self::Output> {
+    fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
+        let ActionsBatch {
+            actions,
+            is_log_batch,
+        } = actions_batch;
         // Build an initial selection vector for the batch which has had the data skipping filter
         // applied. The selection vector is further updated by the deduplication visitor to remove
         // rows that are not valid adds.
-        let selection_vector = self.build_selection_vector(actions_batch.as_ref())?;
-        assert_eq!(selection_vector.len(), actions_batch.len());
+        let selection_vector = self.build_selection_vector(actions.as_ref())?;
+        assert_eq!(selection_vector.len(), actions.len());
 
         let mut visitor = AddRemoveDedupVisitor::new(
             &mut self.seen_file_keys,
@@ -361,10 +371,10 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             self.partition_filter.clone(),
             is_log_batch,
         );
-        visitor.visit_rows_of(actions_batch.as_ref())?;
+        visitor.visit_rows_of(actions.as_ref())?;
 
         // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
-        let result = self.add_transform.evaluate(actions_batch.as_ref())?;
+        let result = self.add_transform.evaluate(actions.as_ref())?;
         Ok(ScanMetadata::new(
             result,
             visitor.selection_vector,
@@ -377,19 +387,20 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
     }
 }
 
-/// Given an iterator of (engine_data, bool) tuples and a predicate, returns an iterator of
-/// `(engine_data, selection_vec)`. Each row that is selected in the returned `engine_data` _must_
-/// be processed to complete the scan. Non-selected rows _must_ be ignored. The boolean flag
-/// indicates whether the record batch is a log or checkpoint batch.
+/// Given an iterator of [`ActionsBatch`]s (batches of actions read from the log) and a predicate,
+/// returns an iterator of [`ScanMetadata`]s (which includes the files to be scanned as
+/// [`FilteredEngineData`] and transforms that must be applied to correctly read the data). Each row
+/// that is selected in the returned `engine_data` _must_ be processed to complete the scan.
+/// Non-selected rows _must_ be ignored.
 ///
-/// Note: The iterator of (engine_data, bool) tuples 'action_iter' parameter must be sorted by the
-/// order of the actions in the log from most recent to least recent.
+/// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
+/// the actions in the log from most recent to least recent.
 pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
-    action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
+    action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     logical_schema: SchemaRef,
     transform: Option<Arc<Transform>>,
-    physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+    physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> impl Iterator<Item = DeltaResult<ScanMetadata>> {
     ScanLogReplayProcessor::new(engine, physical_predicate, logical_schema, transform)
         .process_actions_iter(action_iter)
@@ -401,6 +412,7 @@ mod tests {
 
     use crate::actions::get_log_schema;
     use crate::expressions::{column_name, Scalar};
+    use crate::log_replay::ActionsBatch;
     use crate::scan::state::{DvInfo, Stats};
     use crate::scan::test_utils::{
         add_batch_simple, add_batch_with_partition_col, add_batch_with_remove,
@@ -468,7 +480,9 @@ mod tests {
         let logical_schema = Arc::new(crate::schema::StructType::new(vec![]));
         let iter = scan_action_iter(
             &SyncEngine::new(),
-            batch.into_iter().map(|batch| Ok((batch as _, true))),
+            batch
+                .into_iter()
+                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             logical_schema,
             None,
             None,
@@ -494,7 +508,9 @@ mod tests {
         let batch = vec![add_batch_with_partition_col()];
         let iter = scan_action_iter(
             &SyncEngine::new(),
-            batch.into_iter().map(|batch| Ok((batch as _, true))),
+            batch
+                .into_iter()
+                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             schema,
             static_transform,
             None,

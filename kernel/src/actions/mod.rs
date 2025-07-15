@@ -5,32 +5,35 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::str::FromStr;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::schemas::GetStructField;
-use crate::internal_mod;
-use crate::schema::{SchemaRef, StructType};
+use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
 use crate::table_features::{
     ReaderFeature, WriterFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::EvaluationHandlerExtension;
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, RowVisitor as _};
+use crate::{DeltaResult, EngineData, Error, FileMeta, RowVisitor as _};
 
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
-use delta_kernel_derive::{internal_api, Schema};
+use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 pub mod deletion_vector;
 pub mod set_transaction;
 
-internal_mod!(pub(crate) mod schemas);
-internal_mod!(pub(crate) mod visitors);
+pub(crate) mod crc;
+pub(crate) mod domain_metadata;
+
+// see comment in ../lib.rs for the path module for why we include this way
+#[cfg(feature = "internal-api")]
+pub mod visitors;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod visitors;
 
 #[internal_api]
 pub(crate) const ADD_NAME: &str = "add";
@@ -50,36 +53,52 @@ pub(crate) const CDC_NAME: &str = "cdc";
 pub(crate) const SIDECAR_NAME: &str = "sidecar";
 #[internal_api]
 pub(crate) const CHECKPOINT_METADATA_NAME: &str = "checkpointMetadata";
+#[internal_api]
+pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 
-static LOG_ADD_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| StructType::new([Option::<Add>::get_struct_field(ADD_NAME)]).into());
+pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
+
+static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new([StructField::nullable(
+        ADD_NAME,
+        Add::to_schema(),
+    )]))
+});
 
 static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    StructType::new([
-        Option::<Add>::get_struct_field(ADD_NAME),
-        Option::<Remove>::get_struct_field(REMOVE_NAME),
-        Option::<Metadata>::get_struct_field(METADATA_NAME),
-        Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
-        Option::<SetTransaction>::get_struct_field(SET_TRANSACTION_NAME),
-        Option::<CommitInfo>::get_struct_field(COMMIT_INFO_NAME),
-        Option::<Cdc>::get_struct_field(CDC_NAME),
-        Option::<Sidecar>::get_struct_field(SIDECAR_NAME),
-        Option::<CheckpointMetadata>::get_struct_field(CHECKPOINT_METADATA_NAME),
-        // We don't support the following actions yet
-        //Option::<DomainMetadata>::get_struct_field(DOMAIN_METADATA_NAME),
-    ])
-    .into()
+    Arc::new(StructType::new([
+        StructField::nullable(ADD_NAME, Add::to_schema()),
+        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
+        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
+        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
+        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
+        StructField::nullable(COMMIT_INFO_NAME, CommitInfo::to_schema()),
+        StructField::nullable(CDC_NAME, Cdc::to_schema()),
+        StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
+        StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema()),
+        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
+    ]))
 });
 
 static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    StructType::new([Option::<CommitInfo>::get_struct_field(COMMIT_INFO_NAME)]).into()
+    Arc::new(StructType::new([StructField::nullable(
+        COMMIT_INFO_NAME,
+        CommitInfo::to_schema(),
+    )]))
 });
 
 static LOG_TXN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    StructType::new([Option::<SetTransaction>::get_struct_field(
+    Arc::new(StructType::new([StructField::nullable(
         SET_TRANSACTION_NAME,
-    )])
-    .into()
+        SetTransaction::to_schema(),
+    )]))
+});
+
+static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new([StructField::nullable(
+        DOMAIN_METADATA_NAME,
+        DomainMetadata::to_schema(),
+    )]))
 });
 
 #[internal_api]
@@ -100,9 +119,17 @@ pub(crate) fn get_log_txn_schema() -> &'static SchemaRef {
     &LOG_TXN_SCHEMA
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
+    &LOG_DOMAIN_METADATA_SCHEMA
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[cfg_attr(
+    any(test, feature = "internal-api"),
+    derive(Serialize, Deserialize),
+    serde(rename_all = "camelCase")
+)]
 #[internal_api]
-#[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
 pub(crate) struct Format {
     /// Name of the encoding for files in this table
     pub(crate) provider: String,
@@ -119,8 +146,12 @@ impl Default for Format {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Schema)]
-#[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
+#[derive(Debug, Default, Clone, PartialEq, Eq, ToSchema)]
+#[cfg_attr(
+    any(test, feature = "internal-api"),
+    derive(Serialize, Deserialize),
+    serde(rename_all = "camelCase")
+)]
 #[internal_api]
 pub(crate) struct Metadata {
     /// Unique identifier for this table
@@ -172,7 +203,7 @@ impl Metadata {
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, Schema, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
@@ -267,11 +298,13 @@ impl Protocol {
     }
 
     /// Get the reader features for the protocol
+    #[internal_api]
     pub(crate) fn reader_features(&self) -> Option<&[ReaderFeature]> {
         self.reader_features.as_deref()
     }
 
     /// Get the writer features for the protocol
+    #[internal_api]
     pub(crate) fn writer_features(&self) -> Option<&[WriterFeature]> {
         self.writer_features.as_deref()
     }
@@ -384,7 +417,7 @@ where
     )))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct CommitInfo {
@@ -412,7 +445,7 @@ pub(crate) struct CommitInfo {
     pub(crate) engine_commit_info: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 #[internal_api]
 pub(crate) struct Add {
@@ -425,9 +458,12 @@ pub(crate) struct Add {
 
     /// A map from partition column to value for this logical file. This map can contain null in the
     /// values meaning a partition is null. We drop those values from this map, due to the
-    /// `drop_null_container_values` annotation. This means an engine can assume that if a partition
-    /// is found in [`Metadata`] `partition_columns`, but not in this map, its value is null.
-    #[drop_null_container_values]
+    /// `allow_null_container_values` annotation allowing them and because [`materialize`] drops
+    /// null values. This means an engine can assume that if a partition is found in
+    /// [`Metadata::partition_columns`] but not in this map, its value is null.
+    ///
+    /// [`materialize`]: crate::engine_data::EngineMap::materialize
+    #[allow_null_container_values]
     pub(crate) partition_values: HashMap<String, String>,
 
     /// The size of this data file in bytes
@@ -477,7 +513,7 @@ impl Add {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct Remove {
@@ -527,7 +563,7 @@ pub(crate) struct Remove {
     pub(crate) default_row_commit_version: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct Cdc {
@@ -540,9 +576,12 @@ pub(crate) struct Cdc {
 
     /// A map from partition column to value for this logical file. This map can contain null in the
     /// values meaning a partition is null. We drop those values from this map, due to the
-    /// `drop_null_container_values` annotation. This means an engine can assume that if a partition
-    /// is found in [`Metadata`] `partition_columns`, but not in this map, its value is null.
-    #[drop_null_container_values]
+    /// `allow_null_container_values` annotation allowing them and because [`materialize`] drops
+    /// null values. This means an engine can assume that if a partition is found in
+    /// [`Metadata::partition_columns`] but not in this map, its value is null.
+    ///
+    /// [`materialize`]: crate::engine_data::EngineMap::materialize
+    #[allow_null_container_values]
     pub partition_values: HashMap<String, String>,
 
     /// The size of this cdc file in bytes
@@ -559,7 +598,7 @@ pub(crate) struct Cdc {
     pub tags: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
 #[internal_api]
 pub(crate) struct SetTransaction {
     /// A unique identifier for the application performing the transaction.
@@ -580,23 +619,13 @@ impl SetTransaction {
             last_updated,
         }
     }
-
-    pub(crate) fn into_engine_data(self, engine: &dyn Engine) -> DeltaResult<Box<dyn EngineData>> {
-        let values = [
-            self.app_id.into(),
-            self.version.into(),
-            self.last_updated.into(),
-        ];
-        let evaluator = engine.evaluation_handler();
-        evaluator.create_one(get_log_txn_schema().clone(), &values)
-    }
 }
 
 /// The sidecar action references a sidecar file which provides some of the checkpoint's
 /// file actions. This action is only allowed in checkpoints following the V2 spec.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-file-information
-#[derive(Schema, Debug, PartialEq)]
+#[derive(ToSchema, Debug, PartialEq)]
 #[internal_api]
 pub(crate) struct Sidecar {
     /// A path to a sidecar file that can be either:
@@ -640,7 +669,7 @@ impl Sidecar {
 /// The CheckpointMetadata action describes details about a checkpoint following the V2 specification.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-metadata
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[internal_api]
 pub(crate) struct CheckpointMetadata {
     /// The version of the V2 spec checkpoint.
@@ -653,6 +682,30 @@ pub(crate) struct CheckpointMetadata {
 
     /// Map containing any additional metadata about the V2 spec checkpoint.
     pub(crate) tags: Option<HashMap<String, String>>,
+}
+
+/// The [DomainMetadata] action contains a configuration (string) for a named metadata domain. Two
+/// overlapping transactions conflict if they both contain a domain metadata action for the same
+/// metadata domain.
+///
+/// Note that the `delta.*` domain is reserved for internal use.
+///
+/// [DomainMetadata]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#domain-metadata
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[internal_api]
+pub(crate) struct DomainMetadata {
+    domain: String,
+    configuration: String,
+    removed: bool,
+}
+
+impl DomainMetadata {
+    // returns true if the domain metadata is an system-controlled domain (all domains that start
+    // with "delta.")
+    #[allow(unused)]
+    fn is_internal(&self) -> bool {
+        self.domain.starts_with(INTERNAL_DOMAIN_PREFIX)
+    }
 }
 
 #[cfg(test)]
@@ -874,6 +927,22 @@ mod tests {
     }
 
     #[test]
+    fn test_domain_metadata_schema() {
+        let schema = get_log_schema()
+            .project(&[DOMAIN_METADATA_NAME])
+            .expect("Couldn't get domainMetadata field");
+        let expected = Arc::new(StructType::new([StructField::nullable(
+            "domainMetadata",
+            StructType::new([
+                StructField::not_null("domain", DataType::STRING),
+                StructField::not_null("configuration", DataType::STRING),
+                StructField::not_null("removed", DataType::BOOLEAN),
+            ]),
+        )]));
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
     fn test_validate_protocol() {
         let invalid_protocols = [
             Protocol {
@@ -1046,5 +1115,80 @@ mod tests {
             ReaderFeature::unknown("absurD_)(+13%^⚙️"),
         ]);
         assert_eq!(parse_features::<ReaderFeature>(features), expected);
+    }
+
+    #[test]
+    fn test_into_engine_data() {
+        use crate::arrow::array::{Int64Array, StringArray};
+        use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use crate::arrow::record_batch::RecordBatch;
+
+        use crate::engine::arrow_data::ArrowEngineData;
+        use crate::engine::arrow_expression::ArrowEvaluationHandler;
+        use crate::IntoEngineData;
+        use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
+
+        // duplicated
+        struct ExprEngine(Arc<dyn EvaluationHandler>);
+
+        impl ExprEngine {
+            fn new() -> Self {
+                ExprEngine(Arc::new(ArrowEvaluationHandler))
+            }
+        }
+
+        impl Engine for ExprEngine {
+            fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+                self.0.clone()
+            }
+
+            fn json_handler(&self) -> Arc<dyn JsonHandler> {
+                unimplemented!()
+            }
+
+            fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+                unimplemented!()
+            }
+
+            fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+                unimplemented!()
+            }
+        }
+
+        let engine = ExprEngine::new();
+
+        let set_transaction = SetTransaction {
+            app_id: "app_id".to_string(),
+            version: 0,
+            last_updated: None,
+        };
+
+        let engine_data =
+            set_transaction.into_engine_data(SetTransaction::to_schema().into(), &engine);
+
+        let record_batch: crate::arrow::array::RecordBatch = engine_data
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("appId", ArrowDataType::Utf8, false),
+            Field::new("version", ArrowDataType::Int64, false),
+            Field::new("lastUpdated", ArrowDataType::Int64, true),
+        ]));
+
+        let expected = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["app_id"])),
+                Arc::new(Int64Array::from(vec![0_i64])),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(record_batch, expected);
     }
 }

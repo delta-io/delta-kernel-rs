@@ -44,34 +44,18 @@ void print_tree_helper(ExpressionItem ref, int depth) {
           printf("LessThan\n");
           break;
         };
-        case LessThanOrEqual: {
-          printf("LessThanOrEqual\n");
-          break;
-        }
         case GreaterThan: {
           printf("GreaterThan\n");
-          break;
-        };
-        case GreaterThaneOrEqual: {
-          printf("GreaterThanOrEqual\n");
           break;
         };
         case Equal: {
           printf("Equal\n");
           break;
         };
-        case NotEqual: {
-          printf("NotEqual\n");
-          break;
-        };
         case In: {
           printf("In\n");
           break;
         };
-        case NotIn: {
-          printf("NotIn\n");
-          break;
-        }; break;
         case Distinct:
           printf("Distinct\n");
           break;
@@ -174,6 +158,27 @@ void print_tree_helper(ExpressionItem ref, int depth) {
           printf("Array\n");
           struct ArrayData* array = &lit->value.array_data;
           print_expression_item_list(array->exprs, depth + 1);
+          break;
+        case Map:
+          printf("Map\n");
+          struct MapData* map_data = &lit->value.map_data;
+          for (size_t i = 0; i < map_data->keys.len; i++) {
+            print_n_spaces(depth + 1);
+
+            // Extract key
+            ExpressionItem key = map_data->keys.list[i];
+            assert(key.type == Literal);
+            struct Literal* key_lit = key.ref;
+            assert(key_lit->type == String);
+            // Extract val
+            ExpressionItem val = map_data->vals.list[i];
+            assert(val.type == Literal);
+            struct Literal* val_lit = val.ref;
+            assert(val_lit->type == String);
+
+            // instead of recursing (which forces newlines) we just directly print strings here
+            printf("String(%s): String(%s)\n", key_lit->value.string_data, val_lit->value.string_data);
+          }
           break;
       }
       break;

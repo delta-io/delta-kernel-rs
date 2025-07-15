@@ -84,8 +84,6 @@ mod tests {
     use itertools::Itertools;
     use url::Url;
 
-    use test_utils::abs_diff;
-
     use super::SyncStorageHandler;
     use crate::StorageHandler;
 
@@ -113,7 +111,7 @@ mod tests {
         assert!(!files.is_empty());
         for meta in files.iter() {
             let meta_time = Duration::from_millis(meta.last_modified.try_into()?);
-            assert!(abs_diff(meta_time, begin_time) < Duration::from_secs(10));
+            assert!(meta_time.abs_diff(begin_time) < Duration::from_secs(10));
         }
         Ok(())
     }

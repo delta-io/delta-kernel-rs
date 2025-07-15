@@ -1,9 +1,10 @@
 //! Scan related ffi code
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
-use delta_kernel::scan::state::{DvInfo, GlobalScanState};
+use delta_kernel::scan::state::DvInfo;
 use delta_kernel::scan::{Scan, ScanMetadata};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::{DeltaResult, Error, Expression, ExpressionRef};
@@ -11,14 +12,12 @@ use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
 
-use crate::expressions::engine::{
-    unwrap_kernel_expression, EnginePredicate, KernelExpressionVisitorState,
-};
+use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::expressions::SharedExpression;
 use crate::{
-    kernel_string_slice, AllocateStringFn, ExternEngine, ExternResult, IntoExternResult,
-    KernelBoolSlice, KernelRowIndexArray, KernelStringSlice, NullableCvoid, SharedExternEngine,
-    SharedSchema, SharedSnapshot, TryFromStringSlice,
+    kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
+    ExternResult, IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice,
+    NullableCvoid, SharedExternEngine, SharedSchema, SharedSnapshot, TryFromStringSlice,
 };
 
 use super::handle::Handle;
@@ -31,6 +30,23 @@ pub struct SharedScan;
 
 #[handle_descriptor(target=ScanMetadata, mutable=false, sized=true)]
 pub struct SharedScanMetadata;
+
+/// A predicate that can be used to skip data when scanning.
+///
+/// When invoking [`scan`], The engine provides a pointer to the (engine's native) predicate, along
+/// with a visitor function that can be invoked to recursively visit the predicate. This engine
+/// state must be valid until the call to [`scan`] returns. Inside that method, the kernel allocates
+/// visitor state, which becomes the second argument to the predicate visitor invocation along with
+/// the engine-provided predicate pointer. The visitor state is valid for the lifetime of the
+/// predicate visitor invocation. Thanks to this double indirection, engine and kernel each retain
+/// ownership of their respective objects, with no need to coordinate memory lifetimes with the
+/// other.
+#[repr(C)]
+pub struct EnginePredicate {
+    pub predicate: *mut c_void,
+    pub visitor:
+        extern "C" fn(predicate: *mut c_void, state: &mut KernelExpressionVisitorState) -> usize,
+}
 
 /// Drop a `SharedScanMetadata`.
 ///
@@ -94,61 +110,47 @@ fn scan_impl(
     if let Some(predicate) = predicate {
         let mut visitor_state = KernelExpressionVisitorState::default();
         let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
-        let predicate = unwrap_kernel_expression(&mut visitor_state, pred_id);
+        let predicate = unwrap_kernel_predicate(&mut visitor_state, pred_id);
         debug!("Got predicate: {:#?}", predicate);
         scan_builder = scan_builder.with_predicate(predicate.map(Arc::new));
     }
     Ok(Arc::new(scan_builder.build()?).into())
 }
 
-#[handle_descriptor(target=GlobalScanState, mutable=false, sized=true)]
-pub struct SharedGlobalScanState;
-
-/// Get the global state for a scan. See the docs for [`delta_kernel::scan::state::GlobalScanState`]
-/// for more information.
+/// Get the table root of a scan.
 ///
 /// # Safety
-/// Engine is responsible for providing a valid scan pointer
+/// Engine is responsible for providing a valid scan pointer and allocate_fn (for allocating the
+/// string)
 #[no_mangle]
-pub unsafe extern "C" fn get_global_scan_state(
+pub unsafe extern "C" fn scan_table_root(
     scan: Handle<SharedScan>,
-) -> Handle<SharedGlobalScanState> {
+    allocate_fn: AllocateStringFn,
+) -> NullableCvoid {
     let scan = unsafe { scan.as_ref() };
-    Arc::new(scan.global_scan_state()).into()
+    let table_root = scan.table_root().to_string();
+    allocate_fn(kernel_string_slice!(table_root))
+}
+
+/// Get the logical (i.e. output) schema of a scan.
+///
+/// # Safety
+/// Engine is responsible for providing a valid `SharedScan` handle
+#[no_mangle]
+pub unsafe extern "C" fn scan_logical_schema(scan: Handle<SharedScan>) -> Handle<SharedSchema> {
+    let scan = unsafe { scan.as_ref() };
+    scan.logical_schema().clone().into()
 }
 
 /// Get the kernel view of the physical read schema that an engine should read from parquet file in
 /// a scan
 ///
 /// # Safety
-/// Engine is responsible for providing a valid GlobalScanState pointer
+/// Engine is responsible for providing a valid `SharedScan` handle
 #[no_mangle]
-pub unsafe extern "C" fn get_global_read_schema(
-    state: Handle<SharedGlobalScanState>,
-) -> Handle<SharedSchema> {
-    let state = unsafe { state.as_ref() };
-    state.physical_schema.clone().into()
-}
-
-/// Get the kernel view of the physical read schema that an engine should read from parquet file in
-/// a scan
-///
-/// # Safety
-/// Engine is responsible for providing a valid GlobalScanState pointer
-#[no_mangle]
-pub unsafe extern "C" fn get_global_logical_schema(
-    state: Handle<SharedGlobalScanState>,
-) -> Handle<SharedSchema> {
-    let state = unsafe { state.as_ref() };
-    state.logical_schema.clone().into()
-}
-
-/// # Safety
-///
-/// Caller is responsible for passing a valid global scan state pointer.
-#[no_mangle]
-pub unsafe extern "C" fn free_global_scan_state(state: Handle<SharedGlobalScanState>) {
-    state.drop_handle();
+pub unsafe extern "C" fn scan_physical_schema(scan: Handle<SharedScan>) -> Handle<SharedSchema> {
+    let scan = unsafe { scan.as_ref() };
+    scan.physical_schema().clone().into()
 }
 
 // Intentionally opaque to the engine.
@@ -366,20 +368,19 @@ pub unsafe extern "C" fn get_transform_for_row(
 pub unsafe extern "C" fn selection_vector_from_dv(
     dv_info: &DvInfo,
     engine: Handle<SharedExternEngine>,
-    state: Handle<SharedGlobalScanState>,
+    root_url: KernelStringSlice,
 ) -> ExternResult<KernelBoolSlice> {
-    let state = unsafe { state.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    selection_vector_from_dv_impl(dv_info, engine, state).into_extern_result(&engine)
+    let root_url = unsafe { unwrap_and_parse_path_as_url(root_url) };
+    selection_vector_from_dv_impl(dv_info, engine, root_url).into_extern_result(&engine)
 }
 
 fn selection_vector_from_dv_impl(
     dv_info: &DvInfo,
     extern_engine: &dyn ExternEngine,
-    state: &GlobalScanState,
+    root_url: DeltaResult<Url>,
 ) -> DeltaResult<KernelBoolSlice> {
-    let root_url = Url::parse(&state.table_root)?;
-    match dv_info.get_selection_vector(extern_engine.engine().as_ref(), &root_url)? {
+    match dv_info.get_selection_vector(extern_engine.engine().as_ref(), &root_url?)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelBoolSlice::empty()),
     }
@@ -393,20 +394,19 @@ fn selection_vector_from_dv_impl(
 pub unsafe extern "C" fn row_indexes_from_dv(
     dv_info: &DvInfo,
     engine: Handle<SharedExternEngine>,
-    state: Handle<SharedGlobalScanState>,
+    root_url: KernelStringSlice,
 ) -> ExternResult<KernelRowIndexArray> {
-    let state = unsafe { state.as_ref() };
     let engine = unsafe { engine.as_ref() };
-    row_indexes_from_dv_impl(dv_info, engine, state).into_extern_result(&engine)
+    let root_url = unsafe { unwrap_and_parse_path_as_url(root_url) };
+    row_indexes_from_dv_impl(dv_info, engine, root_url).into_extern_result(&engine)
 }
 
 fn row_indexes_from_dv_impl(
     dv_info: &DvInfo,
     extern_engine: &dyn ExternEngine,
-    state: &GlobalScanState,
+    root_url: DeltaResult<Url>,
 ) -> DeltaResult<KernelRowIndexArray> {
-    let root_url = Url::parse(&state.table_root)?;
-    match dv_info.get_row_indexes(extern_engine.engine().as_ref(), &root_url)? {
+    match dv_info.get_row_indexes(extern_engine.engine().as_ref(), &root_url?)? {
         Some(v) => Ok(v.into()),
         None => Ok(KernelRowIndexArray::empty()),
     }

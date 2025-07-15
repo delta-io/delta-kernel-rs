@@ -10,13 +10,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use self::storage::parse_url_opts;
-use object_store::DynObjectStore;
+use crate::object_store::DynObjectStore;
 use url::Url;
 
 use self::executor::TaskExecutor;
 use self::filesystem::ObjectStoreStorageHandler;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
+use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::schema::Schema;
@@ -100,7 +101,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         data_change: bool,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
-        let input_schema: Schema = data.record_batch().schema().try_into()?;
+        let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
         let output_schema = write_context.schema();
         let logical_to_physical_expr = self.evaluation_handler().new_expression_evaluator(
             input_schema.into(),
@@ -171,7 +172,7 @@ mod tests {
     use super::executor::tokio::TokioBackgroundExecutor;
     use super::*;
     use crate::engine::tests::test_arrow_engine;
-    use object_store::local::LocalFileSystem;
+    use crate::object_store::local::LocalFileSystem;
 
     #[test]
     fn test_default_engine() {

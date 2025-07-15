@@ -4,16 +4,17 @@ use crate::{kernel_string_slice, ExternEngine, KernelStringSlice};
 
 #[repr(C)]
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum KernelError {
     UnknownError, // catch-all for unrecognized kernel Error types
     FFIError,     // errors encountered in the code layer that supports FFI
-    #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+    #[cfg(feature = "default-engine")]
     ArrowError,
     EngineDataTypeError,
     ExtractError,
     GenericError,
     IOErrorError,
-    #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+    #[cfg(feature = "default-engine")]
     ParquetError,
     #[cfg(feature = "default-engine")]
     ObjectStoreError,
@@ -53,20 +54,23 @@ pub enum KernelError {
     ChangeDataFeedIncompatibleSchema,
     InvalidCheckpoint,
     LiteralExpressionTransformError,
+    CheckpointWriteError,
+    SchemaError,
 }
 
 impl From<Error> for KernelError {
     fn from(e: Error) -> Self {
         match e {
             // NOTE: By definition, no kernel Error maps to FFIError
-            #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+            #[cfg(feature = "default-engine")]
             Error::Arrow(_) => KernelError::ArrowError,
+            Error::CheckpointWrite(_) => KernelError::CheckpointWriteError,
             Error::EngineDataType(_) => KernelError::EngineDataTypeError,
             Error::Extract(..) => KernelError::ExtractError,
             Error::Generic(_) => KernelError::GenericError,
             Error::GenericError { .. } => KernelError::GenericError,
             Error::IOError(_) => KernelError::IOErrorError,
-            #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+            #[cfg(feature = "default-engine")]
             Error::Parquet(_) => KernelError::ParquetError,
             #[cfg(feature = "default-engine")]
             Error::ObjectStore(_) => KernelError::ObjectStoreError,
@@ -114,6 +118,8 @@ impl From<Error> for KernelError {
             Error::LiteralExpressionTransformError(_) => {
                 KernelError::LiteralExpressionTransformError
             }
+            Error::Schema(_) => KernelError::SchemaError,
+            _ => KernelError::UnknownError,
         }
     }
 }

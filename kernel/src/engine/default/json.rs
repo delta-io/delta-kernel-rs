@@ -5,25 +5,25 @@ use std::ops::Range;
 use std::sync::{mpsc, Arc};
 use std::task::Poll;
 
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use crate::arrow::json::ReaderBuilder;
 use crate::arrow::record_batch::RecordBatch;
+use crate::object_store::path::Path;
+use crate::object_store::{self, DynObjectStore, GetResultPayload, PutMode};
 use bytes::{Buf, Bytes};
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
-use object_store::path::Path;
-use object_store::{DynObjectStore, GetResultPayload, PutMode};
 use tracing::warn;
 use url::Url;
 
 use super::executor::TaskExecutor;
+use crate::engine::arrow_conversion::TryFromKernel as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::parse_json as arrow_parse_json;
 use crate::engine::arrow_utils::to_json_bytes;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, ExpressionRef, FileDataReadResultIterator, FileMeta,
-    JsonHandler,
+    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
 };
 
 const DEFAULT_BUFFER_SIZE: usize = 1000;
@@ -96,13 +96,13 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        _predicate: Option<ExpressionRef>,
+        _predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         if files.is_empty() {
             return Ok(Box::new(std::iter::empty()));
         }
 
-        let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
+        let schema = Arc::new(ArrowSchema::try_from_kernel(physical_schema.as_ref())?);
         let file_opener = JsonOpener::new(self.batch_size, schema.clone(), self.store.clone());
 
         let (tx, rx) = mpsc::sync_channel(self.buffer_size);
@@ -258,15 +258,16 @@ mod tests {
     use crate::engine::default::executor::tokio::{
         TokioBackgroundExecutor, TokioMultiThreadExecutor,
     };
-    use crate::utils::test_utils::string_array_to_engine_data;
-    use futures::future;
-    use itertools::Itertools;
-    use object_store::local::LocalFileSystem;
-    use object_store::memory::InMemory;
-    use object_store::{
+    use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::{
         GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
         PutMultipartOpts, PutOptions, PutPayload, PutResult, Result,
     };
+    use crate::schema::{DataType as DeltaDataType, Schema, StructField};
+    use crate::utils::test_utils::string_array_to_engine_data;
+    use futures::future;
+    use itertools::Itertools;
     use serde_json::json;
 
     // TODO: should just use the one from test_utils, but running into dependency issues
@@ -425,11 +426,11 @@ mod tests {
             self.inner.get_opts(location, options).await
         }
 
-        async fn get_range(&self, location: &Path, range: Range<usize>) -> Result<Bytes> {
+        async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
             self.inner.get_range(location, range).await
         }
 
-        async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
             self.inner.get_ranges(location, ranges).await
         }
 
@@ -441,7 +442,7 @@ mod tests {
             self.inner.delete(location).await
         }
 
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
             self.inner.list(prefix)
         }
 
@@ -449,7 +450,7 @@ mod tests {
             &self,
             prefix: Option<&Path>,
             offset: &Path,
-        ) -> BoxStream<'_, Result<ObjectMeta>> {
+        ) -> BoxStream<'static, Result<ObjectMeta>> {
             self.inner.list_with_offset(prefix, offset)
         }
 
@@ -528,17 +529,19 @@ mod tests {
         ))
         .unwrap();
         let url = Url::from_file_path(path).unwrap();
-        let location = Path::from(url.path());
+        let location = Path::from_url_path(url.path()).unwrap();
         let meta = store.head(&location).await.unwrap();
 
+        let meta_size = meta.size;
+        #[cfg(not(feature = "arrow-55"))]
+        let meta_size = meta_size.try_into().unwrap();
         let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp_millis(),
-            size: meta.size,
+            size: meta_size,
         }];
 
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
-        let physical_schema = Arc::new(ArrowSchema::try_from(get_log_schema().as_ref()).unwrap());
         let data: Vec<RecordBatch> = handler
             .read_json_files(files, get_log_schema().clone(), None)
             .unwrap()
@@ -552,7 +555,7 @@ mod tests {
         // limit batch size
         let handler = handler.with_batch_size(2);
         let data: Vec<RecordBatch> = handler
-            .read_json_files(files, Arc::new(physical_schema.try_into().unwrap()), None)
+            .read_json_files(files, get_log_schema().clone(), None)
             .unwrap()
             .map_ok(into_record_batch)
             .try_collect()
@@ -680,10 +683,13 @@ mod tests {
                         let url = Url::parse(&format!("memory:/{}", path)).unwrap();
                         let location = Path::from(path.as_ref());
                         let meta = store.head(&location).await.unwrap();
+                        let meta_size = meta.size;
+                        #[cfg(not(feature = "arrow-55"))]
+                        let meta_size = meta_size.try_into().unwrap();
                         FileMeta {
                             location: url,
                             last_modified: meta.last_modified.timestamp_millis(),
-                            size: meta.size,
+                            size: meta_size,
                         }
                     }
                 })
@@ -700,12 +706,10 @@ mod tests {
                 )),
             );
             let handler = handler.with_buffer_size(*buffer_size);
-            let schema = Arc::new(ArrowSchema::new(vec![Arc::new(Field::new(
+            let physical_schema = Arc::new(Schema::new(vec![StructField::nullable(
                 "val",
-                DataType::Int32,
-                true,
-            ))]));
-            let physical_schema = Arc::new(schema.try_into().unwrap());
+                DeltaDataType::INTEGER,
+            )]));
             let data: Vec<RecordBatch> = handler
                 .read_json_files(&files, physical_schema, None)
                 .unwrap()

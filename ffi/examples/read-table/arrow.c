@@ -119,10 +119,10 @@ static ExclusiveEngineData* apply_transform(
   print_diag("  Applying transform\n");
   SharedExpressionEvaluator* evaluator = new_expression_evaluator(
     context->engine,
-    context->read_schema, // input schema
+    context->physical_schema, // input schema
     context->arrow_context->cur_transform,
     context->logical_schema); // output schema
-  ExternResultHandleExclusiveEngineData transformed_res = evaluate(
+  ExternResultHandleExclusiveEngineData transformed_res = evaluate_expression(
     context->engine,
     &data,
     evaluator);
@@ -172,7 +172,7 @@ void c_read_parquet_file(
     .path = path_slice,
   };
   ExternResultHandleExclusiveFileReadResultIterator read_res =
-    read_parquet_file(context->engine, &meta, context->read_schema);
+    read_parquet_file(context->engine, &meta, context->physical_schema);
   free(full_path);
   if (read_res.tag != OkHandleExclusiveFileReadResultIterator) {
     print_error("Couldn't read data.", (Error*) read_res.err);

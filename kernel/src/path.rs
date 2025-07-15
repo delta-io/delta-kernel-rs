@@ -36,6 +36,7 @@ pub(crate) enum LogPathFileType {
     CompactedCommit {
         hi: Version,
     },
+    Crc,
     Unknown,
 }
 
@@ -118,6 +119,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         // Parse the file type, based on the number of remaining parts
         let file_type = match split.as_slice() {
             ["json"] => LogPathFileType::Commit,
+            ["crc"] => LogPathFileType::Crc,
             ["checkpoint", "parquet"] => LogPathFileType::SinglePartCheckpoint,
             ["checkpoint", uuid, "json" | "parquet"] => {
                 let uuid = parse_path_part(uuid, UUID_PART_LEN, url)?;
@@ -229,6 +231,20 @@ impl ParsedLogPath<Url> {
         }
         Ok(path)
     }
+
+    // TODO: remove after support for writing CRC files
+    #[allow(unused)]
+    /// Create a new ParsedCommitPath<Url> for a new CRC file
+    pub(crate) fn new_crc(table_root: &Url, version: Version) -> DeltaResult<Self> {
+        let filename = format!("{:020}.crc", version);
+        let path = Self::create_path(table_root, filename)?;
+        if path.file_type != LogPathFileType::Crc {
+            return Err(Error::internal_error(
+                "ParsedLogPath::new_crc created a non-crc path",
+            ));
+        }
+        Ok(path)
+    }
 }
 
 #[cfg(test)]
@@ -335,6 +351,25 @@ mod tests {
         let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
         assert_eq!(log_path.version, 5);
         assert!(log_path.is_commit());
+    }
+
+    #[test]
+    fn test_crc_patterns() {
+        let table_log_dir = table_log_dir_url();
+
+        let log_path = table_log_dir.join("00000000000000000000.crc").unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        assert_eq!(log_path.filename, "00000000000000000000.crc");
+        assert_eq!(log_path.extension, "crc");
+        assert_eq!(log_path.version, 0);
+        assert!(matches!(log_path.file_type, LogPathFileType::Crc));
+        assert!(!log_path.is_commit());
+        assert!(!log_path.is_checkpoint());
+
+        let log_path = table_log_dir.join("00000000000000000005.crc").unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        assert_eq!(log_path.version, 5);
+        assert!(log_path.file_type == LogPathFileType::Crc);
     }
 
     #[test]

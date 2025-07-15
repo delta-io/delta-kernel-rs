@@ -4,8 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
-use crate::actions::schemas::GetStructField;
-use crate::actions::visitors::{visit_deletion_vector_at, ProtocolVisitor};
+use crate::actions::visitors::{visit_deletion_vector_at, visit_protocol_at};
 use crate::actions::{
     get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, METADATA_NAME,
     PROTOCOL_NAME, REMOVE_NAME,
@@ -15,12 +14,15 @@ use crate::expressions::{column_name, ColumnName};
 use crate::path::ParsedLogPath;
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
-use crate::schema::{ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructType};
+use crate::schema::{
+    ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType,
+    ToSchema as _,
+};
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_changes::{check_cdf_table_properties, ensure_cdf_read_supported};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef, RowVisitor};
+use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
 
 use itertools::Itertools;
 
@@ -51,7 +53,7 @@ pub(crate) fn table_changes_action_iter(
     engine: Arc<dyn Engine>,
     commit_files: impl IntoIterator<Item = ParsedLogPath>,
     table_schema: SchemaRef,
-    physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+    physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
     let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
     let result = commit_files
@@ -278,11 +280,11 @@ struct PreparePhaseVisitor<'a> {
 impl PreparePhaseVisitor<'_> {
     fn schema() -> Arc<StructType> {
         Arc::new(StructType::new(vec![
-            Option::<Add>::get_struct_field(ADD_NAME),
-            Option::<Remove>::get_struct_field(REMOVE_NAME),
-            Option::<Cdc>::get_struct_field(CDC_NAME),
-            Option::<Metadata>::get_struct_field(METADATA_NAME),
-            Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
+            StructField::nullable(ADD_NAME, Add::to_schema()),
+            StructField::nullable(REMOVE_NAME, Remove::to_schema()),
+            StructField::nullable(CDC_NAME, Cdc::to_schema()),
+            StructField::nullable(METADATA_NAME, Metadata::to_schema()),
+            StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
         ]))
     }
 }
@@ -348,11 +350,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 let configuration_map_opt = getters[11].get_opt(i, "metadata.configuration")?;
                 let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
                 self.metadata_info = Some((schema.to_string(), configuration));
-            } else if let Some(min_reader_version) =
-                getters[12].get_int(i, "protocol.min_reader_version")?
-            {
-                let protocol =
-                    ProtocolVisitor::visit_protocol(i, min_reader_version, &getters[12..=15])?;
+            } else if let Some(protocol) = visit_protocol_at(i, &getters[12..])? {
                 self.protocol = Some(protocol);
             }
         }
@@ -382,9 +380,9 @@ impl<'a> FileActionSelectionVisitor<'a> {
     }
     fn schema() -> Arc<StructType> {
         Arc::new(StructType::new(vec![
-            Option::<Cdc>::get_struct_field(CDC_NAME),
-            Option::<Add>::get_struct_field(ADD_NAME),
-            Option::<Remove>::get_struct_field(REMOVE_NAME),
+            StructField::nullable(CDC_NAME, Cdc::to_schema()),
+            StructField::nullable(ADD_NAME, Add::to_schema()),
+            StructField::nullable(REMOVE_NAME, Remove::to_schema()),
         ]))
     }
 }

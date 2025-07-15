@@ -11,16 +11,15 @@ use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::engine::sync::SyncEngine;
-use delta_kernel::scan::state::{transform_to_logical, DvInfo, GlobalScanState, Stats};
-use delta_kernel::schema::Schema;
+use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
+use delta_kernel::schema::{Schema, SchemaRef};
 use delta_kernel::{DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Table};
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use url::Url;
 
 /// An example program that reads a table using multiple threads. This shows the use of the
-/// scan_metadata and global_scan_state methods on a Scan, that can be used to partition work to either
+/// scan_metadata method on a Scan, that can be used to partition work to either
 /// multiple threads, or workers (in the case of a distributed engine).
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -32,10 +31,6 @@ struct Cli {
     /// how many threads to read with (1 - 2048)
     #[arg(short, long, default_value_t = 2, value_parser = 1..=2048)]
     thread_count: i64,
-
-    /// Which Engine to use
-    #[arg(short, long, value_enum, default_value_t = EngineType::Default)]
-    engine: EngineType,
 
     /// Comma separated list of columns to select
     #[arg(long, value_delimiter=',', num_args(0..))]
@@ -54,14 +49,6 @@ struct Cli {
     /// Limit to printing only LIMIT rows.
     #[arg(short, long)]
     limit: Option<usize>,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-enum EngineType {
-    /// Use the default, async engine
-    Default,
-    /// Use the sync engine (local files only)
-    Sync,
 }
 
 fn main() -> ExitCode {
@@ -122,6 +109,12 @@ fn send_scan_file(
     scan_tx.send(scan_file).unwrap();
 }
 
+struct ScanState {
+    table_root: Url,
+    physical_schema: SchemaRef,
+    logical_schema: SchemaRef,
+}
+
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
 
@@ -129,27 +122,21 @@ fn try_main() -> DeltaResult<()> {
     let table = Table::try_from_uri(&cli.path)?;
     println!("Reading {}", table.location());
 
-    // create the requested engine
-    let engine: Arc<dyn Engine> = match cli.engine {
-        EngineType::Default => {
-            let mut options = if let Some(region) = cli.region {
-                HashMap::from([("region", region)])
-            } else {
-                HashMap::new()
-            };
-            if cli.public {
-                options.insert("skip_signature", "true".to_string());
-            }
-            Arc::new(DefaultEngine::try_new(
-                table.location(),
-                options,
-                Arc::new(TokioBackgroundExecutor::new()),
-            )?)
-        }
-        EngineType::Sync => Arc::new(SyncEngine::new()),
+    let mut options = if let Some(region) = cli.region {
+        HashMap::from([("region", region)])
+    } else {
+        HashMap::new()
     };
+    if cli.public {
+        options.insert("skip_signature", "true".to_string());
+    }
+    let engine = DefaultEngine::try_new(
+        table.location(),
+        options,
+        Arc::new(TokioBackgroundExecutor::new()),
+    )?;
 
-    let snapshot = table.snapshot(engine.as_ref(), None)?;
+    let snapshot = table.snapshot(&engine, None)?;
 
     // process the columns requested and build a schema from them
     let read_schema_opt = cli
@@ -179,10 +166,7 @@ fn try_main() -> DeltaResult<()> {
     // [`delta_kernel::scan::scan_row_schema`]. Generally engines will not need to interact with
     // this data directly, and can just call [`visit_scan_files`] to get pre-parsed data back from
     // the kernel.
-    let scan_metadata = scan.scan_metadata(engine.as_ref())?;
-
-    // get any global state associated with this scan
-    let global_state = Arc::new(scan.global_scan_state());
+    let scan_metadata = scan.scan_metadata(&engine)?;
 
     // create the channels we'll use. record_batch_[t/r]x are used for the threads to send back the
     // processed RecordBatches to themain thread
@@ -192,18 +176,21 @@ fn try_main() -> DeltaResult<()> {
 
     // fire up each thread. we don't need the handles as we rely on the channels to indicate when
     // things are done
-    let _handles: Vec<_> = (0..cli.thread_count)
-        .map(|_| {
+    thread::scope(|s| {
+        (0..cli.thread_count).for_each(|_| {
             // items that we need to send to the other thread
-            let scan_state = global_state.clone();
+            let scan_state = Arc::new(ScanState {
+                table_root: scan.table_root().clone(),
+                physical_schema: scan.physical_schema().clone(),
+                logical_schema: scan.logical_schema().clone(),
+            });
             let rb_tx = record_batch_tx.clone();
             let scan_file_rx = scan_file_rx.clone();
-            let engine = engine.clone();
-            thread::spawn(move || {
-                do_work(engine, scan_state, rb_tx, scan_file_rx);
-            })
-        })
-        .collect();
+            s.spawn(|| {
+                do_work(&engine, scan_state, rb_tx, scan_file_rx);
+            });
+        });
+    });
 
     // have handed out all copies needed, drop so record_batch_rx will exit when the last thread is
     // done sending
@@ -244,30 +231,28 @@ fn try_main() -> DeltaResult<()> {
 
 // this is the work each thread does
 fn do_work(
-    engine: Arc<dyn Engine>,
-    scan_state: Arc<GlobalScanState>,
+    engine: &dyn Engine,
+    scan_state: Arc<ScanState>,
     record_batch_tx: Sender<RecordBatch>,
     scan_file_rx: spmc::Receiver<ScanFile>,
 ) {
-    // get the type for the function calls
-    let engine: &dyn Engine = engine.as_ref();
     // in a loop, try and get a ScanFile. Note that `recv` will return an `Err` when the other side
     // hangs up, which indicates there's no more data to process.
     while let Ok(scan_file) = scan_file_rx.recv() {
         // we got a scan file, let's process it
-        let root_url = Url::parse(&scan_state.table_root).unwrap();
+        let root_url = &scan_state.table_root;
 
         // get the selection vector (i.e. deletion vector)
         let mut selection_vector = scan_file
             .dv_info
-            .get_selection_vector(engine, &root_url)
+            .get_selection_vector(engine, root_url)
             .unwrap();
 
         // build the required metadata for our parquet handler to read this file
         let location = root_url.join(&scan_file.path).unwrap();
         let meta = FileMeta {
             last_modified: 0,
-            size: scan_file.size as usize,
+            size: scan_file.size.try_into().unwrap(),
             location,
         };
 
