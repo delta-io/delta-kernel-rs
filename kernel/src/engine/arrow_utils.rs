@@ -1,6 +1,6 @@
 //! Some utilities for working with arrow data types
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
@@ -27,7 +27,7 @@ use crate::arrow::json::{LineDelimitedWriter, ReaderBuilder};
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 use delta_kernel_derive::internal_api;
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 use tracing::debug;
 
 macro_rules! prim_array_cmp {
@@ -276,14 +276,14 @@ fn get_indices(
     // for each field, get its position in the parquet (via enumerate), a reference to the arrow
     // field, and info about where it appears in the requested_schema, or None if the field is not
     // requested
-    let all_field_info = fields.iter().enumerate().map(|(parquet_index, field)| {
-        let field_info = if using_id {
-            get_field_info_by_id(requested_schema, field)
-        } else {
-            requested_schema.fields.get_full(field.name())
-        };
-        (parquet_index, field, field_info)
-    });
+    let all_field_info = if using_id {
+        Either::Left(get_field_info_by_id(requested_schema, fields))
+    } else {
+        Either::Right(fields.iter().enumerate().map(|(parquet_index, field)| {
+            let field_info = requested_schema.fields.get_full(field.name());
+            (parquet_index, field, field_info)
+        }))
+    };
     for (parquet_index, field, field_info) in all_field_info {
         debug!(
             "Getting indices for field {} with offset {parquet_offset}, with index {parquet_index}",
@@ -445,22 +445,36 @@ fn get_indices(
     ))
 }
 
-/// Extract the [[StructField]] from `requested_schema` that matches the field id of `field`.
-fn get_field_info_by_id<'a>(
-    requested_schema: &'a StructType,
-    field: &Field,
-) -> Option<(usize, &'a String, &'a StructField)> {
-    let field_id = field
-        .metadata()
-        .get(PARQUET_FIELD_ID_META_KEY)
-        .and_then(|x| x.parse::<i64>().ok())?;
-
-    let field= requested_schema
+type FieldInfo<'k> = (usize, &'k String, &'k StructField);
+/// Matches each parquet Field with an optional kernel [[FieldInfo]]. If
+/// present, Parquet [[Field]] and kernel [[FieldInfo]] will have matching
+/// field ids.
+fn get_field_info_by_id<'k, 'p>(
+    requested_schema: &'k StructType,
+    fields: &'p Fields,
+) -> impl Iterator<Item = (usize, &'p Arc<Field>, Option<FieldInfo<'k>>)> {
+    // Construct a map from the field id to its StructField
+    let field_id_to_name: HashMap<i64, &String> = requested_schema
         .fields()
-        .find_map(|delta_struct_field|{
-            (delta_struct_field.field_id()? == field_id).then_some(delta_struct_field)
-        })?;
-    requested_schema.fields.get_full(field.name())
+        .filter_map(|field| Some((field.field_id()?, field.name())))
+        .collect();
+    // Closure to map the parquet Field to the matching kernel FieldInfo if present
+    let parquet_to_field_info = move |field: &'p Field| -> Option<FieldInfo<'k>> {
+        // Get field id
+        let field_id = field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|x| x.parse::<i64>().ok())?;
+        let field_name = field_id_to_name.get(&field_id)?;
+        requested_schema.fields.get_full(*field_name)
+    };
+
+    fields
+        .iter()
+        .enumerate()
+        .map(move |(parquet_index, field)| {
+            (parquet_index, field, parquet_to_field_info(field))
+        })
 }
 
 /// Get the indices in `parquet_schema` of the specified columns in `requested_schema`. This returns
