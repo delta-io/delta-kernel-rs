@@ -645,8 +645,8 @@ compile_error!(
 mod doc_tests {
 
     /// ```
-    /// # use delta_kernel_derive::Schema;
-    /// #[derive(Schema)]
+    /// # use delta_kernel_derive::ToSchema;
+    /// #[derive(ToSchema)]
     /// pub struct WithFields {
     ///     some_name: String,
     /// }
@@ -655,17 +655,17 @@ mod doc_tests {
     pub struct MacroTestStructWithField;
 
     /// ```compile_fail
-    /// # use delta_kernel_derive::Schema;
-    /// #[derive(Schema)]
+    /// # use delta_kernel_derive::ToSchema;
+    /// #[derive(ToSchema)]
     /// pub struct NoFields;
     /// ```
     #[cfg(doctest)]
     pub struct MacroTestStructWithoutField;
 
     /// ```
-    /// # use delta_kernel_derive::Schema;
+    /// # use delta_kernel_derive::ToSchema;
     /// # use std::collections::HashMap;
-    /// #[derive(Schema)]
+    /// #[derive(ToSchema)]
     /// pub struct WithAngleBracketPath {
     ///     map_field: HashMap<String, String>,
     /// }
@@ -674,11 +674,11 @@ mod doc_tests {
     pub struct MacroTestStructWithAngleBracketedPathField;
 
     /// ```
-    /// # use delta_kernel_derive::Schema;
+    /// # use delta_kernel_derive::ToSchema;
     /// # use std::collections::HashMap;
-    /// #[derive(Schema)]
+    /// #[derive(ToSchema)]
     /// pub struct WithAttributedField {
-    ///     #[drop_null_container_values]
+    ///     #[allow_null_container_values]
     ///     map_field: HashMap<String, String>,
     /// }
     /// ```
@@ -686,10 +686,10 @@ mod doc_tests {
     pub struct MacroTestStructWithAttributedField;
 
     /// ```compile_fail
-    /// # use delta_kernel_derive::Schema;
-    /// #[derive(Schema)]
+    /// # use delta_kernel_derive::ToSchema;
+    /// #[derive(ToSchema)]
     /// pub struct WithInvalidAttributeTarget {
-    ///     #[drop_null_container_values]
+    ///     #[allow_null_container_values]
     ///     some_name: String,
     /// }
     /// ```
@@ -697,9 +697,9 @@ mod doc_tests {
     pub struct MacroTestStructWithInvalidAttributeTarget;
 
     /// ```compile_fail
-    /// # use delta_kernel_derive::Schema;
+    /// # use delta_kernel_derive::ToSchema;
     /// # use syn::Token;
-    /// #[derive(Schema)]
+    /// #[derive(ToSchema)]
     /// pub struct WithInvalidFieldType {
     ///     token: Token![struct],
     /// }
