@@ -178,7 +178,10 @@ impl StructField {
             .get(ColumnMetadataKey::ColumnMappingId.as_ref())
         {
             Some(MetadataValue::Number(num)) => Some(*num),
-            _ => None,
+            val => {
+                println!("Got value {:?}", val);
+                None
+            }
         }
     }
 
