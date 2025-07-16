@@ -444,7 +444,7 @@ where
     )))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct CommitInfo {
@@ -467,9 +467,8 @@ pub(crate) struct CommitInfo {
     /// write this field, but it is optional since many tables will not have this field (i.e. any
     /// tables not written by kernel).
     pub(crate) kernel_version: Option<String>,
-    /// A place for the engine to store additional metadata associated with this commit encoded as
-    /// a map of strings.
-    pub(crate) engine_commit_info: Option<HashMap<String, String>>,
+    /// A place for the engine to store additional metadata associated with this commit
+    pub(crate) engine_info: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -944,10 +943,7 @@ mod tests {
                     MapType::new(DataType::STRING, DataType::STRING, false),
                 ),
                 StructField::nullable("kernelVersion", DataType::STRING),
-                StructField::nullable(
-                    "engineCommitInfo",
-                    MapType::new(DataType::STRING, DataType::STRING, false),
-                ),
+                StructField::nullable("engineInfo", DataType::STRING),
             ]),
         )]));
         assert_eq!(schema, expected);

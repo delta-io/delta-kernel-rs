@@ -37,11 +37,9 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     for (table_url, engine, store, table_name) in setup_test_tables(schema, &[]).await? {
         // create a transaction
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
-        let txn = snapshot.transaction()?.with_engine_commit_info(
-            vec![("engineInfo".to_string(), "default engine".to_string())]
-                .into_iter()
-                .collect(),
-        );
+        let txn = snapshot
+            .transaction()?
+            .with_engine_info("default engine".to_string());
 
         // commit!
         txn.commit(&engine)?;
@@ -64,34 +62,11 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
                 "timestamp": 0,
                 "operation": "UNKNOWN",
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
-                "operationParameters": {},
-                "engineCommitInfo": {
-                    "engineInfo": "default engine"
-                }
+                "engineInfo": "default engine",
             }
         });
 
         assert_eq!(parsed_commit, expected_commit);
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_empty_commit() -> Result<(), Box<dyn std::error::Error>> {
-    // setup tracing
-    let _ = tracing_subscriber::fmt::try_init();
-    // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )]));
-
-    for (table_url, engine, _store, _table_name) in setup_test_tables(schema, &[]).await? {
-        let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
-        assert!(matches!(
-            snapshot.transaction()?.commit(&engine).unwrap_err(),
-            KernelError::MissingCommitInfo
-        ));
     }
     Ok(())
 }
@@ -165,11 +140,9 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
 
     for (table_url, engine, store, table_name) in setup_test_tables(schema.clone(), &[]).await? {
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
-        let txn = snapshot.transaction()?.with_engine_commit_info(
-            vec![("engineInfo".to_string(), "default engine".to_string())]
-                .into_iter()
-                .collect(),
-        );
+        let txn = snapshot
+            .transaction()?
+            .with_engine_info("default engine".to_string());
 
         txn.commit(&engine)?;
 
@@ -192,10 +165,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
                 "timestamp": 0,
                 "operation": "UNKNOWN",
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
-                "operationParameters": {},
-                "engineCommitInfo": {
-                    "engineInfo": "default engine"
-                }
+                "engineInfo": "default engine",
             }
         })];
 
@@ -216,11 +186,9 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
 
     for (table_url, engine, store, table_name) in setup_test_tables(schema.clone(), &[]).await? {
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
-        let mut txn = snapshot.transaction()?.with_engine_commit_info(
-            vec![("engineInfo".to_string(), "default engine".to_string())]
-                .into_iter()
-                .collect(),
-        );
+        let mut txn = snapshot
+            .transaction()?
+            .with_engine_info("default engine".to_string());
 
         // create two new arrow record batches to append
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -289,10 +257,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
                     "timestamp": 0,
                     "operation": "UNKNOWN",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
-                    "operationParameters": {},
-                    "engineCommitInfo": {
-                        "engineInfo": "default engine"
-                    }
+                    "engineInfo": "default engine",
                 }
             }),
             json!({
@@ -351,11 +316,9 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(table_schema.clone(), &[partition_col]).await?
     {
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
-        let mut txn = snapshot.transaction()?.with_engine_commit_info(
-            vec![("engineInfo".to_string(), "default engine".to_string())]
-                .into_iter()
-                .collect(),
-        );
+        let mut txn = snapshot
+            .transaction()?
+            .with_engine_info("default engine".to_string());
 
         // create two new arrow record batches to append
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -428,10 +391,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     "timestamp": 0,
                     "operation": "UNKNOWN",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
-                    "operationParameters": {},
-                    "engineCommitInfo": {
-                        "engineInfo": "default engine"
-                    }
+                    "engineInfo": "default engine",
                 }
             }),
             json!({
@@ -492,11 +452,9 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 
     for (table_url, engine, _store, _table_name) in setup_test_tables(table_schema, &[]).await? {
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
-        let txn = snapshot.transaction()?.with_engine_commit_info(
-            vec![("engineInfo".to_string(), "default engine".to_string())]
-                .into_iter()
-                .collect(),
-        );
+        let txn = snapshot
+            .transaction()?
+            .with_engine_info("default engine".to_string());
 
         // create two new arrow record batches to append
         let append_data = [["a", "b"], ["c", "d"]].map(|data| -> DeltaResult<_> {
@@ -550,10 +508,6 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
     )]));
 
     for (table_url, engine, store, table_name) in setup_test_tables(schema, &[]).await? {
-        let commit_info = vec![("engineInfo".to_string(), "default engine".to_string())]
-            .into_iter()
-            .collect();
-
         // can't have duplicate app_id in same transaction
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
         assert!(matches!(
@@ -568,7 +522,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
         let txn = snapshot
             .transaction()?
-            .with_engine_commit_info(commit_info)
+            .with_engine_info("default engine".to_string())
             .with_transaction_id("app_id1".to_string(), 1)
             .with_transaction_id("app_id2".to_string(), 2);
 
@@ -645,10 +599,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
                     "timestamp": 0,
                     "operation": "UNKNOWN",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
-                    "operationParameters": {},
-                    "engineCommitInfo": {
-                        "engineInfo": "default engine"
-                    }
+                    "engineInfo": "default engine",
                 }
             }),
             json!({
@@ -695,11 +646,9 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
-    let mut txn = snapshot.transaction()?.with_engine_commit_info(
-        vec![("engineInfo".to_string(), "default engine".to_string())]
-            .into_iter()
-            .collect(),
-    );
+    let mut txn = snapshot
+        .transaction()?
+        .with_engine_info("default engine".to_string());
 
     // Create Arrow data with TIMESTAMP_NTZ values including edge cases
     // These are microseconds since Unix epoch
