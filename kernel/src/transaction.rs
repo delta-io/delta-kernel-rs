@@ -55,7 +55,7 @@ pub fn add_files_schema() -> &'static SchemaRef {
 /// ```
 pub struct Transaction {
     read_snapshot: Arc<Snapshot>,
-    commit_info: CommitInfo,
+    commit_info: Box<CommitInfo>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
@@ -102,13 +102,13 @@ impl Transaction {
             in_commit_timestamp: None,
             operation: Some(UNKNOWN_OPERATION.to_string()),
             operation_parameters: None,
-            kernel_version: Some(format!("v{}", KERNEL_VERSION)),
+            kernel_version: Some(format!("v{KERNEL_VERSION}")),
             engine_info: None,
         };
 
         Ok(Transaction {
             read_snapshot,
-            commit_info,
+            commit_info: Box::new(commit_info),
             add_files_metadata: vec![],
             set_transactions: vec![],
         })
