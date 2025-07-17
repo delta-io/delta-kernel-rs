@@ -10,6 +10,7 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStore;
+use delta_kernel::transaction::CommitResult;
 use itertools::Itertools;
 use serde_json::json;
 use serde_json::Deserializer;
@@ -298,7 +299,14 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // commit!
-        txn.commit(engine.as_ref())?;
+        match txn.commit(engine.as_ref())? {
+            CommitResult::Committed { version, post_commit_stats } => {
+                assert_eq!(version, 1);
+                assert_eq!(post_commit_stats.commits_since_checkpoint, 1);
+                assert_eq!(post_commit_stats.commits_since_log_compaction, 1);
+            }
+            _ => panic!("Commit should have succeeded"),
+        }
 
         let commit1 = store
             .get(&Path::from(format!(
