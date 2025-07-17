@@ -55,7 +55,7 @@ pub fn add_files_schema() -> &'static SchemaRef {
 /// ```
 pub struct Transaction {
     read_snapshot: Arc<Snapshot>,
-    commit_info: Box<CommitInfo>,
+    commit_info: CommitInfo,
     add_files_metadata: Vec<Box<dyn EngineData>>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
