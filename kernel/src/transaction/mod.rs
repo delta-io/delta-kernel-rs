@@ -164,7 +164,18 @@ impl Transaction {
         match json_handler.write_json_file(&commit_path.location, Box::new(actions), false) {
             Ok(()) => Ok(CommitResult::Committed {
                 version: commit_version,
-                post_commit_actions: vec![],
+                post_commit_stats: PostCommitStats {
+                    commits_since_checkpoint: self
+                        .read_snapshot
+                        .log_segment()
+                        .commits_since_checkpoint()
+                        + 1,
+                    commits_since_log_compaction: self
+                        .read_snapshot
+                        .log_segment()
+                        .commits_since_log_compaction_or_checkpoint()
+                        + 1,
+                },
             }),
             Err(Error::FileAlreadyExists(_)) => Ok(CommitResult::Conflict(self, commit_version)),
             Err(e) => Err(e),
@@ -300,15 +311,12 @@ impl WriteContext {
     }
 }
 
-/// Kernel can indicate to the engine that it should perform certain actions post commit. To do so
-/// it returns a set of `PostCommitAction`s in a [`CommitResult`], where each action indicates something the
-/// engine should do.
+/// Kernel exposes information about the state of the table that engines might want to use to
+/// trigger actions like checkpointing or log compaction. This struct holds that information.
 #[derive(Debug)]
-pub enum PostCommitAction {
-    /// The table is ready for checkpointing, and should be checkpointed at the included
-    /// `Version`. The engine should follow the proceedure outlined in [module@crate::checkpoint] to
-    /// create a checkpoint for this table.
-    Checkpoint(Version),
+pub struct PostCommitStats {
+    pub commits_since_checkpoint: usize,
+    pub commits_since_log_compaction: usize,
 }
 
 /// Result of committing a transaction.
@@ -318,8 +326,8 @@ pub enum CommitResult {
     Committed {
         /// the version of the table that was just committed
         version: Version,
-        /// Any [`PostCommitAction`]s that should be run by the engine
-        post_commit_actions: Vec<PostCommitAction>,
+        /// The [`PostCommitStats`] for this transaction
+        post_commit_stats: PostCommitStats,
     },
     /// This transaction conflicted with an existing version (at the version given). The transaction
     /// is returned so the caller can resolve the conflict (along with the version which
