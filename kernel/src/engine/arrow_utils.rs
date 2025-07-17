@@ -259,11 +259,19 @@ fn _count_cols(dt: &ArrowDataType) -> usize {
     }
 }
 
+/// A helper type to determine how parqet fields are mapped to kernel fields.
 #[derive(Copy, Clone)]
 enum ColumnMode {
+    // The fields should be accessed by Parquet column id. If any child is a map
+    // or list, then it must be read using `ColumnMode::IdNested`. Otherwise,
+    // all subfields should be read using `ColumnMode::Id`
     Id,
-    Name,
+    // The fields for this level should be accessed by name. If any child is a
+    // map or list, then it must be read using `ColumnMode::IdNested`.
+    // Otherwise, all subfields should be read using `ColumnMode::Id`
     IdNested,
+    // The fields should be accessed by Parquet column name
+    Name,
 }
 impl ColumnMode {
     fn of_regular(&self) -> Self {
@@ -386,18 +394,16 @@ fn get_indices(
                             if key_val_names.next().is_some() {
                                 return Err(Error::generic("map fields had more than 2 members"));
                             }
-                            // TODO(Oussama): Once nested column ids are supproted, we can choose what column
-                            // mode.
-                            // If nested column ids are present (as in IcebergCompat) => use [[ColumnMode::Id]]
-                            // If not present but this is id column mapping mode: => use [[ColumnMode::IdNested]]
-                            // Otherwise => use [[ColumnMode::Name]]
+                            // TODO(#1070): Once nested column ids are supproted, we can either pass
+                            // `ColumnMode::Id` if the nested columns are present. Otherwise, pass
+                            // in `ColumnMode::NestedId`.
                             let inner_schema = map_type.as_struct_schema(key_name, val_name);
                             let (parquet_advance, _children) = get_indices(
                                 parquet_index + parquet_offset,
                                 &inner_schema,
                                 inner_fields,
                                 mask_indices,
-                                column_mode.of_nested(), // FIXME(Oussama): THIS IS A HACK
+                                column_mode.of_nested(),
                             )?;
                             // advance the number of parquet fields, but subtract 1 because the
                             // map will be counted by the `enumerate` call but doesn't count as
@@ -442,11 +448,7 @@ fn get_indices(
         } else {
             // We're NOT selecting this field, but we still need to track how many leaf columns we
             // skipped over
-            debug!(
-                "Skipping over un-selected field: {} for schema: {:?}",
-                field.name(),
-                requested_schema
-            );
+            debug!("Skipping over un-selected field: {}", field.name());
             // offset by number of inner fields. subtract one, because the enumerate still
             // counts this logical "parent" field
             parquet_offset += count_cols(field) - 1;
@@ -1046,13 +1048,14 @@ mod tests {
             let (mask_indices, reorder_indices) =
                 get_requested_indices(&requested_schema, &parquet_schema, *using_id).unwrap();
             let expect_mask = vec![0, 1];
+            let expected_arrow_metadata = kernel_fid(2).into_iter().map(|(key, val)| (key, val.to_string())).collect();
             let expect_reorder = vec![
                 ReorderIndex::identity(0),
                 ReorderIndex::identity(2),
                 ReorderIndex::missing(
                     1,
                     Arc::new(
-                        ArrowField::new("s", ArrowDataType::Utf8, true).with_metadata(arrow_fid(2)),
+                        ArrowField::new("s", ArrowDataType::Utf8, true).with_metadata(expected_arrow_metadata),
                     ),
                 ),
             ];
@@ -1454,25 +1457,31 @@ mod tests {
                     "skipped",
                     ArrowDataType::Struct(
                         vec![
-                            ArrowField::new("int32", ArrowDataType::Int32, false).with_metadata(arrow_fid(7)),
-                            ArrowField::new("string", ArrowDataType::Utf8, false).with_metadata(arrow_fid(8)),
+                            ArrowField::new("int32", ArrowDataType::Int32, false)
+                                .with_metadata(arrow_fid(7)),
+                            ArrowField::new("string", ArrowDataType::Utf8, false)
+                                .with_metadata(arrow_fid(8)),
                         ]
                         .into(),
                     ),
                     false,
-                ).with_metadata(arrow_fid(6)),
+                )
+                .with_metadata(arrow_fid(6)),
                 ArrowField::new("j", ArrowDataType::Int32, false).with_metadata(arrow_fid(3)),
                 ArrowField::new(
                     "nested",
                     ArrowDataType::Struct(
                         vec![
-                            ArrowField::new("int32", ArrowDataType::Int32, false).with_metadata(arrow_fid(4)),
-                            ArrowField::new("string", ArrowDataType::Utf8, false).with_metadata(arrow_fid(5)),
+                            ArrowField::new("int32", ArrowDataType::Int32, false)
+                                .with_metadata(arrow_fid(4)),
+                            ArrowField::new("string", ArrowDataType::Utf8, false)
+                                .with_metadata(arrow_fid(5)),
                         ]
                         .into(),
                     ),
                     false,
-                ).with_metadata(arrow_fid(2)),
+                )
+                .with_metadata(arrow_fid(2)),
                 ArrowField::new("i", ArrowDataType::Int32, false).with_metadata(arrow_fid(1)),
             ]));
             let (mask_indices, reorder_indices) =

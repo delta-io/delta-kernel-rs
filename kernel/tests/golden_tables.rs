@@ -342,7 +342,7 @@ golden_test!(
 skip_test!("data-reader-partition-values": "Golden data needs to have 2021-09-08T11:11:11+00:00 as expected value for as_timestamp col");
 golden_test!("data-reader-primitives", latest_snapshot_test);
 golden_test!("data-reader-timestamp_ntz", latest_snapshot_test);
-skip_test!("data-reader-timestamp_ntz-id-mode": "id column mapping mode not supported");
+golden_test!("data-reader-timestamp_ntz-id-mode", latest_snapshot_test);
 golden_test!("data-reader-timestamp_ntz-name-mode", latest_snapshot_test);
 
 // TODO test with predicate

@@ -8,11 +8,10 @@ use crate::arrow::datatypes::{
 };
 use crate::arrow::error::ArrowError;
 use itertools::Itertools;
-use parquet_55::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::error::Error;
 use crate::schema::{
-    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
+    ArrayType, DataType, MapType, MetadataValue, PrimitiveType, StructField,
     StructType,
 };
 
@@ -75,14 +74,9 @@ impl TryFromKernel<&StructField> for ArrowField {
         let metadata = f
             .metadata()
             .iter()
-            .map(|(key, val)| match &key {
-                k if *k == ColumnMetadataKey::ColumnMappingId.as_ref() => {
-                    Ok((PARQUET_FIELD_ID_META_KEY.to_string(), serde_json::to_string(val)?))
-                }
-                _ => match &val {
-                    &MetadataValue::String(val) => Ok((key.clone(), val.clone())),
-                    _ => Ok((key.clone(), serde_json::to_string(val)?)),
-                },
+            .map(|(key, val)| match &val {
+                &MetadataValue::String(val) => Ok((key.clone(), val.clone())),
+                _ => Ok((key.clone(), serde_json::to_string(val)?)),
             })
             .collect::<Result<_, serde_json::Error>>()
             .map_err(|err| ArrowError::JsonError(err.to_string()))?;
