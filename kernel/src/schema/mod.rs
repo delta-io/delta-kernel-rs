@@ -172,6 +172,19 @@ impl StructField {
         }
     }
 
+    pub fn field_id(&self) -> Option<i64> {
+        match self
+            .metadata
+            .get(ColumnMetadataKey::ColumnMappingId.as_ref())
+        {
+            Some(MetadataValue::Number(num)) => Some(*num),
+            val => {
+                println!("Got value {:?}", val);
+                None
+            }
+        }
+    }
+
     /// Change the name of a field. The field will preserve its data type and nullability. Note that
     /// this allocates a new field.
     pub fn with_name(&self, new_name: impl Into<String>) -> Self {
@@ -489,8 +502,15 @@ impl MapType {
     /// Create a schema assuming the map is stored as a struct with the specified key and value field names
     pub fn as_struct_schema(&self, key_name: String, val_name: String) -> Schema {
         StructType::new([
-            StructField::not_null(key_name, self.key_type.clone()),
-            StructField::new(val_name, self.value_type.clone(), self.value_contains_null),
+            StructField::not_null(key_name, self.key_type.clone()).with_metadata([(
+                ColumnMetadataKey::ColumnMappingId.as_ref(),
+                MetadataValue::String("key_id".to_string()),
+            )]),
+            StructField::new(val_name, self.value_type.clone(), self.value_contains_null)
+                .with_metadata([(
+                    ColumnMetadataKey::ColumnMappingId.as_ref(),
+                    MetadataValue::String("value_id".to_string()),
+                )]),
         ])
     }
 }
