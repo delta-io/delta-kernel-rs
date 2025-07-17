@@ -471,6 +471,19 @@ pub(crate) struct CommitInfo {
     pub(crate) engine_info: Option<String>,
 }
 
+impl CommitInfo {
+    pub(crate) fn new(timestamp: i64) -> Self {
+        return CommitInfo {
+            timestamp: Some(timestamp),
+            in_commit_timestamp: None,
+            operation: None,
+            operation_parameters: None,
+            kernel_version: None,
+            engine_info: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 #[internal_api]

@@ -55,7 +55,8 @@ pub fn add_files_schema() -> &'static SchemaRef {
 /// ```
 pub struct Transaction {
     read_snapshot: Arc<Snapshot>,
-    commit_info: Box<CommitInfo>,
+    operation: Option<String>,
+    engine_info: Option<String>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
@@ -63,14 +64,16 @@ pub struct Transaction {
     // would make error messaging unnecessarily difficult. Thus, we keep Vec here and deduplicate in
     // the commit method.
     set_transactions: Vec<SetTransaction>,
+    // commit-wide timestamp (in milliseconds since epoch) - used in ICT, `txn` action, etc. to	
+    // keep all timestamps within the same commit consistent.	
+    commit_timestamp: i64,
 }
 
 impl std::fmt::Debug for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&format!(
-            "Transaction {{ read_snapshot version: {}, commit_info: {:#?} }}",
-            self.read_snapshot.version(),
-            self.commit_info
+            "Transaction {{ read_snapshot version: {} }}",
+            self.read_snapshot.version()
         ))
     }
 }
@@ -97,20 +100,13 @@ impl Transaction {
             .and_then(|d| i64::try_from(d.as_millis()).ok())
             .ok_or_else(|| Error::generic("Failed to get current time for commit_timestamp"))?;
 
-        let commit_info = CommitInfo {
-            timestamp: Some(commit_timestamp),
-            in_commit_timestamp: None,
-            operation: Some(UNKNOWN_OPERATION.to_string()),
-            operation_parameters: None,
-            kernel_version: Some(format!("v{KERNEL_VERSION}")),
-            engine_info: None,
-        };
-
         Ok(Transaction {
             read_snapshot,
-            commit_info: Box::new(commit_info),
+            operation: None,
+            engine_info: None,
             add_files_metadata: vec![],
             set_transactions: vec![],
+            commit_timestamp,
         })
     }
 
@@ -139,11 +135,15 @@ impl Transaction {
             .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
 
         // step one: construct the iterator of commit info + file actions we want to commit
+        let mut commit_info = CommitInfo::new(self.commit_timestamp);
+        commit_info.operation = Some(self.operation.clone().unwrap_or(UNKNOWN_OPERATION.to_string()));
+        commit_info.kernel_version = Some(format!("v{KERNEL_VERSION}"));
+        commit_info.engine_info = self.engine_info.clone(); 
+
         let commit_info_schema = get_log_commit_info_schema().as_ref().clone();
 
-        let commit_info_action = self
-            .commit_info
-            .clone()
+        let commit_info_action = 
+            commit_info
             .into_engine_data(Arc::new(commit_info_schema), engine);
         let add_actions = generate_adds(engine, self.add_files_metadata.iter().map(|a| a.as_ref()));
 
@@ -168,14 +168,14 @@ impl Transaction {
     /// Set the operation that this transaction is performing. This string will be persisted in the
     /// commit and visible to anyone who describes the table history.
     pub fn with_operation(mut self, operation: String) -> Self {
-        self.commit_info.operation = Some(operation);
+        self.operation = Some(operation);
         self
     }
 
     /// Add commit info to this transaction and append the argument as its engine_commit_info.
     /// The engine is required to provide commit info before committing the transcation.
     pub fn with_engine_info(mut self, engine_info: String) -> Self {
-        self.commit_info.engine_info = Some(engine_info);
+        self.engine_info = Some(engine_info);
         self
     }
 
@@ -185,7 +185,7 @@ impl Transaction {
     /// different versions are disallowed in a single transaction. If a duplicate app_id is
     /// included, the `commit` will fail (that is, we don't eagerly check app_id validity here).
     pub fn with_transaction_id(mut self, app_id: String, version: i64) -> Self {
-        let set_transaction = SetTransaction::new(app_id, version, self.commit_info.timestamp);
+        let set_transaction = SetTransaction::new(app_id, version, Some(self.commit_timestamp));
         self.set_transactions.push(set_transaction);
         self
     }
