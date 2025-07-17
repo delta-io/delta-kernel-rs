@@ -108,7 +108,7 @@ impl Transaction {
 
         Ok(Transaction {
             read_snapshot,
-            commit_info: Box::new(commit_info),
+            commit_info,
             add_files_metadata: vec![],
             set_transactions: vec![],
         })
