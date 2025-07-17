@@ -473,7 +473,7 @@ pub(crate) struct CommitInfo {
 
 impl CommitInfo {
     pub(crate) fn new(timestamp: i64) -> Self {
-        return CommitInfo {
+        CommitInfo {
             timestamp: Some(timestamp),
             in_commit_timestamp: None,
             operation: None,
