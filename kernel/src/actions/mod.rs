@@ -129,8 +129,7 @@ pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
     derive(Serialize, Deserialize),
     serde(rename_all = "camelCase")
 )]
-#[internal_api]
-pub(crate) struct Format {
+pub struct Format {
     /// Name of the encoding for files in this table
     pub(crate) provider: String,
     /// A map containing configuration options for the format
@@ -152,8 +151,7 @@ impl Default for Format {
     derive(Serialize, Deserialize),
     serde(rename_all = "camelCase")
 )]
-#[internal_api]
-pub(crate) struct Metadata {
+pub struct Metadata {
     /// Unique identifier for this table
     pub(crate) id: String,
     /// User-provided identifier for this table
@@ -198,6 +196,28 @@ impl Metadata {
         self.created_time
     }
 
+    pub fn new(
+        id: String,
+        name: Option<String>,
+        description: Option<String>,
+        format: Format,
+        schema_string: String,
+        partition_columns: Vec<String>,
+        created_time: Option<i64>,
+        configuration: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            description,
+            format,
+            schema_string,
+            partition_columns,
+            created_time,
+            configuration,
+        }
+    }
+
     pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
         let mut visitor = MetadataVisitor::default();
         visitor.visit_rows_of(data)?;
@@ -232,10 +252,9 @@ impl Metadata {
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
 // try_new function.
-pub(crate) struct Protocol {
+pub struct Protocol {
     /// The minimum version of the Delta read protocol that a client must implement
     /// in order to correctly read this table
     min_reader_version: i32,
@@ -270,7 +289,7 @@ where
 impl Protocol {
     /// Try to create a new Protocol instance from reader/writer versions and table features. This
     /// can fail if the protocol is invalid.
-    pub(crate) fn try_new(
+    pub fn try_new(
         min_reader_version: i32,
         min_writer_version: i32,
         reader_features: Option<impl IntoIterator<Item = impl ToString>>,

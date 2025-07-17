@@ -13,8 +13,12 @@ version.workspace = true
 release = false
 
 [dependencies]
-delta_kernel = { path = "../kernel", features = ["arrow"] }
+delta_kernel = { path = "../kernel", features = ["arrow", "default-engine" ] }
+url = "2"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+tokio = { version = "1.44", features = ["rt-multi-thread"] }
 
 [features]
-default-engine = [ "delta_kernel/default-engine" ]
+default-engine = [] # REVERT
 default-engine-rustls = [ "delta_kernel/default-engine-rustls" ]

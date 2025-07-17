@@ -32,7 +32,6 @@ use delta_kernel_derive::internal_api;
 /// to validate that Metadata and Protocol are correctly formatted and mutually compatible. If
 /// `try_new` successfully returns `TableConfiguration`, it is also guaranteed that reading the
 /// table is supported.
-#[internal_api]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableConfiguration {
     metadata: Metadata,

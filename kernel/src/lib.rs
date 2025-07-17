@@ -81,6 +81,7 @@ pub mod expressions;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
+pub mod snapshot_builder;
 pub mod table_changes;
 pub mod table_configuration;
 pub mod table_features;
@@ -106,6 +107,8 @@ pub mod path;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod path;
 
+pub use path::ParsedLogPath;
+
 #[cfg(feature = "internal-api")]
 pub mod log_replay;
 #[cfg(not(feature = "internal-api"))]
@@ -126,6 +129,7 @@ pub use engine_data::{EngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use snapshot::Snapshot;
+pub use snapshot_builder::SnapshotBuilder;
 
 use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
