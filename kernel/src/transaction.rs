@@ -64,8 +64,8 @@ pub struct Transaction {
     // would make error messaging unnecessarily difficult. Thus, we keep Vec here and deduplicate in
     // the commit method.
     set_transactions: Vec<SetTransaction>,
-    // commit-wide timestamp (in milliseconds since epoch) - used in ICT, `txn` action, etc. to	
-    // keep all timestamps within the same commit consistent.	
+    // commit-wide timestamp (in milliseconds since epoch) - used in ICT, `txn` action, etc. to
+    // keep all timestamps within the same commit consistent.
     commit_timestamp: i64,
 }
 
@@ -136,15 +136,17 @@ impl Transaction {
 
         // step one: construct the iterator of commit info + file actions we want to commit
         let mut commit_info = CommitInfo::new(self.commit_timestamp);
-        commit_info.operation = Some(self.operation.clone().unwrap_or(UNKNOWN_OPERATION.to_string()));
+        commit_info.operation = Some(
+            self.operation
+                .clone()
+                .unwrap_or(UNKNOWN_OPERATION.to_string()),
+        );
         commit_info.kernel_version = Some(format!("v{KERNEL_VERSION}"));
-        commit_info.engine_info = self.engine_info.clone(); 
+        commit_info.engine_info = self.engine_info.clone();
 
         let commit_info_schema = get_log_commit_info_schema().as_ref().clone();
 
-        let commit_info_action = 
-            commit_info
-            .into_engine_data(Arc::new(commit_info_schema), engine);
+        let commit_info_action = commit_info.into_engine_data(Arc::new(commit_info_schema), engine);
         let add_actions = generate_adds(engine, self.add_files_metadata.iter().map(|a| a.as_ref()));
 
         let actions = iter::once(commit_info_action)

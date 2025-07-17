@@ -480,7 +480,7 @@ impl CommitInfo {
             operation_parameters: None,
             kernel_version: None,
             engine_info: None,
-        }
+        };
     }
 }
 
