@@ -10,6 +10,7 @@ readme.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+# for cargo-release
 [package.metadata.release]
 release = false
 

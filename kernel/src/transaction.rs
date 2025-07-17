@@ -86,8 +86,8 @@ impl Transaction {
     /// state of the table (e.g. to read the current version).
     ///
     /// Instead of using this API, the more typical (user-facing) API is
-    /// [Table::new_transaction](crate::table::Table::new_transaction) to create a transaction from
-    /// a table automatically backed by the latest snapshot.
+    /// [Snapshot::transaction](crate::snapshot::Snapshot::transaction) to create a transaction from
+    /// a snapshot.
     pub(crate) fn try_new(snapshot: impl Into<Arc<Snapshot>>) -> DeltaResult<Self> {
         let read_snapshot = snapshot.into();
 

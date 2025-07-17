@@ -13,7 +13,8 @@ use crate::schema::{Schema, SchemaRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
-use crate::utils::calculate_transaction_expiration_timestamp;
+use crate::transaction::Transaction;
+use crate::utils::{calculate_transaction_expiration_timestamp, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler, Version};
 use delta_kernel_derive::internal_api;
 
@@ -59,6 +60,24 @@ impl Snapshot {
             log_segment,
             table_configuration,
         }
+    }
+
+    /// Create a new [`Snapshot`] instance for the given version by parsing the given uri string.
+    ///
+    /// # Parameters
+    ///
+    /// - `table_root`: string-encoded URI pointing at the table root (where `_delta_log` folder is
+    ///   located)
+    /// - `engine`: Implementation of [`Engine`] apis.
+    /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
+    ///   version of the table.
+    pub fn try_from_uri(
+        uri: impl AsRef<str>,
+        engine: &dyn Engine,
+        version: Option<Version>,
+    ) -> DeltaResult<Self> {
+        let url = try_parse_uri(uri)?;
+        Self::try_new(url, engine, version)
     }
 
     /// Create a new [`Snapshot`] instance for the given version.
@@ -329,6 +348,11 @@ impl Snapshot {
     /// Consume this `Snapshot` to create a [`ScanBuilder`]
     pub fn into_scan_builder(self) -> ScanBuilder {
         ScanBuilder::new(self)
+    }
+
+    /// Create a [`Transaction`] for this `Arc<Snapshot>`.
+    pub fn transaction(self: Arc<Self>) -> DeltaResult<Transaction> {
+        Transaction::try_new(self)
     }
 
     /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the txn based on the SetTransactionRetentionDuration property and lastUpdated

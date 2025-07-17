@@ -6,7 +6,7 @@ use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
 use common::{LocationArgs, ScanArgs};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::DeltaResult;
+use delta_kernel::{DeltaResult, Snapshot};
 
 use clap::Parser;
 use itertools::Itertools;
@@ -40,10 +40,11 @@ fn main() -> ExitCode {
 
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
-    let table = common::get_table(&cli.location_args)?;
-    println!("Reading {}", table.location());
-    let engine = common::get_engine(&table, &cli.location_args)?;
-    let Some(scan) = common::get_scan(&table, &engine, &cli.scan_args)? else {
+    let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
+    println!("Reading {url}");
+    let engine = common::get_engine(&url, &cli.location_args)?;
+    let snapshot = Snapshot::try_new(url, &engine, None)?;
+    let Some(scan) = common::get_scan(snapshot, &cli.scan_args)? else {
         return Ok(());
     };
 

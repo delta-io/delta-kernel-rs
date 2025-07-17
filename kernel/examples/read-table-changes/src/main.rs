@@ -5,6 +5,7 @@ use common::LocationArgs;
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::{compute::filter_record_batch, util::pretty::print_batches};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::table_changes::TableChanges;
 use delta_kernel::DeltaResult;
 use itertools::Itertools;
 
@@ -25,9 +26,9 @@ struct Cli {
 
 fn main() -> DeltaResult<()> {
     let cli = Cli::parse();
-    let table = common::get_table(&cli.location_args)?;
-    let engine = common::get_engine(&table, &cli.location_args)?;
-    let table_changes = table.table_changes(&engine, cli.start_version, cli.end_version)?;
+    let url = delta_kernel::try_parse_uri(cli.location_args.path.as_str())?;
+    let engine = common::get_engine(&url, &cli.location_args)?;
+    let table_changes = TableChanges::try_new(url, &engine, cli.start_version, cli.end_version)?;
 
     let table_changes_scan = table_changes.into_scan_builder().build()?;
     let batches: Vec<RecordBatch> = table_changes_scan

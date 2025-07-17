@@ -81,7 +81,6 @@ pub mod expressions;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
-pub mod table;
 pub mod table_changes;
 pub mod table_configuration;
 pub mod table_features;
@@ -94,6 +93,9 @@ pub use arrow_compat::*;
 
 pub mod kernel_predicates;
 pub(crate) mod utils;
+
+#[cfg(feature = "internal-api")]
+pub use utils::try_parse_uri;
 
 // for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
 // macros, and so will not format the files associated with these modules if we get too clever. see:
@@ -123,7 +125,7 @@ pub use delta_kernel_derive;
 pub use engine_data::{EngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
-pub use table::Table;
+pub use snapshot::Snapshot;
 
 use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
@@ -326,6 +328,18 @@ impl<T: Any + Send + Sync> AsAny for T {
     }
     fn type_name(&self) -> &'static str {
         std::any::type_name::<Self>()
+    }
+}
+
+/// Extension trait that facilitates object-safe implementations of `PartialEq`.
+pub trait DynPartialEq: AsAny {
+    fn dyn_eq(&self, other: &dyn Any) -> bool;
+}
+
+// Blanket implementation for all eligible types
+impl<T: PartialEq + AsAny> DynPartialEq for T {
+    fn dyn_eq(&self, other: &dyn Any) -> bool {
+        other.downcast_ref::<T>().is_some_and(|other| self == other)
     }
 }
 

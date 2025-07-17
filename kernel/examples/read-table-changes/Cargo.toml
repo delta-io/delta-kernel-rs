@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+# for cargo-release
 [package.metadata.release]
 release = false
 
@@ -13,6 +14,7 @@ common = { path = "../common" }
 delta_kernel = { path = "../../../kernel", features = [
   "arrow",
   "default-engine",
+  "internal-api",
 ] }
 url = "2"
 itertools = "0.14"

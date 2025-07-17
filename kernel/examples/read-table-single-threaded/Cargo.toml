@@ -17,5 +17,6 @@ env_logger = "0.11.8"
 itertools = "0.14"
 url = "2"
 
+# for cargo-release
 [package.metadata.release]
 release = false

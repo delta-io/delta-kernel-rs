@@ -84,7 +84,7 @@ pub enum Error {
     #[error("Object store path error: {0}")]
     ObjectStorePath(#[from] object_store::path::Error),
 
-    #[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
+    #[cfg(feature = "default-engine-base")]
     #[error("Reqwest Error: {0}")]
     Reqwest(#[from] reqwest::Error),
 
