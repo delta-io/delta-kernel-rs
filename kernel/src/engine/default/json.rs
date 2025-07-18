@@ -262,7 +262,7 @@ mod tests {
     use crate::object_store::memory::InMemory;
     use crate::object_store::{
         GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOpts, PutOptions, PutPayload, PutResult, Result,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
     };
     use crate::schema::{DataType as DeltaDataType, Schema, StructField};
     use crate::utils::test_utils::string_array_to_engine_data;
@@ -355,7 +355,7 @@ mod tests {
         async fn put_multipart_opts(
             &self,
             location: &Path,
-            opts: PutMultipartOpts,
+            opts: PutMultipartOptions,
         ) -> Result<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
