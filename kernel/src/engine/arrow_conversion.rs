@@ -11,8 +11,7 @@ use itertools::Itertools;
 
 use crate::error::Error;
 use crate::schema::{
-    ArrayType, DataType, MapType, MetadataValue, PrimitiveType, StructField,
-    StructType,
+    ArrayType, DataType, MapType, MetadataValue, PrimitiveType, StructField, StructType,
 };
 
 pub(crate) const LIST_ARRAY_ROOT: &str = "element";

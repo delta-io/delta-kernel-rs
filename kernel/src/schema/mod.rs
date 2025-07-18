@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
+use crate::table_features::ColumnMappingMode;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
@@ -85,6 +86,7 @@ impl From<bool> for MetadataValue {
 pub enum ColumnMetadataKey {
     ColumnMappingId,
     ColumnMappingPhysicalName,
+    ParquetFieldId,
     GenerationExpression,
     IdentityStart,
     IdentityStep,
@@ -98,6 +100,7 @@ impl AsRef<str> for ColumnMetadataKey {
         match self {
             Self::ColumnMappingId => "delta.columnMapping.id",
             Self::ColumnMappingPhysicalName => "delta.columnMapping.physicalName",
+            Self::ParquetFieldId => "parquet.field.id",
             Self::GenerationExpression => "delta.generationExpression",
             Self::IdentityAllowExplicitInsert => "delta.identity.allowExplicitInsert",
             Self::IdentityHighWaterMark => "delta.identity.highWaterMark",
@@ -172,16 +175,6 @@ impl StructField {
         }
     }
 
-    pub fn field_id(&self) -> Option<i64> {
-        match self
-            .metadata
-            .get(ColumnMetadataKey::ColumnMappingId.as_ref())
-        {
-            Some(MetadataValue::Number(num)) => Some(*num),
-            _ => None
-        }
-    }
-
     /// Change the name of a field. The field will preserve its data type and nullability. Note that
     /// this allocates a new field.
     pub fn with_name(&self, new_name: impl Into<String>) -> Self {
@@ -227,22 +220,46 @@ impl StructField {
     /// NOTE: Caller affirms that the schema was already validated by
     /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
     /// always and only present when column mapping mode is enabled.
-    pub fn make_physical(&self) -> Self {
-        struct MakePhysical;
+    pub fn make_physical(&self, column_mapping_mode: ColumnMappingMode) -> Self {
+        struct MakePhysical {
+            column_mapping_mode: ColumnMappingMode,
+        }
         impl<'a> SchemaTransform<'a> for MakePhysical {
             fn transform_struct_field(
                 &mut self,
                 field: &'a StructField,
             ) -> Option<Cow<'a, StructField>> {
                 let field = self.recurse_into_struct_field(field)?;
-                Some(Cow::Owned(field.with_name(field.physical_name())))
+                let metadata = match (
+                    self.column_mapping_mode,
+                    field.get_config_value(&ColumnMetadataKey::ColumnMappingId),
+                ) {
+                    (ColumnMappingMode::Id, Some(MetadataValue::Number(fid))) => {
+                        let mut base_metadata = field.metadata.clone();
+                        base_metadata.insert(
+                            ColumnMetadataKey::ParquetFieldId.as_ref().to_string(),
+                            MetadataValue::Number(*fid),
+                        );
+                        base_metadata
+                    }
+                    _ => field.metadata.clone(),
+                };
+
+                Some(Cow::Owned(StructField {
+                    name: field.physical_name().to_string(),
+                    data_type: field.data_type.clone(),
+                    nullable: field.nullable,
+                    metadata,
+                }))
             }
         }
         // NOTE: unwrap is safe because the transformer is incapable of returning None
-        MakePhysical
-            .transform_struct_field(self)
-            .unwrap()
-            .into_owned()
+        MakePhysical {
+            column_mapping_mode,
+        }
+        .transform_struct_field(self)
+        .unwrap()
+        .into_owned()
     }
 
     fn has_invariants(&self) -> bool {
@@ -330,6 +347,14 @@ impl StructType {
         let mut get_leaves = GetSchemaLeaves::new(own_name.into());
         let _ = get_leaves.transform_struct(self);
         (get_leaves.names, get_leaves.types).into()
+    }
+
+    #[internal_api]
+    pub(crate) fn make_physical(&self, column_mapping_mode: ColumnMappingMode) -> Self {
+        let fields = self
+            .fields()
+            .map(|field| field.make_physical(column_mapping_mode));
+        Self::new(fields)
     }
 }
 
@@ -1161,7 +1186,17 @@ mod tests {
             field.physical_name(),
             "col-5f422f40-de70-45b2-88ab-1d5c90e94db1"
         );
-        let physical_field = field.make_physical();
+        let physical_field = field.make_physical(ColumnMappingMode::Id);
+
+        // Since this is column mapping id mode, the physical field should be a ParquetFieldId present
+        assert!(matches!(
+            physical_field.get_config_value(&ColumnMetadataKey::ParquetFieldId),
+            Some(MetadataValue::Number(4))
+        ));
+        assert!(matches!(
+            physical_field.get_config_value(&ColumnMetadataKey::ColumnMappingId),
+            Some(MetadataValue::Number(4))
+        ));
         assert_eq!(
             physical_field.name,
             "col-5f422f40-de70-45b2-88ab-1d5c90e94db1"
@@ -1172,10 +1207,21 @@ mod tests {
         let DataType::Struct(stype) = atype.element_type else {
             panic!("Expected a Struct");
         };
+
+        let struct_field = stype.fields.get_index(0).unwrap().1;
         assert_eq!(
-            stype.fields.get_index(0).unwrap().1.name,
+            struct_field.name,
             "col-a7f4159c-53be-4cb0-b81a-f7e5240cfc49"
         );
+
+        assert!(matches!(
+            struct_field.get_config_value(&ColumnMetadataKey::ParquetFieldId),
+            Some(MetadataValue::Number(5))
+        ));
+        assert!(matches!(
+            struct_field.get_config_value(&ColumnMetadataKey::ColumnMappingId),
+            Some(MetadataValue::Number(5))
+        ));
     }
 
     #[test]
