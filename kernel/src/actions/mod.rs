@@ -14,7 +14,7 @@ use crate::table_features::{
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{DeltaResult, EngineData, Error, FileMeta, RowVisitor as _};
+use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, IntoEngineData, RowVisitor as _};
 
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
@@ -22,6 +22,9 @@ use visitors::{MetadataVisitor, ProtocolVisitor};
 use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+
+const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
+const UNKNOWN_OPERATION: &str = "UNKNOWN";
 
 pub mod deletion_vector;
 pub mod set_transaction;
@@ -444,7 +447,7 @@ where
     )))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct CommitInfo {
@@ -472,15 +475,58 @@ pub(crate) struct CommitInfo {
 }
 
 impl CommitInfo {
-    pub(crate) fn new(timestamp: i64) -> Self {
+    pub(crate) fn new(
+        timestamp: i64,
+        operation: Option<String>,
+        engine_info: Option<String>,
+    ) -> Self {
         Self {
             timestamp: Some(timestamp),
             in_commit_timestamp: None,
-            operation: None,
+            operation: Some(operation.unwrap_or(UNKNOWN_OPERATION.to_string())),
             operation_parameters: None,
-            kernel_version: None,
-            engine_info: None,
+            kernel_version: Some(format!("v{KERNEL_VERSION}")),
+            engine_info,
         }
+    }
+}
+
+impl IntoEngineData for CommitInfo {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        use crate::{
+            expressions::{MapData, Scalar},
+            schema::{DataType, MapType},
+            EvaluationHandlerExtension as _,
+        };
+
+        let timestamp = Scalar::from(self.timestamp);
+        let in_commit_timestamp = Scalar::from(self.in_commit_timestamp);
+        let operation = Scalar::from(self.operation);
+
+        let operation_parameters = MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, false),
+            self.operation_parameters.clone().unwrap_or_default(),
+        )
+        .map(Scalar::Map)?;
+
+        let kernel_version = Scalar::from(self.kernel_version);
+        let engine_info = Scalar::from(self.engine_info);
+
+        let values = [
+            timestamp,
+            in_commit_timestamp,
+            operation,
+            operation_parameters,
+            kernel_version,
+            engine_info,
+        ];
+
+        let evaluator = engine.evaluation_handler();
+        evaluator.create_one(schema, &values)
     }
 }
 

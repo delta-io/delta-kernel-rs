@@ -13,9 +13,6 @@ use crate::{DataType, DeltaResult, Engine, EngineData, Expression, IntoEngineDat
 
 use url::Url;
 
-const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
-const UNKNOWN_OPERATION: &str = "UNKNOWN";
-
 pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new(vec![
         StructField::not_null("path", DataType::STRING),
@@ -72,8 +69,9 @@ pub struct Transaction {
 impl std::fmt::Debug for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&format!(
-            "Transaction {{ read_snapshot version: {} }}",
-            self.read_snapshot.version()
+            "Transaction {{ read_snapshot version: {}, engine_info: {} }}",
+            self.read_snapshot.version(),
+            self.engine_info.is_some()
         ))
     }
 }
@@ -135,14 +133,11 @@ impl Transaction {
             .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
 
         // step one: construct the iterator of commit info + file actions we want to commit
-        let mut commit_info = CommitInfo::new(self.commit_timestamp);
-        commit_info.operation = Some(
-            self.operation
-                .clone()
-                .unwrap_or(UNKNOWN_OPERATION.to_string()),
+        let commit_info = CommitInfo::new(
+            self.commit_timestamp.clone(),
+            self.operation.clone(),
+            self.engine_info.clone(),
         );
-        commit_info.kernel_version = Some(format!("v{KERNEL_VERSION}"));
-        commit_info.engine_info = self.engine_info.clone();
 
         let commit_info_schema = get_log_commit_info_schema().as_ref().clone();
 
@@ -174,8 +169,7 @@ impl Transaction {
         self
     }
 
-    /// Add commit info to this transaction and append the argument as its engine_commit_info.
-    /// The engine is required to provide commit info before committing the transcation.
+    /// Set the engine info field of this transaction's commit info action. This field is optional.
     pub fn with_engine_info(mut self, engine_info: String) -> Self {
         self.engine_info = Some(engine_info);
         self
@@ -302,6 +296,8 @@ pub enum CommitResult {
 mod tests {
     use super::*;
     use crate::schema::MapType;
+
+    // TODO: create a finer-grained unit tests for transactions
 
     #[test]
     fn test_add_files_schema() {

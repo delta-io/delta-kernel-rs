@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -553,22 +552,6 @@ impl<T: Into<Scalar> + ToDataType> From<Option<T>> for Scalar {
             Some(t) => t.into(),
             None => Self::Null(T::to_data_type()),
         }
-    }
-}
-
-impl<K: Into<Scalar> + ToDataType, V: Into<Scalar> + ToDataType> From<HashMap<K, V>> for Scalar {
-    fn from(map: HashMap<K, V>) -> Self {
-        let map_type = MapType::new(K::to_data_type(), V::to_data_type(), false);
-
-        let pairs = map
-            .into_iter()
-            .map(|(k, v)| (k.into(), v.into()))
-            .collect::<Vec<_>>();
-
-        let map_data =
-            MapData::try_new(map_type, pairs).expect("Failed to create MapData from HashMap");
-
-        Self::Map(map_data)
     }
 }
 
