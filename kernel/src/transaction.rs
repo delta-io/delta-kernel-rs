@@ -134,7 +134,7 @@ impl Transaction {
 
         // step one: construct the iterator of commit info + file actions we want to commit
         let commit_info = CommitInfo::new(
-            self.commit_timestamp.clone(),
+            self.commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
         );

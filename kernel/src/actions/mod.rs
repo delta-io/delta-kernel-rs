@@ -795,10 +795,43 @@ impl DomainMetadata {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
-    use crate::schema::{ArrayType, DataType, MapType, StructField};
+    use crate::{
+        arrow::array::{Int64Array, MapBuilder, MapFieldNames, StringArray, StringBuilder},
+        arrow::datatypes::{DataType as ArrowDataType, Field, Schema},
+        arrow::record_batch::RecordBatch,
+        engine::arrow_data::ArrowEngineData,
+        engine::arrow_expression::ArrowEvaluationHandler,
+        schema::{ArrayType, DataType, MapType, StructField},
+        Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+    };
+
+    // duplicated
+    struct ExprEngine(Arc<dyn EvaluationHandler>);
+
+    impl ExprEngine {
+        fn new() -> Self {
+            ExprEngine(Arc::new(ArrowEvaluationHandler))
+        }
+    }
+
+    impl Engine for ExprEngine {
+        fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+            self.0.clone()
+        }
+
+        fn json_handler(&self) -> Arc<dyn JsonHandler> {
+            unimplemented!()
+        }
+
+        fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+            unimplemented!()
+        }
+
+        fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+            unimplemented!()
+        }
+    }
 
     #[test]
     fn test_metadata_schema() {
@@ -1201,42 +1234,6 @@ mod tests {
 
     #[test]
     fn test_into_engine_data() {
-        use crate::arrow::array::{Int64Array, StringArray};
-        use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
-        use crate::arrow::record_batch::RecordBatch;
-
-        use crate::engine::arrow_data::ArrowEngineData;
-        use crate::engine::arrow_expression::ArrowEvaluationHandler;
-        use crate::IntoEngineData;
-        use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
-
-        // duplicated
-        struct ExprEngine(Arc<dyn EvaluationHandler>);
-
-        impl ExprEngine {
-            fn new() -> Self {
-                ExprEngine(Arc::new(ArrowEvaluationHandler))
-            }
-        }
-
-        impl Engine for ExprEngine {
-            fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-                self.0.clone()
-            }
-
-            fn json_handler(&self) -> Arc<dyn JsonHandler> {
-                unimplemented!()
-            }
-
-            fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-                unimplemented!()
-            }
-
-            fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-                unimplemented!()
-            }
-        }
-
         let engine = ExprEngine::new();
 
         let set_transaction = SetTransaction {
@@ -1267,6 +1264,50 @@ mod tests {
                 Arc::new(StringArray::from(vec!["app_id"])),
                 Arc::new(Int64Array::from(vec![0_i64])),
                 Arc::new(Int64Array::from(vec![None::<i64>])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(record_batch, expected);
+    }
+
+    #[test]
+    fn test_commit_info_into_engine_data() {
+        let engine = ExprEngine::new();
+
+        let commit_info = CommitInfo::new(0, None, None);
+
+        let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
+
+        let record_batch: crate::arrow::array::RecordBatch = engine_data
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        let mut map_builder = MapBuilder::new(
+            Some(MapFieldNames {
+                entry: "key_value".to_string(),
+                key: "key".to_string(),
+                value: "value".to_string(),
+            }),
+            StringBuilder::new(),
+            StringBuilder::new(),
+        )
+        .with_values_field(Field::new("value".to_string(), ArrowDataType::Utf8, false));
+        map_builder.append(true).unwrap();
+        let operation_parameters = Arc::new(map_builder.finish());
+
+        let expected = RecordBatch::try_new(
+            record_batch.schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(0)])),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+                Arc::new(StringArray::from(vec![Some("UNKNOWN")])),
+                operation_parameters,
+                Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
+                Arc::new(StringArray::from(vec![None::<String>])),
             ],
         )
         .unwrap();
