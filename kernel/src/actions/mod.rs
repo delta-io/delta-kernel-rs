@@ -8,13 +8,17 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
+use crate::expressions::{MapData, Scalar};
+use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::table_features::{
     ReaderFeature, WriterFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, IntoEngineData, RowVisitor as _};
+use crate::{
+    DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension as _, FileMeta,
+    IntoEngineData, RowVisitor as _,
+};
 
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
@@ -491,25 +495,20 @@ impl CommitInfo {
     }
 }
 
+// TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro
 impl IntoEngineData for CommitInfo {
     fn into_engine_data(
         self,
         schema: SchemaRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        use crate::{
-            expressions::{MapData, Scalar},
-            schema::{DataType, MapType},
-            EvaluationHandlerExtension as _,
-        };
-
         let timestamp = Scalar::from(self.timestamp);
         let in_commit_timestamp = Scalar::from(self.in_commit_timestamp);
         let operation = Scalar::from(self.operation);
 
         let operation_parameters = MapData::try_new(
             MapType::new(DataType::STRING, DataType::STRING, false),
-            self.operation_parameters.clone().unwrap_or_default(),
+            self.operation_parameters.unwrap_or_default(),
         )
         .map(Scalar::Map)?;
 
