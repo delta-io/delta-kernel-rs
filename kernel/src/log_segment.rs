@@ -487,7 +487,6 @@ impl LogSegment {
         // We can return 0 in the case there is no compaction since end_version - 0 is the correct
         // number of commits since compaction if there are no compactions
         let max_compaction_end = self.ascending_compaction_files.iter().fold(0, |cur, f| {
-            println!("compare {cur} and {f:?}");
             if let &ParsedLogPath {
                 file_type: LogPathFileType::CompactedCommit { hi },
                 ..
@@ -500,11 +499,8 @@ impl LogSegment {
             }
         });
         // we want to subtract off the max of the max compaction end or the checkpoint version
-        println!("here {:?}, {max_compaction_end}", self.checkpoint_version);
         let to_sub = Version::max(self.checkpoint_version.unwrap_or(0), max_compaction_end);
-        (self.end_version - to_sub)
-            .try_into()
-            .unwrap_or(usize::MAX)
+        (self.end_version - to_sub).try_into().unwrap_or(usize::MAX)
     }
 }
 

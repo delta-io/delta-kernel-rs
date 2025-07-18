@@ -1772,7 +1772,7 @@ fn commits_since() {
         &Vec::from_iter(0..=6),
         &[],
         Some(3), // No checkpoint
-        None, // Version to load
+        None,    // Version to load
     );
     assert_eq!(log_segment.commits_since_checkpoint(), 3);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 3);
@@ -1782,7 +1782,7 @@ fn commits_since() {
         &Vec::from_iter(0..=6),
         &[(0, 2)],
         Some(3), // Checkpoint
-        None, // Version to load
+        None,    // Version to load
     );
     assert_eq!(log_segment.commits_since_checkpoint(), 3);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 3);
@@ -1792,7 +1792,7 @@ fn commits_since() {
         &Vec::from_iter(0..=6),
         &[(3, 4)],
         Some(2), // Checkpoint
-        None, // Version to load
+        None,    // Version to load
     );
     assert_eq!(log_segment.commits_since_checkpoint(), 4);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
